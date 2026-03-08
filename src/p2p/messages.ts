@@ -65,7 +65,10 @@ export type NetworkMessage =
   | { type: "sendcmpct"; payload: SendCmpctPayload }
   | { type: "feefilter"; payload: FeeFilterPayload }
   | { type: "wtxidrelay"; payload: null }
-  | { type: "sendaddrv2"; payload: null };
+  | { type: "sendaddrv2"; payload: null }
+  | { type: "cmpctblock"; payload: CmpctBlockPayload }
+  | { type: "getblocktxn"; payload: GetBlockTxnPayload }
+  | { type: "blocktxn"; payload: BlockTxnPayload };
 
 /**
  * Network address (without timestamp, used in version message).
@@ -153,6 +156,56 @@ export interface SendCmpctPayload {
  */
 export interface FeeFilterPayload {
   feeRate: bigint;
+}
+
+// ============================================================================
+// BIP-152 Compact Block Relay
+// ============================================================================
+
+/**
+ * Short transaction ID for compact blocks (6 bytes).
+ * Computed as: SHA256(SHA256(nonce || txid))[0:6]
+ */
+export interface ShortTxId {
+  shortId: Buffer;  // 6 bytes
+}
+
+/**
+ * Prefilled transaction in a compact block.
+ * Used for coinbase and any transactions not expected to be in mempool.
+ */
+export interface PrefilledTx {
+  index: number;    // differentially encoded index
+  tx: Transaction;
+}
+
+/**
+ * Compact block message payload (BIP 152).
+ *
+ * Contains block header + short transaction IDs + prefilled transactions.
+ * Allows reconstruction of the full block using transactions from mempool.
+ */
+export interface CmpctBlockPayload {
+  header: BlockHeader;
+  nonce: bigint;              // 64-bit nonce for short ID calculation
+  shortIds: Buffer[];         // Array of 6-byte short transaction IDs
+  prefilledTxns: PrefilledTx[];
+}
+
+/**
+ * Request for block transactions not found in mempool.
+ */
+export interface GetBlockTxnPayload {
+  blockHash: Buffer;          // 32 bytes
+  indexes: number[];          // differentially encoded tx indices
+}
+
+/**
+ * Response with requested transactions.
+ */
+export interface BlockTxnPayload {
+  blockHash: Buffer;          // 32 bytes
+  transactions: Transaction[];
 }
 
 // ============================================================================
@@ -395,6 +448,67 @@ function serializeFeeFilterPayload(payload: FeeFilterPayload): Buffer {
   return writer.toBuffer();
 }
 
+function serializeCmpctBlockPayload(payload: CmpctBlockPayload): Buffer {
+  const writer = new BufferWriter();
+
+  // Header (80 bytes)
+  writer.writeBytes(serializeBlockHeader(payload.header));
+
+  // Nonce (8 bytes)
+  writer.writeUInt64LE(payload.nonce);
+
+  // Short IDs count and data
+  writer.writeVarInt(payload.shortIds.length);
+  for (const shortId of payload.shortIds) {
+    if (shortId.length !== 6) {
+      throw new Error(`Invalid short ID length: ${shortId.length}, expected 6`);
+    }
+    writer.writeBytes(shortId);
+  }
+
+  // Prefilled transactions (differentially encoded indices)
+  writer.writeVarInt(payload.prefilledTxns.length);
+  let lastIndex = -1;
+  for (const prefilled of payload.prefilledTxns) {
+    // Differential encoding: store difference from last index - 1
+    const diff = prefilled.index - lastIndex - 1;
+    writer.writeVarInt(diff);
+    writer.writeBytes(serializeTx(prefilled.tx, true));
+    lastIndex = prefilled.index;
+  }
+
+  return writer.toBuffer();
+}
+
+function serializeGetBlockTxnPayload(payload: GetBlockTxnPayload): Buffer {
+  const writer = new BufferWriter();
+
+  writer.writeHash(payload.blockHash);
+
+  // Differentially encoded indices
+  writer.writeVarInt(payload.indexes.length);
+  let lastIndex = -1;
+  for (const index of payload.indexes) {
+    const diff = index - lastIndex - 1;
+    writer.writeVarInt(diff);
+    lastIndex = index;
+  }
+
+  return writer.toBuffer();
+}
+
+function serializeBlockTxnPayload(payload: BlockTxnPayload): Buffer {
+  const writer = new BufferWriter();
+
+  writer.writeHash(payload.blockHash);
+  writer.writeVarInt(payload.transactions.length);
+  for (const tx of payload.transactions) {
+    writer.writeBytes(serializeTx(tx, true));
+  }
+
+  return writer.toBuffer();
+}
+
 // ============================================================================
 // Payload deserializers
 // ============================================================================
@@ -511,6 +625,59 @@ function deserializeFeeFilterPayload(reader: BufferReader): FeeFilterPayload {
   return { feeRate };
 }
 
+function deserializeCmpctBlockPayload(reader: BufferReader): CmpctBlockPayload {
+  const header = deserializeBlockHeader(reader);
+  const nonce = reader.readUInt64LE();
+
+  // Short IDs
+  const shortIdCount = reader.readVarInt();
+  const shortIds: Buffer[] = [];
+  for (let i = 0; i < shortIdCount; i++) {
+    shortIds.push(reader.readBytes(6));
+  }
+
+  // Prefilled transactions (differentially encoded)
+  const prefilledCount = reader.readVarInt();
+  const prefilledTxns: PrefilledTx[] = [];
+  let lastIndex = -1;
+  for (let i = 0; i < prefilledCount; i++) {
+    const diff = reader.readVarInt();
+    const index = lastIndex + diff + 1;
+    const tx = deserializeTx(reader);
+    prefilledTxns.push({ index, tx });
+    lastIndex = index;
+  }
+
+  return { header, nonce, shortIds, prefilledTxns };
+}
+
+function deserializeGetBlockTxnPayload(reader: BufferReader): GetBlockTxnPayload {
+  const blockHash = reader.readHash();
+
+  // Differentially encoded indices
+  const count = reader.readVarInt();
+  const indexes: number[] = [];
+  let lastIndex = -1;
+  for (let i = 0; i < count; i++) {
+    const diff = reader.readVarInt();
+    const index = lastIndex + diff + 1;
+    indexes.push(index);
+    lastIndex = index;
+  }
+
+  return { blockHash, indexes };
+}
+
+function deserializeBlockTxnPayload(reader: BufferReader): BlockTxnPayload {
+  const blockHash = reader.readHash();
+  const count = reader.readVarInt();
+  const transactions: Transaction[] = [];
+  for (let i = 0; i < count; i++) {
+    transactions.push(deserializeTx(reader));
+  }
+  return { blockHash, transactions };
+}
+
 // ============================================================================
 // Main serialization/deserialization functions
 // ============================================================================
@@ -611,6 +778,18 @@ export function serializeMessage(magic: number, msg: NetworkMessage): Buffer {
       command = "sendaddrv2";
       payload = Buffer.alloc(0);
       break;
+    case "cmpctblock":
+      command = "cmpctblock";
+      payload = serializeCmpctBlockPayload(msg.payload);
+      break;
+    case "getblocktxn":
+      command = "getblocktxn";
+      payload = serializeGetBlockTxnPayload(msg.payload);
+      break;
+    case "blocktxn":
+      command = "blocktxn";
+      payload = serializeBlockTxnPayload(msg.payload);
+      break;
     default:
       throw new Error(`Unknown message type: ${(msg as NetworkMessage).type}`);
   }
@@ -680,7 +859,145 @@ export function deserializeMessage(header: MessageHeader, payload: Buffer): Netw
       return { type: "wtxidrelay", payload: null };
     case "sendaddrv2":
       return { type: "sendaddrv2", payload: null };
+    case "cmpctblock":
+      return { type: "cmpctblock", payload: deserializeCmpctBlockPayload(reader) };
+    case "getblocktxn":
+      return { type: "getblocktxn", payload: deserializeGetBlockTxnPayload(reader) };
+    case "blocktxn":
+      return { type: "blocktxn", payload: deserializeBlockTxnPayload(reader) };
     default:
       throw new Error(`Unknown command: ${header.command}`);
   }
 }
+
+// ============================================================================
+// BIP-152 Compact Block Helper Functions
+// ============================================================================
+
+import { sha256Hash } from "../crypto/primitives.js";
+
+/**
+ * Compute short transaction ID for compact blocks (BIP 152).
+ *
+ * shortid = SipHash-2-4(k0, k1, txid)[0:6]
+ * where k0, k1 are derived from SHA256(header || nonce)
+ *
+ * For simplicity, we use SHA256 truncated (not SipHash) as an approximation.
+ * Full BIP-152 implementation would use SipHash.
+ */
+export function computeShortTxId(
+  headerHash: Buffer,
+  nonce: bigint,
+  txid: Buffer
+): Buffer {
+  // Compute key = SHA256(header || nonce)
+  const nonceBuffer = Buffer.alloc(8);
+  nonceBuffer.writeBigUInt64LE(nonce, 0);
+  const keyData = Buffer.concat([headerHash, nonceBuffer]);
+  const key = sha256Hash(keyData);
+
+  // Compute short ID = SHA256(key || txid)[0:6]
+  const shortIdData = Buffer.concat([key, txid]);
+  const fullHash = sha256Hash(shortIdData);
+
+  return fullHash.subarray(0, 6);
+}
+
+/**
+ * Create a compact block from a full block.
+ *
+ * @param block - Full block to compact
+ * @param nonce - Random nonce for short ID calculation
+ * @param mempoolTxIds - Set of txids known to be in peer's mempool
+ */
+export function createCompactBlock(
+  block: Block,
+  nonce: bigint,
+  mempoolTxIds: Set<string> = new Set()
+): CmpctBlockPayload {
+  const headerHash = hash256(serializeBlockHeader(block.header));
+  const shortIds: Buffer[] = [];
+  const prefilledTxns: PrefilledTx[] = [];
+
+  for (let i = 0; i < block.transactions.length; i++) {
+    const tx = block.transactions[i];
+    const txid = getTxId(tx);
+
+    // Always include coinbase in prefilled
+    if (i === 0) {
+      prefilledTxns.push({ index: i, tx });
+      continue;
+    }
+
+    // If not in mempool, include in prefilled
+    const txidHex = txid.toString("hex");
+    if (!mempoolTxIds.has(txidHex)) {
+      prefilledTxns.push({ index: i, tx });
+    } else {
+      // Add short ID
+      shortIds.push(computeShortTxId(headerHash, nonce, txid));
+    }
+  }
+
+  return {
+    header: block.header,
+    nonce,
+    shortIds,
+    prefilledTxns,
+  };
+}
+
+/**
+ * Reconstruct a full block from a compact block and mempool transactions.
+ *
+ * @param compact - Compact block
+ * @param txLookup - Map from short ID (hex) to full transaction
+ * @returns Reconstructed block or null if transactions are missing
+ */
+export function reconstructBlockFromCompact(
+  compact: CmpctBlockPayload,
+  txLookup: Map<string, Transaction>
+): Block | null {
+  // Total transaction count = shortIds + prefilledTxns
+  const txCount = compact.shortIds.length + compact.prefilledTxns.length;
+  const transactions: (Transaction | undefined)[] = new Array(txCount);
+
+  // Place prefilled transactions
+  for (const prefilled of compact.prefilledTxns) {
+    if (prefilled.index >= txCount) {
+      return null; // Invalid index
+    }
+    transactions[prefilled.index] = prefilled.tx;
+  }
+
+  // Fill remaining from lookup
+  let shortIdIndex = 0;
+  for (let i = 0; i < txCount; i++) {
+    if (transactions[i] === undefined) {
+      if (shortIdIndex >= compact.shortIds.length) {
+        return null; // Not enough short IDs
+      }
+      const shortIdHex = compact.shortIds[shortIdIndex].toString("hex");
+      const tx = txLookup.get(shortIdHex);
+      if (!tx) {
+        return null; // Transaction not found
+      }
+      transactions[i] = tx;
+      shortIdIndex++;
+    }
+  }
+
+  // Verify all slots are filled
+  for (const tx of transactions) {
+    if (tx === undefined) {
+      return null;
+    }
+  }
+
+  return {
+    header: compact.header,
+    transactions: transactions as Transaction[],
+  };
+}
+
+import { getTxId } from "../validation/tx.js";
