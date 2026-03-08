@@ -3,7 +3,110 @@
  *
  * Implements CompactSize (varint) encoding and primitive type serialization
  * used throughout the Bitcoin wire protocol.
+ *
+ * Performance optimizations:
+ * - BufferPool for reusable buffers to reduce GC pressure during IBD
+ * - Common buffer sizes pre-pooled (32 for hashes, 80 for headers, 4096 for general)
  */
+
+/** Common buffer sizes for pooling. */
+const POOL_SIZES = [32, 80, 256, 1024, 4096];
+
+/** Maximum buffers to keep per size. */
+const MAX_POOL_SIZE = 100;
+
+/**
+ * Reusable buffer pool to reduce GC pressure during IBD.
+ *
+ * Pools buffers of common sizes for reuse. Buffers must be released
+ * back to the pool after use.
+ */
+export class BufferPool {
+  private pools: Map<number, Buffer[]>;
+  private acquired: number;
+  private released: number;
+
+  constructor() {
+    this.pools = new Map();
+    this.acquired = 0;
+    this.released = 0;
+
+    // Pre-initialize pools for common sizes
+    for (const size of POOL_SIZES) {
+      this.pools.set(size, []);
+    }
+  }
+
+  /**
+   * Acquire a buffer of at least the given size.
+   * The buffer contents are NOT zeroed.
+   */
+  acquire(size: number): Buffer {
+    this.acquired++;
+
+    // Find the smallest pool size that fits
+    for (const poolSize of POOL_SIZES) {
+      if (poolSize >= size) {
+        const pool = this.pools.get(poolSize);
+        if (pool && pool.length > 0) {
+          return pool.pop()!;
+        }
+        // Pool is empty, allocate new buffer
+        return Buffer.allocUnsafe(poolSize);
+      }
+    }
+
+    // Size is larger than any pool, allocate directly
+    return Buffer.allocUnsafe(size);
+  }
+
+  /**
+   * Acquire a zeroed buffer of at least the given size.
+   */
+  acquireZeroed(size: number): Buffer {
+    const buf = this.acquire(size);
+    buf.fill(0, 0, size);
+    return buf;
+  }
+
+  /**
+   * Release a buffer back to the pool for reuse.
+   * Only buffers of pooled sizes will be retained.
+   */
+  release(buf: Buffer): void {
+    this.released++;
+
+    // Only pool buffers of exact pooled sizes
+    const pool = this.pools.get(buf.length);
+    if (pool && pool.length < MAX_POOL_SIZE) {
+      pool.push(buf);
+    }
+    // Otherwise let it be GC'd
+  }
+
+  /**
+   * Get pool statistics.
+   */
+  getStats(): { acquired: number; released: number; pooled: number } {
+    let pooled = 0;
+    for (const pool of this.pools.values()) {
+      pooled += pool.length;
+    }
+    return { acquired: this.acquired, released: this.released, pooled };
+  }
+
+  /**
+   * Clear all pooled buffers to free memory.
+   */
+  clear(): void {
+    for (const pool of this.pools.values()) {
+      pool.length = 0;
+    }
+  }
+}
+
+/** Global buffer pool instance. */
+export const globalBufferPool = new BufferPool();
 
 /**
  * Calculate the byte size of a CompactSize (varint) encoded value.
