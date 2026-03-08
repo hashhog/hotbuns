@@ -9,32 +9,37 @@ hotbuns is a from-scratch Bitcoin full node written in TypeScript (Bun) that doe
 
 ## Current status
 
-- [x] Project scaffold and module layout
 - [x] Wire serialization (varint, BufferReader/BufferWriter)
 - [x] Cryptographic primitives (SHA256d, HASH160, secp256k1 ECDSA)
 - [x] Address encoding (Base58Check, Bech32, Bech32m)
 - [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
 - [x] Consensus parameters (mainnet, testnet, regtest)
-- [x] Database storage (LevelDB, block index, UTXO set, chain state)
-- [x] Transaction validation (sighash, weight, serialization)
-- [x] Block validation (merkle root, PoW, witness commitment)
-- [x] P2P message serialization (header, version, inv, headers, block, tx)
-- [x] P2P peer connection (TCP via Bun.connect, version handshake, ping/pong)
-- [x] Peer manager (DNS discovery, connection pool, ban scoring, message routing)
-- [x] Header sync (block locator, MTP, PoW validation, difficulty adjustment)
-- [x] Block sync (IBD, parallel download, UTXO updates, stall detection)
-- [x] UTXO/chain state (connect/disconnect blocks, reorg handling, undo data)
-- [x] Mempool (unconfirmed tx validation, fee-rate ordering, eviction, dependency tracking)
-- [x] Fee estimation (confirmation buckets, historical data, adaptive decay)
-- [x] Block template (tx selection, coinbase construction, BIP34 height, witness commitment)
-- [x] RPC server (JSON-RPC 2.0, Bitcoin Core-compatible methods, HTTP Basic Auth)
-- [x] HD wallet (BIP-32/BIP-84 derivation, P2WPKH addresses, encrypted storage)
+- [x] Database storage (LevelDB, block index, UTXO set)
+- [x] Transaction and block validation
+- [x] P2P networking (TCP, version handshake, message framing)
+- [x] Peer manager (DNS discovery, connection pool, ban scoring)
+- [x] Header sync (block locator, MTP, PoW, difficulty adjustment)
+- [x] Block sync (IBD, parallel download, stall detection)
+- [x] UTXO/chain state (connect/disconnect blocks, reorg handling)
+- [x] Mempool (fee-rate ordering, eviction, dependency tracking)
+- [x] Fee estimation (confirmation buckets, historical data)
+- [x] Block template (tx selection, coinbase, witness commitment)
+- [x] RPC server (JSON-RPC 2.0, Bitcoin Core-compatible)
+- [x] HD wallet (BIP-32/BIP-84, P2WPKH, encrypted storage)
+- [x] CLI (start/stop, RPC client, wallet commands)
 
 ## Quick start
 
 ```bash
 bun install
-bun run src/index.ts --datadir ~/.hotbuns
+bun run src/index.ts start --network=testnet
+```
+
+Or use the CLI for wallet and RPC operations:
+
+```bash
+bun run src/index.ts wallet create --password=secret
+bun run src/index.ts getinfo --rpc-port=18332
 ```
 
 ## Project structure
@@ -42,6 +47,7 @@ bun run src/index.ts --datadir ~/.hotbuns
 ```
 src/
   index.ts          # entry point
+  cli/              # command-line interface
   wire/             # protocol serialization
   crypto/           # SHA256, RIPEMD160, secp256k1
   address/          # Base58Check, Bech32
@@ -57,7 +63,6 @@ src/
   mining/           # block templates
   rpc/              # JSON-RPC server
   wallet/           # HD wallet, transaction signing
-  cli/              # command-line parsing
 ```
 
 ## Running tests
