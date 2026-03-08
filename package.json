@@ -6,7 +6,8 @@
     "start": "bun run src/index.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "bench": "bun run src/test/benchmark.ts"
   },
   "devDependencies": {
     "bun-types": "^1.3.10",
