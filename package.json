@@ -1,0 +1,10 @@
+{
+  "name": "hotbuns",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  }
+}
