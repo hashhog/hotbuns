@@ -2,10 +2,21 @@
  * Persistent storage for blocks, headers, and chain state using LevelDB.
  *
  * Uses prefix-based key namespacing and batch write support for atomic operations.
+ *
+ * Performance optimizations:
+ * - Configurable batch sizes to prevent OOM during IBD
+ * - Batch accumulation for reduced write amplification
+ * - Memory monitoring and GC hints
  */
 
 import { ClassicLevel } from 'classic-level';
 import { BufferReader, BufferWriter } from '../wire/serialization.js';
+
+/** Default maximum operations per batch write (prevents OOM). */
+const DEFAULT_MAX_BATCH_SIZE = 10000;
+
+/** IBD-optimized batch size (larger batches, less fsync overhead). */
+const IBD_BATCH_SIZE = 50000;
 
 /** Key prefixes for database namespaces. */
 export const enum DBPrefix {
@@ -291,6 +302,9 @@ export class ChainDB {
 
   // Batch operations for atomic writes
 
+  /**
+   * Execute batch operations atomically.
+   */
   async batch(ops: BatchOperation[]): Promise<void> {
     const batch = this.db.batch();
     for (const op of ops) {
@@ -305,6 +319,54 @@ export class ChainDB {
       }
     }
     await batch.write();
+  }
+
+  /**
+   * Execute batch operations with configurable max batch size.
+   * Splits large batches into smaller chunks to prevent OOM.
+   *
+   * @param ops - Batch operations to execute
+   * @param maxBatchSize - Maximum operations per batch (default: 10000)
+   */
+  async batchWrite(ops: BatchOperation[], maxBatchSize: number = DEFAULT_MAX_BATCH_SIZE): Promise<void> {
+    if (ops.length === 0) {
+      return;
+    }
+
+    // If small enough, write in single batch
+    if (ops.length <= maxBatchSize) {
+      await this.batch(ops);
+      return;
+    }
+
+    // Split into chunks and write sequentially
+    for (let i = 0; i < ops.length; i += maxBatchSize) {
+      const chunk = ops.slice(i, Math.min(i + maxBatchSize, ops.length));
+      await this.batch(chunk);
+
+      // Optional: hint GC between large batches
+      if (typeof Bun !== 'undefined' && typeof Bun.gc === 'function') {
+        // Only force GC if memory pressure is high
+        const memUsage = process.memoryUsage();
+        if (memUsage.heapUsed > memUsage.heapTotal * 0.8) {
+          Bun.gc(true);
+        }
+      }
+    }
+  }
+
+  /**
+   * Get IBD-optimized batch size.
+   */
+  static getIBDBatchSize(): number {
+    return IBD_BATCH_SIZE;
+  }
+
+  /**
+   * Get default batch size.
+   */
+  static getDefaultBatchSize(): number {
+    return DEFAULT_MAX_BATCH_SIZE;
   }
 
   // Undo data operations (for block disconnect / reorgs)
