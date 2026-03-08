@@ -12,7 +12,7 @@ hotbuns is a from-scratch Bitcoin full node written in TypeScript (Bun) that doe
 - [x] Project scaffold and module layout
 - [x] Wire serialization (varint, BufferReader/BufferWriter)
 - [x] Cryptographic primitives (SHA256d, HASH160, secp256k1 ECDSA)
-- [ ] Address encoding (Base58Check, Bech32)
+- [x] Address encoding (Base58Check, Bech32, Bech32m)
 - [ ] Script interpreter
 - [ ] P2P networking and peer management
 - [ ] Header and block sync
