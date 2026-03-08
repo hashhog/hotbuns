@@ -16,6 +16,7 @@
     "@noble/curves": "^2.0.1",
     "@noble/hashes": "^2.0.1",
     "@noble/secp256k1": "^3.0.0",
-    "bech32": "^2.0.0"
+    "bech32": "^2.0.0",
+    "classic-level": "^3.0.0"
   }
 }
