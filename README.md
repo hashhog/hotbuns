@@ -9,18 +9,18 @@ hotbuns is a from-scratch Bitcoin full node written in TypeScript (Bun) that doe
 
 ## Current status
 
-- [x] Wire serialization (varint, BufferReader/BufferWriter)
+- [x] Wire serialization (varint, BufferReader/BufferWriter, buffer pooling)
 - [x] Cryptographic primitives (SHA256d, HASH160, secp256k1 ECDSA)
 - [x] Address encoding (Base58Check, Bech32, Bech32m)
 - [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
 - [x] Consensus parameters (mainnet, testnet, regtest)
-- [x] Database storage (LevelDB, block index, UTXO set)
-- [x] Transaction and block validation
-- [x] P2P networking (TCP, version handshake, message framing)
+- [x] Database storage (LevelDB, block index, UTXO set, batch optimization)
+- [x] Transaction and block validation (parallel sig verification)
+- [x] P2P networking (TCP, version handshake, message framing, BIP-152)
 - [x] Peer manager (DNS discovery, connection pool, ban scoring)
 - [x] Header sync (block locator, MTP, PoW, difficulty adjustment)
 - [x] Block sync (IBD, parallel download, stall detection)
-- [x] UTXO/chain state (connect/disconnect blocks, reorg handling)
+- [x] UTXO/chain state (LRU cache, dirty tracking, connect/disconnect)
 - [x] Mempool (fee-rate ordering, eviction, dependency tracking)
 - [x] Fee estimation (confirmation buckets, historical data)
 - [x] Block template (tx selection, coinbase, witness commitment)
@@ -28,6 +28,7 @@ hotbuns is a from-scratch Bitcoin full node written in TypeScript (Bun) that doe
 - [x] HD wallet (BIP-32/BIP-84, P2WPKH, encrypted storage)
 - [x] CLI (start/stop, RPC client, wallet commands)
 - [x] Test suite (unit, integration, e2e with regtest)
+- [x] Performance benchmarks (block deser, UTXO cache, sig verify)
 
 ## Quick start
 
@@ -72,4 +73,10 @@ src/
 ```bash
 bun test
 bun test --coverage
+```
+
+## Performance benchmarks
+
+```bash
+bun run bench
 ```
