@@ -19,7 +19,8 @@ hotbuns is a from-scratch Bitcoin full node written in TypeScript (Bun) that doe
 - [x] Transaction validation (sighash, weight, serialization)
 - [x] Block validation (merkle root, PoW, witness commitment)
 - [x] P2P message serialization (header, version, inv, headers, block, tx)
-- [ ] P2P peer connection and management
+- [x] P2P peer connection (TCP via Bun.connect, version handshake, ping/pong)
+- [ ] Peer manager (discovery, connection pool)
 - [ ] Header and block sync
 - [ ] Mempool
 - [ ] RPC server
