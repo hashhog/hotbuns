@@ -32,6 +32,7 @@ function flagsWithNullFail(): ScriptFlags {
     verifyNullFail: true,
     verifyCheckLockTimeVerify: true,
     verifyCheckSequenceVerify: true,
+    verifyWitnessPubkeyType: true,
   };
 }
 
