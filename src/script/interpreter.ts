@@ -186,6 +186,7 @@ export interface ScriptFlags {
   verifyNullFail: boolean; // BIP 146 - consensus (activated with SegWit)
   verifyCheckLockTimeVerify: boolean; // BIP 65 - consensus
   verifyCheckSequenceVerify: boolean; // BIP 112 - consensus
+  verifyWitnessPubkeyType: boolean; // BIP 141 - consensus (activated with SegWit)
 }
 
 /**
@@ -293,6 +294,20 @@ export function scriptNumDecode(buf: Buffer, maxLen: number = 4): number {
   }
 
   return result;
+}
+
+/**
+ * Check if a public key is compressed (33 bytes, starting with 0x02 or 0x03).
+ * Used for SCRIPT_VERIFY_WITNESS_PUBKEYTYPE enforcement in witness v0 scripts.
+ */
+function isCompressedPubKey(pubkey: Buffer): boolean {
+  if (pubkey.length !== 33) {
+    return false;
+  }
+  if (pubkey[0] !== 0x02 && pubkey[0] !== 0x03) {
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -985,6 +1000,15 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
         const pubkey = stack.pop()!;
         const sig = stack.pop()!;
 
+        // WITNESS_PUBKEYTYPE: In witness v0, pubkeys must be compressed
+        if (
+          flags.verifyWitnessPubkeyType &&
+          sigVersion === SigVersion.WITNESS_V0 &&
+          !isCompressedPubKey(pubkey)
+        ) {
+          return false;
+        }
+
         let success = false;
         if (sig.length > 0) {
           const hashType = sig[sig.length - 1];
@@ -1032,7 +1056,16 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
         if (stack.length < n) return false;
         const pubkeys: Buffer[] = [];
         for (let i = 0; i < n; i++) {
-          pubkeys.push(stack.pop()!);
+          const pubkey = stack.pop()!;
+          // WITNESS_PUBKEYTYPE: In witness v0, pubkeys must be compressed
+          if (
+            flags.verifyWitnessPubkeyType &&
+            sigVersion === SigVersion.WITNESS_V0 &&
+            !isCompressedPubKey(pubkey)
+          ) {
+            return false;
+          }
+          pubkeys.push(pubkey);
         }
 
         // Get m (number of required signatures)
@@ -1448,6 +1481,7 @@ export function getConsensusFlags(height: number): ScriptFlags {
     verifyWitness: height >= 481824, // BIP 141
     verifyNullDummy: height >= 481824, // BIP 147
     verifyNullFail: height >= 481824, // BIP 146 (activated with SegWit)
+    verifyWitnessPubkeyType: height >= 481824, // BIP 141 (activated with SegWit)
     verifyTaproot: height >= 709632, // BIP 341
     // Policy flags - NOT consensus
     verifyStrictEncoding: false,
