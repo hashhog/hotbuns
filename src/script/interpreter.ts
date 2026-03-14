@@ -183,6 +183,7 @@ export interface ScriptFlags {
   verifyDERSignatures: boolean; // BIP 66 - consensus
   verifyLowS: boolean; // policy
   verifyNullDummy: boolean; // BIP 147 - consensus
+  verifyNullFail: boolean; // BIP 146 - consensus (activated with SegWit)
   verifyCheckLockTimeVerify: boolean; // BIP 65 - consensus
   verifyCheckSequenceVerify: boolean; // BIP 112 - consensus
 }
@@ -1004,6 +1005,11 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
           success = ecdsaVerify(sigBytes, sighash, pubkey);
         }
 
+        // NULLFAIL: If signature check fails and signature is non-empty, fail
+        if (!success && flags.verifyNullFail && sig.length > 0) {
+          return false;
+        }
+
         if (opcode === Opcode.OP_CHECKSIGVERIFY) {
           if (!success) return false;
         } else {
@@ -1063,6 +1069,8 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
         }
 
         // Verify signatures
+        // Algorithm: try to match each signature to a key, moving forward through both.
+        // Empty signatures always fail the check (don't match any key).
         let success = true;
         let iKey = 0;
         let iSig = 0;
@@ -1071,15 +1079,16 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
           const sig = sigs[iSig];
           const pubkey = pubkeys[iKey];
 
+          let sigValid = false;
           if (sig.length > 0) {
             const hashType = sig[sig.length - 1];
             const sigBytes = sig.subarray(0, sig.length - 1);
             const sighash = sigHasher(subscript, hashType);
+            sigValid = ecdsaVerify(sigBytes, sighash, pubkey);
+          }
+          // Empty signatures always fail (sigValid remains false)
 
-            if (ecdsaVerify(sigBytes, sighash, pubkey)) {
-              iSig++;
-            }
-          } else {
+          if (sigValid) {
             iSig++;
           }
 
@@ -1088,6 +1097,15 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
           // Check if we have enough keys left
           if (sigs.length - iSig > pubkeys.length - iKey) {
             success = false;
+          }
+        }
+
+        // NULLFAIL: If the operation failed, all signatures must be empty
+        if (!success && flags.verifyNullFail) {
+          for (const sig of sigs) {
+            if (sig.length > 0) {
+              return false;
+            }
           }
         }
 
@@ -1429,6 +1447,7 @@ export function getConsensusFlags(height: number): ScriptFlags {
     verifyCheckSequenceVerify: height >= 419328, // BIP 112
     verifyWitness: height >= 481824, // BIP 141
     verifyNullDummy: height >= 481824, // BIP 147
+    verifyNullFail: height >= 481824, // BIP 146 (activated with SegWit)
     verifyTaproot: height >= 709632, // BIP 341
     // Policy flags - NOT consensus
     verifyStrictEncoding: false,
