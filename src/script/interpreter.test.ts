@@ -35,6 +35,7 @@ function defaultFlags(): ScriptFlags {
     verifyDERSignatures: true,
     verifyLowS: false,
     verifyNullDummy: true,
+    verifyNullFail: true,
     verifyCheckLockTimeVerify: true,
     verifyCheckSequenceVerify: true,
   };
@@ -694,7 +695,7 @@ describe("executeScript - CHECKSIG", () => {
     expect(scriptNumDecode(ctx.stack[0])).toBe(1);
   });
 
-  test("OP_CHECKSIG with invalid signature fails", () => {
+  test("OP_CHECKSIG with invalid signature pushes false (without NULLFAIL)", () => {
     const privateKey = Buffer.from(
       "0000000000000000000000000000000000000000000000000000000000000001",
       "hex"
@@ -713,7 +714,7 @@ describe("executeScript - CHECKSIG", () => {
     const ctx: ExecutionContext = {
       stack: [sig, publicKey],
       altStack: [],
-      flags: defaultFlags(),
+      flags: { ...defaultFlags(), verifyNullFail: false }, // Disable NULLFAIL for legacy behavior
       sigHasher,
       sigVersion: SigVersion.BASE,
     };
@@ -792,7 +793,7 @@ describe("executeScript - CHECKMULTISIG", () => {
     expect(scriptNumDecode(ctx.stack[0])).toBe(1);
   });
 
-  test("2-of-3 multisig fails with wrong signatures", () => {
+  test("2-of-3 multisig pushes false with wrong signatures (without NULLFAIL)", () => {
     const privKeys = [
       Buffer.from("0000000000000000000000000000000000000000000000000000000000000001", "hex"),
       Buffer.from("0000000000000000000000000000000000000000000000000000000000000002", "hex"),
@@ -820,7 +821,7 @@ describe("executeScript - CHECKMULTISIG", () => {
         scriptNumEncode(3),
       ],
       altStack: [],
-      flags: defaultFlags(),
+      flags: { ...defaultFlags(), verifyNullFail: false }, // Disable NULLFAIL for legacy behavior
       sigHasher,
       sigVersion: SigVersion.BASE,
     };
