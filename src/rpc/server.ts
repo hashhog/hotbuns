@@ -25,11 +25,13 @@ import {
   deserializeTx,
   serializeTx,
   getTxId,
+  getWTxId,
   getTxVSize,
   getTxWeight,
   hasWitness,
   isCoinbase,
 } from "../validation/tx.js";
+import { hash256 } from "../crypto/primitives.js";
 import { BufferReader } from "../wire/serialization.js";
 import type { InvPayload, NetworkMessage } from "../p2p/messages.js";
 import { InvType } from "../p2p/messages.js";
@@ -641,10 +643,19 @@ export class RPCServer {
 
   /**
    * getrawtransaction: Returns raw transaction data.
-   * @param params [txid, verbose]
+   *
+   * @param params [txid, verbose, blockhash]
+   *   - txid: The transaction id (hex string)
+   *   - verbose: If false, return hex string. If true (or 1), return JSON object
+   *   - blockhash: Optional block hash to look in
+   *
+   * Lookup priority:
+   * 1. Mempool
+   * 2. Specific block (if blockhash provided)
+   * 3. TxIndex (if enabled)
    */
   private async getRawTransaction(params: unknown[]): Promise<unknown> {
-    const [txidParam, verboseParam] = params;
+    const [txidParam, verboseParam, blockhashParam] = params;
 
     if (typeof txidParam !== "string") {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "txid must be a string");
@@ -655,29 +666,544 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid txid length");
     }
 
-    const verbose = verboseParam === true || verboseParam === 1;
-
-    // Check mempool first
-    const mempoolEntry = this.mempool.getTransaction(txid);
-    if (mempoolEntry) {
-      const rawHex = serializeTx(mempoolEntry.tx, true).toString("hex");
-
-      if (!verbose) {
-        return rawHex;
-      }
-
-      return {
-        ...this.formatTransaction(mempoolEntry.tx, null, -1, 0),
-        hex: rawHex,
-      };
+    // Parse verbose param: boolean or number (0/1/2 like Bitcoin Core)
+    let verbose = false;
+    if (verboseParam === true || verboseParam === 1 || verboseParam === 2) {
+      verbose = true;
     }
 
-    // TODO: Implement tx index lookup for confirmed transactions
-    // For now, we don't have a tx -> block index
+    // Check mempool first (unless specific blockhash provided)
+    if (blockhashParam === undefined || blockhashParam === null) {
+      const mempoolEntry = this.mempool.getTransaction(txid);
+      if (mempoolEntry) {
+        const rawHex = serializeTx(mempoolEntry.tx, true).toString("hex");
+
+        if (!verbose) {
+          return rawHex;
+        }
+
+        return {
+          ...this.formatTransaction(mempoolEntry.tx, null, -1, 0),
+          hex: rawHex,
+        };
+      }
+    }
+
+    // If blockhash provided, look in specific block
+    if (blockhashParam !== undefined && blockhashParam !== null) {
+      if (typeof blockhashParam !== "string") {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
+      }
+
+      const blockhash = Buffer.from(blockhashParam, "hex");
+      if (blockhash.length !== 32) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
+      }
+
+      const result = await this.findTxInBlock(txid, blockhash, verbose);
+      if (result) {
+        return result;
+      }
+
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "No such transaction found in the provided block"
+      );
+    }
+
+    // Try txindex lookup
+    const txIndexEntry = await this.db.getTxIndex(txid);
+    if (txIndexEntry) {
+      const result = await this.findTxInBlock(txid, txIndexEntry.blockHash, verbose);
+      if (result) {
+        return result;
+      }
+    }
+
+    // Not found anywhere
     throw this.rpcError(
       RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
-      "Transaction not found in mempool. Confirmed transaction lookup not implemented."
+      "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."
     );
+  }
+
+  /**
+   * Find a transaction in a specific block and format the result.
+   */
+  private async findTxInBlock(
+    txid: Buffer,
+    blockhash: Buffer,
+    verbose: boolean
+  ): Promise<unknown | null> {
+    // Get block data
+    const blockData = await this.db.getBlock(blockhash);
+    if (!blockData) {
+      return null;
+    }
+
+    // Get block index for height
+    const blockIndex = await this.db.getBlockIndex(blockhash);
+    if (!blockIndex) {
+      return null;
+    }
+
+    // Parse block and find transaction
+    const reader = new BufferReader(blockData);
+    const block = deserializeBlock(reader);
+
+    for (let i = 0; i < block.transactions.length; i++) {
+      const tx = block.transactions[i];
+      const currentTxid = getTxId(tx);
+
+      if (currentTxid.equals(txid)) {
+        const rawHex = serializeTx(tx, hasWitness(tx)).toString("hex");
+
+        if (!verbose) {
+          return rawHex;
+        }
+
+        // Get block time from header
+        const blocktime = block.header.timestamp;
+        const confirmations = this.chainState.getBestBlock().height - blockIndex.height + 1;
+
+        return {
+          ...this.formatTransactionVerbose(tx, blockhash, blockIndex.height, i),
+          blockhash: blockhash.toString("hex"),
+          confirmations,
+          time: blocktime,
+          blocktime,
+          hex: rawHex,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Format a transaction for verbose RPC output with full details.
+   */
+  private formatTransactionVerbose(
+    tx: Transaction,
+    blockhash: Buffer | null,
+    height: number,
+    txIndex: number
+  ): Record<string, unknown> {
+    const txid = getTxId(tx);
+    const wtxid = getWTxId(tx);
+    const serializedWithWitness = serializeTx(tx, true);
+    const serializedWithoutWitness = serializeTx(tx, false);
+    const weight = getTxWeight(tx);
+    const vsize = getTxVSize(tx);
+
+    const result: Record<string, unknown> = {
+      txid: txid.toString("hex"),
+      hash: wtxid.toString("hex"),
+      version: tx.version,
+      size: serializedWithWitness.length,
+      vsize,
+      weight,
+      locktime: tx.lockTime,
+      vin: tx.inputs.map((input, i) => {
+        const vin: Record<string, unknown> = {};
+
+        // Check if coinbase
+        if (isCoinbase(tx) && i === 0) {
+          vin.coinbase = input.scriptSig.toString("hex");
+          vin.sequence = input.sequence;
+        } else {
+          vin.txid = input.prevOut.txid.toString("hex");
+          vin.vout = input.prevOut.vout;
+          vin.scriptSig = {
+            asm: this.disassembleScript(input.scriptSig),
+            hex: input.scriptSig.toString("hex"),
+          };
+          vin.sequence = input.sequence;
+        }
+
+        if (input.witness.length > 0) {
+          vin.txinwitness = input.witness.map((w) => w.toString("hex"));
+        }
+
+        return vin;
+      }),
+      vout: tx.outputs.map((output, i) => ({
+        value: Number(output.value) / 100_000_000,
+        n: i,
+        scriptPubKey: this.formatScriptPubKey(output.scriptPubKey),
+      })),
+    };
+
+    return result;
+  }
+
+  /**
+   * Format scriptPubKey for RPC output.
+   */
+  private formatScriptPubKey(scriptPubKey: Buffer): Record<string, unknown> {
+    const type = this.getScriptType(scriptPubKey);
+    const result: Record<string, unknown> = {
+      asm: this.disassembleScript(scriptPubKey),
+      hex: scriptPubKey.toString("hex"),
+      type,
+    };
+
+    // Add address if applicable
+    const address = this.scriptPubKeyToAddress(scriptPubKey);
+    if (address) {
+      result.address = address;
+    }
+
+    return result;
+  }
+
+  /**
+   * Basic script disassembly.
+   */
+  private disassembleScript(script: Buffer): string {
+    if (script.length === 0) {
+      return "";
+    }
+
+    const parts: string[] = [];
+    let i = 0;
+
+    while (i < script.length) {
+      const op = script[i];
+
+      // Push data opcodes
+      if (op >= 0x01 && op <= 0x4b) {
+        // OP_PUSHBYTES_N
+        const len = op;
+        if (i + 1 + len <= script.length) {
+          const data = script.subarray(i + 1, i + 1 + len);
+          parts.push(data.toString("hex"));
+          i += 1 + len;
+        } else {
+          parts.push(`[error]`);
+          break;
+        }
+      } else if (op === 0x4c) {
+        // OP_PUSHDATA1
+        if (i + 1 < script.length) {
+          const len = script[i + 1];
+          if (i + 2 + len <= script.length) {
+            const data = script.subarray(i + 2, i + 2 + len);
+            parts.push(data.toString("hex"));
+            i += 2 + len;
+          } else {
+            parts.push(`[error]`);
+            break;
+          }
+        } else {
+          parts.push(`[error]`);
+          break;
+        }
+      } else if (op === 0x4d) {
+        // OP_PUSHDATA2
+        if (i + 2 < script.length) {
+          const len = script.readUInt16LE(i + 1);
+          if (i + 3 + len <= script.length) {
+            const data = script.subarray(i + 3, i + 3 + len);
+            parts.push(data.toString("hex"));
+            i += 3 + len;
+          } else {
+            parts.push(`[error]`);
+            break;
+          }
+        } else {
+          parts.push(`[error]`);
+          break;
+        }
+      } else {
+        // Standard opcode
+        const opName = this.getOpcodeName(op);
+        parts.push(opName);
+        i++;
+      }
+    }
+
+    return parts.join(" ");
+  }
+
+  /**
+   * Get opcode name.
+   */
+  private getOpcodeName(op: number): string {
+    const opcodes: Record<number, string> = {
+      0x00: "OP_0",
+      0x4f: "OP_1NEGATE",
+      0x51: "OP_1",
+      0x52: "OP_2",
+      0x53: "OP_3",
+      0x54: "OP_4",
+      0x55: "OP_5",
+      0x56: "OP_6",
+      0x57: "OP_7",
+      0x58: "OP_8",
+      0x59: "OP_9",
+      0x5a: "OP_10",
+      0x5b: "OP_11",
+      0x5c: "OP_12",
+      0x5d: "OP_13",
+      0x5e: "OP_14",
+      0x5f: "OP_15",
+      0x60: "OP_16",
+      0x61: "OP_NOP",
+      0x63: "OP_IF",
+      0x64: "OP_NOTIF",
+      0x67: "OP_ELSE",
+      0x68: "OP_ENDIF",
+      0x69: "OP_VERIFY",
+      0x6a: "OP_RETURN",
+      0x75: "OP_DROP",
+      0x76: "OP_DUP",
+      0x87: "OP_EQUAL",
+      0x88: "OP_EQUALVERIFY",
+      0x93: "OP_ADD",
+      0x94: "OP_SUB",
+      0xa9: "OP_HASH160",
+      0xaa: "OP_HASH256",
+      0xab: "OP_CODESEPARATOR",
+      0xac: "OP_CHECKSIG",
+      0xad: "OP_CHECKSIGVERIFY",
+      0xae: "OP_CHECKMULTISIG",
+      0xaf: "OP_CHECKMULTISIGVERIFY",
+      0xb1: "OP_CHECKLOCKTIMEVERIFY",
+      0xb2: "OP_CHECKSEQUENCEVERIFY",
+    };
+
+    return opcodes[op] || `OP_UNKNOWN[${op.toString(16)}]`;
+  }
+
+  /**
+   * Convert scriptPubKey to address (basic support for standard types).
+   */
+  private scriptPubKeyToAddress(scriptPubKey: Buffer): string | null {
+    // P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+    if (scriptPubKey.length === 25 && scriptPubKey[0] === 0x76 && scriptPubKey[1] === 0xa9 &&
+        scriptPubKey[2] === 0x14 && scriptPubKey[23] === 0x88 && scriptPubKey[24] === 0xac) {
+      const hash = scriptPubKey.subarray(3, 23);
+      return this.base58CheckEncode(hash, this.getP2PKHVersion());
+    }
+
+    // P2SH: OP_HASH160 <20 bytes> OP_EQUAL
+    if (scriptPubKey.length === 23 && scriptPubKey[0] === 0xa9 && scriptPubKey[1] === 0x14 &&
+        scriptPubKey[22] === 0x87) {
+      const hash = scriptPubKey.subarray(2, 22);
+      return this.base58CheckEncode(hash, this.getP2SHVersion());
+    }
+
+    // P2WPKH: OP_0 <20 bytes>
+    if (scriptPubKey.length === 22 && scriptPubKey[0] === 0x00 && scriptPubKey[1] === 0x14) {
+      const hash = scriptPubKey.subarray(2, 22);
+      return this.bech32Encode(0, hash);
+    }
+
+    // P2WSH: OP_0 <32 bytes>
+    if (scriptPubKey.length === 34 && scriptPubKey[0] === 0x00 && scriptPubKey[1] === 0x20) {
+      const hash = scriptPubKey.subarray(2, 34);
+      return this.bech32Encode(0, hash);
+    }
+
+    // P2TR: OP_1 <32 bytes>
+    if (scriptPubKey.length === 34 && scriptPubKey[0] === 0x51 && scriptPubKey[1] === 0x20) {
+      const hash = scriptPubKey.subarray(2, 34);
+      return this.bech32mEncode(1, hash);
+    }
+
+    return null;
+  }
+
+  /**
+   * Get P2PKH version byte based on network.
+   */
+  private getP2PKHVersion(): number {
+    // Check network magic
+    switch (this.params.networkMagic) {
+      case 0xd9b4bef9: // mainnet
+        return 0x00;
+      case 0x0709110b: // testnet
+      case 0xdab5bffa: // regtest
+      case 0x1c163f28: // testnet4
+      default:
+        return 0x6f;
+    }
+  }
+
+  /**
+   * Get P2SH version byte based on network.
+   */
+  private getP2SHVersion(): number {
+    switch (this.params.networkMagic) {
+      case 0xd9b4bef9: // mainnet
+        return 0x05;
+      default:
+        return 0xc4;
+    }
+  }
+
+  /**
+   * Get bech32 HRP based on network.
+   */
+  private getBech32HRP(): string {
+    switch (this.params.networkMagic) {
+      case 0xd9b4bef9: // mainnet
+        return "bc";
+      case 0x0709110b: // testnet
+      case 0x1c163f28: // testnet4
+        return "tb";
+      case 0xdab5bffa: // regtest
+        return "bcrt";
+      default:
+        return "tb";
+    }
+  }
+
+  /**
+   * Base58Check encode.
+   */
+  private base58CheckEncode(payload: Buffer, version: number): string {
+    const versionBuf = Buffer.from([version]);
+    const data = Buffer.concat([versionBuf, payload]);
+    const checksum = hash256(data).subarray(0, 4);
+    const full = Buffer.concat([data, checksum]);
+    return this.base58Encode(full);
+  }
+
+  /**
+   * Base58 encode.
+   */
+  private base58Encode(data: Buffer): string {
+    const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let num = BigInt("0x" + data.toString("hex"));
+    let result = "";
+
+    while (num > 0n) {
+      const mod = Number(num % 58n);
+      result = ALPHABET[mod] + result;
+      num = num / 58n;
+    }
+
+    // Handle leading zeros
+    for (let i = 0; i < data.length && data[i] === 0; i++) {
+      result = "1" + result;
+    }
+
+    return result;
+  }
+
+  /**
+   * Bech32 encode (witness version 0).
+   */
+  private bech32Encode(witnessVersion: number, data: Buffer): string {
+    const hrp = this.getBech32HRP();
+    const converted = this.convertBits(data, 8, 5, true);
+    if (!converted) return "";
+    const values = [witnessVersion, ...converted];
+    const checksum = this.createBech32Checksum(hrp, values, 1); // bech32
+    const combined = [...values, ...checksum];
+
+    const CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    let result = hrp + "1";
+    for (const v of combined) {
+      result += CHARSET[v];
+    }
+    return result;
+  }
+
+  /**
+   * Bech32m encode (witness version 1+).
+   */
+  private bech32mEncode(witnessVersion: number, data: Buffer): string {
+    const hrp = this.getBech32HRP();
+    const converted = this.convertBits(data, 8, 5, true);
+    if (!converted) return "";
+    const values = [witnessVersion, ...converted];
+    const checksum = this.createBech32Checksum(hrp, values, 0x2bc830a3); // bech32m
+    const combined = [...values, ...checksum];
+
+    const CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    let result = hrp + "1";
+    for (const v of combined) {
+      result += CHARSET[v];
+    }
+    return result;
+  }
+
+  /**
+   * Convert bits between base sizes.
+   */
+  private convertBits(data: Buffer, fromBits: number, toBits: number, pad: boolean): number[] | null {
+    let acc = 0;
+    let bits = 0;
+    const result: number[] = [];
+    const maxV = (1 << toBits) - 1;
+
+    for (let i = 0; i < data.length; i++) {
+      acc = (acc << fromBits) | data[i];
+      bits += fromBits;
+      while (bits >= toBits) {
+        bits -= toBits;
+        result.push((acc >> bits) & maxV);
+      }
+    }
+
+    if (pad) {
+      if (bits > 0) {
+        result.push((acc << (toBits - bits)) & maxV);
+      }
+    } else if (bits >= fromBits || ((acc << (toBits - bits)) & maxV)) {
+      return null;
+    }
+
+    return result;
+  }
+
+  /**
+   * Create bech32 checksum.
+   */
+  private createBech32Checksum(hrp: string, values: number[], encoding: number): number[] {
+    const hrpExpanded = this.expandHRP(hrp);
+    const polymod = this.polymod([...hrpExpanded, ...values, 0, 0, 0, 0, 0, 0]) ^ encoding;
+    const checksum: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      checksum.push((polymod >> (5 * (5 - i))) & 31);
+    }
+    return checksum;
+  }
+
+  /**
+   * Expand HRP for checksum computation.
+   */
+  private expandHRP(hrp: string): number[] {
+    const result: number[] = [];
+    for (let i = 0; i < hrp.length; i++) {
+      result.push(hrp.charCodeAt(i) >> 5);
+    }
+    result.push(0);
+    for (let i = 0; i < hrp.length; i++) {
+      result.push(hrp.charCodeAt(i) & 31);
+    }
+    return result;
+  }
+
+  /**
+   * Bech32 polymod.
+   */
+  private polymod(values: number[]): number {
+    const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+    let chk = 1;
+    for (const v of values) {
+      const top = chk >> 25;
+      chk = ((chk & 0x1ffffff) << 5) ^ v;
+      for (let i = 0; i < 5; i++) {
+        if ((top >> i) & 1) {
+          chk ^= GEN[i];
+        }
+      }
+    }
+    return chk;
   }
 
   /**
@@ -1189,36 +1715,35 @@ export class RPCServer {
     txIndex: number
   ): Record<string, unknown> {
     const txid = getTxId(tx);
+    const wtxid = getWTxId(tx);
 
     const result: Record<string, unknown> = {
       txid: txid.toString("hex"),
-      hash: txid.toString("hex"), // Same as txid for non-witness, different for witness
+      hash: wtxid.toString("hex"),
       version: tx.version,
       size: serializeTx(tx, true).length,
       vsize: getTxVSize(tx),
       weight: getTxWeight(tx),
       locktime: tx.lockTime,
       vin: tx.inputs.map((input, i) => {
-        const vin: Record<string, unknown> = {
-          txid: input.prevOut.txid.toString("hex"),
-          vout: input.prevOut.vout,
-          scriptSig: {
-            asm: "", // Would need script decoder
-            hex: input.scriptSig.toString("hex"),
-          },
-          sequence: input.sequence,
-        };
-
-        if (input.witness.length > 0) {
-          vin.txinwitness = input.witness.map((w) => w.toString("hex"));
-        }
+        const vin: Record<string, unknown> = {};
 
         // Check if coinbase
         if (isCoinbase(tx) && i === 0) {
           vin.coinbase = input.scriptSig.toString("hex");
-          delete vin.txid;
-          delete vin.vout;
-          delete vin.scriptSig;
+          vin.sequence = input.sequence;
+        } else {
+          vin.txid = input.prevOut.txid.toString("hex");
+          vin.vout = input.prevOut.vout;
+          vin.scriptSig = {
+            asm: this.disassembleScript(input.scriptSig),
+            hex: input.scriptSig.toString("hex"),
+          };
+          vin.sequence = input.sequence;
+        }
+
+        if (input.witness.length > 0) {
+          vin.txinwitness = input.witness.map((w) => w.toString("hex"));
         }
 
         return vin;
@@ -1226,11 +1751,7 @@ export class RPCServer {
       vout: tx.outputs.map((output, i) => ({
         value: Number(output.value) / 100_000_000,
         n: i,
-        scriptPubKey: {
-          asm: "", // Would need script decoder
-          hex: output.scriptPubKey.toString("hex"),
-          type: this.getScriptType(output.scriptPubKey),
-        },
+        scriptPubKey: this.formatScriptPubKey(output.scriptPubKey),
       })),
     };
 
