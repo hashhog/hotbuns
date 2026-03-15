@@ -52,6 +52,15 @@ class MockMempool {
     return { accepted: true };
   }
 
+  removeTransaction(_txid: Buffer, _removeDependents = true): void {
+    // No-op for tests
+  }
+
+  async isTransactionConfirmed(_txid: Buffer): Promise<boolean> {
+    // For testing, assume no transactions are confirmed
+    return false;
+  }
+
   // Helper for tests
   addTestTransaction(txid: Buffer, entry: any) {
     this.entries.set(txid.toString("hex"), {
