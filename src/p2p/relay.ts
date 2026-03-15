@@ -10,6 +10,7 @@
 import type { Peer } from "./peer.js";
 import type { InvVector } from "./messages.js";
 import { InvType } from "./messages.js";
+import { meetsFeeFilter } from "./feefilter.js";
 
 /**
  * Average delay between trickled inventory transmissions for inbound peers.
@@ -138,6 +139,31 @@ export class InventoryRelay {
   }
 
   /**
+   * Queue a transaction for announcement to a specific peer, respecting feefilter.
+   * Only queues if the transaction's fee rate meets the peer's feefilter threshold.
+   *
+   * @param peer - The peer to announce to
+   * @param txid - Transaction ID (hex string)
+   * @param txFeeRate - Transaction fee rate in sat/vB
+   * @returns true if queued, false if filtered out
+   */
+  queueTxFiltered(peer: Peer, txid: string, txFeeRate: number): boolean {
+    // Check feefilter before queueing
+    if (!meetsFeeFilter(txFeeRate, peer.feeFilterReceived)) {
+      return false;
+    }
+
+    const key = `${peer.host}:${peer.port}`;
+    const queue = this.queues.get(key);
+
+    if (queue) {
+      queue.pendingTxs.add(txid);
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Queue a transaction for announcement to all registered peers.
    *
    * @param txid - Transaction ID (hex string)
@@ -146,6 +172,26 @@ export class InventoryRelay {
     for (const queue of this.queues.values()) {
       queue.pendingTxs.add(txid);
     }
+  }
+
+  /**
+   * Queue a transaction for announcement to all registered peers, respecting feefilter.
+   * Only queues to peers where the transaction's fee rate meets their feefilter threshold.
+   *
+   * @param txid - Transaction ID (hex string)
+   * @param txFeeRate - Transaction fee rate in sat/vB
+   * @returns Number of peers the transaction was queued to
+   */
+  queueTxToAllFiltered(txid: string, txFeeRate: number): number {
+    let count = 0;
+    for (const queue of this.queues.values()) {
+      // Check feefilter before queueing
+      if (meetsFeeFilter(txFeeRate, queue.peer.feeFilterReceived)) {
+        queue.pendingTxs.add(txid);
+        count++;
+      }
+    }
+    return count;
   }
 
   /**
