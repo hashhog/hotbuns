@@ -43,6 +43,12 @@ export interface ConsensusParams {
   readonly userAgent: string;
   readonly dnsSeed: string[];
   readonly checkpoints: Map<number, Buffer>;
+  /**
+   * Minimum chain work required before storing headers permanently.
+   * This is used by the anti-DoS PRESYNC/REDOWNLOAD mechanism.
+   * Headers are only stored once the chain demonstrates this much cumulative work.
+   */
+  readonly nMinimumChainWork: bigint;
 }
 
 /**
@@ -384,6 +390,8 @@ export const MAINNET: ConsensusParams = {
       ).reverse(),
     ],
   ]),
+  // Minimum chain work from Bitcoin Core (as of recent release)
+  nMinimumChainWork: 0x0000000000000000000000000000000000000001128750f82f4c366153a3a030n,
 };
 
 /**
@@ -420,6 +428,7 @@ export const TESTNET: ConsensusParams = {
       ).reverse(),
     ],
   ]),
+  nMinimumChainWork: 0x0000000000000000000000000000000000000000000017dde1c649f3708d14b6n,
 };
 
 /**
@@ -512,6 +521,7 @@ export const TESTNET4: ConsensusParams = {
       testnet4GenesisHash,
     ],
   ]),
+  nMinimumChainWork: 0x0000000000000000000000000000000000000000000009a0fe15d0177d086304n,
 };
 
 /**
@@ -540,6 +550,8 @@ export const REGTEST: ConsensusParams = {
   difficultyAdjustmentInterval: 2016,
   dnsSeed: [],
   checkpoints: new Map(),
+  // No minimum work for regtest (allows immediate sync)
+  nMinimumChainWork: 0n,
 };
 
 /**
