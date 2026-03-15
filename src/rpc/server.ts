@@ -105,6 +105,7 @@ export interface RPCServerDeps {
   pruneManager?: import("../storage/pruning.js").PruneManager;
   wallet?: Wallet;
   chainstateManager?: ChainstateManager;
+  zmqInterface?: import("./zmq.js").ZMQNotificationInterface;
 }
 
 /** RPC error codes. */
@@ -169,6 +170,7 @@ export class RPCServer {
   private pruneManager?: import("../storage/pruning.js").PruneManager;
   private wallet?: Wallet;
   private chainstateManager?: ChainstateManager;
+  private zmqInterface?: import("./zmq.js").ZMQNotificationInterface;
   private shutdownCallback: (() => void) | null = null;
 
   constructor(config: RPCServerConfig, deps: RPCServerDeps) {
@@ -188,6 +190,7 @@ export class RPCServer {
     this.pruneManager = deps.pruneManager;
     this.wallet = deps.wallet;
     this.chainstateManager = deps.chainstateManager;
+    this.zmqInterface = deps.zmqInterface;
     this.methods = new Map();
 
     this.registerBuiltinMethods();
@@ -525,6 +528,9 @@ export class RPCServer {
     this.registerMethod("loadtxoutset", (params) => this.loadTxoutset(params));
     this.registerMethod("dumptxoutset", (params) => this.dumpTxoutset(params));
     this.registerMethod("getutxosetsnapshot", () => this.getUtxoSetSnapshot());
+
+    // ZMQ methods
+    this.registerMethod("getzmqnotifications", () => this.getZMQNotifications());
   }
 
   // ========== Blockchain Methods ==========
@@ -3188,5 +3194,26 @@ export class RPCServer {
       const message = e instanceof Error ? e.message : String(e);
       throw this.rpcError(RPCErrorCodes.INTERNAL_ERROR, `Failed to compute UTXO set info: ${message}`);
     }
+  }
+
+  // ========== ZMQ Methods ==========
+
+  /**
+   * getzmqnotifications: Returns information about active ZMQ notifications.
+   *
+   * Returns an array of objects with:
+   * - type: notification type (hashblock, hashtx, rawblock, rawtx, sequence)
+   * - address: ZMQ socket address
+   * - hwm: high water mark
+   */
+  private async getZMQNotifications(): Promise<Array<{
+    type: string;
+    address: string;
+    hwm: number;
+  }>> {
+    if (!this.zmqInterface) {
+      return [];
+    }
+    return this.zmqInterface.getNotifications();
   }
 }
