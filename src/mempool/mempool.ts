@@ -14,11 +14,13 @@ import type { Transaction, OutPoint } from "../validation/tx.js";
 import {
   validateTxBasic,
   getTxId,
+  getWTxId,
   getTxWeight,
   getTxVSize,
   isCoinbase,
   serializeTx,
 } from "../validation/tx.js";
+import { sha256Hash } from "../crypto/primitives.js";
 import {
   verifyScript,
   getConsensusFlags,
@@ -32,6 +34,14 @@ import { sigHashLegacy, sigHashWitnessV0 } from "../validation/tx.js";
 const MAX_ANCESTORS = 25;
 const MAX_DESCENDANTS = 25;
 const MAX_ANCESTOR_SIZE = 101_000; // 101 KB in vbytes
+
+/**
+ * Package relay limits.
+ * MAX_PACKAGE_COUNT: Maximum number of transactions in a package
+ * MAX_PACKAGE_WEIGHT: Maximum total weight of a package (404,000 WU = 101 kvB)
+ */
+export const MAX_PACKAGE_COUNT = 25;
+export const MAX_PACKAGE_WEIGHT = 404_000;
 
 /**
  * Default mempool size (300 MB in vbytes).
@@ -54,6 +64,56 @@ const DEFAULT_INCREMENTAL_RELAY_FEE = 1;
  * This includes the directly conflicting transactions and all their descendants.
  */
 const MAX_REPLACEMENT_CANDIDATES = 100;
+
+/**
+ * Package validation result types.
+ */
+export enum PackageValidationResult {
+  /** Package validation state was not set (success). */
+  PCKG_RESULT_UNSET = 0,
+  /** Package policy validation failed. */
+  PCKG_POLICY = 1,
+  /** One or more transactions in the package failed validation. */
+  PCKG_TX = 2,
+  /** Internal mempool error. */
+  PCKG_MEMPOOL_ERROR = 3,
+}
+
+/**
+ * Result of validating/accepting a single transaction within a package.
+ */
+export interface PackageTxResult {
+  /** Transaction ID (hex). */
+  txid: string;
+  /** Witness transaction ID (hex). */
+  wtxid: string;
+  /** Whether the transaction was accepted. */
+  accepted: boolean;
+  /** Error message if not accepted. */
+  error?: string;
+  /** Virtual size if accepted. */
+  vsize?: number;
+  /** Fee in satoshis if accepted. */
+  fee?: bigint;
+  /** Effective fee rate (package fee rate) if accepted. */
+  effectiveFeeRate?: number;
+  /** WTXIDs of transactions included in the effective fee rate calculation. */
+  effectiveIncludes?: string[];
+}
+
+/**
+ * Result of package validation/acceptance.
+ */
+export interface PackageResult {
+  /** Overall package validation result. */
+  result: PackageValidationResult;
+  /** Human-readable message. */
+  message: string;
+  /** Per-transaction results keyed by wtxid. */
+  txResults: Map<string, PackageTxResult>;
+  /** Transactions that were replaced (RBF). */
+  replacedTxids: string[];
+}
 
 /**
  * An entry in the mempool representing an unconfirmed transaction.
@@ -1024,4 +1084,557 @@ export class Mempool {
     this.currentSize = 0;
     this.minFeeRate = DEFAULT_MIN_FEE_RATE;
   }
+
+  /**
+   * Submit a package of transactions for validation and acceptance.
+   *
+   * Package validation allows related transactions to be validated together,
+   * enabling CPFP (Child-Pays-For-Parent) fee bumping. A parent transaction
+   * with a low fee rate can be accepted if its child pays enough fees to
+   * bring the combined package fee rate above the mempool minimum.
+   *
+   * @param transactions - Array of transactions in topological order (parents before children)
+   * @returns Package validation result with per-transaction results
+   */
+  async submitPackage(transactions: Transaction[]): Promise<PackageResult> {
+    // Initialize result
+    const txResults = new Map<string, PackageTxResult>();
+    const replacedTxids: string[] = [];
+
+    // Empty package
+    if (transactions.length === 0) {
+      return {
+        result: PackageValidationResult.PCKG_POLICY,
+        message: "package-empty",
+        txResults,
+        replacedTxids,
+      };
+    }
+
+    // Single transaction - just use regular acceptance
+    if (transactions.length === 1) {
+      const tx = transactions[0];
+      const txid = getTxId(tx).toString("hex");
+      const wtxid = getWTxId(tx).toString("hex");
+
+      const result = await this.addTransaction(tx);
+
+      txResults.set(wtxid, {
+        txid,
+        wtxid,
+        accepted: result.accepted,
+        error: result.error,
+        vsize: result.accepted ? getTxVSize(tx) : undefined,
+      });
+
+      return {
+        result: result.accepted
+          ? PackageValidationResult.PCKG_RESULT_UNSET
+          : PackageValidationResult.PCKG_TX,
+        message: result.accepted ? "success" : result.error || "transaction-rejected",
+        txResults,
+        replacedTxids,
+      };
+    }
+
+    // Validate package structure
+    const packageValidation = validatePackage(transactions);
+    if (!packageValidation.valid) {
+      // Create error results for all transactions
+      for (const tx of transactions) {
+        const txid = getTxId(tx).toString("hex");
+        const wtxid = getWTxId(tx).toString("hex");
+        txResults.set(wtxid, {
+          txid,
+          wtxid,
+          accepted: false,
+          error: "package-not-validated",
+        });
+      }
+
+      return {
+        result: PackageValidationResult.PCKG_POLICY,
+        message: packageValidation.error!,
+        txResults,
+        replacedTxids,
+      };
+    }
+
+    // Build a map of pending transactions for fee calculation
+    // This allows us to look up outputs from package members that aren't in mempool yet
+    const pendingTxs = new Map<string, Transaction>();
+    for (const tx of transactions) {
+      pendingTxs.set(getTxId(tx).toString("hex"), tx);
+    }
+
+    // First pass: calculate fees for all transactions using the pending map
+    const txFees = new Map<string, bigint>();
+    const txVsizes = new Map<string, number>();
+
+    for (const tx of transactions) {
+      const txid = getTxId(tx).toString("hex");
+      const wtxid = getWTxId(tx).toString("hex");
+
+      // Check if already in mempool
+      if (this.entries.has(txid)) {
+        const entry = this.entries.get(txid)!;
+        txFees.set(txid, entry.fee);
+        txVsizes.set(txid, entry.vsize);
+        txResults.set(wtxid, {
+          txid,
+          wtxid,
+          accepted: true,
+          vsize: entry.vsize,
+          fee: entry.fee,
+        });
+        continue;
+      }
+
+      // Calculate fee for this transaction
+      const feeResult = await this.calculateTxFee(tx, pendingTxs);
+      if (!feeResult.valid) {
+        // Transaction is invalid
+        txResults.set(wtxid, {
+          txid,
+          wtxid,
+          accepted: false,
+          error: feeResult.error,
+        });
+
+        return {
+          result: PackageValidationResult.PCKG_TX,
+          message: feeResult.error || "transaction-invalid",
+          txResults,
+          replacedTxids,
+        };
+      }
+
+      txFees.set(txid, feeResult.fee!);
+      txVsizes.set(txid, getTxVSize(tx));
+    }
+
+    // Calculate total package fee and vsize
+    let totalPackageFee = 0n;
+    let totalPackageVsize = 0;
+    const packageWtxids: string[] = [];
+
+    for (const tx of transactions) {
+      const txid = getTxId(tx).toString("hex");
+      const wtxid = getWTxId(tx).toString("hex");
+
+      // Skip transactions already in mempool (they're already accounted for)
+      if (this.entries.has(txid)) {
+        continue;
+      }
+
+      totalPackageFee += txFees.get(txid)!;
+      totalPackageVsize += txVsizes.get(txid)!;
+      packageWtxids.push(wtxid);
+    }
+
+    // Calculate package fee rate
+    const packageFeeRate = totalPackageVsize > 0
+      ? Number(totalPackageFee) / totalPackageVsize
+      : 0;
+
+    // Check if package fee rate meets minimum
+    if (totalPackageVsize > 0 && packageFeeRate < this.minFeeRate) {
+      // Package fee rate too low
+      for (const tx of transactions) {
+        const txid = getTxId(tx).toString("hex");
+        const wtxid = getWTxId(tx).toString("hex");
+
+        if (this.entries.has(txid)) {
+          continue; // Already in mempool
+        }
+
+        txResults.set(wtxid, {
+          txid,
+          wtxid,
+          accepted: false,
+          error: `Package fee rate ${packageFeeRate.toFixed(2)} sat/vB below minimum ${this.minFeeRate}`,
+        });
+      }
+
+      return {
+        result: PackageValidationResult.PCKG_POLICY,
+        message: "package-fee-too-low",
+        txResults,
+        replacedTxids,
+      };
+    }
+
+    // Now add all transactions to mempool in order
+    // Bypass individual fee checks since we've validated package fee rate
+    const acceptedTxs: Transaction[] = [];
+
+    for (const tx of transactions) {
+      const txid = getTxId(tx).toString("hex");
+      const wtxid = getWTxId(tx).toString("hex");
+
+      // Skip if already in mempool
+      if (this.entries.has(txid)) {
+        continue;
+      }
+
+      // Add with bypassed fee check
+      const result = await this.addTransactionBypassFeeCheck(tx);
+
+      if (result.accepted) {
+        acceptedTxs.push(tx);
+        const entry = this.entries.get(txid)!;
+        txResults.set(wtxid, {
+          txid,
+          wtxid,
+          accepted: true,
+          vsize: entry.vsize,
+          fee: entry.fee,
+          effectiveFeeRate: packageFeeRate,
+          effectiveIncludes: packageWtxids,
+        });
+      } else {
+        txResults.set(wtxid, {
+          txid,
+          wtxid,
+          accepted: false,
+          error: result.error,
+        });
+
+        // Remove already accepted transactions from this package
+        for (const acceptedTx of acceptedTxs) {
+          this.removeTransaction(getTxId(acceptedTx), true);
+        }
+
+        return {
+          result: PackageValidationResult.PCKG_TX,
+          message: result.error || "transaction-rejected",
+          txResults,
+          replacedTxids,
+        };
+      }
+    }
+
+    return {
+      result: PackageValidationResult.PCKG_RESULT_UNSET,
+      message: "success",
+      txResults,
+      replacedTxids,
+    };
+  }
+
+  /**
+   * Calculate the fee for a transaction without adding it to mempool.
+   * Used for CPFP package fee rate calculation.
+   *
+   * @param tx - Transaction to calculate fee for
+   * @param pendingTxs - Optional map of txid -> Transaction for transactions
+   *                     in the package that haven't been added to mempool yet.
+   */
+  private async calculateTxFee(
+    tx: Transaction,
+    pendingTxs?: Map<string, Transaction>
+  ): Promise<{ valid: boolean; fee?: bigint; error?: string }> {
+    // Basic validation
+    const basicResult = validateTxBasic(tx);
+    if (!basicResult.valid) {
+      return { valid: false, error: basicResult.error };
+    }
+
+    if (isCoinbase(tx)) {
+      return { valid: false, error: "Coinbase transaction not allowed" };
+    }
+
+    // Calculate input values
+    let totalInput = 0n;
+
+    for (const input of tx.inputs) {
+      const parentTxidHex = input.prevOut.txid.toString("hex");
+
+      // Check pending transactions first (package members not yet in mempool)
+      if (pendingTxs && pendingTxs.has(parentTxidHex)) {
+        const pendingTx = pendingTxs.get(parentTxidHex)!;
+        if (input.prevOut.vout >= pendingTx.outputs.length) {
+          return { valid: false, error: `Invalid pending input` };
+        }
+        totalInput += pendingTx.outputs[input.prevOut.vout].value;
+        continue;
+      }
+
+      // Check mempool
+      const mempoolParent = this.entries.get(parentTxidHex);
+      if (mempoolParent) {
+        if (input.prevOut.vout >= mempoolParent.tx.outputs.length) {
+          return { valid: false, error: `Invalid mempool input` };
+        }
+        totalInput += mempoolParent.tx.outputs[input.prevOut.vout].value;
+        continue;
+      }
+
+      // Check UTXO set
+      const utxo = await this.utxo.getUTXOAsync(input.prevOut);
+      if (!utxo) {
+        return { valid: false, error: `Missing input` };
+      }
+      totalInput += utxo.amount;
+    }
+
+    // Calculate output values
+    let totalOutput = 0n;
+    for (const output of tx.outputs) {
+      totalOutput += output.value;
+    }
+
+    if (totalInput < totalOutput) {
+      return { valid: false, error: `Insufficient input value` };
+    }
+
+    return { valid: true, fee: totalInput - totalOutput };
+  }
+
+  /**
+   * Add a transaction bypassing the fee rate check.
+   * Used for CPFP where the package fee rate has already been validated.
+   */
+  private async addTransactionBypassFeeCheck(
+    tx: Transaction
+  ): Promise<{ accepted: boolean; error?: string }> {
+    // Save current minFeeRate
+    const savedMinFeeRate = this.minFeeRate;
+
+    // Temporarily set minFeeRate to 0 to bypass the check
+    this.minFeeRate = 0;
+
+    try {
+      const result = await this.addTransaction(tx);
+      return result;
+    } finally {
+      // Restore minFeeRate
+      this.minFeeRate = savedMinFeeRate;
+    }
+  }
+}
+
+// ============================================================================
+// Package Validation Functions
+// ============================================================================
+
+/**
+ * Check if transactions are topologically sorted (parents before children).
+ *
+ * @param transactions - Array of transactions to check
+ * @returns true if topologically sorted
+ */
+export function isTopoSortedPackage(transactions: Transaction[]): boolean {
+  // Build a set of txids we've seen so far
+  const seenTxids = new Set<string>();
+
+  for (const tx of transactions) {
+    const txid = getTxId(tx).toString("hex");
+
+    // Check if any input spends a transaction that comes later
+    for (const input of tx.inputs) {
+      const parentTxid = input.prevOut.txid.toString("hex");
+      // If the parent txid is in our set of txids for this package but not yet seen,
+      // it means a parent appears after its child
+      if (!seenTxids.has(parentTxid)) {
+        // Check if this parent is in the package at all
+        const parentInPackage = transactions.some(
+          (t) => getTxId(t).toString("hex") === parentTxid
+        );
+        if (parentInPackage) {
+          // Parent is in package but hasn't been processed yet = not topo sorted
+          return false;
+        }
+      }
+    }
+
+    seenTxids.add(txid);
+  }
+
+  return true;
+}
+
+/**
+ * Check if package has no conflicting transactions (no double-spends within package).
+ *
+ * @param transactions - Array of transactions to check
+ * @returns true if consistent (no conflicts)
+ */
+export function isConsistentPackage(transactions: Transaction[]): boolean {
+  const inputsSeen = new Set<string>();
+
+  for (const tx of transactions) {
+    // Empty inputs are not allowed for non-coinbase transactions
+    if (tx.inputs.length === 0) {
+      return false;
+    }
+
+    // Check for duplicate inputs within package
+    for (const input of tx.inputs) {
+      const outpointKey = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+      if (inputsSeen.has(outpointKey)) {
+        // This input is spent by another transaction in the package
+        return false;
+      }
+    }
+
+    // Add all inputs from this transaction
+    for (const input of tx.inputs) {
+      const outpointKey = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+      inputsSeen.add(outpointKey);
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Check if package is a child-with-parents structure.
+ * The last transaction must be the child, and all other transactions must be parents of that child.
+ *
+ * @param transactions - Array of transactions to check
+ * @returns true if child-with-parents structure
+ */
+export function isChildWithParents(transactions: Transaction[]): boolean {
+  if (transactions.length < 2) {
+    return false;
+  }
+
+  const child = transactions[transactions.length - 1];
+
+  // Get all input txids of the child
+  const childInputTxids = new Set<string>();
+  for (const input of child.inputs) {
+    childInputTxids.add(input.prevOut.txid.toString("hex"));
+  }
+
+  // Every other transaction must be a parent of the child
+  for (let i = 0; i < transactions.length - 1; i++) {
+    const txid = getTxId(transactions[i]).toString("hex");
+    if (!childInputTxids.has(txid)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Check if package is a child-with-parents tree structure.
+ * Child-with-parents, plus parents don't depend on each other.
+ *
+ * @param transactions - Array of transactions to check
+ * @returns true if child-with-parents tree structure
+ */
+export function isChildWithParentsTree(transactions: Transaction[]): boolean {
+  if (!isChildWithParents(transactions)) {
+    return false;
+  }
+
+  // Get set of parent txids
+  const parentTxids = new Set<string>();
+  for (let i = 0; i < transactions.length - 1; i++) {
+    parentTxids.add(getTxId(transactions[i]).toString("hex"));
+  }
+
+  // Each parent must not have an input that is one of the other parents
+  for (let i = 0; i < transactions.length - 1; i++) {
+    const tx = transactions[i];
+    for (const input of tx.inputs) {
+      if (parentTxids.has(input.prevOut.txid.toString("hex"))) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Validate a package of transactions.
+ *
+ * Checks:
+ * 1. Package size limits (max 25 transactions, max 404,000 WU)
+ * 2. No duplicate transactions
+ * 3. Topological ordering (parents before children)
+ * 4. No conflicting transactions (double-spends within package)
+ *
+ * @param transactions - Array of transactions to validate
+ * @returns Validation result
+ */
+export function validatePackage(
+  transactions: Transaction[]
+): { valid: boolean; error?: string } {
+  // Check transaction count
+  if (transactions.length > MAX_PACKAGE_COUNT) {
+    return {
+      valid: false,
+      error: "package-too-many-transactions",
+    };
+  }
+
+  // Calculate total weight
+  let totalWeight = 0;
+  for (const tx of transactions) {
+    totalWeight += getTxWeight(tx);
+  }
+
+  // Single transaction packages skip the weight check (reported on individual tx)
+  if (transactions.length > 1 && totalWeight > MAX_PACKAGE_WEIGHT) {
+    return {
+      valid: false,
+      error: "package-too-large",
+    };
+  }
+
+  // Check for duplicate transactions
+  const txids = new Set<string>();
+  for (const tx of transactions) {
+    const txid = getTxId(tx).toString("hex");
+    if (txids.has(txid)) {
+      return {
+        valid: false,
+        error: "package-contains-duplicates",
+      };
+    }
+    txids.add(txid);
+  }
+
+  // Check topological ordering
+  if (!isTopoSortedPackage(transactions)) {
+    return {
+      valid: false,
+      error: "package-not-sorted",
+    };
+  }
+
+  // Check for conflicts
+  if (!isConsistentPackage(transactions)) {
+    return {
+      valid: false,
+      error: "conflict-in-package",
+    };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Compute the package hash (for P2P relay).
+ *
+ * The package hash is SHA256 of the sorted wtxids concatenated together.
+ *
+ * @param transactions - Array of transactions
+ * @returns 32-byte package hash
+ */
+export function getPackageHash(transactions: Transaction[]): Buffer {
+  // Get all wtxids
+  const wtxids = transactions.map((tx) => getWTxId(tx));
+
+  // Sort wtxids lexicographically (comparing as byte arrays)
+  wtxids.sort((a, b) => Buffer.compare(a, b));
+
+  // Concatenate and hash
+  const concat = Buffer.concat(wtxids);
+  return sha256Hash(concat);
 }
