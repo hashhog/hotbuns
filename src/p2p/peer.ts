@@ -41,6 +41,9 @@ export interface PeerEvents {
   onHandshakeComplete: (peer: Peer) => void;
 }
 
+/** Callback for when a peer should be banned. */
+export type OnBanCallback = (peer: Peer, reason: string) => void;
+
 /**
  * Represents a connection to a single Bitcoin peer.
  *
@@ -53,6 +56,10 @@ export class Peer {
   state: PeerState;
   versionPayload: VersionPayload | null;
   latency: number;
+  /** Accumulated misbehavior score; peer is banned at 100. */
+  misbehaviorScore: number;
+  /** Tracks whether this peer should be discouraged/banned. */
+  shouldDisconnect: boolean;
 
   private socket: Socket | null;
   private recvBuffer: Buffer;
@@ -62,8 +69,9 @@ export class Peer {
   private lastPingTime: number;
   private sentVerack: boolean;
   private receivedVerack: boolean;
+  private onBan: OnBanCallback | null;
 
-  constructor(config: PeerConfig, events: PeerEvents) {
+  constructor(config: PeerConfig, events: PeerEvents, onBan?: OnBanCallback) {
     this.config = config;
     this.events = events;
     this.host = config.host;
@@ -77,6 +85,9 @@ export class Peer {
     this.latency = 0;
     this.sentVerack = false;
     this.receivedVerack = false;
+    this.misbehaviorScore = 0;
+    this.shouldDisconnect = false;
+    this.onBan = onBan ?? null;
   }
 
   /**
@@ -144,6 +155,31 @@ export class Peer {
       this.socket = null;
     }
     this.events.onDisconnect(this);
+  }
+
+  /**
+   * Mark a peer as misbehaving by adding to their score.
+   * If the score reaches or exceeds 100, the peer is banned.
+   *
+   * Modeled after Bitcoin Core's Misbehaving() in net_processing.cpp.
+   *
+   * @param howmuch - Score to add (common values: 10, 20, 50, 100)
+   * @param message - Description of the violation
+   */
+  misbehaving(howmuch: number, message: string): void {
+    this.misbehaviorScore += howmuch;
+    const messagePrefixed = message ? `: ${message}` : "";
+    console.log(
+      `Misbehaving: peer=${this.host}:${this.port} score=${this.misbehaviorScore}${messagePrefixed}`
+    );
+
+    if (this.misbehaviorScore >= 100) {
+      this.shouldDisconnect = true;
+      if (this.onBan) {
+        this.onBan(this, message);
+      }
+      this.disconnect(`banned: ${message}`);
+    }
   }
 
   /**
