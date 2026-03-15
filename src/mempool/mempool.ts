@@ -4,6 +4,10 @@
  * Manages the pool of unconfirmed transactions waiting to be included in blocks.
  * Validates transactions, tracks dependencies between mempool transactions,
  * enforces fee-rate minimums, and evicts low-fee transactions when full.
+ *
+ * Uses cluster mempool architecture: transactions are organized into clusters
+ * (connected components of the dependency graph) and each cluster is linearized
+ * for optimal fee-rate ordering.
  */
 
 import type { UTXOEntry } from "../storage/database.js";
@@ -29,7 +33,14 @@ import {
 import { sigHashLegacy, sigHashWitnessV0 } from "../validation/tx.js";
 
 /**
- * Ancestor/descendant limits per BIP-125.
+ * Maximum cluster size (replaces ancestor/descendant limits).
+ * A cluster is a connected component of transactions in the mempool.
+ */
+export const MAX_CLUSTER_SIZE = 100;
+
+/**
+ * Legacy ancestor/descendant limits per BIP-125.
+ * These are now superseded by MAX_CLUSTER_SIZE but kept for TRUC policy.
  */
 const MAX_ANCESTORS = 25;
 const MAX_DESCENDANTS = 25;
@@ -161,6 +172,10 @@ export interface MempoolEntry {
   descendantCount: number;
   /** Cached total descendant size in vbytes (including self). */
   descendantSize: number;
+  /** Cluster ID this transaction belongs to. */
+  clusterId: string;
+  /** Mining score (effective fee rate as sat/vB from chunk). */
+  miningScore: number;
 }
 
 /**
@@ -173,12 +188,189 @@ interface MempoolUTXO {
   vout: number;
 }
 
+// ============================================================================
+// Cluster Mempool Data Structures
+// ============================================================================
+
+/**
+ * Union-Find (Disjoint Set Union) data structure for efficient cluster identification.
+ * Uses weighted union with path compression for near-constant time operations.
+ */
+export class UnionFind {
+  /** Parent pointers. Maps txid hex -> parent txid hex. */
+  private parent: Map<string, string>;
+  /** Rank (tree depth) for each root. */
+  private rank: Map<string, number>;
+  /** Size of each set (number of elements). */
+  private size: Map<string, number>;
+
+  constructor() {
+    this.parent = new Map();
+    this.rank = new Map();
+    this.size = new Map();
+  }
+
+  /**
+   * Add a new element to the union-find structure.
+   */
+  makeSet(id: string): void {
+    if (this.parent.has(id)) return;
+    this.parent.set(id, id);
+    this.rank.set(id, 0);
+    this.size.set(id, 1);
+  }
+
+  /**
+   * Find the root of the set containing the given element.
+   * Uses path compression for efficiency.
+   */
+  find(id: string): string {
+    if (!this.parent.has(id)) {
+      this.makeSet(id);
+    }
+    let root = id;
+    // Find root
+    while (this.parent.get(root) !== root) {
+      root = this.parent.get(root)!;
+    }
+    // Path compression
+    let current = id;
+    while (current !== root) {
+      const next = this.parent.get(current)!;
+      this.parent.set(current, root);
+      current = next;
+    }
+    return root;
+  }
+
+  /**
+   * Union two sets. Returns the root of the merged set.
+   * Uses union by rank.
+   */
+  union(a: string, b: string): string {
+    const rootA = this.find(a);
+    const rootB = this.find(b);
+
+    if (rootA === rootB) return rootA;
+
+    const rankA = this.rank.get(rootA)!;
+    const rankB = this.rank.get(rootB)!;
+    const sizeA = this.size.get(rootA)!;
+    const sizeB = this.size.get(rootB)!;
+
+    // Union by rank
+    if (rankA < rankB) {
+      this.parent.set(rootA, rootB);
+      this.size.set(rootB, sizeA + sizeB);
+      return rootB;
+    } else if (rankA > rankB) {
+      this.parent.set(rootB, rootA);
+      this.size.set(rootA, sizeA + sizeB);
+      return rootA;
+    } else {
+      this.parent.set(rootB, rootA);
+      this.rank.set(rootA, rankA + 1);
+      this.size.set(rootA, sizeA + sizeB);
+      return rootA;
+    }
+  }
+
+  /**
+   * Get the size of the set containing the given element.
+   */
+  getSize(id: string): number {
+    const root = this.find(id);
+    return this.size.get(root) ?? 0;
+  }
+
+  /**
+   * Check if two elements are in the same set.
+   */
+  connected(a: string, b: string): boolean {
+    return this.find(a) === this.find(b);
+  }
+
+  /**
+   * Remove an element from the structure.
+   * Note: This is expensive - requires rebuilding affected sets.
+   */
+  remove(id: string): void {
+    this.parent.delete(id);
+    this.rank.delete(id);
+    this.size.delete(id);
+  }
+
+  /**
+   * Clear the entire structure.
+   */
+  clear(): void {
+    this.parent.clear();
+    this.rank.clear();
+    this.size.clear();
+  }
+
+  /**
+   * Get all unique root IDs (cluster IDs).
+   */
+  getAllRoots(): Set<string> {
+    const roots = new Set<string>();
+    for (const id of this.parent.keys()) {
+      roots.add(this.find(id));
+    }
+    return roots;
+  }
+}
+
+/**
+ * A chunk in the linearization: a set of transactions with aggregate fee rate.
+ * Chunks are contiguous prefixes of the linearization that form valid topological orderings.
+ */
+export interface Chunk {
+  /** Transaction IDs (hex) in this chunk. */
+  txids: Set<string>;
+  /** Total fee (satoshis). */
+  totalFee: bigint;
+  /** Total vsize (vbytes). */
+  totalVsize: number;
+  /** Aggregate fee rate (sat/vB). */
+  feeRate: number;
+}
+
+/**
+ * A linearization of a cluster: an ordered list of chunks.
+ */
+export interface Linearization {
+  /** Ordered list of chunks from highest to lowest fee rate. */
+  chunks: Chunk[];
+  /** Map from txid hex -> chunk index in the linearization. */
+  txToChunk: Map<string, number>;
+}
+
+/**
+ * A cluster: a connected component of transactions in the mempool.
+ */
+export interface Cluster {
+  /** Cluster ID (typically the root txid in union-find). */
+  id: string;
+  /** All transaction IDs in this cluster. */
+  txids: Set<string>;
+  /** Total fee. */
+  totalFee: bigint;
+  /** Total vsize. */
+  totalVsize: number;
+  /** Current linearization of the cluster. */
+  linearization: Linearization;
+}
+
 /**
  * Transaction memory pool.
  *
  * Validates and stores unconfirmed transactions. When full, evicts transactions
  * with the lowest fee rate. Tracks dependencies between mempool transactions
  * to handle chained unconfirmed transactions.
+ *
+ * Uses cluster mempool architecture where transactions are organized into
+ * clusters (connected components) and linearized for optimal mining.
  */
 export class Mempool {
   /** Map of txid hex -> entry. */
@@ -208,6 +400,15 @@ export class Mempool {
   /** Incremental relay fee rate (sat/vB). Replacement must pay this per vbyte over replaced fees. */
   private incrementalRelayFee: number;
 
+  /** Union-Find structure for cluster identification. */
+  private clusters: UnionFind;
+
+  /** Map of cluster ID -> Cluster object with linearization. */
+  private clusterCache: Map<string, Cluster>;
+
+  /** Whether cluster cache needs to be rebuilt. */
+  private clusterCacheDirty: boolean;
+
   constructor(
     utxo: UTXOManager,
     params: ConsensusParams,
@@ -222,6 +423,9 @@ export class Mempool {
     this.minFeeRate = DEFAULT_MIN_FEE_RATE;
     this.incrementalRelayFee = DEFAULT_INCREMENTAL_RELAY_FEE;
     this.tipHeight = 0;
+    this.clusters = new UnionFind();
+    this.clusterCache = new Map();
+    this.clusterCacheDirty = false;
   }
 
   /**
@@ -480,8 +684,14 @@ export class Mempool {
       }
     }
 
-    // 9b. Check ancestor/descendant limits (standard, non-TRUC)
+    // 9b. Check cluster size limit (replaces ancestor/descendant limits)
     // For TRUC, we've already checked in checkTRUCPolicy with stricter limits
+    const clusterResult = this.checkClusterSizeLimit(parentTxids, vsize);
+    if (!clusterResult.valid) {
+      return { accepted: false, error: clusterResult.error };
+    }
+
+    // Also check legacy ancestor/descendant limits for backward compatibility
     const ancestorResult = this.checkAncestorLimits(parentTxids, vsize);
     if (!ancestorResult.valid) {
       return { accepted: false, error: ancestorResult.error };
@@ -555,6 +765,8 @@ export class Mempool {
       ancestorSize,
       descendantCount: 1, // Only self initially
       descendantSize: vsize,
+      clusterId: txidHex, // Will be updated by addToCluster
+      miningScore: feeRate, // Will be updated by linearization
     };
 
     // Add to mempool
@@ -571,6 +783,9 @@ export class Mempool {
 
     // Update all ancestors' descendant counts
     this.updateAncestorDescendantStats(txidHex, vsize);
+
+    // Add to cluster structure
+    this.addToCluster(txidHex, parentTxids);
 
     // Index the spent outpoints
     for (const input of tx.inputs) {
@@ -635,6 +850,9 @@ export class Mempool {
     // Remove from entries
     this.entries.delete(txidHex);
     this.currentSize -= entry.vsize;
+
+    // Mark cluster cache as dirty
+    this.clusterCacheDirty = true;
   }
 
   /**
@@ -710,6 +928,34 @@ export class Mempool {
 
     // Recalculate cached stats for all remaining entries
     this.recalculateAllStats();
+
+    // Rebuild cluster structure from scratch
+    this.rebuildClusters();
+  }
+
+  /**
+   * Rebuild the cluster union-find structure from scratch.
+   * Called after bulk operations like removeForBlock.
+   */
+  private rebuildClusters(): void {
+    this.clusters.clear();
+    this.clusterCache.clear();
+
+    // Create singleton sets for all remaining transactions
+    for (const txidHex of this.entries.keys()) {
+      this.clusters.makeSet(txidHex);
+    }
+
+    // Union based on dependencies
+    for (const [txidHex, entry] of this.entries) {
+      for (const parentTxidHex of entry.dependsOn) {
+        if (this.entries.has(parentTxidHex)) {
+          this.clusters.union(txidHex, parentTxidHex);
+        }
+      }
+    }
+
+    this.clusterCacheDirty = true;
   }
 
   /**
@@ -1217,33 +1463,42 @@ export class Mempool {
   }
 
   /**
-   * Evict lowest fee-rate transactions to make room.
+   * Evict lowest mining-score transactions to make room.
    *
-   * Removes transactions with the lowest fee rate until the mempool
-   * is below the size limit. Updates minFeeRate to the rate of the
-   * last evicted transaction.
+   * Uses cluster-based eviction: finds the transaction with the lowest
+   * mining score (chunk fee rate) from the worst cluster and removes it.
+   * Updates minFeeRate to the rate of the last evicted transaction.
    */
   private evict(): void {
-    // Sort by fee rate ascending
-    const entries = Array.from(this.entries.values());
-    entries.sort((a, b) => a.feeRate - b.feeRate);
+    this.rebuildClusterCache();
 
     let evictedFeeRate = this.minFeeRate;
 
-    while (this.currentSize > this.maxSize && entries.length > 0) {
-      const lowest = entries.shift()!;
-      evictedFeeRate = lowest.feeRate;
+    while (this.currentSize > this.maxSize && this.entries.size > 0) {
+      // Find the transaction with the lowest mining score
+      let worstTxidHex: string | null = null;
+      let worstScore = Infinity;
+
+      for (const [txidHex, entry] of this.entries) {
+        // Use mining score (chunk fee rate) for eviction
+        const score = entry.miningScore;
+        if (score < worstScore) {
+          worstScore = score;
+          worstTxidHex = txidHex;
+        }
+      }
+
+      if (!worstTxidHex) break;
+
+      const entry = this.entries.get(worstTxidHex)!;
+      evictedFeeRate = entry.miningScore;
 
       // Remove the transaction and all its descendants
-      this.removeTransaction(lowest.txid, true);
+      this.removeTransaction(entry.txid, true);
 
-      // Re-filter entries list since we may have removed descendants
-      const remainingTxids = new Set(this.entries.keys());
-      entries.splice(
-        0,
-        entries.length,
-        ...entries.filter((e) => remainingTxids.has(e.txid.toString("hex")))
-      );
+      // Mark cluster cache as dirty since we removed transactions
+      this.clusterCacheDirty = true;
+      this.rebuildClusterCache();
     }
 
     // Update minimum fee rate to slightly above the last evicted rate
@@ -1299,6 +1554,334 @@ export class Mempool {
     this.outpointIndex.clear();
     this.currentSize = 0;
     this.minFeeRate = DEFAULT_MIN_FEE_RATE;
+    this.clusters.clear();
+    this.clusterCache.clear();
+    this.clusterCacheDirty = false;
+  }
+
+  // ============================================================================
+  // Cluster Mempool Methods
+  // ============================================================================
+
+  /**
+   * Get the cluster ID for a transaction.
+   */
+  getClusterId(txidHex: string): string {
+    return this.clusters.find(txidHex);
+  }
+
+  /**
+   * Get the size of a cluster (number of transactions).
+   */
+  getClusterSize(txidHex: string): number {
+    return this.clusters.getSize(txidHex);
+  }
+
+  /**
+   * Check if adding a transaction would exceed the cluster size limit.
+   * A new transaction may merge multiple clusters together.
+   */
+  private checkClusterSizeLimit(parentTxids: Set<string>, newTxVsize: number): { valid: boolean; error?: string } {
+    // Calculate the resulting cluster size if this tx is added
+    // First, find all unique clusters that would be merged
+    const clusterRoots = new Set<string>();
+    for (const parentTxidHex of parentTxids) {
+      if (this.entries.has(parentTxidHex)) {
+        clusterRoots.add(this.clusters.find(parentTxidHex));
+      }
+    }
+
+    // Sum up the sizes of all clusters that would be merged + 1 for the new tx
+    let mergedSize = 1;
+    for (const root of clusterRoots) {
+      mergedSize += this.clusters.getSize(root);
+    }
+
+    if (mergedSize > MAX_CLUSTER_SIZE) {
+      return {
+        valid: false,
+        error: `Cluster would exceed maximum size: ${mergedSize} > ${MAX_CLUSTER_SIZE}`,
+      };
+    }
+
+    return { valid: true };
+  }
+
+  /**
+   * Add a transaction to the cluster structure.
+   * Updates union-find and marks cluster cache as dirty.
+   */
+  private addToCluster(txidHex: string, parentTxids: Set<string>): void {
+    // Create a new singleton cluster for this tx
+    this.clusters.makeSet(txidHex);
+
+    // Union with all parent clusters
+    for (const parentTxidHex of parentTxids) {
+      if (this.entries.has(parentTxidHex)) {
+        this.clusters.union(txidHex, parentTxidHex);
+      }
+    }
+
+    // Mark cache as dirty since cluster structure changed
+    this.clusterCacheDirty = true;
+  }
+
+  /**
+   * Rebuild the cluster cache from scratch.
+   * Called lazily when cluster information is needed.
+   */
+  private rebuildClusterCache(): void {
+    if (!this.clusterCacheDirty) return;
+
+    this.clusterCache.clear();
+
+    // Group transactions by cluster ID
+    const clusterTxids = new Map<string, Set<string>>();
+    for (const txidHex of this.entries.keys()) {
+      const clusterId = this.clusters.find(txidHex);
+      if (!clusterTxids.has(clusterId)) {
+        clusterTxids.set(clusterId, new Set());
+      }
+      clusterTxids.get(clusterId)!.add(txidHex);
+    }
+
+    // Build cluster objects with linearization
+    for (const [clusterId, txids] of clusterTxids) {
+      const linearization = this.linearizeCluster(txids);
+
+      let totalFee = 0n;
+      let totalVsize = 0;
+      for (const txidHex of txids) {
+        const entry = this.entries.get(txidHex)!;
+        totalFee += entry.fee;
+        totalVsize += entry.vsize;
+      }
+
+      const cluster: Cluster = {
+        id: clusterId,
+        txids,
+        totalFee,
+        totalVsize,
+        linearization,
+      };
+
+      this.clusterCache.set(clusterId, cluster);
+
+      // Update mining scores for all transactions in this cluster
+      for (let chunkIdx = 0; chunkIdx < linearization.chunks.length; chunkIdx++) {
+        const chunk = linearization.chunks[chunkIdx];
+        for (const txidHex of chunk.txids) {
+          const entry = this.entries.get(txidHex);
+          if (entry) {
+            entry.clusterId = clusterId;
+            entry.miningScore = chunk.feeRate;
+          }
+        }
+      }
+    }
+
+    this.clusterCacheDirty = false;
+  }
+
+  /**
+   * Linearize a cluster: order transactions by optimal fee-rate chunks.
+   *
+   * This implements the greedy algorithm from Bitcoin Core's cluster_linearize.h:
+   * 1. Start with the linearization in topological order
+   * 2. Compute chunks by absorbing higher-feerate transactions into earlier chunks
+   *
+   * A chunk is a contiguous prefix of the linearization that forms a valid
+   * topological ordering. Transactions in the same chunk get the same mining score
+   * (the chunk's aggregate fee rate).
+   */
+  linearizeCluster(txids: Set<string>): Linearization {
+    if (txids.size === 0) {
+      return { chunks: [], txToChunk: new Map() };
+    }
+
+    // Build a topological ordering of the cluster
+    const topoOrder = this.topologicalSort(txids);
+
+    // Compute chunks using the greedy algorithm from Bitcoin Core
+    // Each tx starts as its own chunk, then absorb higher-feerate chunks
+    const chunks: Chunk[] = [];
+
+    for (const txidHex of topoOrder) {
+      const entry = this.entries.get(txidHex)!;
+
+      // Create a new chunk for this transaction
+      const newChunk: Chunk = {
+        txids: new Set([txidHex]),
+        totalFee: entry.fee,
+        totalVsize: entry.vsize,
+        feeRate: entry.feeRate,
+      };
+
+      // While the new chunk has a higher feerate than the last chunk, absorb it
+      // This implements: while (!ret.empty() && new_chunk.feerate >> ret.back().feerate)
+      while (chunks.length > 0 && this.compareFeeRate(newChunk, chunks[chunks.length - 1]) > 0) {
+        const lastChunk = chunks.pop()!;
+        // Merge lastChunk into newChunk
+        for (const txid of lastChunk.txids) {
+          newChunk.txids.add(txid);
+        }
+        newChunk.totalFee += lastChunk.totalFee;
+        newChunk.totalVsize += lastChunk.totalVsize;
+        newChunk.feeRate = Number(newChunk.totalFee) / newChunk.totalVsize;
+      }
+
+      chunks.push(newChunk);
+    }
+
+    // Build txToChunk map
+    const txToChunk = new Map<string, number>();
+    for (let i = 0; i < chunks.length; i++) {
+      for (const txidHex of chunks[i].txids) {
+        txToChunk.set(txidHex, i);
+      }
+    }
+
+    return { chunks, txToChunk };
+  }
+
+  /**
+   * Compare two chunks by fee rate.
+   * Returns > 0 if a has higher feerate, < 0 if b has higher, 0 if equal.
+   * Uses cross-multiplication to avoid floating point issues.
+   */
+  private compareFeeRate(a: Chunk, b: Chunk): number {
+    // a.feeRate > b.feeRate iff a.fee * b.size > b.fee * a.size
+    const lhs = a.totalFee * BigInt(b.totalVsize);
+    const rhs = b.totalFee * BigInt(a.totalVsize);
+    if (lhs > rhs) return 1;
+    if (lhs < rhs) return -1;
+    return 0;
+  }
+
+  /**
+   * Topologically sort a set of transactions (parents before children).
+   * Uses Kahn's algorithm.
+   */
+  private topologicalSort(txids: Set<string>): string[] {
+    // Build in-degree counts and adjacency for the subset
+    const inDegree = new Map<string, number>();
+    const children = new Map<string, Set<string>>();
+
+    for (const txidHex of txids) {
+      inDegree.set(txidHex, 0);
+      children.set(txidHex, new Set());
+    }
+
+    // Count in-degree (number of parents within the cluster)
+    for (const txidHex of txids) {
+      const entry = this.entries.get(txidHex)!;
+      for (const parentTxidHex of entry.dependsOn) {
+        if (txids.has(parentTxidHex)) {
+          inDegree.set(txidHex, (inDegree.get(txidHex) || 0) + 1);
+          children.get(parentTxidHex)!.add(txidHex);
+        }
+      }
+    }
+
+    // Start with nodes that have no in-cluster parents
+    // Sort by ancestor count for deterministic ordering
+    const queue: string[] = [];
+    for (const [txidHex, degree] of inDegree) {
+      if (degree === 0) {
+        queue.push(txidHex);
+      }
+    }
+    // Sort queue by ancestor count for consistent ordering
+    queue.sort((a, b) => {
+      const entryA = this.entries.get(a)!;
+      const entryB = this.entries.get(b)!;
+      return entryA.ancestorCount - entryB.ancestorCount;
+    });
+
+    const result: string[] = [];
+    while (queue.length > 0) {
+      const txidHex = queue.shift()!;
+      result.push(txidHex);
+
+      // Decrease in-degree for all children
+      for (const childTxidHex of children.get(txidHex)!) {
+        const newDegree = inDegree.get(childTxidHex)! - 1;
+        inDegree.set(childTxidHex, newDegree);
+        if (newDegree === 0) {
+          queue.push(childTxidHex);
+          // Re-sort to maintain consistent ordering
+          queue.sort((a, b) => {
+            const entryA = this.entries.get(a)!;
+            const entryB = this.entries.get(b)!;
+            return entryA.ancestorCount - entryB.ancestorCount;
+          });
+        }
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Get the cluster containing a transaction.
+   */
+  getCluster(txidHex: string): Cluster | null {
+    this.rebuildClusterCache();
+    const clusterId = this.clusters.find(txidHex);
+    return this.clusterCache.get(clusterId) || null;
+  }
+
+  /**
+   * Get all clusters in the mempool.
+   */
+  getAllClusters(): Cluster[] {
+    this.rebuildClusterCache();
+    return Array.from(this.clusterCache.values());
+  }
+
+  /**
+   * Get the mining score (chunk fee rate) for a transaction.
+   * Returns the fee rate of the chunk this transaction belongs to in its cluster's linearization.
+   */
+  getMiningScore(txidHex: string): number {
+    this.rebuildClusterCache();
+    const entry = this.entries.get(txidHex);
+    if (!entry) return 0;
+    return entry.miningScore;
+  }
+
+  /**
+   * Get transactions sorted by mining score (descending) for block template.
+   * This respects chunk boundaries and topological ordering within clusters.
+   */
+  getTransactionsByMiningScore(): MempoolEntry[] {
+    this.rebuildClusterCache();
+
+    // Collect all chunks from all clusters
+    const allChunks: { chunk: Chunk; clusterId: string }[] = [];
+    for (const cluster of this.clusterCache.values()) {
+      for (const chunk of cluster.linearization.chunks) {
+        allChunks.push({ chunk, clusterId: cluster.id });
+      }
+    }
+
+    // Sort chunks by fee rate descending
+    allChunks.sort((a, b) => b.chunk.feeRate - a.chunk.feeRate);
+
+    // Flatten into transaction entries, respecting topological order within chunks
+    const result: MempoolEntry[] = [];
+    for (const { chunk, clusterId } of allChunks) {
+      // Get transactions in this chunk in topological order
+      const chunkTxids = this.topologicalSort(chunk.txids);
+      for (const txidHex of chunkTxids) {
+        const entry = this.entries.get(txidHex);
+        if (entry) {
+          result.push(entry);
+        }
+      }
+    }
+
+    return result;
   }
 
   /**
