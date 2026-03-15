@@ -10,8 +10,13 @@ import type { ConsensusParams } from "../consensus/params.js";
 import { getBlockSubsidy } from "../consensus/params.js";
 import type { Block, BlockHeader } from "../validation/block.js";
 import { getBlockHash, serializeBlock } from "../validation/block.js";
-import type { Transaction } from "../validation/tx.js";
-import { getTxId, isCoinbase } from "../validation/tx.js";
+import type { Transaction, UTXOConfirmation } from "../validation/tx.js";
+import {
+  getTxId,
+  isCoinbase,
+  checkSequenceLocks,
+  SEQUENCE_LOCKTIME_DISABLE_FLAG,
+} from "../validation/tx.js";
 import type { HeaderChainEntry } from "../sync/headers.js";
 import {
   UTXOManager,
