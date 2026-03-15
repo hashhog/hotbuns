@@ -26,6 +26,25 @@ import {
   deserializeTx,
   serializeTx,
 } from "../validation/tx.js";
+import {
+  type AddrV2Payload,
+  serializeAddrV2Payload,
+  deserializeAddrV2Payload,
+} from "./addrv2.js";
+
+// Re-export addrv2 types for convenience
+export type { AddrV2Payload, NetworkAddressV2, AddrV2Entry } from "./addrv2.js";
+export {
+  BIP155Network,
+  isValidNetworkAddressV2,
+  isAddrV1Compatible,
+  legacyAddressToNetworkAddressV2,
+  networkAddressV2ToLegacy,
+  ipv4ToNetworkAddressV2,
+  networkAddressV2ToIPv4String,
+  formatNetworkAddressV2,
+  getNetworkName,
+} from "./addrv2.js";
 
 /** Maximum message payload size: 32 MiB */
 export const MAX_MESSAGE_SIZE = 32 * 1024 * 1024;
@@ -59,6 +78,7 @@ export type NetworkMessage =
   | { type: "block"; payload: BlockPayload }
   | { type: "tx"; payload: TxPayload }
   | { type: "addr"; payload: AddrPayload }
+  | { type: "addrv2"; payload: AddrV2Payload }
   | { type: "getaddr"; payload: null }
   | { type: "reject"; payload: RejectPayload }
   | { type: "sendheaders"; payload: null }
@@ -750,6 +770,10 @@ export function serializeMessage(magic: number, msg: NetworkMessage): Buffer {
       command = "addr";
       payload = serializeAddrPayload(msg.payload.addrs);
       break;
+    case "addrv2":
+      command = "addrv2";
+      payload = serializeAddrV2Payload(msg.payload.addrs);
+      break;
     case "getaddr":
       command = "getaddr";
       payload = Buffer.alloc(0);
@@ -845,6 +869,8 @@ export function deserializeMessage(header: MessageHeader, payload: Buffer): Netw
       return { type: "tx", payload: { tx: deserializeTx(reader) } };
     case "addr":
       return { type: "addr", payload: deserializeAddrPayload(reader) };
+    case "addrv2":
+      return { type: "addrv2", payload: deserializeAddrV2Payload(reader) };
     case "getaddr":
       return { type: "getaddr", payload: null };
     case "reject":
