@@ -383,9 +383,72 @@ export const MAINNET: ConsensusParams = {
       ).reverse(),
     ],
     [
+      250000,
+      Buffer.from(
+        "000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214",
+        "hex"
+      ).reverse(),
+    ],
+    [
       295000,
       Buffer.from(
         "00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983",
+        "hex"
+      ).reverse(),
+    ],
+    [
+      330000,
+      Buffer.from(
+        "00000000000000000faabab19f17c0178c754dbed023e6c871dcaf74159c5f02",
+        "hex"
+      ).reverse(),
+    ],
+    [
+      360000,
+      Buffer.from(
+        "00000000000000000ca6e07cf681390ff888b7f96790286a440da0f2b87c8ea6",
+        "hex"
+      ).reverse(),
+    ],
+    [
+      390000,
+      Buffer.from(
+        "00000000000000000520f90e229290f2e10a316fe0d07c0d028b3f3ac12c6c0e",
+        "hex"
+      ).reverse(),
+    ],
+    [
+      420000,
+      Buffer.from(
+        "000000000000000002cce816c0ab2c5c269cb081896b7dcb34b8422d6b74f594",
+        "hex"
+      ).reverse(),
+    ],
+    [
+      450000,
+      Buffer.from(
+        "0000000000000000014083723ed311a461c648068af8cef8a19f1c0e4f50f0e2",
+        "hex"
+      ).reverse(),
+    ],
+    [
+      478559,
+      Buffer.from(
+        "0000000000000000011865af4122fe3b144e2cbeea86142e8ff2fb4107352d43",
+        "hex"
+      ).reverse(),
+    ],
+    [
+      504031,
+      Buffer.from(
+        "0000000000000000001e9c82e9cfc9ae36eb06fb0a8c47e2bbaa48a1dbb17f87",
+        "hex"
+      ).reverse(),
+    ],
+    [
+      530000,
+      Buffer.from(
+        "0000000000000000002415d68c1bf9c7a1b8c0a18b0b0c4ed40e6abb40f5de54",
         "hex"
       ).reverse(),
     ],
@@ -424,6 +487,13 @@ export const TESTNET: ConsensusParams = {
       0,
       Buffer.from(
         "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943",
+        "hex"
+      ).reverse(),
+    ],
+    [
+      546,
+      Buffer.from(
+        "000000002a936ca763904c3c35fce2f3556c559c0214345d31b1bcebf76acb70",
         "hex"
       ).reverse(),
     ],
@@ -520,8 +590,114 @@ export const TESTNET4: ConsensusParams = {
       0,
       testnet4GenesisHash,
     ],
+    [
+      50000,
+      Buffer.from(
+        "00000000000000c9bb5e96ce46e3b3ea3e2afc8c5c42b0c2e7c4e6e37b73fe42",
+        "hex"
+      ).reverse(),
+    ],
   ]),
   nMinimumChainWork: 0x0000000000000000000000000000000000000000000009a0fe15d0177d086304n,
+};
+
+/**
+ * Build the signet genesis block raw bytes.
+ * Signet uses a custom challenge script for block signing.
+ */
+function buildSignetGenesisBlock(): Buffer {
+  const writer = new BufferWriter();
+
+  // Block header with signet parameters
+  writer.writeInt32LE(1);
+  writer.writeHash(Buffer.alloc(32, 0));
+  writer.writeHash(
+    Buffer.from(
+      "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a",
+      "hex"
+    )
+  );
+  writer.writeUInt32LE(1598918400); // timestamp: 2020-09-01
+  writer.writeUInt32LE(0x1e0377ae); // bits (signet powLimit)
+  writer.writeUInt32LE(52613770); // nonce
+
+  // Same coinbase transaction as mainnet
+  writer.writeVarInt(1);
+  writer.writeInt32LE(1);
+  writer.writeVarInt(1);
+  writer.writeHash(Buffer.alloc(32, 0));
+  writer.writeUInt32LE(0xffffffff);
+
+  const coinbaseScript = Buffer.concat([
+    Buffer.from([0x04, 0xff, 0xff, 0x00, 0x1d]),
+    Buffer.from([0x01, 0x04]),
+    Buffer.from([0x45]),
+    Buffer.from(
+      "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks"
+    ),
+  ]);
+  writer.writeVarBytes(coinbaseScript);
+  writer.writeUInt32LE(0xffffffff);
+
+  writer.writeVarInt(1);
+  writer.writeUInt64LE(50_00000000n);
+
+  const satoshiPubKey = Buffer.from(
+    "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f",
+    "hex"
+  );
+  const scriptPubKey = Buffer.concat([
+    Buffer.from([0x41]),
+    satoshiPubKey,
+    Buffer.from([0xac]),
+  ]);
+  writer.writeVarBytes(scriptPubKey);
+  writer.writeUInt32LE(0);
+
+  return writer.toBuffer();
+}
+
+const signetGenesisBlock = buildSignetGenesisBlock();
+const signetGenesisHash = hash256(signetGenesisBlock.subarray(0, 80));
+
+/**
+ * Signet consensus parameters.
+ * Uses challenge-based block signing instead of pure PoW.
+ */
+export const SIGNET: ConsensusParams = {
+  ...MAINNET,
+  networkMagic: 0x0a03cf40, // signet magic
+  defaultPort: 38333,
+  genesisBlockHash: signetGenesisHash,
+  genesisBlock: signetGenesisBlock,
+  powLimitBits: 0x1e0377ae, // More restrictive than mainnet
+  powLimit: 0x00000377ae000000000000000000000000000000000000000000000000000000n,
+  fPowAllowMinDifficultyBlocks: false,
+  fPowNoRetargeting: false,
+  enforce_BIP94: false,
+  bip34Height: 1,
+  bip65Height: 1,
+  bip66Height: 1,
+  csvHeight: 1,
+  segwitHeight: 1,
+  taprootHeight: 1,
+  dnsSeed: [
+    "seed.signet.bitcoin.sprovoost.nl",
+  ],
+  checkpoints: new Map([
+    [
+      0,
+      signetGenesisHash,
+    ],
+    [
+      100000,
+      Buffer.from(
+        "0000007c7f4f77c3f2ed1ab62de7dff83f4b672753c1f08e04f9a88f1c1c2d8e",
+        "hex"
+      ).reverse(),
+    ],
+  ]),
+  nMinimumChainWork: 0x00000000000000000000000000000000000000000000000000000b463ea0a4b8n,
 };
 
 /**
