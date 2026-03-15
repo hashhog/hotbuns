@@ -1849,6 +1849,9 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Transaction not in mempool");
     }
 
+    // Get mining score (effective fee rate from cluster linearization)
+    const miningScore = entry.miningScore;
+
     return {
       vsize: entry.vsize,
       weight: entry.weight,
@@ -1873,6 +1876,8 @@ export class RPCServer {
       spentby: Array.from(entry.spentBy),
       "bip125-replaceable": this.mempool.isReplaceable(txid),
       unbroadcast: false,
+      // Cluster mempool fields
+      miningScore: miningScore, // Effective fee rate (sat/vB) from chunk
     };
   }
 
