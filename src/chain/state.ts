@@ -29,6 +29,7 @@ import {
   serializeUndoData,
   deserializeUndoData,
 } from "./utxo.js";
+import { ConsensusError, ConsensusErrorCode } from "../validation/errors.js";
 
 /**
  * Result of transaction input validation.
@@ -240,6 +241,17 @@ export class ChainStateManager {
           const utxoEntry = this.utxo.getUTXO(input.prevOut);
           if (utxoEntry) {
             prevOutputs.push(utxoEntry.scriptPubKey);
+
+            // Check coinbase maturity: coinbase outputs require COINBASE_MATURITY (100) confirmations
+            if (utxoEntry.coinbase) {
+              const confirmations = height - utxoEntry.height;
+              if (confirmations < this.params.coinbaseMaturity) {
+                throw new ConsensusError(
+                  ConsensusErrorCode.PREMATURE_COINBASE_SPEND,
+                  `coinbase at height ${utxoEntry.height} has only ${confirmations} confirmations, need ${this.params.coinbaseMaturity}`
+                );
+              }
+            }
           }
 
           // Spend the UTXO
@@ -550,7 +562,7 @@ export class ChainStateManager {
           return {
             valid: false,
             fee: 0n,
-            error: `Coinbase maturity not met: ${confirmations} < ${this.params.coinbaseMaturity}`,
+            error: ConsensusErrorCode.PREMATURE_COINBASE_SPEND,
           };
         }
       }
@@ -568,7 +580,7 @@ export class ChainStateManager {
       return {
         valid: false,
         fee: 0n,
-        error: `Insufficient input value: ${totalInputValue} < ${totalOutputValue}`,
+        error: ConsensusErrorCode.INPUTS_NOT_EQUAL_OUTPUTS,
       };
     }
 
@@ -598,7 +610,7 @@ export class ChainStateManager {
         return {
           valid: false,
           fee: 0n,
-          error: `Missing UTXO: ${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`,
+          error: ConsensusErrorCode.MISSING_INPUTS,
         };
       }
 
@@ -609,7 +621,7 @@ export class ChainStateManager {
           return {
             valid: false,
             fee: 0n,
-            error: `Coinbase maturity not met: ${confirmations} < ${this.params.coinbaseMaturity}`,
+            error: ConsensusErrorCode.PREMATURE_COINBASE_SPEND,
           };
         }
       }
@@ -627,7 +639,7 @@ export class ChainStateManager {
       return {
         valid: false,
         fee: 0n,
-        error: `Insufficient input value: ${totalInputValue} < ${totalOutputValue}`,
+        error: ConsensusErrorCode.INPUTS_NOT_EQUAL_OUTPUTS,
       };
     }
 
