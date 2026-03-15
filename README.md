@@ -10,7 +10,7 @@ hotbuns is a from-scratch Bitcoin full node written in TypeScript (Bun) that doe
 ## Current status
 
 - [x] Wire serialization (varint, BufferReader/BufferWriter, buffer pooling)
-- [x] Cryptographic primitives (SHA256d, HASH160, secp256k1 ECDSA)
+- [x] Cryptographic primitives (hardware-accelerated SHA256, SHA256d, HASH160, secp256k1 ECDSA/Schnorr, batch verification, Taproot tweaks)
 - [x] Address encoding (Base58Check, Bech32, Bech32m)
 - [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR, P2A anchors, NULLFAIL, WITNESS_PUBKEYTYPE, witness cleanstack, P2SH push-only, FindAndDelete, OP_CODESEPARATOR, MINIMALIF)
 - [x] Consensus parameters (mainnet, testnet3, testnet4/BIP94, signet, regtest)
@@ -53,7 +53,7 @@ hotbuns is a from-scratch Bitcoin full node written in TypeScript (Bun) that doe
 - [x] Regtest mode (instant block generation, generatetoaddress/generateblock/generatetodescriptor RPCs, min difficulty PoW)
 - [x] Chain management (invalidateblock/reconsiderblock/preciousblock RPCs, BLOCK_FAILED_VALID/CHILD flags, reorg support)
 - [x] Test suite (unit, integration, e2e with regtest)
-- [x] Performance benchmarks (block deser, UTXO cache, sig verify)
+- [x] Performance benchmarks (crypto throughput, block deser, UTXO cache, sig verify)
 
 ## Quick start
 
@@ -76,7 +76,7 @@ src/
   index.ts          # entry point
   cli/              # command-line interface
   wire/             # protocol serialization
-  crypto/           # SHA256, RIPEMD160, secp256k1
+  crypto/           # SHA256 (hw-accel), RIPEMD160, secp256k1, Schnorr
   address/          # Base58Check, Bech32
   script/           # Script interpreter
   consensus/        # network parameters, proof-of-work, BIP9 versionbits
