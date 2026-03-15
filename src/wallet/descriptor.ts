@@ -54,6 +54,13 @@ import {
 } from "../address/encoding.js";
 import { Opcode } from "../script/interpreter.js";
 import type { KeyOriginInfo } from "./psbt.js";
+import {
+  parseMiniscript,
+  compileScript,
+  miniscriptToString,
+  MiniscriptContext,
+  type MiniscriptNode,
+} from "./miniscript.js";
 
 // =============================================================================
 // Constants
@@ -1273,6 +1280,71 @@ export class ComboDescriptor implements Descriptor {
   }
 }
 
+/**
+ * Miniscript descriptor - represents a miniscript expression.
+ *
+ * Used inside wsh() for P2WSH or inside tr() for Tapscript.
+ */
+export class MiniscriptDescriptor implements Descriptor {
+  private node: MiniscriptNode;
+  private miniscriptStr: string;
+  private context: MiniscriptContext;
+
+  constructor(
+    node: MiniscriptNode,
+    miniscriptStr: string,
+    context: MiniscriptContext = MiniscriptContext.P2WSH
+  ) {
+    this.node = node;
+    this.miniscriptStr = miniscriptStr;
+    this.context = context;
+  }
+
+  getType(): DescriptorType {
+    return DescriptorType.RAW; // Miniscript compiles to raw script
+  }
+
+  isRange(): boolean {
+    return false; // Miniscript doesn't support ranged keys directly
+  }
+
+  isSingleType(): boolean {
+    return true;
+  }
+
+  getOutputType(): OutputType {
+    return OutputType.LEGACY; // The script itself is legacy; wsh/tr wraps it
+  }
+
+  expand(_index: number, _network: NetworkType): ExpandedOutput[] {
+    const script = compileScript(this.node, this.context);
+    return [
+      {
+        scriptPubKey: script,
+        outputType: OutputType.LEGACY,
+        pubkeys: [],
+        origins: new Map(),
+      },
+    ];
+  }
+
+  toString(): string {
+    return this.miniscriptStr;
+  }
+
+  toPrivateString(): string {
+    return this.miniscriptStr;
+  }
+
+  getNode(): MiniscriptNode {
+    return this.node;
+  }
+
+  getContext(): MiniscriptContext {
+    return this.context;
+  }
+}
+
 // =============================================================================
 // Taproot Tree
 // =============================================================================
@@ -1723,6 +1795,11 @@ function parseDescriptorInner(
     }
   }
 
+  // In P2WSH or P2TR context, try parsing as miniscript
+  if (context === ParseContext.P2WSH || context === ParseContext.P2TR) {
+    return parseMiniscriptDescriptor(desc, pos, context);
+  }
+
   throw new Error(`Unknown descriptor at position ${pos}: ${desc.slice(pos)}`);
 }
 
@@ -2072,6 +2149,55 @@ function parseCombo(
     descriptor: new ComboDescriptor(keyResult.provider),
     pos: pos + 1,
   };
+}
+
+function parseMiniscriptDescriptor(
+  desc: string,
+  pos: number,
+  context: ParseContext
+): ParseResult {
+  // Find the end of the miniscript by tracking parentheses
+  let parenDepth = 0;
+  let endPos = pos;
+
+  while (endPos < desc.length) {
+    const ch = desc[endPos];
+    if (ch === "(") {
+      parenDepth++;
+    } else if (ch === ")") {
+      if (parenDepth === 0) {
+        // This is the closing paren of the outer wsh() or tr() leaf
+        break;
+      }
+      parenDepth--;
+    } else if (ch === "}" || ch === ",") {
+      // In tr() context, these can end a miniscript expression
+      if (context === ParseContext.P2TR && parenDepth === 0) {
+        break;
+      }
+    }
+    endPos++;
+  }
+
+  if (endPos === pos) {
+    throw new Error(`Empty miniscript at position ${pos}`);
+  }
+
+  const miniscriptStr = desc.slice(pos, endPos);
+  const msContext =
+    context === ParseContext.P2TR
+      ? MiniscriptContext.TAPSCRIPT
+      : MiniscriptContext.P2WSH;
+
+  try {
+    const node = parseMiniscript(miniscriptStr, msContext);
+    return {
+      descriptor: new MiniscriptDescriptor(node, miniscriptStr, msContext),
+      pos: endPos,
+    };
+  } catch (e) {
+    throw new Error(`Invalid miniscript at position ${pos}: ${(e as Error).message}`);
+  }
 }
 
 interface KeyParseResult {
