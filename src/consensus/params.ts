@@ -31,6 +31,7 @@ export interface ConsensusParams {
   readonly bip34Height: number;
   readonly bip65Height: number;
   readonly bip66Height: number;
+  readonly csvHeight: number; // BIP68/112/113 (relative timelocks)
   readonly segwitHeight: number;
   readonly taprootHeight: number;
   readonly protocolVersion: number;
@@ -289,6 +290,7 @@ export const MAINNET: ConsensusParams = {
   bip34Height: 227931,
   bip65Height: 388381,
   bip66Height: 363725,
+  csvHeight: 419328, // BIP68/112/113
   segwitHeight: 481824,
   taprootHeight: 709632,
   protocolVersion: 70016,
@@ -390,6 +392,7 @@ export const TESTNET: ConsensusParams = {
   bip34Height: 21111,
   bip65Height: 581885,
   bip66Height: 330776,
+  csvHeight: 770112, // BIP68/112/113
   segwitHeight: 834624,
   taprootHeight: 0,
   dnsSeed: [
@@ -423,6 +426,7 @@ export const REGTEST: ConsensusParams = {
   bip34Height: 500,
   bip65Height: 1351,
   bip66Height: 1251,
+  csvHeight: 0, // BIP68/112/113 always active on regtest
   segwitHeight: 0,
   taprootHeight: 0,
   coinbaseMaturity: 100,
