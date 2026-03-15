@@ -13,6 +13,16 @@ import { sha256Hash, hash256, hash160, ecdsaVerify } from "../crypto/primitives.
 import { ripemd160 } from "@noble/hashes/legacy.js";
 import { AddressType } from "../address/encoding.js";
 
+/**
+ * Script execution error with a specific error code.
+ */
+export class ScriptError extends Error {
+  constructor(public readonly code: string) {
+    super(`SCRIPT_ERR_${code}`);
+    this.name = "ScriptError";
+  }
+}
+
 // Script limits
 const MAX_SCRIPT_SIZE = 10000;
 const MAX_STACK_SIZE = 1000;
@@ -1396,8 +1406,9 @@ function verifyWitnessV0(
     const p2pkhScript = buildP2PKHScript(programHash);
     const parsedScript = parseScript(p2pkhScript);
 
-    // Witness stack: bottom to top in wire format, so reverse for stack (top-first)
-    const witnessStack = [...witness].reverse();
+    // Witness stack: wire format is [sig, pubkey] where index 0 is stack bottom
+    // and last index is stack top. No reversal needed.
+    const witnessStack = [...witness];
 
     const ctx: ExecutionContext = {
       stack: witnessStack,
@@ -1411,7 +1422,12 @@ function verifyWitnessV0(
       return false;
     }
 
-    if (witnessStack.length === 0 || !castToBool(witnessStack[witnessStack.length - 1])) {
+    // Witness cleanstack: stack must have exactly 1 element AND it must be true
+    // This is NOT gated by SCRIPT_VERIFY_CLEANSTACK flag — it's always enforced for witness
+    if (witnessStack.length !== 1) {
+      throw new ScriptError("CLEANSTACK");
+    }
+    if (!castToBool(witnessStack[0])) {
       return false;
     }
 
@@ -1444,8 +1460,9 @@ function verifyWitnessV0(
       return false;
     }
 
-    // Witness stack (excluding the script itself), reversed for proper stack order
-    const witnessStack = witness.slice(0, -1).reverse();
+    // Witness stack (excluding the script itself). Wire format is already
+    // bottom-to-top (index 0 = bottom, last = top). No reversal needed.
+    const witnessStack = [...witness.slice(0, -1)];
 
     const ctx: ExecutionContext = {
       stack: witnessStack,
@@ -1459,7 +1476,12 @@ function verifyWitnessV0(
       return false;
     }
 
-    if (witnessStack.length === 0 || !castToBool(witnessStack[witnessStack.length - 1])) {
+    // Witness cleanstack: stack must have exactly 1 element AND it must be true
+    // This is NOT gated by SCRIPT_VERIFY_CLEANSTACK flag — it's always enforced for witness
+    if (witnessStack.length !== 1) {
+      throw new ScriptError("CLEANSTACK");
+    }
+    if (!castToBool(witnessStack[0])) {
       return false;
     }
 
