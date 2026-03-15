@@ -17,6 +17,11 @@ import {
   bigIntToCompact,
 } from "../consensus/params.js";
 import {
+  verifyCheckpoint,
+  checkForkBelowCheckpoint,
+  getLastCheckpointHeight,
+} from "../chain/state.js";
+import {
   getNextWorkRequired,
   type BlockInfo,
   type BlockLookup,
@@ -251,6 +256,34 @@ export class HeaderSync {
       // Calculate chain work
       const headerWork = this.getHeaderWork(header.bits);
       const chainWork = parent.chainWork + headerWork;
+
+      // Height of this header
+      const headerHeight = parent.height + 1;
+
+      // Verify checkpoint if this height has one
+      const checkpointResult = verifyCheckpoint(hash, headerHeight, this.params);
+      if (!checkpointResult.valid) {
+        console.warn(
+          `Checkpoint verification failed from ${fromPeer.host}: ${checkpointResult.error}`
+        );
+        // This is a consensus violation - could increase ban score significantly
+        continue;
+      }
+
+      // Check for forks below the last checkpoint
+      const forkCheck = checkForkBelowCheckpoint(
+        headerHeight,
+        hash,
+        header.prevBlock,
+        this.params,
+        (height: number) => this.headersByHeight.get(height)?.hash
+      );
+      if (!forkCheck.valid) {
+        console.warn(
+          `Fork below checkpoint rejected from ${fromPeer.host}: ${forkCheck.error}`
+        );
+        continue;
+      }
 
       // Determine status
       let status: HeaderStatus = "valid-header";
