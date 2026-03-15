@@ -418,6 +418,287 @@ export function sigHashWitnessV0(
   return hash256(preimageWriter.toBuffer());
 }
 
+// OP_CODESEPARATOR opcode value
+const OP_CODESEPARATOR = 0xab;
+
+/**
+ * Remove all occurrences of OP_CODESEPARATOR from a script.
+ * Used when preparing subscript for legacy sighash computation.
+ *
+ * References Bitcoin Core's CTransactionSignatureSerializer::SerializeScriptCode
+ */
+export function removeCodeSeparators(script: Buffer): Buffer {
+  if (script.length === 0) return script;
+
+  // Count OP_CODESEPARATOR bytes to determine if we need to modify
+  let separatorCount = 0;
+  let pos = 0;
+
+  while (pos < script.length) {
+    const opcode = script[pos];
+
+    if (opcode === OP_CODESEPARATOR) {
+      separatorCount++;
+      pos++;
+      continue;
+    }
+
+    // Skip push data
+    if (opcode <= 0x4b) {
+      // Direct push: 1-75 bytes
+      pos += 1 + opcode;
+    } else if (opcode === 0x4c) {
+      // OP_PUSHDATA1
+      if (pos + 1 >= script.length) break;
+      const len = script[pos + 1];
+      pos += 2 + len;
+    } else if (opcode === 0x4d) {
+      // OP_PUSHDATA2
+      if (pos + 2 >= script.length) break;
+      const len = script[pos + 1] | (script[pos + 2] << 8);
+      pos += 3 + len;
+    } else if (opcode === 0x4e) {
+      // OP_PUSHDATA4
+      if (pos + 4 >= script.length) break;
+      const len =
+        script[pos + 1] |
+        (script[pos + 2] << 8) |
+        (script[pos + 3] << 16) |
+        (script[pos + 4] << 24);
+      pos += 5 + len;
+    } else {
+      // Single-byte opcode
+      pos++;
+    }
+  }
+
+  if (separatorCount === 0) {
+    return script;
+  }
+
+  // Build result without OP_CODESEPARATOR
+  const result: number[] = [];
+  pos = 0;
+
+  while (pos < script.length) {
+    const opcode = script[pos];
+
+    if (opcode === OP_CODESEPARATOR) {
+      pos++;
+      continue;
+    }
+
+    let chunkEnd: number;
+
+    if (opcode <= 0x4b) {
+      // Direct push: 1-75 bytes
+      chunkEnd = pos + 1 + opcode;
+    } else if (opcode === 0x4c) {
+      // OP_PUSHDATA1
+      if (pos + 1 >= script.length) {
+        chunkEnd = script.length;
+      } else {
+        const len = script[pos + 1];
+        chunkEnd = pos + 2 + len;
+      }
+    } else if (opcode === 0x4d) {
+      // OP_PUSHDATA2
+      if (pos + 2 >= script.length) {
+        chunkEnd = script.length;
+      } else {
+        const len = script[pos + 1] | (script[pos + 2] << 8);
+        chunkEnd = pos + 3 + len;
+      }
+    } else if (opcode === 0x4e) {
+      // OP_PUSHDATA4
+      if (pos + 4 >= script.length) {
+        chunkEnd = script.length;
+      } else {
+        const len =
+          script[pos + 1] |
+          (script[pos + 2] << 8) |
+          (script[pos + 3] << 16) |
+          (script[pos + 4] << 24);
+        chunkEnd = pos + 5 + len;
+      }
+    } else {
+      // Single-byte opcode
+      chunkEnd = pos + 1;
+    }
+
+    // Clamp to script bounds
+    chunkEnd = Math.min(chunkEnd, script.length);
+
+    // Copy chunk
+    for (let i = pos; i < chunkEnd; i++) {
+      result.push(script[i]);
+    }
+    pos = chunkEnd;
+  }
+
+  return Buffer.from(result);
+}
+
+/**
+ * Create the push-encoded form of data for FindAndDelete.
+ * This matches Bitcoin Core's CScript() << data.
+ */
+function encodePushData(data: Buffer): Buffer {
+  if (data.length === 0) {
+    // Empty data: just OP_0
+    return Buffer.from([0x00]);
+  } else if (data.length <= 0x4b) {
+    // Direct push (1-75 bytes)
+    const result = Buffer.allocUnsafe(1 + data.length);
+    result[0] = data.length;
+    data.copy(result, 1);
+    return result;
+  } else if (data.length <= 0xff) {
+    // OP_PUSHDATA1
+    const result = Buffer.allocUnsafe(2 + data.length);
+    result[0] = 0x4c;
+    result[1] = data.length;
+    data.copy(result, 2);
+    return result;
+  } else if (data.length <= 0xffff) {
+    // OP_PUSHDATA2
+    const result = Buffer.allocUnsafe(3 + data.length);
+    result[0] = 0x4d;
+    result[1] = data.length & 0xff;
+    result[2] = (data.length >> 8) & 0xff;
+    data.copy(result, 3);
+    return result;
+  } else {
+    // OP_PUSHDATA4
+    const result = Buffer.allocUnsafe(5 + data.length);
+    result[0] = 0x4e;
+    result[1] = data.length & 0xff;
+    result[2] = (data.length >> 8) & 0xff;
+    result[3] = (data.length >> 16) & 0xff;
+    result[4] = (data.length >> 24) & 0xff;
+    data.copy(result, 5);
+    return result;
+  }
+}
+
+/**
+ * Find and delete all occurrences of a byte sequence from a script.
+ * This is used in legacy sighash to remove the signature from the scriptCode
+ * before hashing. It operates on raw bytes, matching at opcode boundaries.
+ *
+ * References Bitcoin Core's FindAndDelete function.
+ *
+ * @param script - The script to search in
+ * @param needle - The byte sequence to remove (typically push-encoded signature)
+ * @returns A new Buffer with all occurrences removed
+ */
+export function findAndDelete(script: Buffer, needle: Buffer): Buffer {
+  if (needle.length === 0 || script.length < needle.length) {
+    return script;
+  }
+
+  const result: number[] = [];
+  let pos = 0;
+  let lastCopied = 0;
+
+  while (pos < script.length) {
+    // Check if needle matches at current position
+    if (
+      pos + needle.length <= script.length &&
+      script.subarray(pos, pos + needle.length).equals(needle)
+    ) {
+      // Copy bytes from lastCopied to pos (excluding the match)
+      for (let i = lastCopied; i < pos; i++) {
+        result.push(script[i]);
+      }
+      // Skip past the match
+      pos += needle.length;
+      lastCopied = pos;
+      continue;
+    }
+
+    // Advance by one opcode
+    const opcode = script[pos];
+    let nextPos: number;
+
+    if (opcode <= 0x4b) {
+      // Direct push: 1-75 bytes
+      nextPos = pos + 1 + opcode;
+    } else if (opcode === 0x4c) {
+      // OP_PUSHDATA1
+      if (pos + 1 >= script.length) {
+        nextPos = script.length;
+      } else {
+        const len = script[pos + 1];
+        nextPos = pos + 2 + len;
+      }
+    } else if (opcode === 0x4d) {
+      // OP_PUSHDATA2
+      if (pos + 2 >= script.length) {
+        nextPos = script.length;
+      } else {
+        const len = script[pos + 1] | (script[pos + 2] << 8);
+        nextPos = pos + 3 + len;
+      }
+    } else if (opcode === 0x4e) {
+      // OP_PUSHDATA4
+      if (pos + 4 >= script.length) {
+        nextPos = script.length;
+      } else {
+        const len =
+          script[pos + 1] |
+          (script[pos + 2] << 8) |
+          (script[pos + 3] << 16) |
+          (script[pos + 4] << 24);
+        nextPos = pos + 5 + len;
+      }
+    } else {
+      // Single-byte opcode
+      nextPos = pos + 1;
+    }
+
+    // Clamp to script bounds
+    nextPos = Math.min(nextPos, script.length);
+    pos = nextPos;
+  }
+
+  // Copy any remaining bytes
+  for (let i = lastCopied; i < script.length; i++) {
+    result.push(script[i]);
+  }
+
+  // Only return new buffer if we actually removed something
+  if (result.length === script.length) {
+    return script;
+  }
+
+  return Buffer.from(result);
+}
+
+/**
+ * Prepare subscript for legacy sighash by removing the signature and all OP_CODESEPARATOR.
+ * This matches Bitcoin Core's behavior for pre-segwit signature hashing.
+ *
+ * @param subscript - The script code (portion after last executed OP_CODESEPARATOR)
+ * @param signature - The signature being verified (to be removed via FindAndDelete)
+ * @returns The prepared subscript ready for sighash computation
+ */
+export function prepareSubscriptForSigning(
+  subscript: Buffer,
+  signature?: Buffer
+): Buffer {
+  // First remove OP_CODESEPARATOR
+  let result = removeCodeSeparators(subscript);
+
+  // Then remove the push-encoded signature if provided
+  if (signature && signature.length > 0) {
+    const pushEncodedSig = encodePushData(signature);
+    result = findAndDelete(result, pushEncodedSig);
+  }
+
+  return result;
+}
+
 /**
  * Legacy sighash computation (pre-segwit).
  *
@@ -425,8 +706,142 @@ export function sigHashWitnessV0(
  * - All input scripts cleared except the one being signed
  * - The subscript placed in the signing input
  * - Modifications based on sighash type
+ * - OP_CODESEPARATOR removed from subscript
+ *
+ * Note: For full CHECKSIG/CHECKMULTISIG verification, the signature should also
+ * be removed via FindAndDelete before calling this function, or use the
+ * sigHashLegacyWithSig variant.
  */
 export function sigHashLegacy(
+  tx: Transaction,
+  inputIndex: number,
+  subscript: Buffer,
+  hashType: number
+): Buffer {
+  if (inputIndex < 0 || inputIndex >= tx.inputs.length) {
+    throw new Error(`Invalid input index: ${inputIndex}`);
+  }
+
+  const anyoneCanPay = (hashType & SIGHASH_ANYONECANPAY) !== 0;
+  const sigHashBase = hashType & 0x1f;
+
+  // Handle SIGHASH_SINGLE with inputIndex >= outputs.length
+  // This is a Bitcoin quirk: returns hash of 0x01 (32 bytes zero-padded)
+  if (sigHashBase === SIGHASH_SINGLE && inputIndex >= tx.outputs.length) {
+    const oneHash = Buffer.alloc(32, 0);
+    oneHash[0] = 1;
+    return oneHash;
+  }
+
+  // Remove OP_CODESEPARATOR from subscript before hashing
+  const cleanedSubscript = removeCodeSeparators(subscript);
+
+  // Create modified transaction
+  const writer = new BufferWriter();
+  writer.writeInt32LE(tx.version);
+
+  // Determine which inputs to include
+  let inputsToSign: TxIn[];
+  if (anyoneCanPay) {
+    // Only the signing input
+    inputsToSign = [tx.inputs[inputIndex]];
+  } else {
+    inputsToSign = tx.inputs;
+  }
+
+  writer.writeVarInt(inputsToSign.length);
+
+  for (let i = 0; i < inputsToSign.length; i++) {
+    const input = inputsToSign[i];
+    const actualIndex = anyoneCanPay ? inputIndex : i;
+    const isSigningInput = actualIndex === inputIndex;
+
+    writer.writeHash(input.prevOut.txid);
+    writer.writeUInt32LE(input.prevOut.vout);
+
+    // Script: cleaned subscript for signing input, empty for others
+    if (isSigningInput) {
+      writer.writeVarBytes(cleanedSubscript);
+    } else {
+      writer.writeVarBytes(Buffer.alloc(0));
+    }
+
+    // Sequence: modified for SIGHASH_NONE and SIGHASH_SINGLE (except signing input)
+    if (
+      !isSigningInput &&
+      (sigHashBase === SIGHASH_NONE || sigHashBase === SIGHASH_SINGLE)
+    ) {
+      writer.writeUInt32LE(0);
+    } else {
+      writer.writeUInt32LE(input.sequence);
+    }
+  }
+
+  // Determine outputs
+  let outputsToInclude: TxOut[];
+  if (sigHashBase === SIGHASH_NONE) {
+    outputsToInclude = [];
+  } else if (sigHashBase === SIGHASH_SINGLE) {
+    // Include outputs up to and including the signing input's index
+    outputsToInclude = tx.outputs.slice(0, inputIndex + 1);
+  } else {
+    outputsToInclude = tx.outputs;
+  }
+
+  writer.writeVarInt(outputsToInclude.length);
+
+  for (let i = 0; i < outputsToInclude.length; i++) {
+    const output = outputsToInclude[i];
+
+    if (sigHashBase === SIGHASH_SINGLE && i < inputIndex) {
+      // Outputs before the signing input are "nullified"
+      writer.writeUInt64LE(0xffffffffffffffffn); // -1 as uint64
+      writer.writeVarBytes(Buffer.alloc(0));
+    } else {
+      writer.writeUInt64LE(output.value);
+      writer.writeVarBytes(output.scriptPubKey);
+    }
+  }
+
+  writer.writeUInt32LE(tx.lockTime);
+
+  // Append hash type as 4-byte little-endian (signed)
+  writer.writeInt32LE(hashType);
+
+  return hash256(writer.toBuffer());
+}
+
+/**
+ * Legacy sighash computation with signature removal (FindAndDelete).
+ *
+ * This version removes the signature from the subscript before hashing,
+ * which is required for proper CHECKSIG/CHECKMULTISIG verification in
+ * pre-segwit scripts.
+ *
+ * @param tx - The transaction
+ * @param inputIndex - The input being signed
+ * @param subscript - The script code (after last OP_CODESEPARATOR)
+ * @param hashType - The sighash type (from the signature's last byte)
+ * @param signature - The signature being verified (will be removed from subscript)
+ */
+export function sigHashLegacyWithSig(
+  tx: Transaction,
+  inputIndex: number,
+  subscript: Buffer,
+  hashType: number,
+  signature: Buffer
+): Buffer {
+  // Prepare subscript: remove OP_CODESEPARATOR and the signature
+  const cleanedSubscript = prepareSubscriptForSigning(subscript, signature);
+  return sigHashLegacyRaw(tx, inputIndex, cleanedSubscript, hashType);
+}
+
+/**
+ * Raw legacy sighash computation without any subscript preprocessing.
+ * Use this when you have already prepared the subscript (removed OP_CODESEPARATOR
+ * and FindAndDelete'd the signature).
+ */
+export function sigHashLegacyRaw(
   tx: Transaction,
   inputIndex: number,
   subscript: Buffer,
@@ -516,8 +931,8 @@ export function sigHashLegacy(
 
   writer.writeUInt32LE(tx.lockTime);
 
-  // Append hash type as 4-byte little-endian
-  writer.writeUInt32LE(hashType);
+  // Append hash type as 4-byte little-endian (signed)
+  writer.writeInt32LE(hashType);
 
   return hash256(writer.toBuffer());
 }
