@@ -1317,15 +1317,96 @@ export function isP2TR(script: Buffer): boolean {
 }
 
 /**
- * Detect script type.
+ * Pay-to-Anchor (P2A) script constant.
+ * This is a witness v1 program with a 2-byte program (0x4e73, "Ns" in ASCII).
+ * P2A outputs are anyone-can-spend and used for fee bumping via CPFP.
+ *
+ * Script: OP_1 OP_PUSHBYTES_2 0x4e 0x73 (4 bytes total)
+ * Reference: Bitcoin Core script.cpp IsPayToAnchor()
  */
-export function getScriptType(script: Buffer): AddressType | "nonstandard" {
-  if (isP2PKH(script)) return AddressType.P2PKH;
-  if (isP2SH(script)) return AddressType.P2SH;
-  if (isP2WPKH(script)) return AddressType.P2WPKH;
-  if (isP2WSH(script)) return AddressType.P2WSH;
-  if (isP2TR(script)) return AddressType.P2TR;
+export const P2A_SCRIPT = Buffer.from([0x51, 0x02, 0x4e, 0x73]);
+
+/**
+ * Check if script is P2A (Pay-to-Anchor): OP_1 <2 bytes: 0x4e73>
+ *
+ * P2A is a specific witness v1 program used for anchor outputs.
+ * It's anyone-can-spend (requires empty witness) and must have 0 value.
+ *
+ * Reference: Bitcoin Core script.cpp IsPayToAnchor()
+ */
+export function isP2A(script: Buffer): boolean {
+  return (
+    script.length === 4 &&
+    script[0] === Opcode.OP_1 &&
+    script[1] === 0x02 &&
+    script[2] === 0x4e &&
+    script[3] === 0x73
+  );
+}
+
+/**
+ * Check if a witness program is P2A (given version and program bytes).
+ * This is used after parsing a witness program to identify anchors.
+ *
+ * Reference: Bitcoin Core script.cpp IsPayToAnchor(int version, vector<unsigned char>& program)
+ */
+export function isP2AProgram(version: number, program: Buffer): boolean {
+  return (
+    version === 1 &&
+    program.length === 2 &&
+    program[0] === 0x4e &&
+    program[1] === 0x73
+  );
+}
+
+/**
+ * Transaction output types for the script solver.
+ * Matches Bitcoin Core's TxoutType enum.
+ */
+export type TxoutType =
+  | "p2pkh"
+  | "p2sh"
+  | "p2wpkh"
+  | "p2wsh"
+  | "p2tr"
+  | "anchor"
+  | "nulldata"
+  | "witness_unknown"
+  | "nonstandard";
+
+/**
+ * Detect script type.
+ * Returns both AddressType-compatible values and extended TxoutType values.
+ */
+export function getScriptType(script: Buffer): TxoutType {
+  if (isP2PKH(script)) return "p2pkh";
+  if (isP2SH(script)) return "p2sh";
+  if (isP2WPKH(script)) return "p2wpkh";
+  if (isP2WSH(script)) return "p2wsh";
+  // Check P2A before P2TR since P2A is a specific witness v1 program
+  if (isP2A(script)) return "anchor";
+  if (isP2TR(script)) return "p2tr";
+  // Check for OP_RETURN (nulldata)
+  if (script.length >= 1 && script[0] === Opcode.OP_RETURN) return "nulldata";
+  // Check for unknown witness versions (witness v2-v16)
+  if (isWitnessProgram(script)) return "witness_unknown";
   return "nonstandard";
+}
+
+/**
+ * Check if a script is a valid witness program (any version).
+ * Witness programs are: OP_n (where n is 0-16) followed by a push of 2-40 bytes.
+ */
+export function isWitnessProgram(script: Buffer): boolean {
+  if (script.length < 4 || script.length > 42) return false;
+  // First byte must be OP_0 (0x00) or OP_1-OP_16 (0x51-0x60)
+  const version = script[0];
+  if (version !== 0x00 && (version < 0x51 || version > 0x60)) return false;
+  // Second byte must be the push length (2-40 bytes)
+  const pushLen = script[1];
+  if (pushLen < 2 || pushLen > 40) return false;
+  // Total length must match: version (1) + push opcode (1) + data (pushLen)
+  return script.length === 2 + pushLen;
 }
 
 /**
@@ -1463,6 +1544,20 @@ export function verifyScript(
       // Basic taproot - just check witness exists
       // Full taproot implementation would handle key path and script path
       return witness.length >= 1;
+    }
+
+    // P2A (Pay-to-Anchor): anyone-can-spend with empty witness
+    // This is a witness v1 program with a 2-byte program (0x4e73)
+    // Reference: Bitcoin Core interpreter.cpp VerifyWitnessProgram
+    if (flags.verifyTaproot && isP2A(scriptPubKey)) {
+      if (scriptSig.length !== 0) {
+        return false;
+      }
+      // P2A requires empty witness (anyone can spend)
+      if (witness.length !== 0) {
+        return false;
+      }
+      return true;
     }
   }
 
