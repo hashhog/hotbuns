@@ -9,6 +9,7 @@ import {
   type UTXOEntry,
   type ChainState,
   type BatchOperation,
+  type TxIndexEntry,
 } from './database.js';
 
 describe('ChainDB', () => {
@@ -272,6 +273,72 @@ describe('ChainDB', () => {
       retrieved = await db.getChainState();
       expect(retrieved!.bestHeight).toBe(200);
       expect(retrieved!.totalWork).toBe(2000n);
+    });
+  });
+
+  describe('Transaction index operations', () => {
+    test('put and get tx index entry', async () => {
+      const txid = Buffer.alloc(32, 0xab);
+      const blockHash = Buffer.alloc(32, 0xcd);
+      const entry = {
+        blockHash,
+        offset: 1234,
+        length: 567,
+      };
+
+      await db.putTxIndex(txid, entry);
+      const retrieved = await db.getTxIndex(txid);
+
+      expect(retrieved).not.toBeNull();
+      expect(retrieved!.blockHash.equals(blockHash)).toBe(true);
+      expect(retrieved!.offset).toBe(1234);
+      expect(retrieved!.length).toBe(567);
+    });
+
+    test('get non-existent tx index returns null', async () => {
+      const txid = Buffer.alloc(32, 0xff);
+      const result = await db.getTxIndex(txid);
+      expect(result).toBeNull();
+    });
+
+    test('delete tx index', async () => {
+      const txid = Buffer.alloc(32, 0xee);
+      const entry = {
+        blockHash: Buffer.alloc(32, 0xdd),
+        offset: 100,
+        length: 200,
+      };
+
+      await db.putTxIndex(txid, entry);
+      let retrieved = await db.getTxIndex(txid);
+      expect(retrieved).not.toBeNull();
+
+      await db.deleteTxIndex(txid);
+      retrieved = await db.getTxIndex(txid);
+      expect(retrieved).toBeNull();
+    });
+
+    test('update tx index entry', async () => {
+      const txid = Buffer.alloc(32, 0x11);
+      const entry1 = {
+        blockHash: Buffer.alloc(32, 0x22),
+        offset: 100,
+        length: 200,
+      };
+      const entry2 = {
+        blockHash: Buffer.alloc(32, 0x33),
+        offset: 300,
+        length: 400,
+      };
+
+      await db.putTxIndex(txid, entry1);
+      let retrieved = await db.getTxIndex(txid);
+      expect(retrieved!.offset).toBe(100);
+
+      await db.putTxIndex(txid, entry2);
+      retrieved = await db.getTxIndex(txid);
+      expect(retrieved!.offset).toBe(300);
+      expect(retrieved!.blockHash.equals(entry2.blockHash)).toBe(true);
     });
   });
 

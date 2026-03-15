@@ -46,6 +46,13 @@ export interface UTXOEntry {
   scriptPubKey: Buffer;
 }
 
+/** Transaction index entry (txid -> block location). */
+export interface TxIndexEntry {
+  blockHash: Buffer; // 32 bytes
+  offset: number; // byte offset within block
+  length: number; // serialized tx length
+}
+
 /** Chain state metadata. */
 export interface ChainState {
   bestBlockHash: Buffer;
@@ -135,6 +142,28 @@ function deserializeUTXO(data: Buffer): UTXOEntry {
   const amount = reader.readUInt64LE();
   const scriptPubKey = reader.readVarBytes();
   return { height, coinbase, amount, scriptPubKey };
+}
+
+/**
+ * Serialize TxIndexEntry to bytes.
+ */
+function serializeTxIndex(entry: TxIndexEntry): Buffer {
+  const writer = new BufferWriter();
+  writer.writeHash(entry.blockHash);
+  writer.writeUInt32LE(entry.offset);
+  writer.writeUInt32LE(entry.length);
+  return writer.toBuffer();
+}
+
+/**
+ * Deserialize TxIndexEntry from bytes.
+ */
+function deserializeTxIndex(data: Buffer): TxIndexEntry {
+  const reader = new BufferReader(data);
+  const blockHash = reader.readHash();
+  const offset = reader.readUInt32LE();
+  const length = reader.readUInt32LE();
+  return { blockHash, offset, length };
 }
 
 /**
@@ -280,6 +309,32 @@ export class ChainDB {
 
   async deleteUTXO(txid: Buffer, vout: number): Promise<void> {
     const key = makeKey(DBPrefix.UTXO, encodeUTXOKey(txid, vout));
+    await this.db.del(key);
+  }
+
+  // Transaction index operations
+
+  async putTxIndex(txid: Buffer, entry: TxIndexEntry): Promise<void> {
+    const key = makeKey(DBPrefix.TX_INDEX, txid);
+    const value = serializeTxIndex(entry);
+    await this.db.put(key, value);
+  }
+
+  async getTxIndex(txid: Buffer): Promise<TxIndexEntry | null> {
+    const key = makeKey(DBPrefix.TX_INDEX, txid);
+    try {
+      const value = await this.db.get(key);
+      if (value === undefined) {
+        return null;
+      }
+      return deserializeTxIndex(value);
+    } catch {
+      return null;
+    }
+  }
+
+  async deleteTxIndex(txid: Buffer): Promise<void> {
+    const key = makeKey(DBPrefix.TX_INDEX, txid);
     await this.db.del(key);
   }
 
