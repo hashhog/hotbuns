@@ -31,7 +31,8 @@ hotbuns is a from-scratch Bitcoin full node written in TypeScript (Bun) that doe
 - [x] Block template (tx selection, locktime finality, coinbase, witness commitment)
 - [x] RPC server (JSON-RPC 2.0, batch requests, Bitcoin Core-compatible: getblockchaininfo, getblock, getblockheader, getblockhash, getrawtransaction, sendrawtransaction, getmempoolinfo, getrawmempool, estimatesmartfee, getpeerinfo, getnetworkinfo, validateaddress, getblocktemplate)
 - [x] HD wallet (BIP-32/BIP-84, P2WPKH, encrypted storage)
-- [x] CLI (start/stop, RPC client, wallet commands)
+- [x] Block pruning (automatic disk management, pruneblockchain RPC, MIN_BLOCKS_TO_KEEP)
+- [x] CLI (start/stop, RPC client, wallet commands, --prune flag)
 - [x] Test suite (unit, integration, e2e with regtest)
 - [x] Performance benchmarks (block deser, UTXO cache, sig verify)
 
