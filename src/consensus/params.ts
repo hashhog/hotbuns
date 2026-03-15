@@ -28,6 +28,10 @@ export interface ConsensusParams {
   readonly difficultyAdjustmentInterval: number;
   readonly powLimit: bigint;
   readonly powLimitBits: number;
+  // Proof-of-work flags
+  readonly fPowAllowMinDifficultyBlocks: boolean; // true for testnet/regtest
+  readonly fPowNoRetargeting: boolean; // true for regtest
+  readonly enforce_BIP94: boolean; // true for testnet4
   readonly bip34Height: number;
   readonly bip65Height: number;
   readonly bip66Height: number;
@@ -287,6 +291,9 @@ export const MAINNET: ConsensusParams = {
   difficultyAdjustmentInterval: 2016, // targetTimespan / targetSpacing
   powLimit: 0x00000000ffff0000000000000000000000000000000000000000000000000000n,
   powLimitBits: 0x1d00ffff,
+  fPowAllowMinDifficultyBlocks: false,
+  fPowNoRetargeting: false,
+  enforce_BIP94: false,
   bip34Height: 227931,
   bip65Height: 388381,
   bip66Height: 363725,
@@ -380,7 +387,8 @@ export const MAINNET: ConsensusParams = {
 };
 
 /**
- * Testnet consensus parameters (testnet3).
+ * Testnet3 consensus parameters.
+ * Includes special 20-minute min-difficulty rule with walk-back.
  */
 export const TESTNET: ConsensusParams = {
   ...MAINNET,
@@ -389,6 +397,9 @@ export const TESTNET: ConsensusParams = {
   genesisBlockHash: testnetGenesisHash,
   genesisBlock: testnetGenesisBlock,
   powLimitBits: 0x1d00ffff,
+  fPowAllowMinDifficultyBlocks: true, // 20-minute rule enabled
+  fPowNoRetargeting: false,
+  enforce_BIP94: false,
   bip34Height: 21111,
   bip65Height: 581885,
   bip66Height: 330776,
@@ -412,7 +423,100 @@ export const TESTNET: ConsensusParams = {
 };
 
 /**
+ * Build the testnet4 genesis block raw bytes.
+ * Different nonce and timestamp for testnet4 (BIP94).
+ */
+function buildTestnet4GenesisBlock(): Buffer {
+  const writer = new BufferWriter();
+
+  // Block header with testnet4 parameters
+  writer.writeInt32LE(1);
+  writer.writeHash(Buffer.alloc(32, 0));
+  writer.writeHash(
+    Buffer.from(
+      "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a",
+      "hex"
+    )
+  );
+  writer.writeUInt32LE(1714777860); // timestamp: 2024-05-03 (BIP94 activation)
+  writer.writeUInt32LE(0x1d00ffff); // bits
+  writer.writeUInt32LE(393743547); // nonce
+
+  // Same coinbase transaction as mainnet
+  writer.writeVarInt(1);
+  writer.writeInt32LE(1);
+  writer.writeVarInt(1);
+  writer.writeHash(Buffer.alloc(32, 0));
+  writer.writeUInt32LE(0xffffffff);
+
+  const coinbaseScript = Buffer.concat([
+    Buffer.from([0x04, 0xff, 0xff, 0x00, 0x1d]),
+    Buffer.from([0x01, 0x04]),
+    Buffer.from([0x45]),
+    Buffer.from(
+      "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks"
+    ),
+  ]);
+  writer.writeVarBytes(coinbaseScript);
+  writer.writeUInt32LE(0xffffffff);
+
+  writer.writeVarInt(1);
+  writer.writeUInt64LE(50_00000000n);
+
+  const satoshiPubKey = Buffer.from(
+    "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f",
+    "hex"
+  );
+  const scriptPubKey = Buffer.concat([
+    Buffer.from([0x41]),
+    satoshiPubKey,
+    Buffer.from([0xac]),
+  ]);
+  writer.writeVarBytes(scriptPubKey);
+  writer.writeUInt32LE(0);
+
+  return writer.toBuffer();
+}
+
+const testnet4GenesisBlock = buildTestnet4GenesisBlock();
+const testnet4GenesisHash = hash256(testnet4GenesisBlock.subarray(0, 80));
+
+/**
+ * Testnet4 consensus parameters (BIP94).
+ * Uses improved retargeting from first block of period to prevent
+ * difficulty storms from min-difficulty blocks.
+ */
+export const TESTNET4: ConsensusParams = {
+  ...MAINNET,
+  networkMagic: 0x1c163f28, // testnet4 magic
+  defaultPort: 48333,
+  genesisBlockHash: testnet4GenesisHash,
+  genesisBlock: testnet4GenesisBlock,
+  powLimitBits: 0x1d00ffff,
+  fPowAllowMinDifficultyBlocks: true, // 20-minute rule enabled
+  fPowNoRetargeting: false,
+  enforce_BIP94: true, // Use first block of period for retargeting
+  bip34Height: 1,
+  bip65Height: 1,
+  bip66Height: 1,
+  csvHeight: 1,
+  segwitHeight: 1,
+  taprootHeight: 1,
+  dnsSeed: [
+    "seed.testnet4.bitcoin.sprovoost.nl",
+    "seed.testnet4.wiz.biz",
+  ],
+  checkpoints: new Map([
+    [
+      0,
+      testnet4GenesisHash,
+    ],
+  ]),
+};
+
+/**
  * Regtest consensus parameters for local development/testing.
+ * Always minimum difficulty, no retargeting.
  */
 export const REGTEST: ConsensusParams = {
   ...MAINNET,
@@ -423,6 +527,9 @@ export const REGTEST: ConsensusParams = {
   subsidyHalvingInterval: 150,
   powLimitBits: 0x207fffff,
   powLimit: 0x7fffff0000000000000000000000000000000000000000000000000000000000n,
+  fPowAllowMinDifficultyBlocks: true,
+  fPowNoRetargeting: true, // Always minimum difficulty
+  enforce_BIP94: false,
   bip34Height: 500,
   bip65Height: 1351,
   bip66Height: 1251,
