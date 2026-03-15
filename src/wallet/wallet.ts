@@ -16,6 +16,7 @@ import { sha512, sha256 } from "@noble/hashes/sha2.js";
 import { pbkdf2 } from "@noble/hashes/pbkdf2.js";
 import { gcm } from "@noble/ciphers/aes.js";
 import { randomBytes } from "@noble/ciphers/utils.js";
+import * as crypto from "node:crypto";
 
 import {
   hash160,
@@ -43,6 +44,7 @@ import {
   getTxId,
   sigHashWitnessV0,
   SIGHASH_ALL,
+  isCoinbase,
 } from "../validation/tx.js";
 import type { Block } from "../validation/block.js";
 
@@ -106,7 +108,11 @@ export interface WalletUTXO {
   keyPath: string;
   confirmations: number;
   addressType: AddressType;
+  isCoinbase: boolean;
 }
+
+// Consensus constant: coinbase outputs require 100 confirmations before spending
+export const COINBASE_MATURITY = 100;
 
 // Coin selection result
 export interface CoinSelectionResult {
@@ -139,6 +145,15 @@ interface WalletData {
   nextReceiveIndex?: number;
   nextChangeIndex?: number;
   utxos: SerializedUTXO[];
+  // Address labels (address -> label)
+  labels?: Record<string, string>;
+  // Wallet encryption state (for encrypted wallets)
+  encryption?: {
+    isEncrypted: boolean;
+    encryptedSeed: string | null;
+    encryptionSalt: string | null;
+    encryptionIV: string | null;
+  };
 }
 
 interface SerializedUTXO {
@@ -149,6 +164,19 @@ interface SerializedUTXO {
   keyPath: string;
   confirmations: number;
   addressType: string;
+  isCoinbase: boolean;
+}
+
+/**
+ * Wallet encryption state for AES-256-CBC encrypted wallets.
+ */
+export interface WalletEncryptionState {
+  isEncrypted: boolean;
+  isLocked: boolean;
+  encryptedSeed: Buffer | null; // Encrypted seed (when locked)
+  encryptionSalt: Buffer | null; // Scrypt salt
+  encryptionIV: Buffer | null; // AES IV
+  unlockTimeout: ReturnType<typeof setTimeout> | null;
 }
 
 /**
@@ -168,12 +196,29 @@ export class Wallet {
   // Pre-generated address gap
   private readonly ADDRESS_GAP = 20;
 
+  // Wallet encryption state
+  private encryption: WalletEncryptionState;
+
+  // Address labels (address -> label)
+  private labels: Map<string, string>;
+
   constructor(config: WalletConfig) {
     this.config = config;
     this.keys = new Map();
     this.utxos = new Map();
     this.seed = Buffer.alloc(0);
     this.masterKey = { key: Buffer.alloc(0), chainCode: Buffer.alloc(0) };
+    this.labels = new Map();
+
+    // Initialize encryption state
+    this.encryption = {
+      isEncrypted: false,
+      isLocked: false,
+      encryptedSeed: null,
+      encryptionSalt: null,
+      encryptionIV: null,
+      unlockTimeout: null,
+    };
 
     // Initialize per-type indices
     this.nextReceiveIndex = new Map([
@@ -308,11 +353,24 @@ export class Wallet {
         keyPath: utxo.keyPath,
         confirmations: utxo.confirmations,
         addressType: (utxo.addressType as AddressType) || AddressType.P2WPKH,
+        isCoinbase: utxo.isCoinbase ?? false,
       });
     }
 
-    // Regenerate keys
-    wallet.pregenerateAddresses();
+    // Restore labels
+    if (data.labels) {
+      wallet.setLabelsFromObject(data.labels);
+    }
+
+    // Restore encryption state
+    if (data.encryption) {
+      wallet.setEncryptionState(data.encryption);
+    }
+
+    // Regenerate keys (only if not encrypted, or if we have the seed)
+    if (!wallet.encryption.isEncrypted || wallet.seed.length > 0) {
+      wallet.pregenerateAddresses();
+    }
 
     return wallet;
   }
@@ -334,6 +392,7 @@ export class Wallet {
         keyPath: utxo.keyPath,
         confirmations: utxo.confirmations,
         addressType: utxo.addressType,
+        isCoinbase: utxo.isCoinbase ?? false,
       });
     }
 
@@ -348,10 +407,14 @@ export class Wallet {
     }
 
     const data: WalletData = {
-      seed: this.seed.toString("hex"),
+      seed: this.encryption.isEncrypted
+        ? "" // Don't store plaintext seed if wallet is encrypted
+        : this.seed.toString("hex"),
       nextReceiveIndices,
       nextChangeIndices,
       utxos,
+      labels: this.getLabelsObject(),
+      encryption: this.getEncryptionState(),
     };
 
     const plaintext = Buffer.from(JSON.stringify(data), "utf-8");
@@ -1252,11 +1315,17 @@ export class Wallet {
     changeType: AddressType = AddressType.P2WPKH
   ): CoinSelectionResult {
     // Get all available UTXOs (confirmed only for safety)
+    // Skip coinbase UTXOs that haven't reached maturity (100 confirmations)
     const available: WalletUTXO[] = [];
     for (const utxo of this.utxos.values()) {
-      if (utxo.confirmations >= 1) {
-        available.push(utxo);
+      if (utxo.confirmations < 1) {
+        continue; // Unconfirmed
       }
+      // Coinbase outputs require COINBASE_MATURITY (100) confirmations
+      if (utxo.isCoinbase && utxo.confirmations < COINBASE_MATURITY) {
+        continue; // Immature coinbase
+      }
+      available.push(utxo);
     }
 
     if (available.length === 0) {
@@ -1729,6 +1798,7 @@ export class Wallet {
     // Process each transaction
     for (const tx of block.transactions) {
       const txid = getTxId(tx);
+      const txIsCoinbase = isCoinbase(tx);
 
       // Check outputs for incoming payments
       for (let vout = 0; vout < tx.outputs.length; vout++) {
@@ -1747,6 +1817,7 @@ export class Wallet {
             keyPath,
             confirmations: 1,
             addressType: addrType,
+            isCoinbase: txIsCoinbase,
           });
         }
       }
@@ -1894,6 +1965,36 @@ export class Wallet {
   }
 
   /**
+   * Get only spendable UTXOs (confirmed and mature coinbase).
+   */
+  getSpendableUTXOs(): WalletUTXO[] {
+    const spendable: WalletUTXO[] = [];
+    for (const utxo of this.utxos.values()) {
+      if (utxo.confirmations < 1) {
+        continue; // Unconfirmed
+      }
+      if (utxo.isCoinbase && utxo.confirmations < COINBASE_MATURITY) {
+        continue; // Immature coinbase
+      }
+      spendable.push(utxo);
+    }
+    return spendable;
+  }
+
+  /**
+   * Check if a UTXO is spendable (confirmed and mature if coinbase).
+   */
+  isUTXOSpendable(utxo: WalletUTXO): boolean {
+    if (utxo.confirmations < 1) {
+      return false;
+    }
+    if (utxo.isCoinbase && utxo.confirmations < COINBASE_MATURITY) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
    * Manually add a UTXO (for testing or importing).
    */
   addUTXO(utxo: WalletUTXO): void {
@@ -1906,6 +2007,419 @@ export class Wallet {
    * WARNING: This exposes the master secret!
    */
   getSeed(): Buffer {
+    if (this.encryption.isEncrypted && this.encryption.isLocked) {
+      throw new Error("Wallet is locked. Please unlock with walletpassphrase first.");
+    }
     return this.seed;
+  }
+
+  // ============================================================================
+  // Wallet Encryption Methods (AES-256-CBC with scrypt key derivation)
+  // ============================================================================
+
+  /**
+   * Check if the wallet is encrypted.
+   */
+  isEncrypted(): boolean {
+    return this.encryption.isEncrypted;
+  }
+
+  /**
+   * Check if the wallet is locked (encrypted and not unlocked).
+   */
+  isLocked(): boolean {
+    return this.encryption.isEncrypted && this.encryption.isLocked;
+  }
+
+  /**
+   * Derive encryption key from passphrase using scrypt.
+   * Uses secure parameters: N=2^14, r=8, p=1
+   * (Bitcoin Core uses N=2^14 for wallet encryption)
+   */
+  private async deriveEncryptionKey(passphrase: string, salt: Buffer): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      crypto.scrypt(passphrase, salt, 32, { N: 16384, r: 8, p: 1 }, (err, key) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(key);
+        }
+      });
+    });
+  }
+
+  /**
+   * Encrypt data using AES-256-CBC.
+   */
+  private encryptAES256CBC(plaintext: Buffer, key: Buffer, iv: Buffer): Buffer {
+    const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+    const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+    return encrypted;
+  }
+
+  /**
+   * Decrypt data using AES-256-CBC.
+   */
+  private decryptAES256CBC(ciphertext: Buffer, key: Buffer, iv: Buffer): Buffer {
+    const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
+    const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return decrypted;
+  }
+
+  /**
+   * Encrypt the wallet with a passphrase (encryptwallet RPC).
+   *
+   * This encrypts the seed with AES-256-CBC and locks the wallet.
+   * After encryption, the wallet file will be re-saved with encrypted keys.
+   *
+   * @param passphrase - The encryption passphrase
+   * @throws If wallet is already encrypted
+   */
+  async encryptWallet(passphrase: string): Promise<void> {
+    if (this.encryption.isEncrypted) {
+      throw new Error("Wallet is already encrypted. Use walletpassphrasechange to change the passphrase.");
+    }
+
+    if (!passphrase || passphrase.length < 1) {
+      throw new Error("Passphrase cannot be empty.");
+    }
+
+    // Generate salt and IV
+    const salt = crypto.randomBytes(32);
+    const iv = crypto.randomBytes(16);
+
+    // Derive encryption key
+    const key = await this.deriveEncryptionKey(passphrase, salt);
+
+    // Encrypt the seed
+    const encryptedSeed = this.encryptAES256CBC(this.seed, key, iv);
+
+    // Update encryption state
+    this.encryption = {
+      isEncrypted: true,
+      isLocked: true,
+      encryptedSeed,
+      encryptionSalt: salt,
+      encryptionIV: iv,
+      unlockTimeout: null,
+    };
+
+    // Clear the plaintext seed from memory
+    this.seed.fill(0);
+    this.seed = Buffer.alloc(0);
+
+    // Clear master key
+    this.masterKey.key.fill(0);
+    this.masterKey.chainCode.fill(0);
+
+    // Note: Private keys are derived on-demand from the seed, so they're not in memory
+    // when the wallet is locked. The key map contains public info only when locked.
+  }
+
+  /**
+   * Unlock the wallet temporarily (walletpassphrase RPC).
+   *
+   * @param passphrase - The encryption passphrase
+   * @param timeout - Seconds to keep the wallet unlocked (0 = until lock or shutdown)
+   * @throws If passphrase is incorrect or wallet is not encrypted
+   */
+  async unlockWallet(passphrase: string, timeout: number): Promise<void> {
+    if (!this.encryption.isEncrypted) {
+      throw new Error("Wallet is not encrypted.");
+    }
+
+    if (!this.encryption.isLocked) {
+      // Already unlocked - just reset the timeout
+      if (this.encryption.unlockTimeout) {
+        clearTimeout(this.encryption.unlockTimeout);
+        this.encryption.unlockTimeout = null;
+      }
+
+      if (timeout > 0) {
+        this.encryption.unlockTimeout = setTimeout(() => {
+          this.lockWallet();
+        }, timeout * 1000);
+      }
+      return;
+    }
+
+    if (!this.encryption.encryptedSeed || !this.encryption.encryptionSalt || !this.encryption.encryptionIV) {
+      throw new Error("Wallet encryption state is invalid.");
+    }
+
+    // Derive encryption key
+    const key = await this.deriveEncryptionKey(passphrase, this.encryption.encryptionSalt);
+
+    // Try to decrypt the seed
+    let decryptedSeed: Buffer;
+    try {
+      decryptedSeed = this.decryptAES256CBC(this.encryption.encryptedSeed, key, this.encryption.encryptionIV);
+    } catch {
+      throw new Error("Incorrect passphrase.");
+    }
+
+    // Verify the seed is valid (64 bytes for BIP-39)
+    if (decryptedSeed.length !== 64) {
+      throw new Error("Incorrect passphrase.");
+    }
+
+    // Restore the seed
+    this.seed = decryptedSeed;
+    this.masterKey = this.deriveMasterKey(this.seed);
+
+    // Regenerate addresses now that we have the seed
+    this.pregenerateAddresses();
+
+    // Mark as unlocked
+    this.encryption.isLocked = false;
+
+    // Set auto-lock timeout
+    if (timeout > 0) {
+      this.encryption.unlockTimeout = setTimeout(() => {
+        this.lockWallet();
+      }, timeout * 1000);
+    }
+  }
+
+  /**
+   * Lock the wallet (walletlock RPC).
+   *
+   * Clears the decrypted seed from memory.
+   */
+  lockWallet(): void {
+    if (!this.encryption.isEncrypted) {
+      throw new Error("Wallet is not encrypted.");
+    }
+
+    if (this.encryption.isLocked) {
+      return; // Already locked
+    }
+
+    // Clear timeout if set
+    if (this.encryption.unlockTimeout) {
+      clearTimeout(this.encryption.unlockTimeout);
+      this.encryption.unlockTimeout = null;
+    }
+
+    // Clear the plaintext seed from memory
+    this.seed.fill(0);
+    this.seed = Buffer.alloc(0);
+
+    // Clear master key
+    this.masterKey.key.fill(0);
+    this.masterKey.chainCode.fill(0);
+
+    // Mark as locked
+    this.encryption.isLocked = true;
+  }
+
+  /**
+   * Change the wallet passphrase (walletpassphrasechange RPC).
+   *
+   * @param oldPassphrase - Current passphrase
+   * @param newPassphrase - New passphrase
+   * @throws If old passphrase is incorrect or wallet is not encrypted
+   */
+  async changePassphrase(oldPassphrase: string, newPassphrase: string): Promise<void> {
+    if (!this.encryption.isEncrypted) {
+      throw new Error("Wallet is not encrypted.");
+    }
+
+    if (!newPassphrase || newPassphrase.length < 1) {
+      throw new Error("New passphrase cannot be empty.");
+    }
+
+    // If locked, unlock first to get the seed
+    const wasLocked = this.encryption.isLocked;
+    if (wasLocked) {
+      await this.unlockWallet(oldPassphrase, 0);
+    }
+
+    // Generate new salt and IV
+    const newSalt = crypto.randomBytes(32);
+    const newIV = crypto.randomBytes(16);
+
+    // Derive new encryption key
+    const newKey = await this.deriveEncryptionKey(newPassphrase, newSalt);
+
+    // Re-encrypt the seed
+    const encryptedSeed = this.encryptAES256CBC(this.seed, newKey, newIV);
+
+    // Update encryption state
+    this.encryption.encryptedSeed = encryptedSeed;
+    this.encryption.encryptionSalt = newSalt;
+    this.encryption.encryptionIV = newIV;
+
+    // If was locked, lock again
+    if (wasLocked) {
+      this.lockWallet();
+    }
+  }
+
+  /**
+   * Get encryption state for serialization.
+   */
+  getEncryptionState(): {
+    isEncrypted: boolean;
+    encryptedSeed: string | null;
+    encryptionSalt: string | null;
+    encryptionIV: string | null;
+  } {
+    return {
+      isEncrypted: this.encryption.isEncrypted,
+      encryptedSeed: this.encryption.encryptedSeed?.toString("hex") ?? null,
+      encryptionSalt: this.encryption.encryptionSalt?.toString("hex") ?? null,
+      encryptionIV: this.encryption.encryptionIV?.toString("hex") ?? null,
+    };
+  }
+
+  /**
+   * Restore encryption state from serialization.
+   */
+  setEncryptionState(state: {
+    isEncrypted: boolean;
+    encryptedSeed: string | null;
+    encryptionSalt: string | null;
+    encryptionIV: string | null;
+  }): void {
+    this.encryption = {
+      isEncrypted: state.isEncrypted,
+      isLocked: state.isEncrypted, // Start locked if encrypted
+      encryptedSeed: state.encryptedSeed ? Buffer.from(state.encryptedSeed, "hex") : null,
+      encryptionSalt: state.encryptionSalt ? Buffer.from(state.encryptionSalt, "hex") : null,
+      encryptionIV: state.encryptionIV ? Buffer.from(state.encryptionIV, "hex") : null,
+      unlockTimeout: null,
+    };
+  }
+
+  // ============================================================================
+  // Address Label Methods
+  // ============================================================================
+
+  /**
+   * Set a label for an address.
+   *
+   * @param address - The address to label
+   * @param label - The label to assign (empty string removes the label)
+   */
+  setLabel(address: string, label: string): void {
+    if (!this.hasAddress(address)) {
+      throw new Error(`Address not found in wallet: ${address}`);
+    }
+
+    if (label === "") {
+      this.labels.delete(address);
+    } else {
+      this.labels.set(address, label);
+    }
+  }
+
+  /**
+   * Get the label for an address.
+   *
+   * @param address - The address to look up
+   * @returns The label, or empty string if not labeled
+   */
+  getLabel(address: string): string {
+    return this.labels.get(address) ?? "";
+  }
+
+  /**
+   * Get all addresses with a specific label.
+   *
+   * @param label - The label to search for
+   * @returns Array of addresses with that label
+   */
+  getAddressesByLabel(label: string): string[] {
+    const addresses: string[] = [];
+    for (const [address, addressLabel] of this.labels) {
+      if (addressLabel === label) {
+        addresses.push(address);
+      }
+    }
+    return addresses;
+  }
+
+  /**
+   * Get all labels with their addresses.
+   *
+   * @returns Map of label -> addresses
+   */
+  listLabels(): Map<string, string[]> {
+    const labelMap = new Map<string, string[]>();
+    for (const [address, label] of this.labels) {
+      const addresses = labelMap.get(label) ?? [];
+      addresses.push(address);
+      labelMap.set(label, addresses);
+    }
+    return labelMap;
+  }
+
+  /**
+   * Get all labels as an object (for serialization).
+   */
+  getLabelsObject(): Record<string, string> {
+    const obj: Record<string, string> = {};
+    for (const [address, label] of this.labels) {
+      obj[address] = label;
+    }
+    return obj;
+  }
+
+  /**
+   * Restore labels from an object.
+   */
+  setLabelsFromObject(obj: Record<string, string>): void {
+    this.labels.clear();
+    for (const [address, label] of Object.entries(obj)) {
+      this.labels.set(address, label);
+    }
+  }
+
+  /**
+   * List received by address with labels.
+   *
+   * @returns Array of { address, label, amount, confirmations }
+   */
+  listReceivedByAddress(): Array<{
+    address: string;
+    label: string;
+    amount: bigint;
+    confirmations: number;
+  }> {
+    const received = new Map<string, { amount: bigint; confirmations: number }>();
+
+    // Aggregate UTXOs by address
+    for (const utxo of this.utxos.values()) {
+      const existing = received.get(utxo.address);
+      if (existing) {
+        existing.amount += utxo.amount;
+        existing.confirmations = Math.min(existing.confirmations, utxo.confirmations);
+      } else {
+        received.set(utxo.address, {
+          amount: utxo.amount,
+          confirmations: utxo.confirmations,
+        });
+      }
+    }
+
+    // Build result with labels
+    const result: Array<{
+      address: string;
+      label: string;
+      amount: bigint;
+      confirmations: number;
+    }> = [];
+
+    for (const [address, { amount, confirmations }] of received) {
+      result.push({
+        address,
+        label: this.getLabel(address),
+        amount,
+        confirmations,
+      });
+    }
+
+    return result;
   }
 }
