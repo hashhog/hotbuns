@@ -92,9 +92,21 @@ export const RPCErrorCodes = {
   // Bitcoin-specific errors
   MISC_ERROR: -1,
   INVALID_ADDRESS_OR_KEY: -5,
+  // Transaction-related errors (sendrawtransaction)
+  RPC_TRANSACTION_ERROR: -25,
+  RPC_TRANSACTION_REJECTED: -26,
+  RPC_TRANSACTION_ALREADY_IN_CHAIN: -27,
+  // Legacy aliases for backward compatibility
   VERIFY_ALREADY_IN_CHAIN: -25,
   VERIFY_REJECTED: -26,
 } as const;
+
+/**
+ * Default max fee rate for sendrawtransaction (0.10 BTC/kvB = 10000 sat/vB).
+ * Transactions with fee rates higher than this are rejected to prevent
+ * accidental fee overpayment.
+ */
+export const DEFAULT_MAX_FEE_RATE = 0.1; // BTC/kvB
 
 /**
  * JSON-RPC 2.0 server for Bitcoin node control and queries.
@@ -670,13 +682,53 @@ export class RPCServer {
 
   /**
    * sendrawtransaction: Decode, validate, add to mempool, broadcast to peers.
+   *
    * @param params [hexstring, maxfeerate]
+   *   - hexstring: The hex-encoded raw transaction
+   *   - maxfeerate: (optional) Reject transactions whose fee rate is higher
+   *                 than this value, in BTC/kvB. Default is 0.10 BTC/kvB.
+   *                 Set to 0 to accept any fee rate.
+   *
+   * @returns The transaction hash (txid) in hex
+   *
+   * Error codes:
+   *   - RPC_TRANSACTION_ERROR (-25): Generic TX error
+   *   - RPC_TRANSACTION_REJECTED (-26): TX rejected by mempool policy
+   *   - RPC_TRANSACTION_ALREADY_IN_CHAIN (-27): TX already confirmed in blockchain
    */
   private async sendRawTransaction(params: unknown[]): Promise<string> {
-    const [hexstringParam] = params;
+    const [hexstringParam, maxfeerateParam] = params;
 
     if (typeof hexstringParam !== "string") {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "hexstring must be a string");
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "hexstring must be a string"
+      );
+    }
+
+    // Parse maxfeerate parameter (default 0.10 BTC/kvB)
+    let maxFeeRate = DEFAULT_MAX_FEE_RATE;
+    if (maxfeerateParam !== undefined && maxfeerateParam !== null) {
+      if (typeof maxfeerateParam !== "number") {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "maxfeerate must be a number"
+        );
+      }
+      if (maxfeerateParam < 0) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "maxfeerate cannot be negative"
+        );
+      }
+      // Reject absurdly high fee rates (> 1 BTC/kvB)
+      if (maxfeerateParam > 1) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "Fee rates larger than 1 BTC/kvB are rejected"
+        );
+      }
+      maxFeeRate = maxfeerateParam;
     }
 
     // Parse the hex string
@@ -687,6 +739,14 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid hex encoding");
     }
 
+    // Validate hex has even length (each byte = 2 hex chars)
+    if (hexstringParam.length % 2 !== 0) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "Invalid hex encoding (odd length)"
+      );
+    }
+
     // Deserialize the transaction
     let tx: Transaction;
     try {
@@ -694,7 +754,7 @@ export class RPCServer {
       tx = deserializeTx(reader);
     } catch (e) {
       throw this.rpcError(
-        RPCErrorCodes.VERIFY_REJECTED,
+        RPCErrorCodes.RPC_TRANSACTION_REJECTED,
         `TX decode failed: ${(e as Error).message}`
       );
     }
@@ -702,24 +762,65 @@ export class RPCServer {
     const txid = getTxId(tx);
     const txidHex = txid.toString("hex");
 
-    // Check if already in mempool
+    // Check if already in mempool (this is NOT an error per Bitcoin Core behavior)
+    // We return the txid and consider it success - the tx is in the mempool already
     if (this.mempool.hasTransaction(txid)) {
+      // Re-broadcast to peers in case they missed it
+      this.broadcastTxInv(txid);
+      return txidHex;
+    }
+
+    // Check if transaction is already confirmed in the blockchain
+    const isConfirmed = await this.mempool.isTransactionConfirmed(txid);
+    if (isConfirmed) {
       throw this.rpcError(
-        RPCErrorCodes.VERIFY_ALREADY_IN_CHAIN,
-        "Transaction already in mempool"
+        RPCErrorCodes.RPC_TRANSACTION_ALREADY_IN_CHAIN,
+        "Transaction already in block chain"
       );
     }
+
+    // Calculate fee rate before adding to mempool to check maxfeerate
+    // This requires knowing the fee, which we get from addTransaction
+    // For now, we add to mempool first, then check fee rate
+    // (mempool.addTransaction already validates minimum fee rate)
 
     // Add to mempool (includes validation)
     const result = await this.mempool.addTransaction(tx);
     if (!result.accepted) {
       throw this.rpcError(
-        RPCErrorCodes.VERIFY_REJECTED,
+        RPCErrorCodes.RPC_TRANSACTION_REJECTED,
         result.error || "Transaction rejected"
       );
     }
 
-    // Broadcast to peers
+    // Now check maxfeerate if specified (and not 0 which means accept any rate)
+    if (maxFeeRate > 0) {
+      const entry = this.mempool.getTransaction(txid);
+      if (entry) {
+        // Convert fee rate from sat/vB to BTC/kvB for comparison
+        // sat/vB * 1000 / 100_000_000 = BTC/kvB
+        const feeRateBTCkvB = (entry.feeRate * 1000) / 100_000_000;
+        if (feeRateBTCkvB > maxFeeRate) {
+          // Remove from mempool since we're rejecting it
+          this.mempool.removeTransaction(txid);
+          throw this.rpcError(
+            RPCErrorCodes.RPC_TRANSACTION_REJECTED,
+            `Fee rate ${feeRateBTCkvB.toFixed(8)} BTC/kvB exceeds max rate ${maxFeeRate} BTC/kvB`
+          );
+        }
+      }
+    }
+
+    // Broadcast inv to peers
+    this.broadcastTxInv(txid);
+
+    return txidHex;
+  }
+
+  /**
+   * Broadcast a transaction inventory message to all connected peers.
+   */
+  private broadcastTxInv(txid: Buffer): void {
     const invMsg: NetworkMessage = {
       type: "inv",
       payload: {
@@ -732,8 +833,6 @@ export class RPCServer {
       },
     };
     this.peerManager.broadcast(invMsg);
-
-    return txidHex;
   }
 
   // ========== Mempool Methods ==========
