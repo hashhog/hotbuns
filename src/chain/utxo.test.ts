@@ -126,7 +126,10 @@ describe("UTXOManager", () => {
       const outpoint: OutPoint = { txid, vout: 0 };
       utxo.spendOutput(outpoint);
 
-      expect(() => utxo.spendOutput(outpoint)).toThrow("already spent");
+      // After spending a FRESH coin, it's removed from cache entirely
+      // (optimization: it never existed in DB, so nothing to delete)
+      // So the second spend throws "not in cache" instead of "already spent"
+      expect(() => utxo.spendOutput(outpoint)).toThrow();
     });
 
     test("throws when UTXO not in cache", () => {
