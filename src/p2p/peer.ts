@@ -56,6 +56,36 @@ export const MIN_PEER_PROTO_VERSION = 70015;
 /** Handshake timeout in milliseconds. */
 export const HANDSHAKE_TIMEOUT_MS = 60_000;
 
+/** Ping interval in milliseconds (2 minutes). */
+export const PING_INTERVAL_MS = 2 * 60 * 1000;
+
+/** Ping timeout in milliseconds (20 minutes). */
+export const PING_TIMEOUT_MS = 20 * 60 * 1000;
+
+/** Headers response timeout in milliseconds (2 minutes). */
+export const HEADERS_RESPONSE_TIMEOUT_MS = 2 * 60 * 1000;
+
+/** Stale tip threshold in milliseconds (30 minutes). */
+export const STALE_TIP_THRESHOLD_MS = 30 * 60 * 1000;
+
+/** Stale check interval in milliseconds (45 seconds). */
+export const STALE_CHECK_INTERVAL_MS = 45 * 1000;
+
+/** Block download timeout base in milliseconds (10 minutes - one block interval). */
+export const BLOCK_DOWNLOAD_TIMEOUT_BASE_MS = 10 * 60 * 1000;
+
+/** Block download timeout per peer scaling (5 minutes). */
+export const BLOCK_DOWNLOAD_TIMEOUT_PER_PEER_MS = 5 * 60 * 1000;
+
+/** Maximum blocks in transit per peer. */
+export const MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16;
+
+/** Minimum connect time before considering eviction (30 seconds). */
+export const MINIMUM_CONNECT_TIME_MS = 30 * 1000;
+
+/** Maximum outbound peers to protect from stale tip disconnect. */
+export const MAX_OUTBOUND_PEERS_TO_PROTECT = 4;
+
 export class Peer {
   readonly host: string;
   readonly port: number;
@@ -68,6 +98,23 @@ export class Peer {
   shouldDisconnect: boolean;
   /** Whether the VERSION + VERACK handshake is complete. */
   handshakeComplete: boolean;
+
+  /** Timestamp of last block received from this peer (ms). */
+  lastBlockTime: number;
+  /** Timestamp of last transaction received from this peer (ms). */
+  lastTxTime: number;
+  /** Timestamp of when ping was sent (for timeout detection). */
+  pingSentTime: number;
+  /** Whether we're waiting for a pong response. */
+  pingOutstanding: boolean;
+  /** Timestamp of when headers request was sent (ms), 0 if none pending. */
+  headersRequestTime: number;
+  /** Timestamp of when this peer connected (ms). */
+  connectedTime: number;
+  /** Set of blocks in flight (hashes as hex strings) with request times. */
+  blocksInFlight: Map<string, number>;
+  /** Best known height from this peer (from version message or updates). */
+  bestKnownHeight: number;
 
   private socket: Socket | null;
   private recvBuffer: Buffer;
@@ -107,6 +154,15 @@ export class Peer {
     this.onBan = onBan ?? null;
     this.ourNonce = BigInt(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER));
     this.handshakeTimer = null;
+    // Stale peer tracking fields
+    this.lastBlockTime = 0;
+    this.lastTxTime = 0;
+    this.pingSentTime = 0;
+    this.pingOutstanding = false;
+    this.headersRequestTime = 0;
+    this.connectedTime = Date.now();
+    this.blocksInFlight = new Map();
+    this.bestKnownHeight = 0;
     // Register our nonce for self-connection detection
     Peer.localNonces.add(this.ourNonce);
   }
@@ -249,6 +305,8 @@ export class Peer {
   sendPing(): void {
     this.pingNonce = BigInt(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER));
     this.lastPingTime = Date.now();
+    this.pingSentTime = this.lastPingTime;
+    this.pingOutstanding = true;
     this.send({ type: "ping", payload: { nonce: this.pingNonce } });
   }
 
@@ -398,6 +456,8 @@ export class Peer {
         if (msg.payload.nonce === this.pingNonce) {
           this.latency = Date.now() - this.lastPingTime;
           this.pingNonce = null;
+          this.pingOutstanding = false;
+          this.pingSentTime = 0;
         }
       }
       // Dispatch all messages to the event handler
@@ -482,6 +542,8 @@ export class Peer {
 
       this.handshakeComplete = true;
       this.state = "connected";
+      // Store the peer's best height from version message
+      this.bestKnownHeight = this.versionPayload.startHeight;
       this.events.onHandshakeComplete(this);
 
       // Send optional feature negotiation messages
@@ -489,5 +551,128 @@ export class Peer {
       this.send({ type: "sendaddrv2", payload: null });
       this.send({ type: "wtxidrelay", payload: null });
     }
+  }
+
+  /**
+   * Record that we received a block from this peer.
+   */
+  recordBlockReceived(): void {
+    this.lastBlockTime = Date.now();
+  }
+
+  /**
+   * Record that we received a transaction from this peer.
+   */
+  recordTxReceived(): void {
+    this.lastTxTime = Date.now();
+  }
+
+  /**
+   * Mark that we sent a getheaders request to this peer.
+   */
+  markHeadersRequested(): void {
+    this.headersRequestTime = Date.now();
+  }
+
+  /**
+   * Mark that we received headers response.
+   */
+  markHeadersReceived(): void {
+    this.headersRequestTime = 0;
+  }
+
+  /**
+   * Add a block to in-flight tracking.
+   * @param blockHash - Block hash as hex string
+   */
+  addBlockInFlight(blockHash: string): void {
+    if (this.blocksInFlight.size >= MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
+      return; // Already at maximum
+    }
+    this.blocksInFlight.set(blockHash, Date.now());
+  }
+
+  /**
+   * Remove a block from in-flight tracking (received or cancelled).
+   * @param blockHash - Block hash as hex string
+   */
+  removeBlockInFlight(blockHash: string): void {
+    this.blocksInFlight.delete(blockHash);
+  }
+
+  /**
+   * Get the number of blocks currently in flight.
+   */
+  getBlocksInFlightCount(): number {
+    return this.blocksInFlight.size;
+  }
+
+  /**
+   * Check if we have any blocks in flight.
+   */
+  hasBlocksInFlight(): boolean {
+    return this.blocksInFlight.size > 0;
+  }
+
+  /**
+   * Update the peer's best known height.
+   * @param height - New best known height
+   */
+  updateBestKnownHeight(height: number): void {
+    if (height > this.bestKnownHeight) {
+      this.bestKnownHeight = height;
+    }
+  }
+
+  /**
+   * Check if ping has timed out.
+   * @returns true if a ping is outstanding and has exceeded timeout
+   */
+  hasPingTimedOut(): boolean {
+    if (!this.pingOutstanding || this.pingSentTime === 0) {
+      return false;
+    }
+    return Date.now() - this.pingSentTime > PING_TIMEOUT_MS;
+  }
+
+  /**
+   * Check if headers request has timed out.
+   * @returns true if headers request is pending and has exceeded timeout
+   */
+  hasHeadersTimedOut(): boolean {
+    if (this.headersRequestTime === 0) {
+      return false;
+    }
+    return Date.now() - this.headersRequestTime > HEADERS_RESPONSE_TIMEOUT_MS;
+  }
+
+  /**
+   * Get the oldest block in flight that has exceeded timeout.
+   * @param peerCount - Number of connected peers (used for timeout scaling)
+   * @returns Block hash of timed-out block, or null if none
+   */
+  getTimedOutBlock(peerCount: number): string | null {
+    const now = Date.now();
+    // Timeout scales: base + per_peer * peerCount
+    const timeout = BLOCK_DOWNLOAD_TIMEOUT_BASE_MS + BLOCK_DOWNLOAD_TIMEOUT_PER_PEER_MS * peerCount;
+
+    for (const [hash, requestTime] of this.blocksInFlight) {
+      if (now - requestTime > timeout) {
+        return hash;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Check if peer should be considered for ping (needs keepalive).
+   * @param lastActivity - Timestamp of last activity from this peer
+   * @returns true if it's been PING_INTERVAL_MS since last activity
+   */
+  needsPing(lastActivity: number): boolean {
+    if (!this.handshakeComplete || this.pingOutstanding) {
+      return false;
+    }
+    return Date.now() - lastActivity >= PING_INTERVAL_MS;
   }
 }
