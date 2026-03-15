@@ -36,6 +36,20 @@ const MAX_DESCENDANTS = 25;
 const MAX_ANCESTOR_SIZE = 101_000; // 101 KB in vbytes
 
 /**
+ * TRUC (v3) policy constants per BIP 431.
+ * v3 transactions have stricter relay rules to enable more reliable fee bumping.
+ */
+export const TRUC_VERSION = 3;
+/** Maximum number of transactions including a TRUC tx and all its mempool ancestors. */
+export const TRUC_ANCESTOR_LIMIT = 2;
+/** Maximum number of transactions including an unconfirmed tx and its descendants. */
+export const TRUC_DESCENDANT_LIMIT = 2;
+/** Maximum sigop-adjusted virtual size of all v3 transactions. */
+export const TRUC_MAX_VSIZE = 10_000;
+/** Maximum sigop-adjusted virtual size of a tx which spends from an unconfirmed TRUC transaction. */
+export const TRUC_CHILD_MAX_VSIZE = 1000;
+
+/**
  * Package relay limits.
  * MAX_PACKAGE_COUNT: Maximum number of transactions in a package
  * MAX_PACKAGE_WEIGHT: Maximum total weight of a package (404,000 WU = 101 kvB)
@@ -430,7 +444,44 @@ export class Mempool {
       }
     }
 
-    // 9. Check ancestor/descendant limits
+    // 9a. Check TRUC (v3) policy rules
+    const trucResult = this.checkTRUCPolicy(
+      tx,
+      vsize,
+      parentTxids,
+      conflicts,
+      isReplacement
+    );
+    if (!trucResult.valid) {
+      // If sibling eviction is possible, add the sibling to conflicts
+      if (trucResult.siblingToEvict) {
+        // Sibling eviction: v3 child can replace existing v3 child
+        const siblingEntry = this.entries.get(trucResult.siblingToEvict);
+        if (siblingEntry) {
+          // For sibling eviction, we allow replacement without normal RBF fee-rate rules
+          // Just need to pay higher absolute fee
+          if (fee <= siblingEntry.fee) {
+            return {
+              accepted: false,
+              error: `TRUC sibling eviction requires higher fee: ${fee} <= ${siblingEntry.fee}`,
+            };
+          }
+
+          // Add sibling to eviction list
+          if (!conflictsToEvict.some((e) => e.txid.toString("hex") === trucResult.siblingToEvict)) {
+            conflictsToEvict.push(siblingEntry);
+            totalConflictingFee += siblingEntry.fee;
+            totalConflictingVsize += siblingEntry.vsize;
+            isReplacement = true;
+          }
+        }
+      } else {
+        return { accepted: false, error: trucResult.error };
+      }
+    }
+
+    // 9b. Check ancestor/descendant limits (standard, non-TRUC)
+    // For TRUC, we've already checked in checkTRUCPolicy with stricter limits
     const ancestorResult = this.checkAncestorLimits(parentTxids, vsize);
     if (!ancestorResult.valid) {
       return { accepted: false, error: ancestorResult.error };
@@ -833,6 +884,148 @@ export class Mempool {
             error: `Ancestor ${ancestorTxidHex.slice(0, 16)}... would have too many descendants: ${newDescendantCount} > ${MAX_DESCENDANTS}`,
           };
         }
+      }
+    }
+
+    return { valid: true };
+  }
+
+  /**
+   * Check TRUC (v3) policy rules for a transaction.
+   *
+   * Rules for nVersion === 3 transactions:
+   * 1. A v3 tx can have at most 1 unconfirmed ancestor (parent) in the mempool.
+   * 2. A v3 tx can have at most 1 unconfirmed descendant (child).
+   * 3. A v3 child tx must be at most 1000 vbytes.
+   * 4. A v3 parent can be up to standard size (TRUC_MAX_VSIZE = 10000).
+   * 5. v3 transactions are always replaceable (implicit RBF signaling).
+   * 6. A v3 child can replace an existing v3 child of the same parent without
+   *    the normal RBF fee-rate rule (sibling eviction).
+   * 7. Non-v3 transactions cannot spend unconfirmed v3 outputs;
+   *    v3 transactions cannot spend unconfirmed non-v3 outputs.
+   *
+   * @returns Result with optional siblingToEvict txid for sibling eviction
+   */
+  private checkTRUCPolicy(
+    tx: Transaction,
+    vsize: number,
+    parentTxids: Set<string>,
+    conflicts: MempoolEntry[],
+    isReplacement: boolean
+  ): { valid: boolean; error?: string; siblingToEvict?: string } {
+    const isV3 = tx.version === TRUC_VERSION;
+
+    // Get mempool parents (those that are in the mempool)
+    const mempoolParents: MempoolEntry[] = [];
+    for (const parentTxidHex of parentTxids) {
+      const parent = this.entries.get(parentTxidHex);
+      if (parent) {
+        mempoolParents.push(parent);
+      }
+    }
+
+    // Rule 7: Check version inheritance between this tx and its mempool parents
+    for (const parent of mempoolParents) {
+      const parentIsV3 = parent.tx.version === TRUC_VERSION;
+
+      if (isV3 && !parentIsV3) {
+        // v3 tx cannot spend unconfirmed non-v3 outputs
+        return {
+          valid: false,
+          error: `version=3 tx cannot spend from non-version=3 unconfirmed tx ${parent.txid.toString("hex").slice(0, 16)}...`,
+        };
+      }
+
+      if (!isV3 && parentIsV3) {
+        // non-v3 tx cannot spend unconfirmed v3 outputs
+        return {
+          valid: false,
+          error: `non-version=3 tx cannot spend from version=3 unconfirmed tx ${parent.txid.toString("hex").slice(0, 16)}...`,
+        };
+      }
+    }
+
+    // The rest of the rules only apply to v3 transactions
+    if (!isV3) {
+      return { valid: true };
+    }
+
+    // Rule 4: v3 tx must be within TRUC_MAX_VSIZE
+    if (vsize > TRUC_MAX_VSIZE) {
+      return {
+        valid: false,
+        error: `version=3 tx is too big: ${vsize} > ${TRUC_MAX_VSIZE} vbytes`,
+      };
+    }
+
+    // Rule 1: v3 tx can have at most 1 unconfirmed ancestor (parent) in mempool
+    // With TRUC_ANCESTOR_LIMIT = 2, that means parent + self
+    if (mempoolParents.length > 1) {
+      return {
+        valid: false,
+        error: `version=3 tx would have too many ancestors: ${mempoolParents.length + 1} > ${TRUC_ANCESTOR_LIMIT}`,
+      };
+    }
+
+    // If there's a mempool parent, ensure it doesn't also have an ancestor
+    if (mempoolParents.length === 1) {
+      const parent = mempoolParents[0];
+      // Check if parent has any mempool ancestors
+      if (parent.dependsOn.size > 0) {
+        return {
+          valid: false,
+          error: `version=3 tx would have too many ancestors`,
+        };
+      }
+
+      // Rule 3: If this is a child (has unconfirmed parent), it must be small
+      if (vsize > TRUC_CHILD_MAX_VSIZE) {
+        return {
+          valid: false,
+          error: `version=3 child tx is too big: ${vsize} > ${TRUC_CHILD_MAX_VSIZE} vbytes`,
+        };
+      }
+
+      // Rule 2: Check descendant limit for the parent
+      // The parent can have at most 1 descendant (this new tx)
+      // But if an existing child will be replaced (conflict or sibling eviction), it's ok
+      const parentTxidHex = parent.txid.toString("hex");
+
+      // Count current descendants of the parent (not including pending conflicts)
+      const conflictTxids = new Set(conflicts.map((c) => c.txid.toString("hex")));
+      let currentDescendants = 0;
+      let existingChild: MempoolEntry | undefined;
+
+      for (const childTxidHex of parent.spentBy) {
+        if (!conflictTxids.has(childTxidHex)) {
+          currentDescendants++;
+          const child = this.entries.get(childTxidHex);
+          if (child && child.tx.version === TRUC_VERSION) {
+            existingChild = child;
+          }
+        }
+      }
+
+      // If parent already has a descendant that isn't being replaced
+      if (currentDescendants >= 1) {
+        // Sibling eviction: if there's exactly one existing v3 child, we can evict it
+        if (
+          currentDescendants === 1 &&
+          existingChild &&
+          existingChild.descendantCount === 1 // Child has no grandchildren
+        ) {
+          // Allow sibling eviction - return the sibling to be evicted
+          return {
+            valid: false,
+            error: `version=3 tx would exceed descendant limit`,
+            siblingToEvict: existingChild.txid.toString("hex"),
+          };
+        }
+
+        return {
+          valid: false,
+          error: `version=3 tx would exceed descendant limit: parent ${parentTxidHex.slice(0, 16)}... already has ${currentDescendants} descendant(s)`,
+        };
       }
     }
 
