@@ -44,6 +44,18 @@ const DEFAULT_MAX_SIZE = 300_000_000;
 const DEFAULT_MIN_FEE_RATE = 1;
 
 /**
+ * Default incremental relay fee rate (1 sat/vB).
+ * Replacement must pay at least this much per vbyte more than what it evicts.
+ */
+const DEFAULT_INCREMENTAL_RELAY_FEE = 1;
+
+/**
+ * Maximum number of transactions that can be evicted by a single RBF replacement.
+ * This includes the directly conflicting transactions and all their descendants.
+ */
+const MAX_REPLACEMENT_CANDIDATES = 100;
+
+/**
  * An entry in the mempool representing an unconfirmed transaction.
  */
 export interface MempoolEntry {
@@ -119,6 +131,9 @@ export class Mempool {
   /** Current chain tip height. */
   private tipHeight: number;
 
+  /** Incremental relay fee rate (sat/vB). Replacement must pay this per vbyte over replaced fees. */
+  private incrementalRelayFee: number;
+
   constructor(
     utxo: UTXOManager,
     params: ConsensusParams,
@@ -131,6 +146,7 @@ export class Mempool {
     this.utxo = utxo;
     this.params = params;
     this.minFeeRate = DEFAULT_MIN_FEE_RATE;
+    this.incrementalRelayFee = DEFAULT_INCREMENTAL_RELAY_FEE;
     this.tipHeight = 0;
   }
 
@@ -184,13 +200,44 @@ export class Mempool {
       return { accepted: false, error: "Transaction already in mempool" };
     }
 
-    // 3. Check for double-spend conflicts
+    // 3. Check for double-spend conflicts - with RBF support
     const conflicts = this.checkConflicts(tx);
+    let isReplacement = false;
+    let conflictsToEvict: MempoolEntry[] = [];
+    let totalConflictingFee = 0n;
+    let totalConflictingVsize = 0;
+
     if (conflicts.length > 0) {
-      return {
-        accepted: false,
-        error: `Double-spend conflict with mempool transaction ${conflicts[0].txid.toString("hex")}`,
-      };
+      // Mark this as a potential RBF replacement - we'll validate the fees later
+      isReplacement = true;
+
+      // Gather all conflicts and their descendants
+      const allConflictTxids = new Set<string>();
+      for (const conflict of conflicts) {
+        allConflictTxids.add(conflict.txid.toString("hex"));
+        const descendants = this.getDescendantSet(conflict.txid.toString("hex"));
+        for (const desc of descendants) {
+          allConflictTxids.add(desc);
+        }
+      }
+
+      // Check eviction limit (Rule #5: max 100 transactions)
+      if (allConflictTxids.size > MAX_REPLACEMENT_CANDIDATES) {
+        return {
+          accepted: false,
+          error: `RBF would evict too many transactions: ${allConflictTxids.size} > ${MAX_REPLACEMENT_CANDIDATES}`,
+        };
+      }
+
+      // Collect all entries to be evicted
+      for (const txidHex of allConflictTxids) {
+        const entry = this.entries.get(txidHex);
+        if (entry) {
+          conflictsToEvict.push(entry);
+          totalConflictingFee += entry.fee;
+          totalConflictingVsize += entry.vsize;
+        }
+      }
     }
 
     // 4. Check all inputs exist and calculate fee
@@ -291,6 +338,38 @@ export class Mempool {
       };
     }
 
+    // RBF replacement checks (BIP 125 Rule #3 and #4)
+    if (isReplacement) {
+      // Rule #3: Replacement must pay a higher absolute fee
+      if (fee <= totalConflictingFee) {
+        return {
+          accepted: false,
+          error: `RBF replacement fee ${fee} must be greater than conflicting fee ${totalConflictingFee}`,
+        };
+      }
+
+      // Rule #4: Additional fee must cover the replacement's own bandwidth
+      // newFee - sumOldFees >= incrementalRelayFee * newVsize
+      const additionalFee = fee - totalConflictingFee;
+      const requiredIncrementalFee = BigInt(this.incrementalRelayFee * vsize);
+      if (additionalFee < requiredIncrementalFee) {
+        return {
+          accepted: false,
+          error: `RBF incremental fee ${additionalFee} < required ${requiredIncrementalFee} (${this.incrementalRelayFee} sat/vB * ${vsize} vB)`,
+        };
+      }
+
+      // Additional check: new tx's fee rate must be higher than all directly conflicting txs
+      for (const conflict of conflicts) {
+        if (feeRate <= conflict.feeRate) {
+          return {
+            accepted: false,
+            error: `RBF replacement fee rate ${feeRate.toFixed(2)} must be higher than conflicting tx ${conflict.txid.toString("hex").slice(0, 16)}... fee rate ${conflict.feeRate.toFixed(2)}`,
+          };
+        }
+      }
+    }
+
     // 9. Check ancestor/descendant limits
     const ancestorResult = this.checkAncestorLimits(parentTxids, vsize);
     if (!ancestorResult.valid) {
@@ -335,6 +414,14 @@ export class Mempool {
           accepted: false,
           error: `Script validation failed for input ${i}`,
         };
+      }
+    }
+
+    // If this is an RBF replacement, remove all conflicting transactions first
+    if (isReplacement) {
+      for (const conflictEntry of conflictsToEvict) {
+        // Remove without removing dependents since we're removing all of them
+        this.removeTransactionInternal(conflictEntry.txid);
       }
     }
 
@@ -790,6 +877,90 @@ export class Mempool {
     }
 
     return descendants.size;
+  }
+
+  /**
+   * Get the set of all descendant txids (not including self).
+   * Used for RBF to calculate total eviction count.
+   */
+  private getDescendantSet(txidHex: string): Set<string> {
+    const descendants = new Set<string>();
+    const queue: string[] = [];
+
+    const entry = this.entries.get(txidHex);
+    if (!entry) return descendants;
+
+    for (const childTxidHex of entry.spentBy) {
+      queue.push(childTxidHex);
+    }
+
+    while (queue.length > 0) {
+      const childTxidHex = queue.shift()!;
+
+      if (descendants.has(childTxidHex)) continue;
+      descendants.add(childTxidHex);
+
+      const childEntry = this.entries.get(childTxidHex);
+      if (childEntry) {
+        for (const grandchildTxidHex of childEntry.spentBy) {
+          if (!descendants.has(grandchildTxidHex)) {
+            queue.push(grandchildTxidHex);
+          }
+        }
+      }
+    }
+
+    return descendants;
+  }
+
+  /**
+   * Remove a transaction from the mempool without removing dependents.
+   * Used internally by RBF when we're removing all conflicts at once.
+   */
+  private removeTransactionInternal(txid: Buffer): void {
+    const txidHex = txid.toString("hex");
+    const entry = this.entries.get(txidHex);
+
+    if (!entry) {
+      return;
+    }
+
+    // Update ancestors' descendant stats before removing
+    const ancestors = this.getAncestorSet(entry.dependsOn);
+    for (const ancestorTxidHex of ancestors) {
+      const ancestor = this.entries.get(ancestorTxidHex);
+      if (ancestor) {
+        ancestor.descendantCount -= 1;
+        ancestor.descendantSize -= entry.vsize;
+      }
+    }
+
+    // Remove from parent's spentBy
+    for (const parentTxidHex of entry.dependsOn) {
+      const parent = this.entries.get(parentTxidHex);
+      if (parent) {
+        parent.spentBy.delete(txidHex);
+      }
+    }
+
+    // Remove outpoint index entries
+    for (const input of entry.tx.inputs) {
+      const outpointKey = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+      this.outpointIndex.delete(outpointKey);
+    }
+
+    // Remove from entries
+    this.entries.delete(txidHex);
+    this.currentSize -= entry.vsize;
+  }
+
+  /**
+   * Check if a transaction is replaceable (always true for full RBF).
+   * In full RBF mode, all unconfirmed transactions are replaceable.
+   */
+  isReplaceable(_txid: Buffer): boolean {
+    // Full RBF: all mempool transactions are replaceable
+    return true;
   }
 
   /**
