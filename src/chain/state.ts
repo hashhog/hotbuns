@@ -5,13 +5,15 @@
  * maintaining UTXO consistency, and handling chain reorganizations.
  */
 
-import type { ChainDB, ChainState, UTXOEntry } from "../storage/database.js";
+import type { ChainDB, ChainState, UTXOEntry, BlockIndexRecord } from "../storage/database.js";
+import { BlockStatus } from "../storage/database.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import { getBlockSubsidy } from "../consensus/params.js";
 import type { Block, BlockHeader } from "../validation/block.js";
 import {
   getBlockHash,
   serializeBlock,
+  deserializeBlock,
   getTransactionSigOpCost,
   MAX_BLOCK_SIGOPS_COST,
 } from "../validation/block.js";
@@ -30,6 +32,7 @@ import {
   deserializeUndoData,
 } from "./utxo.js";
 import { ConsensusError, ConsensusErrorCode } from "../validation/errors.js";
+import { BufferReader } from "../wire/serialization.js";
 
 /**
  * Result of transaction input validation.
@@ -46,6 +49,16 @@ export interface TxInputValidation {
 export interface CheckpointResult {
   valid: boolean;
   error?: string;
+}
+
+/**
+ * Result of chain management operations (invalidateblock, reconsiderblock, preciousblock).
+ */
+export interface ChainManagementResult {
+  success: boolean;
+  error?: string;
+  /** Number of blocks disconnected (invalidateblock) or reconnected (reconsiderblock). */
+  blocksAffected?: number;
 }
 
 /**
@@ -166,6 +179,16 @@ export class ChainStateManager {
   private params: ConsensusParams;
   private bestBlock: { hash: Buffer; height: number; chainWork: bigint };
   private notificationEmitter: import("events").EventEmitter | null;
+  /** Mempool for conflict removal during invalidation. */
+  private mempool: import("../mempool/mempool.js").Mempool | null = null;
+  /** Header sync for coordinating header chain state. */
+  private headerSync: import("../sync/headers.js").HeaderSync | null = null;
+  /** Precious block for tie-breaking. null if no precious block set. */
+  private preciousBlockHash: Buffer | null = null;
+  /** Sequence ID for precious block tie-breaking. Lower = more precious. */
+  private blockSequenceId: number = 0;
+  /** Last chain work when preciousblock was set. Used to reset sequence IDs. */
+  private lastPreciousChainwork: bigint = 0n;
 
   constructor(db: ChainDB, params: ConsensusParams) {
     this.db = db;
@@ -185,6 +208,20 @@ export class ChainStateManager {
    */
   setNotificationEmitter(emitter: import("events").EventEmitter): void {
     this.notificationEmitter = emitter;
+  }
+
+  /**
+   * Set the mempool for conflict removal during invalidation.
+   */
+  setMempool(mempool: import("../mempool/mempool.js").Mempool): void {
+    this.mempool = mempool;
+  }
+
+  /**
+   * Set the header sync for coordinating header chain state.
+   */
+  setHeaderSync(headerSync: import("../sync/headers.js").HeaderSync): void {
+    this.headerSync = headerSync;
   }
 
   /**
@@ -815,5 +852,339 @@ export class ChainStateManager {
    */
   getParams(): ConsensusParams {
     return this.params;
+  }
+
+  /**
+   * Get the database for direct access.
+   */
+  getDB(): ChainDB {
+    return this.db;
+  }
+
+  // ========== Chain Management RPCs ==========
+
+  /**
+   * Mark a block and all its descendants as invalid.
+   *
+   * If the block is on the active chain, disconnects blocks back to the fork point.
+   * Removes conflicting transactions from the mempool.
+   *
+   * Reference: Bitcoin Core's Chainstate::InvalidateBlock (validation.cpp)
+   *
+   * @param blockHash - Hash of the block to invalidate
+   * @returns Result indicating success and number of blocks affected
+   */
+  async invalidateBlock(blockHash: Buffer): Promise<ChainManagementResult> {
+    // Check if block exists
+    const blockIndex = await this.db.getBlockIndex(blockHash);
+    if (!blockIndex) {
+      return { success: false, error: "Block not found" };
+    }
+
+    // Genesis block cannot be invalidated
+    if (blockIndex.height === 0) {
+      return { success: false, error: "Cannot invalidate genesis block" };
+    }
+
+    // Check if block is protected by checkpoint
+    if (this.isProtectedByCheckpoint(blockIndex.height)) {
+      return {
+        success: false,
+        error: `Block at height ${blockIndex.height} is protected by checkpoint`,
+      };
+    }
+
+    // Check if already marked invalid
+    if (blockIndex.status & BlockStatus.FAILED_VALID) {
+      return { success: true, blocksAffected: 0 };
+    }
+
+    let blocksDisconnected = 0;
+
+    // If this block is on the active chain, disconnect blocks back to it
+    const hashHex = blockHash.toString("hex");
+    let currentHash = this.bestBlock.hash;
+    const blocksToDisconnect: Buffer[] = [];
+
+    // Walk back from tip to find if blockHash is an ancestor
+    while (!currentHash.equals(blockHash)) {
+      const currentIndex = await this.db.getBlockIndex(currentHash);
+      if (!currentIndex || currentIndex.height <= blockIndex.height) {
+        // Block is not on our active chain
+        break;
+      }
+
+      blocksToDisconnect.push(currentHash);
+
+      // Get parent hash from header
+      const parentHash = currentIndex.header.subarray(4, 36);
+      currentHash = parentHash;
+    }
+
+    // If we found it on our chain, disconnect blocks
+    if (currentHash.equals(blockHash)) {
+      // Also disconnect the invalidated block itself
+      blocksToDisconnect.push(blockHash);
+
+      // Disconnect in reverse order (from tip to target)
+      for (const hash of blocksToDisconnect) {
+        const rawBlock = await this.db.getBlock(hash);
+        if (!rawBlock) {
+          return {
+            success: false,
+            error: `Missing block data for ${hash.toString("hex")}`,
+          };
+        }
+
+        const block = deserializeBlock(new BufferReader(rawBlock));
+        const idx = await this.db.getBlockIndex(hash);
+        if (!idx) continue;
+
+        await this.disconnectBlock(block, idx.height);
+        blocksDisconnected++;
+
+        // Mark the disconnected block as invalid
+        await this.db.updateBlockStatus(
+          hash,
+          idx.status | BlockStatus.FAILED_VALID
+        );
+      }
+    } else {
+      // Block is not on our chain, just mark it invalid
+      await this.db.updateBlockStatus(
+        blockHash,
+        blockIndex.status | BlockStatus.FAILED_VALID
+      );
+    }
+
+    // Mark all descendants as FAILED_CHILD
+    await this.markDescendantsInvalid(blockHash, blockIndex.height);
+
+    // Remove conflicting transactions from mempool
+    if (this.mempool) {
+      // Get all txids in the invalidated block and its descendants
+      // This is a simplified version - full implementation would track all descendants
+      const rawBlock = await this.db.getBlock(blockHash);
+      if (rawBlock) {
+        const block = deserializeBlock(new BufferReader(rawBlock));
+        for (const tx of block.transactions) {
+          const txid = getTxId(tx);
+          this.mempool.removeTransaction(txid, true);
+        }
+      }
+    }
+
+    return { success: true, blocksAffected: blocksDisconnected };
+  }
+
+  /**
+   * Mark descendants of an invalid block as FAILED_CHILD.
+   */
+  private async markDescendantsInvalid(
+    parentHash: Buffer,
+    parentHeight: number
+  ): Promise<void> {
+    // This is a simplified implementation
+    // A full implementation would iterate through all block index entries
+    // and check ancestry. For now, we rely on the header chain to track
+    // which blocks descend from the invalid block.
+
+    // Walk through heights above parent looking for descendants
+    let height = parentHeight + 1;
+    while (height <= this.bestBlock.height + 1000) {
+      // Look up to 1000 blocks ahead
+      const hashAtHeight = await this.db.getBlockHashByHeight(height);
+      if (!hashAtHeight) break;
+
+      const idx = await this.db.getBlockIndex(hashAtHeight);
+      if (!idx) {
+        height++;
+        continue;
+      }
+
+      // Check if this block's parent chain contains the invalid block
+      // by comparing prevBlock
+      const prevBlockHash = idx.header.subarray(4, 36);
+      const prevIdx = await this.db.getBlockIndex(prevBlockHash);
+
+      if (prevIdx && prevIdx.status & (BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD)) {
+        // Parent is invalid, mark this as FAILED_CHILD
+        await this.db.updateBlockStatus(
+          hashAtHeight,
+          idx.status | BlockStatus.FAILED_CHILD
+        );
+      }
+
+      height++;
+    }
+  }
+
+  /**
+   * Remove the invalid flag from a block and its ancestors.
+   *
+   * If the reconsidered chain has more work than the current tip,
+   * triggers a reorganization.
+   *
+   * Reference: Bitcoin Core's Chainstate::ResetBlockFailureFlags (validation.cpp)
+   *
+   * @param blockHash - Hash of the block to reconsider
+   * @returns Result indicating success and number of blocks affected
+   */
+  async reconsiderBlock(blockHash: Buffer): Promise<ChainManagementResult> {
+    // Check if block exists
+    const blockIndex = await this.db.getBlockIndex(blockHash);
+    if (!blockIndex) {
+      return { success: false, error: "Block not found" };
+    }
+
+    // Check if actually invalid
+    const isInvalid = blockIndex.status & (BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD);
+    if (!isInvalid) {
+      return { success: true, blocksAffected: 0 };
+    }
+
+    // Clear invalid flags from this block and all ancestors
+    let blocksCleared = 0;
+    let currentHash = blockHash;
+
+    while (true) {
+      const idx = await this.db.getBlockIndex(currentHash);
+      if (!idx) break;
+
+      const wasInvalid = idx.status & (BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD);
+      if (!wasInvalid) break;
+
+      // Clear both flags
+      const newStatus =
+        idx.status & ~(BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD);
+      await this.db.updateBlockStatus(currentHash, newStatus);
+      blocksCleared++;
+
+      // Move to parent
+      const parentHash = idx.header.subarray(4, 36);
+      if (idx.height === 0) break;
+      currentHash = parentHash;
+    }
+
+    // Also clear flags from descendants of the reconsidered block
+    await this.clearDescendantInvalidFlags(blockHash, blockIndex.height);
+
+    // Check if we need to reorganize
+    // The reconsidered chain might now have more work than our current tip
+    // A full implementation would recalculate chainwork and potentially reorg.
+    // For now, return success and let the header sync handle reorg if needed.
+
+    return { success: true, blocksAffected: blocksCleared };
+  }
+
+  /**
+   * Clear FAILED_CHILD flags from descendants of a reconsidered block.
+   */
+  private async clearDescendantInvalidFlags(
+    parentHash: Buffer,
+    parentHeight: number
+  ): Promise<void> {
+    // Similar to markDescendantsInvalid, but clears flags instead
+    let height = parentHeight + 1;
+    while (height <= this.bestBlock.height + 1000) {
+      const hashAtHeight = await this.db.getBlockHashByHeight(height);
+      if (!hashAtHeight) break;
+
+      const idx = await this.db.getBlockIndex(hashAtHeight);
+      if (!idx) {
+        height++;
+        continue;
+      }
+
+      // Check if this block has FAILED_CHILD set
+      if (idx.status & BlockStatus.FAILED_CHILD) {
+        // Check if its parent is now valid
+        const prevBlockHash = idx.header.subarray(4, 36);
+        const prevIdx = await this.db.getBlockIndex(prevBlockHash);
+
+        const parentStillInvalid =
+          prevIdx &&
+          prevIdx.status & (BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD);
+
+        if (!parentStillInvalid) {
+          // Clear FAILED_CHILD flag
+          const newStatus = idx.status & ~BlockStatus.FAILED_CHILD;
+          await this.db.updateBlockStatus(hashAtHeight, newStatus);
+        }
+      }
+
+      height++;
+    }
+  }
+
+  /**
+   * Mark a block as "precious" for tie-breaking in chain selection.
+   *
+   * When multiple chains have equal work, the precious block's chain
+   * is preferred. This is a tie-breaker, not a fork override.
+   *
+   * Reference: Bitcoin Core's Chainstate::PreciousBlock (validation.cpp)
+   *
+   * @param blockHash - Hash of the block to mark as precious
+   * @returns Result indicating success
+   */
+  async preciousBlock(blockHash: Buffer): Promise<ChainManagementResult> {
+    // Check if block exists
+    const blockIndex = await this.db.getBlockIndex(blockHash);
+    if (!blockIndex) {
+      return { success: false, error: "Block not found" };
+    }
+
+    // Cannot make an invalid block precious
+    if (blockIndex.status & (BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD)) {
+      return { success: false, error: "Cannot mark invalid block as precious" };
+    }
+
+    // Calculate chain work for this block
+    // Note: Full implementation would need to track chainwork per block
+    const headerWork = this.calculateWork(
+      blockIndex.header.readUInt32LE(72) // bits field offset in header
+    );
+
+    // If the chain has been extended since last precious call, reset
+    if (this.bestBlock.chainWork > this.lastPreciousChainwork) {
+      this.blockSequenceId = -1;
+    }
+    this.lastPreciousChainwork = this.bestBlock.chainWork;
+
+    // Set this block as precious with negative sequence ID
+    // Lower sequence ID = higher priority in tie-breaking
+    this.preciousBlockHash = blockHash;
+    this.blockSequenceId--;
+
+    // If this block has equal or more work than our tip, we might want to switch
+    // For simplicity, we don't force a reorg here - that would require
+    // full chainwork calculation. Return success and let normal chain
+    // selection pick up the preference.
+
+    return { success: true, blocksAffected: 0 };
+  }
+
+  /**
+   * Check if a block is marked as invalid.
+   */
+  async isBlockInvalid(blockHash: Buffer): Promise<boolean> {
+    const idx = await this.db.getBlockIndex(blockHash);
+    if (!idx) return false;
+    return !!(idx.status & (BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD));
+  }
+
+  /**
+   * Check if a block is marked as precious.
+   */
+  isPreciousBlock(blockHash: Buffer): boolean {
+    return this.preciousBlockHash !== null && this.preciousBlockHash.equals(blockHash);
+  }
+
+  /**
+   * Get the precious block hash, if any.
+   */
+  getPreciousBlock(): Buffer | null {
+    return this.preciousBlockHash;
   }
 }
