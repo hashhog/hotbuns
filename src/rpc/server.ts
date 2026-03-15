@@ -529,6 +529,11 @@ export class RPCServer {
     // Pruning methods
     this.registerMethod("pruneblockchain", (params) => this.pruneBlockchain(params));
 
+    // Chain management methods
+    this.registerMethod("invalidateblock", (params) => this.invalidateBlockRPC(params));
+    this.registerMethod("reconsiderblock", (params) => this.reconsiderBlockRPC(params));
+    this.registerMethod("preciousblock", (params) => this.preciousBlockRPC(params));
+
     // Control methods
     this.registerMethod("stop", () => this.stopNode());
 
@@ -3051,6 +3056,107 @@ export class RPCServer {
     }
 
     return INITIAL_SUBSIDY >> BigInt(halvings);
+  }
+
+  // ========== Chain Management Methods ==========
+
+  /**
+   * invalidateblock: Manually invalidate a block and its descendants.
+   *
+   * @param params [blockhash] - Hash of the block to invalidate (hex string)
+   * @returns null on success
+   */
+  private async invalidateBlockRPC(params: unknown[]): Promise<null> {
+    const [blockhashParam] = params;
+
+    if (typeof blockhashParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
+    }
+
+    // Parse and validate hex
+    if (!/^[0-9a-fA-F]{64}$/.test(blockhashParam)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "Invalid block hash format"
+      );
+    }
+
+    // Convert to internal byte order (reversed)
+    const blockHash = Buffer.from(blockhashParam, "hex").reverse();
+
+    const result = await this.chainState.invalidateBlock(blockHash);
+
+    if (!result.success) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, result.error || "Block invalidation failed");
+    }
+
+    return null;
+  }
+
+  /**
+   * reconsiderblock: Remove invalidity status from a block and its ancestors.
+   *
+   * @param params [blockhash] - Hash of the block to reconsider (hex string)
+   * @returns null on success
+   */
+  private async reconsiderBlockRPC(params: unknown[]): Promise<null> {
+    const [blockhashParam] = params;
+
+    if (typeof blockhashParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
+    }
+
+    // Parse and validate hex
+    if (!/^[0-9a-fA-F]{64}$/.test(blockhashParam)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "Invalid block hash format"
+      );
+    }
+
+    // Convert to internal byte order (reversed)
+    const blockHash = Buffer.from(blockhashParam, "hex").reverse();
+
+    const result = await this.chainState.reconsiderBlock(blockHash);
+
+    if (!result.success) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, result.error || "Block reconsideration failed");
+    }
+
+    return null;
+  }
+
+  /**
+   * preciousblock: Mark a block as precious for tie-breaking in chain selection.
+   *
+   * @param params [blockhash] - Hash of the block to mark precious (hex string)
+   * @returns null on success
+   */
+  private async preciousBlockRPC(params: unknown[]): Promise<null> {
+    const [blockhashParam] = params;
+
+    if (typeof blockhashParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
+    }
+
+    // Parse and validate hex
+    if (!/^[0-9a-fA-F]{64}$/.test(blockhashParam)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "Invalid block hash format"
+      );
+    }
+
+    // Convert to internal byte order (reversed)
+    const blockHash = Buffer.from(blockhashParam, "hex").reverse();
+
+    const result = await this.chainState.preciousBlock(blockHash);
+
+    if (!result.success) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, result.error || "Block marking failed");
+    }
+
+    return null;
   }
 
   // ========== Helper Methods ==========
