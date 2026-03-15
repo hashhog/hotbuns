@@ -5,10 +5,11 @@
  * tracks peer quality via ban scores, and routes messages to handlers.
  */
 
-import { Peer, type PeerConfig, type PeerEvents, type PeerState } from "./peer.js";
+import { Peer, type PeerConfig, type PeerEvents, type PeerState, type OnBanCallback } from "./peer.js";
 import type { NetworkMessage, AddrPayload, NetworkAddress } from "./messages.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
+import { BanManager, DEFAULT_BAN_TIME, type BanEntry } from "./banman.js";
 
 /** Service bit flags for peer capabilities. */
 export const ServiceFlags = {
@@ -37,12 +38,18 @@ export interface PeerInfo {
   lastConnected: number;     // Unix timestamp
 }
 
-/** Ban score penalties for various infractions. */
+/**
+ * Ban score penalties for various infractions.
+ * Reference: Bitcoin Core net_processing.cpp Misbehaving() calls.
+ */
 export const BanScores = {
   INVALID_MESSAGE: 20,
+  INVALID_BLOCK_HEADER: 100, // Instant ban
   INVALID_BLOCK: 100,        // Instant ban
+  INVALID_TRANSACTION: 10,
+  UNSOLICITED_MESSAGE: 20,
+  PROTOCOL_VIOLATION: 10,
   SLOW_RESPONSE: 2,
-  PROTOCOL_VIOLATION: 50,
   UNREQUESTED_DATA: 10,
 } as const;
 
@@ -84,6 +91,7 @@ export class PeerManager {
   private running: boolean;
   private lastActivity: Map<string, number>;
   private connectingPeers: Set<string>;
+  private banManager: BanManager;
 
   constructor(config: PeerManagerConfig) {
     this.config = {
@@ -100,6 +108,7 @@ export class PeerManager {
     this.running = false;
     this.lastActivity = new Map();
     this.connectingPeers = new Set();
+    this.banManager = new BanManager(config.datadir);
   }
 
   /**
@@ -108,7 +117,8 @@ export class PeerManager {
   async start(): Promise<void> {
     this.running = true;
 
-    // Load persisted addresses
+    // Load ban list and persisted addresses
+    await this.banManager.load();
     await this.loadAddresses();
 
     // Resolve DNS seeds
@@ -175,8 +185,9 @@ export class PeerManager {
       this.peers.delete(key);
     }
 
-    // Save addresses before shutdown
+    // Save addresses and ban list before shutdown
     await this.saveAddresses();
+    await this.banManager.save();
   }
 
   /**
@@ -218,6 +229,11 @@ export class PeerManager {
   async connectPeer(host: string, port: number): Promise<Peer> {
     const key = `${host}:${port}`;
 
+    // Check if banned
+    if (this.banManager.isBanned(host)) {
+      throw new Error(`Peer ${host} is banned`);
+    }
+
     // Check if already connected or connecting
     if (this.peers.has(key)) {
       return this.peers.get(key)!;
@@ -247,7 +263,12 @@ export class PeerManager {
       onHandshakeComplete: (peer) => this.handleHandshakeComplete(peer),
     };
 
-    const peer = new Peer(config, events);
+    // Callback when peer reaches ban threshold
+    const onBan: OnBanCallback = (peer, reason) => {
+      this.banManager.ban(peer.host, DEFAULT_BAN_TIME, reason);
+    };
+
+    const peer = new Peer(config, events, onBan);
 
     try {
       await peer.connect();
@@ -286,18 +307,23 @@ export class PeerManager {
   /**
    * Disconnect a peer by key, optionally banning them.
    */
-  disconnectPeer(key: string, ban?: boolean): void {
+  disconnectPeer(key: string, ban?: boolean, reason?: string): void {
     const peer = this.peers.get(key);
     if (peer) {
       peer.disconnect(ban ? "banned" : "disconnect");
       this.peers.delete(key);
       this.lastActivity.delete(key);
+
+      if (ban) {
+        // Add to ban manager with 24-hour ban
+        this.banManager.ban(peer.host, DEFAULT_BAN_TIME, reason || "disconnected with ban");
+      }
     }
 
     if (ban) {
       const info = this.knownAddresses.get(key);
       if (info) {
-        info.banScore = 100; // Instant ban
+        info.banScore = 100; // Mark as banned in known addresses too
       }
     }
   }
@@ -342,19 +368,69 @@ export class PeerManager {
   /**
    * Increase ban score for a misbehaving peer.
    * Disconnects and bans if score reaches 100.
+   *
+   * This is a convenience method that delegates to peer.misbehaving().
    */
   increaseBanScore(peer: Peer, score: number, reason: string): void {
     const key = `${peer.host}:${peer.port}`;
     const info = this.knownAddresses.get(key);
 
+    // Update known address ban score
     if (info) {
       info.banScore += score;
+    }
 
-      if (info.banScore >= 100) {
-        console.log(`Banning peer ${key}: ${reason} (score: ${info.banScore})`);
-        this.disconnectPeer(key, true);
+    // Use the peer's misbehaving method which handles the actual banning
+    peer.misbehaving(score, reason);
+  }
+
+  /**
+   * Get the ban manager for RPC access.
+   */
+  getBanManager(): BanManager {
+    return this.banManager;
+  }
+
+  /**
+   * Check if an IP address is currently banned.
+   */
+  isBanned(address: string): boolean {
+    return this.banManager.isBanned(address);
+  }
+
+  /**
+   * Ban an IP address manually (via RPC).
+   */
+  banAddress(address: string, banTime: number = DEFAULT_BAN_TIME, reason: string = ""): void {
+    this.banManager.ban(address, banTime, reason);
+
+    // Disconnect any connected peers from this address
+    for (const [key, peer] of this.peers) {
+      if (peer.host === address) {
+        this.disconnectPeer(key, false, reason);
       }
     }
+  }
+
+  /**
+   * Unban an IP address manually (via RPC).
+   */
+  unbanAddress(address: string): boolean {
+    return this.banManager.unban(address);
+  }
+
+  /**
+   * Get list of all banned addresses.
+   */
+  listBanned(): BanEntry[] {
+    return this.banManager.getBanned();
+  }
+
+  /**
+   * Clear all bans.
+   */
+  clearBanned(): void {
+    this.banManager.clearBanned();
   }
 
   /**
@@ -460,8 +536,8 @@ export class PeerManager {
         continue;
       }
 
-      // Skip banned peers
-      if (info.banScore >= 100) {
+      // Skip banned peers (check both local score and ban manager)
+      if (info.banScore >= 100 || this.banManager.isBanned(info.host)) {
         continue;
       }
 
