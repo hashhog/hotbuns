@@ -12,6 +12,11 @@ import {
   compactToBigInt,
   bigIntToCompact,
 } from "../consensus/params.js";
+import {
+  getNextWorkRequired,
+  type BlockInfo,
+  type BlockLookup,
+} from "../consensus/pow.js";
 import type { Peer } from "../p2p/peer.js";
 import type { PeerManager } from "../p2p/manager.js";
 import type { NetworkMessage } from "../p2p/messages.js";
@@ -330,7 +335,8 @@ export class HeaderSync {
     }
 
     // 6. Difficulty matches expected (from retarget calculation or same as parent)
-    const expectedTarget = this.getNextTarget(parent);
+    // Pass the block's timestamp for testnet min-difficulty check
+    const expectedTarget = this.getNextTarget(parent, header.timestamp);
     const expectedBits = bigIntToCompact(expectedTarget);
 
     // Allow some tolerance for rounding in compact encoding
@@ -377,56 +383,44 @@ export class HeaderSync {
   /**
    * Calculate the expected difficulty target for a given height.
    *
-   * Difficulty adjustment happens every 2016 blocks.
-   * New target = old_target * actual_timespan / target_timespan
-   * Timespan is clamped to [targetTimespan/4, targetTimespan*4].
+   * Delegates to the pow module which handles all network-specific rules:
+   * - Mainnet: standard 2016-block retargeting
+   * - Testnet3: 20-minute min-difficulty rule with walk-back
+   * - Testnet4/BIP94: improved retargeting using first block of period
+   * - Regtest: always minimum difficulty
+   *
+   * @param parent - The parent block entry
+   * @param blockTimestamp - Timestamp of the new block (for testnet min-diff check)
    */
-  getNextTarget(parent: HeaderChainEntry): bigint {
-    const height = parent.height + 1;
-    const interval = this.params.difficultyAdjustmentInterval;
+  getNextTarget(parent: HeaderChainEntry, blockTimestamp?: number): bigint {
+    // Create block lookup function that uses our header chain
+    const getBlockByHeight: BlockLookup = (height: number): BlockInfo | undefined => {
+      const entry = this.headersByHeight.get(height);
+      if (!entry) {
+        return undefined;
+      }
+      return {
+        height: entry.height,
+        header: {
+          timestamp: entry.header.timestamp,
+          bits: entry.header.bits,
+        },
+      };
+    };
 
-    // If not at difficulty adjustment boundary, return same target
-    if (height % interval !== 0) {
-      return compactToBigInt(parent.header.bits);
-    }
+    // Create parent block info
+    const parentInfo: BlockInfo = {
+      height: parent.height,
+      header: {
+        timestamp: parent.header.timestamp,
+        bits: parent.header.bits,
+      },
+    };
 
-    // Find the block 2016 blocks ago
-    let firstEntry: HeaderChainEntry | undefined = parent;
-    for (let i = 0; i < interval - 1 && firstEntry; i++) {
-      const parentHashHex = firstEntry.header.prevBlock.toString("hex");
-      firstEntry = this.headerChain.get(parentHashHex);
-    }
+    // Use current time if no block timestamp provided (for non-testnet validation)
+    const timestamp = blockTimestamp ?? Math.floor(Date.now() / 1000);
 
-    if (!firstEntry) {
-      // Shouldn't happen if chain is consistent
-      return compactToBigInt(parent.header.bits);
-    }
-
-    // Calculate actual timespan
-    let actualTimespan = parent.header.timestamp - firstEntry.header.timestamp;
-
-    // Clamp timespan to [targetTimespan/4, targetTimespan*4]
-    const targetTimespan = this.params.targetTimespan;
-    const minTimespan = Math.floor(targetTimespan / 4);
-    const maxTimespan = targetTimespan * 4;
-
-    if (actualTimespan < minTimespan) {
-      actualTimespan = minTimespan;
-    }
-    if (actualTimespan > maxTimespan) {
-      actualTimespan = maxTimespan;
-    }
-
-    // Calculate new target
-    const oldTarget = compactToBigInt(parent.header.bits);
-    let newTarget = (oldTarget * BigInt(actualTimespan)) / BigInt(targetTimespan);
-
-    // Ensure new target does not exceed powLimit
-    if (newTarget > this.params.powLimit) {
-      newTarget = this.params.powLimit;
-    }
-
-    return newTarget;
+    return getNextWorkRequired(parentInfo, timestamp, this.params, getBlockByHeight);
   }
 
   /**
