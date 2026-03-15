@@ -24,7 +24,7 @@ import {
   type SigHashCache,
   type Transaction,
 } from "../validation/tx.js";
-import { ecdsaSign, ecdsaVerify, hash256 } from "../crypto/primitives.js";
+import { ecdsaSign, ecdsaVerify, hash256, runCryptoBenchmarks, printCryptoBenchmarks, getSha256Implementation } from "../crypto/primitives.js";
 import { REGTEST } from "../consensus/params.js";
 
 interface BenchmarkResult {
@@ -331,6 +331,32 @@ export async function benchBufferPool(count: number = 100000): Promise<void> {
 }
 
 /**
+ * Benchmark hardware-accelerated cryptographic operations.
+ */
+export async function benchCrypto(): Promise<void> {
+  console.log("\n=== Hardware-Accelerated Crypto Benchmark ===");
+  console.log(`Selected SHA-256 implementation: ${getSha256Implementation()}`);
+
+  const results = await runCryptoBenchmarks(10000);
+  printCryptoBenchmarks(results);
+
+  // Target verification
+  const targets = {
+    sha256: { value: results.sha256ThroughputMBps, target: 500, unit: "MB/s", name: "SHA-256 throughput" },
+    hash256: { value: results.hash256OpsPerSec, target: 100000, unit: "ops/sec", name: "Hash256 ops" },
+    merkle: { value: results.merkleRootTxsPerSec, target: 50000, unit: "txs/sec", name: "Merkle root" },
+    ecdsa: { value: results.ecdsaVerifyOpsPerSec, target: 5000, unit: "ops/sec", name: "ECDSA verify" },
+    schnorr: { value: results.schnorrVerifyOpsPerSec, target: 5000, unit: "ops/sec", name: "Schnorr verify" },
+  };
+
+  console.log("\n  Target verification:");
+  for (const [key, { value, target, unit, name }] of Object.entries(targets)) {
+    const status = value >= target ? "PASS" : "FAIL";
+    console.log(`    ${name}: ${value.toFixed(0)} ${unit} (target: ${target}) ${status}`);
+  }
+}
+
+/**
  * Run all benchmarks.
  */
 async function runAllBenchmarks(): Promise<void> {
@@ -342,6 +368,7 @@ async function runAllBenchmarks(): Promise<void> {
   console.log(`\nMemory usage before: ${Math.round(memBefore.heapUsed / 1024 / 1024)} MB`);
 
   try {
+    await benchCrypto();
     await benchDeserializeBlocks();
     await benchUTXOCache(100000);
     await benchSigVerify(5000);
