@@ -1262,6 +1262,29 @@ export class Mempool {
   }
 
   /**
+   * Get the minimum fee rate in sat/kvB (for BIP133 feefilter).
+   * Returns the current minimum relay fee rate * 1000.
+   */
+  getMinFeeRateKvB(): bigint {
+    return BigInt(Math.floor(this.minFeeRate * 1000));
+  }
+
+  /**
+   * Set the incremental relay fee rate (sat/vB).
+   * For RBF, replacement must pay at least this * newVsize more than replaced fees.
+   */
+  setIncrementalRelayFee(rate: number): void {
+    this.incrementalRelayFee = rate;
+  }
+
+  /**
+   * Get the incremental relay fee rate (sat/vB).
+   */
+  getIncrementalRelayFee(): number {
+    return this.incrementalRelayFee;
+  }
+
+  /**
    * Get mempool entry count.
    */
   getSize(): number {
