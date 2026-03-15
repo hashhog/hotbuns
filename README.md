@@ -34,7 +34,7 @@ hotbuns is a from-scratch Bitcoin full node written in TypeScript (Bun) that doe
 - [x] Mempool (cluster mempool, union-find clustering, linearization, mining scores, cluster-based eviction, full RBF, package relay, CPFP, v3/TRUC policy, ephemeral anchors)
 - [x] Fee estimation (confirmation buckets, historical data)
 - [x] Block template (tx selection, locktime finality, coinbase, witness commitment)
-- [x] RPC server (JSON-RPC 2.0, batch requests, Bitcoin Core-compatible: getblockchaininfo, getblock, getblockheader, getblockhash, getrawtransaction, sendrawtransaction, submitpackage, getmempoolinfo, getrawmempool, getmempoolentry, estimatesmartfee, getpeerinfo, getnetworkinfo, validateaddress, getblocktemplate, getdescriptorinfo, deriveaddresses, getzmqnotifications)
+- [x] RPC server (JSON-RPC 2.0, batch requests, Bitcoin Core-compatible: getblockchaininfo, getblock, getblockheader, getblockhash, getrawtransaction, sendrawtransaction, submitpackage, getmempoolinfo, getrawmempool, getmempoolentry, estimatesmartfee, getpeerinfo, getnetworkinfo, validateaddress, getblocktemplate, getdescriptorinfo, deriveaddresses, getzmqnotifications, generatetoaddress, generateblock, generatetodescriptor)
 - [x] REST API (read-only blockchain queries: /rest/block, /rest/headers, /rest/blockhashbyheight, /rest/tx, /rest/getutxos, /rest/mempool, JSON/bin/hex formats)
 - [x] HD wallet (BIP-32/44/49/84/86, P2PKH/P2SH-P2WPKH/P2WPKH/P2TR, BnB+Knapsack coin selection, encrypted storage)
 - [x] PSBT (BIP-174/370, partial signing, multi-party workflows, base64 encoding)
@@ -49,6 +49,7 @@ hotbuns is a from-scratch Bitcoin full node written in TypeScript (Bun) that doe
 - [x] ZMQ notifications (hashblock, hashtx, rawblock, rawtx, sequence topics, multipart messages)
 - [x] Tor/I2P proxy (SOCKS5 client, Tor control for hidden services, I2P SAM protocol, multi-network routing)
 - [x] CLI (start/stop, RPC client, wallet commands, --prune flag, --txindex flag)
+- [x] Regtest mode (instant block generation, generatetoaddress/generateblock/generatetodescriptor RPCs, min difficulty PoW)
 - [x] Test suite (unit, integration, e2e with regtest)
 - [x] Performance benchmarks (block deser, UTXO cache, sig verify)
 
