@@ -165,6 +165,7 @@ export class ChainStateManager {
   private utxo: UTXOManager;
   private params: ConsensusParams;
   private bestBlock: { hash: Buffer; height: number; chainWork: bigint };
+  private notificationEmitter: import("events").EventEmitter | null;
 
   constructor(db: ChainDB, params: ConsensusParams) {
     this.db = db;
@@ -176,6 +177,14 @@ export class ChainStateManager {
       height: 0,
       chainWork: 0n,
     };
+    this.notificationEmitter = null;
+  }
+
+  /**
+   * Set the notification event emitter for ZMQ.
+   */
+  setNotificationEmitter(emitter: import("events").EventEmitter): void {
+    this.notificationEmitter = emitter;
   }
 
   /**
@@ -341,6 +350,11 @@ export class ChainStateManager {
       bestHeight: height,
       totalWork: chainWork,
     });
+
+    // Emit notification for ZMQ
+    if (this.notificationEmitter) {
+      this.notificationEmitter.emit("blockConnected", block);
+    }
   }
 
   /**
@@ -424,6 +438,11 @@ export class ChainStateManager {
       bestHeight: prevHeight,
       totalWork: prevChainWork,
     });
+
+    // Emit notification for ZMQ
+    if (this.notificationEmitter) {
+      this.notificationEmitter.emit("blockDisconnected", block);
+    }
   }
 
   /**
