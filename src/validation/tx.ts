@@ -1319,3 +1319,171 @@ export function verifyAllInputsSequential(
 
   return { valid: true };
 }
+
+// =============================================================================
+// BIP68 Sequence Lock Implementation
+// =============================================================================
+
+/**
+ * BIP68 sequence lock constants.
+ *
+ * References:
+ * - BIP68: https://github.com/bitcoin/bips/blob/master/bip-0068.mediawiki
+ * - Bitcoin Core: /src/consensus/tx_verify.cpp (CalculateSequenceLocks, EvaluateSequenceLocks)
+ */
+
+/** If this flag is set on sequence, BIP68 is disabled for that input. */
+export const SEQUENCE_LOCKTIME_DISABLE_FLAG = 1 << 31;
+
+/** If this flag is set, the lock is time-based; otherwise block-based. */
+export const SEQUENCE_LOCKTIME_TYPE_FLAG = 1 << 22;
+
+/** Mask for the relative lock value (lower 16 bits). */
+export const SEQUENCE_LOCKTIME_MASK = 0x0000ffff;
+
+/** Granularity for time-based locks: 512 seconds (9 minutes). */
+export const SEQUENCE_LOCKTIME_GRANULARITY = 9;
+
+/** Final sequence value (no relative timelock). */
+export const SEQUENCE_FINAL = 0xffffffff;
+
+/**
+ * UTXO confirmation info needed for sequence lock validation.
+ * This includes the height at which the UTXO was confirmed and the
+ * median time past (MTP) of the block *prior* to that block.
+ */
+export interface UTXOConfirmation {
+  /** Height at which the UTXO's transaction was confirmed. */
+  height: number;
+  /** Median time past of the block *before* the UTXO was mined (for time locks). */
+  medianTimePast: number;
+}
+
+/**
+ * Result of sequence lock calculation.
+ */
+export interface SequenceLockResult {
+  /** Minimum block height that must be reached (or -1 if no height lock). */
+  minHeight: number;
+  /** Minimum MTP that must be reached (or -1 if no time lock). */
+  minTime: number;
+}
+
+/**
+ * Calculate the sequence locks for a transaction.
+ *
+ * For each input with BIP68 active (nSequence bit 31 clear and tx version >= 2):
+ * - If bit 22 is set: time-based lock using 512-second granularity
+ * - If bit 22 is clear: height-based lock
+ *
+ * The returned values use nLockTime semantics: they represent the *last invalid*
+ * height/time. A transaction is valid when block.height > minHeight AND
+ * block.prevMTP > minTime.
+ *
+ * @param tx - The transaction to check
+ * @param enforceBIP68 - Whether BIP68 is active (true if height >= CSV activation)
+ * @param utxoConfirmations - Confirmation info for each input's UTXO
+ * @returns The minimum height and time locks
+ */
+export function calculateSequenceLocks(
+  tx: Transaction,
+  enforceBIP68: boolean,
+  utxoConfirmations: UTXOConfirmation[]
+): SequenceLockResult {
+  // Use -1 to indicate "any height/time is valid" (nLockTime semantics)
+  let minHeight = -1;
+  let minTime = -1;
+
+  // BIP68 only applies to transactions with version >= 2
+  if (!enforceBIP68 || tx.version < 2) {
+    return { minHeight, minTime };
+  }
+
+  if (utxoConfirmations.length !== tx.inputs.length) {
+    throw new Error("UTXO confirmation count must match input count");
+  }
+
+  for (let i = 0; i < tx.inputs.length; i++) {
+    const input = tx.inputs[i];
+    const nSequence = input.sequence;
+
+    // Bit 31 set means BIP68 is disabled for this input
+    // Use >>> 0 to ensure unsigned comparison (JS bitwise operates on signed 32-bit)
+    if ((nSequence >>> 0) & SEQUENCE_LOCKTIME_DISABLE_FLAG) {
+      continue;
+    }
+
+    const utxoConf = utxoConfirmations[i];
+    const lockValue = nSequence & SEQUENCE_LOCKTIME_MASK;
+
+    if (nSequence & SEQUENCE_LOCKTIME_TYPE_FLAG) {
+      // Time-based lock
+      // Lock is relative to the MTP of the block *before* the UTXO was mined
+      const nCoinTime = utxoConf.medianTimePast;
+      // The lock is in 512-second units (left shift by SEQUENCE_LOCKTIME_GRANULARITY)
+      // Subtract 1 to convert to nLockTime semantics (last invalid time)
+      const lockTime = nCoinTime + (lockValue << SEQUENCE_LOCKTIME_GRANULARITY) - 1;
+      minTime = Math.max(minTime, lockTime);
+    } else {
+      // Height-based lock
+      // Lock is relative to the height at which the UTXO was mined
+      // Subtract 1 to convert to nLockTime semantics (last invalid height)
+      const lockHeight = utxoConf.height + lockValue - 1;
+      minHeight = Math.max(minHeight, lockHeight);
+    }
+  }
+
+  return { minHeight, minTime };
+}
+
+/**
+ * Evaluate whether sequence locks are satisfied at a given block.
+ *
+ * The transaction is valid if:
+ * - The block height is GREATER than minHeight (minHeight is last invalid)
+ * - The previous block's MTP is GREATER than minTime (minTime is last invalid)
+ *
+ * @param blockHeight - The height of the block being validated
+ * @param blockPrevMTP - The median time past of the *previous* block
+ * @param locks - The sequence locks to check
+ * @returns true if all sequence locks are satisfied
+ */
+export function evaluateSequenceLocks(
+  blockHeight: number,
+  blockPrevMTP: number,
+  locks: SequenceLockResult
+): boolean {
+  // minHeight/minTime use nLockTime semantics (last invalid value)
+  // So we need height > minHeight and prevMTP > minTime
+  if (locks.minHeight >= blockHeight) {
+    return false;
+  }
+  if (locks.minTime >= blockPrevMTP) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Check if a transaction's sequence locks are satisfied.
+ *
+ * This is the main entry point for BIP68 validation, combining
+ * calculateSequenceLocks and evaluateSequenceLocks.
+ *
+ * @param tx - The transaction to validate
+ * @param enforceBIP68 - Whether BIP68 is active
+ * @param blockHeight - Height of the block being validated
+ * @param blockPrevMTP - MTP of the previous block
+ * @param utxoConfirmations - Confirmation info for each input's UTXO
+ * @returns true if sequence locks are satisfied
+ */
+export function checkSequenceLocks(
+  tx: Transaction,
+  enforceBIP68: boolean,
+  blockHeight: number,
+  blockPrevMTP: number,
+  utxoConfirmations: UTXOConfirmation[]
+): boolean {
+  const locks = calculateSequenceLocks(tx, enforceBIP68, utxoConfirmations);
+  return evaluateSequenceLocks(blockHeight, blockPrevMTP, locks);
+}
