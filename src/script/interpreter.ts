@@ -404,6 +404,59 @@ export function parseScript(raw: Buffer): Script {
 }
 
 /**
+ * Check if a raw script contains only push operations.
+ *
+ * Push operations are:
+ * - OP_0 (0x00)
+ * - Direct data pushes (0x01-0x4b, where opcode = number of bytes)
+ * - OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHDATA4 (0x4c-0x4e)
+ * - OP_1NEGATE (0x4f)
+ * - OP_RESERVED (0x50) - considered push-only (but fails on execution)
+ * - OP_1 through OP_16 (0x51-0x60)
+ *
+ * This is consensus-critical for P2SH (BIP16).
+ * Reference: Bitcoin Core script.cpp IsPushOnly()
+ */
+export function isPushOnly(script: Buffer): boolean {
+  let i = 0;
+
+  while (i < script.length) {
+    const opcode = script[i];
+    i++;
+
+    // Any opcode > OP_16 is not a push
+    if (opcode > Opcode.OP_16) {
+      return false;
+    }
+
+    // For data push opcodes, skip over the pushed data
+    if (opcode >= 1 && opcode <= 75) {
+      // Direct push: opcode is the number of bytes
+      if (i + opcode > script.length) return false; // Truncated
+      i += opcode;
+    } else if (opcode === Opcode.OP_PUSHDATA1) {
+      if (i >= script.length) return false;
+      const len = script[i];
+      if (i + 1 + len > script.length) return false; // Truncated
+      i += 1 + len;
+    } else if (opcode === Opcode.OP_PUSHDATA2) {
+      if (i + 2 > script.length) return false;
+      const len = script[i] | (script[i + 1] << 8);
+      if (i + 2 + len > script.length) return false; // Truncated
+      i += 2 + len;
+    } else if (opcode === Opcode.OP_PUSHDATA4) {
+      if (i + 4 > script.length) return false;
+      const len = script[i] | (script[i + 1] << 8) | (script[i + 2] << 16) | (script[i + 3] << 24);
+      if (i + 4 + len > script.length) return false; // Truncated
+      i += 4 + len;
+    }
+    // OP_0, OP_1NEGATE, OP_RESERVED, OP_1-OP_16 are all <= OP_16 and don't push extra data
+  }
+
+  return true;
+}
+
+/**
  * Serialize a parsed script back to raw bytes.
  */
 export function serializeScript(script: Script): Buffer {
@@ -1305,9 +1358,10 @@ export function verifyScript(
 
   // Step 3: P2SH evaluation
   if (flags.verifyP2SH && isP2SH(scriptPubKey)) {
-    // scriptSig must be push-only for P2SH
-    if (!parsedSig.every((chunk) => chunk.data !== undefined || chunk.opcode <= Opcode.OP_16)) {
-      return false;
+    // scriptSig must be push-only for P2SH (BIP16)
+    // This is enforced unconditionally for P2SH, separate from SCRIPT_VERIFY_SIGPUSHONLY
+    if (!isPushOnly(scriptSig)) {
+      throw new ScriptError("SIG_PUSHONLY");
     }
 
     if (stackCopy.length === 0) {
