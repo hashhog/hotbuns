@@ -115,6 +115,12 @@ export class Peer {
   blocksInFlight: Map<string, number>;
   /** Best known height from this peer (from version message or updates). */
   bestKnownHeight: number;
+  /**
+   * Whether peer has signaled support for receiving ADDRv2 (BIP155) messages.
+   * Set when we receive sendaddrv2 message during handshake.
+   * When true, we should send addrv2 instead of addr to this peer.
+   */
+  wantsAddrV2: boolean;
 
   private socket: Socket | null;
   private recvBuffer: Buffer;
@@ -163,6 +169,7 @@ export class Peer {
     this.connectedTime = Date.now();
     this.blocksInFlight = new Map();
     this.bestKnownHeight = 0;
+    this.wantsAddrV2 = false;
     // Register our nonce for self-connection detection
     Peer.localNonces.add(this.ourNonce);
   }
@@ -523,6 +530,17 @@ export class Peer {
         // They acknowledged our version
         this.receivedVerack = true;
         this.checkHandshakeComplete();
+        break;
+
+      case "sendaddrv2":
+        // BIP155: Peer wants to receive ADDRv2 messages instead of ADDR.
+        // This message must arrive between VERSION and VERACK.
+        // If we receive it after handshake, it's a protocol violation.
+        if (this.handshakeComplete) {
+          this.misbehaving(10, "sendaddrv2 received after verack");
+          return;
+        }
+        this.wantsAddrV2 = true;
         break;
 
       default:
