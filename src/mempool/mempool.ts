@@ -67,6 +67,14 @@ export interface MempoolEntry {
   spentBy: Set<string>;
   /** Set of txids (hex) that this transaction depends on (parents in mempool). */
   dependsOn: Set<string>;
+  /** Cached ancestor count (including self). */
+  ancestorCount: number;
+  /** Cached total ancestor size in vbytes (including self). */
+  ancestorSize: number;
+  /** Cached descendant count (including self). */
+  descendantCount: number;
+  /** Cached total descendant size in vbytes (including self). */
+  descendantSize: number;
 }
 
 /**
@@ -330,6 +338,9 @@ export class Mempool {
       }
     }
 
+    // Calculate ancestor stats before creating entry
+    const { ancestorCount, ancestorSize } = this.calculateAncestorStats(parentTxids, vsize);
+
     // Create the mempool entry
     const entry: MempoolEntry = {
       tx,
@@ -342,19 +353,26 @@ export class Mempool {
       height: this.tipHeight,
       spentBy: new Set(),
       dependsOn: parentTxids,
+      ancestorCount,
+      ancestorSize,
+      descendantCount: 1, // Only self initially
+      descendantSize: vsize,
     };
 
     // Add to mempool
     this.entries.set(txidHex, entry);
     this.currentSize += vsize;
 
-    // Update parent entries' spentBy
+    // Update parent entries' spentBy and descendant stats
     for (const parentTxidHex of parentTxids) {
       const parent = this.entries.get(parentTxidHex);
       if (parent) {
         parent.spentBy.add(txidHex);
       }
     }
+
+    // Update all ancestors' descendant counts
+    this.updateAncestorDescendantStats(txidHex, vsize);
 
     // Index the spent outpoints
     for (const input of tx.inputs) {
@@ -389,6 +407,16 @@ export class Mempool {
       for (const childTxidHex of entry.spentBy) {
         const childTxid = Buffer.from(childTxidHex, "hex");
         this.removeTransaction(childTxid, true);
+      }
+    }
+
+    // Update ancestors' descendant stats before removing
+    const ancestors = this.getAncestorSet(entry.dependsOn);
+    for (const ancestorTxidHex of ancestors) {
+      const ancestor = this.entries.get(ancestorTxidHex);
+      if (ancestor) {
+        ancestor.descendantCount -= 1;
+        ancestor.descendantSize -= entry.vsize;
       }
     }
 
@@ -481,6 +509,49 @@ export class Mempool {
         }
       }
     }
+
+    // Recalculate cached stats for all remaining entries
+    this.recalculateAllStats();
+  }
+
+  /**
+   * Recalculate all cached ancestor/descendant stats.
+   * Called after bulk operations like removeForBlock.
+   */
+  private recalculateAllStats(): void {
+    // Reset all stats
+    for (const entry of this.entries.values()) {
+      entry.ancestorCount = 1; // Self
+      entry.ancestorSize = entry.vsize;
+      entry.descendantCount = 1; // Self
+      entry.descendantSize = entry.vsize;
+    }
+
+    // Recalculate ancestors for each entry
+    for (const [txidHex, entry] of this.entries) {
+      const ancestors = this.getAncestorSet(entry.dependsOn);
+      let ancestorSize = entry.vsize;
+      for (const ancestorTxidHex of ancestors) {
+        const ancestor = this.entries.get(ancestorTxidHex);
+        if (ancestor) {
+          ancestorSize += ancestor.vsize;
+        }
+      }
+      entry.ancestorCount = ancestors.size + 1;
+      entry.ancestorSize = ancestorSize;
+    }
+
+    // Recalculate descendants: for each entry, increment all its ancestors' descendant counts
+    for (const [txidHex, entry] of this.entries) {
+      const ancestors = this.getAncestorSet(entry.dependsOn);
+      for (const ancestorTxidHex of ancestors) {
+        const ancestor = this.entries.get(ancestorTxidHex);
+        if (ancestor) {
+          ancestor.descendantCount += 1;
+          ancestor.descendantSize += entry.vsize;
+        }
+      }
+    }
   }
 
   /**
@@ -564,36 +635,15 @@ export class Mempool {
     parentTxids: Set<string>,
     newTxVsize: number
   ): { valid: boolean; error?: string } {
-    // Count all ancestors (including parents of parents)
-    const ancestors = new Set<string>();
-    let ancestorSize = newTxVsize;
-    const queue = Array.from(parentTxids);
-
-    while (queue.length > 0) {
-      const txidHex = queue.shift()!;
-
-      if (ancestors.has(txidHex)) continue;
-      ancestors.add(txidHex);
-
-      const entry = this.entries.get(txidHex);
-      if (entry) {
-        ancestorSize += entry.vsize;
-
-        // Add this entry's parents to the queue
-        for (const parentTxidHex of entry.dependsOn) {
-          if (!ancestors.has(parentTxidHex)) {
-            queue.push(parentTxidHex);
-          }
-        }
-      }
-    }
+    // Calculate ancestor stats
+    const { ancestorCount, ancestorSize } = this.calculateAncestorStats(parentTxids, newTxVsize);
 
     // The limit includes the new transaction itself
-    // So if ancestors.size >= MAX_ANCESTORS, adding this tx would exceed the limit
-    if (ancestors.size >= MAX_ANCESTORS) {
+    // So if ancestorCount > MAX_ANCESTORS, it exceeds the limit
+    if (ancestorCount > MAX_ANCESTORS) {
       return {
         valid: false,
-        error: `Too many ancestors: ${ancestors.size} >= ${MAX_ANCESTORS}`,
+        error: `Too many ancestors: ${ancestorCount} > ${MAX_ANCESTORS}`,
       };
     }
 
@@ -604,15 +654,18 @@ export class Mempool {
       };
     }
 
-    // Check descendant limits for each parent
-    for (const parentTxidHex of parentTxids) {
-      const parent = this.entries.get(parentTxidHex);
-      if (parent) {
-        const descendantCount = this.countDescendants(parentTxidHex);
-        if (descendantCount >= MAX_DESCENDANTS) {
+    // Check descendant limits for each ancestor
+    // Adding this tx would increase each ancestor's descendant count by 1
+    const allAncestors = this.getAncestorSet(parentTxids);
+    for (const ancestorTxidHex of allAncestors) {
+      const ancestor = this.entries.get(ancestorTxidHex);
+      if (ancestor) {
+        // Use cached descendant count - adding this tx would add 1 more
+        const newDescendantCount = ancestor.descendantCount + 1;
+        if (newDescendantCount > MAX_DESCENDANTS) {
           return {
             valid: false,
-            error: `Parent ${parentTxidHex.slice(0, 16)}... has too many descendants: ${descendantCount} >= ${MAX_DESCENDANTS}`,
+            error: `Ancestor ${ancestorTxidHex.slice(0, 16)}... would have too many descendants: ${newDescendantCount} > ${MAX_DESCENDANTS}`,
           };
         }
       }
@@ -622,7 +675,74 @@ export class Mempool {
   }
 
   /**
-   * Count the number of descendants for a transaction.
+   * Calculate ancestor count and size for a new transaction.
+   */
+  private calculateAncestorStats(
+    parentTxids: Set<string>,
+    newTxVsize: number
+  ): { ancestorCount: number; ancestorSize: number } {
+    const ancestors = this.getAncestorSet(parentTxids);
+
+    let ancestorSize = newTxVsize; // Include self
+    for (const txidHex of ancestors) {
+      const entry = this.entries.get(txidHex);
+      if (entry) {
+        ancestorSize += entry.vsize;
+      }
+    }
+
+    return {
+      ancestorCount: ancestors.size + 1, // +1 for self
+      ancestorSize,
+    };
+  }
+
+  /**
+   * Get the set of all ancestor txids (not including self).
+   */
+  private getAncestorSet(parentTxids: Set<string>): Set<string> {
+    const ancestors = new Set<string>();
+    const queue = Array.from(parentTxids);
+
+    while (queue.length > 0) {
+      const txidHex = queue.shift()!;
+
+      if (ancestors.has(txidHex)) continue;
+      ancestors.add(txidHex);
+
+      const entry = this.entries.get(txidHex);
+      if (entry) {
+        for (const parentTxidHex of entry.dependsOn) {
+          if (!ancestors.has(parentTxidHex)) {
+            queue.push(parentTxidHex);
+          }
+        }
+      }
+    }
+
+    return ancestors;
+  }
+
+  /**
+   * Update all ancestors' descendant counts when a new tx is added.
+   */
+  private updateAncestorDescendantStats(newTxidHex: string, newTxVsize: number): void {
+    const entry = this.entries.get(newTxidHex);
+    if (!entry) return;
+
+    const ancestors = this.getAncestorSet(entry.dependsOn);
+    for (const ancestorTxidHex of ancestors) {
+      const ancestor = this.entries.get(ancestorTxidHex);
+      if (ancestor) {
+        ancestor.descendantCount += 1;
+        ancestor.descendantSize += newTxVsize;
+      }
+    }
+  }
+
+  /**
+   * Count the number of descendants for a transaction (using BFS, not cache).
+   * This is used for verification/debugging.
    */
   private countDescendants(txidHex: string): number {
     const descendants = new Set<string>();
