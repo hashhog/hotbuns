@@ -18,7 +18,7 @@ import {
   MINIMUM_CONNECT_TIME_MS,
   MAX_OUTBOUND_PEERS_TO_PROTECT,
 } from "./peer.js";
-import type { NetworkMessage, AddrPayload, NetworkAddress, AddrV2Payload } from "./messages.js";
+import type { NetworkMessage, AddrPayload, NetworkAddress, AddrV2Payload, FeeFilterPayload } from "./messages.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { BanManager, DEFAULT_BAN_TIME, type BanEntry } from "./banman.js";
@@ -31,6 +31,12 @@ import {
   isAddrV1Compatible,
   formatNetworkAddressV2,
 } from "./addrv2.js";
+import {
+  FeeFilterManager,
+  meetsFeeFilter,
+  MAX_MONEY,
+  FEEFILTER_VERSION,
+} from "./feefilter.js";
 
 /** Service bit flags for peer capabilities. */
 export const ServiceFlags = {
@@ -256,6 +262,10 @@ export class PeerManager {
   private protectedPeers: Set<string>;
   /** Last time we updated our tip. */
   private lastTipUpdateTime: number;
+  /** BIP133 feefilter manager. */
+  private feeFilterManager: FeeFilterManager;
+  /** Interval for periodic feefilter checks. */
+  private feeFilterInterval: ReturnType<typeof setInterval> | null;
 
   constructor(config: PeerManagerConfig) {
     this.config = {
@@ -283,6 +293,11 @@ export class PeerManager {
     this.staleCheckInterval = null;
     this.protectedPeers = new Set();
     this.lastTipUpdateTime = Date.now();
+    // Initialize feefilter manager with send callback
+    this.feeFilterManager = new FeeFilterManager((peer, feeRate) => {
+      peer.send({ type: "feefilter", payload: { feeRate } });
+    });
+    this.feeFilterInterval = null;
   }
 
   /**
@@ -1226,6 +1241,15 @@ export class PeerManager {
       info.lastSeen = Date.now();
     }
 
+    // Send initial feefilter if this isn't a block-relay-only peer
+    // BIP133: peers supporting feefilter (>= 70013) receive our min fee rate
+    const connType = this.peerConnectionType.get(key);
+    if (connType !== "block_relay" && peer.versionPayload) {
+      if (peer.versionPayload.version >= FEEFILTER_VERSION) {
+        this.feeFilterManager.sendInitialFeeFilter(peer);
+      }
+    }
+
     // Emit connect event to handlers
     const handlers = this.messageHandlers.get("__connect__") ?? [];
     for (const handler of handlers) {
@@ -1249,6 +1273,9 @@ export class PeerManager {
       this.handleAddrMessage(peer, msg.payload);
     } else if (msg.type === "addrv2") {
       this.handleAddrV2Message(peer, msg.payload);
+    } else if (msg.type === "feefilter") {
+      // BIP133: Handle received feefilter
+      this.handleFeeFilterMessage(peer, msg.payload);
     }
 
     // Dispatch to registered handlers
@@ -1911,6 +1938,52 @@ export class PeerManager {
       if (connType === "block_relay") count++;
     }
     return count;
+  }
+
+  // ============================================================================
+  // BIP133 FeeFilter
+  // ============================================================================
+
+  /**
+   * Handle received feefilter message from a peer.
+   * Reference: Bitcoin Core net_processing.cpp ProcessMessage() for "feefilter"
+   */
+  private handleFeeFilterMessage(peer: Peer, payload: FeeFilterPayload): void {
+    this.feeFilterManager.handleFeeFilter(peer, payload.feeRate);
+  }
+
+  /**
+   * Update the minimum fee rate for feefilter broadcasts.
+   * Called when mempool minimum fee changes.
+   * @param feeRate - Fee rate in sat/kvB (NOT sat/vB)
+   */
+  setMinFeeRate(feeRate: bigint): void {
+    this.feeFilterManager.setMinFeeRate(feeRate);
+  }
+
+  /**
+   * Set whether we're in initial block download.
+   * During IBD, we send MAX_MONEY as feefilter to suppress tx relay.
+   */
+  setInIBD(inIBD: boolean): void {
+    this.feeFilterManager.setInIBD(inIBD);
+  }
+
+  /**
+   * Check if a transaction's fee rate meets a peer's feefilter threshold.
+   * @param peer - The peer to check against
+   * @param txFeeRate - Transaction fee rate in sat/vB
+   * @returns true if the transaction should be relayed to this peer
+   */
+  passesFeeFilter(peer: Peer, txFeeRate: number): boolean {
+    return meetsFeeFilter(txFeeRate, peer.feeFilterReceived);
+  }
+
+  /**
+   * Get the fee filter manager (for testing).
+   */
+  getFeeFilterManager(): FeeFilterManager {
+    return this.feeFilterManager;
   }
 }
 
