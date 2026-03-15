@@ -30,6 +30,52 @@ import { hash256 } from "../crypto/primitives.js";
 import { BufferWriter, varIntSize } from "../wire/serialization.js";
 
 /**
+ * Locktime threshold: values below this are block heights, above are Unix timestamps.
+ * Per BIP-113 and consensus rules.
+ */
+const LOCKTIME_THRESHOLD = 500_000_000;
+
+/**
+ * Check if a transaction is final for inclusion in a block at the given height and time.
+ *
+ * A transaction is final if:
+ * - nLockTime == 0, OR
+ * - nLockTime < threshold (block height or time depending on LOCKTIME_THRESHOLD), OR
+ * - All inputs have nSequence == 0xFFFFFFFF
+ *
+ * Reference: Bitcoin Core's IsFinalTx() in consensus/tx_verify.cpp
+ *
+ * @param tx - The transaction to check
+ * @param blockHeight - The height of the block being assembled
+ * @param blockTime - The median time past (MTP) of the previous block
+ * @returns true if the transaction is final
+ */
+export function isFinalTx(tx: Transaction, blockHeight: number, blockTime: number): boolean {
+  // nLockTime == 0 means always final
+  if (tx.lockTime === 0) {
+    return true;
+  }
+
+  // Determine if locktime is height-based or time-based
+  const lockTimeThreshold = tx.lockTime < LOCKTIME_THRESHOLD ? blockHeight : blockTime;
+
+  // If nLockTime is less than the threshold, the tx is final
+  if (tx.lockTime < lockTimeThreshold) {
+    return true;
+  }
+
+  // Even if nLockTime isn't satisfied, a transaction is still final if all
+  // inputs have nSequence == 0xFFFFFFFF (SEQUENCE_FINAL)
+  for (const input of tx.inputs) {
+    if (input.sequence !== 0xffffffff) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
  * A complete block template ready for mining.
  */
 export interface BlockTemplate {
@@ -75,10 +121,33 @@ export class BlockTemplateBuilder {
   private chainState: ChainStateManager;
   private params: ConsensusParams;
 
+  /**
+   * Median time past for locktime validation.
+   * Set via setMedianTimePast() or automatically calculated if available.
+   */
+  private medianTimePast: number = 0;
+
   constructor(mempool: Mempool, chainState: ChainStateManager, params: ConsensusParams) {
     this.mempool = mempool;
     this.chainState = chainState;
     this.params = params;
+  }
+
+  /**
+   * Set the median time past for locktime validation.
+   * This should be the MTP of the previous block (the block we're building on top of).
+   *
+   * @param mtp - The median time past in Unix timestamp seconds
+   */
+  setMedianTimePast(mtp: number): void {
+    this.medianTimePast = mtp;
+  }
+
+  /**
+   * Get the current median time past.
+   */
+  getMedianTimePast(): number {
+    return this.medianTimePast;
   }
 
   /**
@@ -173,10 +242,15 @@ export class BlockTemplateBuilder {
    * - Maximum block weight (minus coinbase reserve)
    * - Maximum sigops cost
    * - Parent-child dependencies (parent must be included before child)
+   * - Transaction locktime (must be final at the target block height/time)
    */
   private selectTransactions(): { txs: MempoolEntry[]; totalFees: bigint; totalWeight: number } {
     const maxWeight = this.params.maxBlockWeight - COINBASE_WEIGHT_RESERVE - 80 * 4; // Subtract header weight too
     const maxSigOps = this.params.maxBlockSigOpsCost;
+
+    // Get target block height for locktime validation
+    const bestBlock = this.chainState.getBestBlock();
+    const targetHeight = bestBlock.height + 1;
 
     // Get all mempool entries sorted by fee rate (descending)
     const entries = this.mempool.getTransactionsByFeeRate();
@@ -189,6 +263,9 @@ export class BlockTemplateBuilder {
 
     // Track which entries we've processed to avoid re-checking
     const processed = new Set<string>();
+
+    // Track entries that are not final (for skipping)
+    const notFinal = new Set<string>();
 
     // Helper to check if all dependencies are satisfied
     const canInclude = (entry: MempoolEntry): boolean => {
@@ -206,6 +283,16 @@ export class BlockTemplateBuilder {
 
       if (selectedTxids.has(txidHex)) {
         return true; // Already selected
+      }
+
+      // Check if this transaction is final
+      if (notFinal.has(txidHex)) {
+        return false;
+      }
+
+      if (!isFinalTx(entry.tx, targetHeight, this.medianTimePast)) {
+        notFinal.add(txidHex);
+        return false;
       }
 
       // First, recursively add all ancestors
