@@ -21,11 +21,15 @@ export const ServiceFlags = {
 
 /** Configuration for the peer manager. */
 export interface PeerManagerConfig {
-  maxOutbound: number;       // default 8
+  maxOutbound: number;       // default 8 full-relay + 2 block-relay
   maxInbound: number;        // default 117
   params: ConsensusParams;
   bestHeight: number;
   datadir: string;
+  /** Maximum full-relay outbound connections (default: 8) */
+  maxOutboundFullRelay?: number;
+  /** Maximum block-relay-only outbound connections (default: 2) */
+  maxOutboundBlockRelay?: number;
 }
 
 /** Stored information about a known peer address. */
@@ -36,6 +40,16 @@ export interface PeerInfo {
   lastSeen: number;          // Unix timestamp
   banScore: number;
   lastConnected: number;     // Unix timestamp
+  /** Connection type when connected */
+  connectionType?: ConnectionType;
+  /** Time when peer was connected (for eviction) */
+  connectedTime?: number;
+  /** Minimum ping latency observed */
+  minPingTime?: number;
+  /** Last time peer sent us a block */
+  lastBlockTime?: number;
+  /** Last time peer sent us a transaction */
+  lastTxTime?: number;
 }
 
 /**
@@ -72,6 +86,107 @@ const FALLBACK_PEERS: Record<number, Array<{ host: string; port: number }>> = {
 /** Database prefix for peer addresses. */
 export const DB_PREFIX_PEERS = 0x70; // 'p'
 
+/** Maximum outbound full-relay connections. */
+export const MAX_OUTBOUND_FULL_RELAY = 8;
+
+/** Maximum outbound block-relay-only connections. */
+export const MAX_OUTBOUND_BLOCK_RELAY = 2;
+
+/** Maximum anchor connections to persist. */
+export const MAX_BLOCK_RELAY_ONLY_ANCHORS = 2;
+
+/** Protection counts for inbound eviction (per category). */
+export const EVICTION_PROTECT_NETGROUP = 4;
+export const EVICTION_PROTECT_PING = 8;
+export const EVICTION_PROTECT_TX = 4;
+export const EVICTION_PROTECT_BLOCKS = 4;
+export const EVICTION_PROTECT_BLOCK_RELAY = 8;
+
+/** Connection type for outbound connections. */
+export type ConnectionType = "full_relay" | "block_relay" | "inbound";
+
+/**
+ * Compute the network group for an IP address.
+ *
+ * For IPv4: uses /16 prefix (first two octets)
+ * For IPv6: uses /32 prefix (first four bytes)
+ *
+ * This ensures outbound connections are distributed across different
+ * network groups, making eclipse attacks much harder.
+ *
+ * Reference: Bitcoin Core netgroup.cpp GetGroup()
+ */
+export function getNetGroup(addr: string): string {
+  // Check if IPv6
+  if (addr.includes(":")) {
+    // IPv6 address - use /32 prefix
+    const parts = addr.split(":");
+    if (parts.length >= 2) {
+      // Expand :: notation if present
+      const fullParts: string[] = [];
+      let seenDoubleColon = false;
+      for (const part of parts) {
+        if (part === "" && !seenDoubleColon) {
+          seenDoubleColon = true;
+          // Fill in zeros for the missing parts
+          const missing = 8 - parts.filter((p) => p !== "").length;
+          for (let i = 0; i < missing + 1; i++) {
+            fullParts.push("0000");
+          }
+        } else if (part !== "") {
+          fullParts.push(part.padStart(4, "0"));
+        }
+      }
+      // /32 = first 2 groups (4 bytes)
+      return `ipv6:${fullParts[0]}:${fullParts[1]}`;
+    }
+    return `ipv6:${addr}`;
+  }
+
+  // Check if it looks like an IPv4 address (all numeric octets)
+  const parts = addr.split(".");
+  if (parts.length === 4) {
+    const isIPv4 = parts.every((p) => {
+      const num = parseInt(p, 10);
+      return !isNaN(num) && num >= 0 && num <= 255 && String(num) === p;
+    });
+    if (isIPv4) {
+      // /16 = first two octets
+      return `ipv4:${parts[0]}.${parts[1]}`;
+    }
+  }
+
+  // Fallback: use full address as group (e.g., hostnames)
+  return `other:${addr}`;
+}
+
+/**
+ * Check if an address is a localhost/loopback address.
+ */
+export function isLocalAddress(addr: string): boolean {
+  return (
+    addr === "127.0.0.1" ||
+    addr === "localhost" ||
+    addr === "::1" ||
+    addr.startsWith("127.")
+  );
+}
+
+/**
+ * Candidate for eviction from inbound slots.
+ * Contains metadata needed for the eviction algorithm.
+ */
+export interface EvictionCandidate {
+  id: string; // peer key (host:port)
+  connectedTime: number; // Unix timestamp when connected
+  minPingTime: number; // Minimum observed ping latency
+  lastBlockTime: number; // Time of last block received
+  lastTxTime: number; // Time of last tx received
+  keyedNetGroup: string; // Network group (hashed for determinism)
+  isBlockRelayOnly: boolean; // Block-relay-only connection
+  isLocal: boolean; // Localhost connection
+}
+
 /**
  * Manages peer connections, discovery, and message routing.
  *
@@ -93,13 +208,24 @@ export class PeerManager {
   private connectingPeers: Set<string>;
   private banManager: BanManager;
 
+  /** Track connection type for each peer */
+  private peerConnectionType: Map<string, ConnectionType>;
+  /** Track network groups of outbound peers (for diversity) */
+  private outboundNetGroups: Set<string>;
+  /** Anchor connections to reconnect on startup */
+  private anchors: Array<{ host: string; port: number }>;
+  /** Track inbound peers for eviction */
+  private inboundPeers: Set<string>;
+
   constructor(config: PeerManagerConfig) {
     this.config = {
-      maxOutbound: config.maxOutbound ?? 8,
+      maxOutbound: config.maxOutbound ?? MAX_OUTBOUND_FULL_RELAY + MAX_OUTBOUND_BLOCK_RELAY,
       maxInbound: config.maxInbound ?? 117,
       params: config.params,
       bestHeight: config.bestHeight ?? 0,
       datadir: config.datadir,
+      maxOutboundFullRelay: config.maxOutboundFullRelay ?? MAX_OUTBOUND_FULL_RELAY,
+      maxOutboundBlockRelay: config.maxOutboundBlockRelay ?? MAX_OUTBOUND_BLOCK_RELAY,
     };
     this.peers = new Map();
     this.knownAddresses = new Map();
@@ -109,6 +235,10 @@ export class PeerManager {
     this.lastActivity = new Map();
     this.connectingPeers = new Set();
     this.banManager = new BanManager(config.datadir);
+    this.peerConnectionType = new Map();
+    this.outboundNetGroups = new Set();
+    this.anchors = [];
+    this.inboundPeers = new Set();
   }
 
   /**
@@ -120,6 +250,9 @@ export class PeerManager {
     // Load ban list and persisted addresses
     await this.banManager.load();
     await this.loadAddresses();
+
+    // Load anchor connections for fast re-entry into the network
+    await this.loadAnchors();
 
     // Resolve DNS seeds
     const addresses = await this.resolveDNSSeeds();
@@ -179,11 +312,19 @@ export class PeerManager {
       this.maintainInterval = null;
     }
 
+    // Save anchor connections before disconnecting (block-relay-only outbound)
+    await this.saveAnchors();
+
     // Disconnect all peers
     for (const [key, peer] of this.peers) {
       peer.disconnect("shutdown");
       this.peers.delete(key);
     }
+
+    // Clear connection tracking
+    this.peerConnectionType.clear();
+    this.outboundNetGroups.clear();
+    this.inboundPeers.clear();
 
     // Save addresses and ban list before shutdown
     await this.saveAddresses();
@@ -225,8 +366,16 @@ export class PeerManager {
   /**
    * Connect to a specific peer by host and port.
    * Returns the connected Peer instance.
+   *
+   * @param host - Peer hostname or IP
+   * @param port - Peer port
+   * @param connectionType - Type of outbound connection (default: full_relay)
    */
-  async connectPeer(host: string, port: number): Promise<Peer> {
+  async connectPeer(
+    host: string,
+    port: number,
+    connectionType: ConnectionType = "full_relay"
+  ): Promise<Peer> {
     const key = `${host}:${port}`;
 
     // Check if banned
@@ -243,6 +392,15 @@ export class PeerManager {
       throw new Error(`Already connecting to ${key}`);
     }
 
+    // Network group diversity check for outbound connections
+    // Skip for localhost (allows testing with multiple connections)
+    if (connectionType !== "inbound" && !isLocalAddress(host)) {
+      const netGroup = getNetGroup(host);
+      if (this.outboundNetGroups.has(netGroup)) {
+        throw new Error(`Already have outbound connection in netgroup ${netGroup}`);
+      }
+    }
+
     this.connectingPeers.add(key);
 
     const config: PeerConfig = {
@@ -253,7 +411,7 @@ export class PeerManager {
       services: this.config.params.services,
       userAgent: this.config.params.userAgent,
       bestHeight: this.config.bestHeight,
-      relay: true,
+      relay: connectionType !== "block_relay", // Block-relay-only connections don't relay txs
     };
 
     const events: PeerEvents = {
@@ -275,6 +433,17 @@ export class PeerManager {
       this.peers.set(key, peer);
       this.lastActivity.set(key, Date.now());
 
+      // Track connection type
+      this.peerConnectionType.set(key, connectionType);
+
+      // Track network group for outbound connections
+      if (connectionType !== "inbound") {
+        const netGroup = getNetGroup(host);
+        this.outboundNetGroups.add(netGroup);
+      } else {
+        this.inboundPeers.add(key);
+      }
+
       // Add or update known address
       const now = Date.now();
       if (!this.knownAddresses.has(key)) {
@@ -285,10 +454,14 @@ export class PeerManager {
           lastSeen: now,
           banScore: 0,
           lastConnected: now,
+          connectionType,
+          connectedTime: now,
         });
       } else {
         const info = this.knownAddresses.get(key)!;
         info.lastConnected = now;
+        info.connectionType = connectionType;
+        info.connectedTime = now;
       }
 
       return peer;
@@ -313,6 +486,17 @@ export class PeerManager {
       peer.disconnect(ban ? "banned" : "disconnect");
       this.peers.delete(key);
       this.lastActivity.delete(key);
+
+      // Clean up connection tracking
+      const connType = this.peerConnectionType.get(key);
+      this.peerConnectionType.delete(key);
+
+      if (connType !== "inbound") {
+        const netGroup = getNetGroup(peer.host);
+        this.outboundNetGroups.delete(netGroup);
+      } else {
+        this.inboundPeers.delete(key);
+      }
 
       if (ban) {
         // Add to ban manager with 24-hour ban
@@ -497,27 +681,108 @@ export class PeerManager {
 
   /**
    * Fill outbound connections up to maxOutbound.
+   *
+   * Connection priority:
+   * 1. Anchor connections (block-relay-only peers from last session)
+   * 2. Full-relay outbound connections (up to maxOutboundFullRelay)
+   * 3. Block-relay-only outbound connections (up to maxOutboundBlockRelay)
+   *
+   * Enforces network group diversity: no two outbound peers share the same /16 (IPv4) or /32 (IPv6).
    */
   private async fillConnections(): Promise<void> {
     if (!this.running) return;
 
-    const currentCount = this.peers.size + this.connectingPeers.size;
-    const needed = this.config.maxOutbound - currentCount;
+    // Count current outbound connections by type
+    let fullRelayCount = 0;
+    let blockRelayCount = 0;
+    for (const [key, connType] of this.peerConnectionType) {
+      if (connType === "full_relay") fullRelayCount++;
+      else if (connType === "block_relay") blockRelayCount++;
+    }
 
-    if (needed <= 0) return;
+    // Also count pending connections (assume they're full-relay unless specified)
+    const pendingCount = this.connectingPeers.size;
 
-    // Get candidate addresses sorted by preference
-    const candidates = this.getCandidateAddresses(needed);
+    const maxFullRelay = this.config.maxOutboundFullRelay ?? MAX_OUTBOUND_FULL_RELAY;
+    const maxBlockRelay = this.config.maxOutboundBlockRelay ?? MAX_OUTBOUND_BLOCK_RELAY;
 
-    for (const info of candidates) {
-      if (this.peers.size + this.connectingPeers.size >= this.config.maxOutbound) {
-        break;
+    // First priority: Connect to anchor peers if we have slots
+    while (
+      this.anchors.length > 0 &&
+      blockRelayCount < maxBlockRelay
+    ) {
+      const anchor = this.anchors.shift()!;
+      const key = `${anchor.host}:${anchor.port}`;
+
+      // Skip if already connected
+      if (this.peers.has(key) || this.connectingPeers.has(key)) {
+        continue;
+      }
+
+      // Skip if banned
+      if (this.banManager.isBanned(anchor.host)) {
+        continue;
+      }
+
+      // Check network group diversity
+      const netGroup = getNetGroup(anchor.host);
+      if (this.outboundNetGroups.has(netGroup)) {
+        continue;
       }
 
       try {
-        await this.connectPeer(info.host, info.port);
+        await this.connectPeer(anchor.host, anchor.port, "block_relay");
+        blockRelayCount++;
       } catch {
-        // Connection failed, will be retried in next maintenance cycle
+        // Anchor connection failed, continue to next
+      }
+    }
+
+    // Second priority: Fill full-relay slots
+    const neededFullRelay = maxFullRelay - fullRelayCount - pendingCount;
+    if (neededFullRelay > 0) {
+      const candidates = this.getCandidateAddresses(neededFullRelay * 3); // Get extra in case some fail diversity check
+      let connected = 0;
+
+      for (const info of candidates) {
+        if (connected >= neededFullRelay) break;
+
+        // Check network group diversity
+        const netGroup = getNetGroup(info.host);
+        if (this.outboundNetGroups.has(netGroup)) {
+          continue;
+        }
+
+        try {
+          await this.connectPeer(info.host, info.port, "full_relay");
+          connected++;
+        } catch {
+          // Connection failed, try next
+        }
+      }
+    }
+
+    // Third priority: Fill block-relay slots
+    const neededBlockRelay = maxBlockRelay - blockRelayCount;
+    if (neededBlockRelay > 0) {
+      const candidates = this.getCandidateAddresses(neededBlockRelay * 3);
+      let connected = 0;
+
+      for (const info of candidates) {
+        if (connected >= neededBlockRelay) break;
+
+        // Check network group diversity
+        const netGroup = getNetGroup(info.host);
+        if (this.outboundNetGroups.has(netGroup)) {
+          continue;
+        }
+
+        try {
+          await this.connectPeer(info.host, info.port, "block_relay");
+          connected++;
+        } catch {
+          // Connection failed, try next
+        }
       }
     }
   }
@@ -593,6 +858,17 @@ export class PeerManager {
     const key = `${peer.host}:${peer.port}`;
     this.peers.delete(key);
     this.lastActivity.delete(key);
+
+    // Clean up connection tracking
+    const connType = this.peerConnectionType.get(key);
+    this.peerConnectionType.delete(key);
+
+    if (connType !== "inbound") {
+      const netGroup = getNetGroup(peer.host);
+      this.outboundNetGroups.delete(netGroup);
+    } else {
+      this.inboundPeers.delete(key);
+    }
 
     // Emit disconnect event to handlers
     const handlers = this.messageHandlers.get("__disconnect__") ?? [];
@@ -724,6 +1000,392 @@ export class PeerManager {
     } catch {
       // Write error
     }
+  }
+
+  /**
+   * Load anchor connections from disk.
+   *
+   * Anchors are block-relay-only peers that we reconnect to on startup
+   * to prevent eclipse attacks after restart.
+   *
+   * Reference: Bitcoin Core addrdb.cpp ReadAnchors()
+   */
+  private async loadAnchors(): Promise<void> {
+    const path = `${this.config.datadir}/anchors.dat`;
+    try {
+      const file = Bun.file(path);
+      if (await file.exists()) {
+        const data = await file.arrayBuffer();
+        const buffer = Buffer.from(data);
+        const reader = new BufferReader(buffer);
+
+        // Version byte
+        const version = reader.readUInt8();
+        if (version !== 1) {
+          return;
+        }
+
+        // Anchor count
+        const count = reader.readVarInt();
+        for (let i = 0; i < count && i < MAX_BLOCK_RELAY_ONLY_ANCHORS; i++) {
+          const host = reader.readVarString();
+          const port = reader.readUInt16LE();
+          this.anchors.push({ host, port });
+        }
+
+        // Delete anchors file after reading (Bitcoin Core behavior)
+        // The file is recreated on clean shutdown
+        try {
+          const fs = await import("node:fs/promises");
+          await fs.unlink(path);
+        } catch {
+          // Ignore unlink errors
+        }
+      }
+    } catch {
+      // No anchors file or read error
+    }
+  }
+
+  /**
+   * Save anchor connections to disk.
+   *
+   * Persists up to MAX_BLOCK_RELAY_ONLY_ANCHORS block-relay-only
+   * outbound connections for reconnection on next startup.
+   *
+   * Reference: Bitcoin Core addrdb.cpp DumpAnchors()
+   */
+  private async saveAnchors(): Promise<void> {
+    const path = `${this.config.datadir}/anchors.dat`;
+    try {
+      // Collect current block-relay-only connections
+      const anchors: Array<{ host: string; port: number }> = [];
+      for (const [key, connType] of this.peerConnectionType) {
+        if (connType === "block_relay" && anchors.length < MAX_BLOCK_RELAY_ONLY_ANCHORS) {
+          const peer = this.peers.get(key);
+          if (peer && peer.state === "connected") {
+            anchors.push({ host: peer.host, port: peer.port });
+          }
+        }
+      }
+
+      if (anchors.length === 0) {
+        // No anchors to save
+        return;
+      }
+
+      const writer = new BufferWriter();
+
+      // Version byte
+      writer.writeUInt8(1);
+
+      // Anchor count
+      writer.writeVarInt(anchors.length);
+
+      for (const anchor of anchors) {
+        writer.writeVarString(anchor.host);
+        writer.writeUInt16LE(anchor.port);
+      }
+
+      await Bun.write(path, writer.toBuffer());
+    } catch {
+      // Write error
+    }
+  }
+
+  /**
+   * Accept an inbound connection.
+   *
+   * When inbound slots are full, uses eviction algorithm to decide
+   * whether to accept the new connection by evicting an existing one.
+   *
+   * @param host - Remote peer's IP address
+   * @param port - Remote peer's port
+   * @returns The accepted Peer, or null if rejected
+   */
+  async acceptInbound(host: string, port: number): Promise<Peer | null> {
+    // Check if banned
+    if (this.banManager.isBanned(host)) {
+      return null;
+    }
+
+    // Check inbound capacity
+    const inboundCount = this.inboundPeers.size;
+    if (inboundCount >= this.config.maxInbound) {
+      // Try to evict a peer
+      const evicted = this.selectPeerToEvict();
+      if (!evicted) {
+        // Cannot evict anyone, reject connection
+        return null;
+      }
+
+      // Disconnect the evicted peer
+      this.disconnectPeer(evicted);
+    }
+
+    // Accept the connection
+    return this.connectPeer(host, port, "inbound");
+  }
+
+  /**
+   * Select a peer to evict when inbound slots are full.
+   *
+   * Implements Bitcoin Core's eviction algorithm which protects
+   * peers across multiple categories to ensure diversity.
+   *
+   * Reference: Bitcoin Core node/eviction.cpp SelectNodeToEvict()
+   */
+  selectPeerToEvict(): string | null {
+    // Build list of eviction candidates (inbound peers only)
+    const candidates: EvictionCandidate[] = [];
+    const now = Date.now();
+
+    for (const key of this.inboundPeers) {
+      const peer = this.peers.get(key);
+      if (!peer) continue;
+
+      const info = this.knownAddresses.get(key);
+      const connType = this.peerConnectionType.get(key);
+
+      candidates.push({
+        id: key,
+        connectedTime: info?.connectedTime ?? now,
+        minPingTime: info?.minPingTime ?? (peer.latency || Infinity),
+        lastBlockTime: info?.lastBlockTime ?? 0,
+        lastTxTime: info?.lastTxTime ?? 0,
+        keyedNetGroup: getNetGroup(peer.host),
+        isBlockRelayOnly: connType === "block_relay",
+        isLocal: isLocalAddress(peer.host),
+      });
+    }
+
+    if (candidates.length === 0) {
+      return null;
+    }
+
+    // Apply protection filters (each removes candidates from consideration)
+    let remaining = [...candidates];
+
+    // 1. Protect by distinct network groups (4 peers)
+    remaining = this.protectByNetGroup(remaining, EVICTION_PROTECT_NETGROUP);
+
+    // 2. Protect by lowest ping time (8 peers)
+    remaining = this.protectByLowestPing(remaining, EVICTION_PROTECT_PING);
+
+    // 3. Protect by recent transaction relay (4 peers)
+    remaining = this.protectByRecentTx(remaining, EVICTION_PROTECT_TX);
+
+    // 4. Protect block-relay-only peers (8 peers)
+    remaining = this.protectBlockRelayOnly(remaining, EVICTION_PROTECT_BLOCK_RELAY);
+
+    // 5. Protect by recent block relay (4 peers)
+    remaining = this.protectByRecentBlocks(remaining, EVICTION_PROTECT_BLOCKS);
+
+    // 6. Protect local/localhost connections
+    remaining = remaining.filter((c) => !c.isLocal);
+
+    if (remaining.length === 0) {
+      return null;
+    }
+
+    // Select victim from remaining: pick from largest network group
+    // (attacker most likely controls the largest group)
+    const groupCounts = new Map<string, EvictionCandidate[]>();
+    for (const c of remaining) {
+      const group = groupCounts.get(c.keyedNetGroup) ?? [];
+      group.push(c);
+      groupCounts.set(c.keyedNetGroup, group);
+    }
+
+    // Find largest group
+    let largestGroup: EvictionCandidate[] = [];
+    let largestGroupAge = Infinity; // Tiebreaker: newest first
+
+    for (const group of groupCounts.values()) {
+      const newestInGroup = Math.max(...group.map((c) => c.connectedTime));
+
+      if (
+        group.length > largestGroup.length ||
+        (group.length === largestGroup.length && newestInGroup > largestGroupAge)
+      ) {
+        largestGroup = group;
+        largestGroupAge = newestInGroup;
+      }
+    }
+
+    if (largestGroup.length === 0) {
+      return null;
+    }
+
+    // Evict oldest peer in the largest group
+    largestGroup.sort((a, b) => a.connectedTime - b.connectedTime);
+    return largestGroup[0].id;
+  }
+
+  /**
+   * Protect peers with distinct network groups.
+   */
+  private protectByNetGroup(
+    candidates: EvictionCandidate[],
+    count: number
+  ): EvictionCandidate[] {
+    // Group by netgroup, keep one from each distinct group
+    const seenGroups = new Set<string>();
+    const protected_: Set<string> = new Set();
+
+    // Sort by connected time (oldest first - reward long connections)
+    const sorted = [...candidates].sort(
+      (a, b) => a.connectedTime - b.connectedTime
+    );
+
+    for (const c of sorted) {
+      if (!seenGroups.has(c.keyedNetGroup) && protected_.size < count) {
+        seenGroups.add(c.keyedNetGroup);
+        protected_.add(c.id);
+      }
+    }
+
+    return candidates.filter((c) => !protected_.has(c.id));
+  }
+
+  /**
+   * Protect peers with lowest ping times.
+   */
+  private protectByLowestPing(
+    candidates: EvictionCandidate[],
+    count: number
+  ): EvictionCandidate[] {
+    const sorted = [...candidates].sort(
+      (a, b) => a.minPingTime - b.minPingTime
+    );
+    const protected_ = new Set(sorted.slice(0, count).map((c) => c.id));
+    return candidates.filter((c) => !protected_.has(c.id));
+  }
+
+  /**
+   * Protect peers that recently relayed transactions.
+   */
+  private protectByRecentTx(
+    candidates: EvictionCandidate[],
+    count: number
+  ): EvictionCandidate[] {
+    // Filter to those that have relayed txs, sort by most recent
+    const withTx = candidates
+      .filter((c) => c.lastTxTime > 0)
+      .sort((a, b) => b.lastTxTime - a.lastTxTime);
+    const protected_ = new Set(withTx.slice(0, count).map((c) => c.id));
+    return candidates.filter((c) => !protected_.has(c.id));
+  }
+
+  /**
+   * Protect block-relay-only connections.
+   */
+  private protectBlockRelayOnly(
+    candidates: EvictionCandidate[],
+    count: number
+  ): EvictionCandidate[] {
+    // Protect block-relay peers that have relayed blocks
+    const blockRelay = candidates
+      .filter((c) => c.isBlockRelayOnly && c.lastBlockTime > 0)
+      .sort((a, b) => b.lastBlockTime - a.lastBlockTime);
+    const protected_ = new Set(blockRelay.slice(0, count).map((c) => c.id));
+    return candidates.filter((c) => !protected_.has(c.id));
+  }
+
+  /**
+   * Protect peers that recently relayed blocks.
+   */
+  private protectByRecentBlocks(
+    candidates: EvictionCandidate[],
+    count: number
+  ): EvictionCandidate[] {
+    const withBlocks = candidates
+      .filter((c) => c.lastBlockTime > 0)
+      .sort((a, b) => b.lastBlockTime - a.lastBlockTime);
+    const protected_ = new Set(withBlocks.slice(0, count).map((c) => c.id));
+    return candidates.filter((c) => !protected_.has(c.id));
+  }
+
+  /**
+   * Update peer's last block time (called when peer sends us a block).
+   */
+  recordBlockFromPeer(key: string): void {
+    const info = this.knownAddresses.get(key);
+    if (info) {
+      info.lastBlockTime = Date.now();
+    }
+  }
+
+  /**
+   * Update peer's last tx time (called when peer sends us a transaction).
+   */
+  recordTxFromPeer(key: string): void {
+    const info = this.knownAddresses.get(key);
+    if (info) {
+      info.lastTxTime = Date.now();
+    }
+  }
+
+  /**
+   * Update peer's minimum ping time.
+   */
+  recordPingFromPeer(key: string, latency: number): void {
+    const info = this.knownAddresses.get(key);
+    if (info) {
+      if (!info.minPingTime || latency < info.minPingTime) {
+        info.minPingTime = latency;
+      }
+    }
+  }
+
+  /**
+   * Get the connection type for a peer.
+   */
+  getConnectionType(key: string): ConnectionType | undefined {
+    return this.peerConnectionType.get(key);
+  }
+
+  /**
+   * Get the set of network groups used by outbound peers.
+   */
+  getOutboundNetGroups(): Set<string> {
+    return new Set(this.outboundNetGroups);
+  }
+
+  /**
+   * Get the current anchor connection addresses.
+   */
+  getAnchors(): Array<{ host: string; port: number }> {
+    return [...this.anchors];
+  }
+
+  /**
+   * Get count of inbound peers.
+   */
+  getInboundCount(): number {
+    return this.inboundPeers.size;
+  }
+
+  /**
+   * Get count of full-relay outbound peers.
+   */
+  getFullRelayCount(): number {
+    let count = 0;
+    for (const connType of this.peerConnectionType.values()) {
+      if (connType === "full_relay") count++;
+    }
+    return count;
+  }
+
+  /**
+   * Get count of block-relay-only outbound peers.
+   */
+  getBlockRelayCount(): number {
+    let count = 0;
+    for (const connType of this.peerConnectionType.values()) {
+      if (connType === "block_relay") count++;
+    }
+    return count;
   }
 }
 
