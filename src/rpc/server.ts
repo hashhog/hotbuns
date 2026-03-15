@@ -451,6 +451,7 @@ export class RPCServer {
     // Mempool methods
     this.registerMethod("getmempoolinfo", () => this.getMempoolInfo());
     this.registerMethod("getrawmempool", (params) => this.getRawMempool(params));
+    this.registerMethod("getmempoolentry", (params) => this.getMempoolEntry(params));
 
     // Fee estimation
     this.registerMethod("estimatesmartfee", (params) =>
@@ -1600,12 +1601,57 @@ export class RPCServer {
         },
         depends: Array.from(entry.dependsOn),
         spentby: Array.from(entry.spentBy),
-        "bip125-replaceable": false,
+        "bip125-replaceable": this.mempool.isReplaceable(txid),
         unbroadcast: false,
       };
     }
 
     return result;
+  }
+
+  /**
+   * getmempoolentry: Returns mempool data for a given transaction.
+   * @param params [txid]
+   */
+  private async getMempoolEntry(params: unknown[]): Promise<Record<string, unknown>> {
+    const [txidParam] = params;
+
+    if (typeof txidParam !== "string" || txidParam.length !== 64) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "txid must be a 64-character hex string");
+    }
+
+    const txid = Buffer.from(txidParam, "hex");
+    const entry = this.mempool.getTransaction(txid);
+
+    if (!entry) {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Transaction not in mempool");
+    }
+
+    return {
+      vsize: entry.vsize,
+      weight: entry.weight,
+      fee: Number(entry.fee) / 100_000_000,
+      modifiedfee: Number(entry.fee) / 100_000_000,
+      time: entry.addedTime,
+      height: entry.height,
+      descendantcount: entry.spentBy.size + 1,
+      descendantsize: entry.vsize,
+      descendantfees: Number(entry.fee),
+      ancestorcount: entry.dependsOn.size + 1,
+      ancestorsize: entry.vsize,
+      ancestorfees: Number(entry.fee),
+      wtxid: txidParam,
+      fees: {
+        base: Number(entry.fee) / 100_000_000,
+        modified: Number(entry.fee) / 100_000_000,
+        ancestor: Number(entry.fee) / 100_000_000,
+        descendant: Number(entry.fee) / 100_000_000,
+      },
+      depends: Array.from(entry.dependsOn),
+      spentby: Array.from(entry.spentBy),
+      "bip125-replaceable": this.mempool.isReplaceable(txid),
+      unbroadcast: false,
+    };
   }
 
   // ========== Fee Estimation ==========
