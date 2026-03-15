@@ -27,6 +27,9 @@ export const enum DBPrefix {
   CHAIN_STATE = 0x73, // 's' - chain state metadata
   HEADER = 0x68, // 'h' - height (4 bytes BE) -> block hash
   UNDO = 0x72, // 'r' - block hash -> undo data for disconnect
+  BLOCK_FILES = 0x66, // 'f' - file number -> block file info
+  LAST_BLOCK_FILE = 0x6c, // 'l' - last block file number
+  BLOCK_POS = 0x70, // 'p' - block hash -> file position
 }
 
 /** Block index record stored in the database. */
@@ -439,4 +442,89 @@ export class ChainDB {
     }
     return value;
   }
+
+  // Block file info operations (for flat file storage)
+
+  /**
+   * Store block file info for a file number.
+   */
+  async putBlockFileInfo(fileNum: number, info: Buffer): Promise<void> {
+    const key = makeKey(DBPrefix.BLOCK_FILES, encodeFileNum(fileNum));
+    await this.db.put(key, info);
+  }
+
+  /**
+   * Get block file info for a file number.
+   */
+  async getBlockFileInfo(fileNum: number): Promise<Buffer | null> {
+    const key = makeKey(DBPrefix.BLOCK_FILES, encodeFileNum(fileNum));
+    try {
+      const value = await this.db.get(key);
+      if (value === undefined) {
+        return null;
+      }
+      return value;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Store the last block file number.
+   */
+  async putLastBlockFile(fileNum: number): Promise<void> {
+    const key = makeKey(DBPrefix.LAST_BLOCK_FILE, Buffer.alloc(0));
+    const buf = Buffer.alloc(4);
+    buf.writeUInt32LE(fileNum, 0);
+    await this.db.put(key, buf);
+  }
+
+  /**
+   * Get the last block file number.
+   */
+  async getLastBlockFile(): Promise<number | null> {
+    const key = makeKey(DBPrefix.LAST_BLOCK_FILE, Buffer.alloc(0));
+    try {
+      const value = await this.db.get(key);
+      if (value === undefined) {
+        return null;
+      }
+      return value.readUInt32LE(0);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Store block position in flat file.
+   */
+  async putBlockPos(hash: Buffer, posData: Buffer): Promise<void> {
+    const key = makeKey(DBPrefix.BLOCK_POS, hash);
+    await this.db.put(key, posData);
+  }
+
+  /**
+   * Get block position from flat file.
+   */
+  async getBlockPos(hash: Buffer): Promise<Buffer | null> {
+    const key = makeKey(DBPrefix.BLOCK_POS, hash);
+    try {
+      const value = await this.db.get(key);
+      if (value === undefined) {
+        return null;
+      }
+      return value;
+    } catch {
+      return null;
+    }
+  }
+}
+
+/**
+ * Encode a file number as 4-byte little-endian.
+ */
+function encodeFileNum(fileNum: number): Buffer {
+  const buf = Buffer.alloc(4);
+  buf.writeUInt32LE(fileNum, 0);
+  return buf;
 }
