@@ -81,6 +81,7 @@ export interface RPCServerDeps {
   headerSync: HeaderSync;
   db: ChainDB;
   params: ConsensusParams;
+  pruneManager?: import("../storage/pruning.js").PruneManager;
 }
 
 /** RPC error codes. */
@@ -130,6 +131,7 @@ export class RPCServer {
   private headerSync: HeaderSync;
   private db: ChainDB;
   private params: ConsensusParams;
+  private pruneManager?: import("../storage/pruning.js").PruneManager;
   private shutdownCallback: (() => void) | null = null;
 
   constructor(config: RPCServerConfig, deps: RPCServerDeps) {
@@ -146,6 +148,7 @@ export class RPCServer {
     this.headerSync = deps.headerSync;
     this.db = deps.db;
     this.params = deps.params;
+    this.pruneManager = deps.pruneManager;
     this.methods = new Map();
 
     this.registerBuiltinMethods();
@@ -453,6 +456,9 @@ export class RPCServer {
     // Mining methods
     this.registerMethod("getblocktemplate", (params) => this.getBlockTemplate(params));
 
+    // Pruning methods
+    this.registerMethod("pruneblockchain", (params) => this.pruneBlockchain(params));
+
     // Control methods
     this.registerMethod("stop", () => this.stopNode());
   }
@@ -499,7 +505,13 @@ export class RPCServer {
     // Build softforks object
     const softforks = this.getSoftforkStatus(bestBlock.height);
 
-    return {
+    // Get pruning info
+    const pruneInfo = this.pruneManager?.getPruneInfo() ?? {
+      pruned: false,
+      automatic_pruning: false,
+    };
+
+    const result: Record<string, unknown> = {
       chain,
       blocks: bestBlock.height,
       headers: headers,
@@ -508,10 +520,23 @@ export class RPCServer {
       mediantime,
       verificationprogress,
       chainwork: bestBlock.chainWork.toString(16).padStart(64, "0"),
-      pruned: false,
+      pruned: pruneInfo.pruned,
       softforks,
       warnings: "",
     };
+
+    // Add pruning-specific fields if pruning is enabled
+    if (pruneInfo.pruned && pruneInfo.pruneheight !== undefined) {
+      result.pruneheight = pruneInfo.pruneheight;
+    }
+    if (pruneInfo.automatic_pruning) {
+      result.automatic_pruning = true;
+      if (pruneInfo.prune_target_size !== undefined) {
+        result.prune_target_size = pruneInfo.prune_target_size;
+      }
+    }
+
+    return result;
   }
 
   /**
@@ -586,16 +611,24 @@ export class RPCServer {
 
     const verbosity = typeof verbosityParam === "number" ? verbosityParam : 1;
 
-    // Get block data
-    const blockData = await this.db.getBlock(blockhash);
-    if (!blockData) {
+    // Get block index record first to check if pruned
+    const blockIndex = await this.db.getBlockIndex(blockhash);
+    if (!blockIndex) {
       throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found");
     }
 
-    // Get block index record
-    const blockIndex = await this.db.getBlockIndex(blockhash);
-    if (!blockIndex) {
-      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block index not found");
+    // Check if block data is pruned
+    if (this.pruneManager?.isPruneMode() && this.pruneManager.isBlockPruned(blockIndex.height)) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        "Block not available (pruned data)"
+      );
+    }
+
+    // Get block data
+    const blockData = await this.db.getBlock(blockhash);
+    if (!blockData) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Block not available (pruned data)");
     }
 
     // Verbosity 0: return hex
@@ -2130,6 +2163,46 @@ export class RPCServer {
     }
 
     return result;
+  }
+
+  // ========== Pruning Methods ==========
+
+  /**
+   * pruneblockchain: Manually prune blocks up to specified height.
+   *
+   * @param params [height] - Height up to which to prune (exclusive)
+   * @returns Height of the first block that is not pruned
+   */
+  private async pruneBlockchain(params: unknown[]): Promise<number> {
+    const [heightParam] = params;
+
+    if (!this.pruneManager) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        "Cannot prune blocks because node is not in prune mode"
+      );
+    }
+
+    if (typeof heightParam !== "number" || !Number.isInteger(heightParam)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "height must be an integer");
+    }
+
+    if (heightParam < 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Negative block height");
+    }
+
+    const bestBlock = this.chainState.getBestBlock();
+
+    if (heightParam > bestBlock.height) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `Blockchain is shorter than the attempted prune height (${bestBlock.height})`
+      );
+    }
+
+    const result = await this.pruneManager.pruneBlockchain(heightParam, bestBlock.height);
+
+    return result.firstUnprunedHeight;
   }
 
   /**
