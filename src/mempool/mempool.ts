@@ -605,6 +605,24 @@ export class Mempool {
   }
 
   /**
+   * Check if a transaction is already confirmed in the blockchain.
+   *
+   * A transaction is considered confirmed if at least one of its outputs
+   * exists in the UTXO set (or was spent after being confirmed).
+   * We check output 0 as a heuristic - if the tx was confirmed, at least
+   * one output must have been created.
+   *
+   * @param txid The transaction ID to check
+   * @returns true if the transaction appears to be confirmed
+   */
+  async isTransactionConfirmed(txid: Buffer): Promise<boolean> {
+    // Check if output 0 exists in the UTXO set
+    // If it does, the transaction is confirmed (output exists)
+    const utxoExists = await this.utxo.hasUTXOAsync({ txid, vout: 0 });
+    return utxoExists;
+  }
+
+  /**
    * Check if a transaction conflicts with existing mempool entries.
    *
    * A conflict occurs when the transaction spends an output that is
