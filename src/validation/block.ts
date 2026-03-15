@@ -19,6 +19,28 @@ import {
   isCoinbase,
   validateTxBasic,
 } from "./tx.js";
+import { isP2SH, isP2WPKH, isP2WSH, isPushOnly, Opcode } from "../script/interpreter.js";
+
+// =============================================================================
+// Sigop Counting Constants
+// =============================================================================
+
+/**
+ * Maximum sigops cost per block (weighted).
+ * Legacy/P2SH sigops cost 4x, witness sigops cost 1x.
+ */
+export const MAX_BLOCK_SIGOPS_COST = 80_000;
+
+/**
+ * Witness scale factor for sigop cost calculation.
+ * Legacy and P2SH sigops are multiplied by this factor.
+ */
+export const WITNESS_SCALE_FACTOR = 4;
+
+/**
+ * Maximum pubkeys in a CHECKMULTISIG operation.
+ */
+export const MAX_PUBKEYS_PER_MULTISIG = 20;
 
 /**
  * Block header structure (80 bytes serialized).
@@ -379,11 +401,11 @@ export function validateBlock(
 
   // Note: Full validation would also check:
   // - BIP34 coinbase height encoding
-  // - Total sigops cost within limit
   // - Coinbase output value <= subsidy + fees
   // - All inputs exist and are unspent (UTXO validation)
   // - Script validation for all inputs
   // - No double spends within block
+  // - Total sigops cost (requires prevOutputs, done in connectBlock)
 
   return { valid: true };
 }
@@ -425,4 +447,431 @@ export function getBlockWeight(block: Block): number {
   const baseSize = getBlockBaseSize(block);
   const totalSize = getBlockTotalSize(block);
   return baseSize * 3 + totalSize;
+}
+
+// =============================================================================
+// Sigop Counting Implementation
+// =============================================================================
+// Reference: Bitcoin Core consensus/tx_verify.cpp and script/script.cpp
+// =============================================================================
+
+/**
+ * Count signature operations in a raw script.
+ *
+ * If `accurate` is true (for P2SH redeem scripts and witness scripts),
+ * OP_CHECKMULTISIG(VERIFY) uses the preceding OP_N to determine the
+ * key count. Otherwise, it counts as MAX_PUBKEYS_PER_MULTISIG (20).
+ *
+ * @param script - The raw script bytes
+ * @param accurate - Whether to use accurate multisig counting
+ * @returns The number of sigops in the script
+ */
+export function countScriptSigOps(script: Buffer, accurate: boolean): number {
+  let sigOps = 0;
+  let lastOpcode = 0xff; // Invalid opcode
+  let pos = 0;
+
+  while (pos < script.length) {
+    const opcode = script[pos];
+    pos++;
+
+    // Skip push data
+    if (opcode <= Opcode.OP_PUSHDATA4) {
+      if (opcode === 0) {
+        // OP_0 - no data to skip
+      } else if (opcode >= 1 && opcode <= 75) {
+        // Direct push
+        pos += opcode;
+      } else if (opcode === Opcode.OP_PUSHDATA1) {
+        if (pos >= script.length) break;
+        const len = script[pos];
+        pos += 1 + len;
+      } else if (opcode === Opcode.OP_PUSHDATA2) {
+        if (pos + 1 >= script.length) break;
+        const len = script[pos] | (script[pos + 1] << 8);
+        pos += 2 + len;
+      } else if (opcode === Opcode.OP_PUSHDATA4) {
+        if (pos + 3 >= script.length) break;
+        const len =
+          script[pos] |
+          (script[pos + 1] << 8) |
+          (script[pos + 2] << 16) |
+          (script[pos + 3] << 24);
+        pos += 4 + len;
+      }
+      lastOpcode = opcode;
+      continue;
+    }
+
+    // Count sigops
+    if (opcode === Opcode.OP_CHECKSIG || opcode === Opcode.OP_CHECKSIGVERIFY) {
+      sigOps++;
+    } else if (
+      opcode === Opcode.OP_CHECKMULTISIG ||
+      opcode === Opcode.OP_CHECKMULTISIGVERIFY
+    ) {
+      // If accurate mode and preceding opcode was OP_1-OP_16, use that as key count
+      if (accurate && lastOpcode >= Opcode.OP_1 && lastOpcode <= Opcode.OP_16) {
+        sigOps += lastOpcode - Opcode.OP_1 + 1;
+      } else {
+        // Default to max pubkeys
+        sigOps += MAX_PUBKEYS_PER_MULTISIG;
+      }
+    }
+
+    lastOpcode = opcode;
+  }
+
+  return sigOps;
+}
+
+/**
+ * Count legacy sigops in a transaction.
+ *
+ * This counts sigops from:
+ * - scriptSig (input scripts)
+ * - scriptPubKey (output scripts)
+ *
+ * Uses inaccurate counting (OP_CHECKMULTISIG = 20 sigops).
+ *
+ * Reference: Bitcoin Core GetLegacySigOpCount()
+ */
+export function getLegacySigOpCount(tx: Transaction): number {
+  let sigOps = 0;
+
+  // Count sigops in all input scriptSigs
+  for (const input of tx.inputs) {
+    sigOps += countScriptSigOps(input.scriptSig, false);
+  }
+
+  // Count sigops in all output scriptPubKeys
+  for (const output of tx.outputs) {
+    sigOps += countScriptSigOps(output.scriptPubKey, false);
+  }
+
+  return sigOps;
+}
+
+/**
+ * Extract the last push data from a scriptSig.
+ * Used for P2SH redeem script extraction.
+ *
+ * @param scriptSig - The input script
+ * @returns The last pushed data item, or null if none
+ */
+function getLastPushData(scriptSig: Buffer): Buffer | null {
+  let lastData: Buffer | null = null;
+  let pos = 0;
+
+  while (pos < scriptSig.length) {
+    const opcode = scriptSig[pos];
+    pos++;
+
+    if (opcode === 0) {
+      // OP_0 - empty push
+      lastData = Buffer.alloc(0);
+    } else if (opcode >= 1 && opcode <= 75) {
+      // Direct push
+      if (pos + opcode > scriptSig.length) return null;
+      lastData = scriptSig.subarray(pos, pos + opcode);
+      pos += opcode;
+    } else if (opcode === Opcode.OP_PUSHDATA1) {
+      if (pos >= scriptSig.length) return null;
+      const len = scriptSig[pos];
+      pos++;
+      if (pos + len > scriptSig.length) return null;
+      lastData = scriptSig.subarray(pos, pos + len);
+      pos += len;
+    } else if (opcode === Opcode.OP_PUSHDATA2) {
+      if (pos + 1 >= scriptSig.length) return null;
+      const len = scriptSig[pos] | (scriptSig[pos + 1] << 8);
+      pos += 2;
+      if (pos + len > scriptSig.length) return null;
+      lastData = scriptSig.subarray(pos, pos + len);
+      pos += len;
+    } else if (opcode === Opcode.OP_PUSHDATA4) {
+      if (pos + 3 >= scriptSig.length) return null;
+      const len =
+        scriptSig[pos] |
+        (scriptSig[pos + 1] << 8) |
+        (scriptSig[pos + 2] << 16) |
+        (scriptSig[pos + 3] << 24);
+      pos += 4;
+      if (pos + len > scriptSig.length) return null;
+      lastData = scriptSig.subarray(pos, pos + len);
+      pos += len;
+    } else if (opcode > Opcode.OP_16) {
+      // Non-push opcode - P2SH scriptSig must be push-only
+      return null;
+    } else {
+      // OP_1NEGATE, OP_1-OP_16 (push small numbers)
+      // Not relevant for P2SH as redeem scripts are typically larger
+      lastData = Buffer.from([opcode === Opcode.OP_1NEGATE ? 0x81 : opcode - Opcode.OP_1 + 1]);
+    }
+  }
+
+  return lastData;
+}
+
+/**
+ * Count P2SH sigops in a transaction.
+ *
+ * For each input spending a P2SH output, extract the redeem script
+ * from the scriptSig and count sigops with accurate mode.
+ *
+ * Reference: Bitcoin Core GetP2SHSigOpCount()
+ *
+ * @param tx - The transaction
+ * @param prevOutputs - The scriptPubKeys being spent, indexed by input
+ * @returns Additional P2SH sigops (not including legacy count)
+ */
+export function getP2SHSigOpCount(
+  tx: Transaction,
+  prevOutputs: Buffer[]
+): number {
+  // Coinbase has no P2SH inputs
+  if (isCoinbase(tx)) {
+    return 0;
+  }
+
+  let sigOps = 0;
+
+  for (let i = 0; i < tx.inputs.length; i++) {
+    const input = tx.inputs[i];
+    const prevScript = prevOutputs[i];
+
+    // Check if previous output is P2SH
+    if (!isP2SH(prevScript)) {
+      continue;
+    }
+
+    // Extract the redeem script from scriptSig
+    // P2SH scriptSig must be push-only
+    if (!isPushOnly(input.scriptSig)) {
+      continue;
+    }
+
+    const redeemScript = getLastPushData(input.scriptSig);
+    if (!redeemScript) {
+      continue;
+    }
+
+    // Count sigops in redeem script with accurate mode
+    sigOps += countScriptSigOps(redeemScript, true);
+  }
+
+  return sigOps;
+}
+
+/**
+ * Count sigops in a witness program (P2WPKH or P2WSH).
+ *
+ * - P2WPKH (20-byte program): 1 sigop
+ * - P2WSH (32-byte program): count from witness script with accurate mode
+ *
+ * Reference: Bitcoin Core WitnessSigOps()
+ *
+ * @param witnessVersion - The witness version (0 for v0)
+ * @param witnessProgram - The witness program bytes
+ * @param witness - The witness stack
+ * @returns Sigop count (NOT scaled)
+ */
+export function countWitnessProgramSigOps(
+  witnessVersion: number,
+  witnessProgram: Buffer,
+  witness: Buffer[]
+): number {
+  if (witnessVersion === 0) {
+    // P2WPKH: 20-byte program = 1 sigop
+    if (witnessProgram.length === 20) {
+      return 1;
+    }
+
+    // P2WSH: 32-byte program = count from witness script
+    if (witnessProgram.length === 32 && witness.length > 0) {
+      const witnessScript = witness[witness.length - 1];
+      return countScriptSigOps(witnessScript, true);
+    }
+  }
+
+  // Future witness versions: 0 sigops
+  return 0;
+}
+
+/**
+ * Check if a script is a witness program and extract its version and program.
+ *
+ * Witness programs have the form: OP_N <2-40 bytes>
+ * where OP_N is OP_0 (0x00) or OP_1-OP_16 (0x51-0x60)
+ *
+ * @param script - The scriptPubKey
+ * @returns [version, program] or null if not a witness program
+ */
+export function parseWitnessProgram(
+  script: Buffer
+): [number, Buffer] | null {
+  if (script.length < 4 || script.length > 42) {
+    return null;
+  }
+
+  const version = script[0];
+
+  // OP_0 or OP_1-OP_16
+  if (version !== 0x00 && (version < 0x51 || version > 0x60)) {
+    return null;
+  }
+
+  // Second byte is the push length
+  const programLen = script[1];
+  if (programLen + 2 !== script.length) {
+    return null;
+  }
+
+  // Program must be 2-40 bytes
+  if (programLen < 2 || programLen > 40) {
+    return null;
+  }
+
+  const witnessVersion = version === 0x00 ? 0 : version - 0x50;
+  const program = script.subarray(2);
+
+  return [witnessVersion, program];
+}
+
+/**
+ * Count witness sigops for a transaction input.
+ *
+ * Handles:
+ * - Native witness programs (P2WPKH, P2WSH)
+ * - P2SH-wrapped witness programs (P2SH-P2WPKH, P2SH-P2WSH)
+ *
+ * Reference: Bitcoin Core CountWitnessSigOps()
+ *
+ * @param input - The transaction input
+ * @param prevScript - The scriptPubKey being spent
+ * @returns Sigop count (NOT scaled)
+ */
+export function countInputWitnessSigOps(
+  input: { scriptSig: Buffer; witness: Buffer[] },
+  prevScript: Buffer
+): number {
+  // Check for native witness program
+  const nativeProgram = parseWitnessProgram(prevScript);
+  if (nativeProgram) {
+    const [version, program] = nativeProgram;
+    return countWitnessProgramSigOps(version, program, input.witness);
+  }
+
+  // Check for P2SH-wrapped witness program
+  if (isP2SH(prevScript) && isPushOnly(input.scriptSig)) {
+    const redeemScript = getLastPushData(input.scriptSig);
+    if (redeemScript) {
+      const wrappedProgram = parseWitnessProgram(redeemScript);
+      if (wrappedProgram) {
+        const [version, program] = wrappedProgram;
+        return countWitnessProgramSigOps(version, program, input.witness);
+      }
+    }
+  }
+
+  return 0;
+}
+
+/**
+ * Calculate the total sigop cost for a transaction.
+ *
+ * This is the weighted sigop count:
+ * - Legacy sigops: count * WITNESS_SCALE_FACTOR (4)
+ * - P2SH sigops: count * WITNESS_SCALE_FACTOR (4)
+ * - Witness sigops: count * 1
+ *
+ * Reference: Bitcoin Core GetTransactionSigOpCost()
+ *
+ * @param tx - The transaction
+ * @param prevOutputs - The scriptPubKeys being spent, indexed by input
+ * @param verifyP2SH - Whether P2SH is active (BIP 16)
+ * @param verifyWitness - Whether witness is active (BIP 141)
+ * @returns The weighted sigop cost
+ */
+export function getTransactionSigOpCost(
+  tx: Transaction,
+  prevOutputs: Buffer[],
+  verifyP2SH: boolean,
+  verifyWitness: boolean
+): number {
+  // Legacy sigops (scriptSig + scriptPubKey) scaled by witness factor
+  let cost = getLegacySigOpCount(tx) * WITNESS_SCALE_FACTOR;
+
+  // Coinbase has no inputs to examine
+  if (isCoinbase(tx)) {
+    return cost;
+  }
+
+  // P2SH sigops (from redeem scripts) scaled by witness factor
+  if (verifyP2SH) {
+    cost += getP2SHSigOpCount(tx, prevOutputs) * WITNESS_SCALE_FACTOR;
+  }
+
+  // Witness sigops (not scaled - already at weight 1)
+  if (verifyWitness) {
+    for (let i = 0; i < tx.inputs.length; i++) {
+      cost += countInputWitnessSigOps(tx.inputs[i], prevOutputs[i]);
+    }
+  }
+
+  return cost;
+}
+
+/**
+ * Calculate the total sigop cost for a block.
+ *
+ * @param block - The block
+ * @param prevOutputsMap - Map from input index to prevOut scriptPubKey for each tx
+ * @param verifyP2SH - Whether P2SH is active
+ * @param verifyWitness - Whether witness is active
+ * @returns The total weighted sigop cost
+ */
+export function getBlockSigOpsCost(
+  block: Block,
+  prevOutputsMap: Map<number, Buffer[]>,
+  verifyP2SH: boolean,
+  verifyWitness: boolean
+): number {
+  let totalCost = 0;
+
+  for (let i = 0; i < block.transactions.length; i++) {
+    const tx = block.transactions[i];
+    const prevOutputs = prevOutputsMap.get(i) ?? [];
+    totalCost += getTransactionSigOpCost(tx, prevOutputs, verifyP2SH, verifyWitness);
+  }
+
+  return totalCost;
+}
+
+/**
+ * Validate that a block's sigop cost is within the limit.
+ *
+ * @param block - The block
+ * @param prevOutputsMap - Map from tx index to prevOut scriptPubKeys
+ * @param verifyP2SH - Whether P2SH is active
+ * @param verifyWitness - Whether witness is active
+ * @returns Validation result
+ */
+export function validateBlockSigOps(
+  block: Block,
+  prevOutputsMap: Map<number, Buffer[]>,
+  verifyP2SH: boolean,
+  verifyWitness: boolean
+): { valid: boolean; error?: string; cost?: number } {
+  const cost = getBlockSigOpsCost(block, prevOutputsMap, verifyP2SH, verifyWitness);
+
+  if (cost > MAX_BLOCK_SIGOPS_COST) {
+    return {
+      valid: false,
+      error: `Block sigops cost ${cost} exceeds maximum ${MAX_BLOCK_SIGOPS_COST}`,
+      cost,
+    };
+  }
+
+  return { valid: true, cost };
 }
