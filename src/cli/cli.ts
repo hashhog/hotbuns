@@ -35,6 +35,8 @@ export interface NodeConfig {
   logLevel: "debug" | "info" | "warn" | "error";
   connect?: string[];
   addnode?: string[];
+  /** Prune target in MiB (0 = disabled, minimum 550 MiB if enabled). */
+  prune?: number;
 }
 
 /**
@@ -160,6 +162,19 @@ export function parseArgs(argv: string[]): ParsedArgs {
             config.addnode.push(value);
           }
           break;
+        case "prune":
+          if (value) {
+            const pruneVal = parseInt(value, 10);
+            if (!isNaN(pruneVal)) {
+              // Minimum 550 MiB if pruning is enabled
+              if (pruneVal > 0 && pruneVal < 550) {
+                console.error("Error: --prune must be at least 550 MiB");
+                process.exit(1);
+              }
+              config.prune = pruneVal;
+            }
+          }
+          break;
         case "password":
           // For wallet commands
           if (value) remainingArgs.push(`--password=${value}`);
@@ -272,6 +287,12 @@ export async function loadConfig(datadir: string): Promise<Partial<NodeConfig>> 
             value === "error"
           ) {
             config.logLevel = value;
+          }
+          break;
+        case "prune":
+          const pruneVal = parseInt(value, 10);
+          if (!isNaN(pruneVal) && pruneVal >= 0) {
+            config.prune = pruneVal;
           }
           break;
       }
@@ -835,6 +856,7 @@ OPTIONS:
   --max-outbound=<n>    Max outbound connections (default: 8)
   --log-level=<level>   Log level: debug, info, warn, error (default: info)
   --connect=<host:port> Connect to specific peer
+  --prune=<n>           Prune block storage to n MiB (minimum 550, 0 = disabled)
   --password=<pass>     Wallet password (for wallet commands)
   --fee-rate=<n>        Fee rate in sat/vB (for wallet send)
   --help                Show this help message
