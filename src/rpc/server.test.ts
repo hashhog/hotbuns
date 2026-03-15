@@ -61,6 +61,11 @@ class MockMempool {
     return false;
   }
 
+  isReplaceable(_txid: Buffer): boolean {
+    // Full RBF: all mempool transactions are replaceable
+    return true;
+  }
+
   // Helper for tests
   addTestTransaction(txid: Buffer, entry: any) {
     this.entries.set(txid.toString("hex"), {
