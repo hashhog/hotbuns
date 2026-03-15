@@ -40,7 +40,7 @@ describe("Regtest Generate RPCs", () => {
 
     chainState = new ChainStateManager(db, REGTEST);
     await chainState.load();
-    mempool = new Mempool(REGTEST);
+    mempool = new Mempool(chainState.getUTXOManager(), REGTEST);
 
     const config: RPCServerConfig = {
       port: 18443,
@@ -51,7 +51,7 @@ describe("Regtest Generate RPCs", () => {
       chainState,
       mempool,
       peerManager: new MockPeerManager() as any,
-      feeEstimator: new FeeEstimator(),
+      feeEstimator: new FeeEstimator(mempool),
       headerSync: new MockHeaderSync() as any,
       db,
       params: REGTEST,
@@ -114,6 +114,7 @@ describe("Regtest Generate RPCs", () => {
       const mainnetDB = await createTestDB();
       const mainnetChainState = new ChainStateManager(mainnetDB.db, mainnetLikeParams);
       await mainnetChainState.load();
+      const mainnetMempool = new Mempool(mainnetChainState.getUTXOManager(), mainnetLikeParams);
 
       const mainnetConfig: RPCServerConfig = {
         port: 8332,
@@ -122,9 +123,9 @@ describe("Regtest Generate RPCs", () => {
 
       const mainnetDeps: RPCServerDeps = {
         chainState: mainnetChainState,
-        mempool: new Mempool(mainnetLikeParams),
+        mempool: mainnetMempool,
         peerManager: new MockPeerManager() as any,
-        feeEstimator: new FeeEstimator(),
+        feeEstimator: new FeeEstimator(mainnetMempool),
         headerSync: new MockHeaderSync() as any,
         db: mainnetDB.db,
         params: mainnetLikeParams,
