@@ -28,6 +28,7 @@ import { sha256Hash } from "../crypto/primitives.js";
 import {
   verifyScript,
   getConsensusFlags,
+  isP2A,
   type ScriptFlags,
 } from "../script/interpreter.js";
 import { sigHashLegacy, sigHashWitnessV0 } from "../validation/tx.js";
@@ -37,6 +38,18 @@ import { sigHashLegacy, sigHashWitnessV0 } from "../validation/tx.js";
  * A cluster is a connected component of transactions in the mempool.
  */
 export const MAX_CLUSTER_SIZE = 100;
+
+/**
+ * Default dust relay fee rate in sat/kvB.
+ * Used to calculate the dust threshold for outputs.
+ */
+const DUST_RELAY_FEE = 3000;
+
+/**
+ * Maximum number of dust outputs allowed per transaction.
+ * Per ephemeral anchor policy, only one dust output is allowed.
+ */
+export const MAX_DUST_OUTPUTS_PER_TX = 1;
 
 /**
  * Legacy ancestor/descendant limits per BIP-125.
@@ -176,6 +189,10 @@ export interface MempoolEntry {
   clusterId: string;
   /** Mining score (effective fee rate as sat/vB from chunk). */
   miningScore: number;
+  /** Set of ephemeral dust parent txids (hex) that this tx spends from. */
+  ephemeralDustParents: Set<string>;
+  /** True if this transaction has ephemeral dust outputs. */
+  hasEphemeralDust: boolean;
 }
 
 /**
@@ -186,6 +203,232 @@ interface MempoolUTXO {
   scriptPubKey: Buffer;
   txid: Buffer;
   vout: number;
+}
+
+// ============================================================================
+// Ephemeral Anchor Policy Functions
+// ============================================================================
+
+/**
+ * Get the dust threshold for a given scriptPubKey.
+ *
+ * Dust is defined as an output whose value is less than the cost to spend it.
+ * The threshold depends on the output type (witness vs non-witness).
+ *
+ * Default dust relay fee: 3000 sat/kvB
+ * - Segwit output: 98 * 3000 / 1000 = 294 sats
+ * - Non-segwit output: 182 * 3000 / 1000 = 546 sats
+ */
+export function getDustThreshold(scriptPubKey: Buffer): bigint {
+  // OP_RETURN is unspendable, dust threshold is 0
+  if (scriptPubKey.length > 0 && scriptPubKey[0] === 0x6a) {
+    return 0n;
+  }
+
+  // Check if witness program (OP_0/OP_1-16 + push)
+  const isWitness = scriptPubKey.length >= 4 &&
+    (scriptPubKey[0] === 0x00 || (scriptPubKey[0] >= 0x51 && scriptPubKey[0] <= 0x60)) &&
+    scriptPubKey[1] >= 2 && scriptPubKey[1] <= 40 &&
+    scriptPubKey.length === scriptPubKey[1] + 2;
+
+  if (isWitness) {
+    // Segwit: output size + input size with witness discount
+    // nSize = output_size + (32 + 4 + 1 + (107/4) + 4) = output_size + 67.75
+    // For typical P2WPKH (31 bytes output): 31 + 67 = 98 bytes
+    // At 3000 sat/kvB: 98 * 3000 / 1000 = 294 sats
+    const outputSize = BigInt(scriptPubKey.length + 8 + 1); // value (8) + scriptLen (1) + script
+    const inputSize = 32n + 4n + 1n + 26n + 4n; // prevout + vout + scriptLen + sig/4 + sequence
+    return ((outputSize + inputSize) * BigInt(DUST_RELAY_FEE)) / 1000n;
+  } else {
+    // Non-segwit: output size + input size
+    // nSize = output_size + (32 + 4 + 1 + 107 + 4) = output_size + 148
+    // For typical P2PKH (34 bytes output): 34 + 148 = 182 bytes
+    // At 3000 sat/kvB: 182 * 3000 / 1000 = 546 sats
+    const outputSize = BigInt(scriptPubKey.length + 8 + 1);
+    const inputSize = 32n + 4n + 1n + 107n + 4n;
+    return ((outputSize + inputSize) * BigInt(DUST_RELAY_FEE)) / 1000n;
+  }
+}
+
+/**
+ * Check if an output is dust (value below dust threshold).
+ */
+export function isDust(value: bigint, scriptPubKey: Buffer): boolean {
+  return value < getDustThreshold(scriptPubKey);
+}
+
+/**
+ * Check if an output is ephemeral dust (0-value dust output).
+ * Ephemeral dust is a 0-value output that would normally be considered dust.
+ */
+export function isEphemeralDust(value: bigint, scriptPubKey: Buffer): boolean {
+  return value === 0n && isDust(value, scriptPubKey);
+}
+
+/**
+ * Get all dust output indices for a transaction.
+ */
+export function getDustOutputs(tx: Transaction): number[] {
+  const dustOutputs: number[] = [];
+  for (let i = 0; i < tx.outputs.length; i++) {
+    const output = tx.outputs[i];
+    if (isDust(output.value, output.scriptPubKey)) {
+      dustOutputs.push(i);
+    }
+  }
+  return dustOutputs;
+}
+
+/**
+ * Get all ephemeral dust output indices for a transaction.
+ * Ephemeral dust must be 0-value.
+ */
+export function getEphemeralDustOutputs(tx: Transaction): number[] {
+  const ephemeralOutputs: number[] = [];
+  for (let i = 0; i < tx.outputs.length; i++) {
+    const output = tx.outputs[i];
+    if (output.value === 0n && isDust(output.value, output.scriptPubKey)) {
+      ephemeralOutputs.push(i);
+    }
+  }
+  return ephemeralOutputs;
+}
+
+/**
+ * Check if a transaction has ephemeral dust outputs.
+ */
+export function hasEphemeralDust(tx: Transaction): boolean {
+  return getEphemeralDustOutputs(tx).length > 0;
+}
+
+/**
+ * Pre-check ephemeral transaction: a tx with dust must have 0 fee.
+ * This ensures we never give incentive to mine a dust-creating tx alone.
+ */
+export function preCheckEphemeralTx(tx: Transaction, fee: bigint): { valid: boolean; error?: string } {
+  const dustOutputs = getDustOutputs(tx);
+
+  // If there's no dust, the transaction passes
+  if (dustOutputs.length === 0) {
+    return { valid: true };
+  }
+
+  // A transaction with dust outputs must have 0 fee
+  if (fee !== 0n) {
+    return {
+      valid: false,
+      error: "tx with dust output must be 0-fee"
+    };
+  }
+
+  // Only one dust output allowed per tx
+  if (dustOutputs.length > MAX_DUST_OUTPUTS_PER_TX) {
+    return {
+      valid: false,
+      error: `too many dust outputs: ${dustOutputs.length} > ${MAX_DUST_OUTPUTS_PER_TX}`
+    };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Result of ephemeral spend check.
+ */
+export interface EphemeralSpendResult {
+  valid: boolean;
+  /** If invalid, the txid of the transaction that failed the check. */
+  failedTxid?: string;
+  /** If invalid, the wtxid of the transaction that failed the check. */
+  failedWtxid?: string;
+  /** Error message if invalid. */
+  error?: string;
+}
+
+/**
+ * Check that all ephemeral dust outputs from parents are spent by children.
+ *
+ * For each transaction in the package:
+ * 1. Find all in-package and in-mempool parents
+ * 2. Collect all dust outputs from those parents
+ * 3. Verify the child spends ALL parent dust outputs
+ */
+export function checkEphemeralSpends(
+  packageTxs: Transaction[],
+  mempoolEntries: Map<string, MempoolEntry>
+): EphemeralSpendResult {
+  // Build txid -> Transaction map for package lookups
+  const packageTxMap = new Map<string, Transaction>();
+  for (const tx of packageTxs) {
+    packageTxMap.set(getTxId(tx).toString("hex"), tx);
+  }
+
+  // For each transaction, check that it spends all parent dust
+  for (const tx of packageTxs) {
+    const processedParents = new Set<string>();
+    const unspentParentDust = new Set<string>(); // "txid:vout" format
+
+    // Collect dust from all parents (both in-package and in-mempool)
+    for (const input of tx.inputs) {
+      const parentTxid = input.prevOut.txid.toString("hex");
+
+      // Skip already processed parents
+      if (processedParents.has(parentTxid)) {
+        continue;
+      }
+
+      // Look for parent in package or mempool
+      let parentTx: Transaction | undefined;
+
+      // Check package first
+      if (packageTxMap.has(parentTxid)) {
+        parentTx = packageTxMap.get(parentTxid);
+      } else {
+        // Check mempool
+        const mempoolEntry = mempoolEntries.get(parentTxid);
+        if (mempoolEntry) {
+          parentTx = mempoolEntry.tx;
+        }
+      }
+
+      // If we found the parent, collect its dust outputs
+      if (parentTx) {
+        for (let i = 0; i < parentTx.outputs.length; i++) {
+          const output = parentTx.outputs[i];
+          if (isDust(output.value, output.scriptPubKey)) {
+            unspentParentDust.add(`${parentTxid}:${i}`);
+          }
+        }
+      }
+
+      processedParents.add(parentTxid);
+    }
+
+    // If no parent dust, this tx passes
+    if (unspentParentDust.size === 0) {
+      continue;
+    }
+
+    // Mark dust outputs as spent by this transaction's inputs
+    for (const input of tx.inputs) {
+      const outpointKey = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+      unspentParentDust.delete(outpointKey);
+    }
+
+    // If there's still unspent parent dust, the check fails
+    if (unspentParentDust.size > 0) {
+      const txid = getTxId(tx).toString("hex");
+      const wtxid = getWTxId(tx).toString("hex");
+      return {
+        valid: false,
+        failedTxid: txid,
+        failedWtxid: wtxid,
+        error: `tx ${txid.slice(0, 16)}... did not spend parent's ephemeral dust`,
+      };
+    }
+  }
+
+  return { valid: true };
 }
 
 // ============================================================================
@@ -749,6 +992,18 @@ export class Mempool {
     // Calculate ancestor stats before creating entry
     const { ancestorCount, ancestorSize } = this.calculateAncestorStats(parentTxids, vsize);
 
+    // Track ephemeral dust relationships
+    const ephemeralDustParents = new Set<string>();
+    for (const parentTxidHex of parentTxids) {
+      const parent = this.entries.get(parentTxidHex);
+      if (parent && parent.hasEphemeralDust) {
+        ephemeralDustParents.add(parentTxidHex);
+      }
+    }
+
+    // Check if this tx has ephemeral dust outputs
+    const txHasEphemeralDust = hasEphemeralDust(tx);
+
     // Create the mempool entry
     const entry: MempoolEntry = {
       tx,
@@ -767,6 +1022,8 @@ export class Mempool {
       descendantSize: vsize,
       clusterId: txidHex, // Will be updated by addToCluster
       miningScore: feeRate, // Will be updated by linearization
+      ephemeralDustParents,
+      hasEphemeralDust: txHasEphemeralDust,
     };
 
     // Add to mempool
@@ -823,6 +1080,30 @@ export class Mempool {
       }
     }
 
+    // Ephemeral anchor cascade: if this tx spends ephemeral dust from a parent,
+    // and this is the only child spending that parent's dust, the parent must
+    // also be removed (it can't exist in mempool without its dust being spent).
+    const ephemeralParentsToRemove: string[] = [];
+    for (const parentTxidHex of entry.ephemeralDustParents) {
+      const parent = this.entries.get(parentTxidHex);
+      if (parent && parent.hasEphemeralDust) {
+        // Check if any other child still spends this parent's dust
+        let hasOtherChild = false;
+        for (const otherChildHex of parent.spentBy) {
+          if (otherChildHex !== txidHex && this.entries.has(otherChildHex)) {
+            const otherChild = this.entries.get(otherChildHex)!;
+            if (otherChild.ephemeralDustParents.has(parentTxidHex)) {
+              hasOtherChild = true;
+              break;
+            }
+          }
+        }
+        if (!hasOtherChild) {
+          ephemeralParentsToRemove.push(parentTxidHex);
+        }
+      }
+    }
+
     // Update ancestors' descendant stats before removing
     const ancestors = this.getAncestorSet(entry.dependsOn);
     for (const ancestorTxidHex of ancestors) {
@@ -853,6 +1134,12 @@ export class Mempool {
 
     // Mark cluster cache as dirty
     this.clusterCacheDirty = true;
+
+    // Cascade removal of ephemeral dust parents that no longer have their dust spent
+    for (const parentTxidHex of ephemeralParentsToRemove) {
+      const parentTxid = Buffer.from(parentTxidHex, "hex");
+      this.removeTransaction(parentTxid, true);
+    }
   }
 
   /**
@@ -1916,6 +2203,24 @@ export class Mempool {
       const txid = getTxId(tx).toString("hex");
       const wtxid = getWTxId(tx).toString("hex");
 
+      // Single transaction with ephemeral dust cannot be accepted alone
+      // It requires a child in the same package to spend the dust
+      if (hasEphemeralDust(tx)) {
+        txResults.set(wtxid, {
+          txid,
+          wtxid,
+          accepted: false,
+          error: "tx has ephemeral dust but no child spending it",
+        });
+
+        return {
+          result: PackageValidationResult.PCKG_POLICY,
+          message: "ephemeral-dust-no-child",
+          txResults,
+          replacedTxids,
+        };
+      }
+
       const result = await this.addTransaction(tx);
 
       txResults.set(wtxid, {
@@ -2010,6 +2315,61 @@ export class Mempool {
 
       txFees.set(txid, feeResult.fee!);
       txVsizes.set(txid, getTxVSize(tx));
+
+      // Pre-check ephemeral tx: dust outputs require 0-fee
+      const ephemeralPreCheck = preCheckEphemeralTx(tx, feeResult.fee!);
+      if (!ephemeralPreCheck.valid) {
+        txResults.set(wtxid, {
+          txid,
+          wtxid,
+          accepted: false,
+          error: ephemeralPreCheck.error,
+        });
+
+        return {
+          result: PackageValidationResult.PCKG_POLICY,
+          message: ephemeralPreCheck.error || "ephemeral-policy-violation",
+          txResults,
+          replacedTxids,
+        };
+      }
+    }
+
+    // Check ephemeral spends: all dust from parents must be spent by children
+    const ephemeralCheck = checkEphemeralSpends(transactions, this.entries);
+    if (!ephemeralCheck.valid) {
+      // Find the failing transaction
+      for (const tx of transactions) {
+        const txid = getTxId(tx).toString("hex");
+        const wtxid = getWTxId(tx).toString("hex");
+
+        if (this.entries.has(txid)) {
+          continue; // Already in mempool, not the issue
+        }
+
+        if (wtxid === ephemeralCheck.failedWtxid) {
+          txResults.set(wtxid, {
+            txid,
+            wtxid,
+            accepted: false,
+            error: ephemeralCheck.error,
+          });
+        } else {
+          txResults.set(wtxid, {
+            txid,
+            wtxid,
+            accepted: false,
+            error: "missing-ephemeral-spends",
+          });
+        }
+      }
+
+      return {
+        result: PackageValidationResult.PCKG_POLICY,
+        message: ephemeralCheck.error || "missing-ephemeral-spends",
+        txResults,
+        replacedTxids,
+      };
     }
 
     // Calculate total package fee and vsize
