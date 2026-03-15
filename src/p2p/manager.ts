@@ -5,7 +5,19 @@
  * tracks peer quality via ban scores, and routes messages to handlers.
  */
 
-import { Peer, type PeerConfig, type PeerEvents, type PeerState, type OnBanCallback } from "./peer.js";
+import {
+  Peer,
+  type PeerConfig,
+  type PeerEvents,
+  type PeerState,
+  type OnBanCallback,
+  PING_INTERVAL_MS,
+  PING_TIMEOUT_MS,
+  STALE_TIP_THRESHOLD_MS,
+  STALE_CHECK_INTERVAL_MS,
+  MINIMUM_CONNECT_TIME_MS,
+  MAX_OUTBOUND_PEERS_TO_PROTECT,
+} from "./peer.js";
 import type { NetworkMessage, AddrPayload, NetworkAddress } from "./messages.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
@@ -217,6 +229,15 @@ export class PeerManager {
   /** Track inbound peers for eviction */
   private inboundPeers: Set<string>;
 
+  /** Interval for periodic ping checks (2 minutes). */
+  private pingInterval: ReturnType<typeof setInterval> | null;
+  /** Interval for stale tip checks (45 seconds). */
+  private staleCheckInterval: ReturnType<typeof setInterval> | null;
+  /** Track protected outbound peers (have good chain). */
+  private protectedPeers: Set<string>;
+  /** Last time we updated our tip. */
+  private lastTipUpdateTime: number;
+
   constructor(config: PeerManagerConfig) {
     this.config = {
       maxOutbound: config.maxOutbound ?? MAX_OUTBOUND_FULL_RELAY + MAX_OUTBOUND_BLOCK_RELAY,
@@ -239,6 +260,10 @@ export class PeerManager {
     this.outboundNetGroups = new Set();
     this.anchors = [];
     this.inboundPeers = new Set();
+    this.pingInterval = null;
+    this.staleCheckInterval = null;
+    this.protectedPeers = new Set();
+    this.lastTipUpdateTime = Date.now();
   }
 
   /**
@@ -298,6 +323,16 @@ export class PeerManager {
         console.error("Maintenance error:", err);
       });
     }, 30_000);
+
+    // Start ping interval (every 2 minutes)
+    this.pingInterval = setInterval(() => {
+      this.checkPings();
+    }, PING_INTERVAL_MS);
+
+    // Start stale peer check interval (every 45 seconds)
+    this.staleCheckInterval = setInterval(() => {
+      this.checkForStaleTipAndEvictPeers();
+    }, STALE_CHECK_INTERVAL_MS);
   }
 
   /**
@@ -311,6 +346,21 @@ export class PeerManager {
       clearInterval(this.maintainInterval);
       this.maintainInterval = null;
     }
+
+    // Stop ping interval
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
+
+    // Stop stale check interval
+    if (this.staleCheckInterval) {
+      clearInterval(this.staleCheckInterval);
+      this.staleCheckInterval = null;
+    }
+
+    // Clear protected peers
+    this.protectedPeers.clear();
 
     // Save anchor connections before disconnecting (block-relay-only outbound)
     await this.saveAnchors();
@@ -632,27 +682,10 @@ export class PeerManager {
   }
 
   /**
-   * Periodic maintenance: evict bad peers, refill connections, ping idle peers.
+   * Periodic maintenance: evict bad peers, refill connections.
    */
   private async maintain(): Promise<void> {
     if (!this.running) return;
-
-    const now = Date.now();
-
-    // Check for peers that need pinging or disconnecting
-    for (const [key, peer] of this.peers) {
-      const lastActivity = this.lastActivity.get(key) ?? 0;
-      const idleTime = now - lastActivity;
-
-      if (idleTime > 300_000) {
-        // 5 minutes without response - disconnect
-        console.log(`Disconnecting unresponsive peer ${key}`);
-        this.disconnectPeer(key);
-      } else if (idleTime > 120_000 && peer.state === "connected") {
-        // 2 minutes idle - send ping
-        peer.sendPing();
-      }
-    }
 
     // Evict peers with high ban scores
     for (const [key, info] of this.knownAddresses) {
@@ -677,6 +710,285 @@ export class PeerManager {
 
     // Save addresses periodically
     await this.saveAddresses();
+  }
+
+  /**
+   * Check pings and send keepalives, disconnect timed-out peers.
+   *
+   * Called every PING_INTERVAL_MS (2 minutes).
+   * Reference: Bitcoin Core net_processing.cpp MaybeSendPing()
+   */
+  private checkPings(): void {
+    if (!this.running) return;
+
+    const now = Date.now();
+
+    for (const [key, peer] of this.peers) {
+      if (peer.state !== "connected") continue;
+
+      // Check for ping timeout (20 minutes without pong)
+      if (peer.hasPingTimedOut()) {
+        console.log(`Ping timeout: disconnecting peer ${key}`);
+        this.disconnectPeer(key, false, "ping timeout");
+        continue;
+      }
+
+      // Send ping if peer needs it (idle for PING_INTERVAL_MS)
+      const lastActivity = this.lastActivity.get(key) ?? now;
+      if (peer.needsPing(lastActivity)) {
+        peer.sendPing();
+      }
+    }
+  }
+
+  /**
+   * Check for stale tip and evict underperforming peers.
+   *
+   * Called every STALE_CHECK_INTERVAL_MS (45 seconds).
+   * Reference: Bitcoin Core net_processing.cpp CheckForStaleTipAndEvictPeers()
+   */
+  private checkForStaleTipAndEvictPeers(): void {
+    if (!this.running) return;
+
+    const now = Date.now();
+
+    // Check headers timeouts
+    this.checkHeadersTimeouts();
+
+    // Check block download timeouts
+    this.checkBlockDownloadTimeouts();
+
+    // Evict extra outbound peers
+    this.evictExtraOutboundPeers(now);
+
+    // Check for stale outbound peers
+    this.evictStaleTipPeers(now);
+  }
+
+  /**
+   * Check for peers with headers request timeouts.
+   * Mark as misbehaving if no response within 2 minutes.
+   */
+  private checkHeadersTimeouts(): void {
+    for (const [key, peer] of this.peers) {
+      if (peer.state !== "connected") continue;
+
+      if (peer.hasHeadersTimedOut()) {
+        console.log(`Headers timeout: peer ${key} not responding`);
+        peer.misbehaving(20, "headers timeout");
+        peer.markHeadersReceived(); // Clear the timeout to avoid repeated scoring
+      }
+    }
+  }
+
+  /**
+   * Check for peers with block download timeouts.
+   * Disconnect if a block hasn't arrived within timeout.
+   */
+  private checkBlockDownloadTimeouts(): void {
+    const peerCount = this.peers.size;
+
+    for (const [key, peer] of this.peers) {
+      if (peer.state !== "connected") continue;
+
+      const timedOutBlock = peer.getTimedOutBlock(peerCount);
+      if (timedOutBlock) {
+        console.log(`Block download timeout: disconnecting peer ${key} (block ${timedOutBlock.slice(0, 16)}...)`);
+        this.disconnectPeer(key, false, "block download timeout");
+      }
+    }
+  }
+
+  /**
+   * Evict stale tip peers that are behind our chain.
+   *
+   * Only evicts one peer per check cycle to avoid mass disconnections.
+   * Protects up to MAX_OUTBOUND_PEERS_TO_PROTECT peers.
+   *
+   * Reference: Bitcoin Core net_processing.cpp ConsiderEviction()
+   */
+  private evictStaleTipPeers(now: number): void {
+    // Find outbound peers with stale tips
+    const stalePeers: Array<{ key: string; peer: Peer }> = [];
+    const ourBestHeight = this.config.bestHeight;
+
+    // First, update protection status for peers with good chains
+    this.updateProtectedPeers();
+
+    for (const [key, peer] of this.peers) {
+      if (peer.state !== "connected") continue;
+
+      // Only consider outbound peers
+      const connType = this.peerConnectionType.get(key);
+      if (connType === "inbound") continue;
+
+      // Skip protected peers
+      if (this.protectedPeers.has(key)) continue;
+
+      // Skip peers connected too recently
+      if (now - peer.connectedTime < MINIMUM_CONNECT_TIME_MS) continue;
+
+      // Skip peers with blocks in flight
+      if (peer.hasBlocksInFlight()) continue;
+
+      // Check if peer's best known height is behind ours by threshold
+      const peerHeight = peer.bestKnownHeight;
+      const heightDiff = ourBestHeight - peerHeight;
+
+      // Check if peer's tip is stale (30 minutes worth of blocks behind)
+      // Assuming ~10 min per block, 30 min = 3 blocks
+      // But we also check if they haven't sent us a block recently
+      const timeSinceBlock = peer.lastBlockTime > 0 ? now - peer.lastBlockTime : Infinity;
+
+      // Peer is stale if:
+      // 1. Their best known height is significantly behind ours (3+ blocks)
+      // 2. OR they haven't given us a block in STALE_TIP_THRESHOLD_MS
+      if (heightDiff >= 3 || timeSinceBlock > STALE_TIP_THRESHOLD_MS) {
+        stalePeers.push({ key, peer });
+      }
+    }
+
+    // Only evict if we have better peers available
+    const goodPeers = this.countPeersWithGoodChain();
+
+    if (stalePeers.length > 0 && goodPeers > 0) {
+      // Evict only one stale peer per cycle
+      const { key, peer: stalePeer } = stalePeers[0];
+      console.log(
+        `Evicting stale outbound peer ${key} (height: ${stalePeer.bestKnownHeight}, ours: ${ourBestHeight})`
+      );
+      this.disconnectPeer(key, false, "stale tip");
+    }
+  }
+
+  /**
+   * Evict extra outbound peers when we have too many.
+   *
+   * Reference: Bitcoin Core net_processing.cpp EvictExtraOutboundPeers()
+   */
+  private evictExtraOutboundPeers(now: number): void {
+    const maxFullRelay = this.config.maxOutboundFullRelay ?? MAX_OUTBOUND_FULL_RELAY;
+    const maxBlockRelay = this.config.maxOutboundBlockRelay ?? MAX_OUTBOUND_BLOCK_RELAY;
+
+    // Count current outbound connections by type
+    let fullRelayCount = 0;
+    let blockRelayCount = 0;
+    const fullRelayPeers: Array<{ key: string; peer: Peer }> = [];
+    const blockRelayPeers: Array<{ key: string; peer: Peer }> = [];
+
+    for (const [key, connType] of this.peerConnectionType) {
+      const peer = this.peers.get(key);
+      if (!peer || peer.state !== "connected") continue;
+
+      if (connType === "full_relay") {
+        fullRelayCount++;
+        fullRelayPeers.push({ key, peer });
+      } else if (connType === "block_relay") {
+        blockRelayCount++;
+        blockRelayPeers.push({ key, peer });
+      }
+    }
+
+    // Evict extra block-relay-only peers first
+    if (blockRelayCount > maxBlockRelay) {
+      // Find the youngest block-relay peer that hasn't given us a block recently
+      const candidates = blockRelayPeers
+        .filter((p) => now - p.peer.connectedTime >= MINIMUM_CONNECT_TIME_MS)
+        .filter((p) => !p.peer.hasBlocksInFlight())
+        .sort((a, b) => b.peer.connectedTime - a.peer.connectedTime); // Youngest first
+
+      if (candidates.length > 0) {
+        // Find peer with oldest block time
+        let evictCandidate = candidates[0];
+        for (const c of candidates) {
+          if (c.peer.lastBlockTime < evictCandidate.peer.lastBlockTime) {
+            evictCandidate = c;
+          }
+        }
+        console.log(`Evicting extra block-relay peer ${evictCandidate.key}`);
+        this.disconnectPeer(evictCandidate.key, false, "extra block-relay peer");
+        return;
+      }
+    }
+
+    // Evict extra full-relay peers
+    if (fullRelayCount > maxFullRelay) {
+      // Find the full-relay peer that least recently announced a block
+      const candidates = fullRelayPeers
+        .filter((p) => now - p.peer.connectedTime >= MINIMUM_CONNECT_TIME_MS)
+        .filter((p) => !p.peer.hasBlocksInFlight())
+        .filter((p) => !this.protectedPeers.has(p.key))
+        .sort((a, b) => a.peer.lastBlockTime - b.peer.lastBlockTime); // Oldest block time first
+
+      if (candidates.length > 0) {
+        const evictCandidate = candidates[0];
+        console.log(`Evicting extra full-relay peer ${evictCandidate.key}`);
+        this.disconnectPeer(evictCandidate.key, false, "extra full-relay peer");
+      }
+    }
+  }
+
+  /**
+   * Update the set of protected outbound peers.
+   * Peers with good chain tips are protected from eviction.
+   */
+  private updateProtectedPeers(): void {
+    const ourBestHeight = this.config.bestHeight;
+    const candidates: Array<{ key: string; peer: Peer }> = [];
+
+    for (const [key, peer] of this.peers) {
+      if (peer.state !== "connected") continue;
+
+      // Only protect outbound full-relay peers
+      const connType = this.peerConnectionType.get(key);
+      if (connType !== "full_relay") continue;
+
+      // Peer has chain at least as good as ours
+      if (peer.bestKnownHeight >= ourBestHeight) {
+        candidates.push({ key, peer });
+      }
+    }
+
+    // Clear and rebuild protected set
+    this.protectedPeers.clear();
+
+    // Sort by earliest connected time (reward long connections)
+    candidates.sort((a, b) => a.peer.connectedTime - b.peer.connectedTime);
+
+    // Protect up to MAX_OUTBOUND_PEERS_TO_PROTECT
+    for (let i = 0; i < Math.min(candidates.length, MAX_OUTBOUND_PEERS_TO_PROTECT); i++) {
+      this.protectedPeers.add(candidates[i].key);
+    }
+  }
+
+  /**
+   * Count outbound peers that have a chain at least as good as ours.
+   */
+  private countPeersWithGoodChain(): number {
+    const ourBestHeight = this.config.bestHeight;
+    let count = 0;
+
+    for (const [key, peer] of this.peers) {
+      if (peer.state !== "connected") continue;
+
+      // Only count outbound peers
+      const connType = this.peerConnectionType.get(key);
+      if (connType === "inbound") continue;
+
+      if (peer.bestKnownHeight >= ourBestHeight) {
+        count++;
+      }
+    }
+
+    return count;
+  }
+
+  /**
+   * Notify manager that our tip was updated.
+   * Call this when a new block is connected.
+   */
+  notifyTipUpdated(): void {
+    this.lastTipUpdateTime = Date.now();
   }
 
   /**
