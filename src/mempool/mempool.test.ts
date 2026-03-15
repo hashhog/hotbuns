@@ -197,26 +197,53 @@ describe("Mempool", () => {
     });
   });
 
-  describe("double-spend detection", () => {
-    test("rejects transaction spending same output as existing mempool tx", async () => {
+  describe("double-spend detection with RBF", () => {
+    test("rejects double-spend with lower fee (RBF requires higher fee)", async () => {
       const inputTxid = Buffer.alloc(32, 0x22);
       await setupUTXO(inputTxid, 0, 10000n);
 
+      // tx1: 1000 sat fee
       const tx1 = createTestTx(
         [{ txid: inputTxid, vout: 0 }],
         [{ value: 9000n }]
       );
 
+      // tx2: lower fee (500 sat) - should be rejected by RBF rules
       const tx2 = createTestTx(
         [{ txid: inputTxid, vout: 0 }],
-        [{ value: 8000n }] // Different output but same input
+        [{ value: 9500n }]
       );
 
       await mempool.addTransaction(tx1);
       const result = await mempool.addTransaction(tx2);
 
       expect(result.accepted).toBe(false);
-      expect(result.error).toContain("Double-spend conflict");
+      expect(result.error).toContain("RBF");
+    });
+
+    test("accepts double-spend with higher fee (full RBF)", async () => {
+      const inputTxid = Buffer.alloc(32, 0x23);
+      await setupUTXO(inputTxid, 0, 10000n);
+
+      // tx1: 1000 sat fee
+      const tx1 = createTestTx(
+        [{ txid: inputTxid, vout: 0 }],
+        [{ value: 9000n }]
+      );
+
+      // tx2: higher fee (2000 sat) - should replace tx1
+      const tx2 = createTestTx(
+        [{ txid: inputTxid, vout: 0 }],
+        [{ value: 8000n }]
+      );
+
+      await mempool.addTransaction(tx1);
+      const result = await mempool.addTransaction(tx2);
+
+      expect(result.accepted).toBe(true);
+      // tx2 should replace tx1
+      expect(mempool.hasTransaction(getTxId(tx1))).toBe(false);
+      expect(mempool.hasTransaction(getTxId(tx2))).toBe(true);
     });
   });
 
