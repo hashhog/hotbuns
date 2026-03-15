@@ -27,6 +27,7 @@ hotbuns is a from-scratch Bitcoin full node written in TypeScript (Bun) that doe
 - [x] Inventory trickling (Poisson tx batching, immediate block relay, Fisher-Yates shuffle)
 - [x] BIP-133 feefilter (min fee rate announcement, relay filtering, Poisson-delayed broadcasts, incremental relay fee)
 - [x] BIP-155 ADDRv2 (TorV3, I2P, CJDNS address support, sendaddrv2 negotiation)
+- [x] BIP-330 Erlay (set reconciliation via Minisketch, short ID computation, periodic recon timers)
 - [x] Header sync (block locator, MTP, PoW verification, PRESYNC/REDOWNLOAD anti-DoS, checkpoint verification)
 - [x] Block sync (IBD, parallel download, stall detection)
 - [x] UTXO/chain state (layered CoinsView cache, dirty/fresh flags, batch flush, undo data, checkpoint verification)
