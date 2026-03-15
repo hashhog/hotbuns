@@ -374,6 +374,11 @@ export class RPCServer {
     this.registerMethod("getpeerinfo", () => this.getPeerInfo());
     this.registerMethod("getnetworkinfo", () => this.getNetworkInfo());
 
+    // Ban management
+    this.registerMethod("listbanned", () => this.listBanned());
+    this.registerMethod("setban", (params) => this.setBan(params));
+    this.registerMethod("clearbanned", () => this.clearBanned());
+
     // Control methods
     this.registerMethod("stop", () => this.stopNode());
   }
@@ -913,6 +918,79 @@ export class RPCServer {
       localaddresses: [],
       warnings: "",
     };
+  }
+
+  // ========== Ban Management ==========
+
+  /**
+   * listbanned: List all banned IPs/Subnets.
+   */
+  private async listBanned(): Promise<unknown[]> {
+    const banned = this.peerManager.listBanned();
+
+    return banned.map((entry) => ({
+      address: entry.address,
+      ban_created: entry.banCreated,
+      banned_until: entry.banUntil,
+      ban_reason: entry.reason,
+    }));
+  }
+
+  /**
+   * setban: Add or remove an IP/Subnet from the banned list.
+   * @param params [ip, command, bantime, absolute]
+   *   ip: IP address or subnet
+   *   command: "add" or "remove"
+   *   bantime: ban time in seconds (default: 24 hours), only for "add"
+   *   absolute: if true, bantime is Unix timestamp (default: false)
+   */
+  private async setBan(params: unknown[]): Promise<null> {
+    const [ipParam, commandParam, bantimeParam, absoluteParam] = params;
+
+    if (typeof ipParam !== "string" || ipParam.length === 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "IP address required");
+    }
+
+    if (typeof commandParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Command required (add or remove)");
+    }
+
+    const ip = ipParam;
+    const command = commandParam.toLowerCase();
+
+    if (command === "add") {
+      const bantime = typeof bantimeParam === "number" ? bantimeParam : 24 * 60 * 60;
+      const absolute = absoluteParam === true;
+
+      if (bantime <= 0) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Ban time must be positive");
+      }
+
+      this.peerManager.banAddress(ip, bantime, "manually banned via setban RPC");
+      console.log(`Banned ${ip} for ${bantime} seconds`);
+      return null;
+    } else if (command === "remove") {
+      const removed = this.peerManager.unbanAddress(ip);
+      if (!removed) {
+        throw this.rpcError(RPCErrorCodes.MISC_ERROR, `Error: IP/Subnet ${ip} is not banned`);
+      }
+      console.log(`Unbanned ${ip}`);
+      return null;
+    } else {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "Invalid command. Use 'add' or 'remove'"
+      );
+    }
+  }
+
+  /**
+   * clearbanned: Clear all banned IPs.
+   */
+  private async clearBanned(): Promise<null> {
+    this.peerManager.clearBanned();
+    console.log("Cleared all bans");
+    return null;
   }
 
   // ========== Control Methods ==========
