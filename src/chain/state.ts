@@ -9,7 +9,12 @@ import type { ChainDB, ChainState, UTXOEntry } from "../storage/database.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import { getBlockSubsidy } from "../consensus/params.js";
 import type { Block, BlockHeader } from "../validation/block.js";
-import { getBlockHash, serializeBlock } from "../validation/block.js";
+import {
+  getBlockHash,
+  serializeBlock,
+  getTransactionSigOpCost,
+  MAX_BLOCK_SIGOPS_COST,
+} from "../validation/block.js";
 import type { Transaction, UTXOConfirmation } from "../validation/tx.js";
 import {
   getTxId,
@@ -76,9 +81,10 @@ export class ChainStateManager {
    * 1. For each transaction in the block (in order):
    *    a. For non-coinbase: validate and spend each input. Accumulate spent UTXOs for undo data.
    *    b. For all: add each output as new UTXOs.
-   * 2. Verify total fees + subsidy match coinbase output value.
-   * 3. Serialize undo data and store via db.putUndoData().
-   * 4. Flush UTXO changes, store block, update chain state.
+   * 2. Verify sigops cost is within limit.
+   * 3. Verify total fees + subsidy match coinbase output value.
+   * 4. Serialize undo data and store via db.putUndoData().
+   * 5. Flush UTXO changes, store block, update chain state.
    */
   async connectBlock(block: Block, height: number): Promise<void> {
     const blockHash = getBlockHash(block.header);
@@ -86,11 +92,21 @@ export class ChainStateManager {
     let totalInputValue = 0n;
     let totalOutputValue = 0n;
 
+    // Determine which consensus rules are active at this height
+    const verifyP2SH = height >= this.params.bip34Height;
+    const verifyWitness = height >= this.params.segwitHeight;
+
+    // Track sigops cost and prevOutputs for each transaction
+    let totalSigOpsCost = 0;
+
     // Process transactions in order
     for (let txIndex = 0; txIndex < block.transactions.length; txIndex++) {
       const tx = block.transactions[txIndex];
       const txid = getTxId(tx);
       const txIsCoinbase = isCoinbase(tx);
+
+      // Collect prevOutputs for sigop counting
+      const prevOutputs: Buffer[] = [];
 
       // For non-coinbase transactions, spend inputs
       if (!txIsCoinbase) {
@@ -101,6 +117,12 @@ export class ChainStateManager {
             throw new Error(
               `Missing UTXO: ${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`
             );
+          }
+
+          // Get the UTXO for sigop counting before spending
+          const utxoEntry = this.utxo.getUTXO(input.prevOut);
+          if (utxoEntry) {
+            prevOutputs.push(utxoEntry.scriptPubKey);
           }
 
           // Spend the UTXO
@@ -116,6 +138,15 @@ export class ChainStateManager {
         }
       }
 
+      // Count sigops for this transaction
+      const txSigOpsCost = getTransactionSigOpCost(
+        tx,
+        prevOutputs,
+        verifyP2SH,
+        verifyWitness
+      );
+      totalSigOpsCost += txSigOpsCost;
+
       // Add outputs as new UTXOs
       this.utxo.addTransaction(txid, tx, height, txIsCoinbase);
 
@@ -126,6 +157,13 @@ export class ChainStateManager {
           // Track coinbase output separately for fee verification
         }
       }
+    }
+
+    // Verify sigops cost is within limit
+    if (totalSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
+      throw new Error(
+        `Block sigops cost ${totalSigOpsCost} exceeds maximum ${MAX_BLOCK_SIGOPS_COST}`
+      );
     }
 
     // Calculate total coinbase output value
