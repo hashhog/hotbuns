@@ -18,10 +18,19 @@ import {
   MINIMUM_CONNECT_TIME_MS,
   MAX_OUTBOUND_PEERS_TO_PROTECT,
 } from "./peer.js";
-import type { NetworkMessage, AddrPayload, NetworkAddress } from "./messages.js";
+import type { NetworkMessage, AddrPayload, NetworkAddress, AddrV2Payload } from "./messages.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { BanManager, DEFAULT_BAN_TIME, type BanEntry } from "./banman.js";
+import {
+  BIP155Network,
+  type NetworkAddressV2,
+  isValidNetworkAddressV2,
+  networkAddressV2ToIPv4String,
+  legacyAddressToNetworkAddressV2,
+  isAddrV1Compatible,
+  formatNetworkAddressV2,
+} from "./addrv2.js";
 
 /** Service bit flags for peer capabilities. */
 export const ServiceFlags = {
@@ -62,6 +71,16 @@ export interface PeerInfo {
   lastBlockTime?: number;
   /** Last time peer sent us a transaction */
   lastTxTime?: number;
+  /**
+   * BIP155 network type (1=IPv4, 2=IPv6, 4=TorV3, 5=I2P, 6=CJDNS).
+   * If not set, assumes IPv4 (for legacy addresses).
+   */
+  networkId?: number;
+  /**
+   * Raw address bytes for non-IPv4/IPv6 addresses (Tor, I2P, CJDNS).
+   * For IPv4/IPv6, we use the host field.
+   */
+  rawAddr?: Buffer;
 }
 
 /**
@@ -1228,6 +1247,8 @@ export class PeerManager {
     // Handle addr messages to learn new peers
     if (msg.type === "addr") {
       this.handleAddrMessage(peer, msg.payload);
+    } else if (msg.type === "addrv2") {
+      this.handleAddrV2Message(peer, msg.payload);
     }
 
     // Dispatch to registered handlers
@@ -1274,9 +1295,201 @@ export class PeerManager {
           lastSeen: entry.timestamp * 1000,
           banScore: 0,
           lastConnected: 0,
+          networkId: BIP155Network.IPV4,
         });
       }
     }
+  }
+
+  /**
+   * Process addrv2 message (BIP155) and add new addresses to known pool.
+   *
+   * ADDRv2 supports Tor v3, I2P, CJDNS, and native IPv4/IPv6 addresses.
+   * Reference: Bitcoin Core net_processing.cpp ProcessMessage() for "addrv2"
+   */
+  private handleAddrV2Message(_peer: Peer, payload: AddrV2Payload): void {
+    const now = Math.floor(Date.now() / 1000);
+
+    for (const entry of payload.addrs) {
+      // Skip addresses that are too old (more than 3 hours)
+      if (now - entry.timestamp > 3 * 60 * 60) {
+        continue;
+      }
+
+      // Validate the address for known network types
+      if (!isValidNetworkAddressV2(entry.addr)) {
+        continue;
+      }
+
+      // Generate unique key for this address
+      const key = this.getAddrV2Key(entry.addr);
+      if (!key) continue;
+
+      // Add or update address
+      const existing = this.knownAddresses.get(key);
+      if (existing) {
+        // Update if more recent
+        if (entry.timestamp > existing.lastSeen) {
+          existing.lastSeen = entry.timestamp * 1000;
+          existing.services = entry.addr.services;
+        }
+      } else {
+        const peerInfo = this.addrV2ToPeerInfo(entry.addr, entry.timestamp);
+        if (peerInfo) {
+          this.knownAddresses.set(key, peerInfo);
+        }
+      }
+    }
+  }
+
+  /**
+   * Generate a unique key for a NetworkAddressV2.
+   */
+  private getAddrV2Key(addr: NetworkAddressV2): string | null {
+    switch (addr.networkId) {
+      case BIP155Network.IPV4: {
+        const ip = networkAddressV2ToIPv4String(addr);
+        return ip ? `${ip}:${addr.port}` : null;
+      }
+      case BIP155Network.IPV6:
+        // IPv6: use hex representation of address
+        return `[${addr.addr.toString("hex")}]:${addr.port}`;
+      case BIP155Network.TORV3:
+        // TorV3: use hex of pubkey (32 bytes)
+        return `torv3:${addr.addr.toString("hex")}:${addr.port}`;
+      case BIP155Network.I2P:
+        // I2P: use hex of hash (32 bytes)
+        return `i2p:${addr.addr.toString("hex")}:${addr.port}`;
+      case BIP155Network.CJDNS:
+        // CJDNS: use hex of address (16 bytes)
+        return `cjdns:${addr.addr.toString("hex")}:${addr.port}`;
+      default:
+        // Unknown network type - skip
+        return null;
+    }
+  }
+
+  /**
+   * Convert a NetworkAddressV2 to PeerInfo.
+   */
+  private addrV2ToPeerInfo(
+    addr: NetworkAddressV2,
+    timestamp: number
+  ): PeerInfo | null {
+    switch (addr.networkId) {
+      case BIP155Network.IPV4: {
+        const ip = networkAddressV2ToIPv4String(addr);
+        if (!ip) return null;
+        return {
+          host: ip,
+          port: addr.port,
+          services: addr.services,
+          lastSeen: timestamp * 1000,
+          banScore: 0,
+          lastConnected: 0,
+          networkId: BIP155Network.IPV4,
+        };
+      }
+      case BIP155Network.IPV6:
+        // For IPv6, store the hex representation as "host" for now
+        return {
+          host: addr.addr.toString("hex"),
+          port: addr.port,
+          services: addr.services,
+          lastSeen: timestamp * 1000,
+          banScore: 0,
+          lastConnected: 0,
+          networkId: BIP155Network.IPV6,
+          rawAddr: Buffer.from(addr.addr),
+        };
+      case BIP155Network.TORV3:
+        // Store TorV3 address (we can't connect yet, but we can relay)
+        return {
+          host: addr.addr.toString("hex"),
+          port: addr.port,
+          services: addr.services,
+          lastSeen: timestamp * 1000,
+          banScore: 0,
+          lastConnected: 0,
+          networkId: BIP155Network.TORV3,
+          rawAddr: Buffer.from(addr.addr),
+        };
+      case BIP155Network.I2P:
+        // Store I2P address
+        return {
+          host: addr.addr.toString("hex"),
+          port: addr.port,
+          services: addr.services,
+          lastSeen: timestamp * 1000,
+          banScore: 0,
+          lastConnected: 0,
+          networkId: BIP155Network.I2P,
+          rawAddr: Buffer.from(addr.addr),
+        };
+      case BIP155Network.CJDNS:
+        // Store CJDNS address
+        return {
+          host: addr.addr.toString("hex"),
+          port: addr.port,
+          services: addr.services,
+          lastSeen: timestamp * 1000,
+          banScore: 0,
+          lastConnected: 0,
+          networkId: BIP155Network.CJDNS,
+          rawAddr: Buffer.from(addr.addr),
+        };
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Convert PeerInfo to NetworkAddressV2 for sending in addrv2 messages.
+   */
+  peerInfoToAddrV2(info: PeerInfo): NetworkAddressV2 | null {
+    const networkId = info.networkId ?? BIP155Network.IPV4;
+
+    switch (networkId) {
+      case BIP155Network.IPV4: {
+        // Parse IPv4 from host string
+        const parts = info.host.split(".");
+        if (parts.length !== 4) return null;
+        const addr = Buffer.alloc(4);
+        for (let i = 0; i < 4; i++) {
+          const octet = parseInt(parts[i], 10);
+          if (isNaN(octet) || octet < 0 || octet > 255) return null;
+          addr[i] = octet;
+        }
+        return {
+          networkId: BIP155Network.IPV4,
+          addr,
+          port: info.port,
+          services: info.services,
+        };
+      }
+      case BIP155Network.IPV6:
+      case BIP155Network.TORV3:
+      case BIP155Network.I2P:
+      case BIP155Network.CJDNS:
+        // Use stored raw address
+        if (!info.rawAddr) return null;
+        return {
+          networkId,
+          addr: info.rawAddr,
+          port: info.port,
+          services: info.services,
+        };
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Check if a PeerInfo can be sent in legacy addr messages.
+   */
+  isAddrV1CompatiblePeer(info: PeerInfo): boolean {
+    const networkId = info.networkId ?? BIP155Network.IPV4;
+    return networkId === BIP155Network.IPV4 || networkId === BIP155Network.IPV6;
   }
 
   /**
