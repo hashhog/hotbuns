@@ -13,12 +13,13 @@ hotbuns is a from-scratch Bitcoin full node written in TypeScript (Bun) that doe
 - [x] Cryptographic primitives (SHA256d, HASH160, secp256k1 ECDSA)
 - [x] Address encoding (Base58Check, Bech32, Bech32m)
 - [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR, NULLFAIL, WITNESS_PUBKEYTYPE, witness cleanstack, P2SH push-only, FindAndDelete, OP_CODESEPARATOR, MINIMALIF)
-- [x] Consensus parameters (mainnet, testnet, regtest)
+- [x] Consensus parameters (mainnet, testnet3, testnet4/BIP94, regtest)
+- [x] Difficulty adjustment (2016-block retargeting, testnet 20-minute rule, BIP94)
 - [x] Database storage (LevelDB, block index, UTXO set, batch optimization)
 - [x] Transaction and block validation (parallel sig verification, BIP68 sequence locks, sigop counting with witness discount)
 - [x] P2P networking (TCP, version handshake, message framing, BIP-152)
 - [x] Peer manager (DNS discovery, connection pool, ban scoring)
-- [x] Header sync (block locator, MTP, PoW, difficulty adjustment)
+- [x] Header sync (block locator, MTP, PoW verification)
 - [x] Block sync (IBD, parallel download, stall detection)
 - [x] UTXO/chain state (LRU cache, dirty tracking, connect/disconnect, undo data)
 - [x] Mempool (fee-rate ordering, eviction, dependency tracking)
@@ -54,7 +55,7 @@ src/
   crypto/           # SHA256, RIPEMD160, secp256k1
   address/          # Base58Check, Bech32
   script/           # Script interpreter
-  consensus/        # network parameters
+  consensus/        # network parameters, proof-of-work
   storage/          # persistent storage, undo data (rev*.dat)
   validation/       # block and tx validation
   p2p/              # peer connections, message framing
