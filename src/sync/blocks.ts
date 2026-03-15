@@ -23,7 +23,13 @@ import {
   serializeBlockHeader,
   validateBlock,
 } from "../validation/block.js";
-import { getTxId, isCoinbase } from "../validation/tx.js";
+import {
+  getTxId,
+  isCoinbase,
+  checkSequenceLocks,
+  SEQUENCE_LOCKTIME_DISABLE_FLAG,
+  type UTXOConfirmation,
+} from "../validation/tx.js";
 import { BufferWriter } from "../wire/serialization.js";
 
 /** Maximum blocks in-flight at once (across all peers). */
@@ -577,6 +583,18 @@ export class BlockSync {
       return false;
     }
 
+    // BIP68 (CSV) activation check
+    const enforceBIP68 = height >= this.params.csvHeight;
+
+    // Get the previous block's MTP for BIP68 time-based locks
+    let blockPrevMTP = 0;
+    if (enforceBIP68) {
+      const prevHeaderEntry = this.headerSync.getHeaderByHeight(height - 1);
+      if (prevHeaderEntry) {
+        blockPrevMTP = this.headerSync.getMedianTimePast(prevHeaderEntry);
+      }
+    }
+
     // Prepare batch operations
     const batchOps: BatchOperation[] = [];
 
@@ -594,12 +612,17 @@ export class BlockSync {
       if (!isCoinbaseTx) {
         let inputValue = 0n;
 
+        // Collect UTXOs and confirmations for BIP68 sequence lock validation
+        const utxoConfirmations: UTXOConfirmation[] = [];
+        const inputUTXOs: (UTXOEntry | null)[] = [];
+
+        // First pass: gather all UTXOs
         for (const input of tx.inputs) {
           const prevTxid = input.prevOut.txid;
           const prevVout = input.prevOut.vout;
 
           // Look up the UTXO being spent
-          const utxo = await this.db.getUTXO(prevTxid, prevVout);
+          let utxo = await this.db.getUTXO(prevTxid, prevVout);
           if (!utxo) {
             // Check if it's in the pending ops (created in same block)
             const pendingUtxo = this.findPendingUTXO(prevTxid, prevVout);
@@ -608,25 +631,76 @@ export class BlockSync {
                 `Missing UTXO for input ${prevTxid.toString("hex").slice(0, 16)}:${prevVout} in tx ${txidHex.slice(0, 16)}`
               );
               // During IBD we may be missing UTXOs - this is expected
-              // Continue anyway to build the chain
+              // Use null to indicate missing and skip BIP68 check for this input
+              inputUTXOs.push(null);
+              utxoConfirmations.push({ height: 0, medianTimePast: 0 });
               continue;
             }
-            inputValue += pendingUtxo.amount;
-          } else {
-            // Check coinbase maturity
-            if (utxo.coinbase) {
-              const maturity = height - utxo.height;
-              if (maturity < this.params.coinbaseMaturity) {
-                console.warn(
-                  `Immature coinbase spend in tx ${txidHex.slice(0, 16)}: maturity ${maturity} < ${this.params.coinbaseMaturity}`
-                );
-                return false;
+            utxo = pendingUtxo;
+          }
+          inputUTXOs.push(utxo);
+
+          // Build UTXO confirmation info for BIP68
+          // medianTimePast is the MTP of the block *before* the UTXO was mined
+          if (enforceBIP68) {
+            let coinMTP = 0;
+            if (utxo.height > 0) {
+              const coinPrevHeader = this.headerSync.getHeaderByHeight(utxo.height - 1);
+              if (coinPrevHeader) {
+                coinMTP = this.headerSync.getMedianTimePast(coinPrevHeader);
               }
             }
+            utxoConfirmations.push({ height: utxo.height, medianTimePast: coinMTP });
+          } else {
+            utxoConfirmations.push({ height: utxo.height, medianTimePast: 0 });
+          }
+        }
 
-            inputValue += utxo.amount;
+        // BIP68 sequence lock validation (only for version >= 2 transactions)
+        if (enforceBIP68 && tx.version >= 2) {
+          const seqLockValid = checkSequenceLocks(
+            tx,
+            enforceBIP68,
+            height,
+            blockPrevMTP,
+            utxoConfirmations
+          );
+          if (!seqLockValid) {
+            console.warn(
+              `Sequence locks not satisfied for tx ${txidHex.slice(0, 16)} at height ${height}`
+            );
+            return false;
+          }
+        }
 
-            // Delete the spent UTXO
+        // Second pass: validate and spend UTXOs
+        for (let i = 0; i < tx.inputs.length; i++) {
+          const input = tx.inputs[i];
+          const prevTxid = input.prevOut.txid;
+          const prevVout = input.prevOut.vout;
+          const utxo = inputUTXOs[i];
+
+          if (!utxo) {
+            // Already warned about missing UTXO
+            continue;
+          }
+
+          // Check coinbase maturity
+          if (utxo.coinbase) {
+            const maturity = height - utxo.height;
+            if (maturity < this.params.coinbaseMaturity) {
+              console.warn(
+                `Immature coinbase spend in tx ${txidHex.slice(0, 16)}: maturity ${maturity} < ${this.params.coinbaseMaturity}`
+              );
+              return false;
+            }
+          }
+
+          inputValue += utxo.amount;
+
+          // Delete the spent UTXO (only if from DB, not pending)
+          const dbUtxo = await this.db.getUTXO(prevTxid, prevVout);
+          if (dbUtxo) {
             const utxoKey = this.makeUTXOKey(prevTxid, prevVout);
             batchOps.push({
               type: "del",
