@@ -1,14 +1,27 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, beforeAll } from "bun:test";
 import {
   sha256Hash,
   hash256,
   hash160,
   ecdsaSign,
   ecdsaVerify,
+  ecdsaVerifyBatch,
   privateKeyToPublicKey,
+  privateKeyToXOnlyPubKey,
   isValidPrivateKey,
   isValidPublicKey,
+  isValidXOnlyPubKey,
   taggedHash,
+  schnorrSign,
+  schnorrVerify,
+  schnorrVerifyBatch,
+  tweakPrivateKey,
+  tweakPublicKey,
+  sha256d64,
+  computeMerkleRootOptimized,
+  hash256Batch,
+  getSha256Implementation,
+  runCryptoBenchmarks,
 } from "./primitives";
 
 describe("sha256Hash", () => {
@@ -116,6 +129,36 @@ describe("ECDSA operations", () => {
     const wrongMsgHash = sha256Hash(Buffer.from("wrong message"));
     const valid = ecdsaVerify(signature, wrongMsgHash, pubKey);
     expect(valid).toBe(false);
+  });
+});
+
+describe("ecdsaVerifyBatch", () => {
+  test("verifies multiple signatures in batch", () => {
+    const privateKey1 = Buffer.from(
+      "0000000000000000000000000000000000000000000000000000000000000001",
+      "hex"
+    );
+    const privateKey2 = Buffer.from(
+      "0000000000000000000000000000000000000000000000000000000000000002",
+      "hex"
+    );
+
+    const msgHash1 = sha256Hash(Buffer.from("msg1"));
+    const msgHash2 = sha256Hash(Buffer.from("msg2"));
+
+    const sig1 = ecdsaSign(msgHash1, privateKey1);
+    const sig2 = ecdsaSign(msgHash2, privateKey2);
+
+    const pubKey1 = privateKeyToPublicKey(privateKey1);
+    const pubKey2 = privateKeyToPublicKey(privateKey2);
+
+    const results = ecdsaVerifyBatch([
+      { signature: sig1, msgHash: msgHash1, publicKey: pubKey1 },
+      { signature: sig2, msgHash: msgHash2, publicKey: pubKey2 },
+      { signature: sig1, msgHash: msgHash2, publicKey: pubKey1 }, // Invalid: wrong message
+    ]);
+
+    expect(results).toEqual([true, true, false]);
   });
 });
 
@@ -233,5 +276,261 @@ describe("taggedHash", () => {
     const hash1 = taggedHash("TapSighash", msg);
     const hash2 = taggedHash("TapSighash", msg);
     expect(hash1.equals(hash2)).toBe(true);
+  });
+});
+
+describe("Schnorr operations", () => {
+  const privateKey = Buffer.from(
+    "0000000000000000000000000000000000000000000000000000000000000001",
+    "hex"
+  );
+
+  test("derives x-only public key", () => {
+    const xOnlyPubKey = privateKeyToXOnlyPubKey(privateKey);
+    expect(xOnlyPubKey.length).toBe(32);
+    // The x-coordinate of the generator point G
+    expect(xOnlyPubKey.toString("hex")).toBe(
+      "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    );
+  });
+
+  test("signs and verifies Schnorr signature", () => {
+    const msgHash = sha256Hash(Buffer.from("test message"));
+    const xOnlyPubKey = privateKeyToXOnlyPubKey(privateKey);
+    const signature = schnorrSign(msgHash, privateKey);
+
+    expect(signature.length).toBe(64);
+
+    const valid = schnorrVerify(signature, msgHash, xOnlyPubKey);
+    expect(valid).toBe(true);
+  });
+
+  test("Schnorr verification fails with wrong pubkey", () => {
+    const msgHash = sha256Hash(Buffer.from("test message"));
+    const signature = schnorrSign(msgHash, privateKey);
+
+    const wrongPrivKey = Buffer.from(
+      "0000000000000000000000000000000000000000000000000000000000000002",
+      "hex"
+    );
+    const wrongPubKey = privateKeyToXOnlyPubKey(wrongPrivKey);
+
+    const valid = schnorrVerify(signature, msgHash, wrongPubKey);
+    expect(valid).toBe(false);
+  });
+
+  test("Schnorr verification fails with wrong message", () => {
+    const msgHash = sha256Hash(Buffer.from("test message"));
+    const xOnlyPubKey = privateKeyToXOnlyPubKey(privateKey);
+    const signature = schnorrSign(msgHash, privateKey);
+
+    const wrongMsgHash = sha256Hash(Buffer.from("wrong"));
+    const valid = schnorrVerify(signature, wrongMsgHash, xOnlyPubKey);
+    expect(valid).toBe(false);
+  });
+
+  test("validates x-only public keys", () => {
+    const validXOnlyPubKey = privateKeyToXOnlyPubKey(privateKey);
+    expect(isValidXOnlyPubKey(validXOnlyPubKey)).toBe(true);
+
+    // Invalid: all zeros (not on curve)
+    expect(isValidXOnlyPubKey(Buffer.alloc(32, 0))).toBe(false);
+
+    // Invalid: wrong length
+    expect(isValidXOnlyPubKey(Buffer.alloc(33, 1))).toBe(false);
+  });
+});
+
+describe("schnorrVerifyBatch", () => {
+  test("verifies multiple Schnorr signatures in batch", () => {
+    const privateKey1 = Buffer.from(
+      "0000000000000000000000000000000000000000000000000000000000000001",
+      "hex"
+    );
+    const privateKey2 = Buffer.from(
+      "0000000000000000000000000000000000000000000000000000000000000002",
+      "hex"
+    );
+
+    const msgHash1 = sha256Hash(Buffer.from("msg1"));
+    const msgHash2 = sha256Hash(Buffer.from("msg2"));
+
+    const sig1 = schnorrSign(msgHash1, privateKey1);
+    const sig2 = schnorrSign(msgHash2, privateKey2);
+
+    const pubKey1 = privateKeyToXOnlyPubKey(privateKey1);
+    const pubKey2 = privateKeyToXOnlyPubKey(privateKey2);
+
+    const results = schnorrVerifyBatch([
+      { signature: sig1, msgHash: msgHash1, publicKey: pubKey1 },
+      { signature: sig2, msgHash: msgHash2, publicKey: pubKey2 },
+      { signature: sig1, msgHash: msgHash2, publicKey: pubKey1 }, // Invalid: wrong message
+    ]);
+
+    expect(results).toEqual([true, true, false]);
+  });
+});
+
+describe("Taproot tweak operations", () => {
+  const privateKey = Buffer.from(
+    "0000000000000000000000000000000000000000000000000000000000000001",
+    "hex"
+  );
+  const tweak = Buffer.from(
+    "0000000000000000000000000000000000000000000000000000000000000005",
+    "hex"
+  );
+
+  test("tweaks private key", () => {
+    const tweakedPrivKey = tweakPrivateKey(privateKey, tweak);
+    expect(tweakedPrivKey.length).toBe(32);
+
+    // 1 + 5 = 6
+    const expected = Buffer.from(
+      "0000000000000000000000000000000000000000000000000000000000000006",
+      "hex"
+    );
+    expect(tweakedPrivKey.toString("hex")).toBe(expected.toString("hex"));
+  });
+
+  test("tweaks public key", () => {
+    const xOnlyPubKey = privateKeyToXOnlyPubKey(privateKey);
+    const tweakedPubKey = tweakPublicKey(xOnlyPubKey, tweak);
+    expect(tweakedPubKey.length).toBe(32);
+
+    // The tweaked public key should correspond to the tweaked private key
+    const expectedPubKey = privateKeyToXOnlyPubKey(tweakPrivateKey(privateKey, tweak));
+    expect(tweakedPubKey.toString("hex")).toBe(expectedPubKey.toString("hex"));
+  });
+});
+
+describe("sha256d64 (Merkle tree optimization)", () => {
+  test("computes double SHA-256 of 64-byte block", () => {
+    const left = Buffer.alloc(32, 0x01);
+    const right = Buffer.alloc(32, 0x02);
+
+    const result = sha256d64(left, right);
+    expect(result.length).toBe(32);
+
+    // Verify it matches hash256 of concatenated data
+    const expected = hash256(Buffer.concat([left, right]));
+    expect(result.toString("hex")).toBe(expected.toString("hex"));
+  });
+});
+
+describe("computeMerkleRootOptimized", () => {
+  test("returns zeros for empty input", () => {
+    const result = computeMerkleRootOptimized([]);
+    expect(result.toString("hex")).toBe("00".repeat(32));
+  });
+
+  test("returns single hash unchanged", () => {
+    const hash = Buffer.alloc(32, 0xab);
+    const result = computeMerkleRootOptimized([hash]);
+    expect(result.toString("hex")).toBe(hash.toString("hex"));
+  });
+
+  test("computes Merkle root for two hashes", () => {
+    const hash1 = Buffer.alloc(32, 0x01);
+    const hash2 = Buffer.alloc(32, 0x02);
+
+    const result = computeMerkleRootOptimized([hash1, hash2]);
+
+    // Should be hash256(hash1 || hash2)
+    const expected = hash256(Buffer.concat([hash1, hash2]));
+    expect(result.toString("hex")).toBe(expected.toString("hex"));
+  });
+
+  test("computes Merkle root for three hashes (odd number)", () => {
+    const hash1 = Buffer.alloc(32, 0x01);
+    const hash2 = Buffer.alloc(32, 0x02);
+    const hash3 = Buffer.alloc(32, 0x03);
+
+    const result = computeMerkleRootOptimized([hash1, hash2, hash3]);
+
+    // Level 1: [hash256(hash1||hash2), hash256(hash3||hash3)]
+    // Level 0: hash256(level1[0] || level1[1])
+    const level1_0 = hash256(Buffer.concat([hash1, hash2]));
+    const level1_1 = hash256(Buffer.concat([hash3, hash3])); // Duplicate last
+    const expected = hash256(Buffer.concat([level1_0, level1_1]));
+
+    expect(result.toString("hex")).toBe(expected.toString("hex"));
+  });
+
+  test("computes Merkle root for four hashes", () => {
+    const hashes = [
+      Buffer.alloc(32, 0x01),
+      Buffer.alloc(32, 0x02),
+      Buffer.alloc(32, 0x03),
+      Buffer.alloc(32, 0x04),
+    ];
+
+    const result = computeMerkleRootOptimized(hashes);
+
+    // Level 1: [hash256(h1||h2), hash256(h3||h4)]
+    // Level 0: hash256(level1[0] || level1[1])
+    const level1_0 = hash256(Buffer.concat([hashes[0], hashes[1]]));
+    const level1_1 = hash256(Buffer.concat([hashes[2], hashes[3]]));
+    const expected = hash256(Buffer.concat([level1_0, level1_1]));
+
+    expect(result.toString("hex")).toBe(expected.toString("hex"));
+  });
+
+  test("handles large number of transactions", () => {
+    const hashes: Buffer[] = [];
+    for (let i = 0; i < 1000; i++) {
+      const hash = Buffer.alloc(32);
+      hash.writeUInt32LE(i, 0);
+      hashes.push(hash);
+    }
+
+    const result = computeMerkleRootOptimized(hashes);
+    expect(result.length).toBe(32);
+
+    // Verify consistency
+    const result2 = computeMerkleRootOptimized(hashes);
+    expect(result.toString("hex")).toBe(result2.toString("hex"));
+  });
+});
+
+describe("hash256Batch", () => {
+  test("computes batch of double SHA-256 hashes", () => {
+    const inputs = [
+      Buffer.from("test1"),
+      Buffer.from("test2"),
+      Buffer.from("test3"),
+    ];
+
+    const results = hash256Batch(inputs);
+
+    expect(results.length).toBe(3);
+    for (let i = 0; i < inputs.length; i++) {
+      expect(results[i].toString("hex")).toBe(hash256(inputs[i]).toString("hex"));
+    }
+  });
+});
+
+describe("getSha256Implementation", () => {
+  test("returns implementation name", () => {
+    const impl = getSha256Implementation();
+    expect(typeof impl).toBe("string");
+    expect(impl.length).toBeGreaterThan(0);
+    // Should be one of the known implementations
+    expect(
+      impl.includes("node:crypto") || impl.includes("@noble/hashes")
+    ).toBe(true);
+  });
+});
+
+describe("crypto benchmarks", () => {
+  test("runCryptoBenchmarks returns valid results", async () => {
+    const results = await runCryptoBenchmarks(100); // Small iteration count for test
+
+    expect(results.implementation).toBeTruthy();
+    expect(results.sha256ThroughputMBps).toBeGreaterThan(0);
+    expect(results.hash256OpsPerSec).toBeGreaterThan(0);
+    expect(results.merkleRootTxsPerSec).toBeGreaterThan(0);
+    expect(results.ecdsaVerifyOpsPerSec).toBeGreaterThan(0);
+    expect(results.schnorrVerifyOpsPerSec).toBeGreaterThan(0);
   });
 });
