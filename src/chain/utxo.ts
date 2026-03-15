@@ -1,15 +1,18 @@
 /**
- * UTXO set management: tracking unspent transaction outputs.
+ * UTXO cache layer: multi-layer cache with database backing.
  *
- * Implements a write-through cache with LRU eviction for efficient UTXO lookups
- * and batch persistence to the database. UTXOs are added when blocks are connected
- * and removed when spent.
+ * Implements a layered CoinsView design following Bitcoin Core:
+ * - CoinsView: abstract interface for UTXO lookups
+ * - CoinsViewDB: reads/writes directly to database
+ * - CoinsViewCache: in-memory cache with dirty/fresh flags
  *
- * Performance optimizations:
- * - LRU eviction: tracks access order and evicts least-recently-used clean entries
- * - Dirty tracking: only flushes modified entries to reduce write amplification
- * - Configurable cache size: defaults to ~450 MB (~5M entries at ~90 bytes each)
- * - Cache statistics: tracks hit/miss rates for monitoring
+ * Key optimizations:
+ * - FRESH flag: coin doesn't exist in backing store; if spent before flush, skip DB write
+ * - DIRTY flag: coin differs from backing store; needs flush
+ * - Batch flushing: accumulates changes and writes atomically
+ * - Memory management: flushes when cache exceeds dbcache limit
+ *
+ * Reference: /home/max/hashhog/bitcoin/src/coins.cpp and coins.h
  */
 
 import type { ChainDB, UTXOEntry, BatchOperation } from "../storage/database.js";
@@ -17,50 +20,54 @@ import { DBPrefix } from "../storage/database.js";
 import type { Transaction, OutPoint } from "../validation/tx.js";
 import { BufferWriter, BufferReader } from "../wire/serialization.js";
 
-/** Estimated bytes per UTXO entry in cache (for size calculations). */
-const BYTES_PER_UTXO_ENTRY = 90;
+/** Default max cache size in bytes (~450 MB). */
+const DEFAULT_DBCACHE_BYTES = 450 * 1024 * 1024;
 
-/** Default max cache size in bytes (~450 MB = ~5M entries). */
-const DEFAULT_MAX_CACHE_BYTES = 450 * 1024 * 1024;
-
-/** Cache statistics for monitoring. */
-export interface UTXOCacheStats {
-  hits: number;
-  misses: number;
-  evictions: number;
-  flushes: number;
-  currentSize: number;
-  maxSize: number;
-}
+/** Estimated overhead per cache entry (key string + CoinEntry object). */
+const CACHE_ENTRY_OVERHEAD = 100;
 
 /**
- * Interface for UTXO set operations.
+ * A single coin in the UTXO set.
+ * Corresponds to Bitcoin Core's Coin class.
  */
-export interface UTXOSet {
-  /** Add all outputs from a transaction as new UTXOs. */
-  addTransaction(
-    txid: Buffer,
-    tx: Transaction,
-    height: number,
-    isCoinbase: boolean
-  ): void;
-
-  /** Spend an input (remove the referenced UTXO). Returns the spent UTXO entry or throws. */
-  spendOutput(outpoint: OutPoint): UTXOEntry;
-
-  /** Look up a UTXO without spending it. */
-  getUTXO(outpoint: OutPoint): UTXOEntry | null;
-
-  /** Check if a UTXO exists. */
-  hasUTXO(outpoint: OutPoint): boolean;
+export interface Coin {
+  /** The transaction output: value and scriptPubKey. */
+  txOut: {
+    value: bigint;
+    scriptPubKey: Buffer;
+  };
+  /** Height at which the containing transaction was included. */
+  height: number;
+  /** Whether the containing transaction was a coinbase. */
+  isCoinbase: boolean;
 }
 
 /**
- * Create a cache key from a txid and vout.
+ * A cache entry with flags for cache management.
+ * Corresponds to Bitcoin Core's CCoinsCacheEntry.
+ */
+export interface CoinEntry {
+  /** The coin data (null if spent). */
+  coin: Coin | null;
+  /** True if this entry differs from the backing store. */
+  dirty: boolean;
+  /** True if this coin doesn't exist in the backing store. */
+  fresh: boolean;
+}
+
+/**
+ * Create an outpoint key string for Map lookup.
  * Format: txid_hex:vout
  */
-function makeOutpointKey(txid: Buffer, vout: number): string {
+function outpointKey(txid: Buffer, vout: number): string {
   return `${txid.toString("hex")}:${vout}`;
+}
+
+/**
+ * Create an outpoint key from OutPoint.
+ */
+function outpointKeyFromOutpoint(outpoint: OutPoint): string {
+  return outpointKey(outpoint.txid, outpoint.vout);
 }
 
 /**
@@ -77,9 +84,12 @@ function parseOutpointKey(key: string): { txid: Buffer; vout: number } {
 }
 
 /**
- * Encode a UTXO key for database storage: txid (32 bytes) || vout (4 bytes LE).
+ * Encode a UTXO key for database storage.
+ * Format: txid (32 bytes) + vout (4 bytes LE)
+ *
+ * Matches the format used by ChainDB.getUTXO / putUTXO.
  */
-function encodeUTXOKey(txid: Buffer, vout: number): Buffer {
+function encodeDBKey(txid: Buffer, vout: number): Buffer {
   const buf = Buffer.alloc(36);
   txid.copy(buf, 0);
   buf.writeUInt32LE(vout, 32);
@@ -87,32 +97,591 @@ function encodeUTXOKey(txid: Buffer, vout: number): Buffer {
 }
 
 /**
- * Serialize a UTXOEntry to bytes for storage.
+ * Serialize a Coin for database storage.
+ * Format matches the existing ChainDB UTXOEntry format:
+ * - height (4 bytes LE)
+ * - coinbase (1 byte)
+ * - amount (8 bytes LE)
+ * - scriptPubKey (varint length + bytes)
  */
-function serializeUTXO(entry: UTXOEntry): Buffer {
+function serializeCoin(coin: Coin): Buffer {
   const writer = new BufferWriter();
-  writer.writeUInt32LE(entry.height);
-  writer.writeUInt8(entry.coinbase ? 1 : 0);
-  writer.writeUInt64LE(entry.amount);
-  writer.writeVarBytes(entry.scriptPubKey);
+  writer.writeUInt32LE(coin.height);
+  writer.writeUInt8(coin.isCoinbase ? 1 : 0);
+  writer.writeUInt64LE(coin.txOut.value);
+  writer.writeVarBytes(coin.txOut.scriptPubKey);
   return writer.toBuffer();
 }
 
 /**
- * Deserialize a UTXOEntry from bytes.
+ * Deserialize a Coin from database storage.
  */
-function deserializeUTXO(data: Buffer): UTXOEntry {
+function deserializeCoin(data: Buffer): Coin {
   const reader = new BufferReader(data);
   const height = reader.readUInt32LE();
-  const coinbase = reader.readUInt8() === 1;
-  const amount = reader.readUInt64LE();
+  const isCoinbase = reader.readUInt8() === 1;
+  const value = reader.readUInt64LE();
   const scriptPubKey = reader.readVarBytes();
-  return { height, coinbase, amount, scriptPubKey };
+  return {
+    txOut: { value, scriptPubKey },
+    height,
+    isCoinbase,
+  };
+}
+
+/**
+ * Estimate memory usage of a Coin.
+ */
+function coinMemoryUsage(coin: Coin | null): number {
+  if (!coin) return 0;
+  // Base size: object overhead + bigint + number + boolean + scriptPubKey
+  return 48 + coin.txOut.scriptPubKey.length;
+}
+
+/**
+ * Abstract interface for UTXO set access.
+ * Corresponds to Bitcoin Core's CCoinsView.
+ */
+export abstract class CoinsView {
+  /**
+   * Retrieve a coin for the given outpoint.
+   * Returns null if the coin doesn't exist or is spent.
+   */
+  abstract getCoin(outpoint: OutPoint): Promise<Coin | null>;
+
+  /**
+   * Check if a coin exists (and is unspent).
+   */
+  abstract haveCoin(outpoint: OutPoint): Promise<boolean>;
+
+  /**
+   * Get the block hash representing the current view state.
+   */
+  abstract getBestBlock(): Promise<Buffer>;
+
+  /**
+   * Estimate the database size (0 if not applicable).
+   */
+  estimateSize(): number {
+    return 0;
+  }
+}
+
+/**
+ * CoinsView backed by the database.
+ * Corresponds to Bitcoin Core's CCoinsViewDB.
+ */
+export class CoinsViewDB extends CoinsView {
+  private db: ChainDB;
+  private bestBlockHash: Buffer;
+
+  constructor(db: ChainDB) {
+    super();
+    this.db = db;
+    this.bestBlockHash = Buffer.alloc(32); // Set from chain state
+  }
+
+  /**
+   * Set the best block hash (called when chain state is loaded).
+   */
+  setBestBlock(hash: Buffer): void {
+    this.bestBlockHash = hash;
+  }
+
+  async getCoin(outpoint: OutPoint): Promise<Coin | null> {
+    const entry = await this.db.getUTXO(outpoint.txid, outpoint.vout);
+    if (!entry) return null;
+    // Convert UTXOEntry to Coin
+    return {
+      txOut: {
+        value: entry.amount,
+        scriptPubKey: entry.scriptPubKey,
+      },
+      height: entry.height,
+      isCoinbase: entry.coinbase,
+    };
+  }
+
+  async haveCoin(outpoint: OutPoint): Promise<boolean> {
+    const entry = await this.db.getUTXO(outpoint.txid, outpoint.vout);
+    return entry !== null;
+  }
+
+  async getBestBlock(): Promise<Buffer> {
+    return this.bestBlockHash;
+  }
+
+  /**
+   * Write a batch of coin changes to the database.
+   * Called by CoinsViewCache during flush.
+   */
+  async batchWrite(
+    entries: Map<string, CoinEntry>,
+    hashBlock: Buffer
+  ): Promise<void> {
+    const ops: BatchOperation[] = [];
+
+    for (const [key, entry] of entries) {
+      if (!entry.dirty) continue;
+
+      const { txid, vout } = parseOutpointKey(key);
+      const dbKey = encodeDBKey(txid, vout);
+
+      if (entry.coin === null) {
+        // Coin was spent - delete from DB unless it was FRESH
+        // (FRESH means it never existed in DB, so no need to delete)
+        if (!entry.fresh) {
+          ops.push({
+            type: "del",
+            prefix: DBPrefix.UTXO,
+            key: dbKey,
+          });
+        }
+      } else {
+        // Coin exists - write to DB
+        ops.push({
+          type: "put",
+          prefix: DBPrefix.UTXO,
+          key: dbKey,
+          value: serializeCoin(entry.coin),
+        });
+      }
+    }
+
+    if (ops.length > 0) {
+      await this.db.batch(ops);
+    }
+
+    this.bestBlockHash = hashBlock;
+  }
+}
+
+/**
+ * In-memory cache layer on top of another CoinsView.
+ * Corresponds to Bitcoin Core's CCoinsViewCache.
+ *
+ * Key behaviors:
+ * - Lookups check cache first, then fall through to backing view
+ * - Changes are marked DIRTY and accumulated until flush
+ * - FRESH flag tracks coins that don't exist in backing store
+ * - If a FRESH coin is spent before flush, it can be deleted without DB write
+ */
+export class CoinsViewCache extends CoinsView {
+  private base: CoinsView | CoinsViewDB;
+  private cache: Map<string, CoinEntry>;
+  private hashBlock: Buffer;
+
+  // Memory management
+  private cachedCoinsUsage: number;
+  private dirtyCount: number;
+  private maxCacheBytes: number;
+
+  // Statistics
+  private hits: number;
+  private misses: number;
+  private flushCount: number;
+
+  constructor(
+    base: CoinsView | CoinsViewDB,
+    maxCacheBytes: number = DEFAULT_DBCACHE_BYTES
+  ) {
+    super();
+    this.base = base;
+    this.cache = new Map();
+    this.hashBlock = Buffer.alloc(32);
+    this.cachedCoinsUsage = 0;
+    this.dirtyCount = 0;
+    this.maxCacheBytes = maxCacheBytes;
+    this.hits = 0;
+    this.misses = 0;
+    this.flushCount = 0;
+  }
+
+  /**
+   * Fetch a coin, checking cache first then backing store.
+   */
+  async getCoin(outpoint: OutPoint): Promise<Coin | null> {
+    const key = outpointKeyFromOutpoint(outpoint);
+
+    // Check cache first
+    const cached = this.cache.get(key);
+    if (cached !== undefined) {
+      this.hits++;
+      return cached.coin;
+    }
+
+    this.misses++;
+
+    // Fetch from backing store
+    const coin = await this.base.getCoin(outpoint);
+    if (coin) {
+      // Cache for future lookups (not dirty, not fresh)
+      const entry: CoinEntry = {
+        coin,
+        dirty: false,
+        fresh: false,
+      };
+      this.cache.set(key, entry);
+      this.cachedCoinsUsage += coinMemoryUsage(coin) + CACHE_ENTRY_OVERHEAD;
+    }
+
+    return coin;
+  }
+
+  /**
+   * Check if a coin exists without fetching full data.
+   */
+  async haveCoin(outpoint: OutPoint): Promise<boolean> {
+    const key = outpointKeyFromOutpoint(outpoint);
+
+    // Check cache first
+    const cached = this.cache.get(key);
+    if (cached !== undefined) {
+      return cached.coin !== null;
+    }
+
+    // Check backing store
+    return this.base.haveCoin(outpoint);
+  }
+
+  /**
+   * Check if a coin is in the cache (without DB lookup).
+   */
+  haveCoinInCache(outpoint: OutPoint): boolean {
+    const key = outpointKeyFromOutpoint(outpoint);
+    const cached = this.cache.get(key);
+    return cached !== undefined && cached.coin !== null;
+  }
+
+  /**
+   * Get a coin from cache only (no DB lookup).
+   * Returns null if not in cache or if spent.
+   */
+  getCoinFromCache(outpoint: OutPoint): Coin | null {
+    const key = outpointKeyFromOutpoint(outpoint);
+    const cached = this.cache.get(key);
+    if (cached === undefined || cached.coin === null) {
+      return null;
+    }
+    this.hits++;
+    return cached.coin;
+  }
+
+  /**
+   * Add a new coin to the cache.
+   *
+   * @param outpoint - The outpoint identifying this coin
+   * @param coin - The coin data
+   * @param possibleOverwrite - True if an unspent coin may already exist
+   */
+  addCoin(outpoint: OutPoint, coin: Coin, possibleOverwrite: boolean): void {
+    const key = outpointKeyFromOutpoint(outpoint);
+
+    // Skip unspendable outputs (OP_RETURN)
+    if (
+      coin.txOut.scriptPubKey.length > 0 &&
+      coin.txOut.scriptPubKey[0] === 0x6a
+    ) {
+      return;
+    }
+
+    const existing = this.cache.get(key);
+    let fresh = false;
+
+    if (!possibleOverwrite) {
+      // This should be a new coin
+      if (existing && existing.coin !== null) {
+        throw new Error(
+          "Attempted to overwrite an unspent coin (when possibleOverwrite is false)"
+        );
+      }
+      // Mark as FRESH if the existing entry is not DIRTY
+      // (If DIRTY and spent, spentness hasn't been flushed yet,
+      // so we can't mark it FRESH or we'd lose the delete)
+      fresh = !existing || !existing.dirty;
+    }
+
+    // Update memory usage
+    if (existing) {
+      if (existing.dirty) this.dirtyCount--;
+      this.cachedCoinsUsage -= coinMemoryUsage(existing.coin);
+    }
+
+    const entry: CoinEntry = {
+      coin,
+      dirty: true,
+      fresh,
+    };
+
+    this.cache.set(key, entry);
+    this.dirtyCount++;
+    this.cachedCoinsUsage += coinMemoryUsage(coin) + CACHE_ENTRY_OVERHEAD;
+  }
+
+  /**
+   * Spend a coin (mark as spent in cache).
+   *
+   * @param outpoint - The outpoint to spend
+   * @param moveout - If provided, the coin data is moved here
+   * @returns True if the coin existed and was spent
+   */
+  async spendCoin(outpoint: OutPoint, moveout?: { coin: Coin | null }): Promise<boolean> {
+    const key = outpointKeyFromOutpoint(outpoint);
+
+    // First, ensure the coin is in the cache
+    let entry = this.cache.get(key);
+
+    if (entry === undefined) {
+      // Try to fetch from backing store
+      const coin = await this.base.getCoin(outpoint);
+      if (!coin) return false;
+
+      // Add to cache as clean
+      entry = {
+        coin,
+        dirty: false,
+        fresh: false,
+      };
+      this.cache.set(key, entry);
+      this.cachedCoinsUsage += coinMemoryUsage(coin) + CACHE_ENTRY_OVERHEAD;
+    }
+
+    if (entry.coin === null) {
+      // Already spent
+      return false;
+    }
+
+    // Move out the coin if requested
+    if (moveout) {
+      moveout.coin = entry.coin;
+    }
+
+    // Update memory usage
+    if (entry.dirty) this.dirtyCount--;
+    this.cachedCoinsUsage -= coinMemoryUsage(entry.coin);
+
+    // If FRESH, we can just delete the entry entirely
+    // (it was created and spent within this cache session)
+    if (entry.fresh) {
+      this.cache.delete(key);
+    } else {
+      // Mark as spent and dirty
+      entry.coin = null;
+      entry.dirty = true;
+      this.dirtyCount++;
+    }
+
+    return true;
+  }
+
+  /**
+   * Synchronous spend for coins already in cache.
+   * Throws if the coin is not in cache.
+   */
+  spendCoinSync(outpoint: OutPoint, moveout?: { coin: Coin | null }): boolean {
+    const key = outpointKeyFromOutpoint(outpoint);
+    const entry = this.cache.get(key);
+
+    if (entry === undefined) {
+      throw new Error(
+        `Coin not in cache (must be pre-loaded): ${outpoint.txid.toString("hex")}:${outpoint.vout}`
+      );
+    }
+
+    if (entry.coin === null) {
+      return false;
+    }
+
+    if (moveout) {
+      moveout.coin = entry.coin;
+    }
+
+    if (entry.dirty) this.dirtyCount--;
+    this.cachedCoinsUsage -= coinMemoryUsage(entry.coin);
+
+    if (entry.fresh) {
+      this.cache.delete(key);
+    } else {
+      entry.coin = null;
+      entry.dirty = true;
+      this.dirtyCount++;
+    }
+
+    return true;
+  }
+
+  /**
+   * Remove a non-dirty entry from the cache.
+   * Used to free memory without losing data (can be re-fetched from DB).
+   */
+  uncache(outpoint: OutPoint): void {
+    const key = outpointKeyFromOutpoint(outpoint);
+    const entry = this.cache.get(key);
+    if (entry && !entry.dirty) {
+      this.cachedCoinsUsage -= coinMemoryUsage(entry.coin) + CACHE_ENTRY_OVERHEAD;
+      this.cache.delete(key);
+    }
+  }
+
+  /**
+   * Get the best block hash for this view.
+   */
+  async getBestBlock(): Promise<Buffer> {
+    if (this.hashBlock.every((b) => b === 0)) {
+      this.hashBlock = await this.base.getBestBlock();
+    }
+    return this.hashBlock;
+  }
+
+  /**
+   * Set the best block hash.
+   */
+  setBestBlock(hash: Buffer): void {
+    this.hashBlock = hash;
+  }
+
+  /**
+   * Flush all dirty entries to the backing store and clear the cache.
+   *
+   * After flush, the cache is empty and all changes are persisted.
+   */
+  async flush(): Promise<void> {
+    if (!(this.base instanceof CoinsViewDB)) {
+      // For layered caches, we'd need to handle this differently
+      // For now, assume base is always CoinsViewDB
+      throw new Error("flush() requires CoinsViewDB as base");
+    }
+
+    await this.base.batchWrite(this.cache, this.hashBlock);
+
+    // Clear the cache
+    this.cache.clear();
+    this.cachedCoinsUsage = 0;
+    this.dirtyCount = 0;
+    this.flushCount++;
+  }
+
+  /**
+   * Sync dirty entries to backing store but keep cache contents.
+   * Spent entries are erased, unspent entries become clean.
+   */
+  async sync(): Promise<void> {
+    if (!(this.base instanceof CoinsViewDB)) {
+      throw new Error("sync() requires CoinsViewDB as base");
+    }
+
+    await this.base.batchWrite(this.cache, this.hashBlock);
+
+    // Update cache: remove spent entries, clear dirty flags
+    for (const [key, entry] of this.cache) {
+      if (entry.coin === null) {
+        // Remove spent entries
+        this.cache.delete(key);
+      } else {
+        // Clear dirty flag
+        entry.dirty = false;
+        entry.fresh = false;
+      }
+    }
+
+    this.dirtyCount = 0;
+    this.flushCount++;
+  }
+
+  /**
+   * Check if the cache should be flushed based on memory usage.
+   */
+  shouldFlush(): boolean {
+    return this.cachedCoinsUsage >= this.maxCacheBytes;
+  }
+
+  /**
+   * Get current cache memory usage in bytes.
+   */
+  getMemoryUsage(): number {
+    return this.cachedCoinsUsage;
+  }
+
+  /**
+   * Get the number of entries in the cache.
+   */
+  getCacheSize(): number {
+    return this.cache.size;
+  }
+
+  /**
+   * Get the number of dirty entries.
+   */
+  getDirtyCount(): number {
+    return this.dirtyCount;
+  }
+
+  /**
+   * Get cache statistics.
+   */
+  getStats(): {
+    size: number;
+    dirtyCount: number;
+    memoryUsage: number;
+    maxMemory: number;
+    hits: number;
+    misses: number;
+    flushCount: number;
+  } {
+    return {
+      size: this.cache.size,
+      dirtyCount: this.dirtyCount,
+      memoryUsage: this.cachedCoinsUsage,
+      maxMemory: this.maxCacheBytes,
+      hits: this.hits,
+      misses: this.misses,
+      flushCount: this.flushCount,
+    };
+  }
+
+  /**
+   * Reset statistics.
+   */
+  resetStats(): void {
+    this.hits = 0;
+    this.misses = 0;
+  }
+}
+
+// ============================================================================
+// Legacy compatibility exports
+// ============================================================================
+
+/** UTXO entry for legacy code compatibility. */
+export type { UTXOEntry };
+
+/** Cache statistics for monitoring. */
+export interface UTXOCacheStats {
+  hits: number;
+  misses: number;
+  evictions: number;
+  flushes: number;
+  currentSize: number;
+  maxSize: number;
+}
+
+/**
+ * Interface for UTXO set operations (legacy).
+ */
+export interface UTXOSet {
+  addTransaction(
+    txid: Buffer,
+    tx: Transaction,
+    height: number,
+    isCoinbase: boolean
+  ): void;
+  spendOutput(outpoint: OutPoint): UTXOEntry;
+  getUTXO(outpoint: OutPoint): UTXOEntry | null;
+  hasUTXO(outpoint: OutPoint): boolean;
 }
 
 /**
  * Data stored for undo operations during block disconnect.
- * For each spent output, we store the full UTXO data plus the outpoint.
  */
 export interface SpentUTXO {
   txid: Buffer;
@@ -166,51 +735,26 @@ export function deserializeUndoData(data: Buffer): SpentUTXO[] {
 }
 
 /**
- * UTXO set manager with write-through caching and LRU eviction.
+ * UTXOManager: wrapper around CoinsViewCache for legacy compatibility.
  *
- * Maintains an in-memory cache of UTXOs being modified. Changes are
- * accumulated in the cache and flushed to the database atomically.
- *
- * Features:
- * - LRU eviction policy for memory-bounded operation
- * - Dirty tracking for efficient flushing
- * - Access order tracking for eviction decisions
- * - Cache statistics for monitoring
+ * This class maintains the same interface as the old UTXOManager but
+ * uses the new layered cache system internally.
  */
 export class UTXOManager implements UTXOSet {
-  private db: ChainDB;
-  private cache: Map<string, UTXOEntry>; // write-through cache
-  private spent: Set<string>; // outpoints spent in current batch
-  private added: Set<string>; // outpoints added in current batch (for flush)
+  private viewDB: CoinsViewDB;
+  private cache: CoinsViewCache;
+  private maxCacheBytes: number;
+  private maxCacheSize: number;
 
-  // LRU eviction support
-  private dirty: Set<string>; // keys modified since last flush
-  private accessOrder: Map<string, number>; // key -> access timestamp
-  private accessCounter: number; // monotonic counter for access ordering
-
-  // Cache size management
-  private maxCacheSize: number; // max entries (derived from max bytes)
-  private maxCacheBytes: number; // max bytes
-
-  // Statistics
+  // Legacy tracking
   private stats: UTXOCacheStats;
 
-  constructor(db: ChainDB, maxCacheBytes: number = DEFAULT_MAX_CACHE_BYTES) {
-    this.db = db;
-    this.cache = new Map();
-    this.spent = new Set();
-    this.added = new Set();
-
-    // LRU support
-    this.dirty = new Set();
-    this.accessOrder = new Map();
-    this.accessCounter = 0;
-
-    // Cache size
+  constructor(db: ChainDB, maxCacheBytes: number = DEFAULT_DBCACHE_BYTES) {
+    this.viewDB = new CoinsViewDB(db);
+    this.cache = new CoinsViewCache(this.viewDB, maxCacheBytes);
     this.maxCacheBytes = maxCacheBytes;
-    this.maxCacheSize = Math.floor(maxCacheBytes / BYTES_PER_UTXO_ENTRY);
+    this.maxCacheSize = Math.floor(maxCacheBytes / CACHE_ENTRY_OVERHEAD);
 
-    // Statistics
     this.stats = {
       hits: 0,
       misses: 0,
@@ -222,12 +766,31 @@ export class UTXOManager implements UTXOSet {
   }
 
   /**
+   * Get the underlying CoinsViewCache.
+   */
+  getCoinsViewCache(): CoinsViewCache {
+    return this.cache;
+  }
+
+  /**
+   * Get the underlying CoinsViewDB.
+   */
+  getCoinsViewDB(): CoinsViewDB {
+    return this.viewDB;
+  }
+
+  /**
    * Get cache statistics.
    */
   getStats(): UTXOCacheStats {
+    const cacheStats = this.cache.getStats();
     return {
-      ...this.stats,
-      currentSize: this.cache.size,
+      hits: cacheStats.hits,
+      misses: cacheStats.misses,
+      evictions: 0, // New system doesn't evict, it flushes
+      flushes: cacheStats.flushCount,
+      currentSize: cacheStats.size,
+      maxSize: this.maxCacheSize,
     };
   }
 
@@ -235,59 +798,7 @@ export class UTXOManager implements UTXOSet {
    * Reset cache statistics.
    */
   resetStats(): void {
-    this.stats = {
-      hits: 0,
-      misses: 0,
-      evictions: 0,
-      flushes: 0,
-      currentSize: this.cache.size,
-      maxSize: this.maxCacheSize,
-    };
-  }
-
-  /**
-   * Touch a key to update its access order (for LRU).
-   */
-  private touch(key: string): void {
-    this.accessOrder.set(key, ++this.accessCounter);
-  }
-
-  /**
-   * Evict clean (non-dirty) entries to free memory.
-   * Evicts the least recently used clean entries until we're under the limit.
-   */
-  private evictClean(targetFreeCount: number = 1): number {
-    if (this.cache.size + targetFreeCount <= this.maxCacheSize) {
-      return 0; // No eviction needed
-    }
-
-    const toEvict = this.cache.size + targetFreeCount - this.maxCacheSize;
-
-    // Build list of clean entries with their access order
-    const cleanEntries: { key: string; accessTime: number }[] = [];
-    for (const [key] of this.cache) {
-      if (!this.dirty.has(key) && !this.added.has(key)) {
-        cleanEntries.push({
-          key,
-          accessTime: this.accessOrder.get(key) ?? 0,
-        });
-      }
-    }
-
-    // Sort by access time (oldest first)
-    cleanEntries.sort((a, b) => a.accessTime - b.accessTime);
-
-    // Evict oldest clean entries
-    let evicted = 0;
-    for (let i = 0; i < Math.min(toEvict, cleanEntries.length); i++) {
-      const key = cleanEntries[i].key;
-      this.cache.delete(key);
-      this.accessOrder.delete(key);
-      evicted++;
-      this.stats.evictions++;
-    }
-
-    return evicted;
+    this.cache.resetStats();
   }
 
   /**
@@ -301,26 +812,19 @@ export class UTXOManager implements UTXOSet {
   ): void {
     for (let vout = 0; vout < tx.outputs.length; vout++) {
       const output = tx.outputs[vout];
-      const key = makeOutpointKey(txid, vout);
+      const outpoint: OutPoint = { txid, vout };
 
-      const entry: UTXOEntry = {
+      const coin: Coin = {
+        txOut: {
+          value: output.value,
+          scriptPubKey: output.scriptPubKey,
+        },
         height,
-        coinbase: isCoinbase,
-        amount: output.value,
-        scriptPubKey: output.scriptPubKey,
+        isCoinbase,
       };
 
-      // Evict if needed before adding
-      this.evictClean(1);
-
-      this.cache.set(key, entry);
-      this.added.add(key);
-      this.dirty.add(key);
-      this.touch(key);
-
-      // If this outpoint was previously spent in this batch, remove from spent
-      // (can happen during reorganization logic)
-      this.spent.delete(key);
+      // Coinbases can always be overwritten (pre-BIP30 duplicates)
+      this.cache.addCoin(outpoint, coin, isCoinbase);
     }
   }
 
@@ -329,74 +833,43 @@ export class UTXOManager implements UTXOSet {
    * Returns the spent UTXO entry or throws if not found.
    */
   spendOutput(outpoint: OutPoint): UTXOEntry {
-    const key = makeOutpointKey(outpoint.txid, outpoint.vout);
+    const moveout: { coin: Coin | null } = { coin: null };
+    const success = this.cache.spendCoinSync(outpoint, moveout);
 
-    // Check if already spent in this batch
-    if (this.spent.has(key)) {
+    if (!success || !moveout.coin) {
       throw new Error(
-        `UTXO already spent: ${outpoint.txid.toString("hex")}:${outpoint.vout}`
+        `UTXO not in cache (must be pre-loaded): ${outpoint.txid.toString("hex")}:${outpoint.vout}`
       );
     }
 
-    // Try to get from cache first
-    const cached = this.cache.get(key);
-    if (cached) {
-      this.stats.hits++;
-      // Mark as spent
-      this.spent.add(key);
-      this.dirty.add(key);
-      this.cache.delete(key);
-      this.added.delete(key);
-      this.accessOrder.delete(key);
-      return cached;
-    }
-
-    this.stats.misses++;
-    // UTXO not in cache - need to load from DB synchronously
-    // This is a limitation: we need the UTXO entry to return it
-    // The caller should pre-load UTXOs before spending
-    throw new Error(
-      `UTXO not in cache (must be pre-loaded): ${outpoint.txid.toString("hex")}:${outpoint.vout}`
-    );
+    // Convert Coin to UTXOEntry
+    return {
+      height: moveout.coin.height,
+      coinbase: moveout.coin.isCoinbase,
+      amount: moveout.coin.txOut.value,
+      scriptPubKey: moveout.coin.txOut.scriptPubKey,
+    };
   }
 
   /**
    * Spend an output asynchronously, loading from DB if needed.
    */
   async spendOutputAsync(outpoint: OutPoint): Promise<UTXOEntry> {
-    const key = makeOutpointKey(outpoint.txid, outpoint.vout);
+    const moveout: { coin: Coin | null } = { coin: null };
+    const success = await this.cache.spendCoin(outpoint, moveout);
 
-    // Check if already spent in this batch
-    if (this.spent.has(key)) {
+    if (!success || !moveout.coin) {
       throw new Error(
-        `UTXO already spent: ${outpoint.txid.toString("hex")}:${outpoint.vout}`
+        `UTXO not found: ${outpoint.txid.toString("hex")}:${outpoint.vout}`
       );
     }
 
-    // Try to get from cache first
-    let entry: UTXOEntry | null | undefined = this.cache.get(key);
-
-    if (entry) {
-      this.stats.hits++;
-    } else {
-      this.stats.misses++;
-      // Load from database
-      entry = await this.db.getUTXO(outpoint.txid, outpoint.vout);
-      if (!entry) {
-        throw new Error(
-          `UTXO not found: ${outpoint.txid.toString("hex")}:${outpoint.vout}`
-        );
-      }
-    }
-
-    // Mark as spent
-    this.spent.add(key);
-    this.dirty.add(key);
-    this.cache.delete(key);
-    this.added.delete(key);
-    this.accessOrder.delete(key);
-
-    return entry;
+    return {
+      height: moveout.coin.height,
+      coinbase: moveout.coin.isCoinbase,
+      amount: moveout.coin.txOut.value,
+      scriptPubKey: moveout.coin.txOut.scriptPubKey,
+    };
   }
 
   /**
@@ -405,289 +878,112 @@ export class UTXOManager implements UTXOSet {
    * Use getUTXOAsync for database lookup.
    */
   getUTXO(outpoint: OutPoint): UTXOEntry | null {
-    const key = makeOutpointKey(outpoint.txid, outpoint.vout);
+    const coin = this.cache.getCoinFromCache(outpoint);
+    if (!coin) return null;
 
-    // If spent in this batch, it doesn't exist
-    if (this.spent.has(key)) {
-      return null;
-    }
-
-    const entry = this.cache.get(key);
-    if (entry) {
-      this.stats.hits++;
-      this.touch(key);
-      return entry;
-    }
-
-    this.stats.misses++;
-    return null;
+    return {
+      height: coin.height,
+      coinbase: coin.isCoinbase,
+      amount: coin.txOut.value,
+      scriptPubKey: coin.txOut.scriptPubKey,
+    };
   }
 
   /**
    * Look up a UTXO asynchronously, checking database if not in cache.
    */
   async getUTXOAsync(outpoint: OutPoint): Promise<UTXOEntry | null> {
-    const key = makeOutpointKey(outpoint.txid, outpoint.vout);
+    const coin = await this.cache.getCoin(outpoint);
+    if (!coin) return null;
 
-    // If spent in this batch, it doesn't exist
-    if (this.spent.has(key)) {
-      return null;
-    }
-
-    // Check cache first
-    const cached = this.cache.get(key);
-    if (cached) {
-      this.stats.hits++;
-      this.touch(key);
-      return cached;
-    }
-
-    this.stats.misses++;
-
-    // Load from database
-    const entry = await this.db.getUTXO(outpoint.txid, outpoint.vout);
-    if (entry) {
-      // Cache for future lookups
-      this.evictClean(1);
-      this.cache.set(key, entry);
-      this.touch(key);
-    }
-    return entry;
+    return {
+      height: coin.height,
+      coinbase: coin.isCoinbase,
+      amount: coin.txOut.value,
+      scriptPubKey: coin.txOut.scriptPubKey,
+    };
   }
 
   /**
    * Check if a UTXO exists in cache.
-   * Use hasUTXOAsync for database lookup.
    */
   hasUTXO(outpoint: OutPoint): boolean {
-    const key = makeOutpointKey(outpoint.txid, outpoint.vout);
-
-    if (this.spent.has(key)) {
-      return false;
-    }
-
-    const exists = this.cache.has(key);
-    if (exists) {
-      this.stats.hits++;
-      this.touch(key);
-    } else {
-      this.stats.misses++;
-    }
-    return exists;
+    return this.cache.haveCoinInCache(outpoint);
   }
 
   /**
    * Check if a UTXO exists, checking database if not in cache.
    */
   async hasUTXOAsync(outpoint: OutPoint): Promise<boolean> {
-    const key = makeOutpointKey(outpoint.txid, outpoint.vout);
-
-    if (this.spent.has(key)) {
-      return false;
-    }
-
-    if (this.cache.has(key)) {
-      this.stats.hits++;
-      this.touch(key);
-      return true;
-    }
-
-    this.stats.misses++;
-    const entry = await this.db.getUTXO(outpoint.txid, outpoint.vout);
-    if (entry) {
-      // Cache for future lookups
-      this.evictClean(1);
-      this.cache.set(key, entry);
-      this.touch(key);
-    }
-    return entry !== null;
+    return this.cache.haveCoin(outpoint);
   }
 
   /**
    * Add a UTXO entry directly (used during block disconnect to restore spent UTXOs).
    */
   restoreUTXO(txid: Buffer, vout: number, entry: UTXOEntry): void {
-    const key = makeOutpointKey(txid, vout);
-    this.evictClean(1);
-    this.cache.set(key, entry);
-    this.added.add(key);
-    this.dirty.add(key);
-    this.touch(key);
-    this.spent.delete(key);
+    const outpoint: OutPoint = { txid, vout };
+    const coin: Coin = {
+      txOut: {
+        value: entry.amount,
+        scriptPubKey: entry.scriptPubKey,
+      },
+      height: entry.height,
+      isCoinbase: entry.coinbase,
+    };
+    // Restoring a spent UTXO is an overwrite of a spent entry
+    this.cache.addCoin(outpoint, coin, true);
   }
 
   /**
    * Remove a UTXO directly (used during block disconnect to remove outputs).
    */
-  removeUTXO(txid: Buffer, vout: number): void {
-    const key = makeOutpointKey(txid, vout);
-    this.cache.delete(key);
-    this.added.delete(key);
-    this.dirty.add(key);
-    this.accessOrder.delete(key);
-    this.spent.add(key);
+  async removeUTXO(txid: Buffer, vout: number): Promise<void> {
+    const outpoint: OutPoint = { txid, vout };
+    await this.cache.spendCoin(outpoint);
   }
 
   /**
    * Flush cached changes to database as an atomic batch.
-   * This flushes all dirty entries and clears tracking sets.
    */
   async flush(): Promise<void> {
-    const ops: BatchOperation[] = [];
-
-    // Add all new/modified UTXOs
-    for (const key of this.added) {
-      const entry = this.cache.get(key);
-      if (entry) {
-        const { txid, vout } = parseOutpointKey(key);
-        ops.push({
-          type: "put",
-          prefix: DBPrefix.UTXO,
-          key: encodeUTXOKey(txid, vout),
-          value: serializeUTXO(entry),
-        });
-      }
+    if (this.cache.shouldFlush() || this.cache.getDirtyCount() > 0) {
+      await this.cache.flush();
     }
-
-    // Delete all spent UTXOs
-    for (const key of this.spent) {
-      const { txid, vout } = parseOutpointKey(key);
-      ops.push({
-        type: "del",
-        prefix: DBPrefix.UTXO,
-        key: encodeUTXOKey(txid, vout),
-      });
-    }
-
-    if (ops.length > 0) {
-      await this.db.batch(ops);
-    }
-
-    this.stats.flushes++;
-
-    // Clear the tracking sets (but keep cache for reads)
-    this.added.clear();
-    this.spent.clear();
-    this.dirty.clear();
   }
 
   /**
-   * Flush only dirty entries to DB and clear dirty set.
-   * More efficient than full flush when only some entries changed.
+   * Flush only dirty entries to DB.
    */
   async flushDirty(): Promise<void> {
-    const ops: BatchOperation[] = [];
-
-    // Only process dirty entries
-    for (const key of this.dirty) {
-      // Check if this was an add or delete
-      if (this.spent.has(key)) {
-        // This was spent (deleted)
-        const { txid, vout } = parseOutpointKey(key);
-        ops.push({
-          type: "del",
-          prefix: DBPrefix.UTXO,
-          key: encodeUTXOKey(txid, vout),
-        });
-      } else if (this.added.has(key)) {
-        // This was added/modified
-        const entry = this.cache.get(key);
-        if (entry) {
-          const { txid, vout } = parseOutpointKey(key);
-          ops.push({
-            type: "put",
-            prefix: DBPrefix.UTXO,
-            key: encodeUTXOKey(txid, vout),
-            value: serializeUTXO(entry),
-          });
-        }
-      }
-    }
-
-    if (ops.length > 0) {
-      await this.db.batch(ops);
-    }
-
-    this.stats.flushes++;
-
-    // Clear dirty tracking (keep added/spent for reference until full flush)
-    this.dirty.clear();
+    await this.cache.sync();
   }
 
   /**
    * Clear the in-memory cache.
-   * Call after flush() to release memory.
    */
   clearCache(): void {
-    this.cache.clear();
-    this.added.clear();
-    this.spent.clear();
-    this.dirty.clear();
-    this.accessOrder.clear();
-    this.accessCounter = 0;
+    // Create a new cache
+    this.cache = new CoinsViewCache(this.viewDB, this.maxCacheBytes);
   }
 
   /**
    * Pre-load a UTXO into the cache from the database.
-   * Useful for batch operations where we need to spend multiple UTXOs.
    */
   async preloadUTXO(outpoint: OutPoint): Promise<boolean> {
-    const key = makeOutpointKey(outpoint.txid, outpoint.vout);
-
-    // Already in cache
-    if (this.cache.has(key)) {
-      this.touch(key);
-      return true;
-    }
-
-    // Already spent
-    if (this.spent.has(key)) {
-      return false;
-    }
-
-    // Load from database
-    const entry = await this.db.getUTXO(outpoint.txid, outpoint.vout);
-    if (entry) {
-      this.evictClean(1);
-      this.cache.set(key, entry);
-      this.touch(key);
-      return true;
-    }
-
-    return false;
+    const coin = await this.cache.getCoin(outpoint);
+    return coin !== null;
   }
 
   /**
    * Pre-load multiple UTXOs in batch.
-   * More efficient than multiple preloadUTXO calls.
    */
   async preloadUTXOs(outpoints: OutPoint[]): Promise<number> {
     let loaded = 0;
-    const toLoad: OutPoint[] = [];
-
-    // Filter out already cached or spent
     for (const outpoint of outpoints) {
-      const key = makeOutpointKey(outpoint.txid, outpoint.vout);
-      if (this.cache.has(key)) {
-        this.touch(key);
-        loaded++;
-      } else if (!this.spent.has(key)) {
-        toLoad.push(outpoint);
-      }
+      const coin = await this.cache.getCoin(outpoint);
+      if (coin) loaded++;
     }
-
-    // Load remaining from database
-    for (const outpoint of toLoad) {
-      const entry = await this.db.getUTXO(outpoint.txid, outpoint.vout);
-      if (entry) {
-        const key = makeOutpointKey(outpoint.txid, outpoint.vout);
-        this.evictClean(1);
-        this.cache.set(key, entry);
-        this.touch(key);
-        loaded++;
-      }
-    }
-
     return loaded;
   }
 
@@ -695,7 +991,7 @@ export class UTXOManager implements UTXOSet {
    * Get estimated memory usage of the cache in bytes.
    */
   getEstimatedMemoryUsage(): number {
-    return this.cache.size * BYTES_PER_UTXO_ENTRY;
+    return this.cache.getMemoryUsage();
   }
 
   /**
@@ -707,37 +1003,38 @@ export class UTXOManager implements UTXOSet {
 
   /**
    * Set a new maximum cache size in bytes.
-   * May trigger eviction if current size exceeds new limit.
    */
   setMaxCacheBytes(maxBytes: number): void {
     this.maxCacheBytes = maxBytes;
-    this.maxCacheSize = Math.floor(maxBytes / BYTES_PER_UTXO_ENTRY);
-    this.stats.maxSize = this.maxCacheSize;
-
-    // Evict if we're over the new limit
-    if (this.cache.size > this.maxCacheSize) {
-      this.evictClean(0);
-    }
+    this.maxCacheSize = Math.floor(maxBytes / CACHE_ENTRY_OVERHEAD);
   }
 
   /**
    * Get the number of UTXOs currently in the cache.
    */
   getCacheSize(): number {
-    return this.cache.size;
+    return this.cache.getCacheSize();
   }
 
   /**
-   * Get the number of pending operations (adds + spends).
+   * Get the number of pending operations.
    */
   getPendingCount(): number {
-    return this.added.size + this.spent.size;
+    return this.cache.getDirtyCount();
   }
 
   /**
    * Get the number of dirty entries pending flush.
    */
   getDirtyCount(): number {
-    return this.dirty.size;
+    return this.cache.getDirtyCount();
+  }
+
+  /**
+   * Set the best block hash.
+   */
+  setBestBlock(hash: Buffer): void {
+    this.cache.setBestBlock(hash);
+    this.viewDB.setBestBlock(hash);
   }
 }
