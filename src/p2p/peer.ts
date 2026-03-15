@@ -141,6 +141,35 @@ export class Peer {
    */
   nextFeeFilterSend: number;
 
+  // BIP-330 Erlay transaction reconciliation state
+  /**
+   * Whether peer has signaled support for Erlay (BIP-330).
+   * Set when we receive sendtxrcncl message during handshake.
+   */
+  supportsErlay: boolean;
+
+  /**
+   * Our local salt for Erlay short ID computation.
+   * Generated when we send sendtxrcncl, used to compute combined salt.
+   */
+  erlayLocalSalt: bigint;
+
+  /**
+   * Peer's salt from their sendtxrcncl message.
+   * 0n means we haven't received their salt yet.
+   */
+  erlayRemoteSalt: bigint;
+
+  /**
+   * Whether we've sent our sendtxrcncl message to this peer.
+   */
+  sentSendTxRcncl: boolean;
+
+  /**
+   * Whether we've received sendtxrcncl from this peer.
+   */
+  receivedSendTxRcncl: boolean;
+
   private socket: Socket | null;
   private recvBuffer: Buffer;
   private config: PeerConfig;
@@ -193,6 +222,12 @@ export class Peer {
     this.feeFilterReceived = 0n;
     this.feeFilterSent = 0n;
     this.nextFeeFilterSend = 0;
+    // BIP330 Erlay state
+    this.supportsErlay = false;
+    this.erlayLocalSalt = 0n;
+    this.erlayRemoteSalt = 0n;
+    this.sentSendTxRcncl = false;
+    this.receivedSendTxRcncl = false;
     // Register our nonce for self-connection detection
     Peer.localNonces.add(this.ourNonce);
   }
@@ -564,6 +599,22 @@ export class Peer {
           return;
         }
         this.wantsAddrV2 = true;
+        break;
+
+      case "sendtxrcncl":
+        // BIP330: Peer supports Erlay transaction reconciliation.
+        // This message must arrive between VERSION and VERACK.
+        if (this.handshakeComplete) {
+          this.misbehaving(10, "sendtxrcncl received after verack");
+          return;
+        }
+        if (this.receivedSendTxRcncl) {
+          this.misbehaving(1, "duplicate sendtxrcncl message");
+          return;
+        }
+        this.receivedSendTxRcncl = true;
+        this.erlayRemoteSalt = msg.payload.salt;
+        this.supportsErlay = true;
         break;
 
       default:
