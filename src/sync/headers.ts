@@ -4,6 +4,10 @@
  * Implements headers-first synchronization: download all block headers from peers
  * using getheaders messages, validate the header chain (proof-of-work, timestamps,
  * difficulty adjustments), and store the validated header chain in the database.
+ *
+ * Includes anti-DoS protection via PRESYNC/REDOWNLOAD mechanism:
+ * - PRESYNC: Accept headers without storing, track cumulative work
+ * - REDOWNLOAD: Once sufficient work is demonstrated, re-fetch and store permanently
  */
 
 import type { ChainDB, BlockIndexRecord } from "../storage/database.js";
@@ -25,6 +29,13 @@ import {
   serializeBlockHeader,
   getBlockHash,
 } from "../validation/block.js";
+import {
+  HeadersSyncState,
+  HeadersSyncStateEnum,
+  MAX_HEADERS_RESULTS,
+  DEFAULT_HEADERS_SYNC_PARAMS,
+  type HeadersSyncParams,
+} from "./header-sync-state.js";
 
 /** Status of a header chain entry. */
 export type HeaderStatus = "valid-header" | "valid-fork" | "invalid";
@@ -44,11 +55,25 @@ export interface HeaderChainEntry {
 const HEADER_TIP_KEY = "header_tip";
 
 /**
+ * Per-peer anti-DoS sync state.
+ */
+interface PeerSyncState {
+  /** The anti-DoS state machine for this peer. */
+  syncState: HeadersSyncState;
+
+  /** When we started syncing with this peer. */
+  startTime: number;
+}
+
+/**
  * Header synchronization manager.
  *
  * Downloads and validates block headers from peers, maintaining the best
  * header chain (by cumulative work). Headers can be far ahead of fully
  * validated blocks.
+ *
+ * Uses PRESYNC/REDOWNLOAD anti-DoS mechanism for new connections to prevent
+ * memory exhaustion attacks from low-work header chains.
  */
 export class HeaderSync {
   private db: ChainDB;
@@ -59,7 +84,13 @@ export class HeaderSync {
   private peerManager: PeerManager | null;
   private syncingPeers: Set<string>; // peer keys currently syncing
 
-  constructor(db: ChainDB, params: ConsensusParams) {
+  /** Per-peer anti-DoS sync state machines. */
+  private peerSyncStates: Map<string, PeerSyncState>;
+
+  /** Anti-DoS sync parameters. */
+  private syncParams: HeadersSyncParams;
+
+  constructor(db: ChainDB, params: ConsensusParams, syncParams?: HeadersSyncParams) {
     this.db = db;
     this.params = params;
     this.bestHeader = null;
@@ -67,6 +98,8 @@ export class HeaderSync {
     this.headersByHeight = new Map();
     this.peerManager = null;
     this.syncingPeers = new Set();
+    this.peerSyncStates = new Map();
+    this.syncParams = syncParams ?? DEFAULT_HEADERS_SYNC_PARAMS;
   }
 
   /**
@@ -470,6 +503,10 @@ export class HeaderSync {
 
   /**
    * Request headers from a peer.
+   *
+   * For peers where we're already past the minimum chain work, we use direct
+   * header sync. For new peers during initial sync, we use the PRESYNC/REDOWNLOAD
+   * anti-DoS mechanism.
    */
   requestHeaders(peer: Peer): void {
     const peerKey = `${peer.host}:${peer.port}`;
@@ -489,7 +526,42 @@ export class HeaderSync {
 
     this.syncingPeers.add(peerKey);
 
-    const locator = this.getBlockLocator();
+    // Check if we need anti-DoS protection for this peer
+    const existingState = this.peerSyncStates.get(peerKey);
+    let locator: Buffer[];
+
+    if (this.needsAntiDoS() && !existingState) {
+      // Create new anti-DoS state for this peer
+      const chainStart = this.bestHeader;
+      if (!chainStart) {
+        // No headers yet, use genesis
+        this.syncingPeers.delete(peerKey);
+        return;
+      }
+
+      const syncState = new HeadersSyncState(
+        this.params,
+        this.syncParams,
+        chainStart.hash,
+        chainStart.height,
+        chainStart.header.bits,
+        chainStart.chainWork
+      );
+
+      this.peerSyncStates.set(peerKey, {
+        syncState,
+        startTime: Date.now(),
+      });
+
+      locator = syncState.getNextHeadersRequestLocator();
+    } else if (existingState && existingState.syncState.getState() !== HeadersSyncStateEnum.FINAL) {
+      // Continue with existing anti-DoS state
+      locator = existingState.syncState.getNextHeadersRequestLocator();
+    } else {
+      // No anti-DoS needed, use normal locator
+      locator = this.getBlockLocator();
+    }
+
     const msg: NetworkMessage = {
       type: "getheaders",
       payload: {
@@ -503,7 +575,27 @@ export class HeaderSync {
   }
 
   /**
+   * Check if we need anti-DoS protection (haven't reached minimum chain work).
+   */
+  private needsAntiDoS(): boolean {
+    // Skip anti-DoS if minimum chain work is 0 (regtest)
+    if (this.params.nMinimumChainWork === 0n) {
+      return false;
+    }
+
+    // Need anti-DoS if we haven't reached minimum chain work yet
+    if (!this.bestHeader) {
+      return true;
+    }
+
+    return this.bestHeader.chainWork < this.params.nMinimumChainWork;
+  }
+
+  /**
    * Handle incoming headers message.
+   *
+   * Processes headers through anti-DoS state machine if active for this peer,
+   * otherwise processes them directly.
    */
   private async handleHeadersMessage(
     peer: Peer,
@@ -514,20 +606,66 @@ export class HeaderSync {
 
     if (headers.length === 0) {
       // Peer has no more headers - sync complete with this peer
+      this.cleanupPeerSyncState(peerKey);
       return;
     }
 
-    const validCount = await this.processHeaders(headers, peer);
+    const peerState = this.peerSyncStates.get(peerKey);
+    const fullMessage = headers.length >= MAX_HEADERS_RESULTS;
 
-    // If we received 2000 headers (max per message), request more
-    if (headers.length >= 2000) {
-      this.requestHeaders(peer);
+    if (peerState && peerState.syncState.getState() !== HeadersSyncStateEnum.FINAL) {
+      // Process through anti-DoS state machine
+      const result = peerState.syncState.processNextHeaders(headers, fullMessage);
+
+      if (!result.success) {
+        // Anti-DoS check failed - peer sent bad headers
+        console.warn(`Anti-DoS check failed for peer ${peerKey}`);
+        this.cleanupPeerSyncState(peerKey);
+        // Could increase ban score here
+        return;
+      }
+
+      // Process any headers that were released by the anti-DoS mechanism
+      if (result.powValidatedHeaders.length > 0) {
+        await this.processHeaders(result.powValidatedHeaders, peer);
+      }
+
+      if (result.requestMore) {
+        // Anti-DoS state needs more headers
+        this.requestHeaders(peer);
+      } else {
+        // Sync complete (either finished or aborted)
+        this.cleanupPeerSyncState(peerKey);
+      }
+    } else {
+      // No anti-DoS state - process directly
+      await this.processHeaders(headers, peer);
+
+      // If we received max headers, request more
+      if (fullMessage) {
+        this.requestHeaders(peer);
+      }
     }
 
     // Update peer manager's best height if needed
     if (this.peerManager && this.bestHeader) {
       this.peerManager.updateBestHeight(this.bestHeader.height);
     }
+  }
+
+  /**
+   * Clean up anti-DoS state for a peer.
+   */
+  private cleanupPeerSyncState(peerKey: string): void {
+    this.peerSyncStates.delete(peerKey);
+  }
+
+  /**
+   * Get the anti-DoS sync state for a peer (for testing/monitoring).
+   */
+  getPeerSyncState(peer: Peer): PeerSyncState | undefined {
+    const peerKey = `${peer.host}:${peer.port}`;
+    return this.peerSyncStates.get(peerKey);
   }
 
   /**
@@ -680,3 +818,13 @@ export class HeaderSync {
     return this.headerChain.size;
   }
 }
+
+// Re-export anti-DoS types for convenience
+export {
+  HeadersSyncState,
+  HeadersSyncStateEnum,
+  MAX_HEADERS_RESULTS,
+  DEFAULT_HEADERS_SYNC_PARAMS,
+  type HeadersSyncParams,
+  type ProcessingResult,
+} from "./header-sync-state.js";
