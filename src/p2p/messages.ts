@@ -93,7 +93,14 @@ export type NetworkMessage =
   | { type: "sendpackages"; payload: SendPackagesPayload }
   | { type: "ancpkginfo"; payload: AncPkgInfoPayload }
   | { type: "getpkgtxns"; payload: GetPkgTxnsPayload }
-  | { type: "pkgtxns"; payload: PkgTxnsPayload };
+  | { type: "pkgtxns"; payload: PkgTxnsPayload }
+  // BIP-330 Erlay transaction reconciliation
+  | { type: "sendtxrcncl"; payload: SendTxRcnclPayload }
+  | { type: "reqrecon"; payload: ReqReconPayload }
+  | { type: "sketch"; payload: SketchPayload }
+  | { type: "reqsketchext"; payload: ReqSketchExtPayload }
+  | { type: "reconcildiff"; payload: ReconcilDiffPayload }
+  | { type: "invtx"; payload: InvTxPayload };
 
 /**
  * Network address (without timestamp, used in version message).
@@ -272,6 +279,62 @@ export interface GetPkgTxnsPayload {
 export interface PkgTxnsPayload {
   packageHash: Buffer;        // 32 bytes - identifies the package
   transactions: Transaction[];  // The requested transactions
+}
+
+// ============================================================================
+// BIP-330 Erlay Transaction Reconciliation Messages
+// ============================================================================
+
+/**
+ * SendTxRcncl message payload (BIP-330).
+ * Sent during handshake to negotiate Erlay support.
+ */
+export interface SendTxRcnclPayload {
+  version: number;            // uint32 - protocol version (currently 1)
+  salt: bigint;               // uint64 - random salt for short ID computation
+}
+
+/**
+ * ReqRecon message payload (BIP-330).
+ * Initiator requests reconciliation with a peer.
+ */
+export interface ReqReconPayload {
+  setSize: number;            // uint16 - size of local reconciliation set
+  q: number;                  // uint16 - estimated difference coefficient
+}
+
+/**
+ * Sketch message payload (BIP-330).
+ * Responder sends their sketch for set reconciliation.
+ */
+export interface SketchPayload {
+  sketchData: Buffer;         // Serialized Minisketch data
+}
+
+/**
+ * ReqSketchExt message payload (BIP-330).
+ * Request sketch extension when initial reconciliation fails.
+ */
+export interface ReqSketchExtPayload {
+  // Empty payload - just signals need for extension
+}
+
+/**
+ * ReconcilDiff message payload (BIP-330).
+ * Announce reconciliation result with missing/extra short IDs.
+ */
+export interface ReconcilDiffPayload {
+  success: boolean;           // Whether reconciliation succeeded
+  localMissing: number[];     // Short IDs of txs we're missing (32-bit each)
+  remoteMissing: number[];    // Short IDs of txs peer is missing
+}
+
+/**
+ * InvTx message payload (BIP-330).
+ * Announce transactions by wtxid after reconciliation.
+ */
+export interface InvTxPayload {
+  wtxids: Buffer[];           // Array of 32-byte wtxids
 }
 
 // ============================================================================
@@ -635,6 +698,70 @@ function serializePkgTxnsPayload(payload: PkgTxnsPayload): Buffer {
 }
 
 // ============================================================================
+// BIP-330 Erlay Payload Serializers
+// ============================================================================
+
+function serializeSendTxRcnclPayload(payload: SendTxRcnclPayload): Buffer {
+  const writer = new BufferWriter();
+  writer.writeUInt32LE(payload.version);
+  writer.writeUInt64LE(payload.salt);
+  return writer.toBuffer();
+}
+
+function serializeReqReconPayload(payload: ReqReconPayload): Buffer {
+  const writer = new BufferWriter();
+  writer.writeUInt16LE(payload.setSize);
+  writer.writeUInt16LE(payload.q);
+  return writer.toBuffer();
+}
+
+function serializeSketchPayload(payload: SketchPayload): Buffer {
+  const writer = new BufferWriter();
+  writer.writeVarBytes(payload.sketchData);
+  return writer.toBuffer();
+}
+
+function serializeReqSketchExtPayload(_payload: ReqSketchExtPayload): Buffer {
+  // Empty payload
+  return Buffer.alloc(0);
+}
+
+function serializeReconcilDiffPayload(payload: ReconcilDiffPayload): Buffer {
+  const writer = new BufferWriter();
+
+  // Success flag as uint8
+  writer.writeUInt8(payload.success ? 1 : 0);
+
+  // Local missing short IDs
+  writer.writeVarInt(payload.localMissing.length);
+  for (const shortId of payload.localMissing) {
+    writer.writeUInt32LE(shortId);
+  }
+
+  // Remote missing short IDs
+  writer.writeVarInt(payload.remoteMissing.length);
+  for (const shortId of payload.remoteMissing) {
+    writer.writeUInt32LE(shortId);
+  }
+
+  return writer.toBuffer();
+}
+
+function serializeInvTxPayload(payload: InvTxPayload): Buffer {
+  const writer = new BufferWriter();
+
+  writer.writeVarInt(payload.wtxids.length);
+  for (const wtxid of payload.wtxids) {
+    if (wtxid.length !== 32) {
+      throw new Error(`Invalid wtxid length: ${wtxid.length}, expected 32`);
+    }
+    writer.writeHash(wtxid);
+  }
+
+  return writer.toBuffer();
+}
+
+// ============================================================================
 // Payload deserializers
 // ============================================================================
 
@@ -846,6 +973,61 @@ function deserializePkgTxnsPayload(reader: BufferReader): PkgTxnsPayload {
 }
 
 // ============================================================================
+// BIP-330 Erlay Payload Deserializers
+// ============================================================================
+
+function deserializeSendTxRcnclPayload(reader: BufferReader): SendTxRcnclPayload {
+  const version = reader.readUInt32LE();
+  const salt = reader.readUInt64LE();
+  return { version, salt };
+}
+
+function deserializeReqReconPayload(reader: BufferReader): ReqReconPayload {
+  const setSize = reader.readUInt16LE();
+  const q = reader.readUInt16LE();
+  return { setSize, q };
+}
+
+function deserializeSketchPayload(reader: BufferReader): SketchPayload {
+  const sketchData = reader.readVarBytes();
+  return { sketchData };
+}
+
+function deserializeReqSketchExtPayload(_reader: BufferReader): ReqSketchExtPayload {
+  // Empty payload
+  return {};
+}
+
+function deserializeReconcilDiffPayload(reader: BufferReader): ReconcilDiffPayload {
+  const success = reader.readUInt8() !== 0;
+
+  const localMissingCount = reader.readVarInt();
+  const localMissing: number[] = [];
+  for (let i = 0; i < localMissingCount; i++) {
+    localMissing.push(reader.readUInt32LE());
+  }
+
+  const remoteMissingCount = reader.readVarInt();
+  const remoteMissing: number[] = [];
+  for (let i = 0; i < remoteMissingCount; i++) {
+    remoteMissing.push(reader.readUInt32LE());
+  }
+
+  return { success, localMissing, remoteMissing };
+}
+
+function deserializeInvTxPayload(reader: BufferReader): InvTxPayload {
+  const count = reader.readVarInt();
+  const wtxids: Buffer[] = [];
+
+  for (let i = 0; i < count; i++) {
+    wtxids.push(reader.readHash());
+  }
+
+  return { wtxids };
+}
+
+// ============================================================================
 // Main serialization/deserialization functions
 // ============================================================================
 
@@ -978,6 +1160,31 @@ export function serializeMessage(magic: number, msg: NetworkMessage): Buffer {
       command = "pkgtxns";
       payload = serializePkgTxnsPayload(msg.payload);
       break;
+    // BIP-330 Erlay messages
+    case "sendtxrcncl":
+      command = "sendtxrcncl";
+      payload = serializeSendTxRcnclPayload(msg.payload);
+      break;
+    case "reqrecon":
+      command = "reqrecon";
+      payload = serializeReqReconPayload(msg.payload);
+      break;
+    case "sketch":
+      command = "sketch";
+      payload = serializeSketchPayload(msg.payload);
+      break;
+    case "reqsketchext":
+      command = "reqsketchext";
+      payload = serializeReqSketchExtPayload(msg.payload);
+      break;
+    case "reconcildiff":
+      command = "reconcildiff";
+      payload = serializeReconcilDiffPayload(msg.payload);
+      break;
+    case "invtx":
+      command = "invtx";
+      payload = serializeInvTxPayload(msg.payload);
+      break;
     default:
       throw new Error(`Unknown message type: ${(msg as NetworkMessage).type}`);
   }
@@ -1064,6 +1271,19 @@ export function deserializeMessage(header: MessageHeader, payload: Buffer): Netw
       return { type: "getpkgtxns", payload: deserializeGetPkgTxnsPayload(reader) };
     case "pkgtxns":
       return { type: "pkgtxns", payload: deserializePkgTxnsPayload(reader) };
+    // BIP-330 Erlay messages
+    case "sendtxrcncl":
+      return { type: "sendtxrcncl", payload: deserializeSendTxRcnclPayload(reader) };
+    case "reqrecon":
+      return { type: "reqrecon", payload: deserializeReqReconPayload(reader) };
+    case "sketch":
+      return { type: "sketch", payload: deserializeSketchPayload(reader) };
+    case "reqsketchext":
+      return { type: "reqsketchext", payload: deserializeReqSketchExtPayload(reader) };
+    case "reconcildiff":
+      return { type: "reconcildiff", payload: deserializeReconcilDiffPayload(reader) };
+    case "invtx":
+      return { type: "invtx", payload: deserializeInvTxPayload(reader) };
     default:
       throw new Error(`Unknown command: ${header.command}`);
   }
