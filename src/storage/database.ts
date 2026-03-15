@@ -40,6 +40,12 @@ export const enum BlockStatus {
   TXS_VALID = 4,
   HAVE_DATA = 8,
   HAVE_UNDO = 16,
+  /** Block failed validation (set by invalidateblock). */
+  FAILED_VALID = 32,
+  /** Block descends from a failed block. */
+  FAILED_CHILD = 64,
+  /** Block has witness data in blk*.dat (enforces SegWit rules). */
+  OPT_WITNESS = 128,
 }
 
 /** Block index record stored in the database. */
