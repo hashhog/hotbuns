@@ -50,6 +50,12 @@ export type OnBanCallback = (peer: Peer, reason: string) => void;
  * Handles TCP connection, message framing over the stream,
  * version handshake, and ping/pong latency measurement.
  */
+/** Minimum protocol version for witness support. */
+export const MIN_PEER_PROTO_VERSION = 70015;
+
+/** Handshake timeout in milliseconds. */
+export const HANDSHAKE_TIMEOUT_MS = 60_000;
+
 export class Peer {
   readonly host: string;
   readonly port: number;
@@ -60,6 +66,8 @@ export class Peer {
   misbehaviorScore: number;
   /** Tracks whether this peer should be discouraged/banned. */
   shouldDisconnect: boolean;
+  /** Whether the VERSION + VERACK handshake is complete. */
+  handshakeComplete: boolean;
 
   private socket: Socket | null;
   private recvBuffer: Buffer;
@@ -69,7 +77,14 @@ export class Peer {
   private lastPingTime: number;
   private sentVerack: boolean;
   private receivedVerack: boolean;
+  private receivedVersion: boolean;
   private onBan: OnBanCallback | null;
+  /** Our version nonce, used for self-connection detection. */
+  private ourNonce: bigint;
+  /** Timer for handshake timeout. */
+  private handshakeTimer: ReturnType<typeof setTimeout> | null;
+  /** Set of known local nonces (for self-connection detection). */
+  private static localNonces: Set<bigint> = new Set();
 
   constructor(config: PeerConfig, events: PeerEvents, onBan?: OnBanCallback) {
     this.config = config;
@@ -85,9 +100,15 @@ export class Peer {
     this.latency = 0;
     this.sentVerack = false;
     this.receivedVerack = false;
+    this.receivedVersion = false;
     this.misbehaviorScore = 0;
     this.shouldDisconnect = false;
+    this.handshakeComplete = false;
     this.onBan = onBan ?? null;
+    this.ourNonce = BigInt(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER));
+    this.handshakeTimer = null;
+    // Register our nonce for self-connection detection
+    Peer.localNonces.add(this.ourNonce);
   }
 
   /**
@@ -108,20 +129,30 @@ export class Peer {
           this.state = "handshaking";
           this.events.onConnect(this);
           this.sendVersionMessage();
+
+          // Start handshake timeout
+          this.handshakeTimer = setTimeout(() => {
+            if (!this.handshakeComplete && this.state !== "disconnected") {
+              this.disconnect("handshake timeout");
+            }
+          }, HANDSHAKE_TIMEOUT_MS);
         },
         close: (_socket) => {
+          this.cleanupHandshakeTimer();
           if (this.state !== "disconnected") {
             this.state = "disconnected";
             this.events.onDisconnect(this);
           }
         },
         error: (_socket, error) => {
+          this.cleanupHandshakeTimer();
           if (this.state !== "disconnected") {
             this.state = "disconnected";
             this.events.onDisconnect(this, error);
           }
         },
         connectError: (_socket, error) => {
+          this.cleanupHandshakeTimer();
           this.state = "disconnected";
           this.events.onDisconnect(this, error);
         },
@@ -149,12 +180,41 @@ export class Peer {
     if (this.state === "disconnected") {
       return;
     }
+    this.cleanupHandshakeTimer();
+    // Clean up our nonce from local nonces
+    Peer.localNonces.delete(this.ourNonce);
     this.state = "disconnected";
     if (this.socket) {
       this.socket.end();
       this.socket = null;
     }
     this.events.onDisconnect(this);
+  }
+
+  /**
+   * Clean up the handshake timer if it exists.
+   */
+  private cleanupHandshakeTimer(): void {
+    if (this.handshakeTimer !== null) {
+      clearTimeout(this.handshakeTimer);
+      this.handshakeTimer = null;
+    }
+  }
+
+  /**
+   * Check if a nonce belongs to one of our local connections (self-connection detection).
+   * @param nonce - The nonce from a received version message
+   * @returns true if this is a self-connection
+   */
+  static isLocalNonce(nonce: bigint): boolean {
+    return Peer.localNonces.has(nonce);
+  }
+
+  /**
+   * Clear all local nonces (for testing).
+   */
+  static clearLocalNonces(): void {
+    Peer.localNonces.clear();
   }
 
   /**
@@ -197,9 +257,8 @@ export class Peer {
    */
   private sendVersionMessage(): void {
     const now = BigInt(Math.floor(Date.now() / 1000));
-    const nonce = BigInt(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER));
 
-    // Create version message
+    // Create version message using our nonce for self-connection detection
     const versionMsg: NetworkMessage = {
       type: "version",
       payload: {
@@ -216,7 +275,7 @@ export class Peer {
           ip: ipv4ToBuffer("0.0.0.0"),
           port: 0,
         },
-        nonce,
+        nonce: this.ourNonce,
         userAgent: this.config.userAgent,
         startHeight: this.config.bestHeight,
         relay: this.config.relay,
@@ -301,9 +360,37 @@ export class Peer {
 
   /**
    * Route a received message to appropriate handler.
+   *
+   * Following Bitcoin Core's net_processing.cpp ProcessMessage():
+   * - Before version received: only accept "version"
+   * - After version, before verack complete: accept "version", "verack", and feature negotiation
+   * - After handshake complete: accept all messages
    */
   private handleMessage(msg: NetworkMessage): void {
-    if (this.state === "handshaking") {
+    // Check for pre-handshake message violations
+    if (!this.handshakeComplete) {
+      // Before we've received their version, only accept version messages
+      if (!this.receivedVersion && msg.type !== "version") {
+        // Non-version message before version handshake
+        this.misbehaving(10, `non-version message before version handshake: ${msg.type}`);
+        return;
+      }
+
+      // After version but before verack, only accept certain messages
+      if (this.receivedVersion && !this.handshakeComplete) {
+        const allowedDuringHandshake = [
+          "version", // Duplicate version check handled in handleHandshake
+          "verack",
+          "wtxidrelay",
+          "sendaddrv2",
+          "sendtxrcncl",
+        ];
+        if (!allowedDuringHandshake.includes(msg.type)) {
+          this.misbehaving(10, `unsupported message prior to verack: ${msg.type}`);
+          return;
+        }
+      }
+
       this.handleHandshake(msg);
     } else if (this.state === "connected") {
       // Handle pong for latency measurement
@@ -327,19 +414,52 @@ export class Peer {
    * 3. Receive their verack - handshake complete
    *
    * We transition to 'connected' once we have both sent and received verack.
+   *
+   * Additional checks (per Bitcoin Core net_processing.cpp):
+   * - Reject duplicate version messages (misbehavior 1)
+   * - Detect self-connections via nonce
+   * - Enforce minimum protocol version (70015 for witness)
    */
   private handleHandshake(msg: NetworkMessage): void {
     switch (msg.type) {
-      case "version":
+      case "version": {
+        // Check for duplicate version message
+        if (this.receivedVersion) {
+          this.misbehaving(1, "duplicate version message");
+          return;
+        }
+
+        const versionPayload = msg.payload;
+
+        // Check minimum protocol version (70015 for witness support)
+        if (versionPayload.version < MIN_PEER_PROTO_VERSION) {
+          this.disconnect(`peer using obsolete version ${versionPayload.version}`);
+          return;
+        }
+
+        // Self-connection detection: check if the nonce matches any of our local nonces
+        if (Peer.isLocalNonce(versionPayload.nonce)) {
+          this.disconnect("connected to self");
+          return;
+        }
+
         // Store their version payload
-        this.versionPayload = msg.payload;
+        this.versionPayload = versionPayload;
+        this.receivedVersion = true;
+
         // Send verack in response
         this.send({ type: "verack", payload: null });
         this.sentVerack = true;
         this.checkHandshakeComplete();
         break;
+      }
 
       case "verack":
+        // Ignore redundant verack after handshake complete
+        if (this.handshakeComplete) {
+          return;
+        }
+
         // They acknowledged our version
         this.receivedVerack = true;
         this.checkHandshakeComplete();
@@ -357,6 +477,10 @@ export class Peer {
    */
   private checkHandshakeComplete(): void {
     if (this.sentVerack && this.receivedVerack && this.versionPayload) {
+      // Clear handshake timeout
+      this.cleanupHandshakeTimer();
+
+      this.handshakeComplete = true;
       this.state = "connected";
       this.events.onHandshakeComplete(this);
 
