@@ -35,6 +35,7 @@ import { hash256 } from "../crypto/primitives.js";
 import { BufferReader } from "../wire/serialization.js";
 import type { InvPayload, NetworkMessage } from "../p2p/messages.js";
 import { InvType } from "../p2p/messages.js";
+import type { Wallet } from "../wallet/wallet.js";
 
 /**
  * JSON-RPC request format.
@@ -82,6 +83,7 @@ export interface RPCServerDeps {
   db: ChainDB;
   params: ConsensusParams;
   pruneManager?: import("../storage/pruning.js").PruneManager;
+  wallet?: Wallet;
 }
 
 /** RPC error codes. */
@@ -102,6 +104,18 @@ export const RPCErrorCodes = {
   // Legacy aliases for backward compatibility
   VERIFY_ALREADY_IN_CHAIN: -25,
   VERIFY_REJECTED: -26,
+  // Wallet errors
+  WALLET_ERROR: -4,
+  WALLET_INSUFFICIENT_FUNDS: -6,
+  WALLET_INVALID_LABEL_NAME: -11,
+  WALLET_KEYPOOL_RAN_OUT: -12,
+  WALLET_UNLOCK_NEEDED: -13,
+  WALLET_PASSPHRASE_INCORRECT: -14,
+  WALLET_WRONG_ENC_STATE: -15,
+  WALLET_ENCRYPTION_FAILED: -16,
+  WALLET_ALREADY_UNLOCKED: -17,
+  WALLET_NOT_FOUND: -18,
+  WALLET_NOT_SPECIFIED: -19,
 } as const;
 
 /**
@@ -132,6 +146,7 @@ export class RPCServer {
   private db: ChainDB;
   private params: ConsensusParams;
   private pruneManager?: import("../storage/pruning.js").PruneManager;
+  private wallet?: Wallet;
   private shutdownCallback: (() => void) | null = null;
 
   constructor(config: RPCServerConfig, deps: RPCServerDeps) {
@@ -149,6 +164,7 @@ export class RPCServer {
     this.db = deps.db;
     this.params = deps.params;
     this.pruneManager = deps.pruneManager;
+    this.wallet = deps.wallet;
     this.methods = new Map();
 
     this.registerBuiltinMethods();
@@ -461,6 +477,18 @@ export class RPCServer {
 
     // Control methods
     this.registerMethod("stop", () => this.stopNode());
+
+    // Wallet methods (only if wallet is available)
+    if (this.wallet) {
+      this.registerMethod("encryptwallet", (params) => this.encryptWallet(params));
+      this.registerMethod("walletpassphrase", (params) => this.walletPassphrase(params));
+      this.registerMethod("walletlock", () => this.walletLock());
+      this.registerMethod("walletpassphrasechange", (params) => this.walletPassphraseChange(params));
+      this.registerMethod("setlabel", (params) => this.setLabel(params));
+      this.registerMethod("listreceivedbyaddress", (params) => this.listReceivedByAddress(params));
+      this.registerMethod("listtransactions", (params) => this.listTransactions(params));
+      this.registerMethod("getwalletinfo", () => this.getWalletInfo());
+    }
   }
 
   // ========== Blockchain Methods ==========
@@ -2385,5 +2413,294 @@ export class RPCServer {
     if (services & 8n) names.push("WITNESS");
     if (services & 1024n) names.push("NETWORK_LIMITED");
     return names;
+  }
+
+  // ========== Wallet Methods ==========
+
+  /**
+   * encryptwallet: Encrypt the wallet with a passphrase.
+   * After encryption, the wallet will need to be unlocked for signing operations.
+   *
+   * @param params [passphrase]
+   */
+  private async encryptWallet(params: unknown[]): Promise<string> {
+    if (!this.wallet) {
+      throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message: "Wallet not loaded" };
+    }
+
+    const [passphrase] = params;
+    if (typeof passphrase !== "string" || passphrase.length === 0) {
+      throw {
+        code: RPCErrorCodes.INVALID_PARAMS,
+        message: "Missing or invalid passphrase",
+      };
+    }
+
+    if (this.wallet.isEncrypted()) {
+      throw {
+        code: RPCErrorCodes.WALLET_WRONG_ENC_STATE,
+        message: "Wallet is already encrypted. Use walletpassphrasechange to change the passphrase.",
+      };
+    }
+
+    try {
+      await this.wallet.encryptWallet(passphrase);
+      return "Wallet encrypted. The wallet is now locked. You need to call walletpassphrase before signing transactions.";
+    } catch (err) {
+      throw {
+        code: RPCErrorCodes.WALLET_ENCRYPTION_FAILED,
+        message: err instanceof Error ? err.message : "Encryption failed",
+      };
+    }
+  }
+
+  /**
+   * walletpassphrase: Unlock the wallet for a specified time.
+   *
+   * @param params [passphrase, timeout]
+   */
+  private async walletPassphrase(params: unknown[]): Promise<null> {
+    if (!this.wallet) {
+      throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message: "Wallet not loaded" };
+    }
+
+    const [passphrase, timeout] = params;
+    if (typeof passphrase !== "string" || passphrase.length === 0) {
+      throw {
+        code: RPCErrorCodes.INVALID_PARAMS,
+        message: "Missing or invalid passphrase",
+      };
+    }
+    if (typeof timeout !== "number" || timeout < 0) {
+      throw {
+        code: RPCErrorCodes.INVALID_PARAMS,
+        message: "Missing or invalid timeout (must be non-negative number)",
+      };
+    }
+
+    if (!this.wallet.isEncrypted()) {
+      throw {
+        code: RPCErrorCodes.WALLET_WRONG_ENC_STATE,
+        message: "Wallet is not encrypted",
+      };
+    }
+
+    try {
+      await this.wallet.unlockWallet(passphrase, timeout);
+      return null;
+    } catch (err) {
+      throw {
+        code: RPCErrorCodes.WALLET_PASSPHRASE_INCORRECT,
+        message: err instanceof Error ? err.message : "Incorrect passphrase",
+      };
+    }
+  }
+
+  /**
+   * walletlock: Lock the wallet.
+   */
+  private async walletLock(): Promise<null> {
+    if (!this.wallet) {
+      throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message: "Wallet not loaded" };
+    }
+
+    if (!this.wallet.isEncrypted()) {
+      throw {
+        code: RPCErrorCodes.WALLET_WRONG_ENC_STATE,
+        message: "Wallet is not encrypted",
+      };
+    }
+
+    this.wallet.lockWallet();
+    return null;
+  }
+
+  /**
+   * walletpassphrasechange: Change the wallet passphrase.
+   *
+   * @param params [oldpassphrase, newpassphrase]
+   */
+  private async walletPassphraseChange(params: unknown[]): Promise<null> {
+    if (!this.wallet) {
+      throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message: "Wallet not loaded" };
+    }
+
+    const [oldPassphrase, newPassphrase] = params;
+    if (typeof oldPassphrase !== "string" || oldPassphrase.length === 0) {
+      throw {
+        code: RPCErrorCodes.INVALID_PARAMS,
+        message: "Missing or invalid old passphrase",
+      };
+    }
+    if (typeof newPassphrase !== "string" || newPassphrase.length === 0) {
+      throw {
+        code: RPCErrorCodes.INVALID_PARAMS,
+        message: "Missing or invalid new passphrase",
+      };
+    }
+
+    if (!this.wallet.isEncrypted()) {
+      throw {
+        code: RPCErrorCodes.WALLET_WRONG_ENC_STATE,
+        message: "Wallet is not encrypted",
+      };
+    }
+
+    try {
+      await this.wallet.changePassphrase(oldPassphrase, newPassphrase);
+      return null;
+    } catch (err) {
+      throw {
+        code: RPCErrorCodes.WALLET_PASSPHRASE_INCORRECT,
+        message: err instanceof Error ? err.message : "Error changing passphrase",
+      };
+    }
+  }
+
+  /**
+   * setlabel: Assign a label to an address.
+   *
+   * @param params [address, label]
+   */
+  private async setLabel(params: unknown[]): Promise<null> {
+    if (!this.wallet) {
+      throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message: "Wallet not loaded" };
+    }
+
+    const [address, label] = params;
+    if (typeof address !== "string" || address.length === 0) {
+      throw {
+        code: RPCErrorCodes.INVALID_PARAMS,
+        message: "Missing or invalid address",
+      };
+    }
+    if (typeof label !== "string") {
+      throw {
+        code: RPCErrorCodes.INVALID_PARAMS,
+        message: "Missing or invalid label",
+      };
+    }
+
+    try {
+      this.wallet.setLabel(address, label);
+      return null;
+    } catch (err) {
+      throw {
+        code: RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        message: err instanceof Error ? err.message : "Error setting label",
+      };
+    }
+  }
+
+  /**
+   * listreceivedbyaddress: List balances by receiving address.
+   *
+   * @param params [minconf, include_empty, include_watchonly, address_filter]
+   */
+  private async listReceivedByAddress(params: unknown[]): Promise<unknown[]> {
+    if (!this.wallet) {
+      throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message: "Wallet not loaded" };
+    }
+
+    const [minconfParam, includeEmptyParam] = params;
+    const minconf = typeof minconfParam === "number" ? minconfParam : 1;
+    const includeEmpty = includeEmptyParam === true;
+
+    const received = this.wallet.listReceivedByAddress();
+
+    return received
+      .filter((entry) => {
+        if (entry.confirmations < minconf) return false;
+        if (!includeEmpty && entry.amount === 0n) return false;
+        return true;
+      })
+      .map((entry) => ({
+        address: entry.address,
+        label: entry.label,
+        amount: Number(entry.amount) / 100_000_000, // Convert to BTC
+        confirmations: entry.confirmations,
+      }));
+  }
+
+  /**
+   * listtransactions: List transactions for the wallet.
+   *
+   * Note: This is a simplified version that returns UTXO-based entries.
+   * A full implementation would track spent transactions separately.
+   *
+   * @param params [label, count, skip, include_watchonly]
+   */
+  private async listTransactions(params: unknown[]): Promise<unknown[]> {
+    if (!this.wallet) {
+      throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message: "Wallet not loaded" };
+    }
+
+    const [labelParam, countParam, skipParam] = params;
+    const labelFilter = typeof labelParam === "string" ? labelParam : "*";
+    const count = typeof countParam === "number" ? Math.min(countParam, 1000) : 10;
+    const skip = typeof skipParam === "number" ? skipParam : 0;
+
+    const utxos = this.wallet.getUTXOs();
+    const transactions: Array<{
+      address: string;
+      category: string;
+      amount: number;
+      label: string;
+      confirmations: number;
+    }> = [];
+
+    for (const utxo of utxos) {
+      const label = this.wallet.getLabel(utxo.address);
+
+      // Filter by label if specified
+      if (labelFilter !== "*" && label !== labelFilter) {
+        continue;
+      }
+
+      transactions.push({
+        address: utxo.address,
+        category: "receive",
+        amount: Number(utxo.amount) / 100_000_000,
+        label,
+        confirmations: utxo.confirmations,
+      });
+    }
+
+    // Sort by confirmations (newest first)
+    transactions.sort((a, b) => a.confirmations - b.confirmations);
+
+    // Apply skip and count
+    return transactions.slice(skip, skip + count);
+  }
+
+  /**
+   * getwalletinfo: Returns wallet state information.
+   */
+  private async getWalletInfo(): Promise<Record<string, unknown>> {
+    if (!this.wallet) {
+      throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message: "Wallet not loaded" };
+    }
+
+    const balance = this.wallet.getBalance();
+    const utxos = this.wallet.getUTXOs();
+
+    return {
+      walletname: "default",
+      walletversion: 1,
+      balance: Number(balance.confirmed) / 100_000_000,
+      unconfirmed_balance: Number(balance.unconfirmed) / 100_000_000,
+      immature_balance: 0, // Would need to track immature coinbase separately
+      txcount: utxos.length,
+      keypoolsize: 20, // Address gap
+      unlocked_until: this.wallet.isLocked() ? 0 : undefined,
+      paytxfee: 0,
+      hdseedid: undefined,
+      private_keys_enabled: true,
+      avoid_reuse: false,
+      scanning: false,
+      descriptors: false,
+      encrypted: this.wallet.isEncrypted(),
+      locked: this.wallet.isLocked(),
+    };
   }
 }
