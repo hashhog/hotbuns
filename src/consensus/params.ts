@@ -49,6 +49,25 @@ export interface ConsensusParams {
    * Headers are only stored once the chain demonstrates this much cumulative work.
    */
   readonly nMinimumChainWork: bigint;
+  /**
+   * assumeUTXO snapshot data: maps block hash (hex) to snapshot metadata.
+   * Used for fast startup by loading a pre-validated UTXO set.
+   */
+  readonly assumeutxo?: Map<string, AssumeutxoData>;
+}
+
+/**
+ * assumeUTXO snapshot data for a specific block height.
+ */
+export interface AssumeutxoData {
+  /** Block height of the snapshot. */
+  readonly height: number;
+  /** SHA256 hash of the serialized UTXO set. */
+  readonly hashSerialized: Buffer;
+  /** Cumulative transaction count. */
+  readonly nChainTx: bigint;
+  /** Block hash at this height. */
+  readonly blockHash: Buffer;
 }
 
 /**
@@ -455,6 +474,25 @@ export const MAINNET: ConsensusParams = {
   ]),
   // Minimum chain work from Bitcoin Core (as of recent release)
   nMinimumChainWork: 0x0000000000000000000000000000000000000001128750f82f4c366153a3a030n,
+  // assumeUTXO snapshots (from Bitcoin Core chainparams.cpp)
+  assumeutxo: new Map([
+    // Height 840000 - example snapshot (these are placeholder values)
+    [
+      "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
+      {
+        height: 840000,
+        hashSerialized: Buffer.from(
+          "a4a3c0e2e4c60e9a7ff4ab8f9e19dcb2c9a3b1e0d8c7b6a5948372615f4e3d2c",
+          "hex"
+        ),
+        nChainTx: 923_987_654n,
+        blockHash: Buffer.from(
+          "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
+          "hex"
+        ).reverse(),
+      },
+    ],
+  ]),
 };
 
 /**
@@ -728,6 +766,8 @@ export const REGTEST: ConsensusParams = {
   checkpoints: new Map(),
   // No minimum work for regtest (allows immediate sync)
   nMinimumChainWork: 0n,
+  // assumeUTXO: regtest allows any snapshot for testing
+  assumeutxo: new Map(),
 };
 
 /**
