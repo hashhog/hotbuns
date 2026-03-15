@@ -30,6 +30,16 @@ export const enum DBPrefix {
   BLOCK_FILES = 0x66, // 'f' - file number -> block file info
   LAST_BLOCK_FILE = 0x6c, // 'l' - last block file number
   BLOCK_POS = 0x70, // 'p' - block hash -> file position
+  PRUNE_STATE = 0x50, // 'P' - pruning state metadata
+}
+
+/** Block status flags (matches Bitcoin Core). */
+export const enum BlockStatus {
+  HEADER_VALID = 1,
+  TXS_KNOWN = 2,
+  TXS_VALID = 4,
+  HAVE_DATA = 8,
+  HAVE_UNDO = 16,
 }
 
 /** Block index record stored in the database. */
@@ -516,6 +526,49 @@ export class ChainDB {
       return value;
     } catch {
       return null;
+    }
+  }
+
+  // Pruning state operations
+
+  /**
+   * Store pruning state metadata.
+   */
+  async putPruneState(havePruned: boolean, pruneTarget: number): Promise<void> {
+    const key = makeKey(DBPrefix.PRUNE_STATE, Buffer.alloc(0));
+    const buf = Buffer.alloc(9);
+    buf.writeUInt8(havePruned ? 1 : 0, 0);
+    buf.writeBigUInt64LE(BigInt(pruneTarget), 1);
+    await this.db.put(key, buf);
+  }
+
+  /**
+   * Get pruning state metadata.
+   */
+  async getPruneState(): Promise<{ havePruned: boolean; pruneTarget: number } | null> {
+    const key = makeKey(DBPrefix.PRUNE_STATE, Buffer.alloc(0));
+    try {
+      const value = await this.db.get(key);
+      if (value === undefined || value.length < 9) {
+        return null;
+      }
+      return {
+        havePruned: value.readUInt8(0) === 1,
+        pruneTarget: Number(value.readBigUInt64LE(1)),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Update a block index record's status flags.
+   */
+  async updateBlockStatus(hash: Buffer, status: number): Promise<void> {
+    const record = await this.getBlockIndex(hash);
+    if (record) {
+      record.status = status;
+      await this.putBlockIndex(hash, record);
     }
   }
 }
