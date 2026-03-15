@@ -104,6 +104,12 @@ export const RPCErrorCodes = {
 } as const;
 
 /**
+ * Maximum number of requests allowed in a batch.
+ * Prevents DoS via large batch requests.
+ */
+export const MAX_BATCH_SIZE = 1000;
+
+/**
  * Default max fee rate for sendrawtransaction (0.10 BTC/kvB = 10000 sat/vB).
  * Transactions with fee rates higher than this are rejected to prevent
  * accidental fee overpayment.
@@ -244,6 +250,40 @@ export class RPCServer {
 
     // Handle batched requests
     if (Array.isArray(body)) {
+      // Empty batch is an error
+      if (body.length === 0) {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: RPCErrorCodes.INVALID_REQUEST, message: "Empty batch request" },
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      // Limit batch size to prevent DoS
+      if (body.length > MAX_BATCH_SIZE) {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: null,
+            error: {
+              code: RPCErrorCodes.INVALID_REQUEST,
+              message: `Batch size ${body.length} exceeds maximum of ${MAX_BATCH_SIZE}`,
+            },
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      // Process all requests in the batch (order preserved)
       const responses = await Promise.all(
         body.map((request) => this.processRequest(request))
       );
@@ -253,7 +293,21 @@ export class RPCServer {
       });
     }
 
-    // Handle single request
+    // Handle single request (must be an object)
+    if (typeof body !== "object" || body === null) {
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: RPCErrorCodes.PARSE_ERROR, message: "Top-level object parse error" },
+        }),
+        {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+
     const response = await this.processRequest(body);
     return new Response(JSON.stringify(response), {
       status: 200,
