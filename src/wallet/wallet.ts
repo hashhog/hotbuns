@@ -2423,3 +2423,405 @@ export class Wallet {
     return result;
   }
 }
+
+/**
+ * Options for creating a new wallet.
+ */
+export interface CreateWalletOptions {
+  /** Disable private keys (watch-only wallet). */
+  disablePrivateKeys?: boolean;
+  /** Create a blank wallet with no keys. */
+  blank?: boolean;
+  /** Encrypt the wallet with this passphrase. */
+  passphrase?: string;
+  /** Track clean/dirty coins to avoid address reuse. */
+  avoidReuse?: boolean;
+  /** Use output descriptors (always true for new wallets). */
+  descriptors?: boolean;
+  /** Save wallet name to settings for auto-load on startup. */
+  loadOnStartup?: boolean;
+}
+
+/**
+ * Result of createwallet RPC.
+ */
+export interface CreateWalletResult {
+  name: string;
+  warnings: string[];
+}
+
+/**
+ * Result of loadwallet RPC.
+ */
+export interface LoadWalletResult {
+  name: string;
+  warnings: string[];
+}
+
+/**
+ * Entry in listwalletdir result.
+ */
+export interface WalletDirEntry {
+  name: string;
+}
+
+/**
+ * Multi-wallet manager: maintains multiple wallets loaded simultaneously.
+ *
+ * Reference: Bitcoin Core's WalletContext in wallet/context.h
+ *
+ * Wallet storage layout:
+ *   <datadir>/wallets/<name>/wallet.dat
+ *
+ * The default wallet (empty name "") is stored at:
+ *   <datadir>/wallets/wallet.dat
+ */
+export class WalletManager {
+  private wallets: Map<string, Wallet> = new Map();
+  private datadir: string;
+  private network: "mainnet" | "testnet" | "regtest";
+  private settingsPath: string;
+
+  constructor(datadir: string, network: "mainnet" | "testnet" | "regtest") {
+    this.datadir = datadir;
+    this.network = network;
+    this.settingsPath = `${datadir}/settings.json`;
+  }
+
+  /**
+   * Get the wallets directory path.
+   */
+  getWalletsDir(): string {
+    return `${this.datadir}/wallets`;
+  }
+
+  /**
+   * Get the path to a wallet's directory.
+   */
+  getWalletPath(name: string): string {
+    if (name === "") {
+      // Default wallet is stored directly in wallets dir
+      return `${this.getWalletsDir()}/wallet.dat`;
+    }
+    return `${this.getWalletsDir()}/${name}`;
+  }
+
+  /**
+   * Get the path to a wallet's data file.
+   */
+  getWalletFilePath(name: string): string {
+    if (name === "") {
+      return `${this.getWalletsDir()}/wallet.dat`;
+    }
+    return `${this.getWalletsDir()}/${name}/wallet.dat`;
+  }
+
+  /**
+   * Create a new wallet.
+   *
+   * Reference: Bitcoin Core's CreateWallet in wallet/wallet.cpp
+   */
+  async createWallet(
+    name: string,
+    options: CreateWalletOptions = {},
+    password: string = ""
+  ): Promise<CreateWalletResult> {
+    const warnings: string[] = [];
+
+    // Wallet must have a non-empty name (Bitcoin Core behavior)
+    // Note: we allow empty name for default wallet unlike Core
+    if (name.includes("/") || name.includes("\\")) {
+      throw new Error("Wallet name cannot contain path separators");
+    }
+
+    // Check if wallet is already loaded
+    if (this.wallets.has(name)) {
+      throw new Error(`Wallet "${name}" is already loaded`);
+    }
+
+    // Check if wallet file already exists
+    const walletFile = this.getWalletFilePath(name);
+    const file = Bun.file(walletFile);
+    if (await file.exists()) {
+      throw new Error(
+        `Wallet "${name}" already exists. Use loadwallet to load it.`
+      );
+    }
+
+    // Create wallet directory if needed
+    const walletDir = name === "" ? this.getWalletsDir() : `${this.getWalletsDir()}/${name}`;
+    const { mkdirSync, existsSync } = await import("fs");
+    if (!existsSync(walletDir)) {
+      mkdirSync(walletDir, { recursive: true });
+    }
+
+    // Handle passphrase for encryption
+    // Only encrypt if options.passphrase is explicitly provided (not the storage password)
+    const encryptionPassphrase = options.passphrase;
+    if (encryptionPassphrase === "" && options.passphrase !== undefined) {
+      warnings.push(
+        "Empty string given as passphrase, wallet will not be encrypted."
+      );
+    }
+
+    // Use storage password (for file encryption, not wallet encryption)
+    const storagePassword = password || "hotbuns";
+
+    // Blank wallet: no keys generated
+    // disablePrivateKeys: watch-only wallet
+    // For now, we create a standard HD wallet
+
+    const config: WalletConfig = {
+      datadir: name === "" ? this.getWalletsDir() : walletDir,
+      network: this.network,
+    };
+
+    const wallet = Wallet.create(config);
+
+    // If passphrase provided in options, encrypt the wallet
+    if (encryptionPassphrase) {
+      await wallet.encryptWallet(encryptionPassphrase);
+    }
+
+    // Save the wallet
+    await wallet.save(storagePassword);
+
+    // Add to loaded wallets
+    this.wallets.set(name, wallet);
+
+    // Update settings if loadOnStartup is true
+    if (options.loadOnStartup === true) {
+      await this.addWalletToSettings(name);
+    } else if (options.loadOnStartup === false) {
+      await this.removeWalletFromSettings(name);
+    }
+
+    return { name, warnings };
+  }
+
+  /**
+   * Load an existing wallet from disk.
+   *
+   * Reference: Bitcoin Core's LoadWallet in wallet/wallet.cpp
+   */
+  async loadWallet(
+    name: string,
+    password: string,
+    loadOnStartup?: boolean
+  ): Promise<LoadWalletResult> {
+    const warnings: string[] = [];
+
+    // Check if already loaded
+    if (this.wallets.has(name)) {
+      throw new Error(`Wallet "${name}" is already loaded`);
+    }
+
+    // Check if wallet file exists
+    const walletFile = this.getWalletFilePath(name);
+    const file = Bun.file(walletFile);
+    if (!(await file.exists())) {
+      throw new Error(`Wallet "${name}" not found`);
+    }
+
+    const config: WalletConfig = {
+      datadir: name === "" ? this.getWalletsDir() : `${this.getWalletsDir()}/${name}`,
+      network: this.network,
+    };
+
+    const wallet = await Wallet.load(config, password);
+    this.wallets.set(name, wallet);
+
+    // Update settings
+    if (loadOnStartup === true) {
+      await this.addWalletToSettings(name);
+    } else if (loadOnStartup === false) {
+      await this.removeWalletFromSettings(name);
+    }
+
+    return { name, warnings };
+  }
+
+  /**
+   * Unload a wallet from memory.
+   *
+   * Reference: Bitcoin Core's RemoveWallet in wallet/wallet.cpp
+   */
+  async unloadWallet(
+    name: string,
+    loadOnStartup?: boolean
+  ): Promise<{ warnings: string[] }> {
+    const warnings: string[] = [];
+
+    if (!this.wallets.has(name)) {
+      throw new Error(`Wallet "${name}" is not loaded`);
+    }
+
+    this.wallets.delete(name);
+
+    // Update settings
+    if (loadOnStartup === true) {
+      await this.addWalletToSettings(name);
+    } else if (loadOnStartup === false) {
+      await this.removeWalletFromSettings(name);
+    }
+
+    return { warnings };
+  }
+
+  /**
+   * Get a loaded wallet by name.
+   */
+  getWallet(name: string): Wallet | undefined {
+    return this.wallets.get(name);
+  }
+
+  /**
+   * Get the default wallet if exactly one wallet is loaded.
+   *
+   * Reference: Bitcoin Core's GetDefaultWallet in wallet/wallet.cpp
+   */
+  getDefaultWallet(): Wallet | undefined {
+    if (this.wallets.size === 1) {
+      return this.wallets.values().next().value;
+    }
+    return undefined;
+  }
+
+  /**
+   * Get all loaded wallet names.
+   */
+  listWallets(): string[] {
+    return Array.from(this.wallets.keys());
+  }
+
+  /**
+   * List available wallet directories.
+   *
+   * Reference: Bitcoin Core's ListDatabases in wallet/walletutil.cpp
+   */
+  async listWalletDir(): Promise<WalletDirEntry[]> {
+    const walletsDir = this.getWalletsDir();
+    const entries: WalletDirEntry[] = [];
+
+    const { readdirSync, statSync, existsSync } = await import("fs");
+
+    if (!existsSync(walletsDir)) {
+      return entries;
+    }
+
+    // Check for default wallet (wallet.dat directly in wallets dir)
+    const defaultWalletFile = `${walletsDir}/wallet.dat`;
+    if (existsSync(defaultWalletFile)) {
+      entries.push({ name: "" });
+    }
+
+    // Check subdirectories for wallet.dat files
+    const files = readdirSync(walletsDir);
+    for (const file of files) {
+      const filePath = `${walletsDir}/${file}`;
+      const stat = statSync(filePath);
+      if (stat.isDirectory()) {
+        const walletFile = `${filePath}/wallet.dat`;
+        if (existsSync(walletFile)) {
+          entries.push({ name: file });
+        }
+      }
+    }
+
+    return entries;
+  }
+
+  /**
+   * Get wallet count.
+   */
+  getWalletCount(): number {
+    return this.wallets.size;
+  }
+
+  /**
+   * Check if a wallet is loaded.
+   */
+  hasWallet(name: string): boolean {
+    return this.wallets.has(name);
+  }
+
+  /**
+   * Load settings from settings.json.
+   */
+  private async loadSettings(): Promise<{ wallet?: string[] }> {
+    try {
+      const file = Bun.file(this.settingsPath);
+      if (await file.exists()) {
+        const content = await file.text();
+        return JSON.parse(content);
+      }
+    } catch {
+      // Ignore errors
+    }
+    return {};
+  }
+
+  /**
+   * Save settings to settings.json.
+   */
+  private async saveSettings(settings: { wallet?: string[] }): Promise<void> {
+    await Bun.write(this.settingsPath, JSON.stringify(settings, null, 2));
+  }
+
+  /**
+   * Add a wallet to the startup list in settings.json.
+   */
+  private async addWalletToSettings(name: string): Promise<void> {
+    const settings = await this.loadSettings();
+    if (!settings.wallet) {
+      settings.wallet = [];
+    }
+    if (!settings.wallet.includes(name)) {
+      settings.wallet.push(name);
+      await this.saveSettings(settings);
+    }
+  }
+
+  /**
+   * Remove a wallet from the startup list in settings.json.
+   */
+  private async removeWalletFromSettings(name: string): Promise<void> {
+    const settings = await this.loadSettings();
+    if (settings.wallet) {
+      settings.wallet = settings.wallet.filter((w) => w !== name);
+      await this.saveSettings(settings);
+    }
+  }
+
+  /**
+   * Get wallets that should be loaded on startup.
+   */
+  async getStartupWallets(): Promise<string[]> {
+    const settings = await this.loadSettings();
+    return settings.wallet || [];
+  }
+
+  /**
+   * Load all wallets configured for startup.
+   */
+  async loadStartupWallets(password: string): Promise<void> {
+    const walletNames = await this.getStartupWallets();
+    for (const name of walletNames) {
+      try {
+        await this.loadWallet(name, password);
+      } catch (error) {
+        // Log error but continue loading other wallets
+        console.error(`Failed to load wallet "${name}":`, error);
+      }
+    }
+  }
+
+  /**
+   * Process a new block for all loaded wallets.
+   */
+  processBlock(block: Block, height: number): void {
+    for (const wallet of this.wallets.values()) {
+      wallet.processBlock(block, height);
+    }
+  }
+}
