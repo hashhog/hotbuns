@@ -44,6 +44,18 @@ import {
   addChecksum,
   type NetworkType,
 } from "../wallet/descriptor.js";
+import {
+  ChainstateManager,
+  computeUTXOSetHash,
+  serializeSnapshotMetadata,
+  deserializeSnapshotMetadata,
+  deserializeCoinFromSnapshot,
+  SNAPSHOT_MAGIC,
+  SNAPSHOT_VERSION,
+  type SnapshotMetadata,
+  type LoadSnapshotResult,
+  type DumpSnapshotResult,
+} from "../chain/snapshot.js";
 
 /**
  * JSON-RPC request format.
@@ -92,6 +104,7 @@ export interface RPCServerDeps {
   params: ConsensusParams;
   pruneManager?: import("../storage/pruning.js").PruneManager;
   wallet?: Wallet;
+  chainstateManager?: ChainstateManager;
 }
 
 /** RPC error codes. */
@@ -155,6 +168,7 @@ export class RPCServer {
   private params: ConsensusParams;
   private pruneManager?: import("../storage/pruning.js").PruneManager;
   private wallet?: Wallet;
+  private chainstateManager?: ChainstateManager;
   private shutdownCallback: (() => void) | null = null;
 
   constructor(config: RPCServerConfig, deps: RPCServerDeps) {
@@ -173,6 +187,7 @@ export class RPCServer {
     this.params = deps.params;
     this.pruneManager = deps.pruneManager;
     this.wallet = deps.wallet;
+    this.chainstateManager = deps.chainstateManager;
     this.methods = new Map();
 
     this.registerBuiltinMethods();
@@ -505,6 +520,11 @@ export class RPCServer {
     // Descriptor methods (work without wallet)
     this.registerMethod("getdescriptorinfo", (params) => this.getDescriptorInfo(params));
     this.registerMethod("deriveaddresses", (params) => this.deriveAddresses(params));
+
+    // assumeUTXO methods
+    this.registerMethod("loadtxoutset", (params) => this.loadTxoutset(params));
+    this.registerMethod("dumptxoutset", (params) => this.dumpTxoutset(params));
+    this.registerMethod("getutxosetsnapshot", () => this.getUtxoSetSnapshot());
   }
 
   // ========== Blockchain Methods ==========
@@ -3067,6 +3087,106 @@ export class RPCServer {
         return "regtest";
       default:
         return "mainnet";
+    }
+  }
+
+  // ========== assumeUTXO Methods ==========
+
+  /**
+   * loadtxoutset: Load a UTXO snapshot from a file.
+   *
+   * @param params - [path] Path to the snapshot file
+   * @returns Load result with coins loaded, base hash, height, and path
+   */
+  private async loadTxoutset(params: unknown[]): Promise<Record<string, unknown>> {
+    const [pathParam] = params;
+
+    if (typeof pathParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "path must be a string");
+    }
+
+    // Create or get chainstate manager
+    let chainstateManager = this.chainstateManager;
+    if (!chainstateManager) {
+      chainstateManager = new ChainstateManager(this.db, this.params);
+      this.chainstateManager = chainstateManager;
+    }
+
+    try {
+      const result = await chainstateManager.loadSnapshot(pathParam);
+
+      return {
+        coins_loaded: Number(result.coinsLoaded),
+        tip_hash: result.baseBlockHash.toString("hex"),
+        base_height: result.baseHeight,
+        path: result.path,
+      };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(RPCErrorCodes.INTERNAL_ERROR, `Failed to load snapshot: ${message}`);
+    }
+  }
+
+  /**
+   * dumptxoutset: Dump the current UTXO set to a snapshot file.
+   *
+   * @param params - [path] Path for the output file
+   * @returns Dump result with coins written, base hash, height, path, and txoutset hash
+   */
+  private async dumpTxoutset(params: unknown[]): Promise<Record<string, unknown>> {
+    const [pathParam] = params;
+
+    if (typeof pathParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "path must be a string");
+    }
+
+    // Create or get chainstate manager
+    let chainstateManager = this.chainstateManager;
+    if (!chainstateManager) {
+      chainstateManager = new ChainstateManager(this.db, this.params);
+      this.chainstateManager = chainstateManager;
+    }
+
+    try {
+      const result = await chainstateManager.dumpSnapshot(pathParam);
+
+      return {
+        coins_written: Number(result.coinsWritten),
+        base_hash: result.baseHash,
+        base_height: result.baseHeight,
+        path: result.path,
+        txoutset_hash: result.txoutsetHash,
+        nchaintx: Number(result.nChainTx),
+      };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(RPCErrorCodes.INTERNAL_ERROR, `Failed to dump snapshot: ${message}`);
+    }
+  }
+
+  /**
+   * getutxosetsnapshot: Get information about the current UTXO set.
+   *
+   * @returns UTXO set statistics including hash and coin count
+   */
+  private async getUtxoSetSnapshot(): Promise<Record<string, unknown>> {
+    try {
+      const chainState = await this.db.getChainState();
+      if (!chainState) {
+        throw new Error("No chain state available");
+      }
+
+      const { hash, coinsCount } = await computeUTXOSetHash(this.db);
+
+      return {
+        height: chainState.bestHeight,
+        bestblock: chainState.bestBlockHash.toString("hex"),
+        txoutset_hash: hash.toString("hex"),
+        coins_count: Number(coinsCount),
+      };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(RPCErrorCodes.INTERNAL_ERROR, `Failed to compute UTXO set info: ${message}`);
     }
   }
 }
