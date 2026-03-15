@@ -13,14 +13,18 @@ import type { PeerManager } from "../p2p/manager.js";
 import type { FeeEstimator } from "../fees/estimator.js";
 import type { HeaderSync, HeaderChainEntry } from "../sync/headers.js";
 import type { ConsensusParams } from "../consensus/params.js";
-import { compactToBigInt } from "../consensus/params.js";
+import { compactToBigInt, bigIntToCompact, getBlockSubsidy } from "../consensus/params.js";
 import type { Block, BlockHeader } from "../validation/block.js";
 import {
   deserializeBlock,
   serializeBlock,
   serializeBlockHeader,
   getBlockHash,
+  computeMerkleRoot,
+  computeWitnessMerkleRoot,
 } from "../validation/block.js";
+import { checkProofOfWork } from "../consensus/pow.js";
+import { BlockTemplateBuilder } from "../mining/template.js";
 import type { Transaction } from "../validation/tx.js";
 import {
   deserializeTx,
@@ -501,6 +505,9 @@ export class RPCServer {
 
     // Mining methods
     this.registerMethod("getblocktemplate", (params) => this.getBlockTemplate(params));
+    this.registerMethod("generatetoaddress", (params) => this.generateToAddress(params));
+    this.registerMethod("generateblock", (params) => this.generateBlock(params));
+    this.registerMethod("generatetodescriptor", (params) => this.generateToDescriptor(params));
 
     // Pruning methods
     this.registerMethod("pruneblockchain", (params) => this.pruneBlockchain(params));
@@ -2490,6 +2497,479 @@ export class RPCServer {
     }
 
     return result;
+  }
+
+  /**
+   * generatetoaddress: Mine blocks with coinbase reward to the specified address.
+   *
+   * This is only available in regtest mode.
+   *
+   * @param params [nblocks, address, maxtries?] - Number of blocks, coinbase address, optional max nonce tries
+   * @returns Array of block hashes (hex strings)
+   */
+  private async generateToAddress(params: unknown[]): Promise<string[]> {
+    const [nblocksParam, addressParam, maxtries] = params;
+
+    // Validate nblocks
+    if (typeof nblocksParam !== "number" || !Number.isInteger(nblocksParam) || nblocksParam < 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "nblocks must be a non-negative integer");
+    }
+    const nblocks = nblocksParam;
+
+    // Validate address
+    if (typeof addressParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "address must be a string");
+    }
+
+    // Check this is regtest (we only allow generate RPCs on regtest)
+    if (!this.params.fPowNoRetargeting) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        "generatetoaddress is only available in regtest mode"
+      );
+    }
+
+    // Decode address to get scriptPubKey
+    const decoded = this.decodeAddress(addressParam);
+    if (!decoded.valid || !decoded.scriptPubKey) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        decoded.error || "Invalid address"
+      );
+    }
+
+    const coinbaseScript = decoded.scriptPubKey;
+    const maxTries = typeof maxtries === "number" ? maxtries : 1000000;
+
+    return this.generateBlocks(nblocks, coinbaseScript, maxTries);
+  }
+
+  /**
+   * generatetodescriptor: Mine blocks with coinbase reward to the specified descriptor.
+   *
+   * This is only available in regtest mode.
+   *
+   * @param params [nblocks, descriptor, maxtries?] - Number of blocks, output descriptor, optional max tries
+   * @returns Array of block hashes (hex strings)
+   */
+  private async generateToDescriptor(params: unknown[]): Promise<string[]> {
+    const [nblocksParam, descriptorParam, maxtries] = params;
+
+    // Validate nblocks
+    if (typeof nblocksParam !== "number" || !Number.isInteger(nblocksParam) || nblocksParam < 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "nblocks must be a non-negative integer");
+    }
+    const nblocks = nblocksParam;
+
+    // Validate descriptor
+    if (typeof descriptorParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "descriptor must be a string");
+    }
+
+    // Check this is regtest
+    if (!this.params.fPowNoRetargeting) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        "generatetodescriptor is only available in regtest mode"
+      );
+    }
+
+    // Parse descriptor and derive script
+    try {
+      // Determine network type from params
+      const networkType = this.getNetworkType();
+
+      // Get addresses from descriptor (just need first one)
+      const addresses = deriveAddresses(descriptorParam, networkType);
+      if (addresses.length === 0) {
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Cannot derive address from descriptor");
+      }
+
+      // Decode the first address to get scriptPubKey
+      const decoded = this.decodeAddress(addresses[0]);
+      if (!decoded.valid || !decoded.scriptPubKey) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+          decoded.error || "Cannot derive valid address from descriptor"
+        );
+      }
+
+      const coinbaseScript = decoded.scriptPubKey;
+      const maxTries = typeof maxtries === "number" ? maxtries : 1000000;
+
+      return this.generateBlocks(nblocks, coinbaseScript, maxTries);
+    } catch (e) {
+      if (e instanceof Error && "code" in e) {
+        throw e; // Re-throw RPC errors
+      }
+      const message = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid descriptor: ${message}`);
+    }
+  }
+
+  /**
+   * generateblock: Mine a block containing specific transactions.
+   *
+   * This is only available in regtest mode.
+   *
+   * @param params [output, transactions, submit?] - Output address/descriptor, array of txids or raw txs, whether to submit
+   * @returns Object with hash (and hex if submit=false)
+   */
+  private async generateBlock(params: unknown[]): Promise<Record<string, string>> {
+    const [outputParam, transactionsParam, submitParam] = params;
+
+    // Validate output (address or descriptor)
+    if (typeof outputParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "output must be a string (address or descriptor)");
+    }
+
+    // Validate transactions array
+    if (!Array.isArray(transactionsParam)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "transactions must be an array");
+    }
+
+    // Check this is regtest
+    if (!this.params.fPowNoRetargeting) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        "generateblock is only available in regtest mode"
+      );
+    }
+
+    // Parse output to get scriptPubKey - try as address first, then as descriptor
+    let coinbaseScript: Buffer;
+
+    const decoded = this.decodeAddress(outputParam);
+    if (decoded.valid && decoded.scriptPubKey) {
+      coinbaseScript = decoded.scriptPubKey;
+    } else {
+      // Try as descriptor
+      try {
+        const networkType = this.getNetworkType();
+        const addresses = deriveAddresses(outputParam, networkType);
+        if (addresses.length === 0) {
+          throw new Error("Cannot derive address from descriptor");
+        }
+        const descDecoded = this.decodeAddress(addresses[0]);
+        if (!descDecoded.valid || !descDecoded.scriptPubKey) {
+          throw new Error(descDecoded.error || "Invalid derived address");
+        }
+        coinbaseScript = descDecoded.scriptPubKey;
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid output: ${message}`);
+      }
+    }
+
+    const submit = submitParam !== false;
+
+    // Collect transactions
+    const txs: Transaction[] = [];
+    for (const item of transactionsParam) {
+      if (typeof item !== "string") {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "transaction must be a hex string (txid or raw tx)");
+      }
+
+      // Check if it's a 64-char txid or a raw transaction hex
+      if (item.length === 64 && /^[0-9a-fA-F]+$/.test(item)) {
+        // It's a txid - look up in mempool
+        const txid = Buffer.from(item, "hex");
+        const entry = this.mempool.getTransaction(txid);
+        if (!entry) {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+            `Transaction ${item} not in mempool`
+          );
+        }
+        txs.push(entry.tx);
+      } else {
+        // It's a raw transaction hex - decode it
+        try {
+          const rawTx = Buffer.from(item, "hex");
+          const reader = new BufferReader(rawTx);
+          const tx = deserializeTx(reader);
+          txs.push(tx);
+        } catch (e) {
+          const message = e instanceof Error ? e.message : String(e);
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_PARAMS,
+            `Failed to decode transaction: ${message}`
+          );
+        }
+      }
+    }
+
+    // Generate a single block with these transactions
+    const result = await this.generateSingleBlock(coinbaseScript, txs, submit);
+
+    if (submit) {
+      return { hash: result.hash };
+    } else {
+      return { hash: result.hash, hex: result.hex! };
+    }
+  }
+
+  /**
+   * Generate multiple blocks with coinbase to the given script.
+   */
+  private async generateBlocks(
+    nblocks: number,
+    coinbaseScript: Buffer,
+    maxTries: number
+  ): Promise<string[]> {
+    const blockHashes: string[] = [];
+
+    for (let i = 0; i < nblocks; i++) {
+      const result = await this.generateSingleBlock(coinbaseScript, [], true, maxTries);
+      blockHashes.push(result.hash);
+    }
+
+    return blockHashes;
+  }
+
+  /**
+   * Generate a single block.
+   */
+  private async generateSingleBlock(
+    coinbaseScript: Buffer,
+    transactions: Transaction[],
+    submit: boolean,
+    maxTries: number = 1000000
+  ): Promise<{ hash: string; hex?: string }> {
+    const bestBlock = this.chainState.getBestBlock();
+    const height = bestBlock.height + 1;
+
+    // Build coinbase transaction
+    const subsidy = getBlockSubsidy(height, this.params);
+
+    // Calculate fees from transactions
+    let totalFees = 0n;
+    for (const tx of transactions) {
+      // For accurate fee calculation, we'd need to look up inputs
+      // For regtest, we'll trust the mempool entries or assume 0 fees for raw txs
+      const txid = getTxId(tx);
+      const entry = this.mempool.getTransaction(txid);
+      if (entry) {
+        totalFees += entry.fee;
+      }
+    }
+
+    // Build coinbase
+    const coinbaseTx = this.buildCoinbaseTx(height, subsidy + totalFees, coinbaseScript);
+
+    // All transactions for the block
+    const allTxs = [coinbaseTx, ...transactions];
+
+    // Compute merkle root
+    const txids = allTxs.map(tx => getTxId(tx));
+    const merkleRoot = computeMerkleRoot(txids);
+
+    // Compute witness commitment if needed
+    const segwitActive = height >= this.params.segwitHeight;
+    let finalCoinbase = coinbaseTx;
+
+    if (segwitActive) {
+      // Compute witness merkle root
+      const wtxids: Buffer[] = [Buffer.alloc(32, 0)]; // Coinbase wtxid is 32 zeros
+      for (const tx of transactions) {
+        wtxids.push(getWTxId(tx));
+      }
+      const witnessMerkleRoot = computeWitnessMerkleRoot(wtxids);
+      const witnessNonce = Buffer.alloc(32, 0);
+      const witnessCommitment = hash256(Buffer.concat([witnessMerkleRoot, witnessNonce]));
+
+      // Rebuild coinbase with witness commitment
+      finalCoinbase = this.buildCoinbaseTxWithWitnessCommitment(
+        height,
+        subsidy + totalFees,
+        coinbaseScript,
+        witnessCommitment
+      );
+
+      // Recompute txids with new coinbase
+      allTxs[0] = finalCoinbase;
+      txids[0] = getTxId(finalCoinbase);
+    }
+
+    // Build header
+    const target = this.params.powLimit;
+    const bits = bigIntToCompact(target);
+
+    let header: BlockHeader = {
+      version: 0x20000000,
+      prevBlock: bestBlock.hash,
+      merkleRoot: computeMerkleRoot(txids),
+      timestamp: Math.floor(Date.now() / 1000),
+      bits,
+      nonce: 0,
+    };
+
+    // Mine the block (find valid nonce)
+    let found = false;
+    for (let nonce = 0; nonce < maxTries && nonce < 0xffffffff; nonce++) {
+      header = { ...header, nonce };
+      const blockHash = getBlockHash(header);
+
+      if (checkProofOfWork(blockHash, bits, this.params)) {
+        found = true;
+        break;
+      }
+    }
+
+    if (!found) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Failed to find valid nonce");
+    }
+
+    // Build the block
+    const block: Block = {
+      header,
+      transactions: allTxs,
+    };
+
+    const blockHash = getBlockHash(header);
+    const blockHashHex = blockHash.toString("hex");
+
+    if (submit) {
+      // Connect the block to the chain
+      await this.chainState.connectBlock(block, height);
+
+      // Remove mined transactions from mempool
+      for (const tx of transactions) {
+        const txid = getTxId(tx);
+        this.mempool.removeTransaction(txid);
+      }
+
+      return { hash: blockHashHex };
+    } else {
+      // Return block hex without submitting
+      const blockHex = serializeBlock(block).toString("hex");
+      return { hash: blockHashHex, hex: blockHex };
+    }
+  }
+
+  /**
+   * Build a coinbase transaction.
+   */
+  private buildCoinbaseTx(height: number, value: bigint, scriptPubKey: Buffer): Transaction {
+    // BIP34 height encoding
+    const heightPush = this.encodeBIP34Height(height);
+
+    return {
+      version: 2,
+      inputs: [
+        {
+          prevOut: {
+            txid: Buffer.alloc(32, 0),
+            vout: 0xffffffff,
+          },
+          scriptSig: heightPush,
+          sequence: 0xffffffff,
+          witness: [],
+        },
+      ],
+      outputs: [
+        {
+          value,
+          scriptPubKey,
+        },
+      ],
+      lockTime: 0,
+    };
+  }
+
+  /**
+   * Build a coinbase transaction with witness commitment.
+   */
+  private buildCoinbaseTxWithWitnessCommitment(
+    height: number,
+    value: bigint,
+    scriptPubKey: Buffer,
+    witnessCommitment: Buffer
+  ): Transaction {
+    const heightPush = this.encodeBIP34Height(height);
+
+    // Witness commitment output: OP_RETURN 0x24 0xaa21a9ed <32-byte commitment>
+    const commitmentScript = Buffer.concat([
+      Buffer.from([0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]),
+      witnessCommitment,
+    ]);
+
+    return {
+      version: 2,
+      inputs: [
+        {
+          prevOut: {
+            txid: Buffer.alloc(32, 0),
+            vout: 0xffffffff,
+          },
+          scriptSig: heightPush,
+          sequence: 0xffffffff,
+          witness: [Buffer.alloc(32, 0)], // Witness nonce
+        },
+      ],
+      outputs: [
+        {
+          value,
+          scriptPubKey,
+        },
+        {
+          value: 0n,
+          scriptPubKey: commitmentScript,
+        },
+      ],
+      lockTime: 0,
+    };
+  }
+
+  /**
+   * Encode height for BIP34 coinbase scriptSig.
+   */
+  private encodeBIP34Height(height: number): Buffer {
+    if (height < 0) {
+      throw new Error("Height cannot be negative");
+    }
+
+    if (height === 0) {
+      return Buffer.from([0x00]); // OP_0
+    }
+
+    if (height >= 1 && height <= 16) {
+      return Buffer.from([0x50 + height]); // OP_1 to OP_16
+    }
+
+    // For heights >= 17, use minimal push encoding
+    const heightBytes = this.encodeScriptNum(height);
+    return Buffer.concat([
+      Buffer.from([heightBytes.length]),
+      heightBytes,
+    ]);
+  }
+
+  /**
+   * Encode a number as a minimal CScript number.
+   */
+  private encodeScriptNum(n: number): Buffer {
+    if (n === 0) {
+      return Buffer.alloc(0);
+    }
+
+    const negative = n < 0;
+    let absValue = Math.abs(n);
+    const result: number[] = [];
+
+    while (absValue > 0) {
+      result.push(absValue & 0xff);
+      absValue >>= 8;
+    }
+
+    // If MSB has high bit set and number is positive, add 0x00
+    if (result[result.length - 1] & 0x80) {
+      result.push(negative ? 0x80 : 0x00);
+    } else if (negative) {
+      result[result.length - 1] |= 0x80;
+    }
+
+    return Buffer.from(result);
   }
 
   // ========== Pruning Methods ==========
