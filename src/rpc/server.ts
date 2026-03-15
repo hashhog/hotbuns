@@ -37,6 +37,13 @@ import { BufferReader } from "../wire/serialization.js";
 import type { InvPayload, NetworkMessage } from "../p2p/messages.js";
 import { InvType } from "../p2p/messages.js";
 import type { Wallet } from "../wallet/wallet.js";
+import {
+  parseDescriptor,
+  getDescriptorInfo,
+  deriveAddresses,
+  addChecksum,
+  type NetworkType,
+} from "../wallet/descriptor.js";
 
 /**
  * JSON-RPC request format.
@@ -494,6 +501,10 @@ export class RPCServer {
       this.registerMethod("listtransactions", (params) => this.listTransactions(params));
       this.registerMethod("getwalletinfo", () => this.getWalletInfo());
     }
+
+    // Descriptor methods (work without wallet)
+    this.registerMethod("getdescriptorinfo", (params) => this.getDescriptorInfo(params));
+    this.registerMethod("deriveaddresses", (params) => this.deriveAddresses(params));
   }
 
   // ========== Blockchain Methods ==========
@@ -2959,5 +2970,98 @@ export class RPCServer {
       encrypted: this.wallet.isEncrypted(),
       locked: this.wallet.isLocked(),
     };
+  }
+
+  // ========== Descriptor Methods ==========
+
+  /**
+   * getdescriptorinfo: Analyzes a descriptor and returns information about it.
+   * @param params [descriptor]
+   */
+  private async getDescriptorInfo(params: unknown[]): Promise<Record<string, unknown>> {
+    const [descriptorParam] = params;
+
+    if (typeof descriptorParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "descriptor must be a string");
+    }
+
+    try {
+      const info = getDescriptorInfo(descriptorParam);
+      return {
+        descriptor: info.descriptor,
+        checksum: info.checksum,
+        isrange: info.isRange,
+        issolvable: info.isSolvable,
+        hasprivatekeys: info.hasPrivateKeys,
+      };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, message);
+    }
+  }
+
+  /**
+   * deriveaddresses: Derives addresses from a descriptor.
+   * @param params [descriptor, range?]
+   * range is [start, end] inclusive, or just end (implies start=0)
+   */
+  private async deriveAddresses(params: unknown[]): Promise<string[]> {
+    const [descriptorParam, rangeParam] = params;
+
+    if (typeof descriptorParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "descriptor must be a string");
+    }
+
+    // Determine network from params
+    const network = this.getNetworkType();
+
+    // Parse range parameter
+    let range: [number, number] | undefined;
+    if (rangeParam !== undefined) {
+      if (typeof rangeParam === "number") {
+        // Single number means [0, rangeParam]
+        range = [0, rangeParam];
+      } else if (Array.isArray(rangeParam) && rangeParam.length === 2) {
+        const [start, end] = rangeParam;
+        if (typeof start !== "number" || typeof end !== "number") {
+          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "range must be [start, end] numbers");
+        }
+        range = [start, end];
+      } else {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "range must be a number or [start, end]");
+      }
+
+      // Validate range
+      if (range[0] < 0 || range[1] < range[0]) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "invalid range");
+      }
+      if (range[1] - range[0] > 10000) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "range too large (max 10000)");
+      }
+    }
+
+    try {
+      const addresses = deriveAddresses(descriptorParam, network, range);
+      return addresses;
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, message);
+    }
+  }
+
+  /**
+   * Get the network type for address encoding.
+   */
+  private getNetworkType(): NetworkType {
+    switch (this.params.networkMagic) {
+      case 0xd9b4bef9:
+        return "mainnet";
+      case 0x0709110b:
+        return "testnet";
+      case 0xdab5bffa:
+        return "regtest";
+      default:
+        return "mainnet";
+    }
   }
 }
