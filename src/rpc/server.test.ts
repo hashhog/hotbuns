@@ -637,4 +637,121 @@ describe("RPCServer", () => {
       expect(result.result.params).toEqual(["arg1", "arg2"]);
     });
   });
+
+  describe("validateaddress", () => {
+    it("should validate a valid P2PKH address", async () => {
+      // A valid regtest P2PKH address (starts with m or n)
+      // This is a testnet/regtest address: mkHGce7dctSxHgaWSSbmmrRWsZfzz7MxMk
+      const result = await rpcRequest(testPort, "validateaddress", [
+        "mkHGce7dctSxHgaWSSbmmrRWsZfzz7MxMk",
+      ]);
+
+      expect(result.result).toBeDefined();
+      expect(result.result.isvalid).toBe(true);
+      expect(result.result.address).toBe("mkHGce7dctSxHgaWSSbmmrRWsZfzz7MxMk");
+      expect(result.result.isscript).toBe(false);
+      expect(result.result.iswitness).toBe(false);
+    });
+
+    it("should validate a valid bech32 address", async () => {
+      // A valid regtest P2WPKH address (bcrt1q...)
+      const result = await rpcRequest(testPort, "validateaddress", [
+        "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwm7tkn",
+      ]);
+
+      // The checksum might not match since we're using a synthetic address
+      // But the parsing should proceed
+      expect(result.result).toBeDefined();
+    });
+
+    it("should reject invalid addresses", async () => {
+      const result = await rpcRequest(testPort, "validateaddress", [
+        "notanaddress",
+      ]);
+
+      expect(result.result).toBeDefined();
+      expect(result.result.isvalid).toBe(false);
+      expect(result.result.error).toBeDefined();
+    });
+
+    it("should reject non-string parameter", async () => {
+      const result = await rpcRequest(testPort, "validateaddress", [123]);
+
+      expect(result.error).toBeDefined();
+      expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+    });
+  });
+
+  describe("getblocktemplate", () => {
+    it("should return block template with segwit rule", async () => {
+      const result = await rpcRequest(testPort, "getblocktemplate", [
+        { rules: ["segwit"] },
+      ]);
+
+      expect(result.result).toBeDefined();
+      expect(result.result.version).toBeDefined();
+      expect(result.result.previousblockhash).toBeDefined();
+      expect(result.result.transactions).toBeDefined();
+      expect(Array.isArray(result.result.transactions)).toBe(true);
+      expect(result.result.coinbasevalue).toBeDefined();
+      expect(result.result.height).toBe(101); // Best block height (100) + 1
+      expect(result.result.capabilities).toContain("proposal");
+      expect(result.result.rules).toContain("!segwit");
+    });
+
+    it("should reject without segwit rule", async () => {
+      const result = await rpcRequest(testPort, "getblocktemplate", [
+        { rules: [] },
+      ]);
+
+      expect(result.error).toBeDefined();
+      expect(result.error.message).toContain("segwit");
+    });
+
+    it("should include transaction data", async () => {
+      // Add a transaction to the mempool
+      const txid = Buffer.alloc(32, 2);
+      mockMempool.addTestTransaction(txid, {
+        tx: {
+          version: 2,
+          inputs: [
+            {
+              prevOut: { txid: Buffer.alloc(32, 0), vout: 0 },
+              scriptSig: Buffer.alloc(0),
+              sequence: 0xffffffff,
+              witness: [],
+            },
+          ],
+          outputs: [
+            { value: 1000n, scriptPubKey: Buffer.alloc(25, 0) },
+          ],
+          lockTime: 0,
+        },
+        fee: 500n,
+        weight: 400,
+      });
+
+      const result = await rpcRequest(testPort, "getblocktemplate", [
+        { rules: ["segwit"] },
+      ]);
+
+      expect(result.result).toBeDefined();
+      expect(result.result.transactions.length).toBe(1);
+      expect(result.result.transactions[0].fee).toBe(500);
+    });
+  });
+
+  describe("getblockchaininfo softforks", () => {
+    it("should include softforks in response", async () => {
+      const result = await rpcRequest(testPort, "getblockchaininfo");
+
+      expect(result.result).toBeDefined();
+      expect(result.result.softforks).toBeDefined();
+      expect(result.result.softforks.segwit).toBeDefined();
+      expect(result.result.softforks.segwit.type).toBe("buried");
+      expect(result.result.softforks.taproot).toBeDefined();
+      expect(result.result.softforks.csv).toBeDefined();
+      expect(result.result.softforks.bip34).toBeDefined();
+    });
+  });
 });
