@@ -539,6 +539,37 @@ export class BlockFileManager {
     const file = Bun.file(filePath);
     return file.exists();
   }
+
+  /**
+   * Get the rev (undo) file path.
+   */
+  getRevFilePath(fileNum: number): string {
+    return join(
+      this.dataDir,
+      "blocks",
+      `rev${formatFileNumber(fileNum)}.dat`
+    );
+  }
+
+  /**
+   * Clear a block file's info (used when pruning).
+   */
+  clearBlockFileInfo(fileNum: number): void {
+    this.blockFileInfo.set(fileNum, createEmptyBlockFileInfo());
+  }
+
+  /**
+   * Get the maximum block file number.
+   */
+  getMaxBlockFileNum(): number {
+    let max = -1;
+    for (const fileNum of this.blockFileInfo.keys()) {
+      if (fileNum > max) {
+        max = fileNum;
+      }
+    }
+    return max;
+  }
 }
 
 /**
