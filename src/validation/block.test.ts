@@ -18,8 +18,22 @@ import {
   getBlockWeight,
   getBlockBaseSize,
   getBlockTotalSize,
+  // Sigop counting
+  MAX_BLOCK_SIGOPS_COST,
+  WITNESS_SCALE_FACTOR,
+  MAX_PUBKEYS_PER_MULTISIG,
+  countScriptSigOps,
+  getLegacySigOpCount,
+  getP2SHSigOpCount,
+  countWitnessProgramSigOps,
+  parseWitnessProgram,
+  countInputWitnessSigOps,
+  getTransactionSigOpCost,
+  getBlockSigOpsCost,
+  validateBlockSigOps,
 } from "./block";
 import { Transaction, getTxId, serializeTx } from "./tx";
+import { Opcode } from "../script/interpreter";
 
 /**
  * Helper to create a valid block header.
@@ -675,5 +689,439 @@ describe("genesis block validation", () => {
 
     const result = validateBlock(validationBlock, 0, REGTEST);
     expect(result.valid).toBe(true);
+  });
+});
+
+// =============================================================================
+// Sigop Counting Tests
+// =============================================================================
+
+describe("sigop constants", () => {
+  test("MAX_BLOCK_SIGOPS_COST is 80000", () => {
+    expect(MAX_BLOCK_SIGOPS_COST).toBe(80_000);
+  });
+
+  test("WITNESS_SCALE_FACTOR is 4", () => {
+    expect(WITNESS_SCALE_FACTOR).toBe(4);
+  });
+
+  test("MAX_PUBKEYS_PER_MULTISIG is 20", () => {
+    expect(MAX_PUBKEYS_PER_MULTISIG).toBe(20);
+  });
+});
+
+describe("countScriptSigOps", () => {
+  test("empty script has 0 sigops", () => {
+    expect(countScriptSigOps(Buffer.alloc(0), false)).toBe(0);
+  });
+
+  test("OP_CHECKSIG counts as 1 sigop", () => {
+    const script = Buffer.from([Opcode.OP_CHECKSIG]);
+    expect(countScriptSigOps(script, false)).toBe(1);
+  });
+
+  test("OP_CHECKSIGVERIFY counts as 1 sigop", () => {
+    const script = Buffer.from([Opcode.OP_CHECKSIGVERIFY]);
+    expect(countScriptSigOps(script, false)).toBe(1);
+  });
+
+  test("multiple OP_CHECKSIG opcodes", () => {
+    const script = Buffer.from([
+      Opcode.OP_CHECKSIG,
+      Opcode.OP_CHECKSIG,
+      Opcode.OP_CHECKSIG,
+    ]);
+    expect(countScriptSigOps(script, false)).toBe(3);
+  });
+
+  test("OP_CHECKMULTISIG counts as 20 sigops in inaccurate mode", () => {
+    const script = Buffer.from([Opcode.OP_CHECKMULTISIG]);
+    expect(countScriptSigOps(script, false)).toBe(20);
+  });
+
+  test("OP_CHECKMULTISIGVERIFY counts as 20 sigops in inaccurate mode", () => {
+    const script = Buffer.from([Opcode.OP_CHECKMULTISIGVERIFY]);
+    expect(countScriptSigOps(script, false)).toBe(20);
+  });
+
+  test("OP_N OP_CHECKMULTISIG uses N sigops in accurate mode", () => {
+    // OP_3 OP_CHECKMULTISIG should count as 3 sigops
+    const script = Buffer.from([Opcode.OP_3, Opcode.OP_CHECKMULTISIG]);
+    expect(countScriptSigOps(script, true)).toBe(3);
+  });
+
+  test("OP_16 OP_CHECKMULTISIG uses 16 sigops in accurate mode", () => {
+    const script = Buffer.from([Opcode.OP_16, Opcode.OP_CHECKMULTISIG]);
+    expect(countScriptSigOps(script, true)).toBe(16);
+  });
+
+  test("OP_1 OP_CHECKMULTISIG uses 1 sigop in accurate mode", () => {
+    const script = Buffer.from([Opcode.OP_1, Opcode.OP_CHECKMULTISIG]);
+    expect(countScriptSigOps(script, true)).toBe(1);
+  });
+
+  test("OP_CHECKMULTISIG without preceding OP_N uses 20 in accurate mode", () => {
+    // Just OP_CHECKMULTISIG without a preceding OP_N
+    const script = Buffer.from([Opcode.OP_DUP, Opcode.OP_CHECKMULTISIG]);
+    expect(countScriptSigOps(script, true)).toBe(20);
+  });
+
+  test("P2PKH script has 1 sigop", () => {
+    // OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+    const pubkeyHash = Buffer.alloc(20, 0xab);
+    const script = Buffer.concat([
+      Buffer.from([Opcode.OP_DUP, Opcode.OP_HASH160, 20]),
+      pubkeyHash,
+      Buffer.from([Opcode.OP_EQUALVERIFY, Opcode.OP_CHECKSIG]),
+    ]);
+    expect(countScriptSigOps(script, false)).toBe(1);
+  });
+
+  test("2-of-3 multisig script", () => {
+    // OP_2 <pubkey1> <pubkey2> <pubkey3> OP_3 OP_CHECKMULTISIG
+    const pubkey = Buffer.alloc(33, 0x02);
+    const script = Buffer.concat([
+      Buffer.from([Opcode.OP_2]),
+      Buffer.from([33]), pubkey,
+      Buffer.from([33]), pubkey,
+      Buffer.from([33]), pubkey,
+      Buffer.from([Opcode.OP_3, Opcode.OP_CHECKMULTISIG]),
+    ]);
+    // In accurate mode, OP_3 before OP_CHECKMULTISIG = 3 sigops
+    expect(countScriptSigOps(script, true)).toBe(3);
+    // In inaccurate mode = 20 sigops
+    expect(countScriptSigOps(script, false)).toBe(20);
+  });
+
+  test("skips push data correctly", () => {
+    // Push 32 bytes of 0xac (OP_CHECKSIG) - should NOT count as sigop
+    const script = Buffer.concat([
+      Buffer.from([32]), // push 32 bytes
+      Buffer.alloc(32, Opcode.OP_CHECKSIG), // 32 bytes that look like OP_CHECKSIG
+      Buffer.from([Opcode.OP_CHECKSIG]), // actual OP_CHECKSIG
+    ]);
+    expect(countScriptSigOps(script, false)).toBe(1);
+  });
+});
+
+describe("getLegacySigOpCount", () => {
+  test("coinbase transaction with OP_CHECKSIG output", () => {
+    const coinbase = createCoinbaseTx(1);
+    // Genesis-style output with OP_CHECKSIG
+    coinbase.outputs[0].scriptPubKey = Buffer.concat([
+      Buffer.from([65]), // push 65 bytes
+      Buffer.alloc(65, 0x04), // fake uncompressed pubkey
+      Buffer.from([Opcode.OP_CHECKSIG]),
+    ]);
+
+    expect(getLegacySigOpCount(coinbase)).toBe(1);
+  });
+
+  test("transaction with P2PKH output", () => {
+    const tx = createRegularTx();
+    // P2PKH output: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+    tx.outputs[0].scriptPubKey = Buffer.concat([
+      Buffer.from([Opcode.OP_DUP, Opcode.OP_HASH160, 20]),
+      Buffer.alloc(20, 0x00),
+      Buffer.from([Opcode.OP_EQUALVERIFY, Opcode.OP_CHECKSIG]),
+    ]);
+
+    expect(getLegacySigOpCount(tx)).toBe(1);
+  });
+
+  test("counts sigops from both inputs and outputs", () => {
+    const tx = createRegularTx();
+    // Input with OP_CHECKSIG in scriptSig (unusual but valid)
+    tx.inputs[0].scriptSig = Buffer.from([Opcode.OP_CHECKSIG]);
+    // Output with OP_CHECKSIG
+    tx.outputs[0].scriptPubKey = Buffer.from([Opcode.OP_CHECKSIG]);
+
+    expect(getLegacySigOpCount(tx)).toBe(2);
+  });
+});
+
+describe("parseWitnessProgram", () => {
+  test("P2WPKH: OP_0 <20 bytes>", () => {
+    const script = Buffer.concat([
+      Buffer.from([0x00, 20]),
+      Buffer.alloc(20, 0xab),
+    ]);
+    const result = parseWitnessProgram(script);
+    expect(result).not.toBeNull();
+    expect(result![0]).toBe(0); // version 0
+    expect(result![1].length).toBe(20);
+  });
+
+  test("P2WSH: OP_0 <32 bytes>", () => {
+    const script = Buffer.concat([
+      Buffer.from([0x00, 32]),
+      Buffer.alloc(32, 0xcd),
+    ]);
+    const result = parseWitnessProgram(script);
+    expect(result).not.toBeNull();
+    expect(result![0]).toBe(0);
+    expect(result![1].length).toBe(32);
+  });
+
+  test("P2TR: OP_1 <32 bytes>", () => {
+    const script = Buffer.concat([
+      Buffer.from([0x51, 32]), // OP_1
+      Buffer.alloc(32, 0xef),
+    ]);
+    const result = parseWitnessProgram(script);
+    expect(result).not.toBeNull();
+    expect(result![0]).toBe(1); // version 1
+    expect(result![1].length).toBe(32);
+  });
+
+  test("non-witness program returns null", () => {
+    // P2PKH is not a witness program
+    const script = Buffer.concat([
+      Buffer.from([Opcode.OP_DUP, Opcode.OP_HASH160, 20]),
+      Buffer.alloc(20, 0x00),
+      Buffer.from([Opcode.OP_EQUALVERIFY, Opcode.OP_CHECKSIG]),
+    ]);
+    expect(parseWitnessProgram(script)).toBeNull();
+  });
+
+  test("too short script returns null", () => {
+    const script = Buffer.from([0x00, 1, 0xab]); // 1-byte program (too short)
+    expect(parseWitnessProgram(script)).toBeNull();
+  });
+
+  test("too long script returns null", () => {
+    const script = Buffer.concat([
+      Buffer.from([0x00, 41]),
+      Buffer.alloc(41, 0x00), // 41-byte program (too long)
+    ]);
+    expect(parseWitnessProgram(script)).toBeNull();
+  });
+});
+
+describe("countWitnessProgramSigOps", () => {
+  test("P2WPKH returns 1 sigop", () => {
+    const program = Buffer.alloc(20, 0xab);
+    const witness = [Buffer.alloc(72), Buffer.alloc(33)]; // sig + pubkey
+    expect(countWitnessProgramSigOps(0, program, witness)).toBe(1);
+  });
+
+  test("P2WSH with OP_CHECKSIG returns 1 sigop", () => {
+    const program = Buffer.alloc(32, 0xcd);
+    const witnessScript = Buffer.from([Opcode.OP_CHECKSIG]);
+    const witness = [Buffer.alloc(72), witnessScript];
+    expect(countWitnessProgramSigOps(0, program, witness)).toBe(1);
+  });
+
+  test("P2WSH with 2-of-3 multisig", () => {
+    const program = Buffer.alloc(32, 0xcd);
+    const pubkey = Buffer.alloc(33, 0x02);
+    const witnessScript = Buffer.concat([
+      Buffer.from([Opcode.OP_2]),
+      Buffer.from([33]), pubkey,
+      Buffer.from([33]), pubkey,
+      Buffer.from([33]), pubkey,
+      Buffer.from([Opcode.OP_3, Opcode.OP_CHECKMULTISIG]),
+    ]);
+    const witness = [Buffer.alloc(0), Buffer.alloc(72), Buffer.alloc(72), witnessScript];
+    // Accurate mode: OP_3 before CHECKMULTISIG = 3 sigops
+    expect(countWitnessProgramSigOps(0, program, witness)).toBe(3);
+  });
+
+  test("witness version 1 (taproot) returns 0 sigops", () => {
+    const program = Buffer.alloc(32, 0xef);
+    const witness = [Buffer.alloc(64)]; // schnorr sig
+    expect(countWitnessProgramSigOps(1, program, witness)).toBe(0);
+  });
+
+  test("empty witness returns 0 for P2WSH", () => {
+    const program = Buffer.alloc(32, 0xcd);
+    expect(countWitnessProgramSigOps(0, program, [])).toBe(0);
+  });
+});
+
+describe("getTransactionSigOpCost", () => {
+  test("legacy transaction sigops are scaled by 4", () => {
+    const tx = createRegularTx();
+    // Output with OP_CHECKSIG
+    tx.outputs[0].scriptPubKey = Buffer.from([Opcode.OP_CHECKSIG]);
+    const prevOutputs = [Buffer.from([Opcode.OP_TRUE])];
+
+    const cost = getTransactionSigOpCost(tx, prevOutputs, false, false);
+    expect(cost).toBe(1 * WITNESS_SCALE_FACTOR); // 4
+  });
+
+  test("coinbase sigops are scaled by 4", () => {
+    const coinbase = createCoinbaseTx(1);
+    coinbase.outputs[0].scriptPubKey = Buffer.concat([
+      Buffer.from([65]),
+      Buffer.alloc(65, 0x04),
+      Buffer.from([Opcode.OP_CHECKSIG]),
+    ]);
+
+    const cost = getTransactionSigOpCost(coinbase, [], true, true);
+    expect(cost).toBe(1 * WITNESS_SCALE_FACTOR); // 4
+  });
+
+  test("P2WPKH input has cost of 1", () => {
+    const tx = createRegularTx();
+    tx.inputs[0].scriptSig = Buffer.alloc(0);
+    tx.inputs[0].witness = [Buffer.alloc(72), Buffer.alloc(33)];
+
+    // P2WPKH prevOutput
+    const prevOutputs = [Buffer.concat([
+      Buffer.from([0x00, 20]),
+      Buffer.alloc(20, 0xab),
+    ])];
+
+    const cost = getTransactionSigOpCost(tx, prevOutputs, true, true);
+    // P2WPKH = 1 sigop (not scaled)
+    expect(cost).toBe(1);
+  });
+
+  test("P2WSH with CHECKSIG has cost of 1", () => {
+    const tx = createRegularTx();
+    tx.inputs[0].scriptSig = Buffer.alloc(0);
+    const witnessScript = Buffer.from([Opcode.OP_CHECKSIG]);
+    tx.inputs[0].witness = [Buffer.alloc(72), witnessScript];
+
+    // P2WSH prevOutput
+    const prevOutputs = [Buffer.concat([
+      Buffer.from([0x00, 32]),
+      Buffer.alloc(32, 0xcd),
+    ])];
+
+    const cost = getTransactionSigOpCost(tx, prevOutputs, true, true);
+    // P2WSH OP_CHECKSIG = 1 sigop (not scaled)
+    expect(cost).toBe(1);
+  });
+
+  test("P2SH-P2WPKH has cost of 1", () => {
+    const tx = createRegularTx();
+    // P2SH-P2WPKH: scriptSig contains the P2WPKH script
+    const p2wpkhScript = Buffer.concat([
+      Buffer.from([0x00, 20]),
+      Buffer.alloc(20, 0xab),
+    ]);
+    tx.inputs[0].scriptSig = Buffer.concat([
+      Buffer.from([p2wpkhScript.length]),
+      p2wpkhScript,
+    ]);
+    tx.inputs[0].witness = [Buffer.alloc(72), Buffer.alloc(33)];
+
+    // P2SH prevOutput
+    const prevOutputs = [Buffer.concat([
+      Buffer.from([Opcode.OP_HASH160, 20]),
+      Buffer.alloc(20, 0x00),
+      Buffer.from([Opcode.OP_EQUAL]),
+    ])];
+
+    const cost = getTransactionSigOpCost(tx, prevOutputs, true, true);
+    // P2SH-P2WPKH = 1 witness sigop (not scaled)
+    expect(cost).toBe(1);
+  });
+
+  test("P2SH with bare multisig redeem script", () => {
+    const tx = createRegularTx();
+    // Build a 2-of-3 multisig redeem script
+    const pubkey = Buffer.alloc(33, 0x02);
+    const redeemScript = Buffer.concat([
+      Buffer.from([Opcode.OP_2]),
+      Buffer.from([33]), pubkey,
+      Buffer.from([33]), pubkey,
+      Buffer.from([33]), pubkey,
+      Buffer.from([Opcode.OP_3, Opcode.OP_CHECKMULTISIG]),
+    ]);
+    // Push the redeem script in scriptSig (using OP_PUSHDATA1 for > 75 bytes)
+    const pushRedeemScript = Buffer.concat([
+      Buffer.from([Opcode.OP_PUSHDATA1, redeemScript.length]),
+      redeemScript,
+    ]);
+    tx.inputs[0].scriptSig = Buffer.concat([
+      Buffer.from([0x00]), // dummy for CHECKMULTISIG
+      Buffer.from([72]), Buffer.alloc(72), // sig1
+      Buffer.from([72]), Buffer.alloc(72), // sig2
+      pushRedeemScript,
+    ]);
+
+    // P2SH prevOutput
+    const prevOutputs = [Buffer.concat([
+      Buffer.from([Opcode.OP_HASH160, 20]),
+      Buffer.alloc(20, 0x00),
+      Buffer.from([Opcode.OP_EQUAL]),
+    ])];
+
+    const cost = getTransactionSigOpCost(tx, prevOutputs, true, false);
+    // P2SH with 3 pubkeys = 3 sigops * 4 = 12
+    expect(cost).toBe(3 * WITNESS_SCALE_FACTOR);
+  });
+});
+
+describe("validateBlockSigOps", () => {
+  test("block within limit passes", () => {
+    const block = createTestBlock();
+    const prevOutputsMap = new Map<number, Buffer[]>();
+    prevOutputsMap.set(0, []); // coinbase has no inputs
+
+    const result = validateBlockSigOps(block, prevOutputsMap, true, true);
+    expect(result.valid).toBe(true);
+  });
+
+  test("block exceeding limit fails", () => {
+    // Create a block that would exceed sigop limit
+    // Each OP_CHECKMULTISIG without OP_N = 20 sigops * 4 = 80 cost
+    // Need 1001 such operations to exceed 80000
+    const block = createTestBlock();
+    // Add many outputs with OP_CHECKMULTISIG
+    const output = { value: 0n, scriptPubKey: Buffer.from([Opcode.OP_CHECKMULTISIG]) };
+    // 1001 outputs * 20 sigops * 4 = 80080 > 80000
+    for (let i = 0; i < 1001; i++) {
+      block.transactions[0].outputs.push(output);
+    }
+
+    const prevOutputsMap = new Map<number, Buffer[]>();
+    prevOutputsMap.set(0, []);
+
+    const result = validateBlockSigOps(block, prevOutputsMap, true, true);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("exceeds maximum");
+    expect(result.cost).toBeGreaterThan(MAX_BLOCK_SIGOPS_COST);
+  });
+});
+
+describe("block_weight sigop integration", () => {
+  test("witness discount applies to sigop counting", () => {
+    // Create two transactions with same sigop pattern
+    // One legacy, one segwit - segwit should have lower cost
+
+    // Legacy P2PKH spend
+    const legacyTx = createRegularTx();
+    legacyTx.outputs[0].scriptPubKey = Buffer.concat([
+      Buffer.from([Opcode.OP_DUP, Opcode.OP_HASH160, 20]),
+      Buffer.alloc(20, 0x00),
+      Buffer.from([Opcode.OP_EQUALVERIFY, Opcode.OP_CHECKSIG]),
+    ]);
+    const legacyPrevOutputs = [Buffer.from([Opcode.OP_TRUE])];
+    const legacyCost = getTransactionSigOpCost(legacyTx, legacyPrevOutputs, true, true);
+    // 1 legacy sigop * 4 = 4
+    expect(legacyCost).toBe(4);
+
+    // SegWit P2WPKH spend
+    const segwitTx = createRegularTx();
+    segwitTx.inputs[0].scriptSig = Buffer.alloc(0);
+    segwitTx.inputs[0].witness = [Buffer.alloc(72), Buffer.alloc(33)];
+    segwitTx.outputs[0].scriptPubKey = Buffer.concat([
+      Buffer.from([0x00, 20]),
+      Buffer.alloc(20, 0x00),
+    ]);
+    const segwitPrevOutputs = [Buffer.concat([
+      Buffer.from([0x00, 20]),
+      Buffer.alloc(20, 0xab),
+    ])];
+    const segwitCost = getTransactionSigOpCost(segwitTx, segwitPrevOutputs, true, true);
+    // P2WPKH = 1 witness sigop (not scaled)
+    expect(segwitCost).toBe(1);
+
+    // Verify witness discount: same effective sigops, lower cost
+    expect(segwitCost).toBeLessThan(legacyCost);
   });
 });
