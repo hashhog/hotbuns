@@ -516,7 +516,12 @@ describe("e2e wallet integration", () => {
     expect(keys.length).toBeGreaterThan(0);
 
     for (const key of keys) {
-      expect(key.address).toMatch(/^bcrt1/);
+      // Now supports multiple address types:
+      // - bcrt1q... (native segwit P2WPKH)
+      // - bcrt1p... (taproot P2TR)
+      // - 2... (P2SH-P2WPKH)
+      // - m/n... (legacy P2PKH)
+      expect(key.address).toMatch(/^(bcrt1|2|m|n)/);
       expect(key.privateKey.length).toBe(32);
       expect(key.publicKey.length).toBe(33);
     }
