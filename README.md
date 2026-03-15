@@ -32,7 +32,7 @@ hotbuns is a from-scratch Bitcoin full node written in TypeScript (Bun) that doe
 - [x] Mempool (fee-rate ordering, eviction, dependency tracking, ancestor/descendant limits, full RBF, package relay, CPFP, v3/TRUC policy)
 - [x] Fee estimation (confirmation buckets, historical data)
 - [x] Block template (tx selection, locktime finality, coinbase, witness commitment)
-- [x] RPC server (JSON-RPC 2.0, batch requests, Bitcoin Core-compatible: getblockchaininfo, getblock, getblockheader, getblockhash, getrawtransaction, sendrawtransaction, submitpackage, getmempoolinfo, getrawmempool, getmempoolentry, estimatesmartfee, getpeerinfo, getnetworkinfo, validateaddress, getblocktemplate)
+- [x] RPC server (JSON-RPC 2.0, batch requests, Bitcoin Core-compatible: getblockchaininfo, getblock, getblockheader, getblockhash, getrawtransaction, sendrawtransaction, submitpackage, getmempoolinfo, getrawmempool, getmempoolentry, estimatesmartfee, getpeerinfo, getnetworkinfo, validateaddress, getblocktemplate, getdescriptorinfo, deriveaddresses)
 - [x] HD wallet (BIP-32/44/49/84/86, P2PKH/P2SH-P2WPKH/P2WPKH/P2TR, BnB+Knapsack coin selection, encrypted storage)
 - [x] PSBT (BIP-174/370, partial signing, multi-party workflows, base64 encoding)
 - [x] Coinbase maturity (100-block delay for coinbase UTXO spending)
@@ -40,6 +40,7 @@ hotbuns is a from-scratch Bitcoin full node written in TypeScript (Bun) that doe
 - [x] Address labels (setlabel RPC, labels in listreceivedbyaddress and listtransactions)
 - [x] Block pruning (automatic disk management, pruneblockchain RPC, MIN_BLOCKS_TO_KEEP)
 - [x] Block indexes (txindex, BIP157/158 blockfilterindex with GCS filters, coinstatsindex with MuHash)
+- [x] Output descriptors (BIP380-386, pk/pkh/wpkh/sh/wsh/tr/multi/sortedmulti/addr/raw/combo, xpub/xprv paths, range derivation, checksums)
 - [x] CLI (start/stop, RPC client, wallet commands, --prune flag, --txindex flag)
 - [x] Test suite (unit, integration, e2e with regtest)
 - [x] Performance benchmarks (block deser, UTXO cache, sig verify)
@@ -78,7 +79,7 @@ src/
   fees/             # fee estimation
   mining/           # block templates
   rpc/              # JSON-RPC server
-  wallet/           # HD wallet, transaction signing
+  wallet/           # HD wallet, transaction signing, output descriptors
   test/             # integration and e2e tests
 ```
 
