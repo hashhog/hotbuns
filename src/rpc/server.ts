@@ -40,7 +40,7 @@ import { hash256 } from "../crypto/primitives.js";
 import { BufferReader } from "../wire/serialization.js";
 import type { InvPayload, NetworkMessage } from "../p2p/messages.js";
 import { InvType } from "../p2p/messages.js";
-import type { Wallet } from "../wallet/wallet.js";
+import type { Wallet, WalletManager, CreateWalletOptions } from "../wallet/wallet.js";
 import {
   parseDescriptor,
   getDescriptorInfo,
@@ -108,6 +108,7 @@ export interface RPCServerDeps {
   params: ConsensusParams;
   pruneManager?: import("../storage/pruning.js").PruneManager;
   wallet?: Wallet;
+  walletManager?: WalletManager;
   chainstateManager?: ChainstateManager;
   zmqInterface?: import("./zmq.js").ZMQNotificationInterface;
 }
@@ -173,9 +174,12 @@ export class RPCServer {
   private params: ConsensusParams;
   private pruneManager?: import("../storage/pruning.js").PruneManager;
   private wallet?: Wallet;
+  private walletManager?: WalletManager;
   private chainstateManager?: ChainstateManager;
   private zmqInterface?: import("./zmq.js").ZMQNotificationInterface;
   private shutdownCallback: (() => void) | null = null;
+  /** Current wallet name for request context (set from URL path). */
+  private currentWalletName: string | null = null;
 
   constructor(config: RPCServerConfig, deps: RPCServerDeps) {
     this.config = {
@@ -193,6 +197,7 @@ export class RPCServer {
     this.params = deps.params;
     this.pruneManager = deps.pruneManager;
     this.wallet = deps.wallet;
+    this.walletManager = deps.walletManager;
     this.chainstateManager = deps.chainstateManager;
     this.zmqInterface = deps.zmqInterface;
     this.methods = new Map();
@@ -259,6 +264,18 @@ export class RPCServer {
           headers: { "Content-Type": "application/json" },
         }
       );
+    }
+
+    // Parse wallet name from URL path: /wallet/<name>
+    // Reference: Bitcoin Core wallet-specific RPC endpoints
+    const url = new URL(req.url);
+    const pathParts = url.pathname.split("/").filter((p) => p !== "");
+    if (pathParts.length >= 2 && pathParts[0] === "wallet") {
+      // URL has /wallet/<name> prefix - use that wallet
+      this.currentWalletName = decodeURIComponent(pathParts[1]);
+    } else {
+      // No wallet in URL - will use default if exactly one wallet loaded
+      this.currentWalletName = null;
     }
 
     // Authenticate
@@ -515,8 +532,17 @@ export class RPCServer {
     // Control methods
     this.registerMethod("stop", () => this.stopNode());
 
-    // Wallet methods (only if wallet is available)
-    if (this.wallet) {
+    // Multi-wallet management methods (always available if walletManager is present)
+    if (this.walletManager) {
+      this.registerMethod("createwallet", (params) => this.createWallet(params));
+      this.registerMethod("loadwallet", (params) => this.loadWallet(params));
+      this.registerMethod("unloadwallet", (params) => this.unloadWallet(params));
+      this.registerMethod("listwallets", () => this.listWallets());
+      this.registerMethod("listwalletdir", () => this.listWalletDir());
+    }
+
+    // Wallet methods (available if wallet or walletManager is present)
+    if (this.wallet || this.walletManager) {
       this.registerMethod("encryptwallet", (params) => this.encryptWallet(params));
       this.registerMethod("walletpassphrase", (params) => this.walletPassphrase(params));
       this.registerMethod("walletlock", () => this.walletLock());
@@ -3194,6 +3220,367 @@ export class RPCServer {
     return names;
   }
 
+  // ========== Multi-Wallet Methods ==========
+
+  /**
+   * Get the wallet for the current RPC request.
+   *
+   * If a wallet name was specified in the URL (/wallet/<name>), use that wallet.
+   * Otherwise, if exactly one wallet is loaded, use it as the default.
+   * If multiple wallets are loaded and no name specified, throw an error.
+   *
+   * Reference: Bitcoin Core's GetWalletForJSONRPCRequest in wallet/rpc/util.cpp
+   */
+  private getCurrentWallet(): Wallet {
+    // First check legacy single wallet
+    if (this.wallet && !this.walletManager) {
+      return this.wallet;
+    }
+
+    if (!this.walletManager) {
+      throw {
+        code: RPCErrorCodes.WALLET_NOT_FOUND,
+        message: "No wallet support configured",
+      };
+    }
+
+    // If wallet name specified in URL
+    if (this.currentWalletName !== null) {
+      const wallet = this.walletManager.getWallet(this.currentWalletName);
+      if (!wallet) {
+        throw {
+          code: RPCErrorCodes.WALLET_NOT_FOUND,
+          message: `Wallet "${this.currentWalletName}" not found`,
+        };
+      }
+      return wallet;
+    }
+
+    // No wallet in URL - try to use default
+    const walletCount = this.walletManager.getWalletCount();
+    if (walletCount === 0) {
+      throw {
+        code: RPCErrorCodes.WALLET_NOT_FOUND,
+        message: "No wallet loaded. Use loadwallet or createwallet to load one.",
+      };
+    }
+
+    if (walletCount > 1) {
+      throw {
+        code: RPCErrorCodes.WALLET_NOT_SPECIFIED,
+        message: `Multiple wallets are loaded. Use /wallet/<name> endpoint to specify which wallet to use. Loaded wallets: ${this.walletManager.listWallets().join(", ")}`,
+      };
+    }
+
+    // Exactly one wallet - use it as default
+    const defaultWallet = this.walletManager.getDefaultWallet();
+    if (!defaultWallet) {
+      throw {
+        code: RPCErrorCodes.WALLET_NOT_FOUND,
+        message: "No wallet loaded",
+      };
+    }
+
+    return defaultWallet;
+  }
+
+  /**
+   * Get the name of the current wallet for RPC response.
+   */
+  private getCurrentWalletName(): string {
+    if (this.currentWalletName !== null) {
+      return this.currentWalletName;
+    }
+    if (this.walletManager && this.walletManager.getWalletCount() === 1) {
+      return this.walletManager.listWallets()[0];
+    }
+    return "default";
+  }
+
+  /**
+   * createwallet: Create a new wallet.
+   *
+   * Reference: Bitcoin Core's createwallet in wallet/rpc/wallet.cpp
+   *
+   * @param params [wallet_name, disable_private_keys, blank, passphrase, avoid_reuse, descriptors, load_on_startup]
+   */
+  private async createWallet(params: unknown[]): Promise<Record<string, unknown>> {
+    if (!this.walletManager) {
+      throw {
+        code: RPCErrorCodes.WALLET_NOT_FOUND,
+        message: "Wallet manager not available",
+      };
+    }
+
+    const [
+      walletName,
+      disablePrivateKeys,
+      blank,
+      passphrase,
+      avoidReuse,
+      descriptors,
+      loadOnStartup,
+    ] = params;
+
+    if (typeof walletName !== "string") {
+      throw {
+        code: RPCErrorCodes.INVALID_PARAMS,
+        message: "wallet_name must be a string",
+      };
+    }
+
+    // Validate optional parameters
+    const options: CreateWalletOptions = {};
+    if (disablePrivateKeys !== undefined && disablePrivateKeys !== null) {
+      if (typeof disablePrivateKeys !== "boolean") {
+        throw {
+          code: RPCErrorCodes.INVALID_PARAMS,
+          message: "disable_private_keys must be a boolean",
+        };
+      }
+      options.disablePrivateKeys = disablePrivateKeys;
+    }
+    if (blank !== undefined && blank !== null) {
+      if (typeof blank !== "boolean") {
+        throw {
+          code: RPCErrorCodes.INVALID_PARAMS,
+          message: "blank must be a boolean",
+        };
+      }
+      options.blank = blank;
+    }
+    if (passphrase !== undefined && passphrase !== null) {
+      if (typeof passphrase !== "string") {
+        throw {
+          code: RPCErrorCodes.INVALID_PARAMS,
+          message: "passphrase must be a string",
+        };
+      }
+      options.passphrase = passphrase;
+    }
+    if (avoidReuse !== undefined && avoidReuse !== null) {
+      if (typeof avoidReuse !== "boolean") {
+        throw {
+          code: RPCErrorCodes.INVALID_PARAMS,
+          message: "avoid_reuse must be a boolean",
+        };
+      }
+      options.avoidReuse = avoidReuse;
+    }
+    if (descriptors !== undefined && descriptors !== null) {
+      if (typeof descriptors !== "boolean") {
+        throw {
+          code: RPCErrorCodes.INVALID_PARAMS,
+          message: "descriptors must be a boolean",
+        };
+      }
+      // We only support descriptor wallets
+      if (descriptors === false) {
+        throw {
+          code: RPCErrorCodes.WALLET_ERROR,
+          message: "Only descriptor wallets are supported (descriptors must be true or omitted)",
+        };
+      }
+      options.descriptors = descriptors;
+    }
+    if (loadOnStartup !== undefined && loadOnStartup !== null) {
+      if (typeof loadOnStartup !== "boolean") {
+        throw {
+          code: RPCErrorCodes.INVALID_PARAMS,
+          message: "load_on_startup must be a boolean",
+        };
+      }
+      options.loadOnStartup = loadOnStartup;
+    }
+
+    try {
+      const result = await this.walletManager.createWallet(walletName, options);
+      const response: Record<string, unknown> = {
+        name: result.name,
+      };
+      if (result.warnings.length > 0) {
+        response.warnings = result.warnings;
+      }
+      return response;
+    } catch (err) {
+      throw {
+        code: RPCErrorCodes.WALLET_ERROR,
+        message: err instanceof Error ? err.message : "Failed to create wallet",
+      };
+    }
+  }
+
+  /**
+   * loadwallet: Load a wallet from disk.
+   *
+   * Reference: Bitcoin Core's loadwallet in wallet/rpc/wallet.cpp
+   *
+   * @param params [filename, load_on_startup]
+   */
+  private async loadWallet(params: unknown[]): Promise<Record<string, unknown>> {
+    if (!this.walletManager) {
+      throw {
+        code: RPCErrorCodes.WALLET_NOT_FOUND,
+        message: "Wallet manager not available",
+      };
+    }
+
+    const [filename, loadOnStartup] = params;
+
+    if (typeof filename !== "string") {
+      throw {
+        code: RPCErrorCodes.INVALID_PARAMS,
+        message: "filename must be a string",
+      };
+    }
+
+    let loadOnStartupValue: boolean | undefined;
+    if (loadOnStartup !== undefined && loadOnStartup !== null) {
+      if (typeof loadOnStartup !== "boolean") {
+        throw {
+          code: RPCErrorCodes.INVALID_PARAMS,
+          message: "load_on_startup must be a boolean",
+        };
+      }
+      loadOnStartupValue = loadOnStartup;
+    }
+
+    try {
+      // For loadwallet, we need a password. Use a default or require it.
+      // In Bitcoin Core, wallets can be unencrypted. For simplicity, we use a default.
+      const result = await this.walletManager.loadWallet(
+        filename,
+        "hotbuns", // Default password for unencrypted wallets
+        loadOnStartupValue
+      );
+      const response: Record<string, unknown> = {
+        name: result.name,
+      };
+      if (result.warnings.length > 0) {
+        response.warnings = result.warnings;
+      }
+      return response;
+    } catch (err) {
+      throw {
+        code: RPCErrorCodes.WALLET_ERROR,
+        message: err instanceof Error ? err.message : "Failed to load wallet",
+      };
+    }
+  }
+
+  /**
+   * unloadwallet: Unload a wallet.
+   *
+   * Reference: Bitcoin Core's unloadwallet in wallet/rpc/wallet.cpp
+   *
+   * @param params [wallet_name, load_on_startup]
+   */
+  private async unloadWallet(params: unknown[]): Promise<Record<string, unknown>> {
+    if (!this.walletManager) {
+      throw {
+        code: RPCErrorCodes.WALLET_NOT_FOUND,
+        message: "Wallet manager not available",
+      };
+    }
+
+    const [walletNameParam, loadOnStartup] = params;
+
+    // Determine wallet name: from param or from URL
+    let walletName: string;
+    if (walletNameParam !== undefined && walletNameParam !== null) {
+      if (typeof walletNameParam !== "string") {
+        throw {
+          code: RPCErrorCodes.INVALID_PARAMS,
+          message: "wallet_name must be a string",
+        };
+      }
+      walletName = walletNameParam;
+    } else if (this.currentWalletName !== null) {
+      walletName = this.currentWalletName;
+    } else if (this.walletManager.getWalletCount() === 1) {
+      walletName = this.walletManager.listWallets()[0];
+    } else {
+      throw {
+        code: RPCErrorCodes.WALLET_NOT_SPECIFIED,
+        message: "Wallet name must be specified when multiple wallets are loaded",
+      };
+    }
+
+    // If both URL and param specify wallet, they must match
+    if (this.currentWalletName !== null && walletNameParam !== undefined && walletNameParam !== null) {
+      if (this.currentWalletName !== walletNameParam) {
+        throw {
+          code: RPCErrorCodes.INVALID_PARAMS,
+          message: `Wallet name from URL (${this.currentWalletName}) does not match parameter (${walletNameParam})`,
+        };
+      }
+    }
+
+    let loadOnStartupValue: boolean | undefined;
+    if (loadOnStartup !== undefined && loadOnStartup !== null) {
+      if (typeof loadOnStartup !== "boolean") {
+        throw {
+          code: RPCErrorCodes.INVALID_PARAMS,
+          message: "load_on_startup must be a boolean",
+        };
+      }
+      loadOnStartupValue = loadOnStartup;
+    }
+
+    try {
+      const result = await this.walletManager.unloadWallet(walletName, loadOnStartupValue);
+      const response: Record<string, unknown> = {};
+      if (result.warnings.length > 0) {
+        response.warnings = result.warnings;
+      }
+      return response;
+    } catch (err) {
+      throw {
+        code: RPCErrorCodes.WALLET_ERROR,
+        message: err instanceof Error ? err.message : "Failed to unload wallet",
+      };
+    }
+  }
+
+  /**
+   * listwallets: List currently loaded wallets.
+   *
+   * Reference: Bitcoin Core's listwallets in wallet/rpc/wallet.cpp
+   */
+  private async listWallets(): Promise<string[]> {
+    if (!this.walletManager) {
+      // Fallback for legacy single wallet
+      if (this.wallet) {
+        return ["default"];
+      }
+      throw {
+        code: RPCErrorCodes.WALLET_NOT_FOUND,
+        message: "Wallet manager not available",
+      };
+    }
+
+    return this.walletManager.listWallets();
+  }
+
+  /**
+   * listwalletdir: List available wallet directories.
+   *
+   * Reference: Bitcoin Core's listwalletdir in wallet/rpc/wallet.cpp
+   */
+  private async listWalletDir(): Promise<Record<string, unknown>> {
+    if (!this.walletManager) {
+      throw {
+        code: RPCErrorCodes.WALLET_NOT_FOUND,
+        message: "Wallet manager not available",
+      };
+    }
+
+    const entries = await this.walletManager.listWalletDir();
+    return {
+      wallets: entries.map((e) => ({ name: e.name })),
+    };
+  }
+
   // ========== Wallet Methods ==========
 
   /**
@@ -3203,9 +3590,7 @@ export class RPCServer {
    * @param params [passphrase]
    */
   private async encryptWallet(params: unknown[]): Promise<string> {
-    if (!this.wallet) {
-      throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message: "Wallet not loaded" };
-    }
+    const wallet = this.getCurrentWallet();
 
     const [passphrase] = params;
     if (typeof passphrase !== "string" || passphrase.length === 0) {
@@ -3215,7 +3600,7 @@ export class RPCServer {
       };
     }
 
-    if (this.wallet.isEncrypted()) {
+    if (wallet.isEncrypted()) {
       throw {
         code: RPCErrorCodes.WALLET_WRONG_ENC_STATE,
         message: "Wallet is already encrypted. Use walletpassphrasechange to change the passphrase.",
@@ -3223,7 +3608,7 @@ export class RPCServer {
     }
 
     try {
-      await this.wallet.encryptWallet(passphrase);
+      await wallet.encryptWallet(passphrase);
       return "Wallet encrypted. The wallet is now locked. You need to call walletpassphrase before signing transactions.";
     } catch (err) {
       throw {
@@ -3239,9 +3624,7 @@ export class RPCServer {
    * @param params [passphrase, timeout]
    */
   private async walletPassphrase(params: unknown[]): Promise<null> {
-    if (!this.wallet) {
-      throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message: "Wallet not loaded" };
-    }
+    const wallet = this.getCurrentWallet();
 
     const [passphrase, timeout] = params;
     if (typeof passphrase !== "string" || passphrase.length === 0) {
@@ -3257,7 +3640,7 @@ export class RPCServer {
       };
     }
 
-    if (!this.wallet.isEncrypted()) {
+    if (!wallet.isEncrypted()) {
       throw {
         code: RPCErrorCodes.WALLET_WRONG_ENC_STATE,
         message: "Wallet is not encrypted",
@@ -3265,7 +3648,7 @@ export class RPCServer {
     }
 
     try {
-      await this.wallet.unlockWallet(passphrase, timeout);
+      await wallet.unlockWallet(passphrase, timeout);
       return null;
     } catch (err) {
       throw {
@@ -3279,18 +3662,16 @@ export class RPCServer {
    * walletlock: Lock the wallet.
    */
   private async walletLock(): Promise<null> {
-    if (!this.wallet) {
-      throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message: "Wallet not loaded" };
-    }
+    const wallet = this.getCurrentWallet();
 
-    if (!this.wallet.isEncrypted()) {
+    if (!wallet.isEncrypted()) {
       throw {
         code: RPCErrorCodes.WALLET_WRONG_ENC_STATE,
         message: "Wallet is not encrypted",
       };
     }
 
-    this.wallet.lockWallet();
+    wallet.lockWallet();
     return null;
   }
 
@@ -3300,9 +3681,7 @@ export class RPCServer {
    * @param params [oldpassphrase, newpassphrase]
    */
   private async walletPassphraseChange(params: unknown[]): Promise<null> {
-    if (!this.wallet) {
-      throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message: "Wallet not loaded" };
-    }
+    const wallet = this.getCurrentWallet();
 
     const [oldPassphrase, newPassphrase] = params;
     if (typeof oldPassphrase !== "string" || oldPassphrase.length === 0) {
@@ -3318,7 +3697,7 @@ export class RPCServer {
       };
     }
 
-    if (!this.wallet.isEncrypted()) {
+    if (!wallet.isEncrypted()) {
       throw {
         code: RPCErrorCodes.WALLET_WRONG_ENC_STATE,
         message: "Wallet is not encrypted",
@@ -3326,7 +3705,7 @@ export class RPCServer {
     }
 
     try {
-      await this.wallet.changePassphrase(oldPassphrase, newPassphrase);
+      await wallet.changePassphrase(oldPassphrase, newPassphrase);
       return null;
     } catch (err) {
       throw {
@@ -3342,9 +3721,7 @@ export class RPCServer {
    * @param params [address, label]
    */
   private async setLabel(params: unknown[]): Promise<null> {
-    if (!this.wallet) {
-      throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message: "Wallet not loaded" };
-    }
+    const wallet = this.getCurrentWallet();
 
     const [address, label] = params;
     if (typeof address !== "string" || address.length === 0) {
@@ -3361,7 +3738,7 @@ export class RPCServer {
     }
 
     try {
-      this.wallet.setLabel(address, label);
+      wallet.setLabel(address, label);
       return null;
     } catch (err) {
       throw {
@@ -3377,15 +3754,13 @@ export class RPCServer {
    * @param params [minconf, include_empty, include_watchonly, address_filter]
    */
   private async listReceivedByAddress(params: unknown[]): Promise<unknown[]> {
-    if (!this.wallet) {
-      throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message: "Wallet not loaded" };
-    }
+    const wallet = this.getCurrentWallet();
 
     const [minconfParam, includeEmptyParam] = params;
     const minconf = typeof minconfParam === "number" ? minconfParam : 1;
     const includeEmpty = includeEmptyParam === true;
 
-    const received = this.wallet.listReceivedByAddress();
+    const received = wallet.listReceivedByAddress();
 
     return received
       .filter((entry) => {
@@ -3410,16 +3785,14 @@ export class RPCServer {
    * @param params [label, count, skip, include_watchonly]
    */
   private async listTransactions(params: unknown[]): Promise<unknown[]> {
-    if (!this.wallet) {
-      throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message: "Wallet not loaded" };
-    }
+    const wallet = this.getCurrentWallet();
 
     const [labelParam, countParam, skipParam] = params;
     const labelFilter = typeof labelParam === "string" ? labelParam : "*";
     const count = typeof countParam === "number" ? Math.min(countParam, 1000) : 10;
     const skip = typeof skipParam === "number" ? skipParam : 0;
 
-    const utxos = this.wallet.getUTXOs();
+    const utxos = wallet.getUTXOs();
     const transactions: Array<{
       address: string;
       category: string;
@@ -3429,7 +3802,7 @@ export class RPCServer {
     }> = [];
 
     for (const utxo of utxos) {
-      const label = this.wallet.getLabel(utxo.address);
+      const label = wallet.getLabel(utxo.address);
 
       // Filter by label if specified
       if (labelFilter !== "*" && label !== labelFilter) {
@@ -3456,30 +3829,28 @@ export class RPCServer {
    * getwalletinfo: Returns wallet state information.
    */
   private async getWalletInfo(): Promise<Record<string, unknown>> {
-    if (!this.wallet) {
-      throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message: "Wallet not loaded" };
-    }
+    const wallet = this.getCurrentWallet();
 
-    const balance = this.wallet.getBalance();
-    const utxos = this.wallet.getUTXOs();
+    const balance = wallet.getBalance();
+    const utxos = wallet.getUTXOs();
 
     return {
-      walletname: "default",
+      walletname: this.getCurrentWalletName(),
       walletversion: 1,
       balance: Number(balance.confirmed) / 100_000_000,
       unconfirmed_balance: Number(balance.unconfirmed) / 100_000_000,
       immature_balance: 0, // Would need to track immature coinbase separately
       txcount: utxos.length,
       keypoolsize: 20, // Address gap
-      unlocked_until: this.wallet.isLocked() ? 0 : undefined,
+      unlocked_until: wallet.isLocked() ? 0 : undefined,
       paytxfee: 0,
       hdseedid: undefined,
       private_keys_enabled: true,
       avoid_reuse: false,
       scanning: false,
-      descriptors: false,
-      encrypted: this.wallet.isEncrypted(),
-      locked: this.wallet.isLocked(),
+      descriptors: true,
+      encrypted: wallet.isEncrypted(),
+      locked: wallet.isLocked(),
     };
   }
 
