@@ -681,7 +681,7 @@ describe("PeerManager service flags", () => {
     expect(BanScores.INVALID_MESSAGE).toBe(20);
     expect(BanScores.INVALID_BLOCK).toBe(100);
     expect(BanScores.SLOW_RESPONSE).toBe(2);
-    expect(BanScores.PROTOCOL_VIOLATION).toBe(50);
+    expect(BanScores.PROTOCOL_VIOLATION).toBe(10);
     expect(BanScores.UNREQUESTED_DATA).toBe(10);
   });
 });
