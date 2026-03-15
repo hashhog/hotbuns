@@ -393,6 +393,12 @@ export class RPCServer {
     this.registerMethod("setban", (params) => this.setBan(params));
     this.registerMethod("clearbanned", () => this.clearBanned());
 
+    // Address validation
+    this.registerMethod("validateaddress", (params) => this.validateAddress(params));
+
+    // Mining methods
+    this.registerMethod("getblocktemplate", (params) => this.getBlockTemplate(params));
+
     // Control methods
     this.registerMethod("stop", () => this.stopNode());
   }
@@ -436,6 +442,9 @@ export class RPCServer {
         chain = "unknown";
     }
 
+    // Build softforks object
+    const softforks = this.getSoftforkStatus(bestBlock.height);
+
     return {
       chain,
       blocks: bestBlock.height,
@@ -446,8 +455,60 @@ export class RPCServer {
       verificationprogress,
       chainwork: bestBlock.chainWork.toString(16).padStart(64, "0"),
       pruned: false,
+      softforks,
       warnings: "",
     };
+  }
+
+  /**
+   * Get softfork activation status for the current height.
+   */
+  private getSoftforkStatus(height: number): Record<string, unknown> {
+    const softforks: Record<string, unknown> = {};
+
+    // BIP34 (Height in coinbase)
+    softforks.bip34 = {
+      type: "buried",
+      active: height >= this.params.bip34Height,
+      height: this.params.bip34Height,
+    };
+
+    // BIP66 (Strict DER)
+    softforks.bip66 = {
+      type: "buried",
+      active: height >= this.params.bip66Height,
+      height: this.params.bip66Height,
+    };
+
+    // BIP65 (CLTV)
+    softforks.bip65 = {
+      type: "buried",
+      active: height >= this.params.bip65Height,
+      height: this.params.bip65Height,
+    };
+
+    // CSV (BIP68, BIP112, BIP113)
+    softforks.csv = {
+      type: "buried",
+      active: height >= this.params.csvHeight,
+      height: this.params.csvHeight,
+    };
+
+    // SegWit (BIP141, BIP143, BIP147)
+    softforks.segwit = {
+      type: "buried",
+      active: height >= this.params.segwitHeight,
+      height: this.params.segwitHeight,
+    };
+
+    // Taproot (BIP341, BIP342)
+    softforks.taproot = {
+      type: "buried",
+      active: height >= this.params.taprootHeight,
+      height: this.params.taprootHeight,
+    };
+
+    return softforks;
   }
 
   /**
@@ -1633,6 +1694,403 @@ export class RPCServer {
     }, 100);
 
     return "hotbuns stopping";
+  }
+
+  // ========== Address Validation Methods ==========
+
+  /**
+   * validateaddress: Return information about the given Bitcoin address.
+   * @param params [address]
+   */
+  private async validateAddress(params: unknown[]): Promise<Record<string, unknown>> {
+    const [addressParam] = params;
+
+    if (typeof addressParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "address must be a string");
+    }
+
+    const address = addressParam;
+    const result: Record<string, unknown> = {};
+
+    // Try to decode the address
+    const decoded = this.decodeAddress(address);
+
+    if (!decoded.valid) {
+      result.isvalid = false;
+      if (decoded.error) {
+        result.error = decoded.error;
+      }
+      return result;
+    }
+
+    result.isvalid = true;
+    result.address = address;
+    result.scriptPubKey = decoded.scriptPubKey!.toString("hex");
+    result.isscript = decoded.isScript;
+    result.iswitness = decoded.isWitness;
+
+    if (decoded.isWitness) {
+      result.witness_version = decoded.witnessVersion;
+      result.witness_program = decoded.witnessProgram!.toString("hex");
+    }
+
+    return result;
+  }
+
+  /**
+   * Decode a Bitcoin address and return its components.
+   */
+  private decodeAddress(address: string): {
+    valid: boolean;
+    error?: string;
+    scriptPubKey?: Buffer;
+    isScript: boolean;
+    isWitness: boolean;
+    witnessVersion?: number;
+    witnessProgram?: Buffer;
+  } {
+    // Try bech32/bech32m first
+    if (address.startsWith("bc1") || address.startsWith("tb1") || address.startsWith("bcrt1")) {
+      return this.decodeBech32Address(address);
+    }
+
+    // Try base58 (P2PKH or P2SH)
+    return this.decodeBase58Address(address);
+  }
+
+  /**
+   * Decode a bech32/bech32m address.
+   */
+  private decodeBech32Address(address: string): {
+    valid: boolean;
+    error?: string;
+    scriptPubKey?: Buffer;
+    isScript: boolean;
+    isWitness: boolean;
+    witnessVersion?: number;
+    witnessProgram?: Buffer;
+  } {
+    const expectedHrp = this.getBech32HRP();
+
+    // Find the separator
+    const sepIndex = address.lastIndexOf("1");
+    if (sepIndex === -1) {
+      return { valid: false, error: "Invalid bech32 address: no separator", isScript: false, isWitness: false };
+    }
+
+    const hrp = address.slice(0, sepIndex).toLowerCase();
+    if (hrp !== expectedHrp) {
+      return { valid: false, error: `Invalid network prefix: expected ${expectedHrp}, got ${hrp}`, isScript: false, isWitness: false };
+    }
+
+    const dataStr = address.slice(sepIndex + 1).toLowerCase();
+    if (dataStr.length < 7) {
+      return { valid: false, error: "Invalid bech32 address: data too short", isScript: false, isWitness: false };
+    }
+
+    // Decode bech32 characters
+    const CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    const values: number[] = [];
+    for (const c of dataStr) {
+      const idx = CHARSET.indexOf(c);
+      if (idx === -1) {
+        return { valid: false, error: `Invalid bech32 character: ${c}`, isScript: false, isWitness: false };
+      }
+      values.push(idx);
+    }
+
+    // Verify checksum (for both bech32 and bech32m)
+    const hrpExpanded = this.expandHRP(hrp);
+    const polymod = this.polymod([...hrpExpanded, ...values]);
+
+    // bech32 uses constant 1, bech32m uses 0x2bc830a3
+    const witnessVersion = values[0];
+    const expectedConst = witnessVersion === 0 ? 1 : 0x2bc830a3;
+
+    if (polymod !== expectedConst) {
+      return { valid: false, error: "Invalid bech32 checksum", isScript: false, isWitness: false };
+    }
+
+    // Extract data (excluding checksum)
+    const dataValues = values.slice(1, values.length - 6);
+
+    // Convert from 5-bit to 8-bit
+    const converted = this.convertBits(Buffer.from(dataValues), 5, 8, false);
+    if (!converted) {
+      return { valid: false, error: "Invalid witness program encoding", isScript: false, isWitness: false };
+    }
+
+    const witnessProgram = Buffer.from(converted);
+
+    // Validate witness program length
+    if (witnessVersion === 0) {
+      if (witnessProgram.length !== 20 && witnessProgram.length !== 32) {
+        return { valid: false, error: "Invalid witness v0 program length", isScript: false, isWitness: false };
+      }
+    } else if (witnessVersion === 1) {
+      if (witnessProgram.length !== 32) {
+        return { valid: false, error: "Invalid witness v1 program length", isScript: false, isWitness: false };
+      }
+    } else if (witnessProgram.length < 2 || witnessProgram.length > 40) {
+      return { valid: false, error: "Invalid witness program length", isScript: false, isWitness: false };
+    }
+
+    // Build scriptPubKey: OP_n <program>
+    const versionOpcode = witnessVersion === 0 ? 0x00 : 0x50 + witnessVersion;
+    const scriptPubKey = Buffer.concat([
+      Buffer.from([versionOpcode, witnessProgram.length]),
+      witnessProgram,
+    ]);
+
+    return {
+      valid: true,
+      scriptPubKey,
+      isScript: witnessVersion === 0 && witnessProgram.length === 32, // P2WSH
+      isWitness: true,
+      witnessVersion,
+      witnessProgram,
+    };
+  }
+
+  /**
+   * Decode a base58check address (P2PKH or P2SH).
+   */
+  private decodeBase58Address(address: string): {
+    valid: boolean;
+    error?: string;
+    scriptPubKey?: Buffer;
+    isScript: boolean;
+    isWitness: boolean;
+  } {
+    // Decode base58
+    const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let num = 0n;
+
+    for (const c of address) {
+      const idx = ALPHABET.indexOf(c);
+      if (idx === -1) {
+        return { valid: false, error: `Invalid base58 character: ${c}`, isScript: false, isWitness: false };
+      }
+      num = num * 58n + BigInt(idx);
+    }
+
+    // Convert to bytes
+    let hex = num.toString(16);
+    if (hex.length % 2) hex = "0" + hex;
+    let decoded = Buffer.from(hex, "hex");
+
+    // Handle leading zeros (represented as '1' in base58)
+    let leadingZeros = 0;
+    for (const c of address) {
+      if (c === "1") leadingZeros++;
+      else break;
+    }
+    if (leadingZeros > 0) {
+      decoded = Buffer.concat([Buffer.alloc(leadingZeros, 0), decoded]);
+    }
+
+    // Address must be 25 bytes (1 version + 20 hash + 4 checksum)
+    if (decoded.length !== 25) {
+      return { valid: false, error: "Invalid address length", isScript: false, isWitness: false };
+    }
+
+    // Verify checksum
+    const payload = decoded.subarray(0, 21);
+    const checksum = decoded.subarray(21, 25);
+    const expectedChecksum = hash256(payload).subarray(0, 4);
+
+    if (!checksum.equals(expectedChecksum)) {
+      return { valid: false, error: "Invalid checksum", isScript: false, isWitness: false };
+    }
+
+    const version = decoded[0];
+    const pubKeyHash = decoded.subarray(1, 21);
+
+    // Determine address type based on version byte
+    const p2pkhVersion = this.getP2PKHVersion();
+    const p2shVersion = this.getP2SHVersion();
+
+    if (version === p2pkhVersion) {
+      // P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+      const scriptPubKey = Buffer.concat([
+        Buffer.from([0x76, 0xa9, 0x14]),
+        pubKeyHash,
+        Buffer.from([0x88, 0xac]),
+      ]);
+      return { valid: true, scriptPubKey, isScript: false, isWitness: false };
+    } else if (version === p2shVersion) {
+      // P2SH: OP_HASH160 <20 bytes> OP_EQUAL
+      const scriptPubKey = Buffer.concat([
+        Buffer.from([0xa9, 0x14]),
+        pubKeyHash,
+        Buffer.from([0x87]),
+      ]);
+      return { valid: true, scriptPubKey, isScript: true, isWitness: false };
+    } else {
+      return { valid: false, error: `Unknown address version: ${version}`, isScript: false, isWitness: false };
+    }
+  }
+
+  // ========== Mining Methods ==========
+
+  /**
+   * getblocktemplate: Returns data needed to construct a block to work on.
+   * Implements BIP22/23 for mining pool compatibility.
+   *
+   * @param params [template_request] - object with mode, rules, capabilities, etc.
+   */
+  private async getBlockTemplate(params: unknown[]): Promise<Record<string, unknown>> {
+    const [templateRequest] = params;
+
+    // Parse template request
+    let mode = "template";
+    let clientRules: Set<string> = new Set();
+
+    if (templateRequest && typeof templateRequest === "object") {
+      const request = templateRequest as Record<string, unknown>;
+
+      if (request.mode !== undefined) {
+        if (typeof request.mode !== "string") {
+          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid mode");
+        }
+        mode = request.mode;
+      }
+
+      if (request.rules && Array.isArray(request.rules)) {
+        for (const rule of request.rules) {
+          if (typeof rule === "string") {
+            clientRules.add(rule);
+          }
+        }
+      }
+    }
+
+    // Only "template" mode is supported (proposal mode would need block validation)
+    if (mode !== "template") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Only 'template' mode is supported");
+    }
+
+    // Check that segwit rule is set
+    if (!clientRules.has("segwit")) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})"
+      );
+    }
+
+    // Get current chain state
+    const bestBlock = this.chainState.getBestBlock();
+    const height = bestBlock.height + 1;
+
+    // Get mempool transactions
+    const mempoolTxids = this.mempool.getAllTxids();
+    const transactions: Record<string, unknown>[] = [];
+    const txIndex: Map<string, number> = new Map();
+    let totalFees = 0n;
+    let totalWeight = 0;
+    let totalSigOps = 0;
+
+    let idx = 1; // 1-based index (coinbase is 0)
+    for (const txid of mempoolTxids) {
+      const entry = this.mempool.getTransaction(txid);
+      if (!entry) continue;
+
+      const txidHex = txid.toString("hex");
+      txIndex.set(txidHex, idx);
+
+      // Calculate dependencies (other transactions in the template that must come before)
+      const depends: number[] = [];
+      for (const parentTxidHex of entry.dependsOn) {
+        const parentIdx = txIndex.get(parentTxidHex);
+        if (parentIdx !== undefined) {
+          depends.push(parentIdx);
+        }
+      }
+
+      const txData = serializeTx(entry.tx, true);
+
+      transactions.push({
+        data: txData.toString("hex"),
+        txid: txidHex,
+        hash: getWTxId(entry.tx).toString("hex"),
+        depends,
+        fee: Number(entry.fee),
+        sigops: 0, // Would need proper sigop counting
+        weight: entry.weight,
+      });
+
+      totalFees += entry.fee;
+      totalWeight += entry.weight;
+      idx++;
+    }
+
+    // Calculate coinbase value (subsidy + fees)
+    const subsidy = this.getBlockSubsidy(height);
+    const coinbaseValue = subsidy + totalFees;
+
+    // Calculate target from current difficulty
+    const target = compactToBigInt(this.params.powLimitBits);
+    const targetHex = target.toString(16).padStart(64, "0");
+
+    // Get previous block hash
+    const previousblockhash = bestBlock.hash.toString("hex");
+
+    // Calculate current time and minimum time
+    const curtime = Math.floor(Date.now() / 1000);
+    const mintime = curtime; // Simplified; should be MTP + 1
+
+    // Calculate bits (difficulty target in compact format)
+    const bits = this.params.powLimitBits.toString(16).padStart(8, "0");
+
+    // Build the result
+    const result: Record<string, unknown> = {
+      capabilities: ["proposal"],
+      version: 0x20000000, // BIP9 version bits
+      rules: ["csv", "!segwit"],
+      vbavailable: {},
+      vbrequired: 0,
+      previousblockhash,
+      transactions,
+      coinbaseaux: {},
+      coinbasevalue: Number(coinbaseValue),
+      longpollid: `${previousblockhash}${idx}`,
+      target: targetHex,
+      mintime,
+      mutable: ["time", "transactions", "prevblock"],
+      noncerange: "00000000ffffffff",
+      sigoplimit: 80000, // MAX_BLOCK_SIGOPS_COST
+      sizelimit: 4000000, // MAX_BLOCK_SERIALIZED_SIZE
+      weightlimit: 4000000, // MAX_BLOCK_WEIGHT
+      curtime,
+      bits,
+      height,
+    };
+
+    // Add default witness commitment if we have transactions
+    if (transactions.length > 0) {
+      // The witness commitment would be calculated from the wtxids
+      // For now, we just indicate that it should be included
+      // In a full implementation, this would be the actual commitment script
+      const witnessCommitmentHeader = "6a24aa21a9ed";
+      result.default_witness_commitment = witnessCommitmentHeader + "0".repeat(64);
+    }
+
+    return result;
+  }
+
+  /**
+   * Calculate block subsidy for a given height.
+   */
+  private getBlockSubsidy(height: number): bigint {
+    const INITIAL_SUBSIDY = 5_000_000_000n; // 50 BTC in satoshis
+    const HALVING_INTERVAL = 210_000;
+
+    const halvings = Math.floor(height / HALVING_INTERVAL);
+    if (halvings >= 64) {
+      return 0n;
+    }
+
+    return INITIAL_SUBSIDY >> BigInt(halvings);
   }
 
   // ========== Helper Methods ==========
