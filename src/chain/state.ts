@@ -40,6 +40,116 @@ export interface TxInputValidation {
 }
 
 /**
+ * Result of checkpoint verification.
+ */
+export interface CheckpointResult {
+  valid: boolean;
+  error?: string;
+}
+
+/**
+ * Get the highest checkpoint height from consensus params.
+ *
+ * @param params - Network consensus parameters
+ * @returns The highest checkpoint height, or -1 if no checkpoints
+ */
+export function getLastCheckpointHeight(params: ConsensusParams): number {
+  let maxHeight = -1;
+  for (const height of params.checkpoints.keys()) {
+    if (height > maxHeight) {
+      maxHeight = height;
+    }
+  }
+  return maxHeight;
+}
+
+/**
+ * Verify that a block at a checkpoint height matches the expected hash.
+ *
+ * @param hash - Block hash to verify
+ * @param height - Block height
+ * @param params - Network consensus parameters
+ * @returns Checkpoint verification result
+ */
+export function verifyCheckpoint(
+  hash: Buffer,
+  height: number,
+  params: ConsensusParams
+): CheckpointResult {
+  const checkpoint = params.checkpoints.get(height);
+
+  // If there's no checkpoint at this height, it passes
+  if (!checkpoint) {
+    return { valid: true };
+  }
+
+  // Verify hash matches exactly
+  if (hash.equals(checkpoint)) {
+    return { valid: true };
+  }
+
+  return {
+    valid: false,
+    error: `Checkpoint mismatch at height ${height}: expected ${checkpoint.toString("hex")}, got ${hash.toString("hex")}`,
+  };
+}
+
+/**
+ * Check if a header would create a fork below the last checkpoint.
+ *
+ * During IBD, we reject any chain that forks from our chain at or before
+ * the last checkpoint. This prevents long-range attacks where an attacker
+ * creates an alternative history.
+ *
+ * @param headerHeight - Height of the header being validated
+ * @param headerHash - Hash of the header being validated
+ * @param parentHash - Hash of the parent block
+ * @param params - Network consensus parameters
+ * @param getAncestorHash - Function to get an ancestor hash at a given height
+ * @returns CheckpointResult indicating if the header is valid
+ */
+export function checkForkBelowCheckpoint(
+  headerHeight: number,
+  headerHash: Buffer,
+  parentHash: Buffer,
+  params: ConsensusParams,
+  getAncestorHash: (height: number) => Buffer | undefined
+): CheckpointResult {
+  const lastCheckpointHeight = getLastCheckpointHeight(params);
+
+  // No checkpoints = no fork restrictions
+  if (lastCheckpointHeight < 0) {
+    return { valid: true };
+  }
+
+  // If this header is at or above the last checkpoint, we need to verify
+  // that our chain ancestry matches all checkpoints
+  if (headerHeight > lastCheckpointHeight) {
+    // Verify all checkpoints are in our ancestry
+    for (const [cpHeight, cpHash] of params.checkpoints) {
+      const ancestorHash = getAncestorHash(cpHeight);
+      if (ancestorHash && !ancestorHash.equals(cpHash)) {
+        return {
+          valid: false,
+          error: `Fork detected below checkpoint at height ${cpHeight}: expected ${cpHash.toString("hex")}, got ${ancestorHash.toString("hex")}`,
+        };
+      }
+    }
+  }
+
+  // If the header is at a checkpoint height, verify it matches
+  const checkpointAtHeight = params.checkpoints.get(headerHeight);
+  if (checkpointAtHeight && !headerHash.equals(checkpointAtHeight)) {
+    return {
+      valid: false,
+      error: `Block at checkpoint height ${headerHeight} does not match: expected ${checkpointAtHeight.toString("hex")}, got ${headerHash.toString("hex")}`,
+    };
+  }
+
+  return { valid: true };
+}
+
+/**
  * Chain state manager.
  *
  * Responsible for:
@@ -88,6 +198,13 @@ export class ChainStateManager {
    */
   async connectBlock(block: Block, height: number): Promise<void> {
     const blockHash = getBlockHash(block.header);
+
+    // Verify checkpoint if this height has one
+    const checkpointResult = verifyCheckpoint(blockHash, height, this.params);
+    if (!checkpointResult.valid) {
+      throw new Error(checkpointResult.error);
+    }
+
     const spentOutputs: SpentUTXO[] = [];
     let totalInputValue = 0n;
     let totalOutputValue = 0n;
@@ -628,5 +745,44 @@ export class ChainStateManager {
       utxoCacheSize: this.utxo.getCacheSize(),
       pendingOps: this.utxo.getPendingCount(),
     };
+  }
+
+  /**
+   * Get the last (highest) checkpoint height for this network.
+   */
+  getLastCheckpointHeight(): number {
+    return getLastCheckpointHeight(this.params);
+  }
+
+  /**
+   * Check if we are past all checkpoints.
+   * When true, we have validated all checkpoint blocks.
+   */
+  isPastLastCheckpoint(): boolean {
+    const lastCp = this.getLastCheckpointHeight();
+    return lastCp < 0 || this.bestBlock.height >= lastCp;
+  }
+
+  /**
+   * Check if a given height is at or below the last checkpoint.
+   * Used to reject forks that attempt to rewrite protected history.
+   */
+  isProtectedByCheckpoint(height: number): boolean {
+    const lastCp = this.getLastCheckpointHeight();
+    return lastCp >= 0 && height <= lastCp;
+  }
+
+  /**
+   * Verify checkpoint for a block at a given height.
+   */
+  verifyBlockCheckpoint(hash: Buffer, height: number): CheckpointResult {
+    return verifyCheckpoint(hash, height, this.params);
+  }
+
+  /**
+   * Get the consensus parameters.
+   */
+  getParams(): ConsensusParams {
+    return this.params;
   }
 }
