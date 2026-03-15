@@ -197,6 +197,7 @@ export interface ScriptFlags {
   verifyCheckLockTimeVerify: boolean; // BIP 65 - consensus
   verifyCheckSequenceVerify: boolean; // BIP 112 - consensus
   verifyWitnessPubkeyType: boolean; // BIP 141 - consensus (activated with SegWit)
+  verifyMinimalIf?: boolean; // BIP 141 - policy for witness v0, consensus for tapscript
 }
 
 /**
@@ -334,6 +335,24 @@ function castToBool(buf: Buffer): boolean {
     }
   }
   return false;
+}
+
+/**
+ * Check if a stack element passes MINIMALIF requirements.
+ * For witness v0: value must be empty (false) or exactly [0x01] (true).
+ * For tapscript: same rule but enforced as consensus.
+ *
+ * Any other value like [0x02], [0x00], [0x01, 0x00] etc. is rejected.
+ * Reference: Bitcoin Core interpreter.cpp OP_IF handler.
+ */
+function checkMinimalIf(element: Buffer): boolean {
+  if (element.length === 0) {
+    return true; // Empty buffer is valid (false)
+  }
+  if (element.length === 1 && element[0] === 1) {
+    return true; // Exactly [0x01] is valid (true)
+  }
+  return false; // All other values are invalid
 }
 
 /**
@@ -611,6 +630,23 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
           return false;
         }
         const top = stack.pop()!;
+
+        // MINIMALIF: In witness v0 (with flag) and tapscript, the argument must be
+        // either empty (false) or exactly [0x01] (true). Any other value is rejected.
+        // For tapscript, this is unconditional consensus.
+        // For witness v0, it's enabled via SCRIPT_VERIFY_MINIMALIF flag.
+        if (sigVersion === SigVersion.TAPSCRIPT) {
+          // Tapscript: MINIMALIF is unconditional consensus
+          if (!checkMinimalIf(top)) {
+            throw new ScriptError("MINIMALIF");
+          }
+        } else if (sigVersion === SigVersion.WITNESS_V0 && flags.verifyMinimalIf) {
+          // Witness v0: MINIMALIF is policy (but we enforce when flag is set)
+          if (!checkMinimalIf(top)) {
+            throw new ScriptError("MINIMALIF");
+          }
+        }
+
         value = castToBool(top);
         if (opcode === Opcode.OP_NOTIF) {
           value = !value;
@@ -1464,10 +1500,13 @@ function verifyWitnessV0(
     // and last index is stack top. No reversal needed.
     const witnessStack = [...witness];
 
+    // For witness v0, MINIMALIF is unconditionally enabled (part of SegWit rules)
+    const witnessFlags: ScriptFlags = { ...flags, verifyMinimalIf: true };
+
     const ctx: ExecutionContext = {
       stack: witnessStack,
       altStack: [],
-      flags,
+      flags: witnessFlags,
       sigHasher,
       sigVersion: SigVersion.WITNESS_V0,
     };
@@ -1518,10 +1557,13 @@ function verifyWitnessV0(
     // bottom-to-top (index 0 = bottom, last = top). No reversal needed.
     const witnessStack = [...witness.slice(0, -1)];
 
+    // For witness v0, MINIMALIF is unconditionally enabled (part of SegWit rules)
+    const witnessFlags: ScriptFlags = { ...flags, verifyMinimalIf: true };
+
     const ctx: ExecutionContext = {
       stack: witnessStack,
       altStack: [],
-      flags,
+      flags: witnessFlags,
       sigHasher,
       sigVersion: SigVersion.WITNESS_V0,
     };
