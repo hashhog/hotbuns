@@ -8,6 +8,7 @@
 import type { ChainStateManager } from "../chain/state.js";
 import type { ChainDB } from "../storage/database.js";
 import type { Mempool, MempoolEntry } from "../mempool/mempool.js";
+import { PackageValidationResult, MAX_PACKAGE_COUNT } from "../mempool/mempool.js";
 import type { PeerManager } from "../p2p/manager.js";
 import type { FeeEstimator } from "../fees/estimator.js";
 import type { HeaderSync, HeaderChainEntry } from "../sync/headers.js";
@@ -446,6 +447,9 @@ export class RPCServer {
     );
     this.registerMethod("sendrawtransaction", (params) =>
       this.sendRawTransaction(params)
+    );
+    this.registerMethod("submitpackage", (params) =>
+      this.submitPackage(params)
     );
 
     // Mempool methods
@@ -1518,6 +1522,213 @@ export class RPCServer {
     this.broadcastTxInv(txid);
 
     return txidHex;
+  }
+
+  /**
+   * submitpackage: Submit a package of raw transactions to the mempool.
+   *
+   * Allows submission of related transactions together, enabling CPFP
+   * (Child-Pays-For-Parent) fee bumping where a child transaction can
+   * pay fees for its parent even if the parent is below minimum relay fee.
+   *
+   * @param params [package, maxfeerate, maxburnamount]
+   *   - package: Array of hex-encoded raw transactions (topologically sorted)
+   *   - maxfeerate: Optional max fee rate in BTC/kvB (default 0.10)
+   *   - maxburnamount: Optional max amount for OP_RETURN outputs (default 0)
+   *
+   * @returns Object with:
+   *   - package_msg: "success" or error message
+   *   - tx-results: Object keyed by wtxid with per-tx results
+   *   - replaced-transactions: Array of replaced txids (RBF)
+   */
+  private async submitPackage(params: unknown[]): Promise<Record<string, unknown>> {
+    const [packageParam, maxfeerateParam, maxburnamountParam] = params;
+
+    // Validate package parameter
+    if (!Array.isArray(packageParam)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "package must be an array of hex-encoded transactions"
+      );
+    }
+
+    if (packageParam.length === 0 || packageParam.length > MAX_PACKAGE_COUNT) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `Array must contain between 1 and ${MAX_PACKAGE_COUNT} transactions.`
+      );
+    }
+
+    // Parse maxfeerate parameter (default 0.10 BTC/kvB)
+    let maxFeeRate = DEFAULT_MAX_FEE_RATE;
+    if (maxfeerateParam !== undefined && maxfeerateParam !== null) {
+      if (typeof maxfeerateParam !== "number") {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "maxfeerate must be a number"
+        );
+      }
+      if (maxfeerateParam < 0) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "maxfeerate cannot be negative"
+        );
+      }
+      if (maxfeerateParam > 1) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "Fee rates larger than 1 BTC/kvB are rejected"
+        );
+      }
+      maxFeeRate = maxfeerateParam;
+    }
+
+    // Parse maxburnamount parameter
+    const maxBurnAmount = maxburnamountParam !== undefined && maxburnamountParam !== null
+      ? Number(maxburnamountParam)
+      : 0;
+
+    // Deserialize all transactions
+    const transactions: Transaction[] = [];
+    for (let i = 0; i < packageParam.length; i++) {
+      const rawtx = packageParam[i];
+
+      if (typeof rawtx !== "string") {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          `Transaction at index ${i} must be a hex string`
+        );
+      }
+
+      let txData: Buffer;
+      try {
+        txData = Buffer.from(rawtx, "hex");
+      } catch {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          `TX decode failed at index ${i}: Invalid hex encoding`
+        );
+      }
+
+      if (rawtx.length % 2 !== 0) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          `TX decode failed at index ${i}: Odd hex length`
+        );
+      }
+
+      let tx: Transaction;
+      try {
+        const reader = new BufferReader(txData);
+        tx = deserializeTx(reader);
+      } catch (e) {
+        throw this.rpcError(
+          RPCErrorCodes.RPC_TRANSACTION_REJECTED,
+          `TX decode failed at index ${i}: ${(e as Error).message}`
+        );
+      }
+
+      // Check max burn amount for OP_RETURN outputs
+      for (const out of tx.outputs) {
+        const isUnspendable = out.scriptPubKey.length > 0 &&
+          (out.scriptPubKey[0] === 0x6a || // OP_RETURN
+           (out.scriptPubKey.length >= 1 && out.scriptPubKey[0] === 0x00 && out.scriptPubKey.length === 1)); // OP_0 alone
+
+        if (isUnspendable && Number(out.value) > maxBurnAmount * 100_000_000) {
+          throw this.rpcError(
+            RPCErrorCodes.RPC_TRANSACTION_REJECTED,
+            `Transaction at index ${i} has unspendable output exceeding maxburnamount`
+          );
+        }
+      }
+
+      transactions.push(tx);
+    }
+
+    // Submit package to mempool
+    const result = await this.mempool.submitPackage(transactions);
+
+    // Build response
+    const rpcResult: Record<string, unknown> = {
+      package_msg: result.message,
+    };
+
+    // Build tx-results object keyed by wtxid
+    const txResults: Record<string, Record<string, unknown>> = {};
+
+    for (const [wtxid, txResult] of result.txResults) {
+      const innerResult: Record<string, unknown> = {
+        txid: txResult.txid,
+      };
+
+      if (txResult.error) {
+        innerResult.error = txResult.error;
+      } else {
+        // Accepted
+        if (txResult.vsize !== undefined) {
+          innerResult.vsize = txResult.vsize;
+        }
+
+        if (txResult.fee !== undefined) {
+          const fees: Record<string, unknown> = {
+            base: Number(txResult.fee) / 100_000_000,
+          };
+
+          if (txResult.effectiveFeeRate !== undefined) {
+            // Convert sat/vB to BTC/kvB
+            fees["effective-feerate"] = (txResult.effectiveFeeRate * 1000) / 100_000_000;
+
+            if (txResult.effectiveIncludes) {
+              fees["effective-includes"] = txResult.effectiveIncludes;
+            }
+          }
+
+          innerResult.fees = fees;
+        }
+      }
+
+      txResults[wtxid] = innerResult;
+    }
+
+    rpcResult["tx-results"] = txResults;
+
+    // Add replaced transactions
+    rpcResult["replaced-transactions"] = result.replacedTxids;
+
+    // Check fee rate for all accepted transactions if maxFeeRate is set
+    if (maxFeeRate > 0) {
+      for (const [wtxid, txResult] of result.txResults) {
+        if (txResult.accepted && txResult.fee !== undefined && txResult.vsize !== undefined) {
+          const feeRate = Number(txResult.fee) / txResult.vsize;
+          const feeRateBTCkvB = (feeRate * 1000) / 100_000_000;
+
+          if (feeRateBTCkvB > maxFeeRate) {
+            // Remove accepted transactions from mempool
+            for (const tx of transactions) {
+              const txid = getTxId(tx);
+              if (this.mempool.hasTransaction(txid)) {
+                this.mempool.removeTransaction(txid);
+              }
+            }
+
+            throw this.rpcError(
+              RPCErrorCodes.RPC_TRANSACTION_REJECTED,
+              `Package fee rate ${feeRateBTCkvB.toFixed(8)} BTC/kvB exceeds max rate ${maxFeeRate} BTC/kvB`
+            );
+          }
+        }
+      }
+    }
+
+    // Broadcast inv for all accepted transactions
+    for (const [wtxid, txResult] of result.txResults) {
+      if (txResult.accepted) {
+        const txid = Buffer.from(txResult.txid, "hex");
+        this.broadcastTxInv(txid);
+      }
+    }
+
+    return rpcResult;
   }
 
   /**
