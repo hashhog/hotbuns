@@ -88,7 +88,12 @@ export type NetworkMessage =
   | { type: "sendaddrv2"; payload: null }
   | { type: "cmpctblock"; payload: CmpctBlockPayload }
   | { type: "getblocktxn"; payload: GetBlockTxnPayload }
-  | { type: "blocktxn"; payload: BlockTxnPayload };
+  | { type: "blocktxn"; payload: BlockTxnPayload }
+  // Package relay messages
+  | { type: "sendpackages"; payload: SendPackagesPayload }
+  | { type: "ancpkginfo"; payload: AncPkgInfoPayload }
+  | { type: "getpkgtxns"; payload: GetPkgTxnsPayload }
+  | { type: "pkgtxns"; payload: PkgTxnsPayload };
 
 /**
  * Network address (without timestamp, used in version message).
@@ -226,6 +231,47 @@ export interface GetBlockTxnPayload {
 export interface BlockTxnPayload {
   blockHash: Buffer;          // 32 bytes
   transactions: Transaction[];
+}
+
+// ============================================================================
+// Package Relay Messages (BIP 331-style)
+// ============================================================================
+
+/**
+ * SendPackages message payload.
+ * Announces support for package relay. Sent during version handshake.
+ */
+export interface SendPackagesPayload {
+  version: number;  // Package relay protocol version
+}
+
+/**
+ * AncPkgInfo message payload.
+ * Announces an available package to a peer.
+ */
+export interface AncPkgInfoPayload {
+  packageHash: Buffer;        // 32 bytes - SHA256 of sorted wtxids
+  packageFeeRate: bigint;     // Fee rate in satoshis per kvB
+  packageWeight: number;      // Total weight of the package
+  txCount: number;            // Number of transactions in the package
+}
+
+/**
+ * GetPkgTxns message payload.
+ * Request specific transactions from an announced package.
+ */
+export interface GetPkgTxnsPayload {
+  packageHash: Buffer;        // 32 bytes - identifies the package
+  wtxids: Buffer[];           // wtxids of requested transactions
+}
+
+/**
+ * PkgTxns message payload.
+ * Response with requested package transactions.
+ */
+export interface PkgTxnsPayload {
+  packageHash: Buffer;        // 32 bytes - identifies the package
+  transactions: Transaction[];  // The requested transactions
 }
 
 // ============================================================================
@@ -530,6 +576,65 @@ function serializeBlockTxnPayload(payload: BlockTxnPayload): Buffer {
 }
 
 // ============================================================================
+// Package Relay Payload Serializers
+// ============================================================================
+
+function serializeSendPackagesPayload(payload: SendPackagesPayload): Buffer {
+  const writer = new BufferWriter();
+  writer.writeUInt32LE(payload.version);
+  return writer.toBuffer();
+}
+
+function serializeAncPkgInfoPayload(payload: AncPkgInfoPayload): Buffer {
+  const writer = new BufferWriter();
+
+  if (payload.packageHash.length !== 32) {
+    throw new Error(`Invalid package hash length: ${payload.packageHash.length}, expected 32`);
+  }
+  writer.writeHash(payload.packageHash);
+  writer.writeUInt64LE(payload.packageFeeRate);
+  writer.writeUInt32LE(payload.packageWeight);
+  writer.writeVarInt(payload.txCount);
+
+  return writer.toBuffer();
+}
+
+function serializeGetPkgTxnsPayload(payload: GetPkgTxnsPayload): Buffer {
+  const writer = new BufferWriter();
+
+  if (payload.packageHash.length !== 32) {
+    throw new Error(`Invalid package hash length: ${payload.packageHash.length}, expected 32`);
+  }
+  writer.writeHash(payload.packageHash);
+
+  writer.writeVarInt(payload.wtxids.length);
+  for (const wtxid of payload.wtxids) {
+    if (wtxid.length !== 32) {
+      throw new Error(`Invalid wtxid length: ${wtxid.length}, expected 32`);
+    }
+    writer.writeHash(wtxid);
+  }
+
+  return writer.toBuffer();
+}
+
+function serializePkgTxnsPayload(payload: PkgTxnsPayload): Buffer {
+  const writer = new BufferWriter();
+
+  if (payload.packageHash.length !== 32) {
+    throw new Error(`Invalid package hash length: ${payload.packageHash.length}, expected 32`);
+  }
+  writer.writeHash(payload.packageHash);
+
+  writer.writeVarInt(payload.transactions.length);
+  for (const tx of payload.transactions) {
+    writer.writeBytes(serializeTx(tx, true));
+  }
+
+  return writer.toBuffer();
+}
+
+// ============================================================================
 // Payload deserializers
 // ============================================================================
 
@@ -699,6 +804,48 @@ function deserializeBlockTxnPayload(reader: BufferReader): BlockTxnPayload {
 }
 
 // ============================================================================
+// Package Relay Payload Deserializers
+// ============================================================================
+
+function deserializeSendPackagesPayload(reader: BufferReader): SendPackagesPayload {
+  const version = reader.readUInt32LE();
+  return { version };
+}
+
+function deserializeAncPkgInfoPayload(reader: BufferReader): AncPkgInfoPayload {
+  const packageHash = reader.readHash();
+  const packageFeeRate = reader.readUInt64LE();
+  const packageWeight = reader.readUInt32LE();
+  const txCount = reader.readVarInt();
+
+  return { packageHash, packageFeeRate, packageWeight, txCount };
+}
+
+function deserializeGetPkgTxnsPayload(reader: BufferReader): GetPkgTxnsPayload {
+  const packageHash = reader.readHash();
+  const count = reader.readVarInt();
+  const wtxids: Buffer[] = [];
+
+  for (let i = 0; i < count; i++) {
+    wtxids.push(reader.readHash());
+  }
+
+  return { packageHash, wtxids };
+}
+
+function deserializePkgTxnsPayload(reader: BufferReader): PkgTxnsPayload {
+  const packageHash = reader.readHash();
+  const count = reader.readVarInt();
+  const transactions: Transaction[] = [];
+
+  for (let i = 0; i < count; i++) {
+    transactions.push(deserializeTx(reader));
+  }
+
+  return { packageHash, transactions };
+}
+
+// ============================================================================
 // Main serialization/deserialization functions
 // ============================================================================
 
@@ -814,6 +961,23 @@ export function serializeMessage(magic: number, msg: NetworkMessage): Buffer {
       command = "blocktxn";
       payload = serializeBlockTxnPayload(msg.payload);
       break;
+    // Package relay messages
+    case "sendpackages":
+      command = "sendpackages";
+      payload = serializeSendPackagesPayload(msg.payload);
+      break;
+    case "ancpkginfo":
+      command = "ancpkginfo";
+      payload = serializeAncPkgInfoPayload(msg.payload);
+      break;
+    case "getpkgtxns":
+      command = "getpkgtxns";
+      payload = serializeGetPkgTxnsPayload(msg.payload);
+      break;
+    case "pkgtxns":
+      command = "pkgtxns";
+      payload = serializePkgTxnsPayload(msg.payload);
+      break;
     default:
       throw new Error(`Unknown message type: ${(msg as NetworkMessage).type}`);
   }
@@ -891,6 +1055,15 @@ export function deserializeMessage(header: MessageHeader, payload: Buffer): Netw
       return { type: "getblocktxn", payload: deserializeGetBlockTxnPayload(reader) };
     case "blocktxn":
       return { type: "blocktxn", payload: deserializeBlockTxnPayload(reader) };
+    // Package relay messages
+    case "sendpackages":
+      return { type: "sendpackages", payload: deserializeSendPackagesPayload(reader) };
+    case "ancpkginfo":
+      return { type: "ancpkginfo", payload: deserializeAncPkgInfoPayload(reader) };
+    case "getpkgtxns":
+      return { type: "getpkgtxns", payload: deserializeGetPkgTxnsPayload(reader) };
+    case "pkgtxns":
+      return { type: "pkgtxns", payload: deserializePkgTxnsPayload(reader) };
     default:
       throw new Error(`Unknown command: ${header.command}`);
   }
