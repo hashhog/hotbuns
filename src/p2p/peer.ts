@@ -122,6 +122,25 @@ export class Peer {
    */
   wantsAddrV2: boolean;
 
+  /**
+   * The fee rate (sat/kvB) that this peer announced via feefilter (BIP133).
+   * Transactions below this rate should not be relayed to this peer.
+   * 0n means no feefilter has been received.
+   */
+  feeFilterReceived: bigint;
+
+  /**
+   * The last fee filter we sent to this peer (sat/kvB).
+   * Used to avoid sending redundant feefilter messages.
+   */
+  feeFilterSent: bigint;
+
+  /**
+   * Timestamp for next feefilter send (ms since epoch).
+   * Used for Poisson-delayed feefilter broadcasting.
+   */
+  nextFeeFilterSend: number;
+
   private socket: Socket | null;
   private recvBuffer: Buffer;
   private config: PeerConfig;
@@ -170,6 +189,10 @@ export class Peer {
     this.blocksInFlight = new Map();
     this.bestKnownHeight = 0;
     this.wantsAddrV2 = false;
+    // BIP133 feefilter state
+    this.feeFilterReceived = 0n;
+    this.feeFilterSent = 0n;
+    this.nextFeeFilterSend = 0;
     // Register our nonce for self-connection detection
     Peer.localNonces.add(this.ourNonce);
   }
