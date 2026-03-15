@@ -16,6 +16,7 @@ import {
   createP2PKHCoinbaseScript,
   createP2WPKHCoinbaseScript,
   createP2WSHCoinbaseScript,
+  isFinalTx,
 } from "./template.js";
 import type { Transaction } from "../validation/tx.js";
 import {
@@ -542,5 +543,262 @@ describe("BlockTemplateBuilder", () => {
       // Total weight should not exceed max (4M for regtest)
       expect(template.totalWeight).toBeLessThanOrEqual(REGTEST.maxBlockWeight);
     });
+  });
+
+  describe("coinbase properties", () => {
+    test("coinbase sequence is 0xFFFFFFFF (opts out of BIP68)", () => {
+      const template = builder.createTemplate(Buffer.from([0x51]));
+
+      // Coinbase input should have sequence 0xFFFFFFFF
+      expect(template.coinbaseTx.inputs[0].sequence).toBe(0xffffffff);
+    });
+
+    test("coinbase lockTime is 0", () => {
+      const template = builder.createTemplate(Buffer.from([0x51]));
+
+      // Coinbase lockTime should be 0
+      expect(template.coinbaseTx.lockTime).toBe(0);
+    });
+  });
+});
+
+describe("isFinalTx", () => {
+  // Helper to create a simple transaction for testing
+  function createTxWithLocktime(
+    lockTime: number,
+    sequences: number[] = [0xffffffff]
+  ): Transaction {
+    return {
+      version: 2,
+      inputs: sequences.map((seq, i) => ({
+        prevOut: {
+          txid: Buffer.alloc(32, i + 1),
+          vout: 0,
+        },
+        scriptSig: Buffer.alloc(0),
+        sequence: seq,
+        witness: [],
+      })),
+      outputs: [
+        {
+          value: 1000n,
+          scriptPubKey: Buffer.from([0x51]), // OP_TRUE
+        },
+      ],
+      lockTime,
+    };
+  }
+
+  describe("lockTime = 0", () => {
+    test("transaction with lockTime 0 is always final", () => {
+      const tx = createTxWithLocktime(0);
+      expect(isFinalTx(tx, 100, 1000000000)).toBe(true);
+    });
+
+    test("transaction with lockTime 0 and non-final sequence is still final", () => {
+      const tx = createTxWithLocktime(0, [0x00000000]);
+      expect(isFinalTx(tx, 100, 1000000000)).toBe(true);
+    });
+  });
+
+  describe("height-based lockTime (< 500_000_000)", () => {
+    test("tx is final when blockHeight > lockTime", () => {
+      const tx = createTxWithLocktime(100);
+      // Block height 101 > lockTime 100, so it's final
+      expect(isFinalTx(tx, 101, 0)).toBe(true);
+    });
+
+    test("tx is final when blockHeight == lockTime (lockTime < blockHeight is final)", () => {
+      const tx = createTxWithLocktime(100);
+      // Block height 100 == lockTime 100, so lockTime is NOT less than height
+      // The tx should NOT be final unless all sequences are final
+      expect(isFinalTx(tx, 100, 0)).toBe(true); // All sequences are 0xffffffff
+    });
+
+    test("tx with non-final sequences is not final when lockTime >= blockHeight", () => {
+      const tx = createTxWithLocktime(100, [0x00000000]);
+      // Block height 100 == lockTime 100, and sequence is not final
+      expect(isFinalTx(tx, 100, 0)).toBe(false);
+    });
+
+    test("tx with non-final sequences becomes final when blockHeight exceeds lockTime", () => {
+      const tx = createTxWithLocktime(100, [0x00000000]);
+      // Block height 101 > lockTime 100
+      expect(isFinalTx(tx, 101, 0)).toBe(true);
+    });
+  });
+
+  describe("time-based lockTime (>= 500_000_000)", () => {
+    const LOCKTIME_THRESHOLD = 500_000_000;
+
+    test("tx is final when blockTime > lockTime", () => {
+      const lockTime = LOCKTIME_THRESHOLD + 1000;
+      const tx = createTxWithLocktime(lockTime);
+      // Block time exceeds lockTime
+      expect(isFinalTx(tx, 1000, lockTime + 1)).toBe(true);
+    });
+
+    test("tx is not final when blockTime <= lockTime and sequences not final", () => {
+      const lockTime = LOCKTIME_THRESHOLD + 1000;
+      const tx = createTxWithLocktime(lockTime, [0x00000000]);
+      // Block time equals lockTime, and sequence is not final
+      expect(isFinalTx(tx, 1000, lockTime)).toBe(false);
+    });
+
+    test("tx is final when blockTime == lockTime but all sequences are final", () => {
+      const lockTime = LOCKTIME_THRESHOLD + 1000;
+      const tx = createTxWithLocktime(lockTime, [0xffffffff]);
+      // Block time equals lockTime, but sequence is final
+      expect(isFinalTx(tx, 1000, lockTime)).toBe(true);
+    });
+  });
+
+  describe("sequence-based finality", () => {
+    test("tx with all inputs having sequence 0xFFFFFFFF is final regardless of lockTime", () => {
+      // High lockTime that would otherwise make tx non-final
+      const tx = createTxWithLocktime(999999, [0xffffffff, 0xffffffff]);
+      // Low block height that wouldn't satisfy lockTime
+      expect(isFinalTx(tx, 100, 0)).toBe(true);
+    });
+
+    test("tx with one non-final sequence is not final when lockTime not satisfied", () => {
+      const tx = createTxWithLocktime(999999, [0xffffffff, 0x00000000]);
+      expect(isFinalTx(tx, 100, 0)).toBe(false);
+    });
+
+    test("tx with all non-final sequences is not final when lockTime not satisfied", () => {
+      const tx = createTxWithLocktime(999999, [0x00000000, 0x00000000]);
+      expect(isFinalTx(tx, 100, 0)).toBe(false);
+    });
+  });
+});
+
+describe("locktime filtering in block template", () => {
+  let tempDir: string;
+  let db: ChainDB;
+  let utxo: UTXOManager;
+  let chainState: ChainStateManager;
+  let mempool: Mempool;
+  let builder: BlockTemplateBuilder;
+
+  async function setupUTXO(
+    txid: Buffer,
+    vout: number,
+    amount: bigint,
+    height: number = 1,
+    coinbase: boolean = false
+  ): Promise<void> {
+    const entry: UTXOEntry = {
+      height,
+      coinbase,
+      amount,
+      scriptPubKey: Buffer.from([0x51]), // OP_TRUE
+    };
+    await db.putUTXO(txid, vout, entry);
+  }
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "locktime-test-"));
+    db = new ChainDB(tempDir);
+    await db.open();
+    utxo = new UTXOManager(db);
+    chainState = new ChainStateManager(db, REGTEST);
+    await chainState.load();
+    mempool = new Mempool(utxo, REGTEST, 1_000_000);
+    mempool.setTipHeight(200);
+    builder = new BlockTemplateBuilder(mempool, chainState, REGTEST);
+    // Set a reasonable MTP for time-based locktime tests
+    builder.setMedianTimePast(Math.floor(Date.now() / 1000) - 3600);
+  });
+
+  afterEach(async () => {
+    await db.close();
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  test("excludes transactions with unsatisfied height-based lockTime", async () => {
+    const inputTxid = Buffer.alloc(32, 0xaa);
+    await setupUTXO(inputTxid, 0, 100000n);
+
+    // Create a tx with lockTime set to a future height (200 + some margin)
+    // Chain tip is at height 0 (genesis), so next block will be height 1
+    // But we set mempool tip to 200, so next block template is for height ~1
+    const tx: Transaction = {
+      version: 2,
+      inputs: [
+        {
+          prevOut: { txid: inputTxid, vout: 0 },
+          scriptSig: Buffer.alloc(0),
+          sequence: 0x00000000, // Non-final sequence
+          witness: [],
+        },
+      ],
+      outputs: [{ value: 90000n, scriptPubKey: Buffer.from([0x51]) }],
+      lockTime: 9999, // Far future height
+    };
+
+    await mempool.addTransaction(tx);
+    expect(mempool.getSize()).toBe(1);
+
+    const template = builder.createTemplate(Buffer.from([0x51]));
+
+    // The tx should NOT be included because lockTime is not satisfied
+    expect(template.transactions.length).toBe(0);
+  });
+
+  test("includes transactions with satisfied height-based lockTime", async () => {
+    const inputTxid = Buffer.alloc(32, 0xaa);
+    await setupUTXO(inputTxid, 0, 100000n);
+
+    // Create a tx with lockTime 0 (always final)
+    const tx: Transaction = {
+      version: 2,
+      inputs: [
+        {
+          prevOut: { txid: inputTxid, vout: 0 },
+          scriptSig: Buffer.alloc(0),
+          sequence: 0x00000000, // Non-final sequence
+          witness: [],
+        },
+      ],
+      outputs: [{ value: 90000n, scriptPubKey: Buffer.from([0x51]) }],
+      lockTime: 0, // Always final
+    };
+
+    await mempool.addTransaction(tx);
+    expect(mempool.getSize()).toBe(1);
+
+    const template = builder.createTemplate(Buffer.from([0x51]));
+
+    // The tx SHOULD be included because lockTime = 0
+    expect(template.transactions.length).toBe(1);
+  });
+
+  test("includes transactions with final sequences regardless of lockTime", async () => {
+    const inputTxid = Buffer.alloc(32, 0xaa);
+    await setupUTXO(inputTxid, 0, 100000n);
+
+    // Create a tx with high lockTime but final sequences
+    const tx: Transaction = {
+      version: 2,
+      inputs: [
+        {
+          prevOut: { txid: inputTxid, vout: 0 },
+          scriptSig: Buffer.alloc(0),
+          sequence: 0xffffffff, // Final sequence
+          witness: [],
+        },
+      ],
+      outputs: [{ value: 90000n, scriptPubKey: Buffer.from([0x51]) }],
+      lockTime: 9999, // High lockTime, but sequence is final
+    };
+
+    await mempool.addTransaction(tx);
+    expect(mempool.getSize()).toBe(1);
+
+    const template = builder.createTemplate(Buffer.from([0x51]));
+
+    // The tx SHOULD be included because all sequences are final
+    expect(template.transactions.length).toBe(1);
   });
 });
