@@ -10,6 +10,7 @@
  * for optimal fee-rate ordering.
  */
 
+import { EventEmitter } from "events";
 import type { UTXOEntry } from "../storage/database.js";
 import type { UTXOManager } from "../chain/utxo.js";
 import type { ConsensusParams } from "../consensus/params.js";
@@ -652,10 +653,17 @@ export class Mempool {
   /** Whether cluster cache needs to be rebuilt. */
   private clusterCacheDirty: boolean;
 
+  /** Optional event emitter for ZMQ notifications. */
+  private notificationEmitter: EventEmitter | null;
+
+  /** Monotonically increasing sequence number for mempool events. */
+  private mempoolSequence: bigint;
+
   constructor(
     utxo: UTXOManager,
     params: ConsensusParams,
-    maxSize: number = DEFAULT_MAX_SIZE
+    maxSize: number = DEFAULT_MAX_SIZE,
+    notificationEmitter: EventEmitter | null = null
   ) {
     this.entries = new Map();
     this.outpointIndex = new Map();
@@ -669,6 +677,22 @@ export class Mempool {
     this.clusters = new UnionFind();
     this.clusterCache = new Map();
     this.clusterCacheDirty = false;
+    this.notificationEmitter = notificationEmitter;
+    this.mempoolSequence = 0n;
+  }
+
+  /**
+   * Set the notification event emitter for ZMQ.
+   */
+  setNotificationEmitter(emitter: EventEmitter): void {
+    this.notificationEmitter = emitter;
+  }
+
+  /**
+   * Get the current mempool sequence number.
+   */
+  getMempoolSequence(): bigint {
+    return this.mempoolSequence;
   }
 
   /**
@@ -1055,6 +1079,13 @@ export class Mempool {
       this.evict();
     }
 
+    // Emit notification for ZMQ
+    if (this.notificationEmitter) {
+      const seq = this.mempoolSequence;
+      this.mempoolSequence += 1n;
+      this.notificationEmitter.emit("txAccepted", tx, seq);
+    }
+
     return { accepted: true };
   }
 
@@ -1134,6 +1165,13 @@ export class Mempool {
 
     // Mark cluster cache as dirty
     this.clusterCacheDirty = true;
+
+    // Emit notification for ZMQ
+    if (this.notificationEmitter) {
+      const seq = this.mempoolSequence;
+      this.mempoolSequence += 1n;
+      this.notificationEmitter.emit("txRemoved", txid, seq);
+    }
 
     // Cascade removal of ephemeral dust parents that no longer have their dust spent
     for (const parentTxidHex of ephemeralParentsToRemove) {
