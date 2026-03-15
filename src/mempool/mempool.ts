@@ -1846,6 +1846,14 @@ export class Mempool {
     this.clusterCacheDirty = false;
   }
 
+  /**
+   * Check if an outpoint is spent by a mempool transaction.
+   */
+  isOutpointSpent(txid: Buffer, vout: number): boolean {
+    const outpointKey = `${txid.toString("hex")}:${vout}`;
+    return this.outpointIndex.has(outpointKey);
+  }
+
   // ============================================================================
   // Cluster Mempool Methods
   // ============================================================================
