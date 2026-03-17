@@ -17,7 +17,7 @@ hotbuns is a from-scratch Bitcoin full node written in TypeScript (Bun) that doe
 - [x] Difficulty adjustment (2016-block retargeting, testnet 20-minute rule, BIP94)
 - [x] BIP9 versionbits (soft fork state machine, deployment signaling)
 - [x] Database storage (LevelDB, block index, UTXO set, batch optimization, flat file block storage)
-- [x] Transaction and block validation (parallel sig verification, BIP68 sequence locks, sigop counting with witness discount)
+- [x] Transaction and block validation (parallel sig verification, BIP68 sequence locks, sigop counting with witness discount, signature cache)
 - [x] P2P networking (TCP, version handshake, message framing, pre-handshake rejection)
 - [x] BIP-324 v2 transport (ElligatorSwift ECDH, ChaCha20-Poly1305 AEAD, forward secrecy)
 - [x] BIP-152 compact blocks (SipHash short IDs, mempool reconstruction, getblocktxn/blocktxn, high/low bandwidth modes)
