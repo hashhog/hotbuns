@@ -33,6 +33,7 @@ import {
 } from "./utxo.js";
 import { ConsensusError, ConsensusErrorCode } from "../validation/errors.js";
 import { BufferReader } from "../wire/serialization.js";
+import { globalSigCache } from "../validation/sig_cache.js";
 
 /**
  * Result of transaction input validation.
@@ -476,6 +477,9 @@ export class ChainStateManager {
       totalWork: prevChainWork,
     });
 
+    // Clear signature cache on disconnect (verifications may no longer be valid)
+    globalSigCache.clear();
+
     // Emit notification for ZMQ
     if (this.notificationEmitter) {
       this.notificationEmitter.emit("blockDisconnected", block);
@@ -805,6 +809,7 @@ export class ChainStateManager {
     chainWork: bigint;
     utxoCacheSize: number;
     pendingOps: number;
+    sigCacheSize: number;
   } {
     return {
       height: this.bestBlock.height,
@@ -812,6 +817,7 @@ export class ChainStateManager {
       chainWork: this.bestBlock.chainWork,
       utxoCacheSize: this.utxo.getCacheSize(),
       pendingOps: this.utxo.getPendingCount(),
+      sigCacheSize: globalSigCache.size,
     };
   }
 
