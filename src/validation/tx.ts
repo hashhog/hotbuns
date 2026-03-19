@@ -10,7 +10,7 @@
  */
 
 import { BufferReader, BufferWriter, varIntSize } from "../wire/serialization.js";
-import { hash256, ecdsaVerify } from "../crypto/primitives.js";
+import { hash256, sha256Hash, ecdsaVerify, taggedHash } from "../crypto/primitives.js";
 import type { UTXOEntry } from "../storage/database.js";
 
 /**
@@ -47,6 +47,9 @@ export const SIGHASH_ALL = 0x01;
 export const SIGHASH_NONE = 0x02;
 export const SIGHASH_SINGLE = 0x03;
 export const SIGHASH_ANYONECANPAY = 0x80;
+
+// Taproot sighash constants (BIP-341)
+export const SIGHASH_DEFAULT = 0x00; // Taproot only: same as SIGHASH_ALL but no byte in signature
 
 /**
  * A reference to a transaction output (txid + output index).
@@ -1126,6 +1129,261 @@ export function sigHashWitnessV0Cached(
   preimageWriter.writeUInt32LE(hashType);
 
   return hash256(preimageWriter.toBuffer());
+}
+
+// =============================================================================
+// BIP-341 Taproot Sighash
+// =============================================================================
+
+/**
+ * Taproot sighash cache for efficient batch verification.
+ * Caches intermediate hashes per BIP-341.
+ */
+export interface TaprootSigHashCache {
+  // Single SHA-256 hashes (not double-hashed like BIP-143)
+  shaPrevouts?: Buffer;
+  shaAmounts?: Buffer;
+  shaScriptPubKeys?: Buffer;
+  shaSequences?: Buffer;
+  shaOutputs?: Buffer;
+}
+
+/**
+ * Compute taproot sighash (BIP-341).
+ *
+ * This implements the SigMsg() function for taproot key-path and script-path spending.
+ *
+ * @param tx - The transaction
+ * @param inputIndex - Index of the input being signed
+ * @param prevOuts - Array of previous outputs (scriptPubKey + value) for ALL inputs
+ * @param hashType - Sighash type (0x00 = SIGHASH_DEFAULT = SIGHASH_ALL without explicit byte)
+ * @param extFlag - Extension flag: 0 for key-path, 1 for script-path
+ * @param annexHash - SHA256 of (compact_size(len(annex)) || annex) if annex present, else undefined
+ * @param tapLeafHash - Leaf hash for script-path spending (32 bytes), undefined for key-path
+ * @param keyVersion - Key version (0x00 for BIP-342 tapscript), undefined for key-path
+ * @param codeSepPos - Code separator position (0xFFFFFFFF if no OP_CODESEPARATOR executed)
+ * @param cache - Cache for intermediate hashes
+ * @returns 32-byte sighash
+ */
+export function sigHashTaproot(
+  tx: Transaction,
+  inputIndex: number,
+  prevOuts: { scriptPubKey: Buffer; value: bigint }[],
+  hashType: number,
+  extFlag: number,
+  annexHash: Buffer | undefined,
+  tapLeafHash: Buffer | undefined,
+  keyVersion: number | undefined,
+  codeSepPos: number,
+  cache: TaprootSigHashCache
+): Buffer {
+  if (inputIndex < 0 || inputIndex >= tx.inputs.length) {
+    throw new Error(`Invalid input index: ${inputIndex}`);
+  }
+  if (prevOuts.length !== tx.inputs.length) {
+    throw new Error("prevOuts must have same length as inputs");
+  }
+
+  // SIGHASH_DEFAULT (0x00) is treated as SIGHASH_ALL for computation purposes
+  const effectiveHashType = hashType === SIGHASH_DEFAULT ? SIGHASH_ALL : hashType;
+  const anyoneCanPay = (effectiveHashType & SIGHASH_ANYONECANPAY) !== 0;
+  const sigHashBase = effectiveHashType & 0x1f;
+
+  // SIGHASH_SINGLE with inputIndex >= outputs requires valid output
+  if (sigHashBase === SIGHASH_SINGLE && inputIndex >= tx.outputs.length) {
+    throw new Error("SIGHASH_SINGLE with no corresponding output");
+  }
+
+  // Build the preimage according to BIP-341
+  const writer = new BufferWriter();
+
+  // Epoch (0x00)
+  writer.writeUInt8(0x00);
+
+  // Control:
+  // - hash_type (1 byte) - the original hashType, NOT effectiveHashType
+  writer.writeUInt8(hashType);
+
+  // Transaction data
+  // - nVersion (4 bytes)
+  writer.writeInt32LE(tx.version);
+
+  // - nLockTime (4 bytes)
+  writer.writeUInt32LE(tx.lockTime);
+
+  // If not ANYONECANPAY:
+  if (!anyoneCanPay) {
+    // sha_prevouts (32 bytes): SHA256 of all input outpoints
+    if (!cache.shaPrevouts) {
+      const prevoutsWriter = new BufferWriter();
+      for (const input of tx.inputs) {
+        prevoutsWriter.writeHash(input.prevOut.txid);
+        prevoutsWriter.writeUInt32LE(input.prevOut.vout);
+      }
+      cache.shaPrevouts = sha256Hash(prevoutsWriter.toBuffer());
+    }
+    writer.writeBytes(cache.shaPrevouts);
+
+    // sha_amounts (32 bytes): SHA256 of all input amounts
+    if (!cache.shaAmounts) {
+      const amountsWriter = new BufferWriter();
+      for (const prevOut of prevOuts) {
+        amountsWriter.writeUInt64LE(prevOut.value);
+      }
+      cache.shaAmounts = sha256Hash(amountsWriter.toBuffer());
+    }
+    writer.writeBytes(cache.shaAmounts);
+
+    // sha_scriptpubkeys (32 bytes): SHA256 of all scriptPubKeys (each prefixed with compact size)
+    if (!cache.shaScriptPubKeys) {
+      const spkWriter = new BufferWriter();
+      for (const prevOut of prevOuts) {
+        spkWriter.writeVarBytes(prevOut.scriptPubKey);
+      }
+      cache.shaScriptPubKeys = sha256Hash(spkWriter.toBuffer());
+    }
+    writer.writeBytes(cache.shaScriptPubKeys);
+
+    // sha_sequences (32 bytes): SHA256 of all input sequences
+    if (!cache.shaSequences) {
+      const seqWriter = new BufferWriter();
+      for (const input of tx.inputs) {
+        seqWriter.writeUInt32LE(input.sequence);
+      }
+      cache.shaSequences = sha256Hash(seqWriter.toBuffer());
+    }
+    writer.writeBytes(cache.shaSequences);
+  }
+
+  // If not SIGHASH_NONE and not SIGHASH_SINGLE:
+  if (sigHashBase !== SIGHASH_NONE && sigHashBase !== SIGHASH_SINGLE) {
+    // sha_outputs (32 bytes): SHA256 of all outputs
+    if (!cache.shaOutputs) {
+      const outputsWriter = new BufferWriter();
+      for (const output of tx.outputs) {
+        outputsWriter.writeUInt64LE(output.value);
+        outputsWriter.writeVarBytes(output.scriptPubKey);
+      }
+      cache.shaOutputs = sha256Hash(outputsWriter.toBuffer());
+    }
+    writer.writeBytes(cache.shaOutputs);
+  }
+
+  // spend_type (1 byte):
+  // - bits 0-1: ext_flag
+  // - bit 2: set if annex is present
+  const hasAnnex = annexHash !== undefined;
+  const spendType = (extFlag * 2) | (hasAnnex ? 1 : 0);
+  writer.writeUInt8(spendType);
+
+  // Input-specific data
+  if (anyoneCanPay) {
+    // If ANYONECANPAY, include this input's data directly
+    const currentInput = tx.inputs[inputIndex];
+    const currentPrevOut = prevOuts[inputIndex];
+
+    // outpoint (36 bytes)
+    writer.writeHash(currentInput.prevOut.txid);
+    writer.writeUInt32LE(currentInput.prevOut.vout);
+
+    // amount (8 bytes)
+    writer.writeUInt64LE(currentPrevOut.value);
+
+    // scriptPubKey (compact size + script)
+    writer.writeVarBytes(currentPrevOut.scriptPubKey);
+
+    // nSequence (4 bytes)
+    writer.writeUInt32LE(currentInput.sequence);
+  } else {
+    // input_index (4 bytes)
+    writer.writeUInt32LE(inputIndex);
+  }
+
+  // If annex is present, include its hash
+  if (hasAnnex && annexHash) {
+    writer.writeBytes(annexHash);
+  }
+
+  // Output-specific data for SIGHASH_SINGLE
+  if (sigHashBase === SIGHASH_SINGLE) {
+    // sha_single_output (32 bytes): SHA256 of the corresponding output
+    const output = tx.outputs[inputIndex];
+    const outputWriter = new BufferWriter();
+    outputWriter.writeUInt64LE(output.value);
+    outputWriter.writeVarBytes(output.scriptPubKey);
+    const shaSingleOutput = sha256Hash(outputWriter.toBuffer());
+    writer.writeBytes(shaSingleOutput);
+  }
+
+  // Extension data for script-path spending (ext_flag == 1)
+  if (extFlag === 1) {
+    if (tapLeafHash === undefined || keyVersion === undefined) {
+      throw new Error("tapLeafHash and keyVersion required for script-path");
+    }
+    // tapleaf_hash (32 bytes)
+    writer.writeBytes(tapLeafHash);
+    // key_version (1 byte)
+    writer.writeUInt8(keyVersion);
+    // codesep_pos (4 bytes)
+    writer.writeUInt32LE(codeSepPos);
+  }
+
+  // Apply tagged hash with "TapSighash"
+  return taggedHash("TapSighash", writer.toBuffer());
+}
+
+/**
+ * Compute taproot sighash for key-path spending (ext_flag=0).
+ * Convenience function that sets ext_flag=0 and omits script-path params.
+ */
+export function sigHashTaprootKeyPath(
+  tx: Transaction,
+  inputIndex: number,
+  prevOuts: { scriptPubKey: Buffer; value: bigint }[],
+  hashType: number,
+  annexHash: Buffer | undefined,
+  cache: TaprootSigHashCache
+): Buffer {
+  return sigHashTaproot(
+    tx,
+    inputIndex,
+    prevOuts,
+    hashType,
+    0, // ext_flag = 0 for key-path
+    annexHash,
+    undefined, // no tapLeafHash
+    undefined, // no keyVersion
+    0xffffffff, // codeSepPos not used
+    cache
+  );
+}
+
+/**
+ * Compute taproot sighash for script-path spending (ext_flag=1).
+ * Convenience function that sets ext_flag=1.
+ */
+export function sigHashTaprootScriptPath(
+  tx: Transaction,
+  inputIndex: number,
+  prevOuts: { scriptPubKey: Buffer; value: bigint }[],
+  hashType: number,
+  annexHash: Buffer | undefined,
+  tapLeafHash: Buffer,
+  codeSepPos: number,
+  cache: TaprootSigHashCache
+): Buffer {
+  return sigHashTaproot(
+    tx,
+    inputIndex,
+    prevOuts,
+    hashType,
+    1, // ext_flag = 1 for script-path
+    annexHash,
+    tapLeafHash,
+    0x00, // key_version = 0 for BIP-342 tapscript
+    codeSepPos,
+    cache
+  );
 }
 
 /**

@@ -57,6 +57,8 @@ export interface PeerManagerConfig {
   maxOutboundFullRelay?: number;
   /** Maximum block-relay-only outbound connections (default: 2) */
   maxOutboundBlockRelay?: number;
+  /** Explicit peer addresses to connect to (from --connect flag) */
+  connect?: string[];
 }
 
 /** Stored information about a known peer address. */
@@ -276,6 +278,7 @@ export class PeerManager {
       datadir: config.datadir,
       maxOutboundFullRelay: config.maxOutboundFullRelay ?? MAX_OUTBOUND_FULL_RELAY,
       maxOutboundBlockRelay: config.maxOutboundBlockRelay ?? MAX_OUTBOUND_BLOCK_RELAY,
+      connect: config.connect,
     };
     this.peers = new Map();
     this.knownAddresses = new Map();
@@ -312,6 +315,28 @@ export class PeerManager {
 
     // Load anchor connections for fast re-entry into the network
     await this.loadAnchors();
+
+    // Add explicit --connect addresses first (highest priority)
+    if (this.config.connect && this.config.connect.length > 0) {
+      const now = Date.now();
+      for (const addr of this.config.connect) {
+        const [host, portStr] = addr.includes(":")
+          ? [addr.slice(0, addr.lastIndexOf(":")), addr.slice(addr.lastIndexOf(":") + 1)]
+          : [addr, String(this.config.params.defaultPort)];
+        const port = parseInt(portStr, 10);
+        const key = `${host}:${port}`;
+        if (!this.knownAddresses.has(key)) {
+          this.knownAddresses.set(key, {
+            host,
+            port,
+            services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS,
+            lastSeen: now,
+            banScore: 0,
+            lastConnected: 0,
+          });
+        }
+      }
+    }
 
     // Resolve DNS seeds
     const addresses = await this.resolveDNSSeeds();

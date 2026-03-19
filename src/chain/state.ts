@@ -13,6 +13,7 @@ import type { Block, BlockHeader } from "../validation/block.js";
 import {
   getBlockHash,
   serializeBlock,
+  serializeBlockHeader,
   deserializeBlock,
   getTransactionSigOpCost,
   MAX_BLOCK_SIGOPS_COST,
@@ -370,6 +371,16 @@ export class ChainStateManager {
     // Store block data
     const rawBlock = serializeBlock(block);
     await this.db.putBlock(blockHash, rawBlock);
+
+    // Store block index record (hash -> metadata) and height -> hash mapping
+    const headerBytes = serializeBlockHeader(block.header);
+    await this.db.putBlockIndex(blockHash, {
+      height,
+      header: headerBytes,
+      nTx: block.transactions.length,
+      status: BlockStatus.HEADER_VALID | BlockStatus.TXS_VALID | BlockStatus.HAVE_DATA | BlockStatus.HAVE_UNDO,
+      dataPos: 1, // block data exists
+    });
 
     // Calculate chain work (approximate - should come from header chain)
     // Work = 2^256 / (target + 1), but we use a simplified version here

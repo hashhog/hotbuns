@@ -486,6 +486,10 @@ export class RPCServer {
     this.registerMethod("getblock", (params) => this.getBlock(params));
     this.registerMethod("getblockhash", (params) => this.getBlockHash(params));
     this.registerMethod("getblockheader", (params) => this.getBlockHeader(params));
+    this.registerMethod("getblockcount", () => this.getBlockCount());
+    this.registerMethod("getbestblockhash", () => this.getBestBlockHash());
+    this.registerMethod("getchaintips", () => this.getChainTips());
+    this.registerMethod("getdifficulty", () => this.getDifficulty());
 
     // Transaction methods
     this.registerMethod("getrawtransaction", (params) =>
@@ -497,11 +501,20 @@ export class RPCServer {
     this.registerMethod("submitpackage", (params) =>
       this.submitPackage(params)
     );
+    this.registerMethod("decoderawtransaction", (params) =>
+      this.decodeRawTransaction(params)
+    );
+    this.registerMethod("decodescript", (params) => this.decodeScript(params));
+    this.registerMethod("createrawtransaction", (params) =>
+      this.createRawTransaction(params)
+    );
 
     // Mempool methods
     this.registerMethod("getmempoolinfo", () => this.getMempoolInfo());
     this.registerMethod("getrawmempool", (params) => this.getRawMempool(params));
     this.registerMethod("getmempoolentry", (params) => this.getMempoolEntry(params));
+    this.registerMethod("testmempoolaccept", (params) => this.testMempoolAccept(params));
+    this.registerMethod("getmempoolancestors", (params) => this.getMempoolAncestors(params));
 
     // Fee estimation
     this.registerMethod("estimatesmartfee", (params) =>
@@ -511,6 +524,9 @@ export class RPCServer {
     // Network methods
     this.registerMethod("getpeerinfo", () => this.getPeerInfo());
     this.registerMethod("getnetworkinfo", () => this.getNetworkInfo());
+    this.registerMethod("getconnectioncount", () => this.getConnectionCount());
+    this.registerMethod("addnode", (params) => this.addNode(params));
+    this.registerMethod("disconnectnode", (params) => this.disconnectNode(params));
 
     // Ban management
     this.registerMethod("listbanned", () => this.listBanned());
@@ -525,6 +541,8 @@ export class RPCServer {
     this.registerMethod("generatetoaddress", (params) => this.generateToAddress(params));
     this.registerMethod("generateblock", (params) => this.generateBlock(params));
     this.registerMethod("generatetodescriptor", (params) => this.generateToDescriptor(params));
+    this.registerMethod("submitblock", (params) => this.submitBlock(params));
+    this.registerMethod("getmininginfo", () => this.getMiningInfo());
 
     // Pruning methods
     this.registerMethod("pruneblockchain", (params) => this.pruneBlockchain(params));
@@ -556,11 +574,30 @@ export class RPCServer {
       this.registerMethod("listreceivedbyaddress", (params) => this.listReceivedByAddress(params));
       this.registerMethod("listtransactions", (params) => this.listTransactions(params));
       this.registerMethod("getwalletinfo", () => this.getWalletInfo());
+      this.registerMethod("getnewaddress", (params) => this.getNewAddress(params));
+      this.registerMethod("getbalance", (params) => this.getBalance(params));
+      this.registerMethod("sendtoaddress", (params) => this.sendToAddress(params));
+      this.registerMethod("listunspent", (params) => this.listUnspent(params));
+      this.registerMethod("signrawtransactionwithwallet", (params) =>
+        this.signRawTransactionWithWallet(params)
+      );
+      this.registerMethod("importdescriptors", (params) =>
+        this.importDescriptors(params)
+      );
     }
 
     // Descriptor methods (work without wallet)
     this.registerMethod("getdescriptorinfo", (params) => this.getDescriptorInfo(params));
     this.registerMethod("deriveaddresses", (params) => this.deriveAddresses(params));
+
+    // PSBT methods
+    this.registerMethod("createpsbt", (params) => this.createPSBT(params));
+    this.registerMethod("decodepsbt", (params) => this.decodePSBT(params));
+    this.registerMethod("combinepsbt", (params) => this.combinePSBTs(params));
+    this.registerMethod("finalizepsbt", (params) => this.finalizePSBT(params));
+
+    // Utility methods
+    this.registerMethod("help", (params) => this.help(params));
 
     // assumeUTXO methods
     this.registerMethod("loadtxoutset", (params) => this.loadTxoutset(params));
@@ -577,6 +614,8 @@ export class RPCServer {
    * getblockchaininfo: Returns blockchain state information.
    */
   private async getBlockchainInfo(): Promise<Record<string, unknown>> {
+    // Reload chain state from DB to pick up blocks connected by block sync
+    await this.chainState.load();
     const bestBlock = this.chainState.getBestBlock();
     const bestHeader = this.headerSync.getBestHeader();
 
@@ -893,6 +932,48 @@ export class RPCServer {
     }
 
     return result;
+  }
+
+  /**
+   * getblockcount: Returns the number of blocks in the best valid chain.
+   */
+  private async getBlockCount(): Promise<number> {
+    return this.chainState.getBestBlock().height;
+  }
+
+  /**
+   * getbestblockhash: Returns the hash of the best (tip) block.
+   */
+  private async getBestBlockHash(): Promise<string> {
+    return this.chainState.getBestBlock().hash.toString("hex");
+  }
+
+  /**
+   * getchaintips: Return information about all known tips in the block tree.
+   * Returns an array of tips with status, height, and hash.
+   */
+  private async getChainTips(): Promise<Array<Record<string, unknown>>> {
+    const tips: Array<Record<string, unknown>> = [];
+    const bestBlock = this.chainState.getBestBlock();
+
+    // For now, return just the active tip
+    // A full implementation would track all fork tips
+    tips.push({
+      height: bestBlock.height,
+      hash: bestBlock.hash.toString("hex"),
+      branchlen: 0,
+      status: "active",
+    });
+
+    return tips;
+  }
+
+  /**
+   * getdifficulty: Returns the current network difficulty.
+   */
+  private async getDifficulty(): Promise<number> {
+    const bestBlock = this.chainState.getBestBlock();
+    return this.calculateDifficulty(bestBlock.hash);
   }
 
   // ========== Transaction Methods ==========
@@ -1943,6 +2024,208 @@ export class RPCServer {
       // Cluster mempool fields
       miningScore: miningScore, // Effective fee rate (sat/vB) from chunk
     };
+  }
+
+  /**
+   * testmempoolaccept: Test transaction(s) for mempool acceptance without submitting.
+   * @param params [rawtxs, maxfeerate?]
+   */
+  private async testMempoolAccept(params: unknown[]): Promise<Array<Record<string, unknown>>> {
+    const [rawtxsParam, maxfeerateParam] = params;
+
+    if (!Array.isArray(rawtxsParam) || rawtxsParam.length === 0) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "rawtxs must be a non-empty array"
+      );
+    }
+
+    if (rawtxsParam.length > 25) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "Array must contain between 1 and 25 transactions"
+      );
+    }
+
+    // Parse maxfeerate (default 0.10 BTC/kvB)
+    let maxFeeRate = DEFAULT_MAX_FEE_RATE;
+    if (maxfeerateParam !== undefined && maxfeerateParam !== null) {
+      if (typeof maxfeerateParam !== "number" || maxfeerateParam < 0) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "maxfeerate must be a non-negative number"
+        );
+      }
+      maxFeeRate = maxfeerateParam;
+    }
+
+    const results: Array<Record<string, unknown>> = [];
+
+    for (const rawtx of rawtxsParam) {
+      if (typeof rawtx !== "string") {
+        results.push({
+          txid: "",
+          allowed: false,
+          "reject-reason": "TX decode failed: not a string",
+        });
+        continue;
+      }
+
+      try {
+        const txData = Buffer.from(rawtx, "hex");
+        const reader = new BufferReader(txData);
+        const tx = deserializeTx(reader);
+        const txid = getTxId(tx);
+        const txidHex = txid.toString("hex");
+
+        // Check if already in mempool
+        if (this.mempool.hasTransaction(txid)) {
+          results.push({
+            txid: txidHex,
+            allowed: false,
+            "reject-reason": "txn-already-in-mempool",
+          });
+          continue;
+        }
+
+        // Check if already confirmed
+        const isConfirmed = await this.mempool.isTransactionConfirmed(txid);
+        if (isConfirmed) {
+          results.push({
+            txid: txidHex,
+            allowed: false,
+            "reject-reason": "txn-already-known",
+          });
+          continue;
+        }
+
+        // Test mempool acceptance (dry run)
+        const result = await this.mempool.addTransaction(tx, { dryRun: true });
+
+        if (result.accepted) {
+          const vsize = getTxVSize(tx);
+          const feeRate = result.fee !== undefined ? Number(result.fee) / vsize : 0;
+          const feeRateBTCkvB = (feeRate * 1000) / 100_000_000;
+
+          // Check maxfeerate
+          if (maxFeeRate > 0 && feeRateBTCkvB > maxFeeRate) {
+            results.push({
+              txid: txidHex,
+              allowed: false,
+              "reject-reason": `max-fee-exceeded`,
+            });
+          } else {
+            const resultEntry: Record<string, unknown> = {
+              txid: txidHex,
+              wtxid: getWTxId(tx).toString("hex"),
+              allowed: true,
+              vsize,
+              fees: {
+                base: Number(result.fee ?? 0n) / 100_000_000,
+              },
+            };
+            results.push(resultEntry);
+          }
+        } else {
+          results.push({
+            txid: txidHex,
+            allowed: false,
+            "reject-reason": result.error || "rejected",
+          });
+        }
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        results.push({
+          txid: "",
+          allowed: false,
+          "reject-reason": `TX decode failed: ${message}`,
+        });
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * getmempoolancestors: Get all in-mempool ancestors of a transaction.
+   * @param params [txid, verbose?]
+   */
+  private async getMempoolAncestors(params: unknown[]): Promise<unknown> {
+    const [txidParam, verboseParam] = params;
+
+    if (typeof txidParam !== "string" || txidParam.length !== 64) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "txid must be a 64-character hex string"
+      );
+    }
+
+    const txid = Buffer.from(txidParam, "hex");
+    const entry = this.mempool.getTransaction(txid);
+
+    if (!entry) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "Transaction not in mempool"
+      );
+    }
+
+    const verbose = verboseParam === true;
+
+    // Get all ancestors (dependsOn contains parent txids)
+    const ancestors = new Set<string>(entry.dependsOn);
+
+    // Recursively get ancestors of ancestors
+    const visited = new Set<string>();
+    const toVisit = [...ancestors];
+    while (toVisit.length > 0) {
+      const ancestorHex = toVisit.pop()!;
+      if (visited.has(ancestorHex)) continue;
+      visited.add(ancestorHex);
+
+      const ancestorTxid = Buffer.from(ancestorHex, "hex");
+      const ancestorEntry = this.mempool.getTransaction(ancestorTxid);
+      if (ancestorEntry) {
+        for (const parentHex of ancestorEntry.dependsOn) {
+          if (!visited.has(parentHex)) {
+            ancestors.add(parentHex);
+            toVisit.push(parentHex);
+          }
+        }
+      }
+    }
+
+    if (!verbose) {
+      return Array.from(ancestors);
+    }
+
+    // Verbose mode: return detailed entries
+    const result: Record<string, Record<string, unknown>> = {};
+    for (const ancestorHex of ancestors) {
+      const ancestorTxid = Buffer.from(ancestorHex, "hex");
+      const ancestorEntry = this.mempool.getTransaction(ancestorTxid);
+      if (ancestorEntry) {
+        result[ancestorHex] = {
+          vsize: ancestorEntry.vsize,
+          weight: ancestorEntry.weight,
+          fee: Number(ancestorEntry.fee) / 100_000_000,
+          modifiedfee: Number(ancestorEntry.fee) / 100_000_000,
+          time: ancestorEntry.addedTime,
+          height: ancestorEntry.height,
+          descendantcount: ancestorEntry.spentBy.size + 1,
+          descendantsize: ancestorEntry.vsize,
+          descendantfees: Number(ancestorEntry.fee),
+          ancestorcount: ancestorEntry.dependsOn.size + 1,
+          ancestorsize: ancestorEntry.vsize,
+          ancestorfees: Number(ancestorEntry.fee),
+          depends: Array.from(ancestorEntry.dependsOn),
+          spentby: Array.from(ancestorEntry.spentBy),
+          "bip125-replaceable": this.mempool.isReplaceable(ancestorTxid),
+        };
+      }
+    }
+
+    return result;
   }
 
   // ========== Fee Estimation ==========
