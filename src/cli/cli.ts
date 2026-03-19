@@ -138,6 +138,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
           config.listen = value !== "0" && value !== "false";
           break;
         case "port":
+        case "p2p-port":
           if (value) config.port = parseInt(value, 10);
           break;
         case "log-level":
@@ -204,7 +205,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
   if (!args.some((a) => a.startsWith("--rpc-port"))) {
     config.rpcPort = getDefaultRpcPort(config.network);
   }
-  if (!args.some((a) => a.startsWith("--port"))) {
+  if (!args.some((a) => a.startsWith("--port") || a.startsWith("--p2p-port"))) {
     config.port = getDefaultP2PPort(config.network);
   }
 
@@ -397,6 +398,7 @@ async function startNode(config: NodeConfig): Promise<void> {
     params,
     bestHeight: bestBlock.height,
     datadir: mergedConfig.datadir,
+    connect: config.connect,
   });
 
   // Register header sync with peer manager

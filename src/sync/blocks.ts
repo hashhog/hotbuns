@@ -241,6 +241,18 @@ export class BlockSync {
         this.requestBlocks();
       }
     });
+
+    // When new headers arrive, re-enter IBD if we have blocks to download
+    peerManager.onMessage("headers", (_peer, _msg) => {
+      if (!this.running) return;
+      const bestHeader = this.headerSync.getBestHeader();
+      if (bestHeader && bestHeader.height >= this.state.nextHeightToProcess) {
+        if (this.ibdComplete) {
+          this.ibdComplete = false;
+        }
+        this.requestBlocks();
+      }
+    });
   }
 
   /**
