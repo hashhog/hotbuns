@@ -24,7 +24,7 @@ import {
 } from "../src/script/interpreter.js";
 
 const VECTOR_PATH =
-  "/home/max/hashhog/ouroboros/bitcoin/src/test/data/script_tests.json";
+  "/home/max/hashhog/bitcoin/src/test/data/script_tests.json";
 
 // ---------------------------------------------------------------------------
 // Opcode name lookup
@@ -251,9 +251,9 @@ function parseFlags(s: string): ScriptFlags {
       case "NULLFAIL": flags.verifyNullFail = true; break;
       case "TAPROOT": flags.verifyTaproot = true; break;
       case "MINIMALIF": flags.verifyMinimalIf = true; break;
-      case "SIGPUSHONLY":
-      case "MINIMALDATA":
-      case "DISCOURAGE_UPGRADABLE_NOPS":
+      case "MINIMALDATA": flags.verifyMinimalData = true; break;
+      case "SIGPUSHONLY": flags.verifySigPushOnly = true; break;
+      case "DISCOURAGE_UPGRADABLE_NOPS": flags.verifyDiscourageUpgradableNops = true; break;
       case "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM":
       case "DISCOURAGE_OP_SUCCESS":
       case "CONST_SCRIPTCODE":
