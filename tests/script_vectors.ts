@@ -22,6 +22,14 @@ import {
   type ScriptChunk,
   type Script,
 } from "../src/script/interpreter.js";
+import {
+  type Transaction,
+  type TxIn,
+  type TxOut,
+  getTxId,
+  sigHashLegacy,
+  sigHashWitnessV0,
+} from "../src/validation/tx.js";
 
 const VECTOR_PATH =
   "/home/max/hashhog/bitcoin/src/test/data/script_tests.json";
@@ -243,7 +251,7 @@ function parseFlags(s: string): ScriptFlags {
       case "DERSIG": flags.verifyDERSignatures = true; break;
       case "LOW_S": flags.verifyLowS = true; break;
       case "NULLDUMMY": flags.verifyNullDummy = true; break;
-      case "CLEANSTACK": /* no field */ break;
+      case "CLEANSTACK": flags.verifyCleanStack = true; break;
       case "CHECKLOCKTIMEVERIFY": flags.verifyCheckLockTimeVerify = true; break;
       case "CHECKSEQUENCEVERIFY": flags.verifyCheckSequenceVerify = true; break;
       case "WITNESS": flags.verifyWitness = true; break;
@@ -269,11 +277,66 @@ function parseFlags(s: string): ScriptFlags {
 }
 
 // ---------------------------------------------------------------------------
-// Dummy sig hasher (always returns zeros)
+// Crediting & spending transactions (matches Bitcoin Core's test approach)
 // ---------------------------------------------------------------------------
 
-function dummySigHasher(_subscript: Buffer, _hashType: number): Buffer {
-  return Buffer.alloc(32);
+/**
+ * Build a "crediting transaction" per Bitcoin Core's script_tests.cpp:
+ * - version 1, locktime 0
+ * - one input: null prevout (all-zero txid, vout=0xFFFFFFFF), scriptSig = OP_0 OP_0, sequence 0xFFFFFFFF
+ * - one output: scriptPubKey = test's scriptPubKey, value = 0
+ */
+function buildCreditingTx(scriptPubKey: Buffer): Transaction {
+  return {
+    version: 1,
+    inputs: [{
+      prevOut: { txid: Buffer.alloc(32, 0), vout: 0xFFFFFFFF },
+      scriptSig: Buffer.from([0x00, 0x00]), // OP_0 OP_0
+      sequence: 0xFFFFFFFF,
+      witness: [],
+    }],
+    outputs: [{
+      value: 0n,
+      scriptPubKey,
+    }],
+    lockTime: 0,
+  };
+}
+
+/**
+ * Build a "spending transaction" per Bitcoin Core's script_tests.cpp:
+ * - version 1, locktime 0
+ * - one input: prevout = txid of crediting tx : 0, scriptSig = test's scriptSig, sequence 0xFFFFFFFF
+ * - one output: scriptPubKey = empty, value = 0
+ */
+function buildSpendingTx(creditingTx: Transaction, scriptSig: Buffer): Transaction {
+  const creditTxId = getTxId(creditingTx);
+  return {
+    version: 1,
+    inputs: [{
+      prevOut: { txid: creditTxId, vout: 0 },
+      scriptSig,
+      sequence: 0xFFFFFFFF,
+      witness: [],
+    }],
+    outputs: [{
+      value: 0n,
+      scriptPubKey: Buffer.alloc(0),
+    }],
+    lockTime: 0,
+  };
+}
+
+/**
+ * Create a real sigHasher for a spending transaction.
+ * The sigHasher callback receives the subscript (already processed by the
+ * interpreter: sliced after OP_CODESEPARATOR, FindAndDelete applied for legacy)
+ * and the hashType byte from the signature.
+ */
+function makeSigHasher(spendingTx: Transaction, inputIndex: number): (subscript: Buffer, hashType: number) => Buffer {
+  return (subscript: Buffer, hashType: number): Buffer => {
+    return sigHashLegacy(spendingTx, inputIndex, subscript, hashType);
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -345,9 +408,21 @@ for (let i = 0; i < vectors.length; i++) {
   const flags = parseFlags(flagsStr);
   const witness: Buffer[] = [];
 
+  // Build crediting and spending transactions (Bitcoin Core approach)
+  const creditingTx = buildCreditingTx(scriptPubKey);
+  const spendingTx = buildSpendingTx(creditingTx, scriptSig);
+  const sigHasher = makeSigHasher(spendingTx, 0);
+
+  // Provide tx context for CLTV/CSV verification
+  const txContext = {
+    txVersion: spendingTx.version,
+    txLockTime: spendingTx.lockTime,
+    txSequence: spendingTx.inputs[0].sequence,
+  };
+
   let gotOK: boolean;
   try {
-    gotOK = verifyScript(scriptSig, scriptPubKey, witness, flags, dummySigHasher);
+    gotOK = verifyScript(scriptSig, scriptPubKey, witness, flags, sigHasher, undefined, txContext);
   } catch {
     gotOK = false;
   }
@@ -371,5 +446,5 @@ for (let i = 0; i < vectors.length; i++) {
 console.log(`script_tests.json results: ${pass} passed, ${fail} failed, ${skip} skipped, ${parseErrors} parse errors`);
 
 if (fail > 0) {
-  console.error(`NOTE: some failures expected due to dummy sig hasher (no real sig verification)`);
+  console.error(`NOTE: ${fail} test(s) failed with real signature verification`);
 }
