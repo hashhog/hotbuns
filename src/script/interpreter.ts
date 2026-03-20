@@ -10,7 +10,7 @@
  */
 
 import { sha256Hash, hash256, hash160, ecdsaVerify, schnorrVerify, taggedHash, tweakPublicKey } from "../crypto/primitives.js";
-import { ripemd160 } from "@noble/hashes/legacy.js";
+import { ripemd160, sha1 } from "@noble/hashes/legacy.js";
 import { AddressType } from "../address/encoding.js";
 import { schnorr } from "@noble/curves/secp256k1.js";
 
@@ -211,6 +211,9 @@ export interface ScriptFlags {
   verifyCheckSequenceVerify: boolean; // BIP 112 - consensus
   verifyWitnessPubkeyType: boolean; // BIP 141 - consensus (activated with SegWit)
   verifyMinimalIf?: boolean; // BIP 141 - policy for witness v0, consensus for tapscript
+  verifyMinimalData?: boolean; // BIP 62 - require minimal encoding for script numbers
+  verifySigPushOnly?: boolean; // policy - scriptSig must be push-only
+  verifyDiscourageUpgradableNops?: boolean; // policy - unused NOPs must error
 }
 
 /**
@@ -322,7 +325,7 @@ export function scriptNumEncode(n: number): Buffer {
   const bytes: number[] = [];
   while (absValue > 0) {
     bytes.push(absValue & 0xff);
-    absValue >>= 8;
+    absValue = Math.floor(absValue / 256);
   }
 
   // If the most significant byte has its high bit set, we need an extra byte
@@ -340,7 +343,7 @@ export function scriptNumEncode(n: number): Buffer {
  * Decode a Bitcoin script number.
  * Numbers are little-endian with a sign bit in the MSB of the last byte.
  */
-export function scriptNumDecode(buf: Buffer, maxLen: number = 4): number {
+export function scriptNumDecode(buf: Buffer, maxLen: number = 4, requireMinimal: boolean = false): number {
   if (buf.length === 0) {
     return 0;
   }
@@ -350,25 +353,33 @@ export function scriptNumDecode(buf: Buffer, maxLen: number = 4): number {
   }
 
   // Check for non-minimal encoding
-  if (buf.length > 1) {
-    // If the last byte is 0x00 or 0x80, and the second-to-last byte
-    // doesn't have its high bit set, then we have a non-minimal encoding
-    if ((buf[buf.length - 1] & 0x7f) === 0) {
-      if ((buf[buf.length - 2] & 0x80) === 0) {
-        throw new Error("Non-minimal script number encoding");
+  if (requireMinimal) {
+    if (buf.length === 1) {
+      // Single byte 0x00 is non-minimal (should be empty for zero)
+      // Single byte 0x80 is non-minimal (negative zero should be empty)
+      if (buf[0] === 0x00 || buf[0] === 0x80) {
+        throw new ScriptError("UNKNOWN");
+      }
+    } else if (buf.length > 1) {
+      // If the last byte is 0x00 or 0x80, and the second-to-last byte
+      // doesn't have its high bit set, then we have a non-minimal encoding
+      if ((buf[buf.length - 1] & 0x7f) === 0) {
+        if ((buf[buf.length - 2] & 0x80) === 0) {
+          throw new ScriptError("UNKNOWN");
+        }
       }
     }
   }
 
   let result = 0;
   for (let i = 0; i < buf.length; i++) {
-    result |= buf[i] << (8 * i);
+    result += buf[i] * (2 ** (8 * i));
   }
 
   // Check sign bit
   if (buf[buf.length - 1] & 0x80) {
     // Negative number - clear the sign bit and negate
-    return -(result & ~(0x80 << (8 * (buf.length - 1))));
+    return -(result - 0x80 * (2 ** (8 * (buf.length - 1))));
   }
 
   return result;
@@ -420,6 +431,48 @@ function checkMinimalIf(element: Buffer): boolean {
     return true; // Exactly [0x01] is valid (true)
   }
   return false; // All other values are invalid
+}
+
+/**
+ * Check if a push operation uses minimal encoding (MINIMALDATA rule, BIP 62).
+ * - Empty data should use OP_0 (not OP_PUSHDATA1 with length 0)
+ * - Single byte 0x01-0x10 should use OP_1-OP_16
+ * - Single byte 0x81 should use OP_1NEGATE
+ * - Data up to 75 bytes should use direct push (opcode = length)
+ * - Data 76-255 bytes should use OP_PUSHDATA1
+ * - Data 256-65535 bytes should use OP_PUSHDATA2
+ */
+function checkMinimalPush(chunk: ScriptChunk): boolean {
+  const data = chunk.data!;
+  const opcode = chunk.opcode;
+
+  if (data.length === 0) {
+    // Empty data should use OP_0
+    return opcode === Opcode.OP_0;
+  }
+  if (data.length === 1) {
+    if (data[0] >= 1 && data[0] <= 16) {
+      // Single byte 1-16 should use OP_1 through OP_16
+      return opcode === Opcode.OP_1 + (data[0] - 1);
+    }
+    if (data[0] === 0x81) {
+      // Single byte 0x81 should use OP_1NEGATE
+      return opcode === Opcode.OP_1NEGATE;
+    }
+  }
+  if (data.length <= 75) {
+    // Direct push: opcode should equal data length
+    return opcode === data.length;
+  }
+  if (data.length <= 255) {
+    // Should use OP_PUSHDATA1
+    return opcode === Opcode.OP_PUSHDATA1;
+  }
+  if (data.length <= 65535) {
+    // Should use OP_PUSHDATA2
+    return opcode === Opcode.OP_PUSHDATA2;
+  }
+  return true;
 }
 
 /**
@@ -732,9 +785,14 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
 
     // Push data operations
     if (chunk.data !== undefined) {
+      // PUSH_SIZE check applies even in unexecuted branches
+      if (chunk.data.length > MAX_ELEMENT_SIZE) {
+        return false;
+      }
       if (executing) {
-        if (chunk.data.length > MAX_ELEMENT_SIZE) {
-          return false;
+        // MINIMALDATA: Check that push uses minimal encoding
+        if (flags.verifyMinimalData && !checkMinimalPush(chunk)) {
+          throw new ScriptError("MINIMALDATA");
         }
         stack.push(chunk.data);
       }
@@ -816,14 +874,11 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
       continue;
     }
 
-    // Stack size check
-    if (stack.length + altStack.length > MAX_STACK_SIZE) {
-      return false;
-    }
-
     switch (opcode) {
       // Control
       case Opcode.OP_NOP:
+        break;
+
       case Opcode.OP_NOP1:
       case Opcode.OP_NOP4:
       case Opcode.OP_NOP5:
@@ -832,6 +887,9 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
       case Opcode.OP_NOP8:
       case Opcode.OP_NOP9:
       case Opcode.OP_NOP10:
+        if (flags.verifyDiscourageUpgradableNops) {
+          throw new ScriptError("DISCOURAGE_UPGRADABLE_NOPS");
+        }
         break;
 
       case Opcode.OP_VERIFY: {
@@ -975,7 +1033,7 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
 
       case Opcode.OP_PICK: {
         if (stack.length < 1) return false;
-        const n = scriptNumDecode(stack.pop()!);
+        const n = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         if (n < 0 || n >= stack.length) return false;
         stack.push(Buffer.from(stack[stack.length - 1 - n]));
         break;
@@ -983,7 +1041,7 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
 
       case Opcode.OP_ROLL: {
         if (stack.length < 1) return false;
-        const n = scriptNumDecode(stack.pop()!);
+        const n = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         if (n < 0 || n >= stack.length) return false;
         const item = stack.splice(stack.length - 1 - n, 1)[0];
         stack.push(item);
@@ -1039,155 +1097,155 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
       // Arithmetic
       case Opcode.OP_1ADD: {
         if (stack.length < 1) return false;
-        const n = scriptNumDecode(stack.pop()!);
+        const n = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(n + 1));
         break;
       }
 
       case Opcode.OP_1SUB: {
         if (stack.length < 1) return false;
-        const n = scriptNumDecode(stack.pop()!);
+        const n = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(n - 1));
         break;
       }
 
       case Opcode.OP_NEGATE: {
         if (stack.length < 1) return false;
-        const n = scriptNumDecode(stack.pop()!);
+        const n = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(-n));
         break;
       }
 
       case Opcode.OP_ABS: {
         if (stack.length < 1) return false;
-        const n = scriptNumDecode(stack.pop()!);
+        const n = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(Math.abs(n)));
         break;
       }
 
       case Opcode.OP_NOT: {
         if (stack.length < 1) return false;
-        const n = scriptNumDecode(stack.pop()!);
+        const n = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(n === 0 ? 1 : 0));
         break;
       }
 
       case Opcode.OP_0NOTEQUAL: {
         if (stack.length < 1) return false;
-        const n = scriptNumDecode(stack.pop()!);
+        const n = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(n !== 0 ? 1 : 0));
         break;
       }
 
       case Opcode.OP_ADD: {
         if (stack.length < 2) return false;
-        const b = scriptNumDecode(stack.pop()!);
-        const a = scriptNumDecode(stack.pop()!);
+        const b = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
+        const a = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(a + b));
         break;
       }
 
       case Opcode.OP_SUB: {
         if (stack.length < 2) return false;
-        const b = scriptNumDecode(stack.pop()!);
-        const a = scriptNumDecode(stack.pop()!);
+        const b = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
+        const a = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(a - b));
         break;
       }
 
       case Opcode.OP_BOOLAND: {
         if (stack.length < 2) return false;
-        const b = scriptNumDecode(stack.pop()!);
-        const a = scriptNumDecode(stack.pop()!);
+        const b = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
+        const a = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(a !== 0 && b !== 0 ? 1 : 0));
         break;
       }
 
       case Opcode.OP_BOOLOR: {
         if (stack.length < 2) return false;
-        const b = scriptNumDecode(stack.pop()!);
-        const a = scriptNumDecode(stack.pop()!);
+        const b = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
+        const a = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(a !== 0 || b !== 0 ? 1 : 0));
         break;
       }
 
       case Opcode.OP_NUMEQUAL: {
         if (stack.length < 2) return false;
-        const b = scriptNumDecode(stack.pop()!);
-        const a = scriptNumDecode(stack.pop()!);
+        const b = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
+        const a = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(a === b ? 1 : 0));
         break;
       }
 
       case Opcode.OP_NUMEQUALVERIFY: {
         if (stack.length < 2) return false;
-        const b = scriptNumDecode(stack.pop()!);
-        const a = scriptNumDecode(stack.pop()!);
+        const b = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
+        const a = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         if (a !== b) return false;
         break;
       }
 
       case Opcode.OP_NUMNOTEQUAL: {
         if (stack.length < 2) return false;
-        const b = scriptNumDecode(stack.pop()!);
-        const a = scriptNumDecode(stack.pop()!);
+        const b = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
+        const a = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(a !== b ? 1 : 0));
         break;
       }
 
       case Opcode.OP_LESSTHAN: {
         if (stack.length < 2) return false;
-        const b = scriptNumDecode(stack.pop()!);
-        const a = scriptNumDecode(stack.pop()!);
+        const b = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
+        const a = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(a < b ? 1 : 0));
         break;
       }
 
       case Opcode.OP_GREATERTHAN: {
         if (stack.length < 2) return false;
-        const b = scriptNumDecode(stack.pop()!);
-        const a = scriptNumDecode(stack.pop()!);
+        const b = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
+        const a = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(a > b ? 1 : 0));
         break;
       }
 
       case Opcode.OP_LESSTHANOREQUAL: {
         if (stack.length < 2) return false;
-        const b = scriptNumDecode(stack.pop()!);
-        const a = scriptNumDecode(stack.pop()!);
+        const b = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
+        const a = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(a <= b ? 1 : 0));
         break;
       }
 
       case Opcode.OP_GREATERTHANOREQUAL: {
         if (stack.length < 2) return false;
-        const b = scriptNumDecode(stack.pop()!);
-        const a = scriptNumDecode(stack.pop()!);
+        const b = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
+        const a = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(a >= b ? 1 : 0));
         break;
       }
 
       case Opcode.OP_MIN: {
         if (stack.length < 2) return false;
-        const b = scriptNumDecode(stack.pop()!);
-        const a = scriptNumDecode(stack.pop()!);
+        const b = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
+        const a = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(Math.min(a, b)));
         break;
       }
 
       case Opcode.OP_MAX: {
         if (stack.length < 2) return false;
-        const b = scriptNumDecode(stack.pop()!);
-        const a = scriptNumDecode(stack.pop()!);
+        const b = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
+        const a = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(Math.max(a, b)));
         break;
       }
 
       case Opcode.OP_WITHIN: {
         if (stack.length < 3) return false;
-        const max = scriptNumDecode(stack.pop()!);
-        const min = scriptNumDecode(stack.pop()!);
-        const x = scriptNumDecode(stack.pop()!);
+        const max = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
+        const min = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
+        const x = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         stack.push(scriptNumEncode(x >= min && x < max ? 1 : 0));
         break;
       }
@@ -1197,6 +1255,13 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
         if (stack.length < 1) return false;
         const data = stack.pop()!;
         stack.push(Buffer.from(ripemd160(data)));
+        break;
+      }
+
+      case Opcode.OP_SHA1: {
+        if (stack.length < 1) return false;
+        const data = stack.pop()!;
+        stack.push(Buffer.from(sha1(data)));
         break;
       }
 
@@ -1307,7 +1372,7 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
         const sig = stack.pop()!;
 
         // Decode n as a script number
-        const n = scriptNumDecode(nElement);
+        const n = scriptNumDecode(nElement, 4, !!flags.verifyMinimalData);
 
         // Verify signature
         let sigResult = 0;
@@ -1342,7 +1407,7 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
 
         // Get n (number of pubkeys)
         if (stack.length < 1) return false;
-        const n = scriptNumDecode(stack.pop()!);
+        const n = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         if (n < 0 || n > MAX_PUBKEYS_PER_MULTISIG) return false;
 
         opCount += n;
@@ -1366,7 +1431,7 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
 
         // Get m (number of required signatures)
         if (stack.length < 1) return false;
-        const m = scriptNumDecode(stack.pop()!);
+        const m = scriptNumDecode(stack.pop()!, 4, !!flags.verifyMinimalData);
         if (m < 0 || m > n) return false;
 
         // Get signatures
@@ -1455,6 +1520,11 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
       default:
         // Unknown opcode
         return false;
+    }
+
+    // Stack size check (after each operation)
+    if (stack.length + altStack.length > MAX_STACK_SIZE) {
+      return false;
     }
   }
 
@@ -1663,6 +1733,11 @@ export function verifyScript(
     return false;
   }
 
+  // SIG_PUSHONLY: When flag is set, scriptSig must be push-only
+  if (flags.verifySigPushOnly && !isPushOnly(scriptSig)) {
+    throw new ScriptError("SIG_PUSHONLY");
+  }
+
   // Step 1: Execute scriptSig
   const stack: Buffer[] = [];
   const ctx: ExecutionContext = {
@@ -1679,6 +1754,9 @@ export function verifyScript(
 
   // Copy stack for potential P2SH evaluation
   const stackCopy = stack.map((b) => Buffer.from(b));
+
+  // Clear altstack between scriptSig and scriptPubKey (they don't share altstack)
+  ctx.altStack.length = 0;
 
   // Step 2: Execute scriptPubKey
   if (!executeScript(parsedPubKey, ctx)) {
