@@ -9,7 +9,7 @@
  * - P2TR (Pay to Taproot) - basic support
  */
 
-import { sha256Hash, hash256, hash160, ecdsaVerify, schnorrVerify, taggedHash, tweakPublicKey } from "../crypto/primitives.js";
+import { sha256Hash, hash256, hash160, ecdsaVerifyLax, schnorrVerify, taggedHash, tweakPublicKey } from "../crypto/primitives.js";
 import { ripemd160, sha1 } from "@noble/hashes/legacy.js";
 import { AddressType } from "../address/encoding.js";
 import { schnorr } from "@noble/curves/secp256k1.js";
@@ -214,6 +214,7 @@ export interface ScriptFlags {
   verifyMinimalData?: boolean; // BIP 62 - require minimal encoding for script numbers
   verifySigPushOnly?: boolean; // policy - scriptSig must be push-only
   verifyDiscourageUpgradableNops?: boolean; // policy - unused NOPs must error
+  verifyCleanStack?: boolean; // BIP 62 - stack must have exactly one element after execution
 }
 
 /**
@@ -235,6 +236,10 @@ export interface ExecutionContext {
   flags: ScriptFlags;
   sigHasher: (subscript: Buffer, hashType: number) => Buffer;
   sigVersion?: SigVersion;
+  // Transaction context for CLTV/CSV
+  txVersion?: number; // Spending tx version
+  txLockTime?: number; // Spending tx locktime
+  txSequence?: number; // Spending input sequence
   // Tapscript-specific fields
   taprootSigHasher?: (hashType: number, codeSepPos: number) => Buffer;
   sigopsBudget?: number; // Remaining sigops for tapscript
@@ -396,6 +401,131 @@ function isCompressedPubKey(pubkey: Buffer): boolean {
   if (pubkey[0] !== 0x02 && pubkey[0] !== 0x03) {
     return false;
   }
+  return true;
+}
+
+/**
+ * Check if a public key is valid for STRICTENC purposes.
+ * Valid formats: compressed (02/03 + 32 bytes), uncompressed (04 + 64 bytes).
+ * Hybrid keys (06/07) are NOT valid under STRICTENC.
+ */
+function isValidPubKeyEncoding(pubkey: Buffer): boolean {
+  if (pubkey.length < 1) return false;
+  if (pubkey[0] === 0x04) {
+    return pubkey.length === 65; // Uncompressed
+  }
+  if (pubkey[0] === 0x02 || pubkey[0] === 0x03) {
+    return pubkey.length === 33; // Compressed
+  }
+  return false;
+}
+
+/**
+ * Check if a signature is valid strict DER encoding (BIP66).
+ * This is a pure format check; it does NOT verify the signature cryptographically.
+ */
+function isValidSignatureEncoding(sig: Buffer): boolean {
+  // Format: 0x30 [total-length] 0x02 [R-length] [R] 0x02 [S-length] [S]
+  if (sig.length < 8) return false;
+  if (sig.length > 72) return false;
+  if (sig[0] !== 0x30) return false;
+  if (sig[1] !== sig.length - 2) return false;
+  if (sig[2] !== 0x02) return false;
+
+  const rLen = sig[3];
+  if (rLen === 0) return false;
+  if (5 + rLen >= sig.length) return false;
+  if (sig[4 + rLen] !== 0x02) return false;
+
+  const sLen = sig[5 + rLen];
+  if (sLen === 0) return false;
+  if (6 + rLen + sLen !== sig.length) return false;
+
+  // R must not be negative
+  if (sig[4] & 0x80) return false;
+  // R must not have unnecessary leading zeros
+  if (rLen > 1 && sig[4] === 0x00 && !(sig[5] & 0x80)) return false;
+
+  // S must not be negative
+  const sStart = 6 + rLen;
+  if (sig[sStart] & 0x80) return false;
+  // S must not have unnecessary leading zeros
+  if (sLen > 1 && sig[sStart] === 0x00 && !(sig[sStart + 1] & 0x80)) return false;
+
+  return true;
+}
+
+/**
+ * Check if a signature has a valid defined hashtype (STRICTENC).
+ */
+function isDefinedHashtypeSignature(sig: Buffer): boolean {
+  if (sig.length === 0) return true;
+  const hashType = sig[sig.length - 1] & ~0x80; // Strip ANYONECANPAY
+  if (hashType < 1 || hashType > 3) return false; // Must be ALL, NONE, or SINGLE
+  return true;
+}
+
+/** secp256k1 curve order */
+const SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141n;
+const SECP256K1_N_HALF = SECP256K1_N / 2n;
+
+/**
+ * Check if a signature has low S value (BIP62 rule 5).
+ * The S value must be at most half the curve order.
+ */
+function isLowDERSignature(sig: Buffer): boolean {
+  if (!isValidSignatureEncoding(sig)) return false;
+  const rLen = sig[3];
+  const sLen = sig[5 + rLen];
+  const sStart = 6 + rLen;
+  const sBytes = sig.subarray(sStart, sStart + sLen);
+  let s = 0n;
+  for (let i = 0; i < sBytes.length; i++) {
+    s = (s << 8n) | BigInt(sBytes[i]);
+  }
+  return s <= SECP256K1_N_HALF;
+}
+
+/**
+ * Validate a signature against the active flags. Returns true if valid (or check not required).
+ * Throws ScriptError with the appropriate code if invalid.
+ */
+function checkSignatureEncoding(sig: Buffer, flags: ScriptFlags): boolean {
+  if (sig.length === 0) return true;
+
+  // DERSIG: signature must be strict DER
+  if ((flags.verifyDERSignatures || flags.verifyStrictEncoding) && !isValidSignatureEncoding(sig.subarray(0, sig.length - 1))) {
+    throw new ScriptError("SIG_DER");
+  }
+
+  // STRICTENC: hash type must be defined
+  if (flags.verifyStrictEncoding && !isDefinedHashtypeSignature(sig)) {
+    throw new ScriptError("SIG_HASHTYPE");
+  }
+
+  // LOW_S: S value must be low
+  if (flags.verifyLowS && !isLowDERSignature(sig.subarray(0, sig.length - 1))) {
+    throw new ScriptError("SIG_HIGH_S");
+  }
+
+  return true;
+}
+
+/**
+ * Validate a public key against the active flags.
+ * Throws ScriptError with the appropriate code if invalid.
+ */
+function checkPubKeyEncoding(pubkey: Buffer, flags: ScriptFlags, sigVersion: SigVersion): boolean {
+  // STRICTENC: pubkey must be valid compressed or uncompressed
+  if (flags.verifyStrictEncoding && !isValidPubKeyEncoding(pubkey)) {
+    throw new ScriptError("PUBKEYTYPE");
+  }
+
+  // WITNESS_PUBKEYTYPE: In witness v0, pubkeys must be compressed
+  if (flags.verifyWitnessPubkeyType && sigVersion === SigVersion.WITNESS_V0 && !isCompressedPubKey(pubkey)) {
+    throw new ScriptError("WITNESS_PUBKEYTYPE");
+  }
+
   return true;
 }
 
@@ -904,24 +1034,75 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
 
       case Opcode.OP_CHECKLOCKTIMEVERIFY: {
         if (!flags.verifyCheckLockTimeVerify) {
+          if (flags.verifyDiscourageUpgradableNops) {
+            throw new ScriptError("DISCOURAGE_UPGRADABLE_NOPS");
+          }
           break; // Treated as NOP
         }
         if (stack.length < 1) return false;
         // Value is checked but not popped
         const locktime = scriptNumDecode(stack[stack.length - 1], 5);
-        if (locktime < 0) return false;
-        // Additional locktime validation would happen here with tx context
+        if (locktime < 0) throw new ScriptError("NEGATIVE_LOCKTIME");
+
+        // Compare against tx locktime (if context available)
+        if (ctx.txLockTime !== undefined) {
+          const txLockTime = ctx.txLockTime;
+          // Both must be in the same domain (block height vs time)
+          const LOCKTIME_THRESHOLD = 500000000;
+          if (
+            (locktime < LOCKTIME_THRESHOLD && txLockTime >= LOCKTIME_THRESHOLD) ||
+            (locktime >= LOCKTIME_THRESHOLD && txLockTime < LOCKTIME_THRESHOLD)
+          ) {
+            throw new ScriptError("UNSATISFIED_LOCKTIME");
+          }
+          if (locktime > txLockTime) {
+            throw new ScriptError("UNSATISFIED_LOCKTIME");
+          }
+          // Sequence must not be final (0xFFFFFFFF disables locktime check)
+          if (ctx.txSequence !== undefined && ctx.txSequence === 0xFFFFFFFF) {
+            throw new ScriptError("UNSATISFIED_LOCKTIME");
+          }
+        }
         break;
       }
 
       case Opcode.OP_CHECKSEQUENCEVERIFY: {
         if (!flags.verifyCheckSequenceVerify) {
+          if (flags.verifyDiscourageUpgradableNops) {
+            throw new ScriptError("DISCOURAGE_UPGRADABLE_NOPS");
+          }
           break; // Treated as NOP
         }
         if (stack.length < 1) return false;
         const sequence = scriptNumDecode(stack[stack.length - 1], 5);
-        if (sequence < 0) return false;
-        // Additional sequence validation would happen here with tx context
+        if (sequence < 0) throw new ScriptError("NEGATIVE_LOCKTIME");
+
+        // If the disable flag (bit 31) is set, CSV is a no-op
+        if (sequence & (1 << 31)) break;
+
+        // CSV requires tx version >= 2
+        if (ctx.txVersion !== undefined && ctx.txVersion < 2) {
+          throw new ScriptError("UNSATISFIED_LOCKTIME");
+        }
+
+        // Compare against input sequence (if context available)
+        if (ctx.txSequence !== undefined) {
+          const txSeq = ctx.txSequence;
+          // If input sequence has disable flag set, fail
+          if (txSeq & (1 << 31)) {
+            throw new ScriptError("UNSATISFIED_LOCKTIME");
+          }
+          // Both must be in the same type (time vs height)
+          const TYPE_FLAG = 1 << 22;
+          if ((sequence & TYPE_FLAG) !== (txSeq & TYPE_FLAG)) {
+            throw new ScriptError("UNSATISFIED_LOCKTIME");
+          }
+          // Compare masked values
+          const MASK = 0x0000ffff;
+          if ((sequence & MASK) > (txSeq & MASK)) {
+            throw new ScriptError("UNSATISFIED_LOCKTIME");
+          }
+        }
         break;
       }
 
@@ -1315,14 +1496,9 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
         } else {
           // Legacy or witness v0: use ECDSA
 
-          // WITNESS_PUBKEYTYPE: In witness v0, pubkeys must be compressed
-          if (
-            flags.verifyWitnessPubkeyType &&
-            sigVersion === SigVersion.WITNESS_V0 &&
-            !isCompressedPubKey(pubkey)
-          ) {
-            return false;
-          }
+          // Validate signature and pubkey encoding per active flags
+          checkSignatureEncoding(sig, flags);
+          checkPubKeyEncoding(pubkey, flags, sigVersion);
 
           if (sig.length > 0) {
             const hashType = sig[sig.length - 1];
@@ -1340,7 +1516,7 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
             }
 
             const sighash = sigHasher(subscript, hashType);
-            success = ecdsaVerify(sigBytes, sighash, pubkey);
+            success = ecdsaVerifyLax(sigBytes, sighash, pubkey);
           }
 
           // NULLFAIL: If signature check fails and signature is non-empty, fail
@@ -1417,16 +1593,7 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
         if (stack.length < n) return false;
         const pubkeys: Buffer[] = [];
         for (let i = 0; i < n; i++) {
-          const pubkey = stack.pop()!;
-          // WITNESS_PUBKEYTYPE: In witness v0, pubkeys must be compressed
-          if (
-            flags.verifyWitnessPubkeyType &&
-            sigVersion === SigVersion.WITNESS_V0 &&
-            !isCompressedPubKey(pubkey)
-          ) {
-            return false;
-          }
-          pubkeys.push(pubkey);
+          pubkeys.push(stack.pop()!);
         }
 
         // Get m (number of required signatures)
@@ -1473,12 +1640,16 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
           const sig = sigs[iSig];
           const pubkey = pubkeys[iKey];
 
+          // Check encoding of signature and pubkey when actually testing them
+          checkSignatureEncoding(sig, flags);
+          checkPubKeyEncoding(pubkey, flags, sigVersion);
+
           let sigValid = false;
           if (sig.length > 0) {
             const hashType = sig[sig.length - 1];
             const sigBytes = sig.subarray(0, sig.length - 1);
             const sighash = sigHasher(subscript, hashType);
-            sigValid = ecdsaVerify(sigBytes, sighash, pubkey);
+            sigValid = ecdsaVerifyLax(sigBytes, sighash, pubkey);
           }
           // Empty signatures always fail (sigValid remains false)
 
@@ -1716,7 +1887,8 @@ export function verifyScript(
   witness: Buffer[],
   flags: ScriptFlags,
   sigHasher: (subscript: Buffer, hashType: number) => Buffer,
-  taprootCtx?: TaprootContext
+  taprootCtx?: TaprootContext,
+  txContext?: { txVersion: number; txLockTime: number; txSequence: number }
 ): boolean {
   // Check script size limits
   if (scriptSig.length > MAX_SCRIPT_SIZE || scriptPubKey.length > MAX_SCRIPT_SIZE) {
@@ -1745,6 +1917,9 @@ export function verifyScript(
     altStack: [],
     flags,
     sigHasher,
+    txVersion: txContext?.txVersion,
+    txLockTime: txContext?.txLockTime,
+    txSequence: txContext?.txSequence,
     sigVersion: SigVersion.BASE,
   };
 
@@ -1801,6 +1976,9 @@ export function verifyScript(
       flags,
       sigHasher,
       sigVersion: SigVersion.BASE,
+      txVersion: txContext?.txVersion,
+      txLockTime: txContext?.txLockTime,
+      txSequence: txContext?.txSequence,
     };
 
     if (!executeScript(parsedRedeem, p2shCtx)) {
@@ -1809,6 +1987,11 @@ export function verifyScript(
 
     if (p2shStack.length === 0 || !castToBool(p2shStack[p2shStack.length - 1])) {
       return false;
+    }
+
+    // CLEANSTACK: after P2SH evaluation, stack must have exactly one element
+    if (flags.verifyCleanStack && p2shStack.length !== 1) {
+      throw new ScriptError("CLEANSTACK");
     }
 
     // Check for P2SH-wrapped witness
@@ -1820,6 +2003,13 @@ export function verifyScript(
         return verifyWitnessV0(redeemScript, witness, flags, sigHasher);
       }
     }
+
+    return true;
+  }
+
+  // CLEANSTACK: after non-P2SH evaluation, stack must have exactly one element
+  if (flags.verifyCleanStack && stack.length !== 1) {
+    throw new ScriptError("CLEANSTACK");
   }
 
   // Step 4: Native SegWit evaluation

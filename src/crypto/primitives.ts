@@ -270,6 +270,7 @@ export function ecdsaSign(msgHash: Buffer, privateKey: Buffer): Buffer {
 
 /**
  * Verify a DER-encoded ECDSA signature against a public key and message hash.
+ * Uses strict DER parsing (rejects non-canonical encodings).
  */
 export function ecdsaVerify(
   signature: Buffer,
@@ -278,6 +279,148 @@ export function ecdsaVerify(
 ): boolean {
   try {
     return secp256k1.verify(signature, msgHash, publicKey, { prehash: false, format: "der" });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Lax DER signature parser matching Bitcoin Core's ecdsa_signature_parse_der_lax.
+ * Handles non-strict DER encoding (excessive padding, non-minimal lengths, etc.)
+ * that OpenSSL historically accepted.
+ *
+ * Returns {r, s} as bigints, or null if completely unparseable.
+ */
+function laxDerParse(sig: Buffer): { r: bigint; s: bigint } | null {
+  let pos = 0;
+  const len = sig.length;
+
+  // Sequence tag
+  if (pos >= len || sig[pos] !== 0x30) return null;
+  pos++;
+
+  // Sequence length (skip, may be non-minimal)
+  if (pos >= len) return null;
+  let seqLen = sig[pos++];
+  if (seqLen & 0x80) {
+    const numBytes = seqLen & 0x7f;
+    seqLen = 0;
+    for (let i = 0; i < numBytes && pos < len; i++) {
+      seqLen = (seqLen << 8) | sig[pos++];
+    }
+  }
+
+  // Parse R
+  if (pos >= len || sig[pos] !== 0x02) return null;
+  pos++;
+
+  if (pos >= len) return null;
+  let rLen = sig[pos++];
+  if (rLen & 0x80) {
+    const numBytes = rLen & 0x7f;
+    rLen = 0;
+    for (let i = 0; i < numBytes && pos < len; i++) {
+      rLen = (rLen << 8) | sig[pos++];
+    }
+  }
+  if (pos + rLen > len) return null;
+
+  // Extract R value, skip leading zeros
+  let rStart = pos;
+  let rEnd = pos + rLen;
+  while (rStart < rEnd && sig[rStart] === 0x00) rStart++;
+  pos += rLen;
+
+  let r = 0n;
+  for (let i = rStart; i < rEnd; i++) {
+    r = (r << 8n) | BigInt(sig[i]);
+  }
+
+  // Parse S
+  if (pos >= len || sig[pos] !== 0x02) return null;
+  pos++;
+
+  if (pos >= len) return null;
+  let sLen = sig[pos++];
+  if (sLen & 0x80) {
+    const numBytes = sLen & 0x7f;
+    sLen = 0;
+    for (let i = 0; i < numBytes && pos < len; i++) {
+      sLen = (sLen << 8) | sig[pos++];
+    }
+  }
+  if (pos + sLen > len) return null;
+
+  // Extract S value, skip leading zeros
+  let sStart = pos;
+  let sEnd = pos + sLen;
+  while (sStart < sEnd && sig[sStart] === 0x00) sStart++;
+
+  let s = 0n;
+  for (let i = sStart; i < sEnd; i++) {
+    s = (s << 8n) | BigInt(sig[i]);
+  }
+
+  if (r === 0n || s === 0n) return null;
+  return { r, s };
+}
+
+/**
+ * Re-encode (r, s) bigints into a canonical DER signature.
+ */
+function encodeStrictDER(r: bigint, s: bigint): Buffer {
+  // Convert to minimal big-endian byte arrays
+  function bigintToMinBytes(n: bigint): Buffer {
+    let hex = n.toString(16);
+    if (hex.length % 2 !== 0) hex = '0' + hex;
+    const buf = Buffer.from(hex, 'hex');
+    // Add leading 0x00 if high bit is set (to keep positive in DER signed integer)
+    if (buf[0] & 0x80) {
+      return Buffer.concat([Buffer.from([0x00]), buf]);
+    }
+    return buf;
+  }
+
+  const rDer = bigintToMinBytes(r);
+  const sDer = bigintToMinBytes(s);
+  const totalLen = 2 + rDer.length + 2 + sDer.length;
+
+  return Buffer.concat([
+    Buffer.from([0x30, totalLen, 0x02, rDer.length]),
+    rDer,
+    Buffer.from([0x02, sDer.length]),
+    sDer,
+  ]);
+}
+
+/**
+ * Verify an ECDSA signature using lax DER parsing.
+ * This matches Bitcoin Core's behavior when SCRIPT_VERIFY_DERSIG is not set:
+ * non-strict DER encodings are accepted as long as the (r,s) values are valid.
+ * Also handles hybrid pubkeys (0x06/0x07 prefix).
+ */
+export function ecdsaVerifyLax(
+  signature: Buffer,
+  msgHash: Buffer,
+  publicKey: Buffer
+): boolean {
+  // Handle hybrid pubkeys (0x06/0x07) by converting to uncompressed (0x04)
+  let pk = publicKey;
+  if (pk.length === 65 && (pk[0] === 0x06 || pk[0] === 0x07)) {
+    pk = Buffer.from(pk);
+    pk[0] = 0x04;
+  }
+
+  try {
+    // Always use lax DER parsing: extract (r,s), re-encode as canonical DER.
+    // This handles non-strict DER (extra padding, non-minimal lengths, etc.)
+    // that OpenSSL historically accepted.
+    // Use lowS: false because high-S signatures are valid in Bitcoin when
+    // SCRIPT_VERIFY_LOW_S is not set. The interpreter handles LOW_S enforcement separately.
+    const parsed = laxDerParse(signature);
+    if (!parsed) return false;
+    const strictDer = encodeStrictDER(parsed.r, parsed.s);
+    return secp256k1.verify(strictDer, msgHash, pk, { prehash: false, format: "der", lowS: false });
   } catch {
     return false;
   }
