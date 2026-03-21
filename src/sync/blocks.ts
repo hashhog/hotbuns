@@ -531,6 +531,18 @@ export class BlockSync {
     } finally {
       this.processing = false;
     }
+
+    // Blocks may have arrived while we held the processing lock.  Check if
+    // the next block we need is already downloaded and, if so, process it
+    // immediately rather than waiting for the next handleBlock call.
+    const bestHeader = this.headerSync.getBestHeader();
+    if (bestHeader && this.state.nextHeightToProcess <= bestHeader.height) {
+      const nextEntry = this.headerSync.getHeaderByHeight(this.state.nextHeightToProcess);
+      if (nextEntry && this.state.downloadedBlocks.has(nextEntry.hash.toString("hex"))) {
+        // Re-enter (the processing flag is now false so this will proceed)
+        await this.processOrderedBlocks();
+      }
+    }
   }
 
   private async processOrderedBlocksInner(): Promise<void> {
@@ -560,9 +572,23 @@ export class BlockSync {
       const success = await this.connectBlock(block, height);
 
       if (!success) {
-        // Block validation failed - stop processing
-        // The block will be removed and re-requested from another peer
-        console.error(`Block validation failed at height ${height}`);
+        // Block validation failed - remove from downloaded to avoid infinite
+        // retry loop.  The failed block may have partially modified the UTXO
+        // cache (spending inputs / adding outputs for earlier txs in the
+        // block), so we must clear the in-memory cache and let it be
+        // re-populated from the database on the next attempt.
+        console.error(`Block validation failed at height ${height}, discarding and re-requesting`);
+        this.state.downloadedBlocks.delete(hashHex);
+
+        // Reset the UTXO cache to avoid corrupt state from partial processing
+        this.utxoManager.clearCache();
+
+        // Reset nextHeightToRequest so the block will be re-requested
+        // from a (potentially different) peer
+        if (height < this.state.nextHeightToRequest) {
+          this.state.nextHeightToRequest = height;
+        }
+
         break;
       }
 
@@ -769,15 +795,14 @@ export class BlockSync {
     const undoData = serializeUndoData(spentOutputs);
     await this.db.putUndoData(blockHash, undoData);
 
-    // Sync UTXO cache to DB (writes dirty entries but keeps them cached
-    // so subsequent blocks can find them without hitting the DB again)
-    this.utxoManager.setBestBlock(blockHash);
-    await this.utxoManager.flushDirty();
-
-    // Store block data and index
+    // Store block data first (independent of UTXO state)
     const rawBlock = serializeBlock(block);
     await this.db.putBlock(blockHash, rawBlock);
 
+    // Build extra operations to commit atomically with the UTXO flush:
+    // block index, height->hash mapping, and chain state.  This prevents
+    // a crash from leaving the UTXO set ahead of the recorded chain tip
+    // (which would cause "Missing UTXO" errors on the next restart).
     const blockRecord: BlockIndexRecord = {
       height,
       header: serializeBlockHeader(block.header),
@@ -786,7 +811,7 @@ export class BlockSync {
       dataPos: 1, // Block data exists
     };
     const indexValue = this.serializeBlockIndex(blockRecord);
-    const batchOps: BatchOperation[] = [
+    const extraOps: BatchOperation[] = [
       {
         type: "put",
         prefix: DBPrefix.BLOCK_INDEX,
@@ -800,17 +825,26 @@ export class BlockSync {
         value: blockHash,
       },
     ];
-    await this.db.batch(batchOps);
 
-    // Update chain state
+    // Include chain state in the same atomic batch
     const headerEntry2 = this.headerSync.getHeaderByHeight(height);
     if (headerEntry2) {
-      await this.db.putChainState({
-        bestBlockHash: blockHash,
-        bestHeight: height,
-        totalWork: headerEntry2.chainWork,
+      const chainStateValue = this.serializeChainState(
+        blockHash,
+        height,
+        headerEntry2.chainWork
+      );
+      extraOps.push({
+        type: "put",
+        prefix: DBPrefix.CHAIN_STATE,
+        key: Buffer.alloc(0),
+        value: chainStateValue,
       });
     }
+
+    // Sync UTXO cache + block index + chain state atomically
+    this.utxoManager.setBestBlock(blockHash);
+    await this.utxoManager.flushDirty(extraOps);
 
     // Update peer manager's best height
     if (this.peerManager) {
@@ -980,6 +1014,28 @@ export class BlockSync {
     writer.writeUInt32LE(record.nTx);
     writer.writeUInt32LE(record.status);
     writer.writeUInt32LE(record.dataPos);
+    return writer.toBuffer();
+  }
+
+  /**
+   * Serialize chain state for atomic batch writes.
+   * Must match the format used by ChainDB.putChainState / serializeChainState.
+   */
+  private serializeChainState(
+    bestBlockHash: Buffer,
+    bestHeight: number,
+    totalWork: bigint
+  ): Buffer {
+    const writer = new BufferWriter();
+    writer.writeHash(bestBlockHash);
+    writer.writeUInt32LE(bestHeight);
+    // totalWork as variable-length big-endian integer with varint length prefix
+    let hex = totalWork === 0n ? "" : totalWork.toString(16);
+    if (hex.length % 2 !== 0) {
+      hex = "0" + hex;
+    }
+    const workBytes = hex.length > 0 ? Buffer.from(hex, "hex") : Buffer.alloc(0);
+    writer.writeVarBytes(workBytes);
     return writer.toBuffer();
   }
 }

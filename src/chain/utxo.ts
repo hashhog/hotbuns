@@ -214,10 +214,15 @@ export class CoinsViewDB extends CoinsView {
   /**
    * Write a batch of coin changes to the database.
    * Called by CoinsViewCache during flush.
+   *
+   * @param entries - Cache entries to flush
+   * @param hashBlock - Best block hash for this view state
+   * @param extraOps - Additional operations to include atomically (e.g., chain state)
    */
   async batchWrite(
     entries: Map<string, CoinEntry>,
-    hashBlock: Buffer
+    hashBlock: Buffer,
+    extraOps?: BatchOperation[]
   ): Promise<void> {
     const ops: BatchOperation[] = [];
 
@@ -246,6 +251,12 @@ export class CoinsViewDB extends CoinsView {
           value: serializeCoin(entry.coin),
         });
       }
+    }
+
+    // Append any extra operations so they are committed atomically
+    // with the UTXO changes (e.g., chain state update).
+    if (extraOps) {
+      ops.push(...extraOps);
     }
 
     if (ops.length > 0) {
@@ -544,15 +555,17 @@ export class CoinsViewCache extends CoinsView {
    * Flush all dirty entries to the backing store and clear the cache.
    *
    * After flush, the cache is empty and all changes are persisted.
+   *
+   * @param extraOps - Additional DB operations committed atomically with the flush
    */
-  async flush(): Promise<void> {
+  async flush(extraOps?: BatchOperation[]): Promise<void> {
     if (!(this.base instanceof CoinsViewDB)) {
       // For layered caches, we'd need to handle this differently
       // For now, assume base is always CoinsViewDB
       throw new Error("flush() requires CoinsViewDB as base");
     }
 
-    await this.base.batchWrite(this.cache, this.hashBlock);
+    await this.base.batchWrite(this.cache, this.hashBlock, extraOps);
 
     // Clear the cache
     this.cache.clear();
@@ -564,13 +577,15 @@ export class CoinsViewCache extends CoinsView {
   /**
    * Sync dirty entries to backing store but keep cache contents.
    * Spent entries are erased, unspent entries become clean.
+   *
+   * @param extraOps - Additional DB operations committed atomically with the sync
    */
-  async sync(): Promise<void> {
+  async sync(extraOps?: BatchOperation[]): Promise<void> {
     if (!(this.base instanceof CoinsViewDB)) {
       throw new Error("sync() requires CoinsViewDB as base");
     }
 
-    await this.base.batchWrite(this.cache, this.hashBlock);
+    await this.base.batchWrite(this.cache, this.hashBlock, extraOps);
 
     // Update cache: remove spent entries, clear dirty flags
     for (const [key, entry] of this.cache) {
@@ -945,18 +960,26 @@ export class UTXOManager implements UTXOSet {
 
   /**
    * Flush cached changes to database as an atomic batch.
+   *
+   * @param extraOps - Additional DB operations committed atomically with the flush
    */
-  async flush(): Promise<void> {
+  async flush(extraOps?: BatchOperation[]): Promise<void> {
     if (this.cache.shouldFlush() || this.cache.getDirtyCount() > 0) {
-      await this.cache.flush();
+      await this.cache.flush(extraOps);
+    } else if (extraOps && extraOps.length > 0) {
+      // Even if nothing to flush, still write the extra ops
+      const bestBlock = await this.cache.getBestBlock();
+      await this.viewDB.batchWrite(new Map(), bestBlock, extraOps);
     }
   }
 
   /**
    * Flush only dirty entries to DB.
+   *
+   * @param extraOps - Additional DB operations committed atomically with the sync
    */
-  async flushDirty(): Promise<void> {
-    await this.cache.sync();
+  async flushDirty(extraOps?: BatchOperation[]): Promise<void> {
+    await this.cache.sync(extraOps);
   }
 
   /**
