@@ -215,6 +215,7 @@ export interface ScriptFlags {
   verifySigPushOnly?: boolean; // policy - scriptSig must be push-only
   verifyDiscourageUpgradableNops?: boolean; // policy - unused NOPs must error
   verifyCleanStack?: boolean; // BIP 62 - stack must have exactly one element after execution
+  verifyDiscourageUpgradableWitnessProgram?: boolean; // policy - unknown witness versions must error
 }
 
 /**
@@ -1888,7 +1889,8 @@ export function verifyScript(
   flags: ScriptFlags,
   sigHasher: (subscript: Buffer, hashType: number) => Buffer,
   taprootCtx?: TaprootContext,
-  txContext?: { txVersion: number; txLockTime: number; txSequence: number }
+  txContext?: { txVersion: number; txLockTime: number; txSequence: number },
+  witnessSigHasher?: (subscript: Buffer, hashType: number) => Buffer
 ): boolean {
   // Check script size limits
   if (scriptSig.length > MAX_SCRIPT_SIZE || scriptPubKey.length > MAX_SCRIPT_SIZE) {
@@ -1997,10 +1999,26 @@ export function verifyScript(
     // Check for P2SH-wrapped witness
     if (flags.verifyWitness) {
       if (isP2WPKH(redeemScript)) {
-        return verifyWitnessV0(redeemScript, witness, flags, sigHasher);
+        return verifyWitnessV0(redeemScript, witness, flags, witnessSigHasher ?? sigHasher);
       }
       if (isP2WSH(redeemScript)) {
-        return verifyWitnessV0(redeemScript, witness, flags, sigHasher);
+        return verifyWitnessV0(redeemScript, witness, flags, witnessSigHasher ?? sigHasher);
+      }
+      if (isWitnessProgram(redeemScript)) {
+        // P2SH-wrapped witness: check v0 program length
+        const witnessVersion = redeemScript[0];
+        const programLen = redeemScript[1];
+        if (witnessVersion === 0x00 && programLen !== 20 && programLen !== 32) {
+          throw new ScriptError("WITNESS_PROGRAM_WRONG_LENGTH");
+        }
+        if (flags.verifyDiscourageUpgradableWitnessProgram) {
+          throw new ScriptError("DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM");
+        }
+        return true;
+      }
+      // P2SH non-witness: if witness is non-empty, fail
+      if (witness.length > 0) {
+        throw new ScriptError("WITNESS_UNEXPECTED");
       }
     }
 
@@ -2019,7 +2037,7 @@ export function verifyScript(
       if (scriptSig.length !== 0) {
         return false;
       }
-      return verifyWitnessV0(scriptPubKey, witness, flags, sigHasher);
+      return verifyWitnessV0(scriptPubKey, witness, flags, witnessSigHasher ?? sigHasher);
     }
 
     if (flags.verifyTaproot && isP2TR(scriptPubKey)) {
@@ -2042,6 +2060,35 @@ export function verifyScript(
         return false;
       }
       return true;
+    }
+
+    // Unknown witness program: forward-compatible (BIP141)
+    // If scriptPubKey is a witness program but not a known type, it succeeds
+    // unless DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM is set
+    if (isWitnessProgram(scriptPubKey)) {
+      if (scriptSig.length !== 0) {
+        return false;
+      }
+
+      // For witness v0, program must be exactly 20 (P2WPKH) or 32 (P2WSH) bytes.
+      // Any other v0 program length is invalid (BIP141 consensus rule).
+      const witnessVersion = scriptPubKey[0];
+      const programLen = scriptPubKey[1];
+      if (witnessVersion === 0x00 && programLen !== 20 && programLen !== 32) {
+        throw new ScriptError("WITNESS_PROGRAM_WRONG_LENGTH");
+      }
+
+      if (flags.verifyDiscourageUpgradableWitnessProgram) {
+        throw new ScriptError("DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM");
+      }
+      // Unknown witness versions succeed (anyone-can-spend for forward compatibility)
+      return true;
+    }
+
+    // WITNESS flag is set but scriptPubKey is not a witness program:
+    // If witness is non-empty, it must fail (BIP141 consensus rule)
+    if (witness.length > 0) {
+      throw new ScriptError("WITNESS_UNEXPECTED");
     }
   }
 
@@ -2446,8 +2493,8 @@ function verifyWitnessV0(
     // and last index is stack top. No reversal needed.
     const witnessStack = [...witness];
 
-    // For witness v0, MINIMALIF is unconditionally enabled (part of SegWit rules)
-    const witnessFlags: ScriptFlags = { ...flags, verifyMinimalIf: true };
+    // For witness v0, MINIMALIF is a policy rule only (enabled via SCRIPT_VERIFY_MINIMALIF flag)
+    const witnessFlags: ScriptFlags = { ...flags };
 
     const ctx: ExecutionContext = {
       stack: witnessStack,
@@ -2503,8 +2550,8 @@ function verifyWitnessV0(
     // bottom-to-top (index 0 = bottom, last = top). No reversal needed.
     const witnessStack = [...witness.slice(0, -1)];
 
-    // For witness v0, MINIMALIF is unconditionally enabled (part of SegWit rules)
-    const witnessFlags: ScriptFlags = { ...flags, verifyMinimalIf: true };
+    // For witness v0, MINIMALIF is a policy rule only (enabled via SCRIPT_VERIFY_MINIMALIF flag)
+    const witnessFlags: ScriptFlags = { ...flags };
 
     const ctx: ExecutionContext = {
       stack: witnessStack,
