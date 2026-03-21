@@ -21,6 +21,7 @@ import {
   type ScriptFlags,
   type ScriptChunk,
   type Script,
+  type TaprootContext,
 } from "../src/script/interpreter.js";
 import {
   type Transaction,
@@ -30,6 +31,8 @@ import {
   sigHashLegacy,
   sigHashWitnessV0,
 } from "../src/validation/tx.js";
+import { taggedHash } from "../src/crypto/primitives.js";
+import { schnorr } from "@noble/curves/secp256k1.js";
 
 const VECTOR_PATH =
   "/home/max/hashhog/bitcoin/src/test/data/script_tests.json";
@@ -221,6 +224,137 @@ function parseScriptAsm(asm: string): Buffer {
   }
 
   return Buffer.concat(parts);
+}
+
+// ---------------------------------------------------------------------------
+// Taproot placeholder resolution
+// ---------------------------------------------------------------------------
+
+// Internal key for taproot test vectors: secp256k1 generator x-coordinate
+const TAPROOT_INTERNAL_KEY = Buffer.from(
+  "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798",
+  "hex"
+);
+
+/**
+ * Encode a length as Bitcoin compact size.
+ */
+function compactSize(n: number): Buffer {
+  if (n < 0xfd) return Buffer.from([n]);
+  if (n <= 0xffff) return Buffer.from([0xfd, n & 0xff, (n >> 8) & 0xff]);
+  return Buffer.from([
+    0xfe, n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >> 24) & 0xff,
+  ]);
+}
+
+/**
+ * Compute taproot leaf hash, control block, and output key for a single-leaf tree.
+ *
+ * Returns { scriptBytes, controlBlock, outputKey } where:
+ * - scriptBytes: the serialized script
+ * - controlBlock: (0xc0 | parity) || internal_key (33 bytes, single leaf = no merkle path)
+ * - outputKey: 32-byte x-only tweaked output key
+ */
+function computeTaprootParams(scriptAsm: string): {
+  scriptBytes: Buffer;
+  controlBlock: Buffer;
+  outputKey: Buffer;
+} {
+  const scriptBytes = parseScriptAsm(scriptAsm);
+
+  // Tapleaf hash: tagged_hash("TapLeaf", 0xc0 || compact_size(script_len) || script)
+  const leafData = Buffer.concat([
+    Buffer.from([0xc0]),
+    compactSize(scriptBytes.length),
+    scriptBytes,
+  ]);
+  const leafHash = taggedHash("TapLeaf", leafData);
+
+  // Merkle root = leaf hash (single leaf, no sibling)
+  const merkleRoot = leafHash;
+
+  // Tweak: tagged_hash("TapTweak", internal_key || merkle_root)
+  const tweak = taggedHash(
+    "TapTweak",
+    Buffer.concat([TAPROOT_INTERNAL_KEY, merkleRoot])
+  );
+
+  // Compute tweaked key: P + tweak*G
+  const x = BigInt("0x" + TAPROOT_INTERNAL_KEY.toString("hex"));
+  const P = schnorr.utils.lift_x(x);
+  const t = BigInt("0x" + tweak.toString("hex"));
+  const Point = schnorr.Point;
+  const tG = Point.BASE.multiply(t);
+  const tweaked = P.add(tG);
+
+  // Output key parity
+  const parity = tweaked.y % 2n === 0n ? 0 : 1;
+
+  // Output key x-only (32 bytes)
+  const outputKey = Buffer.from(
+    tweaked.x.toString(16).padStart(64, "0"),
+    "hex"
+  );
+
+  // Control block: (0xc0 | parity) || internal_key  (no merkle path for single leaf)
+  const controlBlock = Buffer.concat([
+    Buffer.from([0xc0 | parity]),
+    TAPROOT_INTERNAL_KEY,
+  ]);
+
+  return { scriptBytes, controlBlock, outputKey };
+}
+
+/**
+ * Resolve taproot placeholders in a witness-format test vector.
+ *
+ * Finds the witness item prefixed with "#SCRIPT#", extracts the ASM,
+ * computes the script bytes / control block / output key, and replaces
+ * the placeholder items in-place.
+ *
+ * Returns the resolved outputKey hex for use in scriptPubKey, or null if
+ * this vector has no taproot placeholders.
+ */
+function resolveTaprootPlaceholders(
+  witnessHexItems: string[],
+  scriptPubKeyAsm: string
+): { resolvedWitness: string[]; resolvedPubKeyAsm: string } | null {
+  // Find the #SCRIPT# witness item
+  const scriptIdx = witnessHexItems.findIndex((w) => w.startsWith("#SCRIPT#"));
+  if (scriptIdx === -1 && !scriptPubKeyAsm.includes("#TAPROOTOUTPUT#")) {
+    return null;
+  }
+
+  if (scriptIdx === -1) {
+    return null; // shouldn't happen in valid vectors
+  }
+
+  // Extract script ASM (everything after "#SCRIPT# ")
+  const scriptAsm = witnessHexItems[scriptIdx].slice("#SCRIPT# ".length);
+
+  // Compute taproot parameters
+  const { scriptBytes, controlBlock, outputKey } =
+    computeTaprootParams(scriptAsm);
+
+  // Build resolved witness: replace #SCRIPT# with hex of script bytes,
+  // replace #CONTROLBLOCK# with hex of control block
+  const resolvedWitness = witnessHexItems.map((item) => {
+    if (item.startsWith("#SCRIPT#")) {
+      return scriptBytes.toString("hex");
+    }
+    if (item === "#CONTROLBLOCK#") {
+      return controlBlock.toString("hex");
+    }
+    return item;
+  });
+
+  // Replace #TAPROOTOUTPUT# in scriptPubKey ASM with hex of output key
+  const resolvedPubKeyAsm = scriptPubKeyAsm.replace(
+    "#TAPROOTOUTPUT#",
+    "0x" + outputKey.toString("hex")
+  );
+
+  return { resolvedWitness, resolvedPubKeyAsm };
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +557,15 @@ for (let i = 0; i < vectors.length; i++) {
     comment = entry.length >= 5 ? entry[4] : "";
   }
 
+  // Resolve taproot placeholders (#SCRIPT#, #CONTROLBLOCK#, #TAPROOTOUTPUT#)
+  if (isWitness) {
+    const resolved = resolveTaprootPlaceholders(witnessHexItems, scriptPubKeyAsm);
+    if (resolved) {
+      witnessHexItems = resolved.resolvedWitness;
+      scriptPubKeyAsm = resolved.resolvedPubKeyAsm;
+    }
+  }
+
   let scriptSig: Buffer;
   let scriptPubKey: Buffer;
 
@@ -468,11 +611,23 @@ for (let i = 0; i < vectors.length; i++) {
     txSequence: spendingTx.inputs[0].sequence,
   };
 
+  // Build a TaprootContext for taproot script-path test vectors.
+  // These tests don't perform real Schnorr signature verification
+  // (they test script logic), but executeTapscript requires the context.
+  let taprootCtx: TaprootContext | undefined;
+  if (flags.verifyTaproot && isWitness && witness.length >= 2) {
+    taprootCtx = {
+      keyPathSigHasher: (_hashType: number) => Buffer.alloc(32),
+      scriptPathSigHasher: (_hashType: number, _leafHash: Buffer, _codeSepPos: number) =>
+        Buffer.alloc(32),
+    };
+  }
+
   let gotOK: boolean;
   try {
     gotOK = verifyScript(
       scriptSig, scriptPubKey, witness, flags, sigHasher,
-      undefined, txContext, witnessSigHasher
+      taprootCtx, txContext, witnessSigHasher
     );
   } catch {
     gotOK = false;

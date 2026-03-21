@@ -273,14 +273,17 @@ const DISABLED_OPCODES = new Set([
  * Reference: BIP-342
  */
 function isOpSuccess(opcode: number): boolean {
-  if (opcode === 0x50) return true; // OP_RESERVED
-  if (opcode === 0x62) return true; // OP_VER
-  if (opcode === 0x89) return true; // OP_RESERVED1
-  if (opcode === 0x8a) return true; // OP_RESERVED2
-  if (opcode === 0x8d) return true; // OP_2MUL
-  if (opcode === 0x8e) return true; // OP_2DIV
-  if (opcode >= 0x95 && opcode <= 0xaf) return true; // OP_MUL..OP_CHECKMULTISIGVERIFY
-  if (opcode >= 0xba && opcode <= 0xfe) return true; // OP_NOP11..OP_INVALIDOPCODE-1
+  // BIP-342 OP_SUCCESSx: opcodes that cause immediate script success in tapscript.
+  // These are specifically the undefined/disabled opcodes, NOT active ones.
+  // Reference: Bitcoin Core IsOpSuccess() in script/interpreter.cpp
+  if (opcode === 0x50) return true; // OP_RESERVED (80)
+  if (opcode === 0x62) return true; // OP_VER (98)
+  if (opcode >= 0x7e && opcode <= 0x81) return true; // OP_CAT..OP_RIGHT (126-129)
+  if (opcode >= 0x83 && opcode <= 0x86) return true; // OP_SUBSTR..OP_XOR (131-134)
+  if (opcode >= 0x89 && opcode <= 0x8a) return true; // OP_RESERVED1, OP_RESERVED2 (137-138)
+  if (opcode >= 0x8d && opcode <= 0x8e) return true; // OP_2MUL, OP_2DIV (141-142)
+  if (opcode >= 0x95 && opcode <= 0x99) return true; // OP_MUL..OP_RSHIFT (149-153)
+  if (opcode >= 0xbb && opcode <= 0xfe) return true; // OP_NOP11..OP_INVALIDOPCODE-1 (187-254)
   return false;
 }
 
@@ -626,9 +629,14 @@ function verifySchnorrSig(
     return false;
   }
 
-  // Public key must be 32 bytes (x-only)
+  // BIP-342: Empty pubkey (0 bytes) always fails
+  if (pubkey.length === 0) {
+    throw new ScriptError("TAPSCRIPT_EMPTY_PUBKEY");
+  }
+
+  // BIP-342: Unknown pubkey type (not 32 bytes) succeeds for forward compatibility
   if (pubkey.length !== 32) {
-    throw new ScriptError("PUBKEYTYPE");
+    return true;
   }
 
   // Signature must be 64 or 65 bytes
