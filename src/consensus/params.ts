@@ -541,7 +541,12 @@ export const TESTNET: ConsensusParams = {
 
 /**
  * Build the testnet4 genesis block raw bytes.
- * Different nonce and timestamp for testnet4 (BIP94).
+ * Testnet4 (BIP94) uses a different coinbase message and output script
+ * than mainnet/testnet3.
+ *
+ * Coinbase message: "03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e"
+ * Output script: OP_PUSH33 <33 zero bytes> OP_CHECKSIG (unspendable)
+ * Genesis hash: 00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043
  */
 function buildTestnet4GenesisBlock(): Buffer {
   const writer = new BufferWriter();
@@ -549,9 +554,10 @@ function buildTestnet4GenesisBlock(): Buffer {
   // Block header with testnet4 parameters
   writer.writeInt32LE(1);
   writer.writeHash(Buffer.alloc(32, 0));
+  // Merkle root for testnet4 genesis (wire/LE byte order)
   writer.writeHash(
     Buffer.from(
-      "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a",
+      "4e7b2b9128fe0291db0693af2ae418b767e657cd407e80cb1434221eaea7a07a",
       "hex"
     )
   );
@@ -559,20 +565,21 @@ function buildTestnet4GenesisBlock(): Buffer {
   writer.writeUInt32LE(0x1d00ffff); // bits
   writer.writeUInt32LE(393743547); // nonce
 
-  // Same coinbase transaction as mainnet
+  // Coinbase transaction (different from mainnet)
   writer.writeVarInt(1);
   writer.writeInt32LE(1);
   writer.writeVarInt(1);
   writer.writeHash(Buffer.alloc(32, 0));
   writer.writeUInt32LE(0xffffffff);
 
+  // Coinbase scriptSig with testnet4 headline (76 bytes, requires OP_PUSHDATA1)
+  const testnet4Msg =
+    "03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e";
   const coinbaseScript = Buffer.concat([
-    Buffer.from([0x04, 0xff, 0xff, 0x00, 0x1d]),
-    Buffer.from([0x01, 0x04]),
-    Buffer.from([0x45]),
-    Buffer.from(
-      "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks"
-    ),
+    Buffer.from([0x04, 0xff, 0xff, 0x00, 0x1d]), // push 4 bytes: nBits LE
+    Buffer.from([0x01, 0x04]),                     // push 1 byte: 4
+    Buffer.from([0x4c, testnet4Msg.length]),        // OP_PUSHDATA1 + length
+    Buffer.from(testnet4Msg),
   ]);
   writer.writeVarBytes(coinbaseScript);
   writer.writeUInt32LE(0xffffffff);
@@ -580,14 +587,11 @@ function buildTestnet4GenesisBlock(): Buffer {
   writer.writeVarInt(1);
   writer.writeUInt64LE(50_00000000n);
 
-  const satoshiPubKey = Buffer.from(
-    "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f",
-    "hex"
-  );
+  // Output script: OP_PUSH33 <33 zero bytes> OP_CHECKSIG (unspendable)
   const scriptPubKey = Buffer.concat([
-    Buffer.from([0x41]),
-    satoshiPubKey,
-    Buffer.from([0xac]),
+    Buffer.from([0x21]),       // OP_PUSHBYTES_33
+    Buffer.alloc(33, 0),      // 33 zero bytes (null compressed pubkey)
+    Buffer.from([0xac]),       // OP_CHECKSIG
   ]);
   writer.writeVarBytes(scriptPubKey);
   writer.writeUInt32LE(0);
@@ -605,7 +609,7 @@ const testnet4GenesisHash = hash256(testnet4GenesisBlock.subarray(0, 80));
  */
 export const TESTNET4: ConsensusParams = {
   ...MAINNET,
-  networkMagic: 0x1c163f28, // testnet4 magic
+  networkMagic: 0x283f161c, // testnet4 magic (pchMessageStart: 1c 16 3f 28)
   defaultPort: 48333,
   genesisBlockHash: testnet4GenesisHash,
   genesisBlock: testnet4GenesisBlock,

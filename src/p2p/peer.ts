@@ -53,6 +53,9 @@ export type OnBanCallback = (peer: Peer, reason: string) => void;
 /** Minimum protocol version for witness support. */
 export const MIN_PEER_PROTO_VERSION = 70015;
 
+/** TCP connection timeout in milliseconds. */
+export const CONNECT_TIMEOUT_MS = 10_000;
+
 /** Handshake timeout in milliseconds. */
 export const HANDSHAKE_TIMEOUT_MS = 60_000;
 
@@ -239,7 +242,7 @@ export class Peer {
   async connect(): Promise<void> {
     this.state = "connecting";
 
-    this.socket = await Bun.connect({
+    const connectPromise = Bun.connect({
       hostname: this.host,
       port: this.port,
       socket: {
@@ -279,6 +282,18 @@ export class Peer {
         },
       },
     });
+
+    // Race against a connection timeout to avoid blocking on unreachable hosts
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("Connection timeout")), CONNECT_TIMEOUT_MS);
+    });
+
+    try {
+      this.socket = await Promise.race([connectPromise, timeoutPromise]);
+    } catch (error) {
+      this.state = "disconnected";
+      throw error;
+    }
   }
 
   /**
@@ -572,6 +587,10 @@ export class Peer {
         this.versionPayload = versionPayload;
         this.receivedVersion = true;
 
+        // Send feature negotiation messages BEFORE verack (required by protocol)
+        this.send({ type: "wtxidrelay", payload: null });
+        this.send({ type: "sendaddrv2", payload: null });
+
         // Send verack in response
         this.send({ type: "verack", payload: null });
         this.sentVerack = true;
@@ -638,10 +657,8 @@ export class Peer {
       this.bestKnownHeight = this.versionPayload.startHeight;
       this.events.onHandshakeComplete(this);
 
-      // Send optional feature negotiation messages
+      // Send post-handshake feature negotiation messages
       this.send({ type: "sendheaders", payload: null });
-      this.send({ type: "sendaddrv2", payload: null });
-      this.send({ type: "wtxidrelay", payload: null });
     }
   }
 

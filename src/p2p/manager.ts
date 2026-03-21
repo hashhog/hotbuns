@@ -118,6 +118,11 @@ const FALLBACK_PEERS: Record<number, Array<{ host: string; port: number }>> = {
     { host: "testnet-seed.bitcoin.jonasschnelli.ch", port: 18333 },
     { host: "seed.tbtc.petertodd.net", port: 18333 },
   ],
+  // Testnet4 (networkMagic: 0x283f161c)
+  0x283f161c: [
+    { host: "seed.testnet4.bitcoin.sprovoost.nl", port: 48333 },
+    { host: "seed.testnet4.wiz.biz", port: 48333 },
+  ],
   // Regtest (networkMagic: 0xdab5bffa) - no fallbacks, local only
   0xdab5bffa: [],
 };
@@ -1292,6 +1297,11 @@ export class PeerManager {
   private handlePeerMessage(peer: Peer, msg: NetworkMessage): void {
     const key = `${peer.host}:${peer.port}`;
     this.lastActivity.set(key, Date.now());
+
+    // Respond to ping with pong (required by Bitcoin protocol)
+    if (msg.type === "ping") {
+      peer.send({ type: "pong", payload: { nonce: msg.payload.nonce } });
+    }
 
     // Handle addr messages to learn new peers
     if (msg.type === "addr") {
