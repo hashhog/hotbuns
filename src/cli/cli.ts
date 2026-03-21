@@ -18,14 +18,14 @@ import { HeaderSync } from "../sync/headers.js";
 import { BlockSync } from "../sync/blocks.js";
 import { RPCServer, type RPCServerConfig, type RPCServerDeps } from "../rpc/server.js";
 import { Wallet } from "../wallet/wallet.js";
-import { MAINNET, TESTNET, REGTEST, type ConsensusParams } from "../consensus/params.js";
+import { MAINNET, TESTNET, TESTNET4, REGTEST, type ConsensusParams } from "../consensus/params.js";
 
 /**
  * Node configuration options.
  */
 export interface NodeConfig {
   datadir: string;
-  network: "mainnet" | "testnet" | "regtest";
+  network: "mainnet" | "testnet" | "testnet4" | "regtest";
   rpcPort: number;
   rpcUser: string;
   rpcPassword: string;
@@ -70,6 +70,8 @@ function getDefaultRpcPort(network: string): number {
   switch (network) {
     case "testnet":
       return 18332;
+    case "testnet4":
+      return 48332;
     case "regtest":
       return 18443;
     default:
@@ -84,6 +86,8 @@ function getDefaultP2PPort(network: string): number {
   switch (network) {
     case "testnet":
       return 18333;
+    case "testnet4":
+      return 48333;
     case "regtest":
       return 18444;
     default:
@@ -118,11 +122,12 @@ export function parseArgs(argv: string[]): ParsedArgs {
           if (value) config.datadir = value;
           break;
         case "network":
-          if (value === "mainnet" || value === "testnet" || value === "regtest") {
+          if (value === "mainnet" || value === "testnet" || value === "testnet4" || value === "regtest") {
             config.network = value;
           }
           break;
         case "rpc-port":
+        case "rpcport":
           if (value) config.rpcPort = parseInt(value, 10);
           break;
         case "rpc-user":
@@ -202,7 +207,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
   }
 
   // Set network-specific defaults if not explicitly set
-  if (!args.some((a) => a.startsWith("--rpc-port"))) {
+  if (!args.some((a) => a.startsWith("--rpc-port") || a.startsWith("--rpcport"))) {
     config.rpcPort = getDefaultRpcPort(config.network);
   }
   if (!args.some((a) => a.startsWith("--port") || a.startsWith("--p2p-port"))) {
@@ -258,7 +263,7 @@ export async function loadConfig(datadir: string): Promise<Partial<NodeConfig>> 
 
       switch (key) {
         case "network":
-          if (value === "mainnet" || value === "testnet" || value === "regtest") {
+          if (value === "mainnet" || value === "testnet" || value === "testnet4" || value === "regtest") {
             config.network = value;
           }
           break;
@@ -336,6 +341,8 @@ function getParams(network: string): ConsensusParams {
   switch (network) {
     case "testnet":
       return TESTNET;
+    case "testnet4":
+      return TESTNET4;
     case "regtest":
       return REGTEST;
     default:
@@ -851,7 +858,7 @@ COMMANDS:
 
 OPTIONS:
   --datadir=<path>      Data directory (default: ~/.hotbuns)
-  --network=<net>       Network: mainnet, testnet, regtest (default: mainnet)
+  --network=<net>       Network: mainnet, testnet, testnet4, regtest (default: mainnet)
   --rpc-port=<port>     RPC port (default: 8332/18332/18443)
   --rpc-user=<user>     RPC username (default: user)
   --rpc-password=<pass> RPC password (default: pass)
