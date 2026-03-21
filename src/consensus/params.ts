@@ -635,7 +635,7 @@ export const TESTNET4: ConsensusParams = {
     [
       50000,
       Buffer.from(
-        "00000000000000c9bb5e96ce46e3b3ea3e2afc8c5c42b0c2e7c4e6e37b73fe42",
+        "00000000e2c8c94ba126169a88997233f07a9769e2b009fb10cad0e893eff2cb",
         "hex"
       ).reverse(),
     ],
