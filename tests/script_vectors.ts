@@ -7,7 +7,7 @@
  * Formats:
  *   [scriptSig_asm, scriptPubKey_asm, flags, expected_result]              (4 fields)
  *   [scriptSig_asm, scriptPubKey_asm, flags, expected_result, comment]     (5 fields)
- *   [[witness...], amount, scriptSig_asm, scriptPubKey_asm, flags, result] (6+ fields, skipped)
+ *   [[witness...], amount, scriptSig_asm, scriptPubKey_asm, flags, result] (6+ fields, witness)
  *
  * Single-element arrays are comments and are skipped.
  */
@@ -263,10 +263,12 @@ function parseFlags(s: string): ScriptFlags {
       case "SIGPUSHONLY": flags.verifySigPushOnly = true; break;
       case "DISCOURAGE_UPGRADABLE_NOPS": flags.verifyDiscourageUpgradableNops = true; break;
       case "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM":
+        flags.verifyDiscourageUpgradableWitnessProgram = true;
+        break;
       case "DISCOURAGE_OP_SUCCESS":
       case "CONST_SCRIPTCODE":
       case "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION":
-        // May not be in interface; skip
+        // Not yet implemented; skip
         break;
       default:
         // Unknown flag; ignore
@@ -284,9 +286,9 @@ function parseFlags(s: string): ScriptFlags {
  * Build a "crediting transaction" per Bitcoin Core's script_tests.cpp:
  * - version 1, locktime 0
  * - one input: null prevout (all-zero txid, vout=0xFFFFFFFF), scriptSig = OP_0 OP_0, sequence 0xFFFFFFFF
- * - one output: scriptPubKey = test's scriptPubKey, value = 0
+ * - one output: scriptPubKey = test's scriptPubKey, value = amount
  */
-function buildCreditingTx(scriptPubKey: Buffer): Transaction {
+function buildCreditingTx(scriptPubKey: Buffer, amount: bigint = 0n): Transaction {
   return {
     version: 1,
     inputs: [{
@@ -296,7 +298,7 @@ function buildCreditingTx(scriptPubKey: Buffer): Transaction {
       witness: [],
     }],
     outputs: [{
-      value: 0n,
+      value: amount,
       scriptPubKey,
     }],
     lockTime: 0,
@@ -307,9 +309,14 @@ function buildCreditingTx(scriptPubKey: Buffer): Transaction {
  * Build a "spending transaction" per Bitcoin Core's script_tests.cpp:
  * - version 1, locktime 0
  * - one input: prevout = txid of crediting tx : 0, scriptSig = test's scriptSig, sequence 0xFFFFFFFF
- * - one output: scriptPubKey = empty, value = 0
+ * - one output: scriptPubKey = empty, value = amount
  */
-function buildSpendingTx(creditingTx: Transaction, scriptSig: Buffer): Transaction {
+function buildSpendingTx(
+  creditingTx: Transaction,
+  scriptSig: Buffer,
+  witness: Buffer[] = [],
+  amount: bigint = 0n
+): Transaction {
   const creditTxId = getTxId(creditingTx);
   return {
     version: 1,
@@ -317,10 +324,10 @@ function buildSpendingTx(creditingTx: Transaction, scriptSig: Buffer): Transacti
       prevOut: { txid: creditTxId, vout: 0 },
       scriptSig,
       sequence: 0xFFFFFFFF,
-      witness: [],
+      witness,
     }],
     outputs: [{
-      value: 0n,
+      value: amount,
       scriptPubKey: Buffer.alloc(0),
     }],
     lockTime: 0,
@@ -328,14 +335,24 @@ function buildSpendingTx(creditingTx: Transaction, scriptSig: Buffer): Transacti
 }
 
 /**
- * Create a real sigHasher for a spending transaction.
- * The sigHasher callback receives the subscript (already processed by the
- * interpreter: sliced after OP_CODESEPARATOR, FindAndDelete applied for legacy)
- * and the hashType byte from the signature.
+ * Create a legacy sigHasher for a spending transaction.
  */
 function makeSigHasher(spendingTx: Transaction, inputIndex: number): (subscript: Buffer, hashType: number) => Buffer {
   return (subscript: Buffer, hashType: number): Buffer => {
     return sigHashLegacy(spendingTx, inputIndex, subscript, hashType);
+  };
+}
+
+/**
+ * Create a BIP143 witness v0 sigHasher for a spending transaction.
+ */
+function makeWitnessSigHasher(
+  spendingTx: Transaction,
+  inputIndex: number,
+  amount: bigint
+): (subscript: Buffer, hashType: number) => Buffer {
+  return (subscript: Buffer, hashType: number): Buffer => {
+    return sigHashWitnessV0(spendingTx, inputIndex, subscript, amount, hashType);
   };
 }
 
@@ -365,22 +382,46 @@ for (let i = 0; i < vectors.length; i++) {
     continue;
   }
 
-  // Skip witness tests (first element is an array)
+  // Determine if this is a witness test vector or a legacy test vector
+  let scriptSigAsm: string;
+  let scriptPubKeyAsm: string;
+  let flagsStr: string;
+  let expected: string;
+  let comment: string;
+  let witnessHexItems: string[] = [];
+  let amountSatoshis: bigint = 0n;
+  let isWitness = false;
+
   if (Array.isArray(entry[0])) {
-    skip++;
-    continue;
+    // Witness format: [[witness_hex1, ..., amount_btc], scriptSig_asm, scriptPubKey_asm, flags, result, ?comment]
+    // The amount is the LAST element of the witness array (always a number)
+    if (entry.length < 5) {
+      skip++;
+      continue;
+    }
+    isWitness = true;
+    const witnessArr = entry[0] as any[];
+    // Last element of witness array is the amount in BTC
+    const rawAmount = witnessArr[witnessArr.length - 1] as number;
+    amountSatoshis = BigInt(Math.round(rawAmount * 1e8));
+    // Witness items are all elements except the last (the amount)
+    witnessHexItems = witnessArr.slice(0, -1) as string[];
+    scriptSigAsm = entry[1];
+    scriptPubKeyAsm = entry[2];
+    flagsStr = entry[3];
+    expected = entry[4];
+    comment = entry.length >= 6 ? entry[5] : "";
+  } else {
+    if (entry.length < 4) {
+      skip++;
+      continue;
+    }
+    scriptSigAsm = entry[0];
+    scriptPubKeyAsm = entry[1];
+    flagsStr = entry[2];
+    expected = entry[3];
+    comment = entry.length >= 5 ? entry[4] : "";
   }
-
-  if (entry.length < 4) {
-    skip++;
-    continue;
-  }
-
-  const scriptSigAsm: string = entry[0];
-  const scriptPubKeyAsm: string = entry[1];
-  const flagsStr: string = entry[2];
-  const expected: string = entry[3];
-  const comment: string = entry.length >= 5 ? entry[4] : "";
 
   let scriptSig: Buffer;
   let scriptPubKey: Buffer;
@@ -406,12 +447,19 @@ for (let i = 0; i < vectors.length; i++) {
   }
 
   const flags = parseFlags(flagsStr);
-  const witness: Buffer[] = [];
+
+  // Parse witness stack from hex strings
+  const witness: Buffer[] = witnessHexItems.map((hex) =>
+    hex.length === 0 ? Buffer.alloc(0) : Buffer.from(hex, "hex")
+  );
 
   // Build crediting and spending transactions (Bitcoin Core approach)
-  const creditingTx = buildCreditingTx(scriptPubKey);
-  const spendingTx = buildSpendingTx(creditingTx, scriptSig);
+  const creditingTx = buildCreditingTx(scriptPubKey, amountSatoshis);
+  const spendingTx = buildSpendingTx(creditingTx, scriptSig, witness, amountSatoshis);
   const sigHasher = makeSigHasher(spendingTx, 0);
+
+  // Create witness-aware sigHasher for BIP143
+  const witnessSigHasher = makeWitnessSigHasher(spendingTx, 0, amountSatoshis);
 
   // Provide tx context for CLTV/CSV verification
   const txContext = {
@@ -422,7 +470,10 @@ for (let i = 0; i < vectors.length; i++) {
 
   let gotOK: boolean;
   try {
-    gotOK = verifyScript(scriptSig, scriptPubKey, witness, flags, sigHasher, undefined, txContext);
+    gotOK = verifyScript(
+      scriptSig, scriptPubKey, witness, flags, sigHasher,
+      undefined, txContext, witnessSigHasher
+    );
   } catch {
     gotOK = false;
   }
@@ -437,7 +488,8 @@ for (let i = 0; i < vectors.length; i++) {
       console.error(
         `FAIL test ${i}: expected=${expected} got=${gotOK ? "OK" : "FAIL"} ` +
         `sigAsm=${JSON.stringify(scriptSigAsm)} pubkeyAsm=${JSON.stringify(scriptPubKeyAsm)} ` +
-        `flags=${flagsStr} comment=${JSON.stringify(comment)}`
+        `flags=${flagsStr} comment=${JSON.stringify(comment)}` +
+        (isWitness ? ` witness=[${witnessHexItems.length} items] amount=${amountSatoshis}` : "")
       );
     }
   }
