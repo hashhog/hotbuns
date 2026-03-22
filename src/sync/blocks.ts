@@ -613,6 +613,14 @@ export class BlockSync {
       // Advance to next height
       this.state.nextHeightToProcess++;
       this.blocksProcessed++;
+
+      // Yield the event loop periodically to prevent starvation of timers,
+      // I/O callbacks, and RPC handlers.  Without this, a long chain of
+      // cached UTXO hits can resolve all awaits as microtasks, starving
+      // the macrotask queue indefinitely.
+      if (this.blocksProcessed % 32 === 0) {
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+      }
     }
 
     // Check if IBD is complete
@@ -778,7 +786,6 @@ export class BlockSync {
         }
       }
     }
-
     // Verify sigops cost
     if (totalSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
       console.warn(
