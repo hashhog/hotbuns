@@ -20,11 +20,16 @@ import { DBPrefix } from "../storage/database.js";
 import type { Transaction, OutPoint } from "../validation/tx.js";
 import { BufferWriter, BufferReader } from "../wire/serialization.js";
 
-/** Default max cache size in bytes (~450 MB). */
-const DEFAULT_DBCACHE_BYTES = 450 * 1024 * 1024;
+/** Default max cache size in bytes (estimated ~100MB, triggers eviction at ~65k entries). */
+const DEFAULT_DBCACHE_BYTES = 100 * 1024 * 1024;
 
-/** Estimated overhead per cache entry (key string + CoinEntry object). */
-const CACHE_ENTRY_OVERHEAD = 100;
+/**
+ * Estimated overhead per cache entry in the JS heap.
+ * Measured empirically: Bun/JSC uses ~1.5-2KB per Map entry including
+ * the key string (67-char hex), CoinEntry/Coin/txOut nested objects,
+ * Buffer with ArrayBuffer backing, bigint, and Map internal bookkeeping.
+ */
+const CACHE_ENTRY_OVERHEAD = 1500;
 
 /**
  * A single coin in the UTXO set.
@@ -416,6 +421,7 @@ export class CoinsViewCache extends CoinsView {
     if (existing) {
       if (existing.dirty) this.dirtyCount--;
       this.cachedCoinsUsage -= coinMemoryUsage(existing.coin);
+      // Don't add CACHE_ENTRY_OVERHEAD again - it was counted when the entry was first created
     }
 
     const entry: CoinEntry = {
@@ -426,7 +432,7 @@ export class CoinsViewCache extends CoinsView {
 
     this.cache.set(key, entry);
     this.dirtyCount++;
-    this.cachedCoinsUsage += coinMemoryUsage(coin) + CACHE_ENTRY_OVERHEAD;
+    this.cachedCoinsUsage += coinMemoryUsage(coin) + (existing ? 0 : CACHE_ENTRY_OVERHEAD);
   }
 
   /**
@@ -591,6 +597,7 @@ export class CoinsViewCache extends CoinsView {
     for (const [key, entry] of this.cache) {
       if (entry.coin === null) {
         // Remove spent entries
+        this.cachedCoinsUsage -= CACHE_ENTRY_OVERHEAD;
         this.cache.delete(key);
       } else {
         // Clear dirty flag
@@ -601,6 +608,29 @@ export class CoinsViewCache extends CoinsView {
 
     this.dirtyCount = 0;
     this.flushCount++;
+
+    // Evict clean entries if the cache exceeds the memory limit.
+    // Clean entries can always be re-fetched from the database.
+    if (this.cachedCoinsUsage > this.maxCacheBytes) {
+      this.evictCleanEntries();
+    }
+  }
+
+  /**
+   * Evict non-dirty entries from the cache to free memory.
+   * Removes clean entries until usage drops below the target (75% of max).
+   */
+  private evictCleanEntries(): void {
+    const target = Math.floor(this.maxCacheBytes * 0.75);
+    for (const [key, entry] of this.cache) {
+      if (this.cachedCoinsUsage <= target) {
+        break;
+      }
+      if (!entry.dirty) {
+        this.cachedCoinsUsage -= coinMemoryUsage(entry.coin) + CACHE_ENTRY_OVERHEAD;
+        this.cache.delete(key);
+      }
+    }
   }
 
   /**
@@ -980,6 +1010,12 @@ export class UTXOManager implements UTXOSet {
    */
   async flushDirty(extraOps?: BatchOperation[]): Promise<void> {
     await this.cache.sync(extraOps);
+
+    // If the cache is still over the limit after sync+eviction,
+    // do a full flush which clears everything.
+    if (this.cache.shouldFlush()) {
+      await this.cache.flush();
+    }
   }
 
   /**

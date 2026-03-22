@@ -36,7 +36,7 @@ import { BufferWriter } from "../wire/serialization.js";
 import { UTXOManager, serializeUndoData, type SpentUTXO } from "../chain/utxo.js";
 
 /** Maximum blocks in-flight at once (across all peers). */
-const DEFAULT_WINDOW_SIZE = 1024;
+const DEFAULT_WINDOW_SIZE = 64;
 
 /** Maximum blocks in-flight per peer. */
 const MAX_IN_FLIGHT_PER_PEER = 16;
@@ -52,6 +52,9 @@ const LOG_INTERVAL = 10000;
 
 /** Maximum items per getdata message. */
 const MAX_GETDATA_ITEMS = 50000;
+
+/** Maximum downloaded blocks buffered in memory before throttling requests. */
+const MAX_DOWNLOADED_BUFFER = 64;
 
 /**
  * Tracks a pending block request.
@@ -278,8 +281,9 @@ export class BlockSync {
         return;
       }
 
-      // Store it if it's useful
-      if (headerEntry.height >= this.state.nextHeightToProcess) {
+      // Store it if it's useful and we have room in the buffer
+      if (headerEntry.height >= this.state.nextHeightToProcess &&
+          this.state.downloadedBlocks.size < MAX_DOWNLOADED_BUFFER) {
         this.state.downloadedBlocks.set(hashHex, block);
         // Try to process blocks in order
         await this.processOrderedBlocks();
@@ -370,6 +374,12 @@ export class BlockSync {
       return;
     }
 
+    // Throttle: if we have too many buffered blocks, prune far-ahead entries.
+    // Always allow requesting if pendingBlocks is empty (prevents stalls).
+    if (this.state.downloadedBlocks.size >= MAX_DOWNLOADED_BUFFER) {
+      this.pruneDownloadedBlocks();
+    }
+
     // Check if we've caught up
     if (this.state.nextHeightToRequest > bestHeader.height) {
       // All headers have been requested
@@ -389,9 +399,14 @@ export class BlockSync {
       return;
     }
 
-    // Calculate how many more blocks we can request
+    // Calculate how many more blocks we can request.
+    // Reduce the effective window when we have many downloaded but unprocessed blocks.
     const currentInFlight = this.state.pendingBlocks.size;
-    const available = this.windowSize - currentInFlight;
+    const effectiveWindow = Math.max(
+      4,
+      this.windowSize - this.state.downloadedBlocks.size
+    );
+    const available = effectiveWindow - currentInFlight;
     if (available <= 0) {
       return;
     }
@@ -987,8 +1002,21 @@ export class BlockSync {
 
     const peerCount = this.peerManager?.getConnectedPeers().length ?? 0;
 
+    const mem = process.memoryUsage();
+    const rssMB = (mem.rss / 1024 / 1024).toFixed(0);
+    const heapMB = (mem.heapUsed / 1024 / 1024).toFixed(0);
+    const utxoCacheSize = this.utxoManager.getCacheSize();
+    const pendingCount = this.state.pendingBlocks.size;
+    const downloadedCount = this.state.downloadedBlocks.size;
+    const headerCount = this.headerSync.getHeaderCount();
+
+    // Trigger GC to keep memory in check during IBD
+    if (typeof Bun !== "undefined" && typeof Bun.gc === "function") {
+      Bun.gc(true);
+    }
+
     console.log(
-      `IBD: height=${processed}/${total} (${percent.toFixed(1)}%) | ${blocksPerSec.toFixed(0)} blk/s | ${peerCount} peers`
+      `IBD: height=${processed}/${total} (${percent.toFixed(1)}%) | ${blocksPerSec.toFixed(0)} blk/s | ${peerCount} peers | RSS=${rssMB}MB heap=${heapMB}MB | utxo=${utxoCacheSize} pend=${pendingCount} dl=${downloadedCount} hdrs=${headerCount}`
     );
   }
 
@@ -997,6 +1025,32 @@ export class BlockSync {
    */
   getState(): BlockDownloadState {
     return this.state;
+  }
+
+  /**
+   * Prune downloaded blocks that are too far ahead of nextHeightToProcess.
+   * Keeps blocks within the window size of the processing height to avoid
+   * memory bloat from out-of-order arrivals.
+   */
+  private pruneDownloadedBlocks(): void {
+    const maxAhead = this.windowSize * 2;
+    const pruneThreshold = this.state.nextHeightToProcess + maxAhead;
+
+    for (const [hashHex, block] of this.state.downloadedBlocks) {
+      const blockHash = getBlockHash(block.header);
+      const headerEntry = this.headerSync.getHeader(blockHash);
+      if (headerEntry && headerEntry.height > pruneThreshold) {
+        this.state.downloadedBlocks.delete(hashHex);
+        // Allow this height to be re-requested later
+        if (headerEntry.height < this.state.nextHeightToRequest) {
+          this.state.nextHeightToRequest = headerEntry.height;
+        }
+      }
+      // Stop pruning once we're under the limit
+      if (this.state.downloadedBlocks.size < MAX_DOWNLOADED_BUFFER) {
+        break;
+      }
+    }
   }
 
   // Helper methods
