@@ -493,10 +493,10 @@ export function countScriptSigOps(script: Buffer, accurate: boolean): number {
       } else if (opcode === Opcode.OP_PUSHDATA4) {
         if (pos + 3 >= script.length) break;
         const len =
-          script[pos] |
+          (script[pos] |
           (script[pos + 1] << 8) |
           (script[pos + 2] << 16) |
-          (script[pos + 3] << 24);
+          (script[pos + 3] << 24)) >>> 0;  // unsigned right shift to treat as uint32
         pos += 4 + len;
       }
       lastOpcode = opcode;
