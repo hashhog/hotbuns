@@ -428,8 +428,16 @@ export class Peer {
    * Accumulates data in recvBuffer and processes complete messages.
    */
   private onData(data: Buffer): void {
-    // Accumulate incoming data
-    this.recvBuffer = Buffer.concat([this.recvBuffer, data]);
+    // Accumulate incoming data - copy into new buffer to avoid
+    // retaining references to large underlying ArrayBuffers
+    if (this.recvBuffer.length === 0) {
+      this.recvBuffer = Buffer.from(data);
+    } else {
+      const newBuf = Buffer.allocUnsafe(this.recvBuffer.length + data.length);
+      newBuf.set(this.recvBuffer, 0);
+      newBuf.set(data, this.recvBuffer.length);
+      this.recvBuffer = newBuf;
+    }
 
     // Process any complete messages
     try {
@@ -488,8 +496,9 @@ export class Peer {
       // Deserialize the message
       const msg = deserializeMessage(header, payload);
 
-      // Remove consumed bytes from buffer
-      this.recvBuffer = this.recvBuffer.subarray(totalLength);
+      // Remove consumed bytes from buffer - use Buffer.from() to copy
+      // so we don't retain a reference to the (potentially large) original buffer
+      this.recvBuffer = Buffer.from(this.recvBuffer.subarray(totalLength));
 
       // Handle the message
       this.handleMessage(msg);
