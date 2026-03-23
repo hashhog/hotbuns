@@ -36,7 +36,10 @@ import { BufferWriter } from "../wire/serialization.js";
 import { UTXOManager, serializeUndoData, type SpentUTXO } from "../chain/utxo.js";
 
 /** Maximum blocks in-flight at once (across all peers). */
-const DEFAULT_WINDOW_SIZE = 64;
+const DEFAULT_WINDOW_SIZE = 256;
+
+/** Flush UTXO cache to disk every N blocks during IBD. */
+const FLUSH_INTERVAL = 2000;
 
 /** Maximum blocks in-flight per peer. */
 const MAX_IN_FLIGHT_PER_PEER = 16;
@@ -864,9 +867,21 @@ export class BlockSync {
       });
     }
 
-    // Sync UTXO cache + block index + chain state atomically
+    // During IBD, batch UTXO flushes for performance.
+    // Only flush every FLUSH_INTERVAL blocks or at the tip.
     this.utxoManager.setBestBlock(blockHash);
-    await this.utxoManager.flushDirty(extraOps);
+    const bestHeader = this.headerSync.getBestHeader();
+    const atTip = !bestHeader || height >= bestHeader.height;
+    const shouldFlush = atTip || height % FLUSH_INTERVAL === 0;
+
+    if (shouldFlush) {
+      await this.utxoManager.flushDirty(extraOps);
+    } else {
+      // Write block index + chain state without flushing UTXO cache
+      if (extraOps.length > 0) {
+        await this.db.batch(extraOps);
+      }
+    }
 
     // Update peer manager's best height
     if (this.peerManager) {
