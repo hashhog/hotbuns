@@ -20,8 +20,8 @@ import { DBPrefix } from "../storage/database.js";
 import type { Transaction, OutPoint } from "../validation/tx.js";
 import { BufferWriter, BufferReader } from "../wire/serialization.js";
 
-/** Default max cache size in bytes (estimated ~100MB, triggers eviction at ~65k entries). */
-const DEFAULT_DBCACHE_BYTES = 100 * 1024 * 1024;
+/** Default max cache size in bytes (~400MB — plenty of headroom on 92GB systems). */
+const DEFAULT_DBCACHE_BYTES = 400 * 1024 * 1024;
 
 /**
  * Estimated overhead per cache entry in the JS heap.
@@ -618,10 +618,10 @@ export class CoinsViewCache extends CoinsView {
 
   /**
    * Evict non-dirty entries from the cache to free memory.
-   * Removes clean entries until usage drops below the target (75% of max).
+   * Removes clean entries until usage drops below the target (90% of max).
    */
   private evictCleanEntries(): void {
-    const target = Math.floor(this.maxCacheBytes * 0.75);
+    const target = Math.floor(this.maxCacheBytes * 0.90);
     for (const [key, entry] of this.cache) {
       if (this.cachedCoinsUsage <= target) {
         break;
@@ -1035,12 +1035,26 @@ export class UTXOManager implements UTXOSet {
   }
 
   /**
-   * Pre-load multiple UTXOs in batch.
+   * Pre-load multiple UTXOs in batch (parallel LevelDB reads).
    */
   async preloadUTXOs(outpoints: OutPoint[]): Promise<number> {
+    // Filter out outpoints already in cache to avoid unnecessary DB reads
+    const toLoad: OutPoint[] = [];
     let loaded = 0;
     for (const outpoint of outpoints) {
-      const coin = await this.cache.getCoin(outpoint);
+      if (this.cache.haveCoinInCache(outpoint)) {
+        loaded++;
+      } else {
+        toLoad.push(outpoint);
+      }
+    }
+    if (toLoad.length === 0) return loaded;
+
+    // Fire all DB reads in parallel
+    const results = await Promise.all(
+      toLoad.map((op) => this.cache.getCoin(op))
+    );
+    for (const coin of results) {
       if (coin) loaded++;
     }
     return loaded;
