@@ -684,6 +684,22 @@ export class BlockSync {
     let totalInputValue = 0n;
     let totalOutputValue = 0n;
 
+    // Pre-load ALL UTXOs needed by this block in one parallel batch.
+    // This turns N sequential LevelDB reads into N parallel reads.
+    {
+      const allOutpoints: import("../validation/tx.js").OutPoint[] = [];
+      for (const tx of block.transactions) {
+        if (!isCoinbase(tx)) {
+          for (const input of tx.inputs) {
+            allOutpoints.push(input.prevOut);
+          }
+        }
+      }
+      if (allOutpoints.length > 0) {
+        await this.utxoManager.preloadUTXOs(allOutpoints);
+      }
+    }
+
     // Process transactions for UTXO updates using the UTXOManager
     for (let txIndex = 0; txIndex < block.transactions.length; txIndex++) {
       const tx = block.transactions[txIndex];
@@ -698,16 +714,23 @@ export class BlockSync {
         // Collect UTXOs and confirmations for BIP68 sequence lock validation
         const utxoConfirmations: UTXOConfirmation[] = [];
 
-        // First pass: pre-load all UTXOs into cache and gather confirmation info
-        for (const input of tx.inputs) {
-          const loaded = await this.utxoManager.preloadUTXO(input.prevOut);
-          if (!loaded) {
-            console.error(
-              `Missing UTXO: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout} in tx ${txidHex.slice(0, 16)} at height ${height}`
-            );
-            return false;
+        // First pass: pre-load ALL UTXOs for this tx in parallel (batch DB reads)
+        const inputOutpoints = tx.inputs.map((inp) => inp.prevOut);
+        const loadedCount = await this.utxoManager.preloadUTXOs(inputOutpoints);
+        if (loadedCount < tx.inputs.length) {
+          // Find which one is missing for the error message
+          for (const input of tx.inputs) {
+            if (!this.utxoManager.hasUTXO(input.prevOut)) {
+              console.error(
+                `Missing UTXO: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout} in tx ${txidHex.slice(0, 16)} at height ${height}`
+              );
+            }
           }
+          return false;
+        }
 
+        // Second pass: gather confirmation info from (now-cached) UTXOs
+        for (const input of tx.inputs) {
           const utxo = this.utxoManager.getUTXO(input.prevOut);
           if (utxo) {
             prevOutputs.push(utxo.scriptPubKey);
@@ -816,18 +839,12 @@ export class BlockSync {
       return false;
     }
 
-    // Store undo data
+    // Serialize block + undo data
     const undoData = serializeUndoData(spentOutputs);
-    await this.db.putUndoData(blockHash, undoData);
-
-    // Store block data first (independent of UTXO state)
     const rawBlock = serializeBlock(block);
-    await this.db.putBlock(blockHash, rawBlock);
 
-    // Build extra operations to commit atomically with the UTXO flush:
-    // block index, height->hash mapping, and chain state.  This prevents
-    // a crash from leaving the UTXO set ahead of the recorded chain tip
-    // (which would cause "Missing UTXO" errors on the next restart).
+    // Build all DB operations into a single atomic batch:
+    // block data, undo data, block index, height->hash, chain state.
     const blockRecord: BlockIndexRecord = {
       height,
       header: serializeBlockHeader(block.header),
@@ -837,6 +854,18 @@ export class BlockSync {
     };
     const indexValue = this.serializeBlockIndex(blockRecord);
     const extraOps: BatchOperation[] = [
+      {
+        type: "put",
+        prefix: DBPrefix.BLOCK_DATA,
+        key: blockHash,
+        value: rawBlock,
+      },
+      {
+        type: "put",
+        prefix: DBPrefix.UNDO,
+        key: blockHash,
+        value: undoData,
+      },
       {
         type: "put",
         prefix: DBPrefix.BLOCK_INDEX,
@@ -877,10 +906,8 @@ export class BlockSync {
     if (shouldFlush) {
       await this.utxoManager.flushDirty(extraOps);
     } else {
-      // Write block index + chain state without flushing UTXO cache
-      if (extraOps.length > 0) {
-        await this.db.batch(extraOps);
-      }
+      // Write block data + index + chain state without flushing UTXO cache
+      await this.db.batch(extraOps);
     }
 
     // Update peer manager's best height
