@@ -36,7 +36,7 @@ import { BufferWriter } from "../wire/serialization.js";
 import { UTXOManager, serializeUndoData, type SpentUTXO } from "../chain/utxo.js";
 
 /** Maximum blocks in-flight at once (across all peers). */
-const DEFAULT_WINDOW_SIZE = 256;
+const DEFAULT_WINDOW_SIZE = 512;
 
 /** Flush UTXO cache to disk every N blocks during IBD. */
 const FLUSH_INTERVAL = 2000;
@@ -133,6 +133,9 @@ export class BlockSync {
   /** Lock to prevent concurrent block processing. */
   private processing: boolean;
 
+  /** Last height at which UTXO cache was flushed to disk. */
+  private lastFlushedHeight: number;
+
   constructor(
     db: ChainDB,
     params: ConsensusParams,
@@ -153,6 +156,7 @@ export class BlockSync {
     this.ibdComplete = false;
     this.running = false;
     this.processing = false;
+    this.lastFlushedHeight = 0;
 
     this.state = {
       pendingBlocks: new Map(),
@@ -180,6 +184,7 @@ export class BlockSync {
     if (chainState) {
       this.state.nextHeightToProcess = chainState.bestHeight + 1;
       this.state.nextHeightToRequest = chainState.bestHeight + 1;
+      this.lastFlushedHeight = chainState.bestHeight;
     }
 
     // Register message handlers
@@ -586,6 +591,16 @@ export class BlockSync {
         break;
       }
 
+      // Periodically flush dirty UTXO entries to disk.  We batch flushes
+      // every FLUSH_INTERVAL blocks instead of every block for performance.
+      // On connectBlock failure we rewind to lastFlushedHeight so the
+      // re-download picks up from a consistent DB state.
+      const blocksSinceFlush = height - this.lastFlushedHeight;
+      if (blocksSinceFlush >= FLUSH_INTERVAL && this.utxoManager.getDirtyCount() > 0) {
+        await this.utxoManager.flushDirty();
+        this.lastFlushedHeight = height;
+      }
+
       // Validate and connect the block
       const success = await this.connectBlock(block, height);
 
@@ -601,11 +616,15 @@ export class BlockSync {
         // Reset the UTXO cache to avoid corrupt state from partial processing
         this.utxoManager.clearCache();
 
-        // Reset nextHeightToRequest so the block will be re-requested
-        // from a (potentially different) peer
-        if (height < this.state.nextHeightToRequest) {
-          this.state.nextHeightToRequest = height;
-        }
+        // Rewind to last flushed height so we re-process from a known-good
+        // DB state.  All blocks between lastFlushedHeight and height need
+        // to be re-downloaded and re-applied.
+        const rewindTo = this.lastFlushedHeight + 1;
+        this.state.nextHeightToProcess = rewindTo;
+        this.state.nextHeightToRequest = rewindTo;
+
+        // Discard any buffered blocks that are now stale
+        this.state.downloadedBlocks.clear();
 
         break;
       }
@@ -643,13 +662,19 @@ export class BlockSync {
     const blockHash = getBlockHash(block.header);
     const hashHex = blockHash.toString("hex");
 
-    // Validate the block structure
-    const validation = validateBlock(block, height, this.params);
-    if (!validation.valid) {
-      console.warn(
-        `Block ${hashHex.slice(0, 16)}... at height ${height} failed validation: ${validation.error}`
-      );
-      return false;
+    // Under assume-valid, skip expensive structural checks (merkle root,
+    // witness commitment, per-tx validation) for blocks we trust.
+    const assumeValid = this.params.assumeValidHeight > 0 && height <= this.params.assumeValidHeight;
+
+    if (!assumeValid) {
+      // Validate the block structure
+      const validation = validateBlock(block, height, this.params);
+      if (!validation.valid) {
+        console.warn(
+          `Block ${hashHex.slice(0, 16)}... at height ${height} failed validation: ${validation.error}`
+        );
+        return false;
+      }
     }
 
     // Verify the block connects to the header chain
@@ -662,7 +687,7 @@ export class BlockSync {
     }
 
     // BIP68 (CSV) activation check
-    const enforceBIP68 = height >= this.params.csvHeight;
+    const enforceBIP68 = !assumeValid && height >= this.params.csvHeight;
 
     // Get the previous block's MTP for BIP68 time-based locks
     let blockPrevMTP = 0;
@@ -711,9 +736,6 @@ export class BlockSync {
 
       // Spend inputs (except for coinbase)
       if (!isCoinbaseTx) {
-        // Collect UTXOs and confirmations for BIP68 sequence lock validation
-        const utxoConfirmations: UTXOConfirmation[] = [];
-
         // First pass: pre-load ALL UTXOs for this tx in parallel (batch DB reads)
         const inputOutpoints = tx.inputs.map((inp) => inp.prevOut);
         const loadedCount = await this.utxoManager.preloadUTXOs(inputOutpoints);
@@ -729,77 +751,95 @@ export class BlockSync {
           return false;
         }
 
-        // Second pass: gather confirmation info from (now-cached) UTXOs
-        for (const input of tx.inputs) {
-          const utxo = this.utxoManager.getUTXO(input.prevOut);
-          if (utxo) {
-            prevOutputs.push(utxo.scriptPubKey);
+        if (assumeValid) {
+          // Fast path: skip maturity, BIP68, prevOutput collection.
+          // Just spend the UTXOs and record undo data.
+          for (const input of tx.inputs) {
+            const spentEntry = this.utxoManager.spendOutput(input.prevOut);
+            totalInputValue += spentEntry.amount;
+            spentOutputs.push({
+              txid: input.prevOut.txid,
+              vout: input.prevOut.vout,
+              entry: spentEntry,
+            });
+          }
+        } else {
+          // Full validation path
+          const utxoConfirmations: UTXOConfirmation[] = [];
 
-            // Check coinbase maturity
-            if (utxo.coinbase) {
-              const maturity = height - utxo.height;
-              if (maturity < this.params.coinbaseMaturity) {
-                console.warn(
-                  `Immature coinbase spend in tx ${txidHex.slice(0, 16)}: maturity ${maturity} < ${this.params.coinbaseMaturity}`
-                );
-                return false;
-              }
-            }
+          // Gather confirmation info from (now-cached) UTXOs
+          for (const input of tx.inputs) {
+            const utxo = this.utxoManager.getUTXO(input.prevOut);
+            if (utxo) {
+              prevOutputs.push(utxo.scriptPubKey);
 
-            // Build UTXO confirmation info for BIP68
-            if (enforceBIP68) {
-              let coinMTP = 0;
-              if (utxo.height > 0) {
-                const coinPrevHeader = this.headerSync.getHeaderByHeight(utxo.height - 1);
-                if (coinPrevHeader) {
-                  coinMTP = this.headerSync.getMedianTimePast(coinPrevHeader);
+              // Check coinbase maturity
+              if (utxo.coinbase) {
+                const maturity = height - utxo.height;
+                if (maturity < this.params.coinbaseMaturity) {
+                  console.warn(
+                    `Immature coinbase spend in tx ${txidHex.slice(0, 16)}: maturity ${maturity} < ${this.params.coinbaseMaturity}`
+                  );
+                  return false;
                 }
               }
-              utxoConfirmations.push({ height: utxo.height, medianTimePast: coinMTP });
-            } else {
-              utxoConfirmations.push({ height: utxo.height, medianTimePast: 0 });
+
+              // Build UTXO confirmation info for BIP68
+              if (enforceBIP68) {
+                let coinMTP = 0;
+                if (utxo.height > 0) {
+                  const coinPrevHeader = this.headerSync.getHeaderByHeight(utxo.height - 1);
+                  if (coinPrevHeader) {
+                    coinMTP = this.headerSync.getMedianTimePast(coinPrevHeader);
+                  }
+                }
+                utxoConfirmations.push({ height: utxo.height, medianTimePast: coinMTP });
+              } else {
+                utxoConfirmations.push({ height: utxo.height, medianTimePast: 0 });
+              }
             }
           }
-        }
 
-        // BIP68 sequence lock validation (only for version >= 2 transactions)
-        if (enforceBIP68 && tx.version >= 2) {
-          const seqLockValid = checkSequenceLocks(
-            tx,
-            enforceBIP68,
-            height,
-            blockPrevMTP,
-            utxoConfirmations
-          );
-          if (!seqLockValid) {
-            console.warn(
-              `Sequence locks not satisfied for tx ${txidHex.slice(0, 16)} at height ${height}`
+          // BIP68 sequence lock validation (only for version >= 2 transactions)
+          if (enforceBIP68 && tx.version >= 2) {
+            const seqLockValid = checkSequenceLocks(
+              tx,
+              enforceBIP68,
+              height,
+              blockPrevMTP,
+              utxoConfirmations
             );
-            return false;
+            if (!seqLockValid) {
+              console.warn(
+                `Sequence locks not satisfied for tx ${txidHex.slice(0, 16)} at height ${height}`
+              );
+              return false;
+            }
           }
-        }
 
-        // Second pass: spend UTXOs via the UTXOManager
-        for (const input of tx.inputs) {
-          const spentEntry = this.utxoManager.spendOutput(input.prevOut);
-          totalInputValue += spentEntry.amount;
-
-          spentOutputs.push({
-            txid: input.prevOut.txid,
-            vout: input.prevOut.vout,
-            entry: spentEntry,
-          });
+          // Spend UTXOs via the UTXOManager
+          for (const input of tx.inputs) {
+            const spentEntry = this.utxoManager.spendOutput(input.prevOut);
+            totalInputValue += spentEntry.amount;
+            spentOutputs.push({
+              txid: input.prevOut.txid,
+              vout: input.prevOut.vout,
+              entry: spentEntry,
+            });
+          }
         }
       }
 
-      // Count sigops for this transaction
-      const txSigOpsCost = getTransactionSigOpCost(
-        tx,
-        prevOutputs,
-        verifyP2SH,
-        verifyWitness
-      );
-      totalSigOpsCost += txSigOpsCost;
+      // Count sigops for this transaction (skip under assume-valid)
+      if (!assumeValid) {
+        const txSigOpsCost = getTransactionSigOpCost(
+          tx,
+          prevOutputs,
+          verifyP2SH,
+          verifyWitness
+        );
+        totalSigOpsCost += txSigOpsCost;
+      }
 
       // Add outputs as new UTXOs via UTXOManager
       this.utxoManager.addTransaction(txid, tx, height, isCoinbaseTx);
@@ -812,31 +852,33 @@ export class BlockSync {
         }
       }
     }
-    // Verify sigops cost
-    if (totalSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
-      console.warn(
-        `Block sigops cost ${totalSigOpsCost} exceeds maximum ${MAX_BLOCK_SIGOPS_COST}`
-      );
-      return false;
-    }
+    // Verify sigops cost and coinbase value (skip under assume-valid)
+    if (!assumeValid) {
+      if (totalSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
+        console.warn(
+          `Block sigops cost ${totalSigOpsCost} exceeds maximum ${MAX_BLOCK_SIGOPS_COST}`
+        );
+        return false;
+      }
 
-    // Calculate coinbase output value
-    const coinbaseTx = block.transactions[0];
-    let coinbaseOutputValue = 0n;
-    for (const output of coinbaseTx.outputs) {
-      coinbaseOutputValue += output.value;
-    }
+      // Calculate coinbase output value
+      const coinbaseTx = block.transactions[0];
+      let coinbaseOutputValue = 0n;
+      for (const output of coinbaseTx.outputs) {
+        coinbaseOutputValue += output.value;
+      }
 
-    // Verify coinbase output <= subsidy + fees
-    const subsidy = getBlockSubsidy(height, this.params);
-    const fees = totalInputValue - (totalOutputValue - coinbaseOutputValue);
-    const maxCoinbaseValue = subsidy + fees;
+      // Verify coinbase output <= subsidy + fees
+      const subsidy = getBlockSubsidy(height, this.params);
+      const fees = totalInputValue - (totalOutputValue - coinbaseOutputValue);
+      const maxCoinbaseValue = subsidy + fees;
 
-    if (coinbaseOutputValue > maxCoinbaseValue) {
-      console.warn(
-        `Coinbase value ${coinbaseOutputValue} exceeds maximum ${maxCoinbaseValue} at height ${height}`
-      );
-      return false;
+      if (coinbaseOutputValue > maxCoinbaseValue) {
+        console.warn(
+          `Coinbase value ${coinbaseOutputValue} exceeds maximum ${maxCoinbaseValue} at height ${height}`
+        );
+        return false;
+      }
     }
 
     // Serialize block + undo data
@@ -905,6 +947,7 @@ export class BlockSync {
 
     if (shouldFlush) {
       await this.utxoManager.flushDirty(extraOps);
+      this.lastFlushedHeight = height;
     } else {
       // Write block data + index + chain state without flushing UTXO cache
       await this.db.batch(extraOps);
