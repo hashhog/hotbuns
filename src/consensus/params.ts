@@ -50,6 +50,12 @@ export interface ConsensusParams {
    */
   readonly nMinimumChainWork: bigint;
   /**
+   * Height below which script/sigop verification is skipped during IBD.
+   * Set to 0 to disable assume-valid (verify everything).
+   * This is analogous to Bitcoin Core's -assumevalid flag.
+   */
+  readonly assumeValidHeight: number;
+  /**
    * assumeUTXO snapshot data: maps block hash (hex) to snapshot metadata.
    * Used for fast startup by loading a pre-validated UTXO set.
    */
@@ -325,6 +331,7 @@ export const MAINNET: ConsensusParams = {
   csvHeight: 419328, // BIP68/112/113
   segwitHeight: 481824,
   taprootHeight: 709632,
+  assumeValidHeight: 0, // Verify everything on mainnet by default
   protocolVersion: 70016,
   services: 0x0409n, // NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED
   userAgent: "/hotbuns:0.1.0/",
@@ -623,6 +630,9 @@ export const TESTNET4: ConsensusParams = {
   csvHeight: 1,
   segwitHeight: 1,
   taprootHeight: 1,
+  // Skip script/sigop verification for blocks at or below this height.
+  // Testnet4 tip as of 2026-03: ~60k blocks, set conservatively.
+  assumeValidHeight: 50000,
   dnsSeed: [
     "seed.testnet4.bitcoin.sprovoost.nl",
     "seed.testnet4.wiz.biz",
