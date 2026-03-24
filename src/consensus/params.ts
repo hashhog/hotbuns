@@ -632,7 +632,7 @@ export const TESTNET4: ConsensusParams = {
   taprootHeight: 1,
   // Skip script/sigop verification for blocks at or below this height.
   // Testnet4 tip as of 2026-03: ~60k blocks, set conservatively.
-  assumeValidHeight: 50000,
+  assumeValidHeight: 123613,
   dnsSeed: [
     "seed.testnet4.bitcoin.sprovoost.nl",
     "seed.testnet4.wiz.biz",

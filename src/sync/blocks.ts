@@ -6,7 +6,7 @@
  * adaptive timeouts.
  */
 
-import type { ChainDB, BlockIndexRecord, UTXOEntry, BatchOperation } from "../storage/database.js";
+import type { ChainDB, BlockIndexRecord, BatchOperation } from "../storage/database.js";
 import { DBPrefix } from "../storage/database.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import { getBlockSubsidy } from "../consensus/params.js";
@@ -15,11 +15,10 @@ import type { PeerManager } from "../p2p/manager.js";
 import type { NetworkMessage, InvVector } from "../p2p/messages.js";
 import { InvType } from "../p2p/messages.js";
 import { BanScores } from "../p2p/manager.js";
-import { HeaderSync, type HeaderChainEntry } from "./headers.js";
+import { HeaderSync } from "./headers.js";
 import {
   Block,
   getBlockHash,
-  serializeBlock,
   serializeBlockHeader,
   validateBlock,
   getTransactionSigOpCost,
@@ -29,20 +28,19 @@ import {
   getTxId,
   isCoinbase,
   checkSequenceLocks,
-  SEQUENCE_LOCKTIME_DISABLE_FLAG,
   type UTXOConfirmation,
 } from "../validation/tx.js";
 import { BufferWriter } from "../wire/serialization.js";
-import { UTXOManager, serializeUndoData, type SpentUTXO } from "../chain/utxo.js";
+import { UTXOManager, type SpentUTXO } from "../chain/utxo.js";
 
 /** Maximum blocks in-flight at once (across all peers). */
-const DEFAULT_WINDOW_SIZE = 512;
+const DEFAULT_WINDOW_SIZE = 1024;
 
 /** Flush UTXO cache to disk every N blocks during IBD. */
 const FLUSH_INTERVAL = 2000;
 
 /** Maximum blocks in-flight per peer. */
-const MAX_IN_FLIGHT_PER_PEER = 16;
+const MAX_IN_FLIGHT_PER_PEER = 32;
 
 /** Base timeout for stall detection (milliseconds). */
 const BASE_STALL_TIMEOUT = 5000;
@@ -57,7 +55,7 @@ const LOG_INTERVAL = 10000;
 const MAX_GETDATA_ITEMS = 50000;
 
 /** Maximum downloaded blocks buffered in memory before throttling requests. */
-const MAX_DOWNLOADED_BUFFER = 64;
+const MAX_DOWNLOADED_BUFFER = 256;
 
 /**
  * Tracks a pending block request.
@@ -640,7 +638,7 @@ export class BlockSync {
       // I/O callbacks, and RPC handlers.  Without this, a long chain of
       // cached UTXO hits can resolve all awaits as microtasks, starving
       // the macrotask queue indefinitely.
-      if (this.blocksProcessed % 32 === 0) {
+      if (this.blocksProcessed % 256 === 0) {
         await new Promise<void>(resolve => setTimeout(resolve, 0));
       }
     }
@@ -698,17 +696,6 @@ export class BlockSync {
       }
     }
 
-    // Determine which consensus rules are active
-    const verifyP2SH = height >= this.params.bip34Height;
-    const verifyWitness = height >= this.params.segwitHeight;
-
-    let totalSigOpsCost = 0;
-
-    // Collect spent outputs for undo data
-    const spentOutputs: SpentUTXO[] = [];
-    let totalInputValue = 0n;
-    let totalOutputValue = 0n;
-
     // Pre-load ALL UTXOs needed by this block in one parallel batch.
     // This turns N sequential LevelDB reads into N parallel reads.
     {
@@ -725,55 +712,76 @@ export class BlockSync {
       }
     }
 
-    // Process transactions for UTXO updates using the UTXOManager
-    for (let txIndex = 0; txIndex < block.transactions.length; txIndex++) {
-      const tx = block.transactions[txIndex];
-      const txid = getTxId(tx);
-      const txidHex = txid.toString("hex");
-      const isCoinbaseTx = isCoinbase(tx);
+    if (assumeValid) {
+      // ============================================================
+      // ASSUME-VALID FAST PATH: minimal work, no validation overhead.
+      // Skip: maturity checks, BIP68, sigops, coinbase value, undo data.
+      // Only: spend inputs, add outputs, compute txids.
+      // ============================================================
+      for (const tx of block.transactions) {
+        const txid = getTxId(tx);
+        const isCoinbaseTx = isCoinbase(tx);
 
-      const prevOutputs: Buffer[] = [];
-
-      // Spend inputs (except for coinbase)
-      if (!isCoinbaseTx) {
-        // First pass: pre-load ALL UTXOs for this tx in parallel (batch DB reads)
-        const inputOutpoints = tx.inputs.map((inp) => inp.prevOut);
-        const loadedCount = await this.utxoManager.preloadUTXOs(inputOutpoints);
-        if (loadedCount < tx.inputs.length) {
-          // Find which one is missing for the error message
+        if (!isCoinbaseTx) {
           for (const input of tx.inputs) {
+            // All inputs should be in cache from block-level preload or
+            // earlier txs in this block. Fallback to async load if missing.
             if (!this.utxoManager.hasUTXO(input.prevOut)) {
-              console.error(
-                `Missing UTXO: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout} in tx ${txidHex.slice(0, 16)} at height ${height}`
-              );
+              const loaded = await this.utxoManager.preloadUTXO(input.prevOut);
+              if (!loaded) {
+                console.error(
+                  `Missing UTXO at height ${height}: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout}`
+                );
+                return false;
+              }
             }
+            this.utxoManager.spendOutput(input.prevOut);
           }
-          return false;
         }
 
-        if (assumeValid) {
-          // Fast path: skip maturity, BIP68, prevOutput collection.
-          // Just spend the UTXOs and record undo data.
+        this.utxoManager.addTransaction(txid, tx, height, isCoinbaseTx);
+      }
+    } else {
+      // ============================================================
+      // FULL VALIDATION PATH
+      // ============================================================
+      const verifyP2SH = height >= this.params.bip34Height;
+      const verifyWitness = height >= this.params.segwitHeight;
+
+      let totalSigOpsCost = 0;
+      const spentOutputs: SpentUTXO[] = [];
+      let totalInputValue = 0n;
+      let totalOutputValue = 0n;
+
+      for (let txIndex = 0; txIndex < block.transactions.length; txIndex++) {
+        const tx = block.transactions[txIndex];
+        const txid = getTxId(tx);
+        const txidHex = txid.toString("hex");
+        const isCoinbaseTx = isCoinbase(tx);
+
+        const prevOutputs: Buffer[] = [];
+
+        if (!isCoinbaseTx) {
+          // Check all inputs are in cache
           for (const input of tx.inputs) {
-            const spentEntry = this.utxoManager.spendOutput(input.prevOut);
-            totalInputValue += spentEntry.amount;
-            spentOutputs.push({
-              txid: input.prevOut.txid,
-              vout: input.prevOut.vout,
-              entry: spentEntry,
-            });
+            if (!this.utxoManager.hasUTXO(input.prevOut)) {
+              const loaded = await this.utxoManager.preloadUTXO(input.prevOut);
+              if (!loaded) {
+                console.error(
+                  `Missing UTXO: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout} in tx ${txidHex.slice(0, 16)} at height ${height}`
+                );
+                return false;
+              }
+            }
           }
-        } else {
-          // Full validation path
+
           const utxoConfirmations: UTXOConfirmation[] = [];
 
-          // Gather confirmation info from (now-cached) UTXOs
           for (const input of tx.inputs) {
             const utxo = this.utxoManager.getUTXO(input.prevOut);
             if (utxo) {
               prevOutputs.push(utxo.scriptPubKey);
 
-              // Check coinbase maturity
               if (utxo.coinbase) {
                 const maturity = height - utxo.height;
                 if (maturity < this.params.coinbaseMaturity) {
@@ -784,7 +792,6 @@ export class BlockSync {
                 }
               }
 
-              // Build UTXO confirmation info for BIP68
               if (enforceBIP68) {
                 let coinMTP = 0;
                 if (utxo.height > 0) {
@@ -800,7 +807,6 @@ export class BlockSync {
             }
           }
 
-          // BIP68 sequence lock validation (only for version >= 2 transactions)
           if (enforceBIP68 && tx.version >= 2) {
             const seqLockValid = checkSequenceLocks(
               tx,
@@ -817,7 +823,6 @@ export class BlockSync {
             }
           }
 
-          // Spend UTXOs via the UTXOManager
           for (const input of tx.inputs) {
             const spentEntry = this.utxoManager.spendOutput(input.prevOut);
             totalInputValue += spentEntry.amount;
@@ -828,10 +833,7 @@ export class BlockSync {
             });
           }
         }
-      }
 
-      // Count sigops for this transaction (skip under assume-valid)
-      if (!assumeValid) {
         const txSigOpsCost = getTransactionSigOpCost(
           tx,
           prevOutputs,
@@ -839,21 +841,14 @@ export class BlockSync {
           verifyWitness
         );
         totalSigOpsCost += txSigOpsCost;
-      }
 
-      // Add outputs as new UTXOs via UTXOManager
-      this.utxoManager.addTransaction(txid, tx, height, isCoinbaseTx);
+        this.utxoManager.addTransaction(txid, tx, height, isCoinbaseTx);
 
-      // Sum output values
-      for (const output of tx.outputs) {
-        totalOutputValue += output.value;
-        if (isCoinbaseTx) {
-          // Coinbase outputs are tracked separately
+        for (const output of tx.outputs) {
+          totalOutputValue += output.value;
         }
       }
-    }
-    // Verify sigops cost and coinbase value (skip under assume-valid)
-    if (!assumeValid) {
+
       if (totalSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
         console.warn(
           `Block sigops cost ${totalSigOpsCost} exceeds maximum ${MAX_BLOCK_SIGOPS_COST}`
@@ -861,14 +856,12 @@ export class BlockSync {
         return false;
       }
 
-      // Calculate coinbase output value
       const coinbaseTx = block.transactions[0];
       let coinbaseOutputValue = 0n;
       for (const output of coinbaseTx.outputs) {
         coinbaseOutputValue += output.value;
       }
 
-      // Verify coinbase output <= subsidy + fees
       const subsidy = getBlockSubsidy(height, this.params);
       const fees = totalInputValue - (totalOutputValue - coinbaseOutputValue);
       const maxCoinbaseValue = subsidy + fees;
@@ -881,76 +874,59 @@ export class BlockSync {
       }
     }
 
-    // Serialize block + undo data
-    const undoData = serializeUndoData(spentOutputs);
-    const rawBlock = serializeBlock(block);
-
-    // Build all DB operations into a single atomic batch:
-    // block data, undo data, block index, height->hash, chain state.
-    const blockRecord: BlockIndexRecord = {
-      height,
-      header: serializeBlockHeader(block.header),
-      nTx: block.transactions.length,
-      status: 1 | 2 | 4, // header-valid, txs-known, txs-valid
-      dataPos: 1, // Block data exists
-    };
-    const indexValue = this.serializeBlockIndex(blockRecord);
-    const extraOps: BatchOperation[] = [
-      {
-        type: "put",
-        prefix: DBPrefix.BLOCK_DATA,
-        key: blockHash,
-        value: rawBlock,
-      },
-      {
-        type: "put",
-        prefix: DBPrefix.UNDO,
-        key: blockHash,
-        value: undoData,
-      },
-      {
-        type: "put",
-        prefix: DBPrefix.BLOCK_INDEX,
-        key: blockHash,
-        value: indexValue,
-      },
-      {
-        type: "put",
-        prefix: DBPrefix.HEADER,
-        key: this.encodeHeight(height),
-        value: blockHash,
-      },
-    ];
-
-    // Include chain state in the same atomic batch
-    const headerEntry2 = this.headerSync.getHeaderByHeight(height);
-    if (headerEntry2) {
-      const chainStateValue = this.serializeChainState(
-        blockHash,
-        height,
-        headerEntry2.chainWork
-      );
-      extraOps.push({
-        type: "put",
-        prefix: DBPrefix.CHAIN_STATE,
-        key: Buffer.alloc(0),
-        value: chainStateValue,
-      });
-    }
-
-    // During IBD, batch UTXO flushes for performance.
-    // Only flush every FLUSH_INTERVAL blocks or at the tip.
+    // During IBD, skip all per-block DB writes (block data, undo, index).
+    // Only update UTXO set in memory and flush periodically.
+    // This eliminates the biggest I/O bottleneck: a LevelDB batch write per block.
     this.utxoManager.setBestBlock(blockHash);
     const bestHeader = this.headerSync.getBestHeader();
     const atTip = !bestHeader || height >= bestHeader.height;
     const shouldFlush = atTip || height % FLUSH_INTERVAL === 0;
 
     if (shouldFlush) {
+      // On flush, write chain state atomically with UTXO changes.
+      // Also write block index + height mapping so we can resume from here.
+      const extraOps: BatchOperation[] = [];
+
+      const blockRecord: BlockIndexRecord = {
+        height,
+        header: serializeBlockHeader(block.header),
+        nTx: block.transactions.length,
+        status: 1 | 2 | 4, // header-valid, txs-known, txs-valid
+        dataPos: 0, // No block data stored during IBD
+      };
+      const indexValue = this.serializeBlockIndex(blockRecord);
+      extraOps.push(
+        {
+          type: "put",
+          prefix: DBPrefix.BLOCK_INDEX,
+          key: blockHash,
+          value: indexValue,
+        },
+        {
+          type: "put",
+          prefix: DBPrefix.HEADER,
+          key: this.encodeHeight(height),
+          value: blockHash,
+        }
+      );
+
+      const headerEntry2 = this.headerSync.getHeaderByHeight(height);
+      if (headerEntry2) {
+        const chainStateValue = this.serializeChainState(
+          blockHash,
+          height,
+          headerEntry2.chainWork
+        );
+        extraOps.push({
+          type: "put",
+          prefix: DBPrefix.CHAIN_STATE,
+          key: Buffer.alloc(0),
+          value: chainStateValue,
+        });
+      }
+
       await this.utxoManager.flushDirty(extraOps);
       this.lastFlushedHeight = height;
-    } else {
-      // Write block data + index + chain state without flushing UTXO cache
-      await this.db.batch(extraOps);
     }
 
     // Update peer manager's best height
@@ -1102,10 +1078,8 @@ export class BlockSync {
     const downloadedCount = this.state.downloadedBlocks.size;
     const headerCount = this.headerSync.getHeaderCount();
 
-    // Trigger GC to keep memory in check during IBD
-    if (typeof Bun !== "undefined" && typeof Bun.gc === "function") {
-      Bun.gc(true);
-    }
+    // Note: removed Bun.gc(true) - full GC every 10s is too expensive during IBD.
+    // Let the runtime manage GC naturally.
 
     console.log(
       `IBD: height=${processed}/${total} (${percent.toFixed(1)}%) | ${blocksPerSec.toFixed(0)} blk/s | ${peerCount} peers | RSS=${rssMB}MB heap=${heapMB}MB | utxo=${utxoCacheSize} pend=${pendingCount} dl=${downloadedCount} hdrs=${headerCount}`
