@@ -945,7 +945,7 @@ export class RPCServer {
    * getbestblockhash: Returns the hash of the best (tip) block.
    */
   private async getBestBlockHash(): Promise<string> {
-    return this.chainState.getBestBlock().hash.toString("hex");
+    return Buffer.from(this.chainState.getBestBlock().hash).reverse().toString("hex");
   }
 
   /**
