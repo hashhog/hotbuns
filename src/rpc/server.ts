@@ -662,7 +662,7 @@ export class RPCServer {
       chain,
       blocks: bestBlock.height,
       headers: headers,
-      bestblockhash: bestBlock.hash.toString("hex"),
+      bestblockhash: Buffer.from(bestBlock.hash).reverse().toString("hex"),
       difficulty,
       mediantime,
       verificationprogress,
@@ -800,7 +800,7 @@ export class RPCServer {
       height: blockIndex.height,
       version: block.header.version,
       versionHex: block.header.version.toString(16).padStart(8, "0"),
-      merkleroot: block.header.merkleRoot.toString("hex"),
+      merkleroot: block.Buffer.from(header.merkleRoot).reverse().toString("hex"),
       time: block.header.timestamp,
       mediantime: headerEntry
         ? this.headerSync.getMedianTimePast(headerEntry)
@@ -810,18 +810,18 @@ export class RPCServer {
       difficulty: this.calculateDifficultyFromBits(block.header.bits),
       chainwork: headerEntry?.chainWork.toString(16).padStart(64, "0") ?? "0",
       nTx: block.transactions.length,
-      previousblockhash: block.header.prevBlock.toString("hex"),
+      previousblockhash: block.Buffer.from(header.prevBlock).reverse().toString("hex"),
     };
 
     // Add next block hash if available
     const nextHash = await this.db.getBlockHashByHeight(blockIndex.height + 1);
     if (nextHash) {
-      result.nextblockhash = nextHash.toString("hex");
+      result.nextblockhash = Buffer.from(nextHash).reverse().toString("hex");
     }
 
     // Add transactions
     if (verbosity === 1) {
-      result.tx = block.transactions.map((tx) => getTxId(tx).toString("hex"));
+      result.tx = block.transactions.map((tx) => Buffer.from(getTxId(tx)).reverse().toString("hex"));
     } else if (verbosity === 2) {
       result.tx = block.transactions.map((tx, index) =>
         this.formatTransaction(tx, blockhash, blockIndex.height, index)
@@ -860,7 +860,7 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INTERNAL_ERROR, "Block hash not found for height");
     }
 
-    return hash.toString("hex");
+    return Buffer.from(hash).reverse().toString("hex");
   }
 
   /**
@@ -912,7 +912,7 @@ export class RPCServer {
       height: blockIndex.height,
       version: header.version,
       versionHex: header.version.toString(16).padStart(8, "0"),
-      merkleroot: header.merkleRoot.toString("hex"),
+      merkleroot: Buffer.from(header.merkleRoot).reverse().toString("hex"),
       time: header.timestamp,
       mediantime: headerEntry
         ? this.headerSync.getMedianTimePast(headerEntry)
@@ -922,13 +922,13 @@ export class RPCServer {
       difficulty: this.calculateDifficultyFromBits(header.bits),
       chainwork: headerEntry?.chainWork.toString(16).padStart(64, "0") ?? "0",
       nTx: blockIndex.nTx,
-      previousblockhash: header.prevBlock.toString("hex"),
+      previousblockhash: Buffer.from(header.prevBlock).reverse().toString("hex"),
     };
 
     // Add next block hash if available
     const nextHash = await this.db.getBlockHashByHeight(blockIndex.height + 1);
     if (nextHash) {
-      result.nextblockhash = nextHash.toString("hex");
+      result.nextblockhash = Buffer.from(nextHash).reverse().toString("hex");
     }
 
     return result;
@@ -960,7 +960,7 @@ export class RPCServer {
     // A full implementation would track all fork tips
     tips.push({
       height: bestBlock.height,
-      hash: bestBlock.hash.toString("hex"),
+      hash: Buffer.from(bestBlock.hash).reverse().toString("hex"),
       branchlen: 0,
       status: "active",
     });
@@ -1105,7 +1105,7 @@ export class RPCServer {
 
         return {
           ...this.formatTransactionVerbose(tx, blockhash, blockIndex.height, i),
-          blockhash: blockhash.toString("hex"),
+          blockhash: Buffer.from(blockhash).reverse().toString("hex"),
           confirmations,
           time: blocktime,
           blocktime,
@@ -1134,8 +1134,8 @@ export class RPCServer {
     const vsize = getTxVSize(tx);
 
     const result: Record<string, unknown> = {
-      txid: txid.toString("hex"),
-      hash: wtxid.toString("hex"),
+      txid: Buffer.from(txid).reverse().toString("hex"),
+      hash: wBuffer.from(txid).reverse().toString("hex"),
       version: tx.version,
       size: serializedWithWitness.length,
       vsize,
@@ -1149,7 +1149,7 @@ export class RPCServer {
           vin.coinbase = input.scriptSig.toString("hex");
           vin.sequence = input.sequence;
         } else {
-          vin.txid = input.prevOut.txid.toString("hex");
+          vin.txid = input.prevOut.Buffer.from(txid).reverse().toString("hex");
           vin.vout = input.prevOut.vout;
           vin.scriptSig = {
             asm: this.disassembleScript(input.scriptSig),
@@ -1623,7 +1623,7 @@ export class RPCServer {
     }
 
     const txid = getTxId(tx);
-    const txidHex = txid.toString("hex");
+    const txidHex = Buffer.from(txid).reverse().toString("hex");
 
     // Check if already in mempool (this is NOT an error per Bitcoin Core behavior)
     // We return the txid and consider it success - the tx is in the mempool already
@@ -1935,7 +1935,7 @@ export class RPCServer {
     const txids = this.mempool.getAllTxids();
 
     if (!verbose) {
-      return txids.map((txid) => txid.toString("hex"));
+      return txids.map((txid) => Buffer.from(txid).reverse().toString("hex"));
     }
 
     // Verbose: return detailed entries
@@ -1945,7 +1945,7 @@ export class RPCServer {
       const entry = this.mempool.getTransaction(txid);
       if (!entry) continue;
 
-      const txidHex = txid.toString("hex");
+      const txidHex = Buffer.from(txid).reverse().toString("hex");
       result[txidHex] = {
         vsize: entry.vsize,
         weight: entry.weight,
@@ -2076,7 +2076,7 @@ export class RPCServer {
         const reader = new BufferReader(txData);
         const tx = deserializeTx(reader);
         const txid = getTxId(tx);
-        const txidHex = txid.toString("hex");
+        const txidHex = Buffer.from(txid).reverse().toString("hex");
 
         // Check if already in mempool
         if (this.mempool.hasTransaction(txid)) {
@@ -2730,7 +2730,7 @@ export class RPCServer {
       const entry = this.mempool.getTransaction(txid);
       if (!entry) continue;
 
-      const txidHex = txid.toString("hex");
+      const txidHex = Buffer.from(txid).reverse().toString("hex");
       txIndex.set(txidHex, idx);
 
       // Calculate dependencies (other transactions in the template that must come before)
@@ -2768,7 +2768,7 @@ export class RPCServer {
     const targetHex = target.toString(16).padStart(64, "0");
 
     // Get previous block hash
-    const previousblockhash = bestBlock.hash.toString("hex");
+    const previousblockhash = Buffer.from(bestBlock.hash).reverse().toString("hex");
 
     // Calculate current time and minimum time
     const curtime = Math.floor(Date.now() / 1000);
@@ -3525,8 +3525,8 @@ export class RPCServer {
     const wtxid = getWTxId(tx);
 
     const result: Record<string, unknown> = {
-      txid: txid.toString("hex"),
-      hash: wtxid.toString("hex"),
+      txid: Buffer.from(txid).reverse().toString("hex"),
+      hash: wBuffer.from(txid).reverse().toString("hex"),
       version: tx.version,
       size: serializeTx(tx, true).length,
       vsize: getTxVSize(tx),
@@ -3540,7 +3540,7 @@ export class RPCServer {
           vin.coinbase = input.scriptSig.toString("hex");
           vin.sequence = input.sequence;
         } else {
-          vin.txid = input.prevOut.txid.toString("hex");
+          vin.txid = input.prevOut.Buffer.from(txid).reverse().toString("hex");
           vin.vout = input.prevOut.vout;
           vin.scriptSig = {
             asm: this.disassembleScript(input.scriptSig),
@@ -3563,7 +3563,7 @@ export class RPCServer {
     };
 
     if (blockhash) {
-      result.blockhash = blockhash.toString("hex");
+      result.blockhash = Buffer.from(blockhash).reverse().toString("hex");
       result.confirmations = this.chainState.getBestBlock().height - height + 1;
       result.blocktime = 0; // Would need to look up block
       result.time = 0;

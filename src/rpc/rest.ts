@@ -331,12 +331,12 @@ export class RESTServer {
     const bestBlock = this.chainState.getBestBlock();
 
     const result: Record<string, unknown> = {
-      hash: hash.toString("hex"),
+      hash: Buffer.from(hash).reverse().toString("hex"),
       confirmations: height >= 0 ? bestBlock.height - height + 1 : 0,
       height,
       version: block.header.version,
       versionHex: block.header.version.toString(16).padStart(8, "0"),
-      merkleroot: block.header.merkleRoot.toString("hex"),
+      merkleroot: Buffer.from(block.header.merkleRoot).reverse().toString("hex"),
       time: block.header.timestamp,
       mediantime: headerEntry
         ? this.headerSync.getMedianTimePast(headerEntry)
@@ -346,7 +346,7 @@ export class RESTServer {
       difficulty: this.calculateDifficultyFromBits(block.header.bits),
       chainwork: headerEntry?.chainWork.toString(16).padStart(64, "0") ?? "0",
       nTx: block.transactions.length,
-      previousblockhash: block.header.prevBlock.toString("hex"),
+      previousblockhash: Buffer.from(block.header.prevBlock).reverse().toString("hex"),
     };
 
     if (includeTxDetails) {
@@ -354,7 +354,7 @@ export class RESTServer {
         this.formatTxJson(tx, hash, height, index)
       );
     } else {
-      result.tx = block.transactions.map((tx) => getTxId(tx).toString("hex"));
+      result.tx = block.transactions.map((tx) => Buffer.from(getTxId(tx)).reverse().toString("hex"));
     }
 
     return result;
@@ -457,18 +457,18 @@ export class RESTServer {
     const height = headerEntry?.height ?? -1;
 
     return {
-      hash: hash.toString("hex"),
+      hash: Buffer.from(hash).reverse().toString("hex"),
       confirmations: height >= 0 ? bestBlock.height - height + 1 : 0,
       height,
       version: header.version,
       versionHex: header.version.toString(16).padStart(8, "0"),
-      merkleroot: header.merkleRoot.toString("hex"),
+      merkleroot: Buffer.from(header.merkleRoot).reverse().toString("hex"),
       time: header.timestamp,
       nonce: header.nonce,
       bits: header.bits.toString(16).padStart(8, "0"),
       difficulty: this.calculateDifficultyFromBits(header.bits),
       chainwork: headerEntry?.chainWork.toString(16).padStart(64, "0") ?? "0",
-      previousblockhash: header.prevBlock.toString("hex"),
+      previousblockhash: Buffer.from(header.prevBlock).reverse().toString("hex"),
     };
   }
 
@@ -501,13 +501,13 @@ export class RESTServer {
     }
 
     if (format === "hex") {
-      return new Response(hash.toString("hex") + "\n", {
+      return new Response(Buffer.from(hash).reverse().toString("hex") + "\n", {
         status: 200,
         headers: { "Content-Type": "text/plain" },
       });
     }
 
-    return this.formatResponse({ blockhash: hash.toString("hex") }, format);
+    return this.formatResponse({ blockhash: Buffer.from(hash).reverse().toString("hex") }, format);
   }
 
   // ========== Transaction Endpoint ==========
@@ -589,8 +589,8 @@ export class RESTServer {
     const wtxid = getWTxId(tx);
 
     const result: Record<string, unknown> = {
-      txid: txid.toString("hex"),
-      hash: wtxid.toString("hex"),
+      txid: Buffer.from(txid).reverse().toString("hex"),
+      hash: Buffer.from(wtxid).reverse().toString("hex"),
       version: tx.version,
       size: serializeTx(tx, true).length,
       vsize: getTxVSize(tx),
@@ -601,7 +601,7 @@ export class RESTServer {
         if (isCoinbase(tx)) {
           vin.coinbase = input.scriptSig.toString("hex");
         } else {
-          vin.txid = input.prevOut.txid.toString("hex");
+          vin.txid = Buffer.from(input.prevOut.txid).reverse().toString("hex");
           vin.vout = input.prevOut.vout;
           vin.scriptSig = {
             hex: input.scriptSig.toString("hex"),
@@ -623,7 +623,7 @@ export class RESTServer {
     };
 
     if (blockHash) {
-      result.blockhash = blockHash.toString("hex");
+      result.blockhash = Buffer.from(blockHash).reverse().toString("hex");
       result.confirmations = this.chainState.getBestBlock().height - height + 1;
       result.blocktime = 0; // Would need to look up
     }
@@ -756,7 +756,7 @@ export class RESTServer {
     const bitmapStr = hits.map((h) => (h ? "1" : "0")).join("");
     const json: Record<string, unknown> = {
       chainHeight: bestBlock.height,
-      chaintipHash: bestBlock.hash.toString("hex"),
+      chaintipHash: Buffer.from(bestBlock.hash).reverse().toString("hex"),
       bitmap: bitmapStr,
       utxos: utxos.map((utxo) => ({
         height: utxo.height,
@@ -803,7 +803,7 @@ export class RESTServer {
       for (const txid of txids) {
         const entry = this.mempool.getTransaction(txid);
         if (entry) {
-          entries.set(txid.toString("hex"), {
+          entries.set(Buffer.from(txid).reverse().toString("hex"), {
             vsize: entry.vsize,
             weight: entry.weight,
             fee: Number(entry.fee) / 100000000,
@@ -814,7 +814,7 @@ export class RESTServer {
             descendantsize: entry.descendantSize,
             ancestorcount: entry.ancestorCount,
             ancestorsize: entry.ancestorSize,
-            wtxid: getWTxId(entry.tx).toString("hex"),
+            wtxid: Buffer.from(getWTxId(entry.tx)).reverse().toString("hex"),
             fees: {
               base: Number(entry.fee) / 100000000,
               modified: Number(entry.fee) / 100000000,
@@ -855,7 +855,7 @@ export class RESTServer {
       chain: this.getChainName(),
       blocks: bestBlock.height,
       headers: bestHeader?.height ?? bestBlock.height,
-      bestblockhash: bestBlock.hash.toString("hex"),
+      bestblockhash: Buffer.from(bestBlock.hash).reverse().toString("hex"),
       difficulty: await this.getDifficulty(bestBlock.hash),
       mediantime: 0, // Would need MTP calculation
       verificationprogress:
