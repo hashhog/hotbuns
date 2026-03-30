@@ -18,7 +18,9 @@ import { BanScores } from "../p2p/manager.js";
 import { HeaderSync } from "./headers.js";
 import {
   Block,
+  deserializeBlock,
   getBlockHash,
+  serializeBlock,
   serializeBlockHeader,
   validateBlock,
   getTransactionSigOpCost,
@@ -30,7 +32,7 @@ import {
   checkSequenceLocks,
   type UTXOConfirmation,
 } from "../validation/tx.js";
-import { BufferWriter } from "../wire/serialization.js";
+import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { UTXOManager, type SpentUTXO } from "../chain/utxo.js";
 
 /** Maximum blocks in-flight at once (across all peers). */
@@ -248,6 +250,15 @@ export class BlockSync {
       }
     });
 
+    // Handle getdata requests (serve blocks to peers)
+    peerManager.onMessage("getdata", (peer, msg) => {
+      if (msg.type === "getdata") {
+        this.handleGetData(peer, msg.payload.inventory).catch((err) => {
+          console.error(`Error handling getdata from ${peer.host}:${peer.port}:`, err);
+        });
+      }
+    });
+
     // On new peer connection, request blocks if needed
     peerManager.onMessage("__connect__", (peer) => {
       if (this.running && !this.ibdComplete) {
@@ -364,6 +375,25 @@ export class BlockSync {
 
     if (blocksToRequest.length > 0) {
       this.sendGetData(peer, blocksToRequest);
+    }
+  }
+
+  /**
+   * Handle getdata requests from peers — serve blocks we have stored.
+   */
+  private async handleGetData(peer: Peer, inventory: InvVector[]): Promise<void> {
+    for (const inv of inventory) {
+      if (inv.type === InvType.MSG_BLOCK || inv.type === InvType.MSG_WITNESS_BLOCK) {
+        const rawBlock = await this.db.getBlock(inv.hash);
+        if (rawBlock) {
+          const block = deserializeBlock(new BufferReader(rawBlock));
+          const blockMsg: NetworkMessage = {
+            type: "block",
+            payload: { block },
+          };
+          peer.send(blockMsg);
+        }
+      }
     }
   }
 
