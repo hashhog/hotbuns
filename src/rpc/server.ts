@@ -1905,6 +1905,24 @@ export class RPCServer {
     this.peerManager.broadcast(invMsg);
   }
 
+  /**
+   * Broadcast a block inventory message to all connected peers.
+   */
+  private broadcastBlockInv(blockHash: Buffer): void {
+    const invMsg: NetworkMessage = {
+      type: "inv",
+      payload: {
+        inventory: [
+          {
+            type: InvType.MSG_BLOCK,
+            hash: blockHash,
+          },
+        ],
+      },
+    };
+    this.peerManager.broadcast(invMsg);
+  }
+
   // ========== Mempool Methods ==========
 
   /**
@@ -3256,6 +3274,9 @@ export class RPCServer {
         const txid = getTxId(tx);
         this.mempool.removeTransaction(txid);
       }
+
+      // Announce new block to all connected peers
+      this.broadcastBlockInv(blockHash);
 
       return { hash: blockHashHex };
     } else {
