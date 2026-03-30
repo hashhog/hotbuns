@@ -406,6 +406,8 @@ async function startNode(config: NodeConfig): Promise<void> {
     bestHeight: bestBlock.height,
     datadir: mergedConfig.datadir,
     connect: config.connect,
+    listen: mergedConfig.listen,
+    port: mergedConfig.port,
   });
 
   // Register header sync with peer manager

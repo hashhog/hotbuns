@@ -2341,6 +2341,110 @@ export class RPCServer {
     };
   }
 
+  // ========== Node Connection Management ==========
+
+  /**
+   * addnode: Add, remove, or try a connection to a node.
+   * @param params [node, command] where command is "add", "remove", or "onetry"
+   */
+  private async addNode(params: unknown[]): Promise<null> {
+    const [nodeParam, commandParam] = params;
+
+    if (typeof nodeParam !== "string" || nodeParam.length === 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Node address required");
+    }
+    if (typeof commandParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, 'Command required ("add", "remove", or "onetry")');
+    }
+
+    const command = commandParam.toLowerCase();
+    if (command !== "add" && command !== "remove" && command !== "onetry") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, 'Command must be "add", "remove", or "onetry"');
+    }
+
+    // Parse host:port
+    const lastColon = nodeParam.lastIndexOf(":");
+    let host: string;
+    let port: number;
+    if (lastColon > 0) {
+      host = nodeParam.slice(0, lastColon);
+      port = parseInt(nodeParam.slice(lastColon + 1), 10);
+    } else {
+      host = nodeParam;
+      port = this.params.defaultPort;
+    }
+
+    if (isNaN(port) || port <= 0 || port > 65535) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid port number");
+    }
+
+    if (command === "onetry" || command === "add") {
+      try {
+        await this.peerManager.connectPeer(host, port);
+      } catch (err: unknown) {
+        if (command === "add") {
+          throw this.rpcError(
+            RPCErrorCodes.MISC_ERROR,
+            `Failed to connect: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+        // onetry silently ignores connection failure
+      }
+    } else if (command === "remove") {
+      const key = `${host}:${port}`;
+      this.peerManager.disconnectPeer(key);
+    }
+
+    return null;
+  }
+
+  /**
+   * disconnectnode: Disconnect from a specified peer node.
+   * @param params [address] or [{address: string}]
+   */
+  private async disconnectNode(params: unknown[]): Promise<null> {
+    let address: string | undefined;
+
+    if (typeof params[0] === "string") {
+      address = params[0];
+    } else if (typeof params[0] === "object" && params[0] !== null) {
+      address = (params[0] as Record<string, unknown>).address as string | undefined;
+    }
+
+    if (!address || typeof address !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Node address required");
+    }
+
+    // Parse host:port
+    const lastColon = address.lastIndexOf(":");
+    let host: string;
+    let port: number;
+    if (lastColon > 0) {
+      host = address.slice(0, lastColon);
+      port = parseInt(address.slice(lastColon + 1), 10);
+    } else {
+      host = address;
+      port = this.params.defaultPort;
+    }
+
+    const key = `${host}:${port}`;
+    const peers = this.peerManager.getConnectedPeers();
+    const found = peers.some(p => `${p.host}:${p.port}` === key);
+    if (!found) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, `Node ${address} not found`);
+    }
+
+    this.peerManager.disconnectPeer(key);
+    return null;
+  }
+
+  /**
+   * getconnectioncount: Returns the number of connections to other nodes.
+   */
+  private getConnectionCount(): number {
+    return this.peerManager.getConnectedPeers().length;
+  }
+
   // ========== Ban Management ==========
 
   /**
