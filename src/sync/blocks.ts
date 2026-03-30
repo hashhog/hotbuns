@@ -229,8 +229,22 @@ export class BlockSync {
       this.logInterval = null;
     }
 
-    // Flush any pending UTXO updates
-    await this.utxoManager.flush();
+    // If we are in the middle of connectBlock, the UTXO cache may contain
+    // partially-processed state (some inputs spent, some outputs added for
+    // the in-progress block).  Flushing that to disk would corrupt the UTXO
+    // set: a spent coin gets DELETEd from LevelDB even though the block was
+    // never fully connected.  On the next restart the chain-state height
+    // points *before* that block, so we'd try to spend the coin again — but
+    // it's already gone from the DB → permanent "Missing UTXO" stall.
+    //
+    // Fix: discard the dirty cache when a block is in flight.  We'll
+    // re-derive those entries on the next startup from lastFlushedHeight.
+    if (this.processing) {
+      this.utxoManager.clearCache();
+    } else {
+      // Flush any pending UTXO updates
+      await this.utxoManager.flush();
+    }
   }
 
   /**
