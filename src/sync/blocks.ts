@@ -16,6 +16,7 @@ import type { NetworkMessage, InvVector } from "../p2p/messages.js";
 import { InvType } from "../p2p/messages.js";
 import { BanScores } from "../p2p/manager.js";
 import { HeaderSync } from "./headers.js";
+import type { ChainStateManager } from "../chain/state.js";
 import {
   Block,
   deserializeBlock,
@@ -136,16 +137,22 @@ export class BlockSync {
   /** Last height at which UTXO cache was flushed to disk. */
   private lastFlushedHeight: number;
 
+  /** Chain state manager — updated after each connected block so RPC
+   *  methods like getblockcount reflect the latest chain tip. */
+  private chainStateManager: ChainStateManager | null;
+
   constructor(
     db: ChainDB,
     params: ConsensusParams,
     headerSync: HeaderSync,
-    peerManager?: PeerManager
+    peerManager?: PeerManager,
+    chainStateManager?: ChainStateManager
   ) {
     this.db = db;
     this.params = params;
     this.headerSync = headerSync;
     this.peerManager = peerManager ?? null;
+    this.chainStateManager = chainStateManager ?? null;
     this.windowSize = DEFAULT_WINDOW_SIZE;
     this.peerInFlight = new Map();
     this.utxoManager = new UTXOManager(db);
@@ -266,11 +273,14 @@ export class BlockSync {
       }
     });
 
-    // When new headers arrive, re-enter IBD if we have blocks to download
-    peerManager.onMessage("headers", (_peer, _msg) => {
+    // When new headers are fully processed (callback fires AFTER headerSync
+    // has updated bestHeader), re-enter IBD if we have blocks to download.
+    // This replaces the old "headers" message handler which suffered from a
+    // race condition: the message handler ran before headerSync finished
+    // processing headers asynchronously, so bestHeader was stale.
+    this.headerSync.onHeadersProcessed((newTipHeight: number) => {
       if (!this.running) return;
-      const bestHeader = this.headerSync.getBestHeader();
-      if (bestHeader && bestHeader.height >= this.state.nextHeightToProcess) {
+      if (newTipHeight >= this.state.nextHeightToProcess) {
         if (this.ibdComplete) {
           this.ibdComplete = false;
         }
@@ -344,6 +354,7 @@ export class BlockSync {
     }
 
     const blocksToRequest: Buffer[] = [];
+    let needHeaders = false;
 
     for (const inv of inventory) {
       if (inv.type === InvType.MSG_BLOCK || inv.type === InvType.MSG_WITNESS_BLOCK) {
@@ -359,7 +370,10 @@ export class BlockSync {
         // Check if we have the header
         const headerEntry = this.headerSync.getHeader(inv.hash);
         if (!headerEntry) {
-          // Unknown header - let header sync handle it
+          // Unknown header — request headers from this peer so we learn
+          // about the new chain, then the onHeadersProcessed callback will
+          // trigger block downloads.
+          needHeaders = true;
           continue;
         }
 
@@ -375,6 +389,15 @@ export class BlockSync {
 
     if (blocksToRequest.length > 0) {
       this.sendGetData(peer, blocksToRequest);
+    }
+
+    // If we saw block inv(s) with unknown headers, ask the peer for headers.
+    // Use force=true because the peer's startHeight from the version handshake
+    // is stale — the peer has new blocks we don't know about yet.
+    // After headers arrive and are processed, the onHeadersProcessed callback
+    // will trigger requestBlocks() to download the actual block data.
+    if (needHeaders) {
+      this.headerSync.requestHeaders(peer, true);
     }
   }
 
@@ -904,13 +927,20 @@ export class BlockSync {
       }
     }
 
-    // During IBD, skip all per-block DB writes (block data, undo, index).
-    // Only update UTXO set in memory and flush periodically.
+    // During IBD, skip per-block DB writes (block data, undo, index) except
+    // near the tip. Only update UTXO set in memory and flush periodically.
     // This eliminates the biggest I/O bottleneck: a LevelDB batch write per block.
     this.utxoManager.setBestBlock(blockHash);
     const bestHeader = this.headerSync.getBestHeader();
     const atTip = !bestHeader || height >= bestHeader.height;
     const shouldFlush = atTip || height % FLUSH_INTERVAL === 0;
+
+    // Store raw block data when near the tip so we can serve blocks to
+    // peers via getdata.  During deep IBD this is skipped for performance.
+    if (atTip) {
+      const rawBlock = serializeBlock(block);
+      await this.db.putBlock(blockHash, rawBlock);
+    }
 
     if (shouldFlush) {
       // On flush, write chain state atomically with UTXO changes.
@@ -921,8 +951,8 @@ export class BlockSync {
         height,
         header: serializeBlockHeader(block.header),
         nTx: block.transactions.length,
-        status: 1 | 2 | 4, // header-valid, txs-known, txs-valid
-        dataPos: 0, // No block data stored during IBD
+        status: 1 | 2 | 4 | (atTip ? 8 : 0), // header-valid, txs-known, txs-valid, have-data when at tip
+        dataPos: atTip ? 1 : 0,
       };
       const indexValue = this.serializeBlockIndex(blockRecord);
       extraOps.push(
@@ -962,6 +992,26 @@ export class BlockSync {
     // Update peer manager's best height
     if (this.peerManager) {
       this.peerManager.updateBestHeight(height);
+    }
+
+    // Update the in-memory chain state so RPC (getblockcount, getbestblockhash)
+    // reflects the latest connected block without waiting for a restart.
+    if (this.chainStateManager) {
+      const headerEntry3 = this.headerSync.getHeaderByHeight(height);
+      if (headerEntry3) {
+        this.chainStateManager.updateTip(blockHash, height, headerEntry3.chainWork);
+      }
+    }
+
+    // Relay new tip blocks to peers so they learn about the chain extension.
+    if (atTip && this.peerManager) {
+      const invMsg: NetworkMessage = {
+        type: "inv",
+        payload: {
+          inventory: [{ type: InvType.MSG_BLOCK, hash: blockHash }],
+        },
+      };
+      this.peerManager.broadcast(invMsg);
     }
 
     return true;

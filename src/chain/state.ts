@@ -598,6 +598,14 @@ export class ChainStateManager {
   }
 
   /**
+   * Update the in-memory chain tip without going through full connectBlock.
+   * Used by BlockSync to keep RPC state in sync during IBD.
+   */
+  updateTip(hash: Buffer, height: number, chainWork: bigint): void {
+    this.bestBlock = { hash, height, chainWork };
+  }
+
+  /**
    * Validate transaction inputs against the UTXO set (contextual validation).
    *
    * Checks:

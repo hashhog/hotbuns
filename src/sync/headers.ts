@@ -95,6 +95,9 @@ export class HeaderSync {
   /** Anti-DoS sync parameters. */
   private syncParams: HeadersSyncParams;
 
+  /** Callbacks invoked after headers are successfully processed. */
+  private headersProcessedCallbacks: Array<(newTipHeight: number) => void>;
+
   constructor(db: ChainDB, params: ConsensusParams, syncParams?: HeadersSyncParams) {
     this.db = db;
     this.params = params;
@@ -105,6 +108,15 @@ export class HeaderSync {
     this.syncingPeers = new Set();
     this.peerSyncStates = new Map();
     this.syncParams = syncParams ?? DEFAULT_HEADERS_SYNC_PARAMS;
+    this.headersProcessedCallbacks = [];
+  }
+
+  /**
+   * Register a callback to be invoked after new headers are processed.
+   * The callback receives the new best header height.
+   */
+  onHeadersProcessed(callback: (newTipHeight: number) => void): void {
+    this.headersProcessedCallbacks.push(callback);
   }
 
   /**
@@ -165,6 +177,61 @@ export class HeaderSync {
     peerManager.onMessage("__connect__", (peer) => {
       this.requestHeaders(peer);
     });
+
+    // Handle incoming getheaders requests from peers (serve headers)
+    peerManager.onMessage("getheaders", (peer, msg) => {
+      if (msg.type === "getheaders") {
+        this.handleGetHeaders(peer, msg.payload).catch((err) => {
+          console.error(`Error handling getheaders from ${peer.host}:${peer.port}:`, err);
+        });
+      }
+    });
+  }
+
+  /**
+   * Handle incoming getheaders request from a peer.
+   * Respond with up to 2000 headers starting from the best match
+   * in the locator, up to hashStop (or tip if hashStop is zero).
+   */
+  private async handleGetHeaders(
+    peer: Peer,
+    payload: { version: number; locatorHashes: Buffer[]; hashStop: Buffer }
+  ): Promise<void> {
+    // Find the best matching locator hash in our chain
+    let startHeight = 0;
+
+    for (const locatorHash of payload.locatorHashes) {
+      const entry = this.headerChain.get(locatorHash.toString("hex"));
+      if (entry) {
+        startHeight = entry.height + 1;
+        break;
+      }
+    }
+
+    // If no locator matched, start from genesis (height 1)
+    // (The peer might be at genesis and asking for the chain)
+
+    const hashStopHex = payload.hashStop.toString("hex");
+    const isHashStopZero = hashStopHex === "0".repeat(64);
+
+    const headers: BlockHeader[] = [];
+    const maxHeaders = 2000; // MAX_HEADERS_RESULTS
+
+    for (let h = startHeight; h <= (this.bestHeader?.height ?? 0) && headers.length < maxHeaders; h++) {
+      const entry = this.headersByHeight.get(h);
+      if (!entry) break;
+
+      headers.push(entry.header);
+
+      // Stop if we reached hashStop
+      if (!isHashStopZero && entry.hash.toString("hex") === hashStopHex) {
+        break;
+      }
+    }
+
+    if (headers.length > 0) {
+      peer.send({ type: "headers", payload: { headers } });
+    }
   }
 
   /**
@@ -220,7 +287,7 @@ export class HeaderSync {
    * Process incoming headers message. Validate and store each header.
    * Returns new valid headers count.
    */
-  async processHeaders(headers: BlockHeader[], fromPeer: Peer): Promise<number> {
+  async processHeaders(headers: BlockHeader[], fromPeer?: Peer | null): Promise<number> {
     let validCount = 0;
 
     for (const header of headers) {
@@ -247,7 +314,7 @@ export class HeaderSync {
       const validation = this.validateHeader(header, parent);
       if (!validation.valid) {
         console.warn(
-          `Invalid header from ${fromPeer.host}: ${validation.error}`
+          `Invalid header from ${fromPeer?.host ?? "local"}: ${validation.error}`
         );
         // Could increase peer's ban score here
         continue;
@@ -264,7 +331,7 @@ export class HeaderSync {
       const checkpointResult = verifyCheckpoint(hash, headerHeight, this.params);
       if (!checkpointResult.valid) {
         console.warn(
-          `Checkpoint verification failed from ${fromPeer.host}: ${checkpointResult.error}`
+          `Checkpoint verification failed from ${fromPeer?.host ?? "local"}: ${checkpointResult.error}`
         );
         // This is a consensus violation - could increase ban score significantly
         continue;
@@ -280,7 +347,7 @@ export class HeaderSync {
       );
       if (!forkCheck.valid) {
         console.warn(
-          `Fork below checkpoint rejected from ${fromPeer.host}: ${forkCheck.error}`
+          `Fork below checkpoint rejected from ${fromPeer?.host ?? "local"}: ${forkCheck.error}`
         );
         continue;
       }
@@ -318,6 +385,16 @@ export class HeaderSync {
     // Update header tip in database
     if (validCount > 0 && this.bestHeader) {
       await this.saveHeaderTip(this.bestHeader);
+
+      // Notify listeners that new headers were processed
+      const tipHeight = this.bestHeader.height;
+      for (const cb of this.headersProcessedCallbacks) {
+        try {
+          cb(tipHeight);
+        } catch {
+          // Ignore callback errors
+        }
+      }
     }
 
     return validCount;
@@ -541,14 +618,17 @@ export class HeaderSync {
    * header sync. For new peers during initial sync, we use the PRESYNC/REDOWNLOAD
    * anti-DoS mechanism.
    */
-  requestHeaders(peer: Peer): void {
+  requestHeaders(peer: Peer, force?: boolean): void {
     const peerKey = `${peer.host}:${peer.port}`;
 
     // Get peer's best height from version message
     const peerBestHeight = peer.versionPayload?.startHeight ?? 0;
 
-    // Check if we need more headers from this peer
-    if (!this.needsMoreHeaders(peerBestHeight)) {
+    // Check if we need more headers from this peer.
+    // When force=true (e.g. we received an inv for an unknown block), skip
+    // this check because the peer's startHeight from the version handshake
+    // is stale — the peer has mined or received new blocks since connecting.
+    if (!force && !this.needsMoreHeaders(peerBestHeight)) {
       return;
     }
 
