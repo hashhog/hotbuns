@@ -3269,6 +3269,10 @@ export class RPCServer {
       // Connect the block to the chain
       await this.chainState.connectBlock(block, height);
 
+      // Add the new header to headerSync so we can serve it to peers
+      // who send getheaders after receiving our inv announcement.
+      await this.headerSync.processHeaders([block.header], null);
+
       // Remove mined transactions from mempool
       for (const tx of transactions) {
         const txid = getTxId(tx);

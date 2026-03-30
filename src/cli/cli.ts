@@ -414,7 +414,7 @@ async function startNode(config: NodeConfig): Promise<void> {
   headerSync.registerWithPeerManager(peerManager);
 
   // 7. Initialize block sync
-  const blockSync = new BlockSync(db, params, headerSync, peerManager);
+  const blockSync = new BlockSync(db, params, headerSync, peerManager, chainState);
 
   // 8. Start RPC server
   const rpcConfig: RPCServerConfig = {
