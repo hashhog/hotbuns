@@ -59,6 +59,10 @@ export interface PeerManagerConfig {
   maxOutboundBlockRelay?: number;
   /** Explicit peer addresses to connect to (from --connect flag) */
   connect?: string[];
+  /** Whether to listen for inbound connections (default: true) */
+  listen?: boolean;
+  /** P2P port to listen on (default: network default port) */
+  port?: number;
 }
 
 /** Stored information about a known peer address. */
@@ -273,6 +277,8 @@ export class PeerManager {
   private feeFilterManager: FeeFilterManager;
   /** Interval for periodic feefilter checks. */
   private feeFilterInterval: ReturnType<typeof setInterval> | null;
+  /** TCP listener for inbound P2P connections (Bun.listen). */
+  private tcpListener: ReturnType<typeof Bun.listen> | null;
 
   constructor(config: PeerManagerConfig) {
     this.config = {
@@ -284,6 +290,8 @@ export class PeerManager {
       maxOutboundFullRelay: config.maxOutboundFullRelay ?? MAX_OUTBOUND_FULL_RELAY,
       maxOutboundBlockRelay: config.maxOutboundBlockRelay ?? MAX_OUTBOUND_BLOCK_RELAY,
       connect: config.connect,
+      listen: config.listen ?? true,
+      port: config.port ?? config.params.defaultPort,
     };
     this.peers = new Map();
     this.knownAddresses = new Map();
@@ -306,6 +314,7 @@ export class PeerManager {
       peer.send({ type: "feefilter", payload: { feeRate } });
     });
     this.feeFilterInterval = null;
+    this.tcpListener = null;
   }
 
   /**
@@ -313,6 +322,11 @@ export class PeerManager {
    */
   async start(): Promise<void> {
     this.running = true;
+
+    // Start TCP listener for inbound connections
+    if (this.config.listen && this.config.port) {
+      this.startListener(this.config.port);
+    }
 
     // Load ban list and persisted addresses
     await this.banManager.load();
@@ -404,6 +418,12 @@ export class PeerManager {
    */
   async stop(): Promise<void> {
     this.running = false;
+
+    // Stop TCP listener
+    if (this.tcpListener) {
+      this.tcpListener.stop(true);
+      this.tcpListener = null;
+    }
 
     // Stop maintenance loop
     if (this.maintainInterval) {
@@ -1677,6 +1697,94 @@ export class PeerManager {
       await Bun.write(path, writer.toBuffer());
     } catch {
       // Write error
+    }
+  }
+
+  /**
+   * Start the TCP listener for inbound P2P connections using Bun.listen.
+   */
+  private startListener(port: number): void {
+    try {
+      const manager = this;
+      this.tcpListener = Bun.listen<{ peer: Peer | null }>({
+        hostname: "0.0.0.0",
+        port,
+        socket: {
+          open(socket) {
+            const host = socket.remoteAddress;
+            // Check if banned
+            if (manager.banManager.isBanned(host)) {
+              socket.end();
+              return;
+            }
+            // Check inbound capacity
+            if (manager.inboundPeers.size >= manager.config.maxInbound) {
+              const evicted = manager.selectPeerToEvict();
+              if (!evicted) {
+                socket.end();
+                return;
+              }
+              manager.disconnectPeer(evicted);
+            }
+
+            // Create a Peer for this inbound connection
+            const peerConfig: PeerConfig = {
+              host,
+              port: 0, // remote ephemeral port; not meaningful for inbound
+              magic: manager.config.params.networkMagic,
+              protocolVersion: manager.config.params.protocolVersion,
+              services: manager.config.params.services,
+              userAgent: manager.config.params.userAgent,
+              bestHeight: manager.config.bestHeight,
+              relay: true,
+            };
+            const events: PeerEvents = {
+              onConnect: (peer) => manager.handlePeerConnect(peer),
+              onDisconnect: (peer, error) => manager.handlePeerDisconnect(peer, error),
+              onMessage: (peer, msg) => manager.handlePeerMessage(peer, msg),
+              onHandshakeComplete: (peer) => manager.handleHandshakeComplete(peer),
+            };
+            const onBan: OnBanCallback = (peer, reason) => {
+              manager.banManager.ban(peer.host, DEFAULT_BAN_TIME, reason);
+            };
+
+            const peer = new Peer(peerConfig, events, onBan);
+            socket.data = { peer };
+            const key = `${host}:${0}`;
+            manager.peers.set(key, peer);
+            manager.lastActivity.set(key, Date.now());
+            manager.peerConnectionType.set(key, "inbound");
+            manager.inboundPeers.add(key);
+
+            // Accept the already-connected socket
+            peer.acceptSocket(socket);
+          },
+          data(socket, data) {
+            const peer = socket.data?.peer;
+            if (peer) {
+              peer.feedData(Buffer.from(data));
+            }
+          },
+          close(socket) {
+            // Peer.disconnect will be triggered by the socket close handler
+            // that was set up in acceptSocket — but Bun.listen uses its own
+            // close callback, so we need to notify the peer here.
+            const peer = socket.data?.peer;
+            if (peer && peer.state !== "disconnected") {
+              peer.disconnect("remote closed");
+            }
+          },
+          error(socket, err) {
+            const peer = socket.data?.peer;
+            if (peer && peer.state !== "disconnected") {
+              peer.disconnect("socket error");
+            }
+          },
+        },
+      });
+      console.log(`P2P listening on port ${port}`);
+    } catch (err) {
+      console.error(`Failed to start P2P listener on port ${port}:`, err);
     }
   }
 

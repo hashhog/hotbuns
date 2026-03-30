@@ -297,6 +297,35 @@ export class Peer {
   }
 
   /**
+   * Accept an already-connected inbound socket (from Bun.listen).
+   * The remote peer initiated the connection; we wait for their version message.
+   */
+  acceptSocket(sock: Socket<unknown>): void {
+    this.socket = sock as Socket;
+    this.state = "handshaking";
+    this.connectedTime = Date.now();
+    this.events.onConnect(this);
+
+    // For inbound connections we send our version immediately —
+    // Bitcoin Core sends version on both sides of the handshake.
+    this.sendVersionMessage();
+
+    // Start handshake timeout
+    this.handshakeTimer = setTimeout(() => {
+      if (!this.handshakeComplete && this.state !== "disconnected") {
+        this.disconnect("handshake timeout");
+      }
+    }, HANDSHAKE_TIMEOUT_MS);
+  }
+
+  /**
+   * Feed raw data into this peer's receive buffer (used by inbound listener).
+   */
+  feedData(data: Buffer): void {
+    this.onData(data);
+  }
+
+  /**
    * Send a NetworkMessage to this peer.
    * Serializes the message with the network magic and writes to socket.
    */
