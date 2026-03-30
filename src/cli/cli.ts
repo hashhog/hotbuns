@@ -422,6 +422,7 @@ async function startNode(config: NodeConfig): Promise<void> {
     host: "127.0.0.1",
     rpcUser: mergedConfig.rpcUser,
     rpcPassword: mergedConfig.rpcPassword,
+    datadir: mergedConfig.datadir,
   };
 
   const rpcDeps: RPCServerDeps = {

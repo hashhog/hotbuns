@@ -5,6 +5,7 @@
  * submitting transactions, and managing the node.
  */
 
+import * as path from "path";
 import type { ChainStateManager } from "../chain/state.js";
 import type { ChainDB } from "../storage/database.js";
 import type { Mempool, MempoolEntry } from "../mempool/mempool.js";
@@ -93,6 +94,8 @@ export interface RPCServerConfig {
   rpcUser?: string;
   /** RPC password for authentication. */
   rpcPassword?: string;
+  /** Data directory for writing the .cookie file. */
+  datadir?: string;
 }
 
 /**
@@ -180,6 +183,10 @@ export class RPCServer {
   private shutdownCallback: (() => void) | null = null;
   /** Current wallet name for request context (set from URL path). */
   private currentWalletName: string | null = null;
+  /** Cookie password generated on startup (hex-encoded random bytes). */
+  private cookiePassword: string | null = null;
+  /** Absolute path to the .cookie file written on startup. */
+  private cookiePath: string | null = null;
 
   constructor(config: RPCServerConfig, deps: RPCServerDeps) {
     this.config = {
@@ -187,6 +194,7 @@ export class RPCServer {
       host: config.host ?? "127.0.0.1",
       rpcUser: config.rpcUser,
       rpcPassword: config.rpcPassword,
+      datadir: config.datadir,
     };
     this.chainState = deps.chainState;
     this.mempool = deps.mempool;
@@ -214,8 +222,22 @@ export class RPCServer {
 
   /**
    * Start the HTTP server.
+   * Generates a 32-byte random cookie and writes `__cookie__:<hex>` to
+   * `{datadir}/.cookie` so external tools can authenticate without a
+   * configured rpcUser/rpcPassword.
    */
   start(): void {
+    // Generate cookie credentials and persist them to disk.
+    const cookieBytes = crypto.getRandomValues(new Uint8Array(32));
+    this.cookiePassword = Buffer.from(cookieBytes).toString("hex");
+    if (this.config.datadir) {
+      this.cookiePath = path.join(this.config.datadir, ".cookie");
+      // Bun.write is fire-and-forget here; errors are non-fatal but logged.
+      Bun.write(this.cookiePath, `__cookie__:${this.cookiePassword}`).catch(
+        (err) => console.error("Failed to write cookie file:", err)
+      );
+    }
+
     this.server = Bun.serve({
       port: this.config.port,
       hostname: this.config.host,
@@ -228,13 +250,21 @@ export class RPCServer {
   }
 
   /**
-   * Stop the server.
+   * Stop the server and remove the cookie file.
    */
   stop(): void {
     if (this.server) {
       this.server.stop();
       this.server = null;
     }
+    // Remove cookie file so stale credentials cannot be reused after shutdown.
+    if (this.cookiePath) {
+      import("fs").then(({ promises: fsp }) =>
+        fsp.unlink(this.cookiePath!).catch(() => { /* file may already be gone */ })
+      );
+      this.cookiePath = null;
+    }
+    this.cookiePassword = null;
   }
 
   /**
@@ -261,7 +291,7 @@ export class RPCServer {
         }),
         {
           status: 405,
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "Connection": "close" },
         }
       );
     }
@@ -291,6 +321,7 @@ export class RPCServer {
           headers: {
             "Content-Type": "application/json",
             "WWW-Authenticate": 'Basic realm="jsonrpc"',
+            "Connection": "close",
           },
         }
       );
@@ -309,7 +340,7 @@ export class RPCServer {
         }),
         {
           status: 400,
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "Connection": "close" },
         }
       );
     }
@@ -326,7 +357,7 @@ export class RPCServer {
           }),
           {
             status: 200,
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", "Connection": "close" },
           }
         );
       }
@@ -344,7 +375,7 @@ export class RPCServer {
           }),
           {
             status: 200,
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", "Connection": "close" },
           }
         );
       }
@@ -355,7 +386,7 @@ export class RPCServer {
       );
       return new Response(JSON.stringify(responses), {
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "Connection": "close" },
       });
     }
 
@@ -369,7 +400,7 @@ export class RPCServer {
         }),
         {
           status: 400,
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "Connection": "close" },
         }
       );
     }
@@ -377,7 +408,7 @@ export class RPCServer {
     const response = await this.processRequest(body);
     return new Response(JSON.stringify(response), {
       status: 200,
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "Connection": "close" },
     });
   }
 
@@ -430,10 +461,24 @@ export class RPCServer {
 
   /**
    * Validate Basic auth credentials.
+   *
+   * Two credential sources are accepted (tried in order):
+   *   1. Cookie auth — user `__cookie__`, password = hex cookie generated on startup.
+   *   2. Configured rpcUser / rpcPassword (if both are set in config).
+   *
+   * If a cookie has been generated, an Authorization header is always required
+   * (no unauthenticated access).  If neither a cookie nor rpcUser/rpcPassword
+   * are configured the server falls back to allowing all connections (legacy
+   * behaviour for development).
    */
   private authenticate(req: Request): boolean {
-    // If no credentials configured, allow all
-    if (!this.config.rpcUser || !this.config.rpcPassword) {
+    const hasCookie = this.cookiePassword !== null;
+    const hasConfiguredCreds =
+      Boolean(this.config.rpcUser) && Boolean(this.config.rpcPassword);
+
+    // If nothing is configured yet, allow all (shouldn't happen in practice
+    // since start() always generates a cookie, but guards against edge cases).
+    if (!hasCookie && !hasConfiguredCreds) {
       return true;
     }
 
@@ -450,8 +495,25 @@ export class RPCServer {
       return false;
     }
 
-    const [user, password] = credentials.split(":");
-    return user === this.config.rpcUser && password === this.config.rpcPassword;
+    // Split on first colon only — passwords may contain colons.
+    const colonIdx = credentials.indexOf(":");
+    if (colonIdx === -1) {
+      return false;
+    }
+    const user = credentials.slice(0, colonIdx);
+    const password = credentials.slice(colonIdx + 1);
+
+    // Cookie auth takes precedence.
+    if (hasCookie && user === "__cookie__") {
+      return password === this.cookiePassword;
+    }
+
+    // Fall back to configured rpcUser/rpcPassword.
+    if (hasConfiguredCreds) {
+      return user === this.config.rpcUser && password === this.config.rpcPassword;
+    }
+
+    return false;
   }
 
   /**
