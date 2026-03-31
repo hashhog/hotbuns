@@ -20,16 +20,16 @@ import { DBPrefix } from "../storage/database.js";
 import type { Transaction, OutPoint } from "../validation/tx.js";
 import { BufferWriter, BufferReader } from "../wire/serialization.js";
 
-/** Default max cache size in bytes (~400MB — plenty of headroom on 92GB systems). */
-const DEFAULT_DBCACHE_BYTES = 400 * 1024 * 1024;
+/** Default max cache size in bytes (~200MB). */
+const DEFAULT_DBCACHE_BYTES = 200 * 1024 * 1024;
 
 /**
  * Estimated overhead per cache entry in the JS heap.
- * Measured empirically: Bun/JSC uses ~1.5-2KB per Map entry including
+ * Empirical measurement on testnet4: ~3KB per Map entry including
  * the key string (67-char hex), CoinEntry/Coin/txOut nested objects,
  * Buffer with ArrayBuffer backing, bigint, and Map internal bookkeeping.
  */
-const CACHE_ENTRY_OVERHEAD = 1500;
+const CACHE_ENTRY_OVERHEAD = 3000;
 
 /**
  * A single coin in the UTXO set.
@@ -621,7 +621,7 @@ export class CoinsViewCache extends CoinsView {
    * Removes clean entries until usage drops below the target (90% of max).
    */
   private evictCleanEntries(): void {
-    const target = Math.floor(this.maxCacheBytes * 0.90);
+    const target = Math.floor(this.maxCacheBytes * 0.50);
     for (const [key, entry] of this.cache) {
       if (this.cachedCoinsUsage <= target) {
         break;
