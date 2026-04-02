@@ -692,14 +692,22 @@ export class BlockSync {
       this.state.nextHeightToProcess++;
       this.blocksProcessed++;
 
-      // Periodically flush dirty UTXO entries to disk AFTER successful
-      // block connection. Flushing after (not before) ensures that
-      // lastFlushedHeight always reflects a fully consistent DB state.
-      // On failure, we rewind to lastFlushedHeight and re-process.
+      // Flush dirty UTXO entries to disk AFTER successful block connection.
+      // Triggers on EITHER: block count interval OR memory pressure.
       const blocksSinceFlush = height - this.lastFlushedHeight;
-      if (blocksSinceFlush >= FLUSH_INTERVAL && this.utxoManager.getDirtyCount() > 0) {
+      const memoryFlush = this.utxoManager.shouldFlush();
+      if ((blocksSinceFlush >= FLUSH_INTERVAL || memoryFlush) &&
+          this.utxoManager.getDirtyCount() > 0) {
+        if (memoryFlush) {
+          console.log(`UTXO memory flush at height ${height}: ${this.utxoManager.getCacheSize()} entries`);
+        }
         await this.utxoManager.flushDirty();
         this.lastFlushedHeight = height;
+
+        // Force GC after large flush to reclaim V8 heap
+        if (typeof Bun !== "undefined" && Bun.gc) {
+          Bun.gc(true);
+        }
       }
 
       // Yield the event loop periodically to prevent starvation of timers,

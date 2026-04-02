@@ -20,8 +20,8 @@ import { DBPrefix } from "../storage/database.js";
 import type { Transaction, OutPoint } from "../validation/tx.js";
 import { BufferWriter, BufferReader } from "../wire/serialization.js";
 
-/** Default max cache size in bytes (~200MB). */
-const DEFAULT_DBCACHE_BYTES = 200 * 1024 * 1024;
+/** Default max cache size in bytes (~1GB). */
+const DEFAULT_DBCACHE_BYTES = 1024 * 1024 * 1024;
 
 /**
  * Estimated overhead per cache entry in the JS heap.
@@ -1101,6 +1101,13 @@ export class UTXOManager implements UTXOSet {
    */
   getDirtyCount(): number {
     return this.cache.getDirtyCount();
+  }
+
+  /**
+   * Check if cache exceeds memory limit and should be flushed.
+   */
+  shouldFlush(): boolean {
+    return this.cache.shouldFlush();
   }
 
   /**
