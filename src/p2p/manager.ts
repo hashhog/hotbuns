@@ -919,15 +919,15 @@ export class PeerManager {
       const peerHeight = peer.bestKnownHeight;
       const heightDiff = ourBestHeight - peerHeight;
 
+      // Never evict peers that are ahead of us — we need them for sync!
+      if (peerHeight >= ourBestHeight) continue;
+
       // Check if peer's tip is stale (30 minutes worth of blocks behind)
-      // Assuming ~10 min per block, 30 min = 3 blocks
-      // But we also check if they haven't sent us a block recently
       const timeSinceBlock = peer.lastBlockTime > 0 ? now - peer.lastBlockTime : Infinity;
 
-      // Peer is stale if:
-      // 1. Their best known height is significantly behind ours (3+ blocks)
-      // 2. OR they haven't given us a block in STALE_TIP_THRESHOLD_MS
-      if (heightDiff >= 3 || timeSinceBlock > STALE_TIP_THRESHOLD_MS) {
+      // Peer is stale if their best known height is significantly behind ours
+      // AND they haven't given us a block recently
+      if (heightDiff >= 3 && timeSinceBlock > STALE_TIP_THRESHOLD_MS) {
         stalePeers.push({ key, peer });
       }
     }
