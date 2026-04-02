@@ -45,11 +45,12 @@ const FLUSH_INTERVAL = 2000;
 /** Maximum blocks in-flight per peer. */
 const MAX_IN_FLIGHT_PER_PEER = 32;
 
-/** Base timeout for stall detection (milliseconds). */
-const BASE_STALL_TIMEOUT = 5000;
+/** Base timeout for stall detection (milliseconds).
+ *  Must be long enough for large post-SegWit blocks (1-4 MB). */
+const BASE_STALL_TIMEOUT = 30000;
 
 /** Maximum timeout after repeated stalls (milliseconds). */
-const MAX_STALL_TIMEOUT = 64000;
+const MAX_STALL_TIMEOUT = 300000;
 
 /** Interval for progress logging (milliseconds). */
 const LOG_INTERVAL = 10000;
@@ -656,16 +657,6 @@ export class BlockSync {
         break;
       }
 
-      // Periodically flush dirty UTXO entries to disk.  We batch flushes
-      // every FLUSH_INTERVAL blocks instead of every block for performance.
-      // On connectBlock failure we rewind to lastFlushedHeight so the
-      // re-download picks up from a consistent DB state.
-      const blocksSinceFlush = height - this.lastFlushedHeight;
-      if (blocksSinceFlush >= FLUSH_INTERVAL && this.utxoManager.getDirtyCount() > 0) {
-        await this.utxoManager.flushDirty();
-        this.lastFlushedHeight = height;
-      }
-
       // Validate and connect the block
       const success = await this.connectBlock(block, height);
 
@@ -700,6 +691,16 @@ export class BlockSync {
       // Advance to next height
       this.state.nextHeightToProcess++;
       this.blocksProcessed++;
+
+      // Periodically flush dirty UTXO entries to disk AFTER successful
+      // block connection. Flushing after (not before) ensures that
+      // lastFlushedHeight always reflects a fully consistent DB state.
+      // On failure, we rewind to lastFlushedHeight and re-process.
+      const blocksSinceFlush = height - this.lastFlushedHeight;
+      if (blocksSinceFlush >= FLUSH_INTERVAL && this.utxoManager.getDirtyCount() > 0) {
+        await this.utxoManager.flushDirty();
+        this.lastFlushedHeight = height;
+      }
 
       // Yield the event loop periodically to prevent starvation of timers,
       // I/O callbacks, and RPC handlers.  Without this, a long chain of
@@ -1066,8 +1067,8 @@ export class BlockSync {
           peerInfo.stallTimeout * 2
         );
 
-        // If many stalls, consider disconnecting
-        if (stallCount >= 5 && this.peerManager) {
+        // If many stalls, consider disconnecting (high threshold for IBD)
+        if (stallCount >= 20 && this.peerManager) {
           const peers = this.peerManager.getConnectedPeers();
           const peer = peers.find((p) => `${p.host}:${p.port}` === peerKey);
           if (peer) {
