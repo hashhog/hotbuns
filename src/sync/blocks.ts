@@ -1083,16 +1083,26 @@ export class BlockSync {
           peerInfo.stallTimeout * 2
         );
 
-        // If many stalls, consider disconnecting (high threshold for IBD)
+        // During IBD, never ban peers for slow delivery — just disconnect.
+        // Banning during IBD causes the node to run out of peers and die.
+        // After IBD, apply ban scores normally.
+        const isIBD = this.headerSync.getBestHeader() &&
+          this.state.nextHeightToProcess < this.headerSync.getBestHeader()!.height - 1000;
+
         if (stallCount >= 20 && this.peerManager) {
           const peers = this.peerManager.getConnectedPeers();
           const peer = peers.find((p) => `${p.host}:${p.port}` === peerKey);
-          if (peer) {
+          if (peer && !isIBD) {
+            // Only ban outside IBD
             this.peerManager.increaseBanScore(
               peer,
               BanScores.SLOW_RESPONSE * stallCount,
               `Stalled ${stallCount} blocks`
             );
+          }
+          // Log but don't ban during IBD
+          if (isIBD) {
+            console.log(`IBD: peer ${peerKey} stalled ${stallCount} blocks (not banning)`);
           }
         }
       }
