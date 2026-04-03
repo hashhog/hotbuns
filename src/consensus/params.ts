@@ -439,7 +439,7 @@ export const MAINNET: ConsensusParams = {
     [
       390000,
       Buffer.from(
-        "00000000000000000520f90e229290f2e10a316fe0d07c0d028b3f3ac12c6c0e",
+        "00000000000000000520000e60b56818523479ada2614806ba17ce0bbe6eaded",
         "hex"
       ).reverse(),
     ],
