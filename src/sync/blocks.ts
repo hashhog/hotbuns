@@ -58,8 +58,9 @@ const LOG_INTERVAL = 10000;
 /** Maximum items per getdata message. */
 const MAX_GETDATA_ITEMS = 50000;
 
-/** Maximum downloaded blocks buffered in memory before throttling requests. */
-const MAX_DOWNLOADED_BUFFER = 256;
+/** Maximum downloaded blocks buffered in memory before throttling requests.
+ *  Lower values reduce RSS: 128 blocks × ~500KB ≈ 64MB. */
+const MAX_DOWNLOADED_BUFFER = 128;
 
 /**
  * Tracks a pending block request.
@@ -716,6 +717,13 @@ export class BlockSync {
       // the macrotask queue indefinitely.
       if (this.blocksProcessed % 256 === 0) {
         await new Promise<void>(resolve => setTimeout(resolve, 0));
+      }
+
+      // Periodic GC every 100 blocks to reclaim old buffers and Map nodes.
+      // V8 retains heap pages even after objects are collected, so frequent
+      // GC helps keep RSS from growing unboundedly.
+      if (this.blocksProcessed % 100 === 0 && typeof Bun !== "undefined" && Bun.gc) {
+        Bun.gc(false); // incremental GC (cheaper than full)
       }
     }
 
