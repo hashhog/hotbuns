@@ -20,8 +20,12 @@ import { DBPrefix } from "../storage/database.js";
 import type { Transaction, OutPoint } from "../validation/tx.js";
 import { BufferWriter, BufferReader } from "../wire/serialization.js";
 
-/** Default max cache size in bytes (~1GB). */
-const DEFAULT_DBCACHE_BYTES = 1024 * 1024 * 1024;
+/** Default max cache size in bytes (~512MB).
+ *  Lower than Bitcoin Core's default because JS objects have higher
+ *  per-entry overhead (~3KB vs ~100B in C++). At 3KB/entry this allows
+ *  ~170K entries before triggering a flush — enough for ~50-100 blocks
+ *  of batching at mainnet heights. */
+const DEFAULT_DBCACHE_BYTES = 512 * 1024 * 1024;
 
 /**
  * Estimated overhead per cache entry in the JS heap.
