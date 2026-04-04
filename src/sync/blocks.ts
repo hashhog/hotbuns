@@ -60,7 +60,7 @@ const MAX_GETDATA_ITEMS = 50000;
 
 /** Maximum downloaded blocks buffered in memory before throttling requests.
  *  Lower values reduce RSS: 128 blocks × ~500KB ≈ 64MB. */
-const MAX_DOWNLOADED_BUFFER = 128;
+const MAX_DOWNLOADED_BUFFER = 64;
 
 /**
  * Tracks a pending block request.
@@ -651,7 +651,7 @@ export class BlockSync {
       }
 
       const hashHex = headerEntry.hash.toString("hex");
-      const block = this.state.downloadedBlocks.get(hashHex);
+      let block = this.state.downloadedBlocks.get(hashHex);
 
       if (!block) {
         // Block not yet downloaded
@@ -688,6 +688,8 @@ export class BlockSync {
 
       // Remove from downloaded
       this.state.downloadedBlocks.delete(hashHex);
+      // Help V8 GC by nulling block reference
+      block = null as any;
 
       // Advance to next height
       this.state.nextHeightToProcess++;
@@ -719,11 +721,11 @@ export class BlockSync {
         await new Promise<void>(resolve => setTimeout(resolve, 0));
       }
 
-      // Periodic GC every 100 blocks to reclaim old buffers and Map nodes.
+      // Periodic GC every 200 blocks to reclaim old buffers and Map nodes.
       // V8 retains heap pages even after objects are collected, so frequent
       // GC helps keep RSS from growing unboundedly.
-      if (this.blocksProcessed % 100 === 0 && typeof Bun !== "undefined" && Bun.gc) {
-        Bun.gc(false); // incremental GC (cheaper than full)
+      if (this.blocksProcessed % 200 === 0 && typeof Bun !== "undefined" && Bun.gc) {
+        Bun.gc(true); // full GC every 200 blocks
       }
     }
 

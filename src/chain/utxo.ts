@@ -20,12 +20,12 @@ import { DBPrefix } from "../storage/database.js";
 import type { Transaction, OutPoint } from "../validation/tx.js";
 import { BufferWriter, BufferReader } from "../wire/serialization.js";
 
-/** Default max cache size in bytes (~256MB).
+/** Default max cache size in bytes (~128MB).
  *  JS objects have ~3KB overhead per Map entry. At 3KB/entry this allows
  *  ~85K entries before flushing. V8/Bun's RSS stays roughly 2-3x the
  *  actual heap due to page retention, so we need a low cache limit to
  *  keep RSS under 2GB. */
-const DEFAULT_DBCACHE_BYTES = 256 * 1024 * 1024;
+const DEFAULT_DBCACHE_BYTES = 128 * 1024 * 1024;
 
 /**
  * Estimated overhead per cache entry in the JS heap.
