@@ -252,10 +252,10 @@ export class ChainDB {
     this.db = new ClassicLevel<Buffer, Buffer>(dbPath, {
       keyEncoding: 'buffer',
       valueEncoding: 'buffer',
-      // 64 MB LevelDB block cache (reduced to save RSS)
-      cacheSize: 64 * 1024 * 1024,
-      // 32 MB write buffer
-      writeBufferSize: 32 * 1024 * 1024,
+      // 32 MB LevelDB block cache (reduced to save RSS)
+      cacheSize: 32 * 1024 * 1024,
+      // 16 MB write buffer
+      writeBufferSize: 16 * 1024 * 1024,
     });
   }
 
