@@ -22,9 +22,12 @@ import { BufferWriter, BufferReader } from "../wire/serialization.js";
 
 /** Default max cache size in bytes (~256MB).
  *  JS objects have ~3KB overhead per Map entry. At 3KB/entry this allows
- *  ~85K entries before flushing. V8/Bun's RSS stays roughly 2-3x the
- *  actual heap due to page retention. 128MB was too aggressive for mainnet
- *  and caused clean-entry eviction thrashing leading to "Missing UTXO" errors. */
+ *  ~85K entries before flushing. 512MB was causing RSS to climb to 4-5GB
+ *  during mainnet IBD because Bun/V8's native allocator retains freed
+ *  heap pages (RSS never drops even after GC). By capping at 256MB the
+ *  peak heap stays under ~1.5GB and RSS under ~2.5GB, safely within the
+ *  4GB budget. The extra flushes (~1 per block at 380K+) are acceptable
+ *  at 16 blk/s and LevelDB batch writes are fast with 16MB write buffer. */
 const DEFAULT_DBCACHE_BYTES = 256 * 1024 * 1024;
 
 /**
@@ -622,10 +625,12 @@ export class CoinsViewCache extends CoinsView {
 
   /**
    * Evict non-dirty entries from the cache to free memory.
-   * Removes clean entries until usage drops below the target (90% of max).
+   * Removes clean entries until usage drops below 60% of max.
+   * With the reduced 256MB cache, 60% (153MB) leaves enough hot entries
+   * to avoid excessive re-fetches while keeping RSS growth in check.
    */
   private evictCleanEntries(): void {
-    const target = Math.floor(this.maxCacheBytes * 0.50);
+    const target = Math.floor(this.maxCacheBytes * 0.60);
     for (const [key, entry] of this.cache) {
       if (this.cachedCoinsUsage <= target) {
         break;

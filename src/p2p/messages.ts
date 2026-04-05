@@ -1284,8 +1284,14 @@ export function deserializeMessage(header: MessageHeader, payload: Buffer): Netw
       return { type: "reconcildiff", payload: deserializeReconcilDiffPayload(reader) };
     case "invtx":
       return { type: "invtx", payload: deserializeInvTxPayload(reader) };
+    case "notfound":
+      return { type: "notfound", payload: deserializeInvPayload(reader) };
     default:
-      throw new Error(`Unknown command: ${header.command}`);
+      // Unknown messages should be ignored, not crash the connection.
+      // Bitcoin Core regularly adds new message types and peers may send
+      // messages we don't understand yet.
+      console.log(`P2P: ignoring unknown message type "${header.command}" (${payload.length} bytes)`);
+      return { type: header.command as any, payload: null };
   }
 }
 

@@ -13,6 +13,7 @@ import { PackageValidationResult, MAX_PACKAGE_COUNT } from "../mempool/mempool.j
 import type { PeerManager } from "../p2p/manager.js";
 import type { FeeEstimator } from "../fees/estimator.js";
 import type { HeaderSync, HeaderChainEntry } from "../sync/headers.js";
+import type { BlockSync } from "../sync/blocks.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import { compactToBigInt, bigIntToCompact, getBlockSubsidy } from "../consensus/params.js";
 import type { Block, BlockHeader } from "../validation/block.js";
@@ -114,6 +115,7 @@ export interface RPCServerDeps {
   walletManager?: WalletManager;
   chainstateManager?: ChainstateManager;
   zmqInterface?: import("./zmq.js").ZMQNotificationInterface;
+  blockSync?: BlockSync;
 }
 
 /** RPC error codes. */
@@ -180,6 +182,7 @@ export class RPCServer {
   private walletManager?: WalletManager;
   private chainstateManager?: ChainstateManager;
   private zmqInterface?: import("./zmq.js").ZMQNotificationInterface;
+  private blockSync?: BlockSync;
   private shutdownCallback: (() => void) | null = null;
   /** Current wallet name for request context (set from URL path). */
   private currentWalletName: string | null = null;
@@ -208,6 +211,7 @@ export class RPCServer {
     this.walletManager = deps.walletManager;
     this.chainstateManager = deps.chainstateManager;
     this.zmqInterface = deps.zmqInterface;
+    this.blockSync = deps.blockSync;
     this.methods = new Map();
 
     this.registerBuiltinMethods();
@@ -676,8 +680,10 @@ export class RPCServer {
    * getblockchaininfo: Returns blockchain state information.
    */
   private async getBlockchainInfo(): Promise<Record<string, unknown>> {
-    // Reload chain state from DB to pick up blocks connected by block sync
-    await this.chainState.load();
+    // Use the in-memory best block which is updated by block sync after
+    // each connected block via updateTip().  Do NOT call load() here — it
+    // reads from the DB which is only written at flush boundaries (every
+    // 2000 blocks), causing RPC to report a stale height.
     const bestBlock = this.chainState.getBestBlock();
     const bestHeader = this.headerSync.getBestHeader();
 
@@ -2851,6 +2857,41 @@ export class RPCServer {
   }
 
   // ========== Mining Methods ==========
+
+  /**
+   * submitblock: Attempts to submit a new block to the network.
+   * Accepts a hex-encoded serialized block.
+   *
+   * @param params [hexdata] - hex-encoded serialized block
+   * @returns null on success, string error message on failure
+   */
+  private async submitBlock(params: unknown[]): Promise<unknown> {
+    const [hexdata] = params;
+    if (typeof hexdata !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "hex string required");
+    }
+
+    // Deserialize the block from hex
+    let block: Block;
+    try {
+      const buf = Buffer.from(hexdata, "hex");
+      const reader = new (await import("../wire/serialization.js")).BufferReader(buf);
+      block = deserializeBlock(reader);
+    } catch (err) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        `Block decode failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+
+    // If we have a BlockSync instance, inject the block directly
+    if (this.blockSync) {
+      const result = await this.blockSync.injectBlock(block);
+      return result; // null = success, string = error reason
+    }
+
+    throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Block sync not available");
+  }
 
   /**
    * getblocktemplate: Returns data needed to construct a block to work on.
