@@ -37,6 +37,8 @@ export interface NodeConfig {
   addnode?: string[];
   /** Prune target in MiB (0 = disabled, minimum 550 MiB if enabled). */
   prune?: number;
+  /** Path to directory with blk*.dat files, or "-" for framed stdin. */
+  importBlocks?: string;
 }
 
 /**
@@ -180,6 +182,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
               config.prune = pruneVal;
             }
           }
+          break;
+        case "import-blocks":
+          if (value) config.importBlocks = value;
           break;
         case "password":
           // For wallet commands
@@ -365,6 +370,320 @@ interface NodeState {
 let runningNode: NodeState | null = null;
 
 /**
+ * Apply XOR deobfuscation (Bitcoin Core 28.0+) to a buffer in-place.
+ */
+function xorDeobfuscate(data: Buffer, fileOffset: number, key: Buffer): void {
+  if (key.every((b) => b === 0)) return;
+  for (let i = 0; i < data.length; i++) {
+    data[i] ^= key[(fileOffset + i) % 8];
+  }
+}
+
+/**
+ * Detect the XOR obfuscation key used by Bitcoin Core 28.0+.
+ * Returns 8-byte key (all zeros if no obfuscation).
+ */
+async function detectXorKey(blocksDir: string, expectedMagic: Buffer): Promise<Buffer> {
+  const filePath = path.join(blocksDir, "blk00000.dat");
+  const file = Bun.file(filePath);
+  if (!(await file.exists())) return Buffer.alloc(8);
+
+  const headerData = Buffer.from(await file.slice(0, 16).arrayBuffer());
+  if (headerData.length < 16) return Buffer.alloc(8);
+
+  // Check if plaintext
+  if (headerData.subarray(0, 4).equals(expectedMagic)) return Buffer.alloc(8);
+
+  // Derive key[0..4] from magic
+  const key = Buffer.alloc(8);
+  for (let i = 0; i < 4; i++) {
+    key[i] = headerData[i] ^ expectedMagic[i];
+  }
+
+  // Derive key[4..8] from bytes at offset 12..16
+  // After deobfuscation, offset 8..12 should be block version (01 00 00 00)
+  // offset 8 uses key[0..4], offset 12 uses key[4..8]
+  // offset 12..16 after deobfuscation should be prev_block_hash[0..4] = 00 00 00 00
+  for (let i = 0; i < 4; i++) {
+    key[4 + i] = headerData[12 + i]; // ^ 0x00
+  }
+
+  console.log(`Detected XOR obfuscation key: ${key.toString("hex")}`);
+  return key;
+}
+
+/**
+ * Import blocks from blk*.dat files or framed stdin.
+ *
+ * blk*.dat format: [4B magic LE][4B size LE][size bytes raw block] repeated
+ * stdin framed format: [4B height LE][4B size LE][size bytes raw block] repeated
+ */
+async function runBlockImport(
+  importPath: string,
+  db: ChainDB,
+  chainState: ChainStateManager,
+  params: ConsensusParams,
+): Promise<void> {
+  const { deserializeBlock, deserializeBlockHeader, getBlockHash } = await import("../validation/block.js");
+  const { BufferReader } = await import("../wire/serialization.js");
+
+  const bestBlock = chainState.getBestBlock();
+  const startHeight = bestBlock.height;
+  console.log(`Block import mode: starting from height ${startHeight}`);
+
+  if (importPath === "-") {
+    // Read framed format from stdin: [4B height LE][4B size LE][block data]
+    await importFromStdin(startHeight, db, chainState, deserializeBlock, BufferReader);
+  } else {
+    // Read from blk*.dat directory
+    await importFromBlkFiles(importPath, startHeight, db, chainState, params, deserializeBlock, deserializeBlockHeader, getBlockHash, BufferReader);
+  }
+}
+
+/**
+ * Read blocks from stdin in framed format.
+ */
+async function importFromStdin(
+  startHeight: number,
+  db: ChainDB,
+  chainState: ChainStateManager,
+  deserializeBlock: (reader: any) => any,
+  BufferReader: any,
+): Promise<void> {
+  let imported = 0;
+  const importStart = Date.now();
+  let batchStart = Date.now();
+
+  console.log("Reading blocks from stdin (framed format)...");
+
+  // Read stdin as a stream
+  const stdin = Bun.stdin.stream();
+  const reader = stdin.getReader();
+
+  let buffer = Buffer.alloc(0);
+
+  const readExact = async (n: number): Promise<Buffer | null> => {
+    while (buffer.length < n) {
+      const { done, value } = await reader.read();
+      if (done) return null;
+      buffer = Buffer.concat([buffer, Buffer.from(value)]);
+    }
+    const result = buffer.subarray(0, n);
+    buffer = buffer.subarray(n);
+    return Buffer.from(result);
+  };
+
+  while (true) {
+    // Read frame header
+    const frameHeader = await readExact(8);
+    if (!frameHeader) break;
+
+    const frameHeight = frameHeader.readUInt32LE(0);
+    const frameSize = frameHeader.readUInt32LE(4);
+
+    if (frameSize === 0 || frameSize > 4_000_000) {
+      console.error(`Invalid frame size ${frameSize} at height ${frameHeight}`);
+      break;
+    }
+
+    // Skip blocks we already have
+    if (frameHeight <= startHeight) {
+      const skipData = await readExact(frameSize);
+      if (!skipData) break;
+      continue;
+    }
+
+    // Read block data
+    const blockData = await readExact(frameSize);
+    if (!blockData) break;
+
+    const block = deserializeBlock(new BufferReader(blockData));
+
+    try {
+      await chainState.connectBlock(block, frameHeight);
+    } catch (e: any) {
+      console.error(`Block validation failed at height ${frameHeight}: ${e.message}`);
+      break;
+    }
+
+    imported++;
+
+    if (imported % 1000 === 0) {
+      const elapsed = (Date.now() - batchStart) / 1000;
+      const bps = 1000 / elapsed;
+      const totalElapsed = (Date.now() - importStart) / 1000;
+      console.log(
+        `Import progress: height ${frameHeight} (${imported} blocks, ${bps.toFixed(0)} blocks/sec, ${(bps * 60).toFixed(0)} blocks/min, elapsed ${totalElapsed.toFixed(1)}s)`,
+      );
+      batchStart = Date.now();
+    }
+  }
+
+  const totalElapsed = (Date.now() - importStart) / 1000;
+  if (imported > 0) {
+    const bps = imported / totalElapsed;
+    console.log(
+      `Import complete: ${imported} blocks in ${totalElapsed.toFixed(1)}s (${bps.toFixed(0)} blocks/sec, ${(bps * 60).toFixed(0)} blocks/min)`,
+    );
+  }
+}
+
+/**
+ * Read blocks from blk*.dat files.
+ * Scans all files to build a hash-to-location index, then processes in height order.
+ */
+async function importFromBlkFiles(
+  blocksDir: string,
+  startHeight: number,
+  db: ChainDB,
+  chainState: ChainStateManager,
+  params: ConsensusParams,
+  deserializeBlock: (reader: any) => any,
+  deserializeBlockHeader: (reader: any) => any,
+  getBlockHash: (header: any) => Buffer,
+  BufferReader: any,
+): Promise<void> {
+  const magic = Buffer.alloc(4);
+  magic.writeUInt32LE(params.networkMagic, 0);
+
+  console.log(`Scanning blk*.dat files in ${blocksDir} ...`);
+
+  // Detect XOR obfuscation key (Bitcoin Core 28.0+)
+  const xorKey = await detectXorKey(blocksDir, magic);
+
+  // Build hash -> (fileNum, offset, size) index
+  const index = new Map<string, { fileNum: number; offset: number; size: number }>();
+  let fileNum = 0;
+
+  while (true) {
+    const filePath = path.join(blocksDir, `blk${String(fileNum).padStart(5, "0")}.dat`);
+    const file = Bun.file(filePath);
+    if (!(await file.exists())) break;
+
+    const fileData = Buffer.from(await file.arrayBuffer());
+    let pos = 0;
+    let blocksInFile = 0;
+
+    while (pos + 8 <= fileData.length) {
+      // Read and deobfuscate magic + size
+      const hdr = Buffer.from(fileData.subarray(pos, pos + 8));
+      xorDeobfuscate(hdr, pos, xorKey);
+
+      if (hdr[0] === 0 && hdr[1] === 0 && hdr[2] === 0 && hdr[3] === 0) {
+        break;
+      }
+
+      if (!hdr.subarray(0, 4).equals(magic)) {
+        console.warn(`Bad magic at blk${String(fileNum).padStart(5, "0")}.dat offset ${pos}, skipping`);
+        break;
+      }
+
+      const size = hdr.readUInt32LE(4);
+      if (size === 0 || size > 4_000_000) {
+        console.warn(`Invalid block size ${size} at blk${String(fileNum).padStart(5, "0")}.dat offset ${pos}`);
+        break;
+      }
+
+      const blockOffset = pos + 8;
+
+      // Read and deobfuscate 80-byte header to get hash
+      const headerBuf = Buffer.from(fileData.subarray(blockOffset, blockOffset + 80));
+      xorDeobfuscate(headerBuf, blockOffset, xorKey);
+      const header = deserializeBlockHeader(new BufferReader(headerBuf));
+      const hash = getBlockHash(header);
+      const hashHex = hash.toString("hex");
+
+      index.set(hashHex, { fileNum, offset: blockOffset, size });
+
+      blocksInFile++;
+      pos = blockOffset + size;
+    }
+
+    console.log(`Scanned blk${String(fileNum).padStart(5, "0")}.dat: ${blocksInFile} blocks (total: ${index.size})`);
+    fileNum++;
+  }
+
+  if (fileNum === 0) {
+    console.error(`No blk*.dat files found in ${blocksDir}`);
+    return;
+  }
+
+  console.log(`Block index built: ${index.size} blocks from ${fileNum} files`);
+
+  // Cache file data for reading blocks (keep last 2 files in memory)
+  const fileCache = new Map<number, Buffer>();
+
+  const readBlock = async (loc: { fileNum: number; offset: number; size: number }) => {
+    let data = fileCache.get(loc.fileNum);
+    if (!data) {
+      const filePath = path.join(blocksDir, `blk${String(loc.fileNum).padStart(5, "0")}.dat`);
+      data = Buffer.from(await Bun.file(filePath).arrayBuffer());
+      // Keep cache bounded
+      if (fileCache.size >= 2) {
+        const firstKey = fileCache.keys().next().value;
+        if (firstKey !== undefined) fileCache.delete(firstKey);
+      }
+      fileCache.set(loc.fileNum, data);
+    }
+    return data.subarray(loc.offset, loc.offset + loc.size);
+  };
+
+  // Process blocks in height order
+  let height = startHeight + 1;
+  let imported = 0;
+  const importStart = Date.now();
+  let batchStart = Date.now();
+
+  while (true) {
+    // Get expected block hash at this height from our header chain
+    const hashBuf = await db.getBlockHashByHeight(height);
+    if (!hashBuf) {
+      console.log(`No header at height ${height} — end of header chain. Imported ${imported} blocks.`);
+      break;
+    }
+    const hashHex = hashBuf.toString("hex");
+
+    const loc = index.get(hashHex);
+    if (!loc) {
+      console.warn(`Block ${hashHex} at height ${height} not found in blk files. Stopping.`);
+      break;
+    }
+
+    const blockData = Buffer.from(await readBlock(loc));
+    xorDeobfuscate(blockData, loc.offset, xorKey);
+    const block = deserializeBlock(new BufferReader(blockData));
+
+    try {
+      await chainState.connectBlock(block, height);
+    } catch (e: any) {
+      console.error(`Block validation failed at height ${height}: ${e.message}`);
+      break;
+    }
+
+    imported++;
+    height++;
+
+    if (imported % 1000 === 0) {
+      const elapsed = (Date.now() - batchStart) / 1000;
+      const bps = 1000 / elapsed;
+      const totalElapsed = (Date.now() - importStart) / 1000;
+      console.log(
+        `Import progress: height ${height - 1} (${imported} blocks, ${bps.toFixed(0)} blocks/sec, ${(bps * 60).toFixed(0)} blocks/min, elapsed ${totalElapsed.toFixed(1)}s)`,
+      );
+      batchStart = Date.now();
+    }
+  }
+
+  const totalElapsed = (Date.now() - importStart) / 1000;
+  if (imported > 0) {
+    const bps = imported / totalElapsed;
+    console.log(
+      `Import complete: ${imported} blocks in ${totalElapsed.toFixed(1)}s (${bps.toFixed(0)} blocks/sec, ${(bps * 60).toFixed(0)} blocks/min)`,
+    );
+  }
+}
+
+/**
  * Start the hotbuns node.
  */
 async function startNode(config: NodeConfig): Promise<void> {
@@ -393,6 +712,14 @@ async function startNode(config: NodeConfig): Promise<void> {
   // Set tip height
   const bestBlock = chainState.getBestBlock();
   mempool.setTipHeight(bestBlock.height);
+
+  // 4b. Block import mode (--import-blocks)
+  if (mergedConfig.importBlocks) {
+    await runBlockImport(mergedConfig.importBlocks, db, chainState, params);
+    await utxo.flush();
+    await db.close();
+    return;
+  }
 
   // 5. Initialize header sync
   const headerSync = new HeaderSync(db, params);
@@ -433,6 +760,7 @@ async function startNode(config: NodeConfig): Promise<void> {
     headerSync,
     db,
     params,
+    blockSync,
   };
 
   const rpcServer = new RPCServer(rpcConfig, rpcDeps);

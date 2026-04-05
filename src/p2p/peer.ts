@@ -473,9 +473,9 @@ export class Peer {
       this.processRecvBuffer();
     } catch (error) {
       // Malformed message - disconnect
-      this.disconnect(
-        error instanceof Error ? error.message : "malformed message"
-      );
+      const errMsg = error instanceof Error ? error.message : "malformed message";
+      console.error(`PEER ERROR: ${this.host}:${this.port} processRecvBuffer failed: ${errMsg} (recvBuf=${this.recvBuffer.length} bytes)`);
+      this.disconnect(errMsg);
     }
   }
 
@@ -504,6 +504,7 @@ export class Peer {
       // Check if we have the complete payload
       const totalLength = MESSAGE_HEADER_SIZE + header.length;
       if (this.recvBuffer.length < totalLength) {
+        // Log large pending messages (blocks) to diagnose download stalls
         // Wait for more data
         break;
       }
@@ -523,7 +524,16 @@ export class Peer {
       }
 
       // Deserialize the message
-      const msg = deserializeMessage(header, payload);
+      let msg;
+      try {
+        msg = deserializeMessage(header, payload);
+      } catch (deserErr) {
+        // Log deserialization errors for blocks to diagnose stalls
+        if (header.command === "block") {
+          console.error(`BLOCK DESER ERROR: size=${header.length} from=${this.host}: ${deserErr instanceof Error ? deserErr.message : String(deserErr)}`);
+        }
+        throw deserErr;
+      }
 
       // Remove consumed bytes from buffer - use Buffer.from() to copy
       // so we don't retain a reference to the (potentially large) original buffer

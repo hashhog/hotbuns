@@ -331,7 +331,7 @@ export const MAINNET: ConsensusParams = {
   csvHeight: 419328, // BIP68/112/113
   segwitHeight: 481824,
   taprootHeight: 709632,
-  assumeValidHeight: 0, // Verify everything on mainnet by default
+  assumeValidHeight: 938343, // Bitcoin Core default assumevalid (block 938343)
   protocolVersion: 70016,
   services: 0x0409n, // NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED
   userAgent: "/hotbuns:0.1.0/",
@@ -446,35 +446,35 @@ export const MAINNET: ConsensusParams = {
     [
       420000,
       Buffer.from(
-        "000000000000000002cce816c0ab2c5c269cb081896b7dcb34b8422d6b74f594",
+        "000000000000000002cce816c0ab2c5c269cb081896b7dcb34b8422d6b74ffa1",
         "hex"
       ).reverse(),
     ],
     [
       450000,
       Buffer.from(
-        "0000000000000000014083723ed311a461c648068af8cef8a19f1c0e4f50f0e2",
+        "0000000000000000014083723ed311a461c648068af8cef8a19dcd620c07a20b",
         "hex"
       ).reverse(),
     ],
     [
       478559,
       Buffer.from(
-        "0000000000000000011865af4122fe3b144e2cbeea86142e8ff2fb4107352d43",
+        "00000000000000000019f112ec0a9982926f1258cdcc558dd7c3b7e5dc7fa148",
         "hex"
       ).reverse(),
     ],
     [
       504031,
       Buffer.from(
-        "0000000000000000001e9c82e9cfc9ae36eb06fb0a8c47e2bbaa48a1dbb17f87",
+        "0000000000000000005ccd563c9ed7212ad591467cd3db71a17d44918b687f34",
         "hex"
       ).reverse(),
     ],
     [
       530000,
       Buffer.from(
-        "0000000000000000002415d68c1bf9c7a1b8c0a18b0b0c4ed40e6abb40f5de54",
+        "000000000000000000024e9be1c7b56cab6428f07920f21ad8457221a91371ae",
         "hex"
       ).reverse(),
     ],

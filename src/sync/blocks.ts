@@ -37,17 +37,20 @@ import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { UTXOManager, type SpentUTXO } from "../chain/utxo.js";
 
 /** Maximum blocks in-flight at once (across all peers). */
-const DEFAULT_WINDOW_SIZE = 1024;
+const DEFAULT_WINDOW_SIZE = 512;
 
 /** Flush UTXO cache to disk every N blocks during IBD. */
 const FLUSH_INTERVAL = 2000;
 
 /** Maximum blocks in-flight per peer. */
-const MAX_IN_FLIGHT_PER_PEER = 32;
+const MAX_IN_FLIGHT_PER_PEER = 16;
 
 /** Base timeout for stall detection (milliseconds).
- *  Must be long enough for large post-SegWit blocks (1-4 MB). */
-const BASE_STALL_TIMEOUT = 30000;
+ *  Must be long enough for large blocks (~1 MB pre-SegWit, 1-4 MB post-SegWit)
+ *  being downloaded from slow peers during IBD.  30s was too aggressive and
+ *  caused rapid steal/re-request cycles that prevented 1 MB blocks from ever
+ *  completing transfer. */
+const BASE_STALL_TIMEOUT = 120000;
 
 /** Maximum timeout after repeated stalls (milliseconds). */
 const MAX_STALL_TIMEOUT = 300000;
@@ -59,8 +62,9 @@ const LOG_INTERVAL = 10000;
 const MAX_GETDATA_ITEMS = 50000;
 
 /** Maximum downloaded blocks buffered in memory before throttling requests.
- *  Lower values reduce RSS: 128 blocks × ~500KB ≈ 64MB. */
-const MAX_DOWNLOADED_BUFFER = 64;
+ *  At ~118K height, early blocks are small but the total count matters for
+ *  GC pressure. 128 blocks keeps ~10-50MB of block data in the heap. */
+const MAX_DOWNLOADED_BUFFER = 128;
 
 /**
  * Tracks a pending block request.
@@ -70,6 +74,8 @@ export interface PendingBlockRequest {
   peer: string;
   requestedAt: number;
   timeout: number; // Current timeout for this request
+  /** Timestamp of last duplicate request sent for this block. */
+  lastDupAt?: number;
 }
 
 /**
@@ -93,6 +99,8 @@ interface PeerInFlight {
   count: number;
   lastResponse: number;
   stallTimeout: number; // Adaptive timeout
+  blocksDelivered: number; // Tracks actual block deliveries for peer quality
+  cooldownUntil: number; // Don't assign blocks until this timestamp
 }
 
 /**
@@ -139,6 +147,11 @@ export class BlockSync {
   /** Last height at which UTXO cache was flushed to disk. */
   private lastFlushedHeight: number;
 
+  /** Consecutive failures at the same height — used to detect permanent UTXO
+   *  corruption that cannot be fixed by cache-clearing alone. */
+  private consecutiveFailures: number;
+  private lastFailedHeight: number;
+
   /** Chain state manager — updated after each connected block so RPC
    *  methods like getblockcount reflect the latest chain tip. */
   private chainStateManager: ChainStateManager | null;
@@ -166,6 +179,8 @@ export class BlockSync {
     this.running = false;
     this.processing = false;
     this.lastFlushedHeight = 0;
+    this.consecutiveFailures = 0;
+    this.lastFailedHeight = -1;
 
     this.state = {
       pendingBlocks: new Map(),
@@ -244,8 +259,25 @@ export class BlockSync {
     if (this.processing) {
       this.utxoManager.clearCache();
     } else {
-      // Flush any pending UTXO updates
-      await this.utxoManager.flush();
+      // Flush any pending UTXO updates WITH chain state so shutdown is
+      // crash-safe (no "Missing UTXO" on restart).
+      const shutdownHeight = this.state.nextHeightToProcess - 1;
+      const shutdownEntry = this.headerSync.getHeaderByHeight(shutdownHeight);
+      const extraOps: BatchOperation[] = [];
+      if (shutdownEntry && shutdownHeight > 0) {
+        const chainStateValue = this.serializeChainState(
+          shutdownEntry.hash,
+          shutdownHeight,
+          shutdownEntry.chainWork
+        );
+        extraOps.push({
+          type: "put",
+          prefix: DBPrefix.CHAIN_STATE,
+          key: Buffer.alloc(0),
+          value: chainStateValue,
+        });
+      }
+      await this.utxoManager.flush(extraOps);
     }
   }
 
@@ -279,6 +311,39 @@ export class BlockSync {
         this.handleGetData(peer, msg.payload.inventory).catch((err) => {
           console.error(`Error handling getdata from ${peer.host}:${peer.port}:`, err);
         });
+      }
+    });
+
+    // Handle notfound messages — peer doesn't have a block we requested.
+    // Without this, the pending request lingers until stall timeout,
+    // blocking the processing pipeline for the full timeout duration.
+    peerManager.onMessage("notfound", (peer, msg) => {
+      if (msg.type === "notfound" && msg.payload?.inventory) {
+        const peerKey = `${peer.host}:${peer.port}`;
+        for (const inv of msg.payload.inventory) {
+          if (inv.type === 2 || inv.type === 0x40000002) { // MSG_BLOCK or MSG_WITNESS_BLOCK
+            const hashHex = inv.hash.toString("hex");
+            const pending = this.state.pendingBlocks.get(hashHex);
+            if (pending && pending.peer === peerKey) {
+              console.log(`NOTFOUND: block hash=${hashHex.slice(0, 16)} from=${peerKey}, clearing pending`);
+              this.state.pendingBlocks.delete(hashHex);
+              const peerInfo = this.peerInFlight.get(peerKey);
+              if (peerInfo) {
+                peerInfo.count = Math.max(0, peerInfo.count - 1);
+                // Penalize peer — it claimed to have blocks but doesn't
+                peerInfo.stallTimeout = Math.min(
+                  300000,
+                  peerInfo.stallTimeout * 2
+                );
+              }
+              if (pending.height < this.state.nextHeightToRequest) {
+                this.state.nextHeightToRequest = pending.height;
+              }
+            }
+          }
+        }
+        // Re-request from different peers
+        this.requestBlocks();
       }
     });
 
@@ -342,6 +407,7 @@ export class BlockSync {
     if (peerInfo) {
       peerInfo.count = Math.max(0, peerInfo.count - 1);
       peerInfo.lastResponse = Date.now();
+      peerInfo.blocksDelivered++;
       // Decay timeout on successful response
       peerInfo.stallTimeout = Math.max(
         BASE_STALL_TIMEOUT,
@@ -357,6 +423,49 @@ export class BlockSync {
 
     // Request more blocks if needed
     this.requestBlocks();
+  }
+
+  /**
+   * Inject a block directly (e.g. from submitblock RPC) without a peer.
+   * Clears any pending request for this block and stores it in the download
+   * buffer for in-order processing.
+   */
+  async injectBlock(block: Block): Promise<string | null> {
+    const blockHash = getBlockHash(block.header);
+    const hashHex = blockHash.toString("hex");
+
+    const headerEntry = this.headerSync.getHeader(blockHash);
+    if (!headerEntry) {
+      return "inconclusive"; // Unknown block
+    }
+
+    // Already processed?
+    if (headerEntry.height < this.state.nextHeightToProcess) {
+      return "duplicate";
+    }
+
+    // Clear any pending request for this block
+    const pending = this.state.pendingBlocks.get(hashHex);
+    if (pending) {
+      this.state.pendingBlocks.delete(hashHex);
+      const peerInfo = this.peerInFlight.get(pending.peer);
+      if (peerInfo) {
+        peerInfo.count = Math.max(0, peerInfo.count - 1);
+      }
+    }
+
+    console.log(`INJECT: block height=${headerEntry.height} hash=${hashHex.slice(0, 16)} (submitblock)`);
+
+    // Store in downloaded blocks
+    this.state.downloadedBlocks.set(hashHex, block);
+
+    // Try to process blocks in order
+    await this.processOrderedBlocks();
+
+    // Request more blocks if needed
+    this.requestBlocks();
+
+    return null; // success
   }
 
   /**
@@ -449,10 +558,37 @@ export class BlockSync {
       return;
     }
 
-    // Throttle: if we have too many buffered blocks, prune far-ahead entries.
-    // Always allow requesting if pendingBlocks is empty (prevents stalls).
+    // Hard stop: if downloaded blocks buffer is full, do NOT request more.
+    // This prevents unbounded memory growth when processing can't keep up
+    // with downloads. Previously, the window calculation allowed accumulating
+    // thousands of blocks in the downloadedBlocks Map (each holding a full
+    // deserialized Block), eating 500MB-1.5GB of heap and triggering
+    // constant GC, which slowed processing further in a vicious cycle.
     if (this.state.downloadedBlocks.size >= MAX_DOWNLOADED_BUFFER) {
-      this.pruneDownloadedBlocks();
+      return;
+    }
+
+    // PARALLEL CRITICAL BLOCK REQUEST: if the block at nextHeightToProcess
+    // is NOT in downloadedBlocks and IS pending, request it from ALL peers.
+    // This ensures the most critical block arrives as fast as possible by
+    // racing multiple peers against each other.
+    const critEntry = this.headerSync.getHeaderByHeight(this.state.nextHeightToProcess);
+    if (critEntry) {
+      const critHashHex = critEntry.hash.toString("hex");
+      if (!this.state.downloadedBlocks.has(critHashHex)) {
+        const critPending = this.state.pendingBlocks.get(critHashHex);
+        const critAge = critPending ? Date.now() - critPending.requestedAt : 0;
+        // After 30s of waiting, blast the request to all peers
+        if (critPending && critAge > 30000) {
+          const allPeers = this.peerManager.getConnectedPeers();
+          for (const p of allPeers) {
+            const pk = `${p.host}:${p.port}`;
+            if (pk !== critPending.peer) {
+              this.sendGetData(p, [critEntry.hash]);
+            }
+          }
+        }
+      }
     }
 
     // Check if we've caught up
@@ -475,13 +611,15 @@ export class BlockSync {
     }
 
     // Calculate how many more blocks we can request.
-    // Reduce the effective window when we have many downloaded but unprocessed blocks.
+    // Cap total outstanding (pending + downloaded) to MAX_DOWNLOADED_BUFFER
+    // to bound memory usage from buffered Block objects.
     const currentInFlight = this.state.pendingBlocks.size;
+    const totalOutstanding = currentInFlight + this.state.downloadedBlocks.size;
     const effectiveWindow = Math.max(
       4,
-      this.windowSize - this.state.downloadedBlocks.size
+      Math.min(this.windowSize, MAX_DOWNLOADED_BUFFER * 2) - totalOutstanding
     );
-    const available = effectiveWindow - currentInFlight;
+    const available = effectiveWindow;
     if (available <= 0) {
       return;
     }
@@ -496,21 +634,63 @@ export class BlockSync {
       if (!peerInfo) {
         peerInfo = {
           count: 0,
-          lastResponse: Date.now(),
+          lastResponse: 0, // Unknown responsiveness — don't assume responsive
           stallTimeout: BASE_STALL_TIMEOUT,
+          blocksDelivered: 0,
+          cooldownUntil: 0,
         };
         this.peerInFlight.set(peerKey, peerInfo);
       }
       peerQueues.set(peerKey, []);
     }
 
-    // Assign blocks to peers round-robin
+    // Sort peers by responsiveness: prefer peers that have actually delivered
+    // blocks recently (low stallTimeout AND recent lastResponse).
+    // This prevents the round-robin from spreading critical blocks across
+    // non-responsive peers that accept getdata but never respond.
     let peerIndex = 0;
-    const peerList = Array.from(peers);
+    const now = Date.now();
+    const peerList = Array.from(peers).sort((a, b) => {
+      const aKey = `${a.host}:${a.port}`;
+      const bKey = `${b.host}:${b.port}`;
+      const aInfo = this.peerInFlight.get(aKey);
+      const bInfo = this.peerInFlight.get(bKey);
+      const aTimeout = aInfo?.stallTimeout ?? BASE_STALL_TIMEOUT;
+      const bTimeout = bInfo?.stallTimeout ?? BASE_STALL_TIMEOUT;
+      // Primary: sort by recency of last response (more recent = better)
+      const aRecent = aInfo?.lastResponse ?? 0;
+      const bRecent = bInfo?.lastResponse ?? 0;
+      // Primary: peers that have delivered blocks are strongly preferred
+      const aDelivered = aInfo?.blocksDelivered ?? 0;
+      const bDelivered = bInfo?.blocksDelivered ?? 0;
+      const aHasDelivered = aDelivered > 0 ? 0 : 1;
+      const bHasDelivered = bDelivered > 0 ? 0 : 1;
+      if (aHasDelivered !== bHasDelivered) return aHasDelivered - bHasDelivered;
+      // Secondary: peers that responded recently are preferred
+      const aActive = (now - aRecent) < 60000 ? 0 : 1;
+      const bActive = (now - bRecent) < 60000 ? 0 : 1;
+      if (aActive !== bActive) return aActive - bActive;
+      // Tertiary: lower stallTimeout is better
+      return aTimeout - bTimeout;
+    });
+    let requested = 0;
+
+    // Cap how far ahead requests can get relative to processing.  Without
+    // this, the request pointer races ahead filling the buffer with blocks
+    // at heights far beyond what can be processed, while the one block we
+    // actually need at nextHeightToProcess might be missing.
+    const maxRequestHeight = this.state.nextHeightToProcess + MAX_DOWNLOADED_BUFFER * 2;
+
+    // For the first few blocks closest to the processing frontier,
+    // assign them to the MOST responsive peer (index 0 in sorted list)
+    // instead of round-robin. This ensures the blocks we need most
+    // urgently go to the peer most likely to deliver them.
+    const criticalWindow = 4; // First 4 blocks get priority assignment
 
     while (
       this.state.nextHeightToRequest <= bestHeader.height &&
-      this.state.pendingBlocks.size < this.windowSize
+      this.state.nextHeightToRequest <= maxRequestHeight &&
+      requested < available
     ) {
       const height = this.state.nextHeightToRequest;
       const headerEntry = this.headerSync.getHeaderByHeight(height);
@@ -532,13 +712,29 @@ export class BlockSync {
         continue;
       }
 
+      // For blocks near the processing frontier, strongly prefer the best peer
+      const isCritical = (height - this.state.nextHeightToProcess) < criticalWindow;
+      const startIdx = isCritical ? 0 : peerIndex;
+
       // Find a peer with capacity
       let assigned = false;
       for (let attempts = 0; attempts < peerList.length; attempts++) {
-        const peer = peerList[peerIndex % peerList.length];
+        const idx = isCritical ? attempts : ((startIdx + attempts) % peerList.length);
+        const peer = peerList[idx % peerList.length];
         const peerKey = `${peer.host}:${peer.port}`;
         const peerInfo = this.peerInFlight.get(peerKey)!;
 
+        // Skip peers that have been persistently stalling — they likely can't
+        // serve blocks at these heights (e.g. pruned nodes).
+        if (peerInfo.stallTimeout >= MAX_STALL_TIMEOUT) {
+          if (!isCritical) peerIndex++;
+          continue;
+        }
+        // Skip peers in cooldown after stalling
+        if (peerInfo.cooldownUntil > Date.now()) {
+          if (!isCritical) peerIndex++;
+          continue;
+        }
         if (peerInfo.count < MAX_IN_FLIGHT_PER_PEER) {
           // Assign to this peer
           const queue = peerQueues.get(peerKey)!;
@@ -554,16 +750,43 @@ export class BlockSync {
 
           peerInfo.count++;
           assigned = true;
-          peerIndex++;
+          requested++;
+          if (!isCritical) peerIndex++;
           break;
         }
 
-        peerIndex++;
+        if (!isCritical) peerIndex++;
       }
 
       if (!assigned) {
-        // All peers at capacity
-        break;
+        // All responsive peers at capacity (or all peers are stalling).
+        // Fall back to using ANY peer with capacity, even if stalling.
+        // This prevents permanent stalls when all peers have high timeouts.
+        for (let attempts = 0; attempts < peerList.length; attempts++) {
+          const peer = peerList[peerIndex % peerList.length];
+          const fbKey = `${peer.host}:${peer.port}`;
+          const fbInfo = this.peerInFlight.get(fbKey)!;
+          if (fbInfo.count < MAX_IN_FLIGHT_PER_PEER) {
+            const queue = peerQueues.get(fbKey)!;
+            queue.push(headerEntry.hash);
+            this.state.pendingBlocks.set(hashHex, {
+              height,
+              peer: fbKey,
+              requestedAt: Date.now(),
+              timeout: fbInfo.stallTimeout,
+            });
+            fbInfo.count++;
+            assigned = true;
+            requested++;
+            peerIndex++;
+            break;
+          }
+          peerIndex++;
+        }
+        if (!assigned) {
+          // Truly at capacity
+          break;
+        }
       }
 
       this.state.nextHeightToRequest++;
@@ -622,6 +845,11 @@ export class BlockSync {
       this.processing = false;
     }
 
+    // Always try to request more blocks after processing — this handles the
+    // case where a pending request was stolen from a slow peer and needs to
+    // be re-assigned.
+    this.requestBlocks();
+
     // Blocks may have arrived while we held the processing lock.  Check if
     // the next block we need is already downloaded and, if so, process it
     // immediately rather than waiting for the next handleBlock call.
@@ -654,7 +882,61 @@ export class BlockSync {
       let block = this.state.downloadedBlocks.get(hashHex);
 
       if (!block) {
-        // Block not yet downloaded
+        // Block not yet downloaded.  If it's sitting in the pending map and
+        // enough other blocks have arrived in the meantime, the assigned peer
+        // is likely slow or dead.  Cancel the pending request and let the
+        // next requestBlocks() cycle assign it to a different peer.  This
+        // avoids waiting the full stall timeout (30s) while the buffer fills
+        // with blocks at higher heights that we can't use yet.
+        const pending = this.state.pendingBlocks.get(hashHex);
+        // Only steal if the block has been pending for a meaningful amount of
+        // time.  The old threshold (downloadedBlocks.size > 4) was too aggressive
+        // and caused rapid steal/re-request cycles where the block was constantly
+        // yanked from the assigned peer before it had time to deliver a 1 MB
+        // block, leading to permanent stalls at the halving boundary.
+        const stealAge = pending ? Date.now() - pending.requestedAt : 0;
+        // Throttle duplicate requests: don't re-duplicate if we already
+        // sent duplicates recently (within BASE_STALL_TIMEOUT/4 = 30s).
+        const lastDupAt = pending?.lastDupAt ?? 0;
+        const sinceLastDup = Date.now() - lastDupAt;
+        // Send duplicates after BASE_STALL_TIMEOUT/2 (60s) from original
+        // request, or BASE_STALL_TIMEOUT/4 (30s) from last duplicate send.
+        // This gives the assigned peer time to serve its queue (Bitcoin Core
+        // serves 1 block per ProcessGetData call, so 16 blocks takes ~16-32s)
+        // but ensures we don't wait forever.
+        const dupReady = lastDupAt === 0
+          ? stealAge > BASE_STALL_TIMEOUT / 2
+          : sinceLastDup > BASE_STALL_TIMEOUT / 4;
+        if (pending && dupReady && this.state.downloadedBlocks.size > 4) {
+          // The assigned peer hasn't delivered while others have.  Instead
+          // of stealing (which bounces the request between peers), send a
+          // DUPLICATE request to additional peers.  The first response wins.
+          // Keep the original pending entry so we don't disrupt the original
+          // peer's delivery if it's just slow (queued behind other blocks).
+          if (this.peerManager) {
+            const connPeers = this.peerManager.getConnectedPeers();
+            // Send duplicate getdata to up to 3 other peers
+            let duplicatesSent = 0;
+            for (const p of connPeers) {
+              if (duplicatesSent >= 3) break;
+              const pk = `${p.host}:${p.port}`;
+              if (pk === pending.peer) continue;
+              const pi = this.peerInFlight.get(pk);
+              // Prefer peers that have responded recently
+              if (pi && pi.lastResponse > 0 && (Date.now() - pi.lastResponse) < 120000) {
+                this.sendGetData(p, [headerEntry.hash]);
+                duplicatesSent++;
+              }
+            }
+            if (duplicatesSent > 0) {
+              // DO NOT reset requestedAt — that prevents the stall handler
+              // from ever timing out the original pending entry.  Instead,
+              // mark when we last sent duplicates so we don't spam them.
+              pending.lastDupAt = Date.now();
+              console.log(`DUP-REQ: block ${height} sent to ${duplicatesSent} extra peers (orig=${pending.peer}, age=${stealAge}ms)`);
+            }
+          }
+        }
         break;
       }
 
@@ -662,23 +944,44 @@ export class BlockSync {
       const success = await this.connectBlock(block, height);
 
       if (!success) {
-        // Block validation failed - remove from downloaded to avoid infinite
-        // retry loop.  The failed block may have partially modified the UTXO
-        // cache (spending inputs / adding outputs for earlier txs in the
-        // block), so we must clear the in-memory cache and let it be
-        // re-populated from the database on the next attempt.
-        console.error(`Block validation failed at height ${height}, discarding and re-requesting`);
+        // Track consecutive failures at the same height to detect permanent
+        // UTXO corruption (e.g. a coin was DELETEd from LevelDB during a
+        // partial flush but the chain state height was never advanced).
+        if (height === this.lastFailedHeight) {
+          this.consecutiveFailures++;
+        } else {
+          this.consecutiveFailures = 1;
+          this.lastFailedHeight = height;
+        }
+
+        console.error(`Block validation failed at height ${height} (attempt ${this.consecutiveFailures}), discarding and re-requesting`);
         this.state.downloadedBlocks.delete(hashHex);
 
         // Reset the UTXO cache to avoid corrupt state from partial processing
         this.utxoManager.clearCache();
 
-        // Rewind to last flushed height so we re-process from a known-good
-        // DB state.  All blocks between lastFlushedHeight and height need
-        // to be re-downloaded and re-applied.
-        const rewindTo = this.lastFlushedHeight + 1;
-        this.state.nextHeightToProcess = rewindTo;
-        this.state.nextHeightToRequest = rewindTo;
+        if (this.consecutiveFailures >= 3) {
+          // The on-disk UTXO set is permanently corrupted at this height.
+          // During IBD assume-valid mode, undo data is not stored, so we
+          // cannot programmatically roll back the UTXO set.  The only
+          // recovery is to wipe the database and re-sync from genesis.
+          console.error(
+            `\n*** FATAL: Permanent UTXO corruption detected at height ${height}. ***\n` +
+            `The same block has failed validation ${this.consecutiveFailures} consecutive times.\n` +
+            `This means the on-disk UTXO set has entries that were partially flushed\n` +
+            `during a previous unclean shutdown.\n\n` +
+            `To recover, delete the data directory and restart:\n` +
+            `  rm -rf <datadir>/blocks.db && restart hotbuns\n`
+          );
+          // Exit with a distinctive code so monitoring scripts can detect this
+          process.exit(78); // EX_CONFIG from sysexits.h
+        } else {
+          // Normal retry: rewind to last flushed height so we re-process
+          // from a known-good DB state.
+          const rewindTo = this.lastFlushedHeight + 1;
+          this.state.nextHeightToProcess = rewindTo;
+          this.state.nextHeightToRequest = rewindTo;
+        }
 
         // Discard any buffered blocks that are now stale
         this.state.downloadedBlocks.clear();
@@ -695,19 +998,46 @@ export class BlockSync {
       this.state.nextHeightToProcess++;
       this.blocksProcessed++;
 
-      // Flush dirty UTXO entries to disk AFTER successful block connection.
-      // Triggers on EITHER: block count interval OR memory pressure.
-      const blocksSinceFlush = height - this.lastFlushedHeight;
+      // Flush dirty UTXO entries to disk on memory pressure.
+      // The periodic FLUSH_INTERVAL flush is handled inside connectBlock()
+      // which already includes chain state atomically. This flush handles
+      // only memory-triggered cases between those periodic points.
+      //
+      // CRITICAL: chain state (bestHeight) MUST be written atomically with
+      // UTXO changes. Otherwise a crash between flush and chain-state write
+      // leaves the DB in an unrecoverable state: spent coins deleted but
+      // bestHeight pointing before the spend, causing "Missing UTXO" on
+      // restart. This was the root cause of the height 380001 corruption.
       const memoryFlush = this.utxoManager.shouldFlush();
-      if ((blocksSinceFlush >= FLUSH_INTERVAL || memoryFlush) &&
-          this.utxoManager.getDirtyCount() > 0) {
-        if (memoryFlush) {
-          console.log(`UTXO memory flush at height ${height}: ${this.utxoManager.getCacheSize()} entries`);
+      if (memoryFlush && this.utxoManager.getDirtyCount() > 0) {
+        console.log(`UTXO memory flush at height ${height}: ${this.utxoManager.getCacheSize()} entries`);
+
+        // Build extraOps with chain state so the flush is crash-safe.
+        // Use headerEntry which is already resolved for this height.
+        const extraOps: BatchOperation[] = [];
+        if (headerEntry) {
+          const chainStateValue = this.serializeChainState(
+            headerEntry.hash,
+            height,
+            headerEntry.chainWork
+          );
+          extraOps.push({
+            type: "put",
+            prefix: DBPrefix.CHAIN_STATE,
+            key: Buffer.alloc(0),
+            value: chainStateValue,
+          });
         }
-        await this.utxoManager.flushDirty();
+
+        await this.utxoManager.flushDirty(extraOps);
         this.lastFlushedHeight = height;
 
-        // Force GC after large flush to reclaim V8 heap
+        // Use FULL GC (true) on memory-triggered flushes to release the
+        // large batch of evicted Map entries and Buffers back to the OS.
+        // With the reduced 256MB cache, memory flushes happen less often
+        // (~every 1-3 blocks at 380K+), so the stop-the-world cost is
+        // amortized. Incremental GC was insufficient — it left dead objects
+        // in the old generation, keeping RSS at 4GB+.
         if (typeof Bun !== "undefined" && Bun.gc) {
           Bun.gc(true);
         }
@@ -717,15 +1047,16 @@ export class BlockSync {
       // I/O callbacks, and RPC handlers.  Without this, a long chain of
       // cached UTXO hits can resolve all awaits as microtasks, starving
       // the macrotask queue indefinitely.
-      if (this.blocksProcessed % 256 === 0) {
+      if (this.blocksProcessed % 64 === 0) {
         await new Promise<void>(resolve => setTimeout(resolve, 0));
       }
 
-      // Periodic GC every 200 blocks to reclaim old buffers and Map nodes.
-      // V8 retains heap pages even after objects are collected, so frequent
-      // GC helps keep RSS from growing unboundedly.
-      if (this.blocksProcessed % 200 === 0 && typeof Bun !== "undefined" && Bun.gc) {
-        Bun.gc(true); // full GC every 200 blocks
+      // Periodic GC every 2000 blocks — use incremental (false) to avoid
+      // stop-the-world pauses that were the main cause of the 3 blk/s stall.
+      // The runtime's own GC handles most pressure; we only need to nudge it
+      // occasionally to release old Map nodes and Buffers.
+      if (this.blocksProcessed % 2000 === 0 && typeof Bun !== "undefined" && Bun.gc) {
+        Bun.gc(false);
       }
     }
 
@@ -1062,11 +1393,33 @@ export class BlockSync {
     const stalledBlocks: string[] = [];
     const peerStalls: Map<string, number> = new Map();
 
+    // Determine the hash of the most critical block (the one at
+    // nextHeightToProcess).  This is the bottleneck — no other block can
+    // be processed until it arrives.  Previously we gave it 5x the normal
+    // timeout, but that caused a death spiral: the long timeout prevented
+    // stall detection, the peer never delivered, the buffer filled with
+    // higher blocks, the deadlock handler evicted them, and the cycle
+    // repeated forever (observed stuck at block 420,017).
+    //
+    // Now the critical block gets the SAME timeout as other blocks.
+    // The DUP-REQ mechanism in processOrderedBlocksInner handles slow-
+    // but-progressing peers by sending parallel requests without cancelling
+    // the original.
+    const criticalEntry = this.headerSync.getHeaderByHeight(
+      this.state.nextHeightToProcess
+    );
+    const criticalHashHex = criticalEntry?.hash.toString("hex") ?? "";
+
     // Check for stalled requests
     for (const [hashHex, pending] of this.state.pendingBlocks) {
       const elapsed = now - pending.requestedAt;
 
-      if (elapsed > pending.timeout) {
+      // All blocks use the same timeout.  The critical block no longer
+      // gets special treatment — the 5x multiplier caused permanent
+      // stalls when the assigned peer was unresponsive.
+      const effectiveTimeout = pending.timeout;
+
+      if (elapsed > effectiveTimeout) {
         stalledBlocks.push(hashHex);
 
         // Track stalls per peer
@@ -1083,6 +1436,13 @@ export class BlockSync {
         peerInfo.stallTimeout = Math.min(
           MAX_STALL_TIMEOUT,
           peerInfo.stallTimeout * 2
+        );
+        // Put peer in cooldown: don't assign new blocks for a while.
+        // Peers that have never delivered blocks get a longer cooldown.
+        const cooldownMs = peerInfo.blocksDelivered > 0 ? 60000 : 300000;
+        peerInfo.cooldownUntil = Math.max(
+          peerInfo.cooldownUntil,
+          Date.now() + cooldownMs
         );
 
         // During IBD, never ban peers for slow delivery — just disconnect.
@@ -1133,6 +1493,96 @@ export class BlockSync {
     // Request more blocks if any were cleared
     if (stalledBlocks.length > 0) {
       this.requestBlocks();
+    }
+
+    // Clean up pending requests for peers that have disconnected.
+    // Without this, requests to dead peers linger for the full stall
+    // timeout, blocking progress when the buffer fills.
+    if (this.peerManager && this.state.pendingBlocks.size > 0) {
+      const connectedPeers = new Set(
+        this.peerManager
+          .getConnectedPeers()
+          .map((p) => `${p.host}:${p.port}`)
+      );
+      let cleaned = 0;
+      for (const [hashHex, pending] of this.state.pendingBlocks) {
+        if (!connectedPeers.has(pending.peer)) {
+          this.state.pendingBlocks.delete(hashHex);
+          if (pending.height < this.state.nextHeightToRequest) {
+            this.state.nextHeightToRequest = pending.height;
+          }
+          cleaned++;
+        }
+      }
+      if (cleaned > 0) {
+        this.requestBlocks();
+      }
+    }
+
+    // Detect processing deadlock: downloaded buffer is full (or near-full)
+    // but the next block we need isn't in it.  This happens when the buffer
+    // fills with blocks at heights we can't process yet (e.g. blocks arrived
+    // out of order with gaps, or a peer failed to deliver a specific block).
+    // Without this check, processing stalls permanently because
+    // requestBlocks() refuses to fetch more while the buffer is full.
+    if (this.state.downloadedBlocks.size >= MAX_DOWNLOADED_BUFFER) {
+      const bestHeader = this.headerSync.getBestHeader();
+      if (bestHeader && this.state.nextHeightToProcess <= bestHeader.height) {
+        const nextEntry = this.headerSync.getHeaderByHeight(
+          this.state.nextHeightToProcess
+        );
+        if (
+          nextEntry &&
+          !this.state.downloadedBlocks.has(nextEntry.hash.toString("hex"))
+        ) {
+          // The block we need is NOT in the buffer. Evict blocks that are
+          // far ahead of the processing frontier to make room for the blocks
+          // we actually need. Keep blocks that are within a small window of
+          // the processing height since we'll need them soon.
+          const keepWindow = MAX_DOWNLOADED_BUFFER / 2;
+          const maxKeepHeight = this.state.nextHeightToProcess + keepWindow;
+          let evicted = 0;
+          for (const [hashHex] of this.state.downloadedBlocks) {
+            const entry = this.headerSync.getHeader(
+              Buffer.from(hashHex, "hex")
+            );
+            if (!entry || entry.height > maxKeepHeight || entry.height < this.state.nextHeightToProcess) {
+              this.state.downloadedBlocks.delete(hashHex);
+              evicted++;
+            }
+          }
+
+          // Also clear pending requests beyond the keep window,
+          // AND clear the critical block's pending entry if it's been
+          // pending too long.  This is the key fix for the 420,017 stall:
+          // the buffer filling is proof that the critical block's peer is
+          // not delivering, so we must forcibly cancel and re-request.
+          let pendingCleared = 0;
+          const criticalHashHex = nextEntry.hash.toString("hex");
+          for (const [hashHex, pending] of this.state.pendingBlocks) {
+            const shouldClear = pending.height > maxKeepHeight ||
+              (hashHex === criticalHashHex &&
+               (Date.now() - pending.requestedAt) > BASE_STALL_TIMEOUT / 2);
+            if (shouldClear) {
+              this.state.pendingBlocks.delete(hashHex);
+              const peerInfo = this.peerInFlight.get(pending.peer);
+              if (peerInfo) {
+                peerInfo.count = Math.max(0, peerInfo.count - 1);
+              }
+              if (hashHex === criticalHashHex) {
+                console.log(`DEADLOCK-FIX: cleared pending critical block ${pending.height} from ${pending.peer} (age=${Date.now() - pending.requestedAt}ms)`);
+              }
+              pendingCleared++;
+            }
+          }
+
+          if (evicted > 0 || pendingCleared > 0) {
+            // Reset request pointer to fill the gap
+            this.state.nextHeightToRequest = this.state.nextHeightToProcess;
+            this.requestBlocks();
+          }
+        }
+      }
     }
   }
 
@@ -1218,11 +1668,11 @@ export class BlockSync {
 
   /**
    * Prune downloaded blocks that are too far ahead of nextHeightToProcess.
-   * Keeps blocks within the window size of the processing height to avoid
-   * memory bloat from out-of-order arrivals.
+   * Keeps only blocks within MAX_DOWNLOADED_BUFFER heights ahead of
+   * processing to avoid memory bloat from out-of-order arrivals.
    */
   private pruneDownloadedBlocks(): void {
-    const maxAhead = this.windowSize * 2;
+    const maxAhead = MAX_DOWNLOADED_BUFFER * 2;
     const pruneThreshold = this.state.nextHeightToProcess + maxAhead;
 
     for (const [hashHex, block] of this.state.downloadedBlocks) {

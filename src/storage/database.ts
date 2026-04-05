@@ -256,6 +256,12 @@ export class ChainDB {
       cacheSize: 32 * 1024 * 1024,
       // 16 MB write buffer
       writeBufferSize: 16 * 1024 * 1024,
+      // Limit open file handles to cap mmap RSS overhead.
+      // LevelDB opens table files with mmap; at 380K+ blocks the UTXO
+      // SST files number in the thousands, each consuming kernel page
+      // cache counted in RSS. 256 files * ~2MB = ~512MB mmap ceiling.
+      // Default (1000) was contributing ~1-2GB of RSS.
+      maxOpenFiles: 256,
     });
   }
 
@@ -422,14 +428,10 @@ export class ChainDB {
       const chunk = ops.slice(i, Math.min(i + maxBatchSize, ops.length));
       await this.batch(chunk);
 
-      // Optional: hint GC between large batches
-      if (typeof Bun !== 'undefined' && typeof Bun.gc === 'function') {
-        // Only force GC if memory pressure is high
-        const memUsage = process.memoryUsage();
-        if (memUsage.heapUsed > memUsage.heapTotal * 0.8) {
-          Bun.gc(true);
-        }
-      }
+      // Yield between chunks so the event loop can process I/O and timers.
+      // Avoid full GC (Bun.gc(true)) here — it was causing stop-the-world
+      // pauses during every UTXO flush, compounding the sync stall.
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
     }
   }
 
