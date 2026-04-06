@@ -20,15 +20,12 @@ import { DBPrefix } from "../storage/database.js";
 import type { Transaction, OutPoint } from "../validation/tx.js";
 import { BufferWriter, BufferReader } from "../wire/serialization.js";
 
-/** Default max cache size in bytes (~256MB).
- *  JS objects have ~3KB overhead per Map entry. At 3KB/entry this allows
- *  ~85K entries before flushing. 512MB was causing RSS to climb to 4-5GB
- *  during mainnet IBD because Bun/V8's native allocator retains freed
- *  heap pages (RSS never drops even after GC). By capping at 256MB the
- *  peak heap stays under ~1.5GB and RSS under ~2.5GB, safely within the
- *  4GB budget. The extra flushes (~1 per block at 380K+) are acceptable
- *  at 16 blk/s and LevelDB batch writes are fast with 16MB write buffer. */
-const DEFAULT_DBCACHE_BYTES = 256 * 1024 * 1024;
+/** Default max cache size in bytes (~2GB).
+ *  JS objects have ~3KB overhead per Map entry. With BUN_JSC_forceRAMSize=4GB
+ *  and the larger heap budget, 2GB cache keeps more UTXOs in memory between
+ *  flushes, reducing LevelDB reads during IBD. RSS may climb to ~4-5GB but
+ *  the server has 128GB RAM so this is acceptable. */
+const DEFAULT_DBCACHE_BYTES = 2 * 1024 * 1024 * 1024;
 
 /**
  * Estimated overhead per cache entry in the JS heap.

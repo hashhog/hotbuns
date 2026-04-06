@@ -252,8 +252,8 @@ export class ChainDB {
     this.db = new ClassicLevel<Buffer, Buffer>(dbPath, {
       keyEncoding: 'buffer',
       valueEncoding: 'buffer',
-      // 32 MB LevelDB block cache (reduced to save RSS)
-      cacheSize: 32 * 1024 * 1024,
+      // 256 MB LevelDB block cache (increased for 2GB UTXO cache budget)
+      cacheSize: 256 * 1024 * 1024,
       // 16 MB write buffer
       writeBufferSize: 16 * 1024 * 1024,
       // Limit open file handles to cap mmap RSS overhead.
