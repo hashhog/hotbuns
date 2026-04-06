@@ -434,9 +434,23 @@ export class BlockSync {
     const blockHash = getBlockHash(block.header);
     const hashHex = blockHash.toString("hex");
 
-    const headerEntry = this.headerSync.getHeader(blockHash);
+    let headerEntry = this.headerSync.getHeader(blockHash);
     if (!headerEntry) {
-      return "inconclusive"; // Unknown block
+      // Header not known yet — try to accept it directly from the block.
+      // This allows submitblock to work even when header sync is stalled
+      // (e.g. after IBD completes but chain work hasn't reached nMinimumChainWork,
+      // causing the anti-DoS PRESYNC to block new headers from peers).
+      const accepted = await this.headerSync.processHeaders([block.header]);
+      if (accepted > 0) {
+        headerEntry = this.headerSync.getHeader(blockHash);
+      }
+      if (!headerEntry) {
+        return "inconclusive"; // Still unknown (orphan or invalid header)
+      }
+      // Re-enter IBD if we were past it, since we now have new headers
+      if (this.ibdComplete && headerEntry.height >= this.state.nextHeightToProcess) {
+        this.ibdComplete = false;
+      }
     }
 
     // Already processed?
