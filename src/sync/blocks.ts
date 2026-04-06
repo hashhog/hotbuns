@@ -62,9 +62,11 @@ const LOG_INTERVAL = 10000;
 const MAX_GETDATA_ITEMS = 50000;
 
 /** Maximum downloaded blocks buffered in memory before throttling requests.
- *  At ~118K height, early blocks are small but the total count matters for
- *  GC pressure. 128 blocks keeps ~10-50MB of block data in the heap. */
-const MAX_DOWNLOADED_BUFFER = 128;
+ *  At mainnet heights (500K+), blocks average 2-4MB serialized but expand to
+ *  10-20MB as JS objects (transactions, witnesses, Buffers).  32 blocks keeps
+ *  ~320-640MB in the heap — manageable under a 4GB RSS cap.  Early small blocks
+ *  are processed fast enough that a larger buffer isn't needed. */
+const MAX_DOWNLOADED_BUFFER = 32;
 
 /**
  * Tracks a pending block request.
@@ -456,6 +458,16 @@ export class BlockSync {
     // Already processed?
     if (headerEntry.height < this.state.nextHeightToProcess) {
       return "duplicate";
+    }
+
+    // Reject blocks that are too far ahead of the processing frontier.
+    // Without this check, a fast feeder (submitblock at 20+ blk/s) fills the
+    // downloadedBlocks Map with thousands of out-of-order blocks, causing
+    // unbounded RSS growth (~1.7MB/block * 5000 blocks = 8.5GB).
+    // Allow the next block to process and a small buffer ahead of it.
+    if (headerEntry.height > this.state.nextHeightToProcess + MAX_DOWNLOADED_BUFFER &&
+        this.state.downloadedBlocks.size >= MAX_DOWNLOADED_BUFFER) {
+      return "inconclusive"; // Signal caller to retry later
     }
 
     // Clear any pending request for this block
@@ -1065,11 +1077,13 @@ export class BlockSync {
         await new Promise<void>(resolve => setTimeout(resolve, 0));
       }
 
-      // Periodic GC every 2000 blocks — use incremental (false) to avoid
-      // stop-the-world pauses that were the main cause of the 3 blk/s stall.
-      // The runtime's own GC handles most pressure; we only need to nudge it
-      // occasionally to release old Map nodes and Buffers.
-      if (this.blocksProcessed % 2000 === 0 && typeof Bun !== "undefined" && Bun.gc) {
+      // Periodic GC every 50 blocks — use incremental (false) to avoid
+      // stop-the-world pauses.  At mainnet heights, each block creates ~10-20MB
+      // of JS objects (txns, witnesses, Buffers) that become garbage after
+      // connectBlock.  Without frequent nudges, V8/JSC defers collection and
+      // RSS grows ~1.7MB/block until OOM.  Every-50 keeps RSS stable with
+      // negligible throughput impact (~0.5ms per incremental GC).
+      if (this.blocksProcessed % 50 === 0 && typeof Bun !== "undefined" && Bun.gc) {
         Bun.gc(false);
       }
     }
@@ -1689,9 +1703,11 @@ export class BlockSync {
     const maxAhead = MAX_DOWNLOADED_BUFFER * 2;
     const pruneThreshold = this.state.nextHeightToProcess + maxAhead;
 
-    for (const [hashHex, block] of this.state.downloadedBlocks) {
-      const blockHash = getBlockHash(block.header);
-      const headerEntry = this.headerSync.getHeader(blockHash);
+    for (const [hashHex] of this.state.downloadedBlocks) {
+      // Look up the header by the map key directly — avoids re-hashing the
+      // block (expensive) and keeps no reference to the Block object so it
+      // can be collected immediately after deletion.
+      const headerEntry = this.headerSync.getHeader(Buffer.from(hashHex, "hex"));
       if (headerEntry && headerEntry.height > pruneThreshold) {
         this.state.downloadedBlocks.delete(hashHex);
         // Allow this height to be re-requested later
