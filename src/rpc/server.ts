@@ -2871,12 +2871,15 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "hex string required");
     }
 
-    // Deserialize the block from hex
+    // Deserialize the block from hex.  Null out intermediate buffers eagerly
+    // so the large hex string (~2-8MB) and raw buffer are eligible for GC
+    // before the potentially long injectBlock() call.
     let block: Block;
     try {
-      const buf = Buffer.from(hexdata, "hex");
+      let buf: Buffer | null = Buffer.from(hexdata, "hex");
       const reader = new (await import("../wire/serialization.js")).BufferReader(buf);
       block = deserializeBlock(reader);
+      buf = null; // Release raw buffer (~1-4MB)
     } catch (err) {
       throw this.rpcError(
         RPCErrorCodes.MISC_ERROR,

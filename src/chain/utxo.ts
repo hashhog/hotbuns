@@ -20,12 +20,12 @@ import { DBPrefix } from "../storage/database.js";
 import type { Transaction, OutPoint } from "../validation/tx.js";
 import { BufferWriter, BufferReader } from "../wire/serialization.js";
 
-/** Default max cache size in bytes (~2GB).
- *  JS objects have ~3KB overhead per Map entry. With BUN_JSC_forceRAMSize=4GB
- *  and the larger heap budget, 2GB cache keeps more UTXOs in memory between
- *  flushes, reducing LevelDB reads during IBD. RSS may climb to ~4-5GB but
- *  the server has 128GB RAM so this is acceptable. */
-const DEFAULT_DBCACHE_BYTES = 2 * 1024 * 1024 * 1024;
+/** Default max cache size in bytes (~512MB).
+ *  JS objects have ~3KB overhead per Map entry.  With BUN_JSC_forceRAMSize=4GB,
+ *  a 512MB UTXO cache leaves ~2-3GB for block processing, header index, and
+ *  V8/JSC overhead.  The smaller cache means more frequent LevelDB reads but
+ *  keeps RSS stable under the 4GB cap instead of growing ~1.7MB/block. */
+const DEFAULT_DBCACHE_BYTES = 512 * 1024 * 1024;
 
 /**
  * Estimated overhead per cache entry in the JS heap.
