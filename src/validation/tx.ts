@@ -85,6 +85,8 @@ export interface Transaction {
   inputs: TxIn[];
   outputs: TxOut[];
   lockTime: number; // uint32
+  /** Cached txid (set lazily by getTxId to avoid re-serialization). */
+  _cachedTxId?: Buffer;
 }
 
 /**
@@ -235,8 +237,11 @@ export function deserializeTx(reader: BufferReader): Transaction {
  * The txid is stored in little-endian (internal) format.
  */
 export function getTxId(tx: Transaction): Buffer {
+  if (tx._cachedTxId) return tx._cachedTxId;
   const serialized = serializeTx(tx, false);
-  return hash256(serialized);
+  const txid = hash256(serialized);
+  tx._cachedTxId = txid;
+  return txid;
 }
 
 /**

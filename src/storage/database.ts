@@ -89,16 +89,20 @@ export interface BatchOperation {
 
 /**
  * Construct a prefixed key for database storage.
+ * Writes prefix byte directly into a new buffer instead of concat.
  */
 function makeKey(prefix: DBPrefix, key: Buffer): Buffer {
-  return Buffer.concat([Buffer.from([prefix]), key]);
+  const buf = Buffer.allocUnsafe(1 + key.length);
+  buf[0] = prefix;
+  key.copy(buf, 1);
+  return buf;
 }
 
 /**
  * Encode a height as 4-byte big-endian for lexicographic ordering.
  */
 function encodeHeight(height: number): Buffer {
-  const buf = Buffer.alloc(4);
+  const buf = Buffer.allocUnsafe(4);
   buf.writeUInt32BE(height, 0);
   return buf;
 }
@@ -107,7 +111,7 @@ function encodeHeight(height: number): Buffer {
  * Encode a UTXO key: txid (32 bytes) || vout (4 bytes LE).
  */
 function encodeUTXOKey(txid: Buffer, vout: number): Buffer {
-  const buf = Buffer.alloc(36);
+  const buf = Buffer.allocUnsafe(36);
   txid.copy(buf, 0);
   buf.writeUInt32LE(vout, 32);
   return buf;
@@ -117,13 +121,14 @@ function encodeUTXOKey(txid: Buffer, vout: number): Buffer {
  * Serialize a BlockIndexRecord to bytes.
  */
 function serializeBlockIndex(record: BlockIndexRecord): Buffer {
-  const writer = new BufferWriter();
-  writer.writeUInt32LE(record.height);
-  writer.writeBytes(record.header);
-  writer.writeUInt32LE(record.nTx);
-  writer.writeUInt32LE(record.status);
-  writer.writeUInt32LE(record.dataPos);
-  return writer.toBuffer();
+  // Fixed layout: height(4) + header(80) + nTx(4) + status(4) + dataPos(4) = 96
+  const buf = Buffer.allocUnsafe(96);
+  buf.writeUInt32LE(record.height, 0);
+  record.header.copy(buf, 4);
+  buf.writeUInt32LE(record.nTx, 84);
+  buf.writeUInt32LE(record.status, 88);
+  buf.writeUInt32LE(record.dataPos, 92);
+  return buf;
 }
 
 /**
@@ -143,12 +148,24 @@ function deserializeBlockIndex(data: Buffer): BlockIndexRecord {
  * Serialize a UTXOEntry to bytes.
  */
 function serializeUTXO(entry: UTXOEntry): Buffer {
-  const writer = new BufferWriter();
-  writer.writeUInt32LE(entry.height);
-  writer.writeUInt8(entry.coinbase ? 1 : 0);
-  writer.writeUInt64LE(entry.amount);
-  writer.writeVarBytes(entry.scriptPubKey);
-  return writer.toBuffer();
+  const spkLen = entry.scriptPubKey.length;
+  const viSize = spkLen <= 0xfc ? 1 : spkLen <= 0xffff ? 3 : 5;
+  const buf = Buffer.allocUnsafe(4 + 1 + 8 + viSize + spkLen);
+  let pos = 0;
+  buf.writeUInt32LE(entry.height, pos); pos += 4;
+  buf[pos++] = entry.coinbase ? 1 : 0;
+  buf.writeBigUInt64LE(entry.amount, pos); pos += 8;
+  if (spkLen <= 0xfc) {
+    buf[pos++] = spkLen;
+  } else if (spkLen <= 0xffff) {
+    buf[pos++] = 0xfd;
+    buf.writeUInt16LE(spkLen, pos); pos += 2;
+  } else {
+    buf[pos++] = 0xfe;
+    buf.writeUInt32LE(spkLen, pos); pos += 4;
+  }
+  entry.scriptPubKey.copy(buf, pos);
+  return buf;
 }
 
 /**

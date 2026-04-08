@@ -99,9 +99,22 @@ function parseOutpointKey(key: string): { txid: Buffer; vout: number } {
  * Matches the format used by ChainDB.getUTXO / putUTXO.
  */
 function encodeDBKey(txid: Buffer, vout: number): Buffer {
-  const buf = Buffer.alloc(36);
+  const buf = Buffer.allocUnsafe(36);
   txid.copy(buf, 0);
   buf.writeUInt32LE(vout, 32);
+  return buf;
+}
+
+/**
+ * Encode a DB key directly from a Map key string (txid_hex:vout).
+ * Avoids the intermediate parseOutpointKey + encodeDBKey round-trip.
+ */
+function encodeDBKeyFromString(key: string): Buffer {
+  const colonIndex = key.lastIndexOf(":");
+  const buf = Buffer.allocUnsafe(36);
+  // Write txid directly from hex portion of the string
+  Buffer.from(key.slice(0, colonIndex), "hex").copy(buf, 0);
+  buf.writeUInt32LE(parseInt(key.slice(colonIndex + 1), 10), 32);
   return buf;
 }
 
@@ -114,12 +127,27 @@ function encodeDBKey(txid: Buffer, vout: number): Buffer {
  * - scriptPubKey (varint length + bytes)
  */
 function serializeCoin(coin: Coin): Buffer {
-  const writer = new BufferWriter();
-  writer.writeUInt32LE(coin.height);
-  writer.writeUInt8(coin.isCoinbase ? 1 : 0);
-  writer.writeUInt64LE(coin.txOut.value);
-  writer.writeVarBytes(coin.txOut.scriptPubKey);
-  return writer.toBuffer();
+  // Fixed layout: height(4) + coinbase(1) + value(8) + varint_len + scriptPubKey
+  const spkLen = coin.txOut.scriptPubKey.length;
+  // Varint size for scriptPubKey length
+  const viSize = spkLen <= 0xfc ? 1 : spkLen <= 0xffff ? 3 : 5;
+  const buf = Buffer.allocUnsafe(4 + 1 + 8 + viSize + spkLen);
+  let pos = 0;
+  buf.writeUInt32LE(coin.height, pos); pos += 4;
+  buf[pos++] = coin.isCoinbase ? 1 : 0;
+  buf.writeBigUInt64LE(coin.txOut.value, pos); pos += 8;
+  // Write varint
+  if (spkLen <= 0xfc) {
+    buf[pos++] = spkLen;
+  } else if (spkLen <= 0xffff) {
+    buf[pos++] = 0xfd;
+    buf.writeUInt16LE(spkLen, pos); pos += 2;
+  } else {
+    buf[pos++] = 0xfe;
+    buf.writeUInt32LE(spkLen, pos); pos += 4;
+  }
+  coin.txOut.scriptPubKey.copy(buf, pos);
+  return buf;
 }
 
 /**
@@ -238,8 +266,7 @@ export class CoinsViewDB extends CoinsView {
     for (const [key, entry] of entries) {
       if (!entry.dirty) continue;
 
-      const { txid, vout } = parseOutpointKey(key);
-      const dbKey = encodeDBKey(txid, vout);
+      const dbKey = encodeDBKeyFromString(key);
 
       if (entry.coin === null) {
         // Coin was spent - delete from DB unless it was FRESH

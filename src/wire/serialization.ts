@@ -112,13 +112,15 @@ export const globalBufferPool = new BufferPool();
  * Calculate the byte size of a CompactSize (varint) encoded value.
  */
 export function varIntSize(value: number | bigint): number {
-  const n = typeof value === "bigint" ? value : BigInt(value);
-  if (n < 0n) {
-    throw new Error("varIntSize: value must be non-negative");
+  if (typeof value === "number") {
+    if (value <= 0xfc) return 1;
+    if (value <= 0xffff) return 3;
+    if (value <= 0xffffffff) return 5;
+    return 9;
   }
-  if (n <= 0xfcn) return 1;
-  if (n <= 0xffffn) return 3;
-  if (n <= 0xffffffffn) return 5;
+  if (value <= 0xfcn) return 1;
+  if (value <= 0xffffn) return 3;
+  if (value <= 0xffffffffn) return 5;
   return 9;
 }
 
@@ -127,47 +129,53 @@ export function varIntSize(value: number | bigint): number {
  * Data is written in little-endian format as required by the Bitcoin protocol.
  */
 export class BufferWriter {
-  private buffers: Buffer[];
-  private length: number;
+  private buf: Buffer;
+  private pos: number;
 
-  constructor() {
-    this.buffers = [];
-    this.length = 0;
+  constructor(initialCapacity: number = 512) {
+    this.buf = Buffer.allocUnsafe(initialCapacity);
+    this.pos = 0;
+  }
+
+  /** Ensure at least `needed` bytes are available after pos. */
+  private ensureCapacity(needed: number): void {
+    const required = this.pos + needed;
+    if (required <= this.buf.length) return;
+    // Double the buffer (or more if needed)
+    let newSize = this.buf.length * 2;
+    while (newSize < required) newSize *= 2;
+    const newBuf = Buffer.allocUnsafe(newSize);
+    this.buf.copy(newBuf, 0, 0, this.pos);
+    this.buf = newBuf;
   }
 
   writeUInt8(value: number): void {
-    const buf = Buffer.alloc(1);
-    buf.writeUInt8(value, 0);
-    this.buffers.push(buf);
-    this.length += 1;
+    this.ensureCapacity(1);
+    this.buf[this.pos++] = value;
   }
 
   writeUInt16LE(value: number): void {
-    const buf = Buffer.alloc(2);
-    buf.writeUInt16LE(value, 0);
-    this.buffers.push(buf);
-    this.length += 2;
+    this.ensureCapacity(2);
+    this.buf.writeUInt16LE(value, this.pos);
+    this.pos += 2;
   }
 
   writeUInt32LE(value: number): void {
-    const buf = Buffer.alloc(4);
-    buf.writeUInt32LE(value, 0);
-    this.buffers.push(buf);
-    this.length += 4;
+    this.ensureCapacity(4);
+    this.buf.writeUInt32LE(value, this.pos);
+    this.pos += 4;
   }
 
   writeInt32LE(value: number): void {
-    const buf = Buffer.alloc(4);
-    buf.writeInt32LE(value, 0);
-    this.buffers.push(buf);
-    this.length += 4;
+    this.ensureCapacity(4);
+    this.buf.writeInt32LE(value, this.pos);
+    this.pos += 4;
   }
 
   writeUInt64LE(value: bigint): void {
-    const buf = Buffer.alloc(8);
-    buf.writeBigUInt64LE(value, 0);
-    this.buffers.push(buf);
-    this.length += 8;
+    this.ensureCapacity(8);
+    this.buf.writeBigUInt64LE(value, this.pos);
+    this.pos += 8;
   }
 
   /**
@@ -175,22 +183,34 @@ export class BufferWriter {
    * Uses canonical (smallest) encoding.
    */
   writeVarInt(value: number | bigint): void {
-    const n = typeof value === "bigint" ? value : BigInt(value);
-    if (n < 0n) {
-      throw new Error("writeVarInt: value must be non-negative");
-    }
-
-    if (n <= 0xfcn) {
-      this.writeUInt8(Number(n));
-    } else if (n <= 0xffffn) {
-      this.writeUInt8(0xfd);
-      this.writeUInt16LE(Number(n));
-    } else if (n <= 0xffffffffn) {
-      this.writeUInt8(0xfe);
-      this.writeUInt32LE(Number(n));
+    if (typeof value === "number") {
+      if (value < 0) throw new Error("writeVarInt: value must be non-negative");
+      if (value <= 0xfc) {
+        this.writeUInt8(value);
+      } else if (value <= 0xffff) {
+        this.writeUInt8(0xfd);
+        this.writeUInt16LE(value);
+      } else if (value <= 0xffffffff) {
+        this.writeUInt8(0xfe);
+        this.writeUInt32LE(value);
+      } else {
+        this.writeUInt8(0xff);
+        this.writeUInt64LE(BigInt(value));
+      }
     } else {
-      this.writeUInt8(0xff);
-      this.writeUInt64LE(n);
+      if (value < 0n) throw new Error("writeVarInt: value must be non-negative");
+      if (value <= 0xfcn) {
+        this.writeUInt8(Number(value));
+      } else if (value <= 0xffffn) {
+        this.writeUInt8(0xfd);
+        this.writeUInt16LE(Number(value));
+      } else if (value <= 0xffffffffn) {
+        this.writeUInt8(0xfe);
+        this.writeUInt32LE(Number(value));
+      } else {
+        this.writeUInt8(0xff);
+        this.writeUInt64LE(value);
+      }
     }
   }
 
@@ -214,8 +234,10 @@ export class BufferWriter {
    * Write raw bytes without any prefix.
    */
   writeBytes(data: Buffer): void {
-    this.buffers.push(data);
-    this.length += data.length;
+    const len = data.length;
+    this.ensureCapacity(len);
+    data.copy(this.buf, this.pos);
+    this.pos += len;
   }
 
   /**
@@ -230,10 +252,18 @@ export class BufferWriter {
   }
 
   /**
-   * Concatenate all accumulated buffers into a single Buffer.
+   * Return the written portion as a new Buffer (copy).
    */
   toBuffer(): Buffer {
-    return Buffer.concat(this.buffers, this.length);
+    // Return a copy so the internal buffer can be reused
+    return Buffer.from(this.buf.subarray(0, this.pos));
+  }
+
+  /**
+   * Return total bytes written.
+   */
+  get length(): number {
+    return this.pos;
   }
 }
 

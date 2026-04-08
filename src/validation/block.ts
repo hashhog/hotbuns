@@ -66,14 +66,17 @@ export interface Block {
  * Serialize a block header to 80 bytes.
  */
 export function serializeBlockHeader(header: BlockHeader): Buffer {
-  const writer = new BufferWriter();
-  writer.writeInt32LE(header.version);
-  writer.writeHash(header.prevBlock);
-  writer.writeHash(header.merkleRoot);
-  writer.writeUInt32LE(header.timestamp);
-  writer.writeUInt32LE(header.bits);
-  writer.writeUInt32LE(header.nonce);
-  return writer.toBuffer();
+  // Block header is always exactly 80 bytes: version(4) + prevBlock(32) +
+  // merkleRoot(32) + timestamp(4) + bits(4) + nonce(4).
+  // Write directly into a single buffer instead of using BufferWriter.
+  const buf = Buffer.allocUnsafe(80);
+  buf.writeInt32LE(header.version, 0);
+  header.prevBlock.copy(buf, 4);
+  header.merkleRoot.copy(buf, 36);
+  buf.writeUInt32LE(header.timestamp, 68);
+  buf.writeUInt32LE(header.bits, 72);
+  buf.writeUInt32LE(header.nonce, 76);
+  return buf;
 }
 
 /**
