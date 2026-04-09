@@ -349,6 +349,50 @@ export class BlockSync {
       }
     });
 
+    // BIP 152: Handle compact block messages
+    // Since we don't have a mempool, fall back to requesting the full block
+    peerManager.onMessage("cmpctblock", (peer, msg) => {
+      if (msg.type === "cmpctblock") {
+        const header = msg.payload.header;
+        const blockHash = getBlockHash(header);
+        const hashHex = blockHash.toString("hex");
+        console.log(
+          `Received cmpctblock from ${peer.host}:${peer.port}, ` +
+          `falling back to full block request (hash=${hashHex})`
+        );
+        // Request the full block via getdata since we can't reconstruct
+        // from compact block without a mempool
+        const inv: InvVector = {
+          type: InvType.MSG_WITNESS_BLOCK,
+          hash: blockHash,
+        };
+        peer.send({
+          type: "getdata",
+          payload: { inventory: [inv] },
+        });
+      }
+    });
+
+    // BIP 152: Handle sendcmpct — record peer's compact block preferences
+    peerManager.onMessage("sendcmpct", (peer, msg) => {
+      if (msg.type === "sendcmpct") {
+        console.log(
+          `Peer ${peer.host}:${peer.port} supports compact blocks: ` +
+          `version=${msg.payload.version}, announce=${msg.payload.announce}`
+        );
+      }
+    });
+
+    // BIP 152: Handle getblocktxn — peer requesting missing txs for reconstruction
+    peerManager.onMessage("getblocktxn", (_peer, _msg) => {
+      // We don't serve compact blocks yet, so ignore these
+    });
+
+    // BIP 152: Handle blocktxn — response to our getblocktxn request
+    peerManager.onMessage("blocktxn", (_peer, _msg) => {
+      // We fall back to full block download, so we shouldn't receive these
+    });
+
     // On new peer connection, request blocks if needed
     peerManager.onMessage("__connect__", (peer) => {
       if (this.running && !this.ibdComplete) {
@@ -1486,7 +1530,7 @@ export class BlockSync {
             // Only ban outside IBD
             this.peerManager.increaseBanScore(
               peer,
-              BanScores.SLOW_RESPONSE * stallCount,
+              BanScores.BLOCK_DOWNLOAD_STALL,
               `Stalled ${stallCount} blocks`
             );
           }
