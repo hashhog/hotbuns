@@ -107,7 +107,9 @@ export const BanScores = {
   UNSOLICITED_MESSAGE: 20,
   PROTOCOL_VIOLATION: 10,
   SLOW_RESPONSE: 2,
-  UNREQUESTED_DATA: 10,
+  UNREQUESTED_DATA: 5,
+  HEADERS_DONT_CONNECT: 20,
+  BLOCK_DOWNLOAD_STALL: 50,
 } as const;
 
 /** Fallback peer addresses when DNS seeds fail (testnet4 is unreliable). */

@@ -28,6 +28,7 @@ import {
 } from "../consensus/pow.js";
 import type { Peer } from "../p2p/peer.js";
 import type { PeerManager } from "../p2p/manager.js";
+import { BanScores } from "../p2p/manager.js";
 import type { NetworkMessage } from "../p2p/messages.js";
 import {
   BlockHeader,
@@ -734,7 +735,9 @@ export class HeaderSync {
         // Anti-DoS check failed - peer sent bad headers
         console.warn(`Anti-DoS check failed for peer ${peerKey}`);
         this.cleanupPeerSyncState(peerKey);
-        // Could increase ban score here
+        if (peer) {
+          peer.misbehaving(BanScores.HEADERS_DONT_CONNECT, "headers don't connect to our chain");
+        }
         return;
       }
 
