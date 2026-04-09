@@ -707,6 +707,13 @@ export class Peer {
 
       // Send post-handshake feature negotiation messages
       this.send({ type: "sendheaders", payload: null });
+
+      // BIP 152: Signal compact block relay support (version 2 = segwit)
+      // enabled=false means low-bandwidth mode (we receive inv/headers first)
+      this.send({
+        type: "sendcmpct",
+        payload: { enabled: false, version: 2n },
+      });
     }
   }
 
