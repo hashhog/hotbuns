@@ -1045,6 +1045,36 @@ async function startNode(config: NodeConfig): Promise<void> {
   await blockSync.start();
   rpcServer.start();
 
+  // Start Prometheus metrics server
+  const metricsPort = 9332; // TODO: make configurable via --metricsport
+  if (metricsPort > 0) {
+    const metricsServer = Bun.serve({
+      port: metricsPort,
+      hostname: "0.0.0.0",
+      fetch: (_req) => {
+        const height = chainState.getBestBlock().height;
+        const peers = peerManager.getConnectedPeers().length;
+        const mempoolCount = mempool.getInfo().size;
+        const body =
+          `# HELP bitcoin_blocks_total Current block height\n` +
+          `# TYPE bitcoin_blocks_total gauge\n` +
+          `bitcoin_blocks_total ${height}\n` +
+          `# HELP bitcoin_peers_connected Number of connected peers\n` +
+          `# TYPE bitcoin_peers_connected gauge\n` +
+          `bitcoin_peers_connected ${peers}\n` +
+          `# HELP bitcoin_mempool_size Mempool transaction count\n` +
+          `# TYPE bitcoin_mempool_size gauge\n` +
+          `bitcoin_mempool_size ${mempoolCount}\n`;
+        return new Response(body, {
+          headers: {
+            "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
+          },
+        });
+      },
+    });
+    console.log(`Prometheus metrics server listening on http://0.0.0.0:${metricsPort}`);
+  }
+
   // 10. Log startup message
   const peerCount = peerManager.getConnectedPeers().length;
   console.log(
