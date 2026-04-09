@@ -1,0 +1,40 @@
+# Hotbuns - Bitcoin Full Node (TypeScript/Bun)
+# Example configuration file
+# Copy to your data directory and modify as needed.
+
+[network]
+# Network: mainnet, testnet, testnet4, regtest
+network = "mainnet"
+
+[storage]
+# Data directory
+datadir = "~/.hotbuns"
+
+[rpc]
+# RPC port (default: 8332 mainnet, 18332 testnet, 48332 testnet4, 18443 regtest)
+rpcPort = 8332
+# RPC host
+rpcHost = "127.0.0.1"
+# RPC authentication
+rpcUser = "user"
+rpcPassword = "pass"
+
+[p2p]
+# P2P listen port
+port = 8333
+# Accept inbound P2P connections
+listen = true
+# Maximum outbound connections
+maxOutbound = 8
+
+[mempool]
+# (Uses Bitcoin Core defaults internally)
+
+[logging]
+# Log level: debug, info, warn, error
+logLevel = "info"
+
+[metrics]
+# Prometheus metrics endpoint
+# enabled = true
+# port = 9332
