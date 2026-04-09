@@ -1999,14 +1999,25 @@ export class RPCServer {
   private async getMempoolInfo(): Promise<Record<string, unknown>> {
     const info = this.mempool.getInfo();
 
+    // Calculate total fees
+    let totalFee = 0;
+    for (const txid of this.mempool.getAllTxids()) {
+      const entry = this.mempool.getTransaction(txid);
+      if (entry) totalFee += Number(entry.fee);
+    }
+
     return {
       loaded: true,
       size: info.size,
       bytes: info.bytes,
       usage: info.bytes, // Memory usage approximation
+      total_fee: totalFee / 100_000_000, // BTC
       maxmempool: 300_000_000, // Default max mempool size
       mempoolminfee: info.minFeeRate / 100_000, // Convert sat/vB to BTC/kvB
       minrelaytxfee: 0.00001, // 1 sat/vB
+      incrementalrelayfee: 0.00001,
+      unbroadcastcount: 0,
+      fullrbf: true,
     };
   }
 
@@ -2330,6 +2341,13 @@ export class RPCServer {
     const confTarget = Math.max(1, Math.min(1008, confTargetParam));
 
     const estimate = this.feeEstimator.estimateSmartFee(confTarget);
+
+    if (!estimate.feeRate || estimate.feeRate <= 0) {
+      return {
+        errors: ["Insufficient data or no feerate found"],
+        blocks: confTarget,
+      };
+    }
 
     return {
       feerate: estimate.feeRate / 100_000, // Convert sat/vB to BTC/kvB
