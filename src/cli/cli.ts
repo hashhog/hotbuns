@@ -18,6 +18,9 @@ import { PeerManager } from "../p2p/manager.js";
 import { HeaderSync } from "../sync/headers.js";
 import { BlockSync } from "../sync/blocks.js";
 import { RPCServer, type RPCServerConfig, type RPCServerDeps } from "../rpc/server.js";
+import { InventoryRelay } from "../p2p/relay.js";
+import { getTxId, getTxVSize } from "../validation/tx.js";
+import type { NetworkMessage } from "../p2p/messages.js";
 import { Wallet } from "../wallet/wallet.js";
 import { MAINNET, TESTNET, TESTNET4, REGTEST, type ConsensusParams } from "../consensus/params.js";
 
@@ -945,6 +948,35 @@ async function startNode(config: NodeConfig): Promise<void> {
 
   // 7. Initialize block sync
   const blockSync = new BlockSync(db, params, headerSync, peerManager, chainState);
+
+  // 7b. Wire mempool tx relay: accept incoming transactions via AcceptToMemoryPool
+  // and relay accepted txs to peers via inventory trickling.
+  const txRelay = new InventoryRelay((peer, inventory) => {
+    peer.send({ type: "inv", payload: { inventory } });
+  });
+
+  // Register all connected peers for relay
+  peerManager.onMessage("__connect__", (peer) => {
+    txRelay.addPeer(peer, true);
+  });
+  peerManager.onMessage("__disconnect__", (peer) => {
+    txRelay.removePeer(peer);
+  });
+
+  // Handle incoming tx messages: validate via AcceptToMemoryPool and relay
+  peerManager.onMessage("tx", async (peer: import("../p2p/peer.js").Peer, msg: NetworkMessage) => {
+    if (msg.type !== "tx") return;
+    const tx = msg.payload.tx;
+    const result = await mempool.acceptToMemoryPool(tx);
+    if (result.accepted) {
+      const txid = getTxId(tx);
+      const txidHex = txid.toString("hex");
+      const entry = mempool.getTransaction(txid);
+      const feeRate = entry ? entry.feeRate : 0;
+      txRelay.queueTxToAllFiltered(txidHex, feeRate);
+      console.log(`[mempool] Accepted tx ${txidHex.slice(0, 16)}... from ${peer.host}`);
+    }
+  });
 
   // 8. Start RPC server
   const rpcConfig: RPCServerConfig = {

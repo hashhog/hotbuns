@@ -710,6 +710,18 @@ export class Mempool {
   }
 
   /**
+   * AcceptToMemoryPool validates and adds a transaction to the mempool.
+   * This is the canonical entry point matching Bitcoin Core's naming convention.
+   * Performs all policy checks including BIP125 RBF, fee-rate validation,
+   * script verification, and cluster mempool limits.
+   */
+  async acceptToMemoryPool(
+    tx: Transaction
+  ): Promise<{ accepted: boolean; error?: string }> {
+    return this.addTransaction(tx);
+  }
+
+  /**
    * Validate and add a transaction to the mempool.
    *
    * Validation steps:
