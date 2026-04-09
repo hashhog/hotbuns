@@ -1328,8 +1328,12 @@ export class PeerManager {
     // Handle addr messages to learn new peers
     if (msg.type === "addr") {
       this.handleAddrMessage(peer, msg.payload);
+      // BIP155: Relay to up to 2 random peers
+      this.relayAddrToRandomPeers(peer, msg);
     } else if (msg.type === "addrv2") {
       this.handleAddrV2Message(peer, msg.payload);
+      // BIP155: Relay addrv2 to up to 2 random peers
+      this.relayAddrToRandomPeers(peer, msg);
     } else if (msg.type === "feefilter") {
       // BIP133: Handle received feefilter
       this.handleFeeFilterMessage(peer, msg.payload);
@@ -2095,6 +2099,34 @@ export class PeerManager {
    */
   private handleFeeFilterMessage(peer: Peer, payload: FeeFilterPayload): void {
     this.feeFilterManager.handleFeeFilter(peer, payload.feeRate);
+  }
+
+  /**
+   * Relay an addr or addrv2 message to up to 2 random connected peers,
+   * excluding the source peer. Implements Bitcoin Core's RelayAddress behavior.
+   */
+  private relayAddrToRandomPeers(source: Peer, msg: any): void {
+    const candidates: Peer[] = [];
+    for (const [_key, p] of this.peers) {
+      if (p !== source && p.connected) {
+        candidates.push(p);
+      }
+    }
+    if (candidates.length === 0) return;
+
+    // Shuffle and pick up to 2
+    for (let i = candidates.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+    }
+    const targets = candidates.slice(0, Math.min(2, candidates.length));
+    for (const target of targets) {
+      try {
+        target.send(msg);
+      } catch (_e) {
+        // Ignore send errors during relay
+      }
+    }
   }
 
   /**
