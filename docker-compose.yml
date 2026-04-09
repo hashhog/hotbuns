@@ -1,0 +1,14 @@
+services:
+  hotbuns:
+    build: .
+    container_name: hotbuns
+    restart: unless-stopped
+    ports:
+      - "48349:48349"
+      - "48339:48339"
+    volumes:
+      - hotbuns-data:/data
+    command: ["start", "--datadir=/data", "--network=testnet4"]
+
+volumes:
+  hotbuns-data:
