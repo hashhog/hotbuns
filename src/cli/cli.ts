@@ -374,6 +374,8 @@ interface NodeState {
   rpcServer: RPCServer;
   headerSync: HeaderSync;
   blockSync: BlockSync;
+  feeEstimator: FeeEstimator;
+  feeEstimatesPath: string;
 }
 
 let runningNode: NodeState | null = null;
@@ -907,6 +909,16 @@ async function startNode(config: NodeConfig): Promise<void> {
   const mempool = new Mempool(utxo, params);
   const feeEstimator = new FeeEstimator(mempool);
 
+  // Load persisted fee estimates
+  const feeEstimatesPath = path.join(mergedConfig.datadir, "fee_estimates.json");
+  try {
+    const feeData = await Bun.file(feeEstimatesPath).arrayBuffer();
+    feeEstimator.loadState(Buffer.from(feeData));
+    console.log(`Loaded fee estimates from ${feeEstimatesPath}`);
+  } catch {
+    // No saved state or invalid data, use defaults
+  }
+
   // Set tip height
   const bestBlock = chainState.getBestBlock();
   mempool.setTipHeight(bestBlock.height);
@@ -1008,6 +1020,8 @@ async function startNode(config: NodeConfig): Promise<void> {
     rpcServer,
     headerSync,
     blockSync,
+    feeEstimator,
+    feeEstimatesPath,
   };
 
   // Set shutdown callback for RPC stop command
@@ -1058,11 +1072,20 @@ async function gracefulShutdown(): Promise<void> {
   // 3. Stop peer manager
   await runningNode.peerManager.stop();
 
-  // 4. Flush UTXO cache
+  // 4. Save fee estimates
+  try {
+    const serialized = runningNode.feeEstimator.serialize();
+    await Bun.write(runningNode.feeEstimatesPath, serialized);
+    console.log(`Fee estimates saved to ${runningNode.feeEstimatesPath}`);
+  } catch (e) {
+    console.error("Failed to save fee estimates:", e);
+  }
+
+  // 5. Flush UTXO cache
   const utxo = runningNode.chainState.getUTXOManager();
   await utxo.flush();
 
-  // 5. Close database
+  // 6. Close database
   await runningNode.db.close();
 
   console.log("Shutdown complete.");
