@@ -1,107 +1,131 @@
 # hotbuns
 
-A Bitcoin full node implementation in TypeScript, running on Bun.
+A Bitcoin full node implementation in TypeScript, running on [Bun](https://bun.sh).
 
-## What is it?
+## Quick Start
 
-Maybe you've wondered what it takes to validate a Bitcoin transaction from scratch.
-hotbuns is a from-scratch Bitcoin full node written in TypeScript (Bun) that does exactly that.
+### Docker
 
-## Current status
+```bash
+docker build -t hotbuns .
+docker run -v hotbuns-data:/data -p 48349:48349 -p 48339:48339 hotbuns
+```
 
-- [x] Wire serialization (varint, BufferReader/BufferWriter, buffer pooling)
-- [x] Cryptographic primitives (hardware-accelerated SHA256, SHA256d, HASH160, secp256k1 ECDSA/Schnorr, batch verification, Taproot tweaks)
-- [x] Address encoding (Base58Check, Bech32, Bech32m)
-- [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR, P2A anchors, NULLFAIL, WITNESS_PUBKEYTYPE, witness cleanstack, P2SH push-only, FindAndDelete, OP_CODESEPARATOR, MINIMALIF)
-- [x] Consensus parameters (mainnet, testnet3, testnet4/BIP94, signet, regtest)
-- [x] Difficulty adjustment (2016-block retargeting, testnet 20-minute rule, BIP94)
-- [x] BIP9 versionbits (soft fork state machine, deployment signaling)
-- [x] Database storage (LevelDB, block index, UTXO set, batch optimization, flat file block storage)
-- [x] Transaction and block validation (parallel sig verification, BIP68 sequence locks, sigop counting with witness discount, signature cache)
-- [x] P2P networking (TCP, version handshake, message framing, pre-handshake rejection)
-- [x] BIP-324 v2 transport (ElligatorSwift ECDH, ChaCha20-Poly1305 AEAD, forward secrecy)
-- [x] BIP-152 compact blocks (SipHash short IDs, mempool reconstruction, getblocktxn/blocktxn, high/low bandwidth modes)
-- [x] Peer manager (DNS discovery, connection pool, misbehavior scoring, ban management)
-- [x] Stale peer eviction (ping timeout, headers timeout, block download timeout, stale tip)
-- [x] Eclipse attack protections (netgroup diversity, anchor connections, eviction protection)
-- [x] Inventory trickling (Poisson tx batching, immediate block relay, Fisher-Yates shuffle)
-- [x] BIP-133 feefilter (min fee rate announcement, relay filtering, Poisson-delayed broadcasts, incremental relay fee)
-- [x] BIP-155 ADDRv2 (TorV3, I2P, CJDNS address support, sendaddrv2 negotiation)
-- [x] BIP-330 Erlay (set reconciliation via Minisketch, short ID computation, periodic recon timers)
-- [x] Header sync (block locator, MTP, PoW verification, PRESYNC/REDOWNLOAD anti-DoS, checkpoint verification)
-- [x] Block sync (IBD, parallel download, stall detection)
-- [x] UTXO/chain state (layered CoinsView cache, dirty/fresh flags, batch flush, undo data, checkpoint verification)
-- [x] Mempool (cluster mempool, union-find clustering, linearization, mining scores, cluster-based eviction, full RBF, package relay, CPFP, v3/TRUC policy, ephemeral anchors)
-- [x] Fee estimation (confirmation buckets, historical data)
-- [x] Block template (tx selection, locktime finality, coinbase, witness commitment)
-- [x] RPC server (JSON-RPC 2.0, batch requests, Bitcoin Core-compatible: getblockchaininfo, getblock, getblockheader, getblockhash, getrawtransaction, sendrawtransaction, submitpackage, getmempoolinfo, getrawmempool, getmempoolentry, estimatesmartfee, getpeerinfo, getnetworkinfo, validateaddress, getblocktemplate, getdescriptorinfo, deriveaddresses, getzmqnotifications, generatetoaddress, generateblock, generatetodescriptor, invalidateblock, reconsiderblock, preciousblock)
-- [x] REST API (read-only blockchain queries: /rest/block, /rest/headers, /rest/blockhashbyheight, /rest/tx, /rest/getutxos, /rest/mempool, JSON/bin/hex formats)
-- [x] HD wallet (BIP-32/44/49/84/86, P2PKH/P2SH-P2WPKH/P2WPKH/P2TR, BnB+Knapsack coin selection, encrypted storage)
-- [x] Multi-wallet support (createwallet/loadwallet/unloadwallet/listwallets/listwalletdir RPCs, /wallet/<name> URL endpoints, settings.json persistence)
-- [x] PSBT (BIP-174/370, partial signing, multi-party workflows, base64 encoding)
-- [x] Coinbase maturity (100-block delay for coinbase UTXO spending)
-- [x] Wallet encryption (AES-256-CBC with scrypt key derivation, encryptwallet/walletpassphrase/walletlock/walletpassphrasechange RPCs)
-- [x] Address labels (setlabel RPC, labels in listreceivedbyaddress and listtransactions)
-- [x] Block pruning (automatic disk management, pruneblockchain RPC, MIN_BLOCKS_TO_KEEP)
-- [x] Block indexes (txindex, BIP157/158 blockfilterindex with GCS filters, coinstatsindex with MuHash)
-- [x] Output descriptors (BIP380-386, pk/pkh/wpkh/sh/wsh/tr/multi/sortedmulti/addr/raw/combo, xpub/xprv paths, range derivation, checksums)
-- [x] Miniscript (type system, recursive descent parser, script compilation, witness satisfaction, wsh/tr integration)
-- [x] assumeUTXO (snapshot serialization, dual chainstate, background validation, loadtxoutset/dumptxoutset RPCs)
-- [x] ZMQ notifications (hashblock, hashtx, rawblock, rawtx, sequence topics, multipart messages)
-- [x] Tor/I2P proxy (SOCKS5 client, Tor control for hidden services, I2P SAM protocol, multi-network routing)
-- [x] CLI (start/stop, RPC client, wallet commands, --prune flag, --txindex flag)
-- [x] Regtest mode (instant block generation, generatetoaddress/generateblock/generatetodescriptor RPCs, min difficulty PoW)
-- [x] Chain management (invalidateblock/reconsiderblock/preciousblock RPCs, BLOCK_FAILED_VALID/CHILD flags, reorg support)
-- [x] Test suite (unit, integration, e2e with regtest)
-- [x] Performance benchmarks (crypto throughput, block deser, UTXO cache, sig verify)
-
-## Quick start
+### From Source
 
 ```bash
 bun install
-bun run src/index.ts start --network=testnet
+bun run src/index.ts start --network=testnet4
+bun run src/index.ts --help
 ```
 
-Or use the CLI for wallet and RPC operations:
+## Features
 
-```bash
-bun run src/index.ts wallet create --password=secret
-bun run src/index.ts getinfo --rpc-port=18332
+- Full block and transaction validation (SegWit, Taproot, BIP68 sequence locks, sigop counting with witness discount)
+- Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR, P2A anchors, NULLFAIL, WITNESS_PUBKEYTYPE, MINIMALIF, FindAndDelete, OP_CODESEPARATOR)
+- Header-first sync with anti-DoS (PRESYNC/REDOWNLOAD strategy, PoW verification, checkpoint enforcement)
+- Parallel block download with stall detection
+- UTXO set with layered CoinsView cache (dirty/fresh flags, batch flush, undo data)
+- Cluster mempool (union-find clustering, linearization, mining scores, cluster-based eviction, full RBF, package relay, CPFP, v3/TRUC policy, ephemeral anchors)
+- BIP-324 v2 encrypted transport (ElligatorSwift ECDH, ChaCha20-Poly1305 AEAD)
+- BIP-152 compact blocks (SipHash short IDs, mempool reconstruction, high/low bandwidth modes)
+- BIP-330 Erlay transaction reconciliation (Minisketch set reconciliation)
+- BIP-133 feefilter with Poisson-delayed broadcasts
+- BIP-155 ADDRv2 (TorV3, I2P, CJDNS address support)
+- Eclipse attack protections (netgroup diversity, anchor connections, eviction protection)
+- Stale peer eviction (ping timeout, headers timeout, block download timeout)
+- Inventory trickling (Poisson tx batching, immediate block relay, Fisher-Yates shuffle)
+- HD wallet (BIP-32/44/49/84/86, BnB+Knapsack coin selection, encrypted storage)
+- Multi-wallet support (createwallet/loadwallet/unloadwallet/listwallets RPCs)
+- PSBT (BIP-174/370, partial signing, multi-party workflows)
+- Output descriptors (BIP380-386, pk/pkh/wpkh/sh/wsh/tr/multi/sortedmulti/addr/raw/combo)
+- Miniscript (type system, recursive descent parser, script compilation, witness satisfaction)
+- assumeUTXO (snapshot serialization, dual chainstate, background validation)
+- Block pruning (automatic disk management, pruneblockchain RPC, MIN_BLOCKS_TO_KEEP)
+- Block indexes (txindex, BIP-157/158 blockfilterindex with GCS filters, coinstatsindex with MuHash)
+- Fee estimation (confirmation buckets, historical data)
+- Block template construction (tx selection, coinbase, witness commitment)
+- ZMQ notifications (hashblock, hashtx, rawblock, rawtx, sequence topics)
+- REST API (block, headers, blockhashbyheight, tx, utxos, mempool; JSON/bin/hex formats)
+- Tor/I2P proxy (SOCKS5 client, Tor hidden services, I2P SAM protocol)
+- Regtest mode (generatetoaddress, generateblock, generatetodescriptor RPCs)
+- Chain management (invalidateblock, reconsiderblock, preciousblock RPCs)
+
+## Configuration
+
+### CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--datadir=DIR` | `~/.hotbuns` | Data directory |
+| `--network=NET` | `mainnet` | Network: mainnet, testnet, testnet4, regtest |
+| `--rpcport=PORT` | per-network | RPC server port |
+| `--rpc-user=USER` | `user` | RPC username |
+| `--rpc-password=PASS` | `pass` | RPC password |
+| `--port=PORT` | per-network | P2P listen port |
+| `--max-outbound=N` | `8` | Maximum outbound peers |
+| `--listen=BOOL` | `true` | Accept inbound P2P connections |
+| `--connect=ADDR` | none | Connect to specific peer (repeatable) |
+| `--addnode=ADDR` | none | Add peer to address manager (repeatable) |
+| `--log-level=LVL` | `info` | Log level: debug, info, warn, error |
+| `--prune=N` | `0` | Prune target in MiB (0=disabled, min 550) |
+| `--import-blocks=PATH` | none | Import blocks from blk*.dat directory or `-` for stdin |
+| `--import-utxo=PATH` | none | Import UTXO snapshot from HDOG file |
+
+### Config File
+
+`hotbuns.conf` in the data directory (key=value format):
+
+```ini
+# hotbuns configuration file
+network=testnet4
+rpcport=48349
+rpcuser=myuser
+rpcpassword=mypass
+maxoutbound=10
+listen=1
+port=48339
+loglevel=info
+prune=550
 ```
 
-## Project structure
+## RPC API
 
-```
-src/
-  index.ts          # entry point
-  cli/              # command-line interface
-  wire/             # protocol serialization
-  crypto/           # SHA256 (hw-accel), RIPEMD160, secp256k1, Schnorr
-  address/          # Base58Check, Bech32
-  script/           # Script interpreter
-  consensus/        # network parameters, proof-of-work, BIP9 versionbits
-  storage/          # persistent storage, block files (blk*.dat), undo data (rev*.dat), indexes
-  validation/       # block and tx validation
-  p2p/              # peer connections, message framing, relay, Tor/I2P proxy
-  sync/             # header and block sync
-  chain/            # UTXO set, chain state
-  mempool/          # unconfirmed transactions
-  fees/             # fee estimation
-  mining/           # block templates
-  rpc/              # JSON-RPC server, REST API
-  wallet/           # HD wallet, transaction signing, output descriptors
-  test/             # integration and e2e tests
-```
+Bitcoin Core-compatible JSON-RPC 2.0 with batch request support.
 
-## Running tests
+| Category | Methods |
+|----------|---------|
+| Blockchain | `getblockchaininfo`, `getblock`, `getblockhash`, `getblockheader`, `getblockcount`, `getbestblockhash`, `getchaintips`, `getdifficulty` |
+| Transactions | `getrawtransaction`, `sendrawtransaction`, `decoderawtransaction`, `decodescript`, `createrawtransaction`, `submitpackage` |
+| Mempool | `getmempoolinfo`, `getrawmempool`, `getmempoolentry`, `getmempoolancestors` |
+| Mining | `getblocktemplate`, `submitblock`, `getmininginfo`, `generatetoaddress`, `generateblock`, `generatetodescriptor` |
+| Network | `getpeerinfo`, `getnetworkinfo`, `getconnectioncount`, `listbanned` |
+| Wallet | `createwallet`, `loadwallet`, `unloadwallet`, `listwallets`, `listwalletdir`, `getnewaddress`, `getbalance`, `sendtoaddress`, `listunspent`, `getwalletinfo`, `listreceivedbyaddress`, `listtransactions` |
+| Wallet Security | `encryptwallet`, `walletpassphrase`, `walletlock`, `walletpassphrasechange` |
+| Descriptors | `getdescriptorinfo`, `deriveaddresses`, `importdescriptors` |
+| PSBT | `createpsbt`, `decodepsbt`, `combinepsbt`, `finalizepsbt` |
+| Util | `validateaddress`, `estimatesmartfee` |
+| Chain Mgmt | `invalidateblock`, `reconsiderblock`, `preciousblock`, `pruneblockchain` |
+| assumeUTXO | `loadtxoutset`, `dumptxoutset`, `getutxosetsnapshot` |
+| ZMQ | `getzmqnotifications` |
+| Control | `stop`, `help` |
 
-```bash
-bun test
-bun test --coverage
-```
+REST API available at `/rest/` (block, headers, blockhashbyheight, tx, getutxos, mempool).
 
-## Performance benchmarks
+## Monitoring
 
-```bash
-bun run bench
-```
+No built-in Prometheus exporter. Monitor via RPC calls to `getblockchaininfo`, `getpeerinfo`, `getmempoolinfo`, and `getnetworkinfo`.
+
+## Architecture
+
+hotbuns leverages the Bun runtime for its native performance characteristics, including hardware-accelerated SHA256 and direct FFI access to libsecp256k1 via the `@noble/curves` and `@noble/hashes` libraries. The TypeScript type system provides strong guarantees around protocol message formats, script stack operations, and UTXO state transitions while remaining readable. LevelDB handles persistent storage for the block index and UTXO set, with flat file block storage in Bitcoin Core-compatible blk*.dat format.
+
+The P2P layer implements the full Bitcoin protocol including BIP-324 v2 encrypted transport with ElligatorSwift key exchange. Peer management includes DNS seed discovery, misbehavior scoring, netgroup-diversified bucket assignment for eclipse attack resistance, and anchor connections for restart resilience. Inventory relay uses Poisson-timed batching for privacy, and BIP-330 Erlay reduces bandwidth through set reconciliation.
+
+The validation pipeline processes blocks through parallel signature verification with a signature cache to avoid redundant work. The UTXO set uses a layered CoinsView architecture with dirty/fresh flag tracking and periodic batch flushing to LevelDB, matching Bitcoin Core's cache design. The cluster mempool implementation uses union-find clustering with linearization for optimal fee-rate ordering and mining score-based eviction.
+
+The wallet subsystem supports BIP-32/44/49/84/86 HD key derivation across all address types (P2PKH, P2SH-P2WPKH, P2WPKH, P2TR), with Branch-and-Bound and Knapsack coin selection algorithms. PSBT support enables multi-party signing workflows, and output descriptors with miniscript provide flexible script policy composition.
+
+## License
+
+MIT
