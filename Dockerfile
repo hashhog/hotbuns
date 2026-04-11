@@ -2,7 +2,12 @@
 FROM oven/bun:1.2 AS build
 WORKDIR /app
 COPY package.json bun.lock* ./
-RUN bun install --frozen-lockfile
+# Install dependencies; zeromq uses a native postinstall script that may
+# fail on some CPU configurations.  If it does, fall back to installing
+# without lifecycle scripts so the image still builds.
+RUN bun install --frozen-lockfile || \
+    (echo "Retrying with --ignore-scripts for native packages" && \
+     bun install --frozen-lockfile --ignore-scripts)
 COPY . .
 
 # ---------- runtime ----------
