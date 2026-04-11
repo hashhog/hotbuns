@@ -195,6 +195,8 @@ export class RPCServer {
   private cookiePassword: string | null = null;
   /** Absolute path to the .cookie file written on startup. */
   private cookiePath: string | null = null;
+  /** Latched IBD state. Once false, cannot go back to true. */
+  private latchedIsIBD: boolean = true;
 
   constructor(config: RPCServerConfig, deps: RPCServerDeps) {
     this.config = {
@@ -698,11 +700,12 @@ export class RPCServer {
     // Calculate difficulty
     const difficulty = await this.calculateDifficulty(bestBlock.hash);
 
-    // Calculate median time past
+    // Calculate median time past and tip timestamp
     const headerEntry = this.headerSync.getHeader(bestBlock.hash);
     const mediantime = headerEntry
       ? this.headerSync.getMedianTimePast(headerEntry)
       : Math.floor(Date.now() / 1000);
+    const tipTimestamp = headerEntry ? headerEntry.header.timestamp : Math.floor(Date.now() / 1000);
 
     // Calculate verification progress
     const headers = bestHeader?.height ?? bestBlock.height;
@@ -734,6 +737,12 @@ export class RPCServer {
       automatic_pruning: false,
     };
 
+    // Compute initial block download status
+    const initialblockdownload = this.computeInitialBlockDownload(
+      bestBlock.chainWork,
+      tipTimestamp
+    );
+
     const result: Record<string, unknown> = {
       chain,
       blocks: bestBlock.height,
@@ -742,6 +751,7 @@ export class RPCServer {
       difficulty,
       mediantime,
       verificationprogress,
+      initialblockdownload,
       chainwork: bestBlock.chainWork.toString(16).padStart(64, "0"),
       pruned: pruneInfo.pruned,
       softforks,
@@ -3726,6 +3736,38 @@ export class RPCServer {
 
     const bits = blockIndex.header.readUInt32LE(72);
     return this.calculateDifficultyFromBits(bits);
+  }
+
+  /**
+   * Compute the initialblockdownload (IBD) status.
+   * Returns true if we're in Initial Block Download mode, false otherwise.
+   * Follows Bitcoin Core logic: returns true if chainwork < minimumChainWork
+   * OR tip age > 24 hours. Latches to false once cleared.
+   */
+  private computeInitialBlockDownload(
+    bestBlockChainWork: bigint,
+    bestBlockTimestamp: number
+  ): boolean {
+    // If already latched to false, stay false (cannot flip back)
+    if (!this.latchedIsIBD) {
+      return false;
+    }
+
+    // Get current time in seconds
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const maxTipAgeSeconds = 24 * 60 * 60; // 24 hours
+
+    // Still in IBD if chainwork is below minimum OR tip is older than 24 hours
+    const stillInIBD =
+      bestBlockChainWork < this.params.nMinimumChainWork ||
+      bestBlockTimestamp < nowSeconds - maxTipAgeSeconds;
+
+    // If we've exited IBD, latch to false
+    if (!stillInIBD) {
+      this.latchedIsIBD = false;
+    }
+
+    return this.latchedIsIBD;
   }
 
   /**
