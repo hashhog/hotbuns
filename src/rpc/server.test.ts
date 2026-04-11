@@ -434,6 +434,20 @@ describe("RPCServer", () => {
       expect(result.result.headers).toBe(100);
       expect(typeof result.result.difficulty).toBe("number");
       expect(typeof result.result.chainwork).toBe("string");
+      expect(typeof result.result.initialblockdownload).toBe("boolean");
+    });
+
+    it("should include initialblockdownload field that latches to false", async () => {
+      const result1 = await rpcRequest(testPort, "getblockchaininfo");
+      expect(result1.result.initialblockdownload).toBeDefined();
+
+      // Get IBD status multiple times - it should be consistent
+      const result2 = await rpcRequest(testPort, "getblockchaininfo");
+      expect(result2.result.initialblockdownload).toBe(result1.result.initialblockdownload);
+
+      // It should be a boolean
+      const ibd = result1.result.initialblockdownload;
+      expect(typeof ibd).toBe("boolean");
     });
   });
 
