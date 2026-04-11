@@ -837,7 +837,8 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
     }
 
-    const blockhash = Buffer.from(blockhashParam, "hex");
+    // Hashes in Bitcoin RPC are display-order (reversed bytes); reverse to get internal key
+    const blockhash = Buffer.from(blockhashParam, "hex").reverse();
     if (blockhash.length !== 32) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
     }
@@ -873,8 +874,19 @@ export class RPCServer {
     const reader = new BufferReader(blockData);
     const block = deserializeBlock(reader);
 
-    // Get header entry for chain work
+    // Get header entry for chain work and median time
     const headerEntry = this.headerSync.getHeader(blockhash);
+
+    // Resolve chain work: prefer header sync in-memory value, fall back to DB.
+    let chainWorkHex = "0000000000000000000000000000000000000000000000000000000000000000";
+    if (headerEntry) {
+      chainWorkHex = headerEntry.chainWork.toString(16).padStart(64, "0");
+    } else {
+      const dbChainWork = await this.db.getChainWork(blockhash);
+      if (dbChainWork !== null) {
+        chainWorkHex = dbChainWork.toString(16).padStart(64, "0");
+      }
+    }
 
     // Verbosity 1 or 2: return JSON
     const result: Record<string, unknown> = {
@@ -894,7 +906,7 @@ export class RPCServer {
       nonce: block.header.nonce,
       bits: block.header.bits.toString(16).padStart(8, "0"),
       difficulty: this.calculateDifficultyFromBits(block.header.bits),
-      chainwork: headerEntry?.chainWork.toString(16).padStart(64, "0") ?? "0",
+      chainwork: chainWorkHex,
       nTx: block.transactions.length,
       previousblockhash: Buffer.from(block.header.prevBlock).reverse().toString("hex"),
     };
@@ -960,7 +972,8 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
     }
 
-    const blockhash = Buffer.from(blockhashParam, "hex");
+    // Hashes in Bitcoin RPC are display-order (reversed bytes); reverse to get internal key
+    const blockhash = Buffer.from(blockhashParam, "hex").reverse();
     if (blockhash.length !== 32) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
     }
@@ -989,8 +1002,20 @@ export class RPCServer {
       nonce: headerBuf.readUInt32LE(76),
     };
 
-    // Get header entry for chain work
+    // Get header entry for chain work and median time
     const headerEntry = this.headerSync.getHeader(blockhash);
+
+    // Resolve chain work: prefer header sync in-memory value (always current),
+    // fall back to the per-block value stored to DB when the block was connected.
+    let chainWorkHex = "0000000000000000000000000000000000000000000000000000000000000000";
+    if (headerEntry) {
+      chainWorkHex = headerEntry.chainWork.toString(16).padStart(64, "0");
+    } else {
+      const dbChainWork = await this.db.getChainWork(blockhash);
+      if (dbChainWork !== null) {
+        chainWorkHex = dbChainWork.toString(16).padStart(64, "0");
+      }
+    }
 
     const result: Record<string, unknown> = {
       hash: blockhashParam,
@@ -1006,7 +1031,7 @@ export class RPCServer {
       nonce: header.nonce,
       bits: header.bits.toString(16).padStart(8, "0"),
       difficulty: this.calculateDifficultyFromBits(header.bits),
-      chainwork: headerEntry?.chainWork.toString(16).padStart(64, "0") ?? "0",
+      chainwork: chainWorkHex,
       nTx: blockIndex.nTx,
       previousblockhash: Buffer.from(header.prevBlock).reverse().toString("hex"),
     };
@@ -1118,7 +1143,8 @@ export class RPCServer {
         throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
       }
 
-      const blockhash = Buffer.from(blockhashParam, "hex");
+      // Hashes in Bitcoin RPC are display-order (reversed bytes); reverse to get internal key
+      const blockhash = Buffer.from(blockhashParam, "hex").reverse();
       if (blockhash.length !== 32) {
         throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
       }
@@ -3406,7 +3432,8 @@ export class RPCServer {
     };
 
     const blockHash = getBlockHash(header);
-    const blockHashHex = blockHash.toString("hex");
+    // Return hashes in display order (reversed bytes), consistent with getblockhash/getbestblockhash
+    const blockHashHex = Buffer.from(blockHash).reverse().toString("hex");
 
     if (submit) {
       // Connect the block to the chain

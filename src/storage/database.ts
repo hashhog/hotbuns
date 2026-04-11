@@ -31,6 +31,7 @@ export const enum DBPrefix {
   LAST_BLOCK_FILE = 0x6c, // 'l' - last block file number
   BLOCK_POS = 0x70, // 'p' - block hash -> file position
   PRUNE_STATE = 0x50, // 'P' - pruning state metadata
+  CHAIN_WORK = 0x77, // 'w' - block hash -> cumulative chain work (32-byte big-endian uint256)
 }
 
 /** Block status flags (matches Bitcoin Core). */
@@ -464,6 +465,35 @@ export class ChainDB {
    */
   static getDefaultBatchSize(): number {
     return DEFAULT_MAX_BATCH_SIZE;
+  }
+
+  // Chain work per-block (used by getblockheader/getblock RPC)
+
+  async putChainWork(hash: Buffer, chainWork: bigint): Promise<void> {
+    const key = makeKey(DBPrefix.CHAIN_WORK, hash);
+    // Store as 32-byte big-endian uint256
+    const buf = Buffer.allocUnsafe(32);
+    // Write bigint as big-endian 32 bytes
+    let w = chainWork;
+    for (let i = 31; i >= 0; i--) {
+      buf[i] = Number(w & 0xffn);
+      w >>= 8n;
+    }
+    await this.db.put(key, buf);
+  }
+
+  async getChainWork(hash: Buffer): Promise<bigint | null> {
+    const key = makeKey(DBPrefix.CHAIN_WORK, hash);
+    const value = await this.db.get(key);
+    if (value === undefined) {
+      return null;
+    }
+    // Read as 32-byte big-endian uint256
+    let result = 0n;
+    for (let i = 0; i < 32; i++) {
+      result = (result << 8n) | BigInt(value[i]);
+    }
+    return result;
   }
 
   // Undo data operations (for block disconnect / reorgs)
