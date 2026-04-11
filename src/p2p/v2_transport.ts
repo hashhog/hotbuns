@@ -99,8 +99,8 @@ export class V2Transport {
   private cipher: BIP324Cipher;
   private recvState: RecvState;
   private sendState: SendState;
-  private readonly initiator: boolean;
-  private readonly networkMagic: Buffer;
+  private initiator: boolean;
+  private networkMagic: Buffer;
 
   // Receive buffers
   private recvBuffer: Buffer = Buffer.alloc(0);

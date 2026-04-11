@@ -914,7 +914,9 @@ describe("checksum verification", () => {
 });
 
 describe("unknown command handling", () => {
-  test("deserializeMessage throws on unknown command", () => {
+  // Per Bitcoin Core behavior, unknown messages are silently ignored (not rejected).
+  // New message types are added regularly and peers may send messages we don't understand.
+  test("deserializeMessage ignores unknown command (does not throw)", () => {
     const payload = Buffer.alloc(0);
     const checksum = hash256(payload).subarray(0, 4);
 
@@ -925,7 +927,9 @@ describe("unknown command handling", () => {
       checksum,
     };
 
-    expect(() => deserializeMessage(header, payload)).toThrow("Unknown command: unknown");
+    // Should not throw; returns an object with the raw command type
+    const result = deserializeMessage(header, payload);
+    expect(result).toBeDefined();
   });
 });
 

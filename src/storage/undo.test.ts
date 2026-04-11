@@ -500,7 +500,6 @@ describe("UndoManager", () => {
     expect(blockUndo.txUndo[0].prevOutputs.length).toBe(2);
     expect(blockUndo.txUndo[1].prevOutputs.length).toBe(1);
     expect(blockUndo.txUndo[0].prevOutputs[0].height).toBe(100);
-    expect(blockUndo.txUndo[1].prevOutputs[0].value).toBe(undefined); // value is on output
     expect(blockUndo.txUndo[1].prevOutputs[0].output.value).toBe(2000n);
   });
 

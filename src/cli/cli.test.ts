@@ -280,6 +280,7 @@ describe("formatRpcRequest", () => {
       listen: true,
       port: 8333,
       logLevel: "info" as const,
+      metricsPort: 0,
     };
 
     const request = formatRpcRequest(config, "getblockchaininfo", []);
@@ -306,6 +307,7 @@ describe("formatRpcRequest", () => {
       listen: true,
       port: 18333,
       logLevel: "info" as const,
+      metricsPort: 0,
     };
 
     const request = formatRpcRequest(config, "getblock", ["abc123", 1]);
@@ -326,6 +328,7 @@ describe("formatRpcRequest", () => {
       listen: true,
       port: 8333,
       logLevel: "info" as const,
+      metricsPort: 0,
     };
 
     const request = formatRpcRequest(config, "test", []);

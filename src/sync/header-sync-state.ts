@@ -309,7 +309,8 @@ export class HeadersSyncState {
       result.success = this.validateAndStoreHeadersCommitments(headers);
 
       if (result.success) {
-        if (fullHeadersMessage || this.state === HeadersSyncStateEnum.REDOWNLOAD) {
+        const stateAfter = this.state as HeadersSyncStateEnum;
+        if (fullHeadersMessage || stateAfter === HeadersSyncStateEnum.REDOWNLOAD) {
           // Full message means peer may have more, or we just transitioned to REDOWNLOAD
           result.requestMore = true;
         }

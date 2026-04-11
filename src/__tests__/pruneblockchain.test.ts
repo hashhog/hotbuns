@@ -89,6 +89,7 @@ describe("pruneblockchain RPC", () => {
     const config: RPCServerConfig = {
       port: 0, // Don't actually start server
       host: "127.0.0.1",
+      noAuth: true,
     };
 
     const deps: RPCServerDeps = {

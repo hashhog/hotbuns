@@ -229,7 +229,7 @@ export class RESTServer {
           headers: { "Content-Type": "application/json" },
         });
       case "bin":
-        return new Response(binaryData ?? Buffer.alloc(0), {
+        return new Response((binaryData ?? Buffer.alloc(0)) as unknown as BodyInit, {
           status: 200,
           headers: { "Content-Type": "application/octet-stream" },
         });

@@ -378,7 +378,7 @@ export class BlockSync {
       if (msg.type === "sendcmpct") {
         console.log(
           `Peer ${peer.host}:${peer.port} supports compact blocks: ` +
-          `version=${msg.payload.version}, announce=${msg.payload.announce}`
+          `version=${msg.payload.version}, announce=${msg.payload.enabled}`
         );
       }
     });
