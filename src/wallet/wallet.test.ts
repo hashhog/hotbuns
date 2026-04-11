@@ -219,6 +219,7 @@ describe("Balance and UTXOs", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     };
 
     wallet.addUTXO(utxo);
@@ -242,6 +243,7 @@ describe("Balance and UTXOs", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     // Unconfirmed UTXO
@@ -252,6 +254,7 @@ describe("Balance and UTXOs", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 0,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     const balance = wallet.getBalance();
@@ -273,6 +276,7 @@ describe("Balance and UTXOs", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     wallet.addUTXO({
@@ -282,6 +286,7 @@ describe("Balance and UTXOs", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 3,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     const utxos = wallet.getUTXOs();
@@ -302,6 +307,7 @@ describe("Coin selection", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     expect(() => {
@@ -326,6 +332,7 @@ describe("Coin selection", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     wallet.addUTXO({
@@ -335,6 +342,7 @@ describe("Coin selection", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     wallet.addUTXO({
@@ -344,6 +352,7 @@ describe("Coin selection", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     // Create transaction that only needs the largest UTXO
@@ -372,6 +381,7 @@ describe("Transaction creation and signing", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     const tx = wallet.createTransaction(
@@ -397,6 +407,7 @@ describe("Transaction creation and signing", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     const tx = wallet.createTransaction(
@@ -425,6 +436,7 @@ describe("Transaction creation and signing", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     const tx = wallet.createTransaction(
@@ -462,6 +474,7 @@ describe("Transaction creation and signing", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     const tx = wallet.createTransaction(
@@ -491,6 +504,7 @@ describe("Transaction creation and signing", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     const tx = wallet.createTransaction(
@@ -552,6 +566,7 @@ describe("Wallet persistence", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     await wallet1.save(password);
@@ -658,6 +673,7 @@ describe("Block processing", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     expect(wallet.getBalance().total).toBe(100000000n);
@@ -714,6 +730,7 @@ describe("Block processing", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 1,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     const emptyBlock = {
@@ -841,6 +858,7 @@ describe("Advanced coin selection", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     wallet.addUTXO({
@@ -850,6 +868,7 @@ describe("Advanced coin selection", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     // Attempt to select coins using the advanced method
@@ -874,6 +893,7 @@ describe("Advanced coin selection", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     const result = wallet.selectCoinsAdvanced(1000000n, 1);
@@ -898,6 +918,7 @@ describe("Advanced coin selection", () => {
       keyPath: "m/44'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2PKH,
+      isCoinbase: false,
     });
 
     // Add segwit UTXO (smaller input size)
@@ -908,6 +929,7 @@ describe("Advanced coin selection", () => {
       keyPath: "m/84'/0'/0'/0/0",
       confirmations: 6,
       addressType: AddressType.P2WPKH,
+      isCoinbase: false,
     });
 
     const result = wallet.selectCoinsAdvanced(50000n, 1);

@@ -141,6 +141,7 @@ describe("e2e regtest", () => {
     const rpcConfig: RPCServerConfig = {
       port: rpcPort,
       host: "127.0.0.1",
+      noAuth: true,
       // No auth for tests
     };
 
@@ -268,7 +269,7 @@ describe("e2e regtest", () => {
   describe("getblockhash", () => {
     test("returns genesis block hash at height 0", async () => {
       const hash = await rpcCall("getblockhash", [0]) as string;
-      expect(hash).toBe(REGTEST.genesisBlockHash.toString("hex"));
+      expect(hash).toBe(Buffer.from(REGTEST.genesisBlockHash).reverse().toString("hex"));
     });
 
     test("returns block hash for mined block", async () => {
@@ -280,7 +281,7 @@ describe("e2e regtest", () => {
       const currentHeight = chainState.getBestBlock().height;
       const hash = await rpcCall("getblockhash", [currentHeight]) as string;
 
-      expect(hash).toBe(chainState.getBestBlock().hash.toString("hex"));
+      expect(hash).toBe(Buffer.from(chainState.getBestBlock().hash).reverse().toString("hex"));
     });
 
     test("rejects invalid height", async () => {

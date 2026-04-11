@@ -24,6 +24,8 @@ class MockPeerManager {
 class MockHeaderSync {
   getBestHeader() { return null; }
   getHeader() { return null; }
+  async processHeaders() { return { success: true, requestMore: false, powValidatedHeaders: [] }; }
+  getMedianTimePast() { return 0; }
 }
 
 describe("Regtest Generate RPCs", () => {
@@ -45,6 +47,7 @@ describe("Regtest Generate RPCs", () => {
     const config: RPCServerConfig = {
       port: 18443,
       host: "127.0.0.1",
+      noAuth: true,
     };
 
     const deps: RPCServerDeps = {
@@ -119,6 +122,7 @@ describe("Regtest Generate RPCs", () => {
       const mainnetConfig: RPCServerConfig = {
         port: 8332,
         host: "127.0.0.1",
+      noAuth: true,
       };
 
       const mainnetDeps: RPCServerDeps = {

@@ -201,11 +201,11 @@ export function computeMerkleRootOptimized(hashes: Buffer[]): Buffer {
   }
 
   // Copy input hashes to avoid modifying the original array
-  let level = hashes.map((h) => Buffer.from(h));
+  let level: Buffer<ArrayBuffer>[] = hashes.map((h) => Buffer.from(h));
   const combined = Buffer.alloc(64);
 
   while (level.length > 1) {
-    const nextLevel: Buffer[] = [];
+    const nextLevel: Buffer<ArrayBuffer>[] = [];
 
     for (let i = 0; i < level.length; i += 2) {
       const left = level[i];
@@ -217,7 +217,7 @@ export function computeMerkleRootOptimized(hashes: Buffer[]): Buffer {
       right.copy(combined, 32, 0, 32);
 
       // Double SHA-256 and reuse buffer from pool
-      const result = merkleBufferPool.acquire();
+      const result = merkleBufferPool.acquire() as Buffer<ArrayBuffer>;
       const hash = sha256Impl(sha256Impl(combined));
       hash.copy(result, 0, 0, 32);
       nextLevel.push(result);
