@@ -2501,8 +2501,8 @@ function verifyWitnessV0(
     // and last index is stack top. No reversal needed.
     const witnessStack = [...witness];
 
-    // For witness v0, MINIMALIF is a policy rule only (enabled via SCRIPT_VERIFY_MINIMALIF flag)
-    const witnessFlags: ScriptFlags = { ...flags };
+    // Per BIP 141, MINIMALIF is enforced unconditionally in witness v0 (P2WSH)
+    const witnessFlags: ScriptFlags = { ...flags, verifyMinimalIf: true };
 
     const ctx: ExecutionContext = {
       stack: witnessStack,
@@ -2558,8 +2558,8 @@ function verifyWitnessV0(
     // bottom-to-top (index 0 = bottom, last = top). No reversal needed.
     const witnessStack = [...witness.slice(0, -1)];
 
-    // For witness v0, MINIMALIF is a policy rule only (enabled via SCRIPT_VERIFY_MINIMALIF flag)
-    const witnessFlags: ScriptFlags = { ...flags };
+    // Per BIP 141, MINIMALIF is enforced unconditionally in witness v0 (P2WSH)
+    const witnessFlags: ScriptFlags = { ...flags, verifyMinimalIf: true };
 
     const ctx: ExecutionContext = {
       stack: witnessStack,

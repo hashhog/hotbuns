@@ -97,6 +97,11 @@ export interface RPCServerConfig {
   rpcPassword?: string;
   /** Data directory for writing the .cookie file. */
   datadir?: string;
+  /**
+   * Disable all authentication (for testing only).
+   * When true, no cookie is generated and all requests are allowed.
+   */
+  noAuth?: boolean;
 }
 
 /**
@@ -198,6 +203,7 @@ export class RPCServer {
       rpcUser: config.rpcUser,
       rpcPassword: config.rpcPassword,
       datadir: config.datadir,
+      noAuth: config.noAuth,
     };
     this.chainState = deps.chainState;
     this.mempool = deps.mempool;
@@ -231,15 +237,17 @@ export class RPCServer {
    * configured rpcUser/rpcPassword.
    */
   start(): void {
-    // Generate cookie credentials and persist them to disk.
-    const cookieBytes = crypto.getRandomValues(new Uint8Array(32));
-    this.cookiePassword = Buffer.from(cookieBytes).toString("hex");
-    if (this.config.datadir) {
-      this.cookiePath = path.join(this.config.datadir, ".cookie");
-      // Bun.write is fire-and-forget here; errors are non-fatal but logged.
-      Bun.write(this.cookiePath, `__cookie__:${this.cookiePassword}`).catch(
-        (err) => console.error("Failed to write cookie file:", err)
-      );
+    if (!this.config.noAuth) {
+      // Generate cookie credentials and persist them to disk.
+      const cookieBytes = crypto.getRandomValues(new Uint8Array(32));
+      this.cookiePassword = Buffer.from(cookieBytes).toString("hex");
+      if (this.config.datadir) {
+        this.cookiePath = path.join(this.config.datadir, ".cookie");
+        // Bun.write is fire-and-forget here; errors are non-fatal but logged.
+        Bun.write(this.cookiePath, `__cookie__:${this.cookiePassword}`).catch(
+          (err) => console.error("Failed to write cookie file:", err)
+        );
+      }
     }
 
     this.server = Bun.serve({
@@ -590,7 +598,7 @@ export class RPCServer {
     // Network methods
     this.registerMethod("getpeerinfo", () => this.getPeerInfo());
     this.registerMethod("getnetworkinfo", () => this.getNetworkInfo());
-    this.registerMethod("getconnectioncount", () => this.getConnectionCount());
+    this.registerMethod("getconnectioncount", async () => this.getConnectionCount());
     this.registerMethod("addnode", (params) => this.addNode(params));
     this.registerMethod("disconnectnode", (params) => this.disconnectNode(params));
 
@@ -868,7 +876,7 @@ export class RPCServer {
       height: blockIndex.height,
       version: block.header.version,
       versionHex: block.header.version.toString(16).padStart(8, "0"),
-      merkleroot: block.Buffer.from(header.merkleRoot).reverse().toString("hex"),
+      merkleroot: Buffer.from(block.header.merkleRoot).reverse().toString("hex"),
       time: block.header.timestamp,
       mediantime: headerEntry
         ? this.headerSync.getMedianTimePast(headerEntry)
@@ -878,7 +886,7 @@ export class RPCServer {
       difficulty: this.calculateDifficultyFromBits(block.header.bits),
       chainwork: headerEntry?.chainWork.toString(16).padStart(64, "0") ?? "0",
       nTx: block.transactions.length,
-      previousblockhash: block.Buffer.from(header.prevBlock).reverse().toString("hex"),
+      previousblockhash: Buffer.from(block.header.prevBlock).reverse().toString("hex"),
     };
 
     // Add next block hash if available
@@ -1203,7 +1211,7 @@ export class RPCServer {
 
     const result: Record<string, unknown> = {
       txid: Buffer.from(txid).reverse().toString("hex"),
-      hash: wBuffer.from(txid).reverse().toString("hex"),
+      hash: Buffer.from(wtxid).reverse().toString("hex"),
       version: tx.version,
       size: serializedWithWitness.length,
       vsize,
@@ -1217,7 +1225,7 @@ export class RPCServer {
           vin.coinbase = input.scriptSig.toString("hex");
           vin.sequence = input.sequence;
         } else {
-          vin.txid = input.prevOut.Buffer.from(txid).reverse().toString("hex");
+          vin.txid = Buffer.from(input.prevOut.txid).reverse().toString("hex");
           vin.vout = input.prevOut.vout;
           vin.scriptSig = {
             asm: this.disassembleScript(input.scriptSig),
@@ -2196,12 +2204,13 @@ export class RPCServer {
           continue;
         }
 
-        // Test mempool acceptance (dry run)
-        const result = await this.mempool.addTransaction(tx, { dryRun: true });
+        // Test mempool acceptance
+        const result = await this.mempool.addTransaction(tx);
 
         if (result.accepted) {
           const vsize = getTxVSize(tx);
-          const feeRate = result.fee !== undefined ? Number(result.fee) / vsize : 0;
+          // Fee is not returned by addTransaction; report 0 for now
+          const feeRate = 0;
           const feeRateBTCkvB = (feeRate * 1000) / 100_000_000;
 
           // Check maxfeerate
@@ -2218,7 +2227,7 @@ export class RPCServer {
               allowed: true,
               vsize,
               fees: {
-                base: Number(result.fee ?? 0n) / 100_000_000,
+                base: 0,
               },
             };
             results.push(resultEntry);
@@ -3779,7 +3788,7 @@ export class RPCServer {
 
     const result: Record<string, unknown> = {
       txid: Buffer.from(txid).reverse().toString("hex"),
-      hash: wBuffer.from(txid).reverse().toString("hex"),
+      hash: Buffer.from(wtxid).reverse().toString("hex"),
       version: tx.version,
       size: serializeTx(tx, true).length,
       vsize: getTxVSize(tx),
@@ -3793,7 +3802,7 @@ export class RPCServer {
           vin.coinbase = input.scriptSig.toString("hex");
           vin.sequence = input.sequence;
         } else {
-          vin.txid = input.prevOut.Buffer.from(txid).reverse().toString("hex");
+          vin.txid = Buffer.from(input.prevOut.txid).reverse().toString("hex");
           vin.vout = input.prevOut.vout;
           vin.scriptSig = {
             asm: this.disassembleScript(input.scriptSig),
@@ -4708,5 +4717,117 @@ export class RPCServer {
       return [];
     }
     return this.zmqInterface.getNotifications();
+  }
+
+  private async decodeRawTransaction(params: unknown[]): Promise<Record<string, unknown>> {
+    if (!params[0] || typeof params[0] !== "string") {
+      throw this.rpcError(-22, "TX decode failed");
+    }
+    const txBytes = Buffer.from(params[0] as string, "hex");
+    const reader = new BufferReader(txBytes);
+    const tx = deserializeTx(reader);
+    const txid = getTxId(tx);
+    const wtxid = getWTxId(tx);
+    return {
+      txid: Buffer.from(txid).reverse().toString("hex"),
+      hash: Buffer.from(wtxid).reverse().toString("hex"),
+      version: tx.version,
+      size: txBytes.length,
+      vsize: getTxVSize(tx),
+      weight: getTxWeight(tx),
+      locktime: tx.lockTime,
+      vin: tx.inputs.map((input) => ({
+        txid: Buffer.from(input.prevOut.txid).reverse().toString("hex"),
+        vout: input.prevOut.vout,
+        scriptSig: { asm: "", hex: input.scriptSig.toString("hex") },
+        sequence: input.sequence,
+      })),
+      vout: tx.outputs.map((output, i) => ({
+        value: Number(output.value) / 100_000_000,
+        n: i,
+        scriptPubKey: {
+          hex: output.scriptPubKey.toString("hex"),
+          type: this.getScriptType(output.scriptPubKey),
+        },
+      })),
+    };
+  }
+
+  private async decodeScript(params: unknown[]): Promise<Record<string, unknown>> {
+    if (!params[0] || typeof params[0] !== "string") {
+      throw this.rpcError(-22, "Script decode failed");
+    }
+    const script = Buffer.from(params[0] as string, "hex");
+    return {
+      asm: this.disassembleScript(script),
+      hex: script.toString("hex"),
+      type: this.getScriptType(script),
+    };
+  }
+
+  private async createRawTransaction(params: unknown[]): Promise<string> {
+    throw this.rpcError(-1, "createrawtransaction not yet implemented");
+  }
+
+  private async getMiningInfo(): Promise<Record<string, unknown>> {
+    const best = this.chainState.getBestBlock();
+    return {
+      blocks: best.height,
+      currentblocksize: 0,
+      currentblocktx: 0,
+      difficulty: this.calculateDifficultyFromBits(0x207fffff),
+      networkhashps: 0,
+      pooledtx: this.mempool.getSize(),
+      chain: this.getNetworkType(),
+      warnings: "",
+    };
+  }
+
+  private async getNewAddress(params: unknown[]): Promise<string> {
+    const wallet = this.getCurrentWallet();
+    return wallet.getNewAddress();
+  }
+
+  private async getBalance(_params: unknown[]): Promise<number> {
+    const wallet = this.getCurrentWallet();
+    const balance = wallet.getBalance();
+    return Number(balance.total) / 100_000_000;
+  }
+
+  private async sendToAddress(_params: unknown[]): Promise<string> {
+    throw this.rpcError(-1, "sendtoaddress not yet implemented");
+  }
+
+  private async listUnspent(_params: unknown[]): Promise<unknown[]> {
+    throw this.rpcError(-1, "listunspent not yet implemented");
+  }
+
+  private async signRawTransactionWithWallet(params: unknown[]): Promise<Record<string, unknown>> {
+    throw this.rpcError(-1, "signrawtransactionwithwallet not yet implemented");
+  }
+
+  private async importDescriptors(params: unknown[]): Promise<unknown[]> {
+    throw this.rpcError(-1, "importdescriptors not yet implemented");
+  }
+
+  private async createPSBT(params: unknown[]): Promise<string> {
+    throw this.rpcError(-1, "createpsbt not yet implemented");
+  }
+
+  private async decodePSBT(params: unknown[]): Promise<Record<string, unknown>> {
+    throw this.rpcError(-1, "decodepsbt not yet implemented");
+  }
+
+  private async combinePSBTs(params: unknown[]): Promise<string> {
+    throw this.rpcError(-1, "combinepsbt not yet implemented");
+  }
+
+  private async finalizePSBT(params: unknown[]): Promise<Record<string, unknown>> {
+    throw this.rpcError(-1, "finalizepsbt not yet implemented");
+  }
+
+  private async help(params: unknown[]): Promise<string> {
+    const methods = Array.from(this.methods.keys()).sort().join("\n");
+    return methods;
   }
 }

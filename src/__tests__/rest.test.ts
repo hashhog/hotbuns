@@ -293,8 +293,8 @@ describe("REST API", () => {
         hash: blockHash,
         height: 50,
         header: block.header,
-        prevHash: block.header.prevBlock,
         chainWork: 1n,
+        status: "valid-header" as const,
       });
 
       const res = await fetch(`${baseUrl}/rest/block/${blockHash.toString("hex")}.json`);
@@ -302,7 +302,7 @@ describe("REST API", () => {
       expect(res.headers.get("Content-Type")).toBe("application/json");
 
       const json = await res.json();
-      expect(json.hash).toBe(blockHash.toString("hex"));
+      expect(json.hash).toBe(Buffer.from(blockHash).reverse().toString("hex"));
       expect(json.height).toBe(50);
       expect(json.nTx).toBe(1);
       expect(Array.isArray(json.tx)).toBe(true);
@@ -364,15 +364,15 @@ describe("REST API", () => {
         hash: blockHash,
         height: 53,
         header: block.header,
-        prevHash: block.header.prevBlock,
         chainWork: 1n,
+        status: "valid-header" as const,
       });
 
       const res = await fetch(`${baseUrl}/rest/block/notxdetails/${blockHash.toString("hex")}.json`);
       expect(res.status).toBe(200);
 
       const json = await res.json();
-      expect(json.hash).toBe(blockHash.toString("hex"));
+      expect(json.hash).toBe(Buffer.from(blockHash).reverse().toString("hex"));
       expect(Array.isArray(json.tx)).toBe(true);
       // Should have txids (strings), not full tx objects
       expect(typeof json.tx[0]).toBe("string");
@@ -391,7 +391,7 @@ describe("REST API", () => {
       expect(res.status).toBe(200);
 
       const json = await res.json();
-      expect(json.blockhash).toBe(blockHash.toString("hex"));
+      expect(json.blockhash).toBe(Buffer.from(blockHash).reverse().toString("hex"));
     });
 
     test("GET /rest/blockhashbyheight/<height>.hex returns hash as hex", async () => {
@@ -406,7 +406,7 @@ describe("REST API", () => {
       expect(res.headers.get("Content-Type")).toBe("text/plain");
 
       const text = await res.text();
-      expect(text.trim()).toBe(blockHash.toString("hex"));
+      expect(text.trim()).toBe(Buffer.from(blockHash).reverse().toString("hex"));
     });
 
     test("returns 404 for height out of range", async () => {
@@ -432,8 +432,8 @@ describe("REST API", () => {
         hash: blockHash,
         height: 70,
         header: block.header,
-        prevHash: block.header.prevBlock,
         chainWork: 1n,
+        status: "valid-header" as const,
       });
 
       const res = await fetch(`${baseUrl}/rest/headers/1/${blockHash.toString("hex")}.json`);
@@ -473,7 +473,7 @@ describe("REST API", () => {
       expect(res.status).toBe(200);
 
       const json = await res.json();
-      expect(json.txid).toBe(txid.toString("hex"));
+      expect(json.txid).toBe(Buffer.from(txid).reverse().toString("hex"));
       expect(json.version).toBe(2);
       expect(Array.isArray(json.vin)).toBe(true);
       expect(Array.isArray(json.vout)).toBe(true);
@@ -659,7 +659,7 @@ describe("REST API", () => {
 
         const json = await res.json();
         expect(typeof json).toBe("object");
-        const txidHex = txid.toString("hex");
+        const txidHex = Buffer.from(txid).reverse().toString("hex");
         expect(json[txidHex]).toBeDefined();
         expect(json[txidHex].vsize).toBe(entry.vsize);
       } finally {

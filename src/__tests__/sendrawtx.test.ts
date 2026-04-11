@@ -32,7 +32,7 @@ class MockChainStateManager {
   }
 
   setBestBlock(hash: Buffer, height: number, chainWork: bigint) {
-    this.bestBlock = { hash, height, chainWork };
+    this.bestBlock = { hash: hash as Buffer<ArrayBuffer>, height, chainWork };
   }
 }
 
@@ -317,6 +317,7 @@ describe("sendrawtransaction", () => {
     const config: RPCServerConfig = {
       port: testPort,
       host: "127.0.0.1",
+      noAuth: true,
     };
 
     const deps: RPCServerDeps = {
@@ -466,7 +467,7 @@ describe("sendrawtransaction", () => {
 
       // Should return success with the txid (not an error)
       expect(result.error).toBeUndefined();
-      expect(result.result).toBe(txid.toString("hex"));
+      expect(result.result).toBe(Buffer.from(txid).reverse().toString("hex"));
 
       // Should broadcast inv even for duplicate
       expect(mockPeerManager.broadcastCalls.length).toBe(1);
@@ -497,7 +498,7 @@ describe("sendrawtransaction", () => {
       const result = await rpcRequest(testPort, "sendrawtransaction", [txHex]);
 
       expect(result.error).toBeUndefined();
-      expect(result.result).toBe(txid.toString("hex"));
+      expect(result.result).toBe(Buffer.from(txid).reverse().toString("hex"));
 
       // Transaction should be added to mempool
       expect(mockMempool.addTransactionCalls.length).toBe(1);
@@ -559,7 +560,7 @@ describe("sendrawtransaction", () => {
       const result = await rpcRequest(testPort, "sendrawtransaction", [txHex]);
 
       expect(result.error).toBeUndefined();
-      expect(result.result).toBe(txid.toString("hex"));
+      expect(result.result).toBe(Buffer.from(txid).reverse().toString("hex"));
 
       // Should broadcast inv message
       expect(mockPeerManager.broadcastCalls.length).toBe(1);
@@ -625,6 +626,7 @@ describe("broadcast integration", () => {
     const config: RPCServerConfig = {
       port: testPort,
       host: "127.0.0.1",
+      noAuth: true,
     };
 
     const deps: RPCServerDeps = {

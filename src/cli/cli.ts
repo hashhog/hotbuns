@@ -1304,7 +1304,7 @@ async function cmdWalletCreate(config: NodeConfig, args: string[]): Promise<void
   // Create new wallet
   const walletConfig = {
     datadir: config.datadir,
-    network: config.network,
+    network: config.network as "mainnet" | "testnet" | "regtest",
   };
 
   const wallet = Wallet.create(walletConfig);
@@ -1342,7 +1342,7 @@ async function cmdWalletGetAddress(
 
   const walletConfig = {
     datadir: config.datadir,
-    network: config.network,
+    network: config.network as "mainnet" | "testnet" | "regtest",
   };
 
   try {
@@ -1378,7 +1378,7 @@ async function cmdWalletGetBalance(
 
   const walletConfig = {
     datadir: config.datadir,
-    network: config.network,
+    network: config.network as "mainnet" | "testnet" | "regtest",
   };
 
   try {
@@ -1434,7 +1434,7 @@ async function cmdWalletSend(config: NodeConfig, args: string[]): Promise<void> 
 
   const walletConfig = {
     datadir: config.datadir,
-    network: config.network,
+    network: config.network as "mainnet" | "testnet" | "regtest",
   };
 
   try {

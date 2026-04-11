@@ -230,6 +230,7 @@ describe("RPCServer", () => {
     const config: RPCServerConfig = {
       port: testPort,
       host: "127.0.0.1",
+      noAuth: true,
     };
 
     const deps: RPCServerDeps = {

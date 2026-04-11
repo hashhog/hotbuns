@@ -131,12 +131,16 @@ function createMockMempool(txs: Transaction[]): {
     weight: 800,
     addedTime: Date.now(),
     height: 1,
-    spentBy: new Set(),
-    dependsOn: new Set(),
+    spentBy: new Set<string>(),
+    dependsOn: new Set<string>(),
     ancestorCount: 1,
     ancestorSize: 200,
     descendantCount: 1,
     descendantSize: 200,
+    clusterId: getTxId(tx).toString("hex"),
+    miningScore: 1,
+    ephemeralDustParents: new Set<string>(),
+    hasEphemeralDust: false,
   }));
 
   const txidMap = new Map<string, MempoolEntry>();
