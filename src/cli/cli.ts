@@ -36,6 +36,8 @@ export interface NodeConfig {
   maxOutbound: number;
   listen: boolean;
   port: number;
+  /** Prometheus metrics port (0 = disabled). */
+  metricsPort: number;
   logLevel: "debug" | "info" | "warn" | "error";
   connect?: string[];
   addnode?: string[];
@@ -68,6 +70,7 @@ const DEFAULT_CONFIG: NodeConfig = {
   maxOutbound: 8,
   listen: true,
   port: 8333,
+  metricsPort: 9332,
   logLevel: "info",
 };
 
@@ -153,6 +156,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
         case "port":
         case "p2p-port":
           if (value) config.port = parseInt(value, 10);
+          break;
+        case "metrics-port":
+        case "metricsport":
+          if (value) config.metricsPort = parseInt(value, 10);
           break;
         case "log-level":
           if (
@@ -298,6 +305,9 @@ export async function loadConfig(datadir: string): Promise<Partial<NodeConfig>> 
           break;
         case "port":
           config.port = parseInt(value, 10);
+          break;
+        case "metricsport":
+          config.metricsPort = parseInt(value, 10);
           break;
         case "loglevel":
           if (
@@ -1046,7 +1056,7 @@ async function startNode(config: NodeConfig): Promise<void> {
   rpcServer.start();
 
   // Start Prometheus metrics server
-  const metricsPort = 9332; // TODO: make configurable via --metricsport
+  const metricsPort = mergedConfig.metricsPort;
   if (metricsPort > 0) {
     const metricsServer = Bun.serve({
       port: metricsPort,
@@ -1479,6 +1489,7 @@ OPTIONS:
   --datadir=<path>      Data directory (default: ~/.hotbuns)
   --network=<net>       Network: mainnet, testnet, testnet4, regtest (default: mainnet)
   --rpc-port=<port>     RPC port (default: 8332/18332/18443)
+  --metrics-port=<port> Prometheus metrics port (default: 9332, 0 = disabled)
   --rpc-user=<user>     RPC username (default: user)
   --rpc-password=<pass> RPC password (default: pass)
   --max-outbound=<n>    Max outbound connections (default: 8)
