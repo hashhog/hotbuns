@@ -13,6 +13,7 @@ import {
   executeScript,
   scriptNumEncode,
   getConsensusFlags,
+  ScriptError,
   type ScriptFlags,
   type ExecutionContext,
   SigVersion,
@@ -83,8 +84,9 @@ describe("SCRIPT_VERIFY_WITNESS_PUBKEYTYPE - OP_CHECKSIG", () => {
       sigVersion: SigVersion.WITNESS_V0,
     };
 
+    // executeScript throws ScriptError for WITNESS_PUBKEYTYPE violations (like Bitcoin Core)
     const script = parseScript(Buffer.from([Opcode.OP_CHECKSIG]));
-    expect(executeScript(script, ctx)).toBe(false);
+    expect(() => executeScript(script, ctx)).toThrow(ScriptError);
   });
 
   test("WITNESS_PUBKEYTYPE: uncompressed pubkey allowed in legacy scripts", () => {
@@ -138,8 +140,9 @@ describe("SCRIPT_VERIFY_WITNESS_PUBKEYTYPE - OP_CHECKSIG", () => {
       sigVersion: SigVersion.WITNESS_V0,
     };
 
+    // executeScript throws ScriptError for WITNESS_PUBKEYTYPE violations (like Bitcoin Core)
     const script = parseScript(Buffer.from([Opcode.OP_CHECKSIG]));
-    expect(executeScript(script, ctx)).toBe(false);
+    expect(() => executeScript(script, ctx)).toThrow(ScriptError);
   });
 
   test("WITNESS_PUBKEYTYPE: invalid pubkey format (wrong prefix) rejected", () => {
@@ -157,8 +160,9 @@ describe("SCRIPT_VERIFY_WITNESS_PUBKEYTYPE - OP_CHECKSIG", () => {
       sigVersion: SigVersion.WITNESS_V0,
     };
 
+    // executeScript throws ScriptError for WITNESS_PUBKEYTYPE violations (like Bitcoin Core)
     const script = parseScript(Buffer.from([Opcode.OP_CHECKSIG]));
-    expect(executeScript(script, ctx)).toBe(false);
+    expect(() => executeScript(script, ctx)).toThrow(ScriptError);
   });
 });
 
@@ -200,8 +204,9 @@ describe("SCRIPT_VERIFY_WITNESS_PUBKEYTYPE - OP_CHECKSIGVERIFY", () => {
       sigVersion: SigVersion.WITNESS_V0,
     };
 
+    // executeScript throws ScriptError for WITNESS_PUBKEYTYPE violations (like Bitcoin Core)
     const script = parseScript(Buffer.from([Opcode.OP_CHECKSIGVERIFY]));
-    expect(executeScript(script, ctx)).toBe(false);
+    expect(() => executeScript(script, ctx)).toThrow(ScriptError);
   });
 });
 
@@ -265,8 +270,9 @@ describe("SCRIPT_VERIFY_WITNESS_PUBKEYTYPE - OP_CHECKMULTISIG", () => {
       sigVersion: SigVersion.WITNESS_V0,
     };
 
+    // executeScript throws ScriptError for WITNESS_PUBKEYTYPE violations (like Bitcoin Core)
     const script = parseScript(Buffer.from([Opcode.OP_CHECKMULTISIG]));
-    expect(executeScript(script, ctx)).toBe(false);
+    expect(() => executeScript(script, ctx)).toThrow(ScriptError);
   });
 
   test("WITNESS_PUBKEYTYPE: mixed compressed/uncompressed rejected (first key uncompressed)", () => {
@@ -291,8 +297,9 @@ describe("SCRIPT_VERIFY_WITNESS_PUBKEYTYPE - OP_CHECKMULTISIG", () => {
       sigVersion: SigVersion.WITNESS_V0,
     };
 
+    // executeScript throws ScriptError for WITNESS_PUBKEYTYPE violations (like Bitcoin Core)
     const script = parseScript(Buffer.from([Opcode.OP_CHECKMULTISIG]));
-    expect(executeScript(script, ctx)).toBe(false);
+    expect(() => executeScript(script, ctx)).toThrow(ScriptError);
   });
 
   test("WITNESS_PUBKEYTYPE: mixed compressed/uncompressed rejected (last key uncompressed)", () => {
@@ -317,8 +324,9 @@ describe("SCRIPT_VERIFY_WITNESS_PUBKEYTYPE - OP_CHECKMULTISIG", () => {
       sigVersion: SigVersion.WITNESS_V0,
     };
 
+    // executeScript throws ScriptError for WITNESS_PUBKEYTYPE violations (like Bitcoin Core)
     const script = parseScript(Buffer.from([Opcode.OP_CHECKMULTISIG]));
-    expect(executeScript(script, ctx)).toBe(false);
+    expect(() => executeScript(script, ctx)).toThrow(ScriptError);
   });
 
   test("WITNESS_PUBKEYTYPE: uncompressed pubkeys allowed in legacy multisig", () => {

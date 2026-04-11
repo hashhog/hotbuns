@@ -113,11 +113,13 @@ export const globalBufferPool = new BufferPool();
  */
 export function varIntSize(value: number | bigint): number {
   if (typeof value === "number") {
+    if (value < 0) throw new Error("varIntSize requires non-negative value");
     if (value <= 0xfc) return 1;
     if (value <= 0xffff) return 3;
     if (value <= 0xffffffff) return 5;
     return 9;
   }
+  if (value < 0n) throw new Error("varIntSize requires non-negative value");
   if (value <= 0xfcn) return 1;
   if (value <= 0xffffn) return 3;
   if (value <= 0xffffffffn) return 5;

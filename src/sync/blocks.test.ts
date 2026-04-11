@@ -400,13 +400,13 @@ describe("BlockSync", () => {
       const peer = createMockPeer();
       const peerManager = createMockPeerManager([peer]);
 
-      // Create valid blocks
+      // Create valid blocks — need 20+ stalls to trigger ban (threshold is 20)
       const genesis = headerSync.getBestHeader()!;
       const blocks: Block[] = [];
       let prevBlock = genesis.hash;
       let timestamp = genesis.header.timestamp + 600;
 
-      for (let i = 0; i < 10; i++) {
+      for (let i = 0; i < 25; i++) {
         const block = createValidBlock(prevBlock, timestamp, i + 1);
         blocks.push(block);
         prevBlock = getBlockHash(block.header);
@@ -422,15 +422,17 @@ describe("BlockSync", () => {
       // Set running to true (normally done by start())
       (bs as any).running = true;
 
-      // Set up peer in-flight tracking
+      // Set up peer in-flight tracking with all required fields
       (bs as any).peerInFlight.set(peerKey, {
-        count: 6,
+        count: 25,
         lastResponse: Date.now(),
         stallTimeout: 5000,
+        blocksDelivered: 0,
+        cooldownUntil: 0,
       });
 
-      // Simulate many stalled requests from the same peer
-      for (let i = 0; i < 6; i++) {
+      // Simulate 20+ stalled requests from the same peer (threshold is >= 20)
+      for (let i = 0; i < 25; i++) {
         const hash = getBlockHash(blocks[i].header);
         bs.getState().pendingBlocks.set(hash.toString("hex"), {
           height: i + 1,
@@ -442,7 +444,7 @@ describe("BlockSync", () => {
 
       bs.handleStalled();
 
-      // Should have tried to increase ban score
+      // Should have tried to increase ban score (triggered after 20+ stalls)
       expect(peerManager.increaseBanScore).toHaveBeenCalled();
 
       await bs.stop();
@@ -516,8 +518,14 @@ describe("BlockSync", () => {
         transactions: [], // Empty - invalid
       };
 
-      const result = await blockSync.connectBlock(invalidBlock, 1);
+      // Use params with assumeValidHeight=0 so structural validation is not skipped
+      const strictParams = { ...REGTEST, assumeValidHeight: 0 };
+      const strictBlockSync = new BlockSync(db, strictParams, headerSync);
+
+      const result = await strictBlockSync.connectBlock(invalidBlock, 1);
       expect(result).toBe(false);
+
+      await strictBlockSync.stop();
     });
 
     test("accepts valid blocks", async () => {

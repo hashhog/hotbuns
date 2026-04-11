@@ -170,7 +170,7 @@ export function socks5ErrorString(reply: SOCKS5Reply): string {
     case SOCKS5Reply.TOR_HS_INTRO_TIMEOUT:
       return "onion service introduction timed out";
     default:
-      return `unknown (0x${reply.toString(16).padStart(2, "0")})`;
+      return `unknown (0x${(reply as number).toString(16).padStart(2, "0")})`;
   }
 }
 
@@ -415,7 +415,7 @@ export class SOCKS5Client {
                     addrLen = 1 + recvBuffer[4];
                     break;
                   default:
-                    fail(new Error(`SOCKS5: unsupported address type 0x${atyp.toString(16)}`));
+                    fail(new Error(`SOCKS5: unsupported address type 0x${(atyp as number).toString(16)}`));
                     return;
                 }
 

@@ -131,7 +131,7 @@ class MockChainStateManager {
   }
 
   setBestBlock(hash: Buffer, height: number, chainWork: bigint) {
-    this.bestBlock = { hash, height, chainWork };
+    this.bestBlock = { hash: hash as Buffer<ArrayBuffer>, height, chainWork };
   }
 }
 
@@ -302,6 +302,7 @@ describe("getrawtransaction", () => {
     const config: RPCServerConfig = {
       port: testPort,
       host: "127.0.0.1",
+      noAuth: true,
     };
 
     const deps: RPCServerDeps = {
@@ -349,7 +350,8 @@ describe("getrawtransaction", () => {
       expect(res.error).toBeUndefined();
       const result = res.result as Record<string, unknown>;
 
-      expect(result.txid).toBe(txid.toString("hex"));
+      // RPC returns txids in display format (reversed byte order, Bitcoin Core convention)
+      expect(result.txid).toBe(Buffer.from(txid).reverse().toString("hex"));
       expect(result.version).toBe(2);
       expect(result.locktime).toBe(100);
       expect(result.size).toBeGreaterThan(0);
@@ -375,7 +377,7 @@ describe("getrawtransaction", () => {
 
       expect(res.error).toBeUndefined();
       const result = res.result as Record<string, unknown>;
-      expect(result.txid).toBe(txid.toString("hex"));
+      expect(result.txid).toBe(Buffer.from(txid).reverse().toString("hex"));
     });
 
     it("should handle witness transactions", async () => {
@@ -391,7 +393,7 @@ describe("getrawtransaction", () => {
       const result = res.result as Record<string, unknown>;
 
       // txid and hash (wtxid) should be different for witness tx
-      expect(result.txid).toBe(txid.toString("hex"));
+      expect(result.txid).toBe(Buffer.from(txid).reverse().toString("hex"));
       expect(result.hash).not.toBe(result.txid);
 
       // Should have witness data in vin
@@ -430,8 +432,8 @@ describe("getrawtransaction", () => {
       expect(res.error).toBeUndefined();
       const result = res.result as Record<string, unknown>;
 
-      expect(result.txid).toBe(coinbaseTxid.toString("hex"));
-      expect(result.blockhash).toBe(blockHash.toString("hex"));
+      expect(result.txid).toBe(Buffer.from(coinbaseTxid).reverse().toString("hex"));
+      expect(result.blockhash).toBe(Buffer.from(blockHash).reverse().toString("hex"));
       expect(result.confirmations).toBe(51); // 100 - 50 + 1
       expect(result.blocktime).toBe(block.header.timestamp);
     });
@@ -556,8 +558,8 @@ describe("getrawtransaction", () => {
       expect(res.error).toBeUndefined();
       const result = res.result as Record<string, unknown>;
 
-      expect(result.txid).toBe(coinbaseTxid.toString("hex"));
-      expect(result.blockhash).toBe(blockHash.toString("hex"));
+      expect(result.txid).toBe(Buffer.from(coinbaseTxid).reverse().toString("hex"));
+      expect(result.blockhash).toBe(Buffer.from(blockHash).reverse().toString("hex"));
       expect(result.confirmations).toBe(11); // 100 - 90 + 1
     });
   });

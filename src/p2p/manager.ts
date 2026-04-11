@@ -280,7 +280,8 @@ export class PeerManager {
   /** Interval for periodic feefilter checks. */
   private feeFilterInterval: ReturnType<typeof setInterval> | null;
   /** TCP listener for inbound P2P connections (Bun.listen). */
-  private tcpListener: ReturnType<typeof Bun.listen> | null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private tcpListener: any;
 
   constructor(config: PeerManagerConfig) {
     this.config = {
@@ -2108,7 +2109,7 @@ export class PeerManager {
   private relayAddrToRandomPeers(source: Peer, msg: any): void {
     const candidates: Peer[] = [];
     for (const [_key, p] of this.peers) {
-      if (p !== source && p.connected) {
+      if (p !== source && p.state === "connected") {
         candidates.push(p);
       }
     }

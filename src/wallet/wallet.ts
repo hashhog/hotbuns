@@ -1217,43 +1217,43 @@ export class Wallet {
     // Hash of prevouts
     const prevoutsWriter = new BufferWriter();
     for (const input of tx.inputs) {
-      prevoutsWriter.writeBuffer(input.prevOut.txid);
+      prevoutsWriter.writeBytes(input.prevOut.txid);
       prevoutsWriter.writeUInt32LE(input.prevOut.vout);
     }
     const { sha256Hash } = require("../crypto/primitives.js");
-    writer.writeBuffer(sha256Hash(prevoutsWriter.toBuffer()));
+    writer.writeBytes(sha256Hash(prevoutsWriter.toBuffer()));
 
     // Hash of amounts
     const amountsWriter = new BufferWriter();
     // For proper implementation, we'd need all input amounts
     // For now, use a placeholder
-    amountsWriter.writeInt64LE(amount);
+    amountsWriter.writeUInt64LE(amount);
     for (let i = 1; i < tx.inputs.length; i++) {
-      amountsWriter.writeInt64LE(0n); // Would need actual amounts
+      amountsWriter.writeUInt64LE(0n); // Would need actual amounts
     }
-    writer.writeBuffer(sha256Hash(amountsWriter.toBuffer()));
+    writer.writeBytes(sha256Hash(amountsWriter.toBuffer()));
 
     // Hash of scriptPubKeys
     const scriptsWriter = new BufferWriter();
     // For key-path, this would be the witness program
     const pubKeyHash = Buffer.alloc(32); // placeholder
-    scriptsWriter.writeVarSlice(pubKeyHash);
-    writer.writeBuffer(sha256Hash(scriptsWriter.toBuffer()));
+    scriptsWriter.writeVarBytes(pubKeyHash);
+    writer.writeBytes(sha256Hash(scriptsWriter.toBuffer()));
 
     // Hash of sequences
     const seqWriter = new BufferWriter();
     for (const input of tx.inputs) {
       seqWriter.writeUInt32LE(input.sequence);
     }
-    writer.writeBuffer(sha256Hash(seqWriter.toBuffer()));
+    writer.writeBytes(sha256Hash(seqWriter.toBuffer()));
 
     // Hash of outputs
     const outputsWriter = new BufferWriter();
     for (const output of tx.outputs) {
-      outputsWriter.writeInt64LE(output.value);
-      outputsWriter.writeVarSlice(output.scriptPubKey);
+      outputsWriter.writeUInt64LE(output.value);
+      outputsWriter.writeVarBytes(output.scriptPubKey);
     }
-    writer.writeBuffer(sha256Hash(outputsWriter.toBuffer()));
+    writer.writeBytes(sha256Hash(outputsWriter.toBuffer()));
 
     // Spend type (key-path, no annex)
     writer.writeUInt8(0x00);

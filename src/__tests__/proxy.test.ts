@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
-import type { Server, Socket } from "bun";
+import type { Socket } from "bun";
 import {
   SOCKSVersion,
   SOCKS5Method,
@@ -37,7 +37,8 @@ interface MockSOCKS5Options {
 }
 
 class MockSOCKS5Server {
-  private server: Server | null = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private server: any = null;
   private options: MockSOCKS5Options;
   port: number = 0;
 
@@ -224,7 +225,8 @@ class MockSOCKS5Server {
 // ============================================================================
 
 class MockTorControlServer {
-  private server: Server | null = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private server: any = null;
   private password: string;
   private onionAddress: string;
   port: number = 0;
@@ -309,7 +311,8 @@ class MockTorControlServer {
 // ============================================================================
 
 class MockI2PSAMServer {
-  private server: Server | null = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private server: any = null;
   private sessionCreated: boolean = false;
   private destination: string;
   private fakePrivKey: Buffer;
@@ -810,7 +813,7 @@ describe("ProxyManager", () => {
       hostname: "127.0.0.1",
       port: 0,
       socket: {
-        data: (socket, data) => socket.write(data),
+        data: (socket, data) => { socket.write(data); },
         open: () => {},
         close: () => {},
         error: () => {},

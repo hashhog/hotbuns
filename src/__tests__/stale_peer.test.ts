@@ -415,7 +415,8 @@ describe("Ping timeout detection", () => {
 
     expect(peer.pingOutstanding).toBe(false);
     expect(peer.pingSentTime).toBe(0);
-    expect(peer.latency).toBeGreaterThan(0);
+    // latency is measured as Date.now() difference; may be 0 on fast loopback connections
+    expect(peer.latency).toBeGreaterThanOrEqual(0);
 
     peer.disconnect();
   }, TEST_TIMEOUT);

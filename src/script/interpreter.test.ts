@@ -38,6 +38,7 @@ function defaultFlags(): ScriptFlags {
     verifyNullFail: true,
     verifyCheckLockTimeVerify: true,
     verifyCheckSequenceVerify: true,
+    verifyWitnessPubkeyType: true,
   };
 }
 
