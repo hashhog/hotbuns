@@ -897,12 +897,26 @@ export class HeaderSync {
       status |= 1;
     }
 
+    // Preserve nTx and dataPos if connectBlock already stored them.
+    // saveHeaderEntry is called during header sync (before we have block data),
+    // but connectBlock may have already written nTx > 0 and dataPos > 0 for
+    // this block. Overwriting with nTx: 0 / dataPos: 0 would lose that info.
+    let nTx = 0;
+    let dataPos = 0;
+    const existing = await this.db.getBlockIndex(entry.hash);
+    if (existing !== null && existing.nTx > 0 && existing.dataPos > 0) {
+      nTx = existing.nTx;
+      dataPos = existing.dataPos;
+      // Merge in any existing status bits (e.g. TXS_VALID, HAVE_DATA)
+      status |= existing.status;
+    }
+
     const record: BlockIndexRecord = {
       height: entry.height,
       header: headerBuf,
-      nTx: 0, // Unknown until we have the block
+      nTx,
       status,
-      dataPos: 0, // No block data yet
+      dataPos,
     };
 
     await this.db.putBlockIndex(entry.hash, record);

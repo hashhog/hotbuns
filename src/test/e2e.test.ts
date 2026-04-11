@@ -47,13 +47,14 @@ class MockPeerManager {
 
 // Mock HeaderSync for testing
 class MockHeaderSync {
-  private bestHeader: { height: number; hash: Buffer; chainWork: bigint } | null = null;
+  private bestHeader: { height: number; hash: Buffer; chainWork: bigint; header: { timestamp: number } } | null = null;
 
   constructor(genesisHash: Buffer) {
     this.bestHeader = {
       height: 0,
       hash: genesisHash,
       chainWork: 1n,
+      header: { timestamp: 1296688602 },
     };
   }
 
@@ -66,15 +67,21 @@ class MockHeaderSync {
       hash,
       height: 0,
       chainWork: 1n,
+      header: { timestamp: 1296688602 },
+      status: "valid-header" as const,
     };
   }
 
   getMedianTimePast(_entry: unknown) {
-    return Math.floor(Date.now() / 1000);
+    return 1296688602;
+  }
+
+  async processHeaders(_headers: unknown[], _peer: unknown): Promise<number> {
+    return 0;
   }
 
   updateTip(height: number, hash: Buffer, chainWork: bigint) {
-    this.bestHeader = { height, hash, chainWork };
+    this.bestHeader = { height, hash, chainWork, header: { timestamp: Math.floor(Date.now() / 1000) } };
   }
 }
 
@@ -417,11 +424,11 @@ describe("e2e regtest", () => {
 
   describe("block data retrieval", () => {
     test("getblock returns block data", async () => {
-      // Get genesis block
-      const genesisHash = REGTEST.genesisBlockHash.toString("hex");
-      const block = await rpcCall("getblock", [genesisHash, 1]) as Record<string, unknown>;
+      // Hashes in Bitcoin RPC are display-order (reversed bytes)
+      const genesisHashDisplay = Buffer.from(REGTEST.genesisBlockHash).reverse().toString("hex");
+      const block = await rpcCall("getblock", [genesisHashDisplay, 1]) as Record<string, unknown>;
 
-      expect(block.hash).toBe(genesisHash);
+      expect(block.hash).toBe(genesisHashDisplay);
       expect(block.height).toBe(0);
       expect(typeof block.version).toBe("number");
       expect(typeof block.merkleroot).toBe("string");
@@ -429,10 +436,11 @@ describe("e2e regtest", () => {
     });
 
     test("getblockheader returns header data", async () => {
-      const genesisHash = REGTEST.genesisBlockHash.toString("hex");
-      const header = await rpcCall("getblockheader", [genesisHash, true]) as Record<string, unknown>;
+      // Hashes in Bitcoin RPC are display-order (reversed bytes)
+      const genesisHashDisplay = Buffer.from(REGTEST.genesisBlockHash).reverse().toString("hex");
+      const header = await rpcCall("getblockheader", [genesisHashDisplay, true]) as Record<string, unknown>;
 
-      expect(header.hash).toBe(genesisHash);
+      expect(header.hash).toBe(genesisHashDisplay);
       expect(header.height).toBe(0);
       expect(typeof header.version).toBe("number");
       expect(typeof header.merkleroot).toBe("string");

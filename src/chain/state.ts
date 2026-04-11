@@ -387,6 +387,9 @@ export class ChainStateManager {
     const work = this.calculateWork(block.header.bits);
     const chainWork = this.bestBlock.chainWork + work;
 
+    // Persist per-block chain work so getblockheader can return correct chainwork
+    await this.db.putChainWork(blockHash, chainWork);
+
     // Update chain state
     this.bestBlock = {
       hash: blockHash,
@@ -740,10 +743,11 @@ export class ChainStateManager {
       };
     } else {
       // Initialize with genesis block
+      const genesisWork = this.calculateWork(this.params.powLimitBits);
       this.bestBlock = {
         hash: this.params.genesisBlockHash,
         height: 0,
-        chainWork: this.calculateWork(this.params.powLimitBits),
+        chainWork: genesisWork,
       };
 
       // Store initial state
@@ -752,6 +756,20 @@ export class ChainStateManager {
         bestHeight: this.bestBlock.height,
         totalWork: this.bestBlock.chainWork,
       });
+
+      // Store genesis block data and index so getblock/getblockheader work at height 0
+      const genesisRaw = this.params.genesisBlock;
+      await this.db.putBlock(this.params.genesisBlockHash, genesisRaw);
+      const genesisBlockParsed = deserializeBlock(new BufferReader(genesisRaw));
+      await this.db.putBlockIndex(this.params.genesisBlockHash, {
+        height: 0,
+        header: serializeBlockHeader(genesisBlockParsed.header),
+        nTx: genesisBlockParsed.transactions.length,
+        status: BlockStatus.HEADER_VALID | BlockStatus.TXS_VALID | BlockStatus.HAVE_DATA,
+        dataPos: 1,
+      });
+      // Store genesis chain work
+      await this.db.putChainWork(this.params.genesisBlockHash, genesisWork);
     }
   }
 
