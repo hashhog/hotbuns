@@ -559,6 +559,7 @@ export class RPCServer {
   private registerBuiltinMethods(): void {
     // Blockchain methods
     this.registerMethod("getblockchaininfo", () => this.getBlockchainInfo());
+    this.registerMethod("getdeploymentinfo", (params) => this.getDeploymentInfo(params));
     this.registerMethod("getblock", (params) => this.getBlock(params));
     this.registerMethod("getblockhash", (params) => this.getBlockHash(params));
     this.registerMethod("getblockheader", (params) => this.getBlockHeader(params));
@@ -821,6 +822,100 @@ export class RPCServer {
     };
 
     return softforks;
+  }
+
+  /**
+   * getdeploymentinfo: Returns deployment information for all known soft forks.
+   *
+   * Accepts an optional block hash param; if omitted, uses the chain tip.
+   * All deployments in hotbuns are buried (height-based), so every entry
+   * carries type "buried" plus active/height/min_activation_height fields.
+   * A BIP 9 state machine for future deployments is tracked in a follow-up
+   * issue: "getdeploymentinfo: add BIP 9 state machine for future soft forks".
+   *
+   * @param params [blockhash?]
+   */
+  private async getDeploymentInfo(params: unknown[]): Promise<Record<string, unknown>> {
+    const [blockhashParam] = params;
+
+    let height: number;
+    let hash: string;
+
+    if (blockhashParam !== undefined && blockhashParam !== null) {
+      if (typeof blockhashParam !== "string") {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
+      }
+      const hashBuf = Buffer.from(blockhashParam, "hex");
+      if (hashBuf.length !== 32) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
+      }
+      const blockIndex = await this.db.getBlockIndex(hashBuf);
+      if (!blockIndex) {
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found");
+      }
+      height = blockIndex.height;
+      hash = blockhashParam;
+    } else {
+      const bestBlock = this.chainState.getBestBlock();
+      height = bestBlock.height;
+      hash = Buffer.from(bestBlock.hash).reverse().toString("hex");
+    }
+
+    const deployments: Record<string, unknown> = {};
+
+    // BIP34 (block height in coinbase) — buried
+    deployments.bip34 = {
+      type: "buried",
+      active: height >= this.params.bip34Height,
+      height: this.params.bip34Height,
+      min_activation_height: this.params.bip34Height,
+    };
+
+    // BIP66 (strict DER signatures) — buried
+    deployments.bip66 = {
+      type: "buried",
+      active: height >= this.params.bip66Height,
+      height: this.params.bip66Height,
+      min_activation_height: this.params.bip66Height,
+    };
+
+    // BIP65 (CHECKLOCKTIMEVERIFY) — buried
+    deployments.bip65 = {
+      type: "buried",
+      active: height >= this.params.bip65Height,
+      height: this.params.bip65Height,
+      min_activation_height: this.params.bip65Height,
+    };
+
+    // CSV — BIP68/BIP112/BIP113 (relative timelocks) — buried
+    deployments.csv = {
+      type: "buried",
+      active: height >= this.params.csvHeight,
+      height: this.params.csvHeight,
+      min_activation_height: this.params.csvHeight,
+    };
+
+    // Segwit — BIP141/BIP143/BIP147 — buried
+    deployments.segwit = {
+      type: "buried",
+      active: height >= this.params.segwitHeight,
+      height: this.params.segwitHeight,
+      min_activation_height: this.params.segwitHeight,
+    };
+
+    // Taproot — BIP340/BIP341/BIP342 — buried
+    deployments.taproot = {
+      type: "buried",
+      active: height >= this.params.taprootHeight,
+      height: this.params.taprootHeight,
+      min_activation_height: this.params.taprootHeight,
+    };
+
+    return {
+      hash,
+      height,
+      deployments,
+    };
   }
 
   /**

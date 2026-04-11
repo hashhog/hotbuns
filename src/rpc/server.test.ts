@@ -1003,4 +1003,74 @@ describe("RPCServer", () => {
       expect(h.chainwork).toBe(genesisChainWork.toString(16).padStart(64, "0"));
     });
   });
+
+  describe("getdeploymentinfo", () => {
+    it("should return non-empty deployments with segwit and taproot at regtest tip", async () => {
+      const result = await rpcRequest(testPort, "getdeploymentinfo");
+
+      expect(result.error).toBeUndefined();
+      expect(result.result).toBeDefined();
+      expect(result.result.deployments).toBeDefined();
+
+      const deployments = result.result.deployments;
+
+      // Must contain segwit
+      expect(deployments.segwit).toBeDefined();
+      expect(deployments.segwit.type).toBe("buried");
+      expect(typeof deployments.segwit.active).toBe("boolean");
+      expect(typeof deployments.segwit.height).toBe("number");
+      expect(typeof deployments.segwit.min_activation_height).toBe("number");
+
+      // Must contain taproot
+      expect(deployments.taproot).toBeDefined();
+      expect(deployments.taproot.type).toBe("buried");
+      expect(typeof deployments.taproot.active).toBe("boolean");
+      expect(typeof deployments.taproot.height).toBe("number");
+      expect(typeof deployments.taproot.min_activation_height).toBe("number");
+    });
+
+    it("should return active=true for segwit and taproot on regtest (height-0 activation)", async () => {
+      // REGTEST has csvHeight=0, segwitHeight=0, taprootHeight=0 — active from genesis.
+      // The mock chain state reports height=100, so all buried deployments should be active.
+      const result = await rpcRequest(testPort, "getdeploymentinfo");
+
+      expect(result.error).toBeUndefined();
+      const deployments = result.result.deployments;
+
+      expect(deployments.segwit.active).toBe(true);
+      expect(deployments.taproot.active).toBe(true);
+      expect(deployments.csv.active).toBe(true);
+    });
+
+    it("should return all expected deployment keys", async () => {
+      const result = await rpcRequest(testPort, "getdeploymentinfo");
+
+      expect(result.error).toBeUndefined();
+      const deployments = result.result.deployments;
+      const keys = Object.keys(deployments);
+
+      expect(keys).toContain("bip34");
+      expect(keys).toContain("bip65");
+      expect(keys).toContain("bip66");
+      expect(keys).toContain("csv");
+      expect(keys).toContain("segwit");
+      expect(keys).toContain("taproot");
+    });
+
+    it("should return hash and height fields at chain tip", async () => {
+      const result = await rpcRequest(testPort, "getdeploymentinfo");
+
+      expect(result.error).toBeUndefined();
+      expect(typeof result.result.hash).toBe("string");
+      expect(result.result.hash).toHaveLength(64);
+      expect(typeof result.result.height).toBe("number");
+    });
+
+    it("should reject non-string blockhash param", async () => {
+      const result = await rpcRequest(testPort, "getdeploymentinfo", [12345]);
+
+      expect(result.error).toBeDefined();
+      expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+    });
+  });
 });
