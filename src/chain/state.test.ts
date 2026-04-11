@@ -376,7 +376,7 @@ describe("ChainStateManager", () => {
       const result = chainState.validateTxInputs(spendingTx, 50);
 
       expect(result.valid).toBe(false);
-      expect(result.error).toContain("maturity");
+      expect(result.error).toContain("PREMATURE_COINBASE_SPEND");
     });
 
     test("rejects tx with insufficient input value", async () => {
@@ -394,7 +394,7 @@ describe("ChainStateManager", () => {
       const result = chainState.validateTxInputs(spendingTx, 101);
 
       expect(result.valid).toBe(false);
-      expect(result.error).toContain("Insufficient");
+      expect(result.error).toContain("INPUTS_NOT_EQUAL_OUTPUTS");
     });
   });
 

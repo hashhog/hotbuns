@@ -100,7 +100,8 @@ export type NetworkMessage =
   | { type: "sketch"; payload: SketchPayload }
   | { type: "reqsketchext"; payload: ReqSketchExtPayload }
   | { type: "reconcildiff"; payload: ReconcilDiffPayload }
-  | { type: "invtx"; payload: InvTxPayload };
+  | { type: "invtx"; payload: InvTxPayload }
+  | { type: "notfound"; payload: InvPayload };
 
 /**
  * Network address (without timestamp, used in version message).

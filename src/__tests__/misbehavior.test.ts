@@ -87,7 +87,7 @@ describe("Peer misbehavior scoring", () => {
     peer.misbehaving(100, "invalid block header");
 
     expect(banCallbackInvoked).toBe(true);
-    expect(bannedPeer).toBe(peer);
+    expect(bannedPeer as unknown as Peer).toBe(peer);
     expect(banReason).toBe("invalid block header");
   });
 
