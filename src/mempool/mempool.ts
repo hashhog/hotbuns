@@ -33,6 +33,10 @@ import {
   type ScriptFlags,
 } from "../script/interpreter.js";
 import { sigHashLegacy, sigHashWitnessV0 } from "../validation/tx.js";
+import {
+  shouldSkipScripts,
+  type AssumeValidBlockEntry,
+} from "../consensus/assumevalid.js";
 
 /**
  * Maximum cluster size (replaces ancestor/descendant limits).
@@ -659,6 +663,16 @@ export class Mempool {
   /** Monotonically increasing sequence number for mempool events. */
   private mempoolSequence: bigint;
 
+  /**
+   * Optional header sync for assumevalid ancestor checks.
+   * When set, the script-verification skip gate is evaluated before each
+   * script check. For mempool transactions (always above the assumevalid
+   * height), the decision will always be "verify scripts" — the gate is
+   * provided here so that it fires automatically once the IBD path gains
+   * script verification (P2-OPT-ROUND-2).
+   */
+  private headerSync: import("../sync/headers.js").HeaderSync | null = null;
+
   constructor(
     utxo: UTXOManager,
     params: ConsensusParams,
@@ -686,6 +700,20 @@ export class Mempool {
    */
   setNotificationEmitter(emitter: EventEmitter): void {
     this.notificationEmitter = emitter;
+  }
+
+  /**
+   * Set the header sync reference for assumevalid ancestor checks.
+   *
+   * Once set, the script-verification skip gate (shouldSkipScripts) is
+   * evaluated before each per-input verifyScript call in addTransaction.
+   * For unconfirmed mempool txns the check will always return "verify
+   * scripts" since they are above the assumevalid height. This wiring
+   * exists so the canonical gate is in place for the IBD path once
+   * script verification is added there (P2-OPT-ROUND-2).
+   */
+  setHeaderSync(headerSync: import("../sync/headers.js").HeaderSync): void {
+    this.headerSync = headerSync;
   }
 
   /**
@@ -977,43 +1005,93 @@ export class Mempool {
     }
 
     // 7. Script validation
+    //
+    // Evaluate the assumevalid skip gate before the per-input script loop.
+    // For mempool transactions (unconfirmed, at tip height) the ancestor
+    // check will always fail (the tx isn't in any confirmed block), so the
+    // gate always returns "verify scripts" here. The gate is wired here so
+    // that when the IBD path gains script verification (P2-OPT-ROUND-2),
+    // the canonical shouldSkipScripts() function fires automatically.
+    //
+    // NOTE: hotbuns's IBD path (BlockSync.connectBlock) does not currently
+    // invoke script verification — this is the separate P2-OPT-ROUND-2 gap
+    // "hotbuns has verifyAllInputsParallel defined but never imported; script
+    // verification absent from IBD path". Once that is fixed, the assumevalid
+    // decision function will fire in the IBD path automatically.
+    let skipScripts = false;
+    if (this.headerSync && this.params.assumedValid) {
+      // Build a pseudo-pindex for the mempool context.
+      // Mempool txns are unconfirmed so height is tipHeight+1; hash is
+      // unknown — we use an empty hex which will fail the ancestor check,
+      // ensuring skipScripts=false for all mempool txns as expected.
+      const pindexEntry: AssumeValidBlockEntry = {
+        hash: "",
+        height: this.tipHeight + 1,
+        chainWork: 0n,
+      };
+      const bestHeader = this.headerSync.getBestHeader();
+      const skipResult = shouldSkipScripts({
+        pindex: pindexEntry,
+        assumedValidHash: this.params.assumedValid,
+        getBlockByHash: (hashHex) => {
+          const entry = this.headerSync!.getHeader(Buffer.from(hashHex, "hex"));
+          if (!entry) return null;
+          return { hash: entry.hash.toString("hex"), height: entry.height, chainWork: entry.chainWork };
+        },
+        getBlockAtHeight: (height) => {
+          const entry = this.headerSync!.getHeaderByHeight(height);
+          if (!entry) return null;
+          return { hash: entry.hash.toString("hex"), height: entry.height, chainWork: entry.chainWork };
+        },
+        bestHeader: bestHeader
+          ? { hash: bestHeader.hash.toString("hex"), height: bestHeader.height, chainWork: bestHeader.chainWork }
+          : null,
+        minimumChainWork: this.params.nMinimumChainWork,
+        pindexTimestamp: Math.floor(Date.now() / 1000),
+        bestHeaderTimestamp: bestHeader ? bestHeader.header.timestamp : 0,
+      });
+      skipScripts = skipResult.skip;
+    }
+
     const flags = getConsensusFlags(this.tipHeight);
 
-    for (let i = 0; i < tx.inputs.length; i++) {
-      const { utxo, input, isMempool } = inputUtxos[i];
+    if (!skipScripts) {
+      for (let i = 0; i < tx.inputs.length; i++) {
+        const { utxo, input, isMempool } = inputUtxos[i];
 
-      // Create sighash function for this input
-      const sigHasher = (subscript: Buffer, hashType: number): Buffer => {
-        // Determine if this is a witness input
-        const witnessProgram = utxo.scriptPubKey;
-        const isSegwit =
-          (witnessProgram.length === 22 &&
-            witnessProgram[0] === 0x00 &&
-            witnessProgram[1] === 20) ||
-          (witnessProgram.length === 34 &&
-            witnessProgram[0] === 0x00 &&
-            witnessProgram[1] === 32);
+        // Create sighash function for this input
+        const sigHasher = (subscript: Buffer, hashType: number): Buffer => {
+          // Determine if this is a witness input
+          const witnessProgram = utxo.scriptPubKey;
+          const isSegwit =
+            (witnessProgram.length === 22 &&
+              witnessProgram[0] === 0x00 &&
+              witnessProgram[1] === 20) ||
+            (witnessProgram.length === 34 &&
+              witnessProgram[0] === 0x00 &&
+              witnessProgram[1] === 32);
 
-        if (isSegwit || input.witness.length > 0) {
-          return sigHashWitnessV0(tx, i, subscript, utxo.amount, hashType);
-        } else {
-          return sigHashLegacy(tx, i, subscript, hashType);
-        }
-      };
-
-      const valid = verifyScript(
-        input.scriptSig,
-        utxo.scriptPubKey,
-        input.witness,
-        flags,
-        sigHasher
-      );
-
-      if (!valid) {
-        return {
-          accepted: false,
-          error: `Script validation failed for input ${i}`,
+          if (isSegwit || input.witness.length > 0) {
+            return sigHashWitnessV0(tx, i, subscript, utxo.amount, hashType);
+          } else {
+            return sigHashLegacy(tx, i, subscript, hashType);
+          }
         };
+
+        const valid = verifyScript(
+          input.scriptSig,
+          utxo.scriptPubKey,
+          input.witness,
+          flags,
+          sigHasher
+        );
+
+        if (!valid) {
+          return {
+            accepted: false,
+            error: `Script validation failed for input ${i}`,
+          };
+        }
       }
     }
 
