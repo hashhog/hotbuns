@@ -13,6 +13,15 @@ import { sha256 as nobleSha256 } from "@noble/hashes/sha2.js";
 import { ripemd160 } from "@noble/hashes/legacy.js";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { schnorr } from "@noble/curves/secp256k1.js";
+import {
+  FFI_AVAILABLE,
+  ecdsaVerifyFFI,
+  ecdsaVerifyLaxFFI as _ecdsaVerifyLaxFFI,
+  schnorrVerifyFFI as _schnorrVerifyFFI,
+  ecdsaVerifyFFICounted,
+  ecdsaVerifyLaxFFICounted,
+  schnorrVerifyFFICounted,
+} from "./secp256k1_ffi.js";
 
 // ============================================================================
 // SHA-256 Implementation Selection
@@ -271,12 +280,20 @@ export function ecdsaSign(msgHash: Buffer, privateKey: Buffer): Buffer {
 /**
  * Verify a DER-encoded ECDSA signature against a public key and message hash.
  * Uses strict DER parsing (rejects non-canonical encodings).
+ *
+ * Uses libsecp256k1 FFI when available (default, ~30x faster than @noble).
+ * Falls back to @noble/curves when FFI is unavailable.
  */
 export function ecdsaVerify(
   signature: Buffer,
   msgHash: Buffer,
   publicKey: Buffer
 ): boolean {
+  // Consensus hot path: use libsecp256k1 FFI when available
+  if (FFI_AVAILABLE) {
+    return ecdsaVerifyFFICounted(signature, msgHash, publicKey);
+  }
+  // Fallback to @noble/curves
   try {
     return secp256k1.verify(signature, msgHash, publicKey, { prehash: false, format: "der" });
   } catch {
@@ -398,12 +415,21 @@ function encodeStrictDER(r: bigint, s: bigint): Buffer {
  * This matches Bitcoin Core's behavior when SCRIPT_VERIFY_DERSIG is not set:
  * non-strict DER encodings are accepted as long as the (r,s) values are valid.
  * Also handles hybrid pubkeys (0x06/0x07 prefix).
+ *
+ * Uses libsecp256k1 FFI when available (default, ~30x faster than @noble).
+ * Falls back to @noble/curves when FFI is unavailable.
  */
 export function ecdsaVerifyLax(
   signature: Buffer,
   msgHash: Buffer,
   publicKey: Buffer
 ): boolean {
+  // Consensus hot path: use libsecp256k1 FFI when available
+  if (FFI_AVAILABLE) {
+    return ecdsaVerifyLaxFFICounted(signature, msgHash, publicKey);
+  }
+
+  // Fallback to @noble/curves with JS lax DER parser
   // Handle hybrid pubkeys (0x06/0x07) by converting to uncompressed (0x04)
   let pk = publicKey;
   if (pk.length === 65 && (pk[0] === 0x06 || pk[0] === 0x07)) {
@@ -430,15 +456,23 @@ export function ecdsaVerifyLax(
  * Batch verify multiple ECDSA signatures.
  * Returns an array of booleans indicating which signatures are valid.
  *
- * Note: Currently this is sequential verification. True batch verification
- * requires libsecp256k1 binding with secp256k1_ecdsa_verify in batch.
- * The overhead is still reduced by avoiding individual try/catch blocks.
+ * Uses libsecp256k1 FFI when available (default, ~30x faster than @noble).
+ * Falls back to @noble/curves when FFI is unavailable.
  */
 export function ecdsaVerifyBatch(
   signatures: readonly { signature: Buffer; msgHash: Buffer; publicKey: Buffer }[]
 ): boolean[] {
   const results: boolean[] = new Array(signatures.length);
 
+  if (FFI_AVAILABLE) {
+    for (let i = 0; i < signatures.length; i++) {
+      const { signature, msgHash, publicKey } = signatures[i];
+      results[i] = ecdsaVerifyFFICounted(signature, msgHash, publicKey);
+    }
+    return results;
+  }
+
+  // Fallback to @noble/curves
   for (let i = 0; i < signatures.length; i++) {
     const { signature, msgHash, publicKey } = signatures[i];
     try {
@@ -489,16 +523,24 @@ export function schnorrSign(
  * @param msgHash 32-byte message hash
  * @param publicKey 32-byte x-only public key
  * @returns true if signature is valid
+ *
+ * Uses libsecp256k1 FFI when available (default, ~30x faster than @noble).
+ * Falls back to @noble/curves when FFI is unavailable.
  */
 export function schnorrVerify(
   signature: Buffer,
   msgHash: Buffer,
   publicKey: Buffer
 ): boolean {
+  if (signature.length !== 64 || msgHash.length !== 32 || publicKey.length !== 32) {
+    return false;
+  }
+  // Consensus hot path: use libsecp256k1 FFI when available
+  if (FFI_AVAILABLE) {
+    return schnorrVerifyFFICounted(signature, msgHash, publicKey);
+  }
+  // Fallback to @noble/curves
   try {
-    if (signature.length !== 64 || msgHash.length !== 32 || publicKey.length !== 32) {
-      return false;
-    }
     return schnorr.verify(signature, msgHash, publicKey);
   } catch {
     return false;
@@ -509,8 +551,8 @@ export function schnorrVerify(
  * Batch verify multiple Schnorr signatures.
  * Returns an array of booleans indicating which signatures are valid.
  *
- * Note: Noble's schnorr.verify is already optimized. True batch verification
- * (aggregate verification) would require libsecp256k1 binding.
+ * Uses libsecp256k1 FFI when available (default, ~30x faster than @noble).
+ * Falls back to @noble/curves when FFI is unavailable.
  */
 export function schnorrVerifyBatch(
   signatures: readonly { signature: Buffer; msgHash: Buffer; publicKey: Buffer }[]
@@ -519,14 +561,18 @@ export function schnorrVerifyBatch(
 
   for (let i = 0; i < signatures.length; i++) {
     const { signature, msgHash, publicKey } = signatures[i];
-    try {
-      if (signature.length !== 64 || msgHash.length !== 32 || publicKey.length !== 32) {
-        results[i] = false;
-        continue;
-      }
-      results[i] = schnorr.verify(signature, msgHash, publicKey);
-    } catch {
+    if (signature.length !== 64 || msgHash.length !== 32 || publicKey.length !== 32) {
       results[i] = false;
+      continue;
+    }
+    if (FFI_AVAILABLE) {
+      results[i] = schnorrVerifyFFICounted(signature, msgHash, publicKey);
+    } else {
+      try {
+        results[i] = schnorr.verify(signature, msgHash, publicKey);
+      } catch {
+        results[i] = false;
+      }
     }
   }
 
