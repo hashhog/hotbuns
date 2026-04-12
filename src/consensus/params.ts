@@ -56,6 +56,19 @@ export interface ConsensusParams {
    */
   readonly assumeValidHeight: number;
   /**
+   * Assumed-valid block hash (hex string, display/RPC byte order).
+   *
+   * When set, blocks that are ancestors of this block on the active chain
+   * may have their script verification skipped (subject to all six safety
+   * conditions in src/consensus/assumevalid.ts).
+   *
+   * This is the fleet-standard Bitcoin Core v28.0 hash. Absent on regtest —
+   * regtest always verifies every script for test determinism.
+   *
+   * Use shouldSkipScripts() from consensus/assumevalid.ts to evaluate.
+   */
+  readonly assumedValid?: string;
+  /**
    * assumeUTXO snapshot data: maps block hash (hex) to snapshot metadata.
    * Used for fast startup by loading a pre-validated UTXO set.
    */
@@ -332,6 +345,9 @@ export const MAINNET: ConsensusParams = {
   segwitHeight: 481824,
   taprootHeight: 709632,
   assumeValidHeight: 938343, // Bitcoin Core default assumevalid (block 938343)
+  // Fleet-standard assumevalid hash (Bitcoin Core v28.0, block 938343).
+  // Used by shouldSkipScripts() for the proper ancestor-check semantics.
+  assumedValid: "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac",
   protocolVersion: 70016,
   services: 0x0409n, // NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED
   userAgent: "/hotbuns:0.1.0/",
@@ -522,6 +538,8 @@ export const TESTNET: ConsensusParams = {
   csvHeight: 770112, // BIP68/112/113
   segwitHeight: 834624,
   taprootHeight: 0,
+  // Fleet-standard assumevalid hash for testnet3 (Bitcoin Core v28.0, block 123613).
+  assumedValid: "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a",
   dnsSeed: [
     "testnet-seed.bitcoin.jonasschnelli.ch",
     "seed.tbtc.petertodd.net",
@@ -633,6 +651,8 @@ export const TESTNET4: ConsensusParams = {
   // Skip script/sigop verification for blocks at or below this height.
   // Testnet4 tip as of 2026-03: ~60k blocks, set conservatively.
   assumeValidHeight: 123613,
+  // Fleet-standard assumevalid hash for testnet4 (Bitcoin Core v28.0, block 4842348).
+  assumedValid: "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4",
   dnsSeed: [
     "seed.testnet4.bitcoin.sprovoost.nl",
     "seed.testnet4.wiz.biz",
@@ -750,6 +770,8 @@ export const SIGNET: ConsensusParams = {
     ],
   ]),
   nMinimumChainWork: 0x00000000000000000000000000000000000000000000000000000b463ea0a4b8n,
+  // Fleet-standard assumevalid hash for signet (Bitcoin Core v28.0, block 293175).
+  assumedValid: "00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329",
 };
 
 /**
@@ -780,6 +802,9 @@ export const REGTEST: ConsensusParams = {
   checkpoints: new Map(),
   // No minimum work for regtest (allows immediate sync)
   nMinimumChainWork: 0n,
+  // Regtest has NO assumevalid: every script is verified for test determinism.
+  // Explicitly override the MAINNET hash spread-in above.
+  assumedValid: undefined,
   // assumeUTXO: regtest allows any snapshot for testing
   assumeutxo: new Map(),
 };
