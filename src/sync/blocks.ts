@@ -31,10 +31,18 @@ import {
   getTxId,
   isCoinbase,
   checkSequenceLocks,
+  verifyAllInputsParallel,
+  verifyAllInputsSequential,
+  ScriptFlags,
   type UTXOConfirmation,
 } from "../validation/tx.js";
+import type { UTXOEntry } from "../storage/database.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { UTXOManager, type SpentUTXO } from "../chain/utxo.js";
+import {
+  shouldSkipScripts,
+  type AssumeValidContext,
+} from "../consensus/assumevalid.js";
 
 /** Maximum blocks in-flight at once (across all peers). */
 const DEFAULT_WINDOW_SIZE = 512;
@@ -158,18 +166,35 @@ export class BlockSync {
    *  methods like getblockcount reflect the latest chain tip. */
   private chainStateManager: ChainStateManager | null;
 
+  /**
+   * Number of parallel script-verification workers.
+   * 1  = sequential (verifyAllInputsSequential) — benchmark baseline.
+   * >1 = parallel   (verifyAllInputsParallel)   — production default.
+   *
+   * Controlled via --script-threads=N CLI flag (P2-OPT-ROUND-2).
+   * Default: os.cpus().length (Bun: navigator.hardwareConcurrency).
+   */
+  private scriptThreads: number;
+
   constructor(
     db: ChainDB,
     params: ConsensusParams,
     headerSync: HeaderSync,
     peerManager?: PeerManager,
-    chainStateManager?: ChainStateManager
+    chainStateManager?: ChainStateManager,
+    scriptThreads?: number
   ) {
     this.db = db;
     this.params = params;
     this.headerSync = headerSync;
     this.peerManager = peerManager ?? null;
     this.chainStateManager = chainStateManager ?? null;
+    // Default script thread count: hardware concurrency (>= 1).
+    this.scriptThreads =
+      scriptThreads ??
+      (typeof navigator !== "undefined" && navigator.hardwareConcurrency > 0
+        ? navigator.hardwareConcurrency
+        : 4);
     this.windowSize = DEFAULT_WINDOW_SIZE;
     this.peerInFlight = new Map();
     this.utxoManager = new UTXOManager(db);
@@ -1242,6 +1267,43 @@ export class BlockSync {
       let totalInputValue = 0n;
       let totalOutputValue = 0n;
 
+      // ── P2-OPT-ROUND-2: assumevalid gate for script verification ──
+      // Build the context once per block and check whether scripts should
+      // be skipped.  On regtest assumedValid is undefined, so every script
+      // fires (good for tests).  On mainnet the 6-condition check applies.
+      const bestHeader = this.headerSync.getBestHeader();
+      const currentHeaderEntry = this.headerSync.getHeaderByHeight(height);
+      const pindexTimestamp = currentHeaderEntry?.header.timestamp ?? 0;
+      const bestHeaderTimestamp = bestHeader?.header.timestamp ?? 0;
+
+      const avCtx: AssumeValidContext = {
+        pindex: {
+          hash: hashHex,
+          height,
+          chainWork: currentHeaderEntry?.chainWork ?? 0n,
+        },
+        assumedValidHash: this.params.assumedValid,
+        getBlockByHash: (h) => {
+          const entry = this.headerSync.getHeader(Buffer.from(h, "hex"));
+          if (!entry) return null;
+          return { hash: entry.hash.toString("hex"), height: entry.height, chainWork: entry.chainWork };
+        },
+        getBlockAtHeight: (h) => {
+          const entry = this.headerSync.getHeaderByHeight(h);
+          if (!entry) return null;
+          return { hash: entry.hash.toString("hex"), height: entry.height, chainWork: entry.chainWork };
+        },
+        bestHeader: bestHeader
+          ? { hash: bestHeader.hash.toString("hex"), height: bestHeader.height, chainWork: bestHeader.chainWork }
+          : null,
+        minimumChainWork: this.params.nMinimumChainWork,
+        pindexTimestamp,
+        bestHeaderTimestamp,
+      };
+
+      const skipScriptsResult = shouldSkipScripts(avCtx);
+      const skipScripts = skipScriptsResult.skip;
+
       for (let txIndex = 0; txIndex < block.transactions.length; txIndex++) {
         const tx = block.transactions[txIndex];
         const txid = getTxId(tx);
@@ -1265,11 +1327,14 @@ export class BlockSync {
           }
 
           const utxoConfirmations: UTXOConfirmation[] = [];
+          // Collect UTXOEntries for script verification (parallel or sequential).
+          const inputUTXOs: UTXOEntry[] = [];
 
           for (const input of tx.inputs) {
             const utxo = this.utxoManager.getUTXO(input.prevOut);
             if (utxo) {
               prevOutputs.push(utxo.scriptPubKey);
+              inputUTXOs.push(utxo);
 
               if (utxo.coinbase) {
                 const maturity = height - utxo.height;
@@ -1307,6 +1372,35 @@ export class BlockSync {
             if (!seqLockValid) {
               console.warn(
                 `Sequence locks not satisfied for tx ${txidHex.slice(0, 16)} at height ${height}`
+              );
+              return false;
+            }
+          }
+
+          // ── P2-OPT-ROUND-2: parallel script verification ──
+          // Fires for every non-coinbase tx in the full-validation path unless
+          // the assumevalid 6-condition gate says to skip.
+          if (!skipScripts) {
+            const scriptFlags =
+              (verifyP2SH ? ScriptFlags.VERIFY_P2SH : ScriptFlags.VERIFY_NONE) |
+              (verifyWitness ? ScriptFlags.VERIFY_WITNESS : ScriptFlags.VERIFY_NONE);
+
+            let scriptResult;
+            if (this.scriptThreads === 1) {
+              // Benchmark baseline: serial path so callers can compare timings.
+              scriptResult = verifyAllInputsSequential(tx, inputUTXOs, scriptFlags);
+            } else {
+              // Production path: parallel (Promise.all across all inputs).
+              scriptResult = await verifyAllInputsParallel(tx, inputUTXOs, scriptFlags);
+            }
+
+            if (!scriptResult.valid) {
+              console.warn(
+                `Script verification failed in tx ${txidHex.slice(0, 16)} at height ${height}` +
+                  (scriptResult.failedInput !== undefined
+                    ? ` (input ${scriptResult.failedInput})`
+                    : "") +
+                  (scriptResult.error ? `: ${scriptResult.error}` : "")
               );
               return false;
             }
