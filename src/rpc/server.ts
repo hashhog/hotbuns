@@ -774,53 +774,82 @@ export class RPCServer {
   }
 
   /**
-   * Get softfork activation status for the current height.
+   * Canonical deployment state entry.  All buried soft forks share the same
+   * shape; BIP 9 / BIP 8 entries would add a `bip9` sub-object in a future
+   * extension.
+   *
+   * This is the single source of truth read by both getblockchaininfo and
+   * getdeploymentinfo.  Neither RPC may read params.*Height directly — they
+   * must project from this struct.
+   */
+  private buildDeploymentState(height: number): Record<string, {
+    type: "buried";
+    active: boolean;
+    height: number;
+    min_activation_height: number;
+  }> {
+    const p = this.params;
+    return {
+      // BIP34 — block height in coinbase
+      bip34: {
+        type: "buried",
+        active: height >= p.bip34Height,
+        height: p.bip34Height,
+        min_activation_height: p.bip34Height,
+      },
+      // BIP66 — strict DER signatures
+      bip66: {
+        type: "buried",
+        active: height >= p.bip66Height,
+        height: p.bip66Height,
+        min_activation_height: p.bip66Height,
+      },
+      // BIP65 — CHECKLOCKTIMEVERIFY
+      bip65: {
+        type: "buried",
+        active: height >= p.bip65Height,
+        height: p.bip65Height,
+        min_activation_height: p.bip65Height,
+      },
+      // CSV — BIP68/BIP112/BIP113 (relative timelocks)
+      csv: {
+        type: "buried",
+        active: height >= p.csvHeight,
+        height: p.csvHeight,
+        min_activation_height: p.csvHeight,
+      },
+      // SegWit — BIP141/BIP143/BIP147
+      segwit: {
+        type: "buried",
+        active: height >= p.segwitHeight,
+        height: p.segwitHeight,
+        min_activation_height: p.segwitHeight,
+      },
+      // Taproot — BIP340/BIP341/BIP342
+      taproot: {
+        type: "buried",
+        active: height >= p.taprootHeight,
+        height: p.taprootHeight,
+        min_activation_height: p.taprootHeight,
+      },
+    };
+  }
+
+  /**
+   * Project the canonical deployment state into the `softforks` shape used by
+   * getblockchaininfo.  Bitcoin Core does not emit min_activation_height for
+   * buried deployments in getblockchaininfo, so we strip it here.
    */
   private getSoftforkStatus(height: number): Record<string, unknown> {
+    const state = this.buildDeploymentState(height);
     const softforks: Record<string, unknown> = {};
-
-    // BIP34 (Height in coinbase)
-    softforks.bip34 = {
-      type: "buried",
-      active: height >= this.params.bip34Height,
-      height: this.params.bip34Height,
-    };
-
-    // BIP66 (Strict DER)
-    softforks.bip66 = {
-      type: "buried",
-      active: height >= this.params.bip66Height,
-      height: this.params.bip66Height,
-    };
-
-    // BIP65 (CLTV)
-    softforks.bip65 = {
-      type: "buried",
-      active: height >= this.params.bip65Height,
-      height: this.params.bip65Height,
-    };
-
-    // CSV (BIP68, BIP112, BIP113)
-    softforks.csv = {
-      type: "buried",
-      active: height >= this.params.csvHeight,
-      height: this.params.csvHeight,
-    };
-
-    // SegWit (BIP141, BIP143, BIP147)
-    softforks.segwit = {
-      type: "buried",
-      active: height >= this.params.segwitHeight,
-      height: this.params.segwitHeight,
-    };
-
-    // Taproot (BIP341, BIP342)
-    softforks.taproot = {
-      type: "buried",
-      active: height >= this.params.taprootHeight,
-      height: this.params.taprootHeight,
-    };
-
+    for (const [name, entry] of Object.entries(state)) {
+      softforks[name] = {
+        type: entry.type,
+        active: entry.active,
+        height: entry.height,
+      };
+    }
     return softforks;
   }
 
@@ -861,55 +890,9 @@ export class RPCServer {
       hash = Buffer.from(bestBlock.hash).reverse().toString("hex");
     }
 
-    const deployments: Record<string, unknown> = {};
-
-    // BIP34 (block height in coinbase) — buried
-    deployments.bip34 = {
-      type: "buried",
-      active: height >= this.params.bip34Height,
-      height: this.params.bip34Height,
-      min_activation_height: this.params.bip34Height,
-    };
-
-    // BIP66 (strict DER signatures) — buried
-    deployments.bip66 = {
-      type: "buried",
-      active: height >= this.params.bip66Height,
-      height: this.params.bip66Height,
-      min_activation_height: this.params.bip66Height,
-    };
-
-    // BIP65 (CHECKLOCKTIMEVERIFY) — buried
-    deployments.bip65 = {
-      type: "buried",
-      active: height >= this.params.bip65Height,
-      height: this.params.bip65Height,
-      min_activation_height: this.params.bip65Height,
-    };
-
-    // CSV — BIP68/BIP112/BIP113 (relative timelocks) — buried
-    deployments.csv = {
-      type: "buried",
-      active: height >= this.params.csvHeight,
-      height: this.params.csvHeight,
-      min_activation_height: this.params.csvHeight,
-    };
-
-    // Segwit — BIP141/BIP143/BIP147 — buried
-    deployments.segwit = {
-      type: "buried",
-      active: height >= this.params.segwitHeight,
-      height: this.params.segwitHeight,
-      min_activation_height: this.params.segwitHeight,
-    };
-
-    // Taproot — BIP340/BIP341/BIP342 — buried
-    deployments.taproot = {
-      type: "buried",
-      active: height >= this.params.taprootHeight,
-      height: this.params.taprootHeight,
-      min_activation_height: this.params.taprootHeight,
-    };
+    // Use the shared canonical helper so both RPCs always read from the same
+    // data source and can never diverge.
+    const deployments = this.buildDeploymentState(height);
 
     return {
       hash,
