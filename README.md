@@ -126,6 +126,44 @@ The validation pipeline processes blocks through parallel signature verification
 
 The wallet subsystem supports BIP-32/44/49/84/86 HD key derivation across all address types (P2PKH, P2SH-P2WPKH, P2WPKH, P2TR), with Branch-and-Bound and Knapsack coin selection algorithms. PSBT support enables multi-party signing workflows, and output descriptors with miniscript provide flexible script policy composition.
 
+## Cryptography
+
+### libsecp256k1 FFI (ECDSA/Schnorr verification)
+
+hotbuns uses a Bun FFI binding to the system `libsecp256k1` C library for all
+consensus-path ECDSA and BIP-340 Schnorr signature verification. This replaces
+the pure-JavaScript `@noble/curves` implementation on the verification hot path,
+achieving ~30x throughput improvement during IBD (~30,000 ECDSA ops/sec vs
+~1,000 ops/sec with `@noble/curves`).
+
+**Install the system library before running hotbuns:**
+
+```bash
+# Debian / Ubuntu
+sudo apt install libsecp256k1-dev
+
+# Verify version (requires >= 0.4.0)
+pkg-config --modversion libsecp256k1
+```
+
+**FFI module:** `src/crypto/secp256k1_ffi.ts`
+
+Functions:
+- `ecdsaVerifyFFI` — strict DER ECDSA, low-S enforced (used by `ecdsaVerify`)
+- `ecdsaVerifyLaxFFI` — lax DER ECDSA, historical Bitcoin compat (used by `ecdsaVerifyLax`)
+- `schnorrVerifyFFI` — BIP-340 Schnorr (used by `schnorrVerify`)
+
+**Graceful fallback:** If `libsecp256k1.so.2` is not found at startup, hotbuns
+falls back to `@noble/curves` automatically with a warning log. The node
+remains fully functional; IBD will be slower without the C library.
+
+**@noble fallback:** `@noble/secp256k1` and `@noble/curves` are intentionally
+kept in `package.json`. They remain the implementation for:
+- Signing operations (wallet, test helpers) — not on the IBD hot path
+- BIP-324 ECDH / ElligatorSwift (P2P transport)
+- Taproot key tweaking (key derivation math)
+- Cross-checking FFI results in `src/crypto/secp256k1_ffi.test.ts`
+
 ## License
 
 MIT
