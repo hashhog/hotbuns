@@ -47,6 +47,13 @@ export interface NodeConfig {
   importBlocks?: string;
   /** Path to HDOG UTXO snapshot file for AssumeUTXO import. */
   importUtxo?: string;
+  /**
+   * Number of parallel script-verification workers for IBD ConnectBlock.
+   * 1  = sequential (benchmark baseline).
+   * >1 = parallel Promise.all path (default: hardware concurrency).
+   * 0 / undefined = use hardware default.
+   */
+  scriptThreads?: number;
 }
 
 /**
@@ -201,6 +208,12 @@ export function parseArgs(argv: string[]): ParsedArgs {
           break;
         case "import-utxo":
           if (value) config.importUtxo = value;
+          break;
+        case "script-threads":
+          if (value) {
+            const n = parseInt(value, 10);
+            if (!isNaN(n) && n >= 0) config.scriptThreads = n;
+          }
           break;
         case "password":
           // For wallet commands
@@ -969,7 +982,7 @@ async function startNode(config: NodeConfig): Promise<void> {
   headerSync.registerWithPeerManager(peerManager);
 
   // 7. Initialize block sync
-  const blockSync = new BlockSync(db, params, headerSync, peerManager, chainState);
+  const blockSync = new BlockSync(db, params, headerSync, peerManager, chainState, mergedConfig.scriptThreads);
 
   // 7b. Wire mempool tx relay: accept incoming transactions via AcceptToMemoryPool
   // and relay accepted txs to peers via inventory trickling.
