@@ -565,6 +565,7 @@ export class RPCServer {
     this.registerMethod("getblockheader", (params) => this.getBlockHeader(params));
     this.registerMethod("getblockcount", () => this.getBlockCount());
     this.registerMethod("getbestblockhash", () => this.getBestBlockHash());
+    this.registerMethod("getsyncstate", () => this.getSyncState());
     this.registerMethod("getchaintips", () => this.getChainTips());
     this.registerMethod("getdifficulty", () => this.getDifficulty());
 
@@ -1135,6 +1136,73 @@ export class RPCServer {
    */
   private async getBestBlockHash(): Promise<string> {
     return Buffer.from(this.chainState.getBestBlock().hash).reverse().toString("hex");
+  }
+
+  /**
+   * hashhog W70: uniform fleet-wide sync-state report.
+   * Spec: meta-repo `spec/getsyncstate.md`.
+   *
+   * SHOULD fields return `null` (not omitted) so consumer parsers
+   * can index by key without presence checks. blocks_in_flight /
+   * blocks_pending_connect / last_block_received_time are null in v1
+   * because hotbuns's BlockSync doesn't expose public counters yet.
+   */
+  private async getSyncState(): Promise<Record<string, unknown>> {
+    const bestBlock = this.chainState.getBestBlock();
+    const bestHeader = this.headerSync.getBestHeader();
+
+    const tipHash = Buffer.from(bestBlock.hash).reverse().toString("hex");
+    const headerHeight = bestHeader?.height ?? bestBlock.height;
+    const headerHash = bestHeader
+      ? Buffer.from(bestHeader.hash).reverse().toString("hex")
+      : tipHash;
+
+    const headerEntry = this.headerSync.getHeader(bestBlock.hash);
+    const tipTimestamp = headerEntry
+      ? headerEntry.header.timestamp
+      : Math.floor(Date.now() / 1000);
+    const ibd = this.computeInitialBlockDownload(bestBlock.chainWork, tipTimestamp);
+
+    const numPeers = this.peerManager.getConnectedPeers().length;
+
+    let chain: string;
+    switch (this.params.networkMagic) {
+      case 0xd9b4bef9:
+        chain = "main";
+        break;
+      case 0x0709110b:
+        chain = "test";
+        break;
+      case 0x1c163f28:
+        chain = "testnet4";
+        break;
+      case 0x0a03cf40:
+        chain = "signet";
+        break;
+      case 0xdab5bffa:
+        chain = "regtest";
+        break;
+      default:
+        chain = "unknown";
+    }
+
+    const verificationProgress =
+      headerHeight > 0 ? Math.min(bestBlock.height / headerHeight, 1.0) : 0.0;
+
+    return {
+      tip_height: bestBlock.height,
+      tip_hash: tipHash,
+      best_header_height: headerHeight,
+      best_header_hash: headerHash,
+      initial_block_download: ibd,
+      num_peers: numPeers,
+      verification_progress: verificationProgress,
+      blocks_in_flight: null,
+      blocks_pending_connect: null,
+      last_block_received_time: null,
+      chain,
+      protocol_version: this.params.protocolVersion ?? 70016,
+    };
   }
 
   /**
