@@ -114,6 +114,14 @@ export class Peer {
   headersRequestTime: number;
   /** Timestamp of when this peer connected (ms). */
   connectedTime: number;
+  /** Total bytes sent to this peer (for getpeerinfo.bytessent). */
+  bytesSent: number;
+  /** Total bytes received from this peer (for getpeerinfo.bytesrecv). */
+  bytesRecv: number;
+  /** Timestamp of last outbound send (ms, for getpeerinfo.lastsend). */
+  lastSend: number;
+  /** Timestamp of last inbound recv (ms, for getpeerinfo.lastrecv). */
+  lastRecv: number;
   /** Set of blocks in flight (hashes as hex strings) with request times. */
   blocksInFlight: Map<string, number>;
   /** Best known height from this peer (from version message or updates). */
@@ -218,6 +226,10 @@ export class Peer {
     this.pingOutstanding = false;
     this.headersRequestTime = 0;
     this.connectedTime = Date.now();
+    this.bytesSent = 0;
+    this.bytesRecv = 0;
+    this.lastSend = 0;
+    this.lastRecv = 0;
     this.blocksInFlight = new Map();
     this.bestKnownHeight = 0;
     this.wantsAddrV2 = false;
@@ -335,6 +347,8 @@ export class Peer {
     }
     const data = serializeMessage(this.config.magic, msg);
     this.socket.write(data);
+    this.bytesSent += data.length;
+    this.lastSend = Date.now();
   }
 
   /**
@@ -457,6 +471,8 @@ export class Peer {
    * Accumulates data in recvBuffer and processes complete messages.
    */
   private onData(data: Buffer): void {
+    this.bytesRecv += data.length;
+    this.lastRecv = Date.now();
     // Accumulate incoming data - copy into new buffer to avoid
     // retaining references to large underlying ArrayBuffers
     if (this.recvBuffer.length === 0) {
