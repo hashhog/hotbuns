@@ -2569,7 +2569,9 @@ export class RPCServer {
       bytessent: peer.bytesSent,
       bytesrecv: peer.bytesRecv,
       conntime: Math.floor(peer.connectedTime / 1000),
-      timeoffset: 0,
+      timeoffset: peer.versionPayload && peer.versionReceivedAt > 0
+        ? Number(peer.versionPayload.timestamp) - Math.floor(peer.versionReceivedAt / 1000)
+        : 0,
       pingtime: peer.latency / 1000,
       minping: 0,
       version: peer.versionPayload?.version ?? 0,

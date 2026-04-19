@@ -122,6 +122,8 @@ export class Peer {
   lastSend: number;
   /** Timestamp of last inbound recv (ms, for getpeerinfo.lastrecv). */
   lastRecv: number;
+  /** Local time (ms) when peer's VERSION message was processed. 0 until received. */
+  versionReceivedAt: number;
   /** Set of blocks in flight (hashes as hex strings) with request times. */
   blocksInFlight: Map<string, number>;
   /** Best known height from this peer (from version message or updates). */
@@ -230,6 +232,7 @@ export class Peer {
     this.bytesRecv = 0;
     this.lastSend = 0;
     this.lastRecv = 0;
+    this.versionReceivedAt = 0;
     this.blocksInFlight = new Map();
     this.bestKnownHeight = 0;
     this.wantsAddrV2 = false;
@@ -649,6 +652,7 @@ export class Peer {
 
         // Store their version payload
         this.versionPayload = versionPayload;
+        this.versionReceivedAt = Date.now();
         this.receivedVersion = true;
 
         // Send feature negotiation messages BEFORE verack (required by protocol)
