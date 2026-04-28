@@ -691,6 +691,22 @@ describe("empty payload messages", () => {
     const deserialized = deserializeMessage(header, payload);
     expect(deserialized.type).toBe("sendaddrv2");
   });
+
+  test("mempool round-trips correctly", () => {
+    // BIP-35: empty-payload request for peer's mempool contents.
+    const original: NetworkMessage = { type: "mempool", payload: null };
+
+    const serialized = serializeMessage(MAGIC, original);
+    const header = parseHeader(serialized)!;
+    const payload = serialized.subarray(MESSAGE_HEADER_SIZE);
+
+    expect(header.command).toBe("mempool");
+    expect(payload.length).toBe(0);
+
+    const deserialized = deserializeMessage(header, payload);
+    expect(deserialized.type).toBe("mempool");
+    expect(deserialized.payload).toBe(null);
+  });
 });
 
 describe("addr message", () => {

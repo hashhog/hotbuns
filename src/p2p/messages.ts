@@ -86,6 +86,7 @@ export type NetworkMessage =
   | { type: "feefilter"; payload: FeeFilterPayload }
   | { type: "wtxidrelay"; payload: null }
   | { type: "sendaddrv2"; payload: null }
+  | { type: "mempool"; payload: null }
   | { type: "cmpctblock"; payload: CmpctBlockPayload }
   | { type: "getblocktxn"; payload: GetBlockTxnPayload }
   | { type: "blocktxn"; payload: BlockTxnPayload }
@@ -1132,6 +1133,11 @@ export function serializeMessage(magic: number, msg: NetworkMessage): Buffer {
       command = "sendaddrv2";
       payload = Buffer.alloc(0);
       break;
+    case "mempool":
+      // BIP-35: Request peer to send invs of all mempool transactions.
+      command = "mempool";
+      payload = Buffer.alloc(0);
+      break;
     case "cmpctblock":
       command = "cmpctblock";
       payload = serializeCmpctBlockPayload(msg.payload);
@@ -1257,6 +1263,9 @@ export function deserializeMessage(header: MessageHeader, payload: Buffer): Netw
       return { type: "wtxidrelay", payload: null };
     case "sendaddrv2":
       return { type: "sendaddrv2", payload: null };
+    case "mempool":
+      // BIP-35: peer is requesting our mempool contents. Empty payload.
+      return { type: "mempool", payload: null };
     case "cmpctblock":
       return { type: "cmpctblock", payload: deserializeCmpctBlockPayload(reader) };
     case "getblocktxn":
