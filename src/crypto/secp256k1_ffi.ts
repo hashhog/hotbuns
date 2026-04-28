@@ -181,7 +181,7 @@ function initFFI(): boolean {
 FFI_AVAILABLE = initFFI();
 
 if (FFI_AVAILABLE) {
-  console.log("[secp256k1_ffi] libsecp256k1 0.5.0 FFI ready — ECDSA/Schnorr via C library");
+  console.error("[secp256k1_ffi] libsecp256k1 0.5.0 FFI ready — ECDSA/Schnorr via C library");
 } else {
   console.warn("[secp256k1_ffi] libsecp256k1 unavailable — callers fall back to @noble/curves");
 }
