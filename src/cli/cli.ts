@@ -20,7 +20,7 @@ import { BlockSync } from "../sync/blocks.js";
 import { RPCServer, type RPCServerConfig, type RPCServerDeps } from "../rpc/server.js";
 import { InventoryRelay } from "../p2p/relay.js";
 import { getTxId, getTxVSize } from "../validation/tx.js";
-import type { NetworkMessage } from "../p2p/messages.js";
+import { InvType, type NetworkMessage, type InvVector } from "../p2p/messages.js";
 import { Wallet } from "../wallet/wallet.js";
 import { MAINNET, TESTNET, TESTNET4, REGTEST, type ConsensusParams } from "../consensus/params.js";
 
@@ -1010,6 +1010,33 @@ async function startNode(config: NodeConfig): Promise<void> {
       const feeRate = entry ? entry.feeRate : 0;
       txRelay.queueTxToAllFiltered(txidHex, feeRate);
       console.log(`[mempool] Accepted tx ${txidHex.slice(0, 16)}... from ${peer.host}`);
+    }
+  });
+
+  // BIP-35: respond to "mempool" with one or more "inv" messages enumerating
+  // every txid in our mempool. Reference: bitcoin-core net_processing.cpp,
+  // ProcessMessage() handler for NetMsgType::MEMPOOL.
+  //
+  // Core gates this on the *local* node advertising NODE_BLOOM. hotbuns
+  // currently advertises NODE_NETWORK | NODE_WITNESS only (no NODE_BLOOM),
+  // so a strict reading of BIP-35 says we should ignore. We always-allow
+  // here because (a) hotbuns has no SPV/bloom infrastructure to gate on
+  // and (b) honoring mempool requests is harmless and useful for fleet
+  // local-peer IBD setups that probe each other's mempools.
+  // TODO: gate on NODE_BLOOM once hotbuns advertises it (or on a peer
+  // permission flag, once permissions are wired).
+  peerManager.onMessage("mempool", (peer: import("../p2p/peer.js").Peer, _msg: NetworkMessage) => {
+    const txids = mempool.getAllTxids();
+    if (txids.length === 0) return;
+    // bitcoin-core caps invs at MAX_INV_SZ = 50_000 entries per message.
+    const MAX_INV_PER_MESSAGE = 50_000;
+    for (let i = 0; i < txids.length; i += MAX_INV_PER_MESSAGE) {
+      const slice = txids.slice(i, i + MAX_INV_PER_MESSAGE);
+      const inventory: InvVector[] = slice.map((hash) => ({
+        type: InvType.MSG_WITNESS_TX,
+        hash,
+      }));
+      peer.send({ type: "inv", payload: { inventory } });
     }
   });
 
