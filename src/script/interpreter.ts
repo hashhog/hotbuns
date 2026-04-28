@@ -2114,7 +2114,7 @@ export function verifyScript(
  * Key-path: witness = [signature] (64 or 65 bytes)
  * Script-path: witness = [...stack, script, control_block] with optional annex
  */
-function verifyTaproot(
+export function verifyTaproot(
   scriptPubKey: Buffer,
   witness: Buffer[],
   flags: ScriptFlags,

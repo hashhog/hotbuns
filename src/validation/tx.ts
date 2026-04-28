@@ -10,7 +10,7 @@
  */
 
 import { BufferReader, BufferWriter, varIntSize } from "../wire/serialization.js";
-import { hash256, sha256Hash, ecdsaVerify, taggedHash } from "../crypto/primitives.js";
+import { hash256, sha256Hash, ecdsaVerify, schnorrVerify, taggedHash } from "../crypto/primitives.js";
 import type { UTXOEntry } from "../storage/database.js";
 
 /**
@@ -1170,7 +1170,13 @@ export interface TaprootSigHashCache {
  * @param cache - Cache for intermediate hashes
  * @returns 32-byte sighash
  */
-export function sigHashTaproot(
+/**
+ * Build the BIP-341 sigmsg preimage — the bytes fed into TapSighash tagged
+ * hash. Exposed so the bip341-vector-runner shim can validate the preimage
+ * against bitcoin-core's bip341_wallet_vectors.json before checking the
+ * final hash.
+ */
+export function sigMsgTaproot(
   tx: Transaction,
   inputIndex: number,
   prevOuts: { scriptPubKey: Buffer; value: bigint }[],
@@ -1189,36 +1195,22 @@ export function sigHashTaproot(
     throw new Error("prevOuts must have same length as inputs");
   }
 
-  // SIGHASH_DEFAULT (0x00) is treated as SIGHASH_ALL for computation purposes
   const effectiveHashType = hashType === SIGHASH_DEFAULT ? SIGHASH_ALL : hashType;
   const anyoneCanPay = (effectiveHashType & SIGHASH_ANYONECANPAY) !== 0;
   const sigHashBase = effectiveHashType & 0x1f;
 
-  // SIGHASH_SINGLE with inputIndex >= outputs requires valid output
   if (sigHashBase === SIGHASH_SINGLE && inputIndex >= tx.outputs.length) {
     throw new Error("SIGHASH_SINGLE with no corresponding output");
   }
 
-  // Build the preimage according to BIP-341
   const writer = new BufferWriter();
+  writer.writeUInt8(0x00); // epoch
+  writer.writeUInt8(hashType); // original, not effective
 
-  // Epoch (0x00)
-  writer.writeUInt8(0x00);
-
-  // Control:
-  // - hash_type (1 byte) - the original hashType, NOT effectiveHashType
-  writer.writeUInt8(hashType);
-
-  // Transaction data
-  // - nVersion (4 bytes)
   writer.writeInt32LE(tx.version);
-
-  // - nLockTime (4 bytes)
   writer.writeUInt32LE(tx.lockTime);
 
-  // If not ANYONECANPAY:
   if (!anyoneCanPay) {
-    // sha_prevouts (32 bytes): SHA256 of all input outpoints
     if (!cache.shaPrevouts) {
       const prevoutsWriter = new BufferWriter();
       for (const input of tx.inputs) {
@@ -1229,7 +1221,6 @@ export function sigHashTaproot(
     }
     writer.writeBytes(cache.shaPrevouts);
 
-    // sha_amounts (32 bytes): SHA256 of all input amounts
     if (!cache.shaAmounts) {
       const amountsWriter = new BufferWriter();
       for (const prevOut of prevOuts) {
@@ -1239,7 +1230,6 @@ export function sigHashTaproot(
     }
     writer.writeBytes(cache.shaAmounts);
 
-    // sha_scriptpubkeys (32 bytes): SHA256 of all scriptPubKeys (each prefixed with compact size)
     if (!cache.shaScriptPubKeys) {
       const spkWriter = new BufferWriter();
       for (const prevOut of prevOuts) {
@@ -1249,7 +1239,6 @@ export function sigHashTaproot(
     }
     writer.writeBytes(cache.shaScriptPubKeys);
 
-    // sha_sequences (32 bytes): SHA256 of all input sequences
     if (!cache.shaSequences) {
       const seqWriter = new BufferWriter();
       for (const input of tx.inputs) {
@@ -1260,9 +1249,7 @@ export function sigHashTaproot(
     writer.writeBytes(cache.shaSequences);
   }
 
-  // If not SIGHASH_NONE and not SIGHASH_SINGLE:
   if (sigHashBase !== SIGHASH_NONE && sigHashBase !== SIGHASH_SINGLE) {
-    // sha_outputs (32 bytes): SHA256 of all outputs
     if (!cache.shaOutputs) {
       const outputsWriter = new BufferWriter();
       for (const output of tx.outputs) {
@@ -1274,44 +1261,27 @@ export function sigHashTaproot(
     writer.writeBytes(cache.shaOutputs);
   }
 
-  // spend_type (1 byte):
-  // - bits 0-1: ext_flag
-  // - bit 2: set if annex is present
   const hasAnnex = annexHash !== undefined;
   const spendType = (extFlag * 2) | (hasAnnex ? 1 : 0);
   writer.writeUInt8(spendType);
 
-  // Input-specific data
   if (anyoneCanPay) {
-    // If ANYONECANPAY, include this input's data directly
     const currentInput = tx.inputs[inputIndex];
     const currentPrevOut = prevOuts[inputIndex];
-
-    // outpoint (36 bytes)
     writer.writeHash(currentInput.prevOut.txid);
     writer.writeUInt32LE(currentInput.prevOut.vout);
-
-    // amount (8 bytes)
     writer.writeUInt64LE(currentPrevOut.value);
-
-    // scriptPubKey (compact size + script)
     writer.writeVarBytes(currentPrevOut.scriptPubKey);
-
-    // nSequence (4 bytes)
     writer.writeUInt32LE(currentInput.sequence);
   } else {
-    // input_index (4 bytes)
     writer.writeUInt32LE(inputIndex);
   }
 
-  // If annex is present, include its hash
   if (hasAnnex && annexHash) {
     writer.writeBytes(annexHash);
   }
 
-  // Output-specific data for SIGHASH_SINGLE
   if (sigHashBase === SIGHASH_SINGLE) {
-    // sha_single_output (32 bytes): SHA256 of the corresponding output
     const output = tx.outputs[inputIndex];
     const outputWriter = new BufferWriter();
     outputWriter.writeUInt64LE(output.value);
@@ -1320,21 +1290,35 @@ export function sigHashTaproot(
     writer.writeBytes(shaSingleOutput);
   }
 
-  // Extension data for script-path spending (ext_flag == 1)
   if (extFlag === 1) {
     if (tapLeafHash === undefined || keyVersion === undefined) {
       throw new Error("tapLeafHash and keyVersion required for script-path");
     }
-    // tapleaf_hash (32 bytes)
     writer.writeBytes(tapLeafHash);
-    // key_version (1 byte)
     writer.writeUInt8(keyVersion);
-    // codesep_pos (4 bytes)
     writer.writeUInt32LE(codeSepPos);
   }
 
-  // Apply tagged hash with "TapSighash"
-  return taggedHash("TapSighash", writer.toBuffer());
+  return writer.toBuffer();
+}
+
+export function sigHashTaproot(
+  tx: Transaction,
+  inputIndex: number,
+  prevOuts: { scriptPubKey: Buffer; value: bigint }[],
+  hashType: number,
+  extFlag: number,
+  annexHash: Buffer | undefined,
+  tapLeafHash: Buffer | undefined,
+  keyVersion: number | undefined,
+  codeSepPos: number,
+  cache: TaprootSigHashCache
+): Buffer {
+  const msg = sigMsgTaproot(
+    tx, inputIndex, prevOuts, hashType, extFlag,
+    annexHash, tapLeafHash, keyVersion, codeSepPos, cache
+  );
+  return taggedHash("TapSighash", msg);
 }
 
 /**
@@ -1392,15 +1376,25 @@ export function sigHashTaprootScriptPath(
 }
 
 /**
- * Verify a single input script (simplified P2PKH/P2WPKH verification).
+ * Verify a single input script (P2PKH / P2WPKH / P2TR — others fall through).
  *
  * For P2WPKH: witness[0] = signature (DER + sighash), witness[1] = pubkey
+ * For P2TR: witness[0] = Schnorr sig (key-path) or {…, script, control_block}
+ *           (script-path); annex if last element starts with 0x50.
+ *
+ * @param utxos - all of the spending tx's prev-outputs, in input order. Required
+ *   so P2TR sighash can hash sha_amounts + sha_scriptpubkeys over every input
+ *   per BIP-341. Pass null/undefined for legacy/segwit-v0-only call sites.
+ * @param taprootCache - shared per-tx cache of sha_prevouts/amounts/scriptpubkeys/
+ *   sequences/outputs so multiple Taproot inputs in the same tx don't recompute.
  */
 export function verifyInputSignature(
   tx: Transaction,
   inputIndex: number,
   utxo: UTXOEntry,
-  cache: SigHashCache
+  cache: SigHashCache,
+  utxos?: UTXOEntry[],
+  taprootCache?: TaprootSigHashCache
 ): InputVerifyResult {
   const input = tx.inputs[inputIndex];
   const scriptPubKey = utxo.scriptPubKey;
@@ -1498,7 +1492,75 @@ export function verifyInputSignature(
     return { valid: true, inputIndex };
   }
 
-  // For other script types, skip verification (would need full script interpreter)
+  // BIP-341 P2TR: OP_1 <32 bytes>
+  if (scriptPubKey.length === 34 &&
+      scriptPubKey[0] === 0x51 &&
+      scriptPubKey[1] === 0x20) {
+    if (input.scriptSig.length !== 0) {
+      return { valid: false, inputIndex, error: "Taproot input must have empty scriptSig" };
+    }
+    if (input.witness.length === 0) {
+      return { valid: false, inputIndex, error: "Taproot witness empty" };
+    }
+    if (!utxos || utxos.length !== tx.inputs.length) {
+      // Fail-closed: previously this returned { valid: true } silently for any
+      // non-PKH script type (BIP-341 P0). Without per-input prevouts we can't
+      // compute sha_amounts/sha_scriptpubkeys, so we can't verify the Schnorr
+      // sig. Refuse rather than accept-anything.
+      return { valid: false, inputIndex, error: "Taproot verify requires all prev-outputs" };
+    }
+
+    // Detect annex (last witness element starting with 0x50 when stack has >= 2 items)
+    let annexHash: Buffer | undefined = undefined;
+    if (input.witness.length >= 2) {
+      const last = input.witness[input.witness.length - 1];
+      if (last.length > 0 && last[0] === 0x50) {
+        // BIP-341 sha_annex = sha256(compact_size(annex_len) || annex)
+        const annexW = new BufferWriter();
+        annexW.writeVarBytes(last);
+        annexHash = sha256Hash(annexW.toBuffer());
+      }
+    }
+
+    const prevOuts = utxos.map(u => ({
+      scriptPubKey: u.scriptPubKey,
+      value: u.amount,
+    }));
+    const tprCache = taprootCache ?? {};
+
+    // Build TaprootContext closures over this input's prevouts + annex.
+    // verifyTaproot in the interpreter handles BIP-341 dispatch (key-path
+    // vs script-path) + control-block walk + tapscript exec.
+    const taprootCtx = {
+      keyPathSigHasher: (hashType: number) =>
+        sigHashTaproot(tx, inputIndex, prevOuts, hashType, 0,
+          annexHash, undefined, undefined, 0xffffffff, tprCache),
+      scriptPathSigHasher: (hashType: number, leafHash: Buffer, codeSepPos: number) =>
+        sigHashTaproot(tx, inputIndex, prevOuts, hashType, 1,
+          annexHash, leafHash, 0x00, codeSepPos, tprCache),
+    };
+
+    // Lazy require to avoid a circular import (interpreter.ts ↔ tx.ts).
+    const interp = require("../script/interpreter.js") as typeof import("../script/interpreter.js");
+    const flags = interp.getConsensusFlags(709632); // height-independent: Taproot active
+
+    try {
+      const ok = interp.verifyTaproot(scriptPubKey, input.witness, flags, taprootCtx);
+      if (!ok) {
+        return { valid: false, inputIndex, error: "Taproot verify returned false" };
+      }
+      return { valid: true, inputIndex };
+    } catch (e) {
+      return {
+        valid: false,
+        inputIndex,
+        error: `Taproot verify failed: ${(e as Error).message}`,
+      };
+    }
+  }
+
+  // P2WSH and P2SH still fall through unverified — separate consensus gap
+  // documented in PARITY-MATRIX.md. Out of scope for this Taproot P0 commit.
   return { valid: true, inputIndex };
 }
 
@@ -1524,10 +1586,12 @@ export async function verifyAllInputsParallel(
 
   // Create shared sighash cache for BIP-143
   const cache: SigHashCache = {};
+  // Shared per-tx Taproot sighash cache (sha_prevouts/amounts/scriptpubkeys/...)
+  const taprootCache: TaprootSigHashCache = {};
 
   // Create verification promises for each input
   const verifyPromises = tx.inputs.map((_, index) =>
-    Promise.resolve(verifyInputSignature(tx, index, utxos[index], cache))
+    Promise.resolve(verifyInputSignature(tx, index, utxos[index], cache, utxos, taprootCache))
   );
 
   // Run all verifications in parallel
@@ -1567,10 +1631,12 @@ export function verifyAllInputsSequential(
 
   // Create shared sighash cache for BIP-143
   const cache: SigHashCache = {};
+  // Shared per-tx Taproot sighash cache.
+  const taprootCache: TaprootSigHashCache = {};
 
   // Verify each input
   for (let i = 0; i < tx.inputs.length; i++) {
-    const result = verifyInputSignature(tx, i, utxos[i], cache);
+    const result = verifyInputSignature(tx, i, utxos[i], cache, utxos, taprootCache);
     if (!result.valid) {
       return {
         valid: false,
