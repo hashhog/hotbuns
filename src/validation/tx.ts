@@ -1559,9 +1559,84 @@ export function verifyInputSignature(
     }
   }
 
-  // P2WSH and P2SH still fall through unverified — separate consensus gap
-  // documented in PARITY-MATRIX.md. Out of scope for this Taproot P0 commit.
-  return { valid: true, inputIndex };
+  // Everything else (P2WSH, P2SH, P2SH-wrapped SegWit, P2A, unknown
+  // witness versions, bare scripts, …) — route to the full script
+  // interpreter. Pre-fix this branch returned `{ valid: true }` for
+  // any non-PKH/P2TR script type, silently accepting all P2WSH/P2SH
+  // inputs at consensus level.
+  if (!utxos || utxos.length !== tx.inputs.length) {
+    return { valid: false, inputIndex, error: "Script verify requires all prev-outputs" };
+  }
+
+  const interp = require("../script/interpreter.js") as typeof import("../script/interpreter.js");
+  // Mainnet-active flags. Hard-coded to a height past every soft-fork
+  // activation; this entry point is reached after assumevalid + height
+  // checks anyway, so a height-conditional flag set isn't needed here.
+  // (TODO: thread the actual block height in if any caller wants
+  // pre-soft-fork validation.)
+  const flags = interp.getConsensusFlags(709632);
+
+  const tprCache = taprootCache ?? {};
+  const prevOuts = utxos.map(u => ({
+    scriptPubKey: u.scriptPubKey,
+    value: u.amount,
+  }));
+
+  // Detect annex (Taproot only — harmless for non-Taproot scripts since
+  // the interpreter ignores taprootCtx unless scriptPubKey is P2TR).
+  let annexHash: Buffer | undefined = undefined;
+  if (input.witness.length >= 2) {
+    const last = input.witness[input.witness.length - 1];
+    if (last.length > 0 && last[0] === 0x50) {
+      const annexW = new BufferWriter();
+      annexW.writeVarBytes(last);
+      annexHash = sha256Hash(annexW.toBuffer());
+    }
+  }
+
+  const legacySigHasher = (subscript: Buffer, hashType: number) =>
+    sigHashLegacy(tx, inputIndex, subscript, hashType);
+
+  const witnessSigHasher = (scriptCode: Buffer, hashType: number) =>
+    sigHashWitnessV0Cached(tx, inputIndex, scriptCode, utxo.amount, hashType, cache);
+
+  const taprootCtx = {
+    keyPathSigHasher: (hashType: number) =>
+      sigHashTaproot(tx, inputIndex, prevOuts, hashType, 0,
+        annexHash, undefined, undefined, 0xffffffff, tprCache),
+    scriptPathSigHasher: (hashType: number, leafHash: Buffer, codeSepPos: number) =>
+      sigHashTaproot(tx, inputIndex, prevOuts, hashType, 1,
+        annexHash, leafHash, 0x00, codeSepPos, tprCache),
+  };
+
+  const txContext = {
+    txVersion: tx.version,
+    txLockTime: tx.lockTime,
+    txSequence: input.sequence,
+  };
+
+  try {
+    const ok = interp.verifyScript(
+      input.scriptSig,
+      scriptPubKey,
+      input.witness,
+      flags,
+      legacySigHasher,
+      taprootCtx,
+      txContext,
+      witnessSigHasher,
+    );
+    if (!ok) {
+      return { valid: false, inputIndex, error: "Script verify returned false" };
+    }
+    return { valid: true, inputIndex };
+  } catch (e) {
+    return {
+      valid: false,
+      inputIndex,
+      error: `Script verify failed: ${(e as Error).message}`,
+    };
+  }
 }
 
 /**
