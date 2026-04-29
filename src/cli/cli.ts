@@ -54,6 +54,16 @@ export interface NodeConfig {
    * 0 / undefined = use hardware default.
    */
   scriptThreads?: number;
+  /**
+   * Whether we advertise NODE_BLOOM (service bit 4) and therefore honor
+   * BIP-35 "mempool" requests.  Mirrors Bitcoin Core's `-peerbloomfilters`.
+   * Default true, matching Core's current default and the BIP-111 wire
+   * advertisement.
+   *
+   * Reference: bitcoin-core net_processing.cpp ProcessMessage() handler
+   * for NetMsgType::MEMPOOL — the gate is `peer.m_our_services & NODE_BLOOM`.
+   */
+  peerBloomFilters: boolean;
 }
 
 /**
@@ -79,6 +89,7 @@ const DEFAULT_CONFIG: NodeConfig = {
   port: 8333,
   metricsPort: 9332,
   logLevel: "info",
+  peerBloomFilters: true,
 };
 
 /**
@@ -215,6 +226,16 @@ export function parseArgs(argv: string[]): ParsedArgs {
             if (!isNaN(n) && n >= 0) config.scriptThreads = n;
           }
           break;
+        case "peerbloomfilters":
+        case "peer-bloom-filters":
+          // Bitcoin Core flag `-peerbloomfilters`.  Accept 0/1, true/false,
+          // and the bare `--peerbloomfilters` (treated as true).
+          if (value === undefined || value === "1" || value === "true") {
+            config.peerBloomFilters = true;
+          } else if (value === "0" || value === "false") {
+            config.peerBloomFilters = false;
+          }
+          break;
         case "password":
           // For wallet commands
           if (value) remainingArgs.push(`--password=${value}`);
@@ -337,6 +358,9 @@ export async function loadConfig(datadir: string): Promise<Partial<NodeConfig>> 
           if (!isNaN(pruneVal) && pruneVal >= 0) {
             config.prune = pruneVal;
           }
+          break;
+        case "peerbloomfilters":
+          config.peerBloomFilters = value === "1" || value === "true";
           break;
       }
     }
@@ -912,11 +936,21 @@ async function runUtxoImport(
 async function startNode(config: NodeConfig): Promise<void> {
   console.log("hotbuns v0.1.0 starting...");
 
-  const params = getParams(config.network);
+  const baseParams = getParams(config.network);
 
   // 1. Load or create config file
   const fileConfig = await loadConfig(config.datadir);
   const mergedConfig = { ...config, ...fileConfig };
+
+  // BIP-35 / BIP-111: when peerBloomFilters is enabled (Core default), we
+  // OR NODE_BLOOM (=4) into the advertised services word.  This is the
+  // single source of truth gate that the BIP-35 mempool handler below
+  // checks before honoring an inbound `mempool` request.  Mirrors
+  // Bitcoin Core net.cpp Init: `nLocalServices |= NODE_BLOOM;`.
+  const NODE_BLOOM_BIT = 4n;
+  const params: import("../consensus/params.js").ConsensusParams = mergedConfig.peerBloomFilters
+    ? { ...baseParams, services: baseParams.services | NODE_BLOOM_BIT }
+    : baseParams;
 
   // 2. Open the database
   const dbPath = path.join(mergedConfig.datadir, "blocks.db");
@@ -1017,19 +1051,37 @@ async function startNode(config: NodeConfig): Promise<void> {
   // every txid in our mempool. Reference: bitcoin-core net_processing.cpp,
   // ProcessMessage() handler for NetMsgType::MEMPOOL.
   //
-  // Core gates this on the *local* node advertising NODE_BLOOM. hotbuns
-  // currently advertises NODE_NETWORK | NODE_WITNESS only (no NODE_BLOOM),
-  // so a strict reading of BIP-35 says we should ignore. We always-allow
-  // here because (a) hotbuns has no SPV/bloom infrastructure to gate on
-  // and (b) honoring mempool requests is harmless and useful for fleet
-  // local-peer IBD setups that probe each other's mempools.
-  // TODO: gate on NODE_BLOOM once hotbuns advertises it (or on a peer
-  // permission flag, once permissions are wired).
+  // Core's gate (net_processing.cpp ~line 4855):
+  //   if (!(peer->m_our_services & NODE_BLOOM)
+  //       && !pfrom.HasPermission(NetPermissionFlags::Mempool))
+  //     return;
+  //
+  // hotbuns has no per-peer permission system, so we collapse the gate to
+  // just "did *we* advertise NODE_BLOOM?" — the same boolean we used to
+  // OR the bit into params.services above (mergedConfig.peerBloomFilters).
+  // When the gate is closed we silently drop the message; we deliberately
+  // do NOT disconnect the peer (Core's `pfrom.fDisconnect = true` branch)
+  // because hotbuns lacks a NoBan permission distinction and a sloppy
+  // disconnect on every spurious mempool ping would churn the fleet.
+  const advertisingNodeBloom = (params.services & NODE_BLOOM_BIT) !== 0n;
+  // bitcoin-core caps invs at MAX_INV_SZ = 50_000 entries per message.
+  const MAX_INV_PER_MESSAGE = 50_000;
   peerManager.onMessage("mempool", (peer: import("../p2p/peer.js").Peer, _msg: NetworkMessage) => {
+    if (!advertisingNodeBloom) {
+      // BIP-35 gate closed: we never advertised NODE_BLOOM, so honoring
+      // a mempool request would be a protocol surprise. Drop and return.
+      return;
+    }
     const txids = mempool.getAllTxids();
     if (txids.length === 0) return;
-    // bitcoin-core caps invs at MAX_INV_SZ = 50_000 entries per message.
-    const MAX_INV_PER_MESSAGE = 50_000;
+    // BIP-339 (wtxid relay) is negotiated per-peer with `wtxidrelay`. When
+    // the peer signaled wtxidrelay we should announce by witness txid using
+    // MSG_WTX (=5); otherwise BIP-144 MSG_WITNESS_TX (=0x40000001) is the
+    // legacy witness-aware advertisement. hotbuns does not yet track
+    // per-peer wtxidrelay state, so we conservatively advertise as
+    // MSG_WITNESS_TX — matches the existing relay path and is what Core
+    // emits for non-wtxidrelay peers (sans the witness flag, which we set
+    // to keep witness-capable receivers happy).
     for (let i = 0; i < txids.length; i += MAX_INV_PER_MESSAGE) {
       const slice = txids.slice(i, i + MAX_INV_PER_MESSAGE);
       const inventory: InvVector[] = slice.map((hash) => ({

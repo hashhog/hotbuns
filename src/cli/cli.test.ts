@@ -193,6 +193,29 @@ describe("parseArgs", () => {
     expect(result.config.maxOutbound).toBe(8);
     expect(result.config.listen).toBe(true);
     expect(result.config.logLevel).toBe("info");
+    // BIP-35 / BIP-111: NODE_BLOOM advertisement defaults to ON, matching
+    // Bitcoin Core's `-peerbloomfilters=1` default.
+    expect(result.config.peerBloomFilters).toBe(true);
+  });
+
+  test("parses --peerbloomfilters=0 flag (disable BIP-35 gate)", () => {
+    const result = parseArgs(["bun", "script.ts", "--peerbloomfilters=0"]);
+    expect(result.config.peerBloomFilters).toBe(false);
+  });
+
+  test("parses --peerbloomfilters=1 flag (explicit enable)", () => {
+    const result = parseArgs(["bun", "script.ts", "--peerbloomfilters=1"]);
+    expect(result.config.peerBloomFilters).toBe(true);
+  });
+
+  test("parses --peer-bloom-filters=false (kebab-case alias)", () => {
+    const result = parseArgs(["bun", "script.ts", "--peer-bloom-filters=false"]);
+    expect(result.config.peerBloomFilters).toBe(false);
+  });
+
+  test("parses bare --peerbloomfilters as enable", () => {
+    const result = parseArgs(["bun", "script.ts", "--peerbloomfilters"]);
+    expect(result.config.peerBloomFilters).toBe(true);
   });
 });
 
@@ -266,6 +289,22 @@ rpcuser=bob
     const stat = await fs.promises.stat(subDir);
     expect(stat.isDirectory()).toBe(true);
   });
+
+  test("parses peerbloomfilters=0 in config file", async () => {
+    const configPath = path.join(tempDir, "hotbuns.conf");
+    await Bun.write(configPath, `peerbloomfilters=0\n`);
+
+    const config = await loadConfig(tempDir);
+    expect(config.peerBloomFilters).toBe(false);
+  });
+
+  test("parses peerbloomfilters=1 in config file", async () => {
+    const configPath = path.join(tempDir, "hotbuns.conf");
+    await Bun.write(configPath, `peerbloomfilters=1\n`);
+
+    const config = await loadConfig(tempDir);
+    expect(config.peerBloomFilters).toBe(true);
+  });
 });
 
 describe("formatRpcRequest", () => {
@@ -281,6 +320,7 @@ describe("formatRpcRequest", () => {
       port: 8333,
       logLevel: "info" as const,
       metricsPort: 0,
+      peerBloomFilters: true,
     };
 
     const request = formatRpcRequest(config, "getblockchaininfo", []);
@@ -308,6 +348,7 @@ describe("formatRpcRequest", () => {
       port: 18333,
       logLevel: "info" as const,
       metricsPort: 0,
+      peerBloomFilters: true,
     };
 
     const request = formatRpcRequest(config, "getblock", ["abc123", 1]);
@@ -329,6 +370,7 @@ describe("formatRpcRequest", () => {
       port: 8333,
       logLevel: "info" as const,
       metricsPort: 0,
+      peerBloomFilters: true,
     };
 
     const request = formatRpcRequest(config, "test", []);
