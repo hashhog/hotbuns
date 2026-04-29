@@ -21,7 +21,7 @@ import {
   hasShortId,
   getShortId,
 } from "../p2p/bip324/message_ids.js";
-import { V2Transport, RecvState } from "../p2p/v2_transport.js";
+import { V2Transport, looksLikeV1Version } from "../p2p/v2_transport.js";
 
 // Mainnet network magic for test vectors
 const MAINNET_MAGIC = Buffer.from([0xf9, 0xbe, 0xb4, 0xd9]);
@@ -418,86 +418,171 @@ describe("BIP324Cipher", () => {
 
 // ============================================================================
 // V2Transport Tests
-// TODO: These tests require random key generation via ellswiftCreate, which
-// needs the full ElligatorSwift inverse implementation. For now, we skip them.
-// The core crypto is tested via test vectors above.
+//
+// Exercises the full state machine — key exchange, garbage handshake, version
+// packet, and application encryption — with real ElligatorSwift key
+// generation.  Each transport queues its own handshake bytes via
+// consumeSendBuffer(), matching the inbound + outbound dial paths in
+// p2p/peer.ts.
 // ============================================================================
 
-describe.skip("V2Transport", () => {
-  test("handshake bytes are 64 bytes + garbage", () => {
+describe("V2Transport", () => {
+  test("initiator queues key + garbage on construction", () => {
     const transport = new V2Transport(MAINNET_MAGIC, true);
-    const handshake = transport.getHandshakeBytes();
+    const handshake = transport.consumeSendBuffer();
 
-    // Should be at least 64 bytes (key), garbage is 0 to MAX_GARBAGE_LEN
+    // Key (64) + 0..MAX_GARBAGE_LEN garbage.
     expect(handshake.length).toBeGreaterThanOrEqual(64);
+    expect(transport.isReady()).toBe(false); // cipher not yet initialized
+  });
+
+  test("responder defers send buffer until peer key arrives", () => {
+    const transport = new V2Transport(MAINNET_MAGIC, false);
+    expect(transport.consumeSendBuffer().length).toBe(0);
+    expect(transport.isReady()).toBe(false);
   });
 
   test("v1 detection works for responder", () => {
     const transport = new V2Transport(MAINNET_MAGIC, false);
 
-    // Send v1 magic
-    const v1Data = Buffer.concat([MAINNET_MAGIC, Buffer.alloc(20)]);
+    // Send v1 magic + version command (full 16-byte v1 prefix).
+    const v1Data = Buffer.concat([
+      MAINNET_MAGIC,
+      Buffer.from([0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0, 0, 0, 0, 0]),
+    ]);
     const result = transport.receiveBytes(v1Data);
 
     expect(result.fallbackV1).toBe(true);
     expect(transport.shouldFallbackV1()).toBe(true);
   });
 
+  test("looksLikeV1Version classifies wire correctly", () => {
+    // Real v1 VERSION prefix: magic + "version\0\0\0\0\0".
+    const v1 = Buffer.concat([
+      MAINNET_MAGIC,
+      Buffer.from([0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0, 0, 0, 0, 0]),
+    ]);
+    expect(looksLikeV1Version(v1, MAINNET_MAGIC)).toBe(true);
+
+    // Right magic, wrong command (e.g. peer kicks off with "ping\0...").
+    const wrongCmd = Buffer.concat([
+      MAINNET_MAGIC,
+      Buffer.from([0x70, 0x69, 0x6e, 0x67, 0, 0, 0, 0, 0, 0, 0, 0]),
+    ]);
+    expect(looksLikeV1Version(wrongCmd, MAINNET_MAGIC)).toBe(false);
+
+    // Random 16 bytes (e.g. start of a v2 ellswift pubkey).
+    const random = Buffer.from(
+      "deadbeefcafebabefacefeed0011223344556677",
+      "hex"
+    ).subarray(0, 16);
+    expect(looksLikeV1Version(random, MAINNET_MAGIC)).toBe(false);
+
+    // Insufficient bytes.
+    expect(looksLikeV1Version(Buffer.from([0xf9, 0xbe]), MAINNET_MAGIC)).toBe(false);
+  });
+
   test("full handshake between two transports", () => {
     const initiator = new V2Transport(MAINNET_MAGIC, true);
     const responder = new V2Transport(MAINNET_MAGIC, false);
 
-    // Initiator sends key + garbage
-    const initiatorHandshake = initiator.getHandshakeBytes();
+    // Initiator: pubkey + garbage queued automatically.
+    const initToResp1 = initiator.consumeSendBuffer();
 
-    // Responder receives and processes
-    let result = responder.receiveBytes(initiatorHandshake);
-    expect(result.fallbackV1).toBe(false);
-
-    // Responder sends key + garbage + terminator
-    const responderHandshake = responder.getHandshakeBytes();
-    const responderTerminator = responder.getGarbageTerminator();
-
-    // Initiator receives responder's handshake
-    result = initiator.receiveBytes(Buffer.concat([responderHandshake, responderTerminator]));
-    expect(result.fallbackV1).toBe(false);
-    expect(initiator.isReady()).toBe(true);
-
-    // Initiator sends terminator
-    const initiatorTerminator = initiator.getGarbageTerminator();
-    result = responder.receiveBytes(initiatorTerminator);
+    // Responder: process initiator's key + garbage; this triggers it to
+    // queue (responder pubkey + garbage + terminator + version packet).
+    let r = responder.receiveBytes(initToResp1);
+    expect(r.fallbackV1).toBe(false);
+    const respToInit1 = responder.consumeSendBuffer();
+    // Responder cipher is now initialized.
     expect(responder.isReady()).toBe(true);
+    expect(responder.isHandshakeReady()).toBe(true);
 
-    // Both should have the same session ID
+    // Initiator: process responder's reply.  This advances initiator past
+    // KEY → GARB_GARBTERM → VERSION.  After draining the responder's first
+    // application packet (the version packet), the initiator emits its
+    // own terminator + version packet.
+    r = initiator.receiveBytes(respToInit1);
+    expect(r.fallbackV1).toBe(false);
+    const initToResp2 = initiator.consumeSendBuffer();
+    expect(initiator.isReady()).toBe(true);
+    expect(initiator.isHandshakeReady()).toBe(true);
+    expect(initiator.isVersionReceived()).toBe(true);
+
+    // Responder: process initiator's terminator + version packet.
+    r = responder.receiveBytes(initToResp2);
+    expect(r.fallbackV1).toBe(false);
+    expect(responder.isVersionReceived()).toBe(true);
+
+    // Same session ID on both sides.
     expect(initiator.getSessionId().equals(responder.getSessionId())).toBe(true);
   });
 
-  test("message encryption and decryption works", () => {
+  test("application messages encrypt + decrypt across the handshake", () => {
     const initiator = new V2Transport(MAINNET_MAGIC, true);
     const responder = new V2Transport(MAINNET_MAGIC, false);
 
-    // Complete handshake
-    const initiatorHandshake = initiator.getHandshakeBytes();
-    responder.receiveBytes(initiatorHandshake);
+    // Drive handshake.
+    responder.receiveBytes(initiator.consumeSendBuffer());
+    initiator.receiveBytes(responder.consumeSendBuffer());
+    responder.receiveBytes(initiator.consumeSendBuffer());
 
-    const responderHandshake = responder.getHandshakeBytes();
-    const responderTerminator = responder.getGarbageTerminator();
-    initiator.receiveBytes(Buffer.concat([responderHandshake, responderTerminator]));
+    // Send application "ping" from initiator → responder.
+    const pingPayload = Buffer.from([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+    const pingCt = initiator.encryptMessage("ping", pingPayload);
+    responder.receiveBytes(pingCt);
 
-    const initiatorTerminator = initiator.getGarbageTerminator();
-    responder.receiveBytes(initiatorTerminator);
-
-    // Initiator sends a message
-    const payload = Buffer.from([0x01, 0x02, 0x03]);
-    const encrypted = initiator.encryptMessage("ping", payload);
-
-    // Responder receives and decrypts
-    responder.receiveBytes(encrypted);
     const messages = responder.getReceivedMessages();
-
     expect(messages.length).toBe(1);
     expect(messages[0].type).toBe("ping");
-    expect(messages[0].payload.equals(payload)).toBe(true);
+    expect(messages[0].payload.equals(pingPayload)).toBe(true);
+    expect(messages[0].ignore).toBe(false);
+  });
+
+  test("multiple application messages preserve ordering and FSChaCha20 continuity", () => {
+    const initiator = new V2Transport(MAINNET_MAGIC, true);
+    const responder = new V2Transport(MAINNET_MAGIC, false);
+
+    responder.receiveBytes(initiator.consumeSendBuffer());
+    initiator.receiveBytes(responder.consumeSendBuffer());
+    responder.receiveBytes(initiator.consumeSendBuffer());
+
+    // Send 8 successive packets — exercises FSChaCha20 length-cipher
+    // continuous-keystream behaviour (multiple 3-byte length encryptions
+    // share a single keystream within the rekey epoch).
+    for (let i = 0; i < 8; i++) {
+      const payload = Buffer.from([i, i + 1, i + 2]);
+      const ct = initiator.encryptMessage("pong", payload);
+      responder.receiveBytes(ct);
+    }
+
+    const messages = responder.getReceivedMessages();
+    expect(messages.length).toBe(8);
+    for (let i = 0; i < 8; i++) {
+      expect(messages[i].type).toBe("pong");
+      expect(messages[i].payload.equals(Buffer.from([i, i + 1, i + 2]))).toBe(true);
+    }
+  });
+
+  test("decoy (IGNORE bit) packets are dropped without surfacing", () => {
+    const initiator = new V2Transport(MAINNET_MAGIC, true);
+    const responder = new V2Transport(MAINNET_MAGIC, false);
+
+    responder.receiveBytes(initiator.consumeSendBuffer());
+    initiator.receiveBytes(responder.consumeSendBuffer());
+    responder.receiveBytes(initiator.consumeSendBuffer());
+
+    // Send a decoy followed by a real ping.
+    const decoy = initiator.encryptMessage("ping", Buffer.from([0xff]), true);
+    const realPayload = Buffer.from([0xaa, 0xbb]);
+    const real = initiator.encryptMessage("ping", realPayload);
+
+    responder.receiveBytes(Buffer.concat([decoy, real]));
+
+    const messages = responder.getReceivedMessages();
+    expect(messages.length).toBe(1);
+    expect(messages[0].type).toBe("ping");
+    expect(messages[0].payload.equals(realPayload)).toBe(true);
   });
 });
 
