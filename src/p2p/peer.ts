@@ -858,6 +858,16 @@ export class Peer {
     // VERSION exactly once.  sendVersionMessage flips versionSent
     // internally (idempotence guard).
     if (this.v2Transport.isHandshakeReady() && !this.versionSent) {
+      // Positive v2-success log so the cross-impl BIP-324 interop matrix
+      // harness can classify hotbuns pairs as v2 instead of "unknown"
+      // (Phase D parity fix).  Fires once per Peer because !versionSent
+      // is the same one-shot guard as the sendVersionMessage call below.
+      // Direction is determined by the V2Transport role (initiator =
+      // outbound, responder = inbound).
+      const dir = this.v2Transport.isInitiator() ? "outbound" : "inbound";
+      console.log(
+        `[bip324] v2 ${dir} connected (encrypted) peer=${this.host}:${this.port}`
+      );
       this.sendVersionMessage();
     }
 
