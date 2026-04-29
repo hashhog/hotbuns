@@ -15,8 +15,15 @@ import {
   parseHeader,
   serializeMessage,
   deserializeMessage,
+  deserializeV2Message,
+  extractCommandAndPayload,
   ipv4ToBuffer,
 } from "./messages.js";
+import {
+  V2Transport,
+  V1_PREFIX_LEN,
+  looksLikeV1Version,
+} from "./v2_transport.js";
 
 /** State of a peer connection. */
 export type PeerState = "connecting" | "handshaking" | "connected" | "disconnected";
@@ -200,6 +207,35 @@ export class Peer {
   /** Set of known local nonces (for self-connection detection). */
   private static localNonces: Set<bigint> = new Set();
 
+  /**
+   * Transport mode for this peer.
+   *
+   * - "unknown" — inbound only, before we've classified the wire as v1 or v2.
+   *   The recv buffer accumulates bytes; we peek the first 16 bytes to
+   *   decide.  Outbound peers default to "v1" since this implementation
+   *   does not yet initiate v2 (see outbound audit in commit message).
+   * - "v1" — plaintext Bitcoin Core protocol (the historical default).
+   * - "v2" — BIP-324 encrypted transport.  All sends/receives go through
+   *   {@link v2Transport}.
+   */
+  private transportMode: "unknown" | "v1" | "v2";
+
+  /** V2 transport state machine, populated when transportMode === "v2". */
+  private v2Transport: V2Transport | null;
+
+  /** Network magic in 4-byte little-endian form (for v1/v2 classification). */
+  private magicLE: Buffer;
+
+  /**
+   * Whether we have already emitted our application-layer VERSION.
+   * v1 path: sendVersionMessage is called from connect() (outbound) or
+   * after the magic-bytes classification (inbound).
+   * v2 path: sendVersionMessage is deferred until the cipher handshake
+   * has produced symmetric keys and queued our outbound version packet
+   * (so the v1-formatted VERSION rides through the encrypted channel).
+   */
+  private versionSent: boolean;
+
   constructor(config: PeerConfig, events: PeerEvents, onBan?: OnBanCallback) {
     this.config = config;
     this.events = events;
@@ -246,6 +282,14 @@ export class Peer {
     this.erlayRemoteSalt = 0n;
     this.sentSendTxRcncl = false;
     this.receivedSendTxRcncl = false;
+    // BIP-324 transport state.  Defaults to v1 — the inbound listener
+    // overrides to "unknown" via {@link acceptSocket} so we can classify
+    // the wire after the first 16 bytes arrive.
+    this.transportMode = "v1";
+    this.v2Transport = null;
+    this.magicLE = Buffer.alloc(4);
+    this.magicLE.writeUInt32LE(config.magic, 0);
+    this.versionSent = false;
     // Register our nonce for self-connection detection
     Peer.localNonces.add(this.ourNonce);
   }
@@ -313,19 +357,35 @@ export class Peer {
 
   /**
    * Accept an already-connected inbound socket (from Bun.listen).
-   * The remote peer initiated the connection; we wait for their version message.
+   *
+   * Per BIP-324 inbound flow, we DEFER sending our application-layer
+   * VERSION until we have classified the wire as v1 or v2:
+   *
+   *   - If the first 16 bytes match `<network_magic> || "version\0\0\0\0\0"`,
+   *     the peer is speaking plaintext v1.  We then send our v1 VERSION
+   *     and proceed normally.
+   *   - Otherwise (and assuming the peer is well-behaved), the first
+   *     bytes are the peer's 64-byte ElligatorSwift pubkey, kicking off
+   *     a v2 BIP-324 handshake.  We construct a {@link V2Transport} in
+   *     responder mode, drive the cipher handshake, and only then emit
+   *     our application-layer VERSION through the encrypted channel.
+   *
+   * If we send our v1 VERSION too early, a v2-only peer will see four
+   * bytes of network magic where it expects an ElligatorSwift pubkey —
+   * the v1 magic-byte heuristic triggers v1 fallback at best, or the
+   * peer drops us at worst.
+   *
+   * Reference: clearbit src/peer.zig:891-930 performHandshake (inbound
+   * peek-and-classify), Bitcoin Core src/net.cpp V2Transport responder.
    */
   acceptSocket(sock: Socket<unknown>): void {
     this.socket = sock as Socket;
     this.state = "handshaking";
     this.connectedTime = Date.now();
+    this.transportMode = "unknown"; // classified by processRecvBuffer
     this.events.onConnect(this);
 
-    // For inbound connections we send our version immediately —
-    // Bitcoin Core sends version on both sides of the handshake.
-    this.sendVersionMessage();
-
-    // Start handshake timeout
+    // Start handshake timeout — covers both v1 and v2 paths.
     this.handshakeTimer = setTimeout(() => {
       if (!this.handshakeComplete && this.state !== "disconnected") {
         this.disconnect("handshake timeout");
@@ -342,15 +402,57 @@ export class Peer {
 
   /**
    * Send a NetworkMessage to this peer.
-   * Serializes the message with the network magic and writes to socket.
+   *
+   * Routes through the BIP-324 v2 transport when negotiated; otherwise
+   * serializes the message in the plaintext v1 framing (4-byte magic +
+   * 12-byte command + length + checksum + payload).
    */
   send(msg: NetworkMessage): void {
     if (!this.socket || this.state === "disconnected") {
       return;
     }
+    if (this.transportMode === "v2" && this.v2Transport) {
+      this.sendV2(msg);
+      return;
+    }
     const data = serializeMessage(this.config.magic, msg);
     this.socket.write(data);
     this.bytesSent += data.length;
+    this.lastSend = Date.now();
+  }
+
+  /**
+   * Encrypt and send a message via the BIP-324 v2 transport.
+   * Internal — callers use {@link send}.
+   */
+  private sendV2(msg: NetworkMessage): void {
+    if (!this.socket || !this.v2Transport) return;
+    if (!this.v2Transport.isHandshakeReady()) {
+      // The cipher handshake hasn't finished queueing our version
+      // packet yet.  This shouldn't happen because we only flip
+      // transportMode to "v2" after the handshake is ready, but
+      // guard defensively.
+      return;
+    }
+    const { command, payload } = extractCommandAndPayload(this.config.magic, msg);
+    const encrypted = this.v2Transport.encryptMessage(command, payload, false);
+    this.socket.write(encrypted);
+    this.bytesSent += encrypted.length;
+    this.lastSend = Date.now();
+  }
+
+  /**
+   * Drain any bytes the V2Transport has queued (handshake bytes during
+   * negotiation; nothing during steady-state app messaging since
+   * {@link sendV2} writes directly).
+   */
+  private flushV2SendBuffer(): void {
+    if (!this.socket || !this.v2Transport) return;
+    if (this.v2Transport.pendingSendBytes() === 0) return;
+    const out = this.v2Transport.consumeSendBuffer();
+    if (out.length === 0) return;
+    this.socket.write(out);
+    this.bytesSent += out.length;
     this.lastSend = Date.now();
   }
 
@@ -438,8 +540,14 @@ export class Peer {
 
   /**
    * Send the initial version message to start the handshake.
+   *
+   * Idempotent: re-entry is a no-op once we've sent VERSION.  Double-calls
+   * happen on the v2 path (acceptSocket vs handshake-ready transition) and
+   * during v1 fallback after a v2 handshake aborted partway through.
    */
   private sendVersionMessage(): void {
+    if (this.versionSent) return;
+    this.versionSent = true;
     const now = BigInt(Math.floor(Date.now() / 1000));
 
     // Create version message using our nonce for self-connection detection
@@ -500,41 +608,73 @@ export class Peer {
 
   /**
    * Parse complete messages from recvBuffer.
-   * Implements message framing: accumulate until we have header + payload,
-   * verify checksum, deserialize, and dispatch.
+   *
+   * Routing layers:
+   *   1. If the transport mode is "unknown" (inbound peer; pre-classification),
+   *      peek the first 16 bytes.  If they match `<magic> || "version\0\0\0\0\0"`,
+   *      switch to v1.  Otherwise switch to v2 and construct a responder
+   *      V2Transport.  Wait for more bytes if we don't have 16 yet.
+   *   2. v1: accumulate until we have header + payload, verify checksum,
+   *      deserialize, and dispatch.
+   *   3. v2: feed bytes into the V2Transport state machine; drain any
+   *      handshake bytes back out to the socket; on handshake completion,
+   *      send our application-layer VERSION through the encrypted channel;
+   *      dispatch decrypted messages.
    */
   private processRecvBuffer(): void {
-    // Process messages in a loop - one data event may contain multiple messages
+    // 1. Classify the wire if we're an inbound peer waiting on first bytes.
+    if (this.transportMode === "unknown") {
+      if (this.recvBuffer.length < V1_PREFIX_LEN) {
+        // Need more bytes before we can decide.
+        return;
+      }
+      if (looksLikeV1Version(this.recvBuffer.subarray(0, V1_PREFIX_LEN), this.magicLE)) {
+        this.transportMode = "v1";
+        // Send our v1 VERSION now (was previously deferred at acceptSocket
+        // time so we wouldn't corrupt a v2 wire).
+        this.sendVersionMessage();
+      } else {
+        // Construct a V2Transport in responder mode; the state machine
+        // will queue our pubkey + garbage + terminator + version packet
+        // automatically as it consumes the peer's bytes.  We pass
+        // skipV1Check=true because we already classified the 16-byte
+        // prefix as not-v1; without it, a uniformly-random ellswift
+        // pubkey colliding with the magic (prob 2^-32) would trigger
+        // an incorrect fallback.
+        this.transportMode = "v2";
+        this.v2Transport = new V2Transport(
+          this.magicLE,
+          /* initiator */ false,
+          /* skipV1Check */ true
+        );
+      }
+    }
+
+    if (this.transportMode === "v2") {
+      this.processRecvBufferV2();
+      return;
+    }
+
+    // 2. v1 path (unchanged from pre-W76 behaviour).
     while (this.recvBuffer.length >= MESSAGE_HEADER_SIZE) {
-      // Try to parse header
       const header = parseHeader(this.recvBuffer);
       if (!header) {
-        // Shouldn't happen since we checked length, but be safe
         break;
       }
 
-      // Validate magic
       if (header.magic !== this.config.magic) {
         throw new Error(
           `Invalid magic: expected ${this.config.magic.toString(16)}, got ${header.magic.toString(16)}`
         );
       }
 
-      // Check if we have the complete payload
       const totalLength = MESSAGE_HEADER_SIZE + header.length;
       if (this.recvBuffer.length < totalLength) {
-        // Log large pending messages (blocks) to diagnose download stalls
-        // Wait for more data
         break;
       }
 
-      // Extract payload
-      const payload = this.recvBuffer.subarray(
-        MESSAGE_HEADER_SIZE,
-        totalLength
-      );
+      const payload = this.recvBuffer.subarray(MESSAGE_HEADER_SIZE, totalLength);
 
-      // Verify checksum before deserialization
       const expectedChecksum = hash256(payload).subarray(0, 4);
       if (!header.checksum.equals(expectedChecksum)) {
         throw new Error(
@@ -542,24 +682,80 @@ export class Peer {
         );
       }
 
-      // Deserialize the message
       let msg;
       try {
         msg = deserializeMessage(header, payload);
       } catch (deserErr) {
-        // Log deserialization errors for blocks to diagnose stalls
         if (header.command === "block") {
           console.error(`BLOCK DESER ERROR: size=${header.length} from=${this.host}: ${deserErr instanceof Error ? deserErr.message : String(deserErr)}`);
         }
         throw deserErr;
       }
 
-      // Remove consumed bytes from buffer - use Buffer.from() to copy
-      // so we don't retain a reference to the (potentially large) original buffer
       this.recvBuffer = Buffer.from(this.recvBuffer.subarray(totalLength));
-
-      // Handle the message
       this.handleMessage(msg);
+    }
+  }
+
+  /**
+   * v2 receive-side dispatch.
+   *
+   * Drives the {@link V2Transport} state machine, drains any pending
+   * outbound handshake bytes (responder pubkey, garbage terminator,
+   * version packet), and on first reaching the application phase emits
+   * our v1-style VERSION over the encrypted transport.  Subsequent
+   * decrypted messages are dispatched through {@link handleMessage}.
+   */
+  private processRecvBufferV2(): void {
+    if (!this.v2Transport) return;
+
+    // One-shot: drive the state machine on whatever has accumulated.
+    const inbound = this.recvBuffer;
+    this.recvBuffer = Buffer.alloc(0);
+    const result = this.v2Transport.receiveBytes(inbound);
+
+    // Flush whatever the state machine queued (responder pubkey + garbage
+    // + terminator + version packet, or just version packet if we are an
+    // initiator — currently unused here since outbound v2 is not wired).
+    this.flushV2SendBuffer();
+
+    if (result.fallbackV1) {
+      // Should not occur with skipV1Check=true (Peer pre-classifies the
+      // wire as not-v1 before constructing the V2Transport).  Defensive
+      // guard: treat any unexpected fallback as a transport-level error.
+      this.disconnect("v2 transport unexpectedly requested v1 fallback");
+      return;
+    }
+    if (result.error) {
+      this.disconnect(`v2 transport error: ${result.error}`);
+      return;
+    }
+
+    // After cipher init + version-packet queueing, send our application
+    // VERSION exactly once.  sendVersionMessage flips versionSent
+    // internally (idempotence guard).
+    if (this.v2Transport.isHandshakeReady() && !this.versionSent) {
+      this.sendVersionMessage();
+    }
+
+    // Drain any decrypted messages into the v1 dispatch path.
+    if (this.v2Transport.hasReceivedMessages()) {
+      const messages = this.v2Transport.getReceivedMessages();
+      for (const v2msg of messages) {
+        let parsed: NetworkMessage;
+        try {
+          parsed = deserializeV2Message(v2msg.type, v2msg.payload);
+        } catch (err) {
+          // Unrecognized command name, malformed payload, etc.  Match
+          // Bitcoin Core: log and discard rather than disconnect, since
+          // BIP-324 explicitly leaves room for unknown extensions.
+          console.error(
+            `V2 deser error from ${this.host}:${this.port} type=${v2msg.type}: ${err instanceof Error ? err.message : String(err)}`
+          );
+          continue;
+        }
+        this.handleMessage(parsed);
+      }
     }
   }
 

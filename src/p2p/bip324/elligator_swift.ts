@@ -184,8 +184,14 @@ export function ellswiftDecode(encoded: Buffer): { x: bigint; parity: number } {
 /**
  * Encode a public key using ElligatorSwift.
  *
- * Given a private key and entropy, produce a 64-byte encoding that
- * is indistinguishable from random data.
+ * Given a private key and entropy, produce a 64-byte encoding that is
+ * indistinguishable from random data.  Implements
+ * `secp256k1_ellswift_create`: pulls (u, branch) values from a tagged-hash
+ * PRNG seeded with (compressed pubkey || entropy) and tries
+ * `xswiftec_inv_var` until one succeeds (expected ~4 iterations).
+ *
+ * Reference: bitcoin-core/src/secp256k1/src/modules/ellswift/main_impl.h
+ *            secp256k1_ellswift_xelligatorswift_var.
  *
  * @param privateKey - 32-byte private key
  * @param entropy - 32-byte entropy for randomization
@@ -199,118 +205,182 @@ export function ellswiftCreate(privateKey: Buffer, entropy: Buffer): Buffer {
     throw new Error(`Invalid entropy length: ${entropy.length}`);
   }
 
-  // Get the public key x-coordinate
+  // Compressed pubkey (33 bytes: 0x02/0x03 prefix + x).  The full y-parity
+  // determines whether `t` should be flipped at the end so the encoding
+  // round-trips back to the original (x, y) point — not just (x, ±y).
   const pubkey = secp256k1.getPublicKey(privateKey, true);
-  // Extract x-coordinate (skip prefix byte)
   const xCoord = bufferToFieldElement(Buffer.from(pubkey.slice(1)));
+  const yIsOdd = (pubkey[0] & 1) === 1;
 
-  // Use entropy to generate u value
-  const u = bufferToFieldElement(entropy);
+  // Tagged-hash PRNG: H_tag("secp256k1_ellswift_encode", pubkey33 || rnd32 || cnt32).
+  // Bitcoin Core seeds the hash midstate to the BIP-340 tagged-hash state
+  // for "secp256k1_ellswift_encode", writes pubkey33 + rnd32, then for each
+  // PRNG call writes a 4-byte counter and finalizes.  We replicate this
+  // bit-for-bit so we match Core's encoding output.
+  function makePrngSeed(): Buffer {
+    // Tag prefix: SHA256("secp256k1_ellswift_encode") || same.
+    const tagHash = createHash("sha256")
+      .update("secp256k1_ellswift_encode")
+      .digest();
+    // The state after writing tag||tag (64 bytes) is the BIP-340 tagged
+    // hash midstate.  We then write pubkey33 + rnd32 (65 bytes) — the
+    // total accumulated input length is 64+65=129 bytes.
+    return Buffer.concat([tagHash, tagHash, Buffer.from(pubkey), entropy]);
+  }
+  const prngBase = makePrngSeed();
 
-  // Find a valid t using the inverse ElligatorSwift map
-  const { t } = ellswiftInverse(xCoord, u);
-
-  // Return (u, t) as 64 bytes
-  return Buffer.concat([fieldElementToBuffer(u), fieldElementToBuffer(t)]);
-}
-
-/**
- * Compute the inverse ElligatorSwift map to find t given x and u.
- *
- * This implements the inverse encoding algorithm from BIP324.
- * Reference: secp256k1_ellswift_xswiftec_inv
- */
-function ellswiftInverse(x: bigint, u: bigint): { t: bigint } {
-  // We need to find t such that decoding (u, t) gives x
-
-  // Try different formula variants (c values 0-7)
-  for (let c = 0; c < 8; c++) {
-    const result = tryEllswiftInverse(x, u, c);
-    if (result !== null) {
-      return { t: result };
-    }
+  function prng(cnt: number): Buffer {
+    const cntBuf = Buffer.alloc(4);
+    cntBuf.writeUInt32LE(cnt, 0);
+    return createHash("sha256")
+      .update(prngBase)
+      .update(cntBuf)
+      .digest();
   }
 
-  // If no t found with this u, use a fallback
-  // This shouldn't happen with proper entropy, but handle gracefully
-  // Generate a new u by hashing the original
-  const newEntropy = createHash("sha256").update(fieldElementToBuffer(u)).digest();
-  const newU = bufferToFieldElement(newEntropy);
-  return ellswiftInverse(x, newU);
+  // Pool of 3-bit branch values (cnt=0 generates 64 of them; consumed
+  // top-down before the next refill at cnt=65).
+  let branchHash: Buffer = prng(0);
+  let branchesLeft = 64;
+  let cnt = 1;
+
+  // Bound iterations to avoid surprising hangs.  Expected ~4; a 1024-cap
+  // gives an astronomically tiny probability of false-failure.
+  for (let iter = 0; iter < 1024; iter++) {
+    if (branchesLeft === 0) {
+      branchHash = prng(cnt);
+      cnt++;
+      branchesLeft = 64;
+    }
+    branchesLeft--;
+    const idx = branchesLeft >> 1;
+    const shift = (branchesLeft & 1) << 2;
+    const branch = (branchHash[idx] >> shift) & 7;
+
+    // Pull u32 from the same PRNG (overflow mod p is fine; uniform u32
+    // is what matters for indistinguishability).
+    const u32 = prng(cnt);
+    cnt++;
+    const u = mod(bufferToFieldElement(u32), FIELD_PRIME);
+    if (u === 0n) continue; // Vanishingly unlikely; skip to keep math clean.
+
+    const t = xswiftecInvVar(xCoord, u, branch);
+    if (t === null) continue;
+
+    // Match the y-parity: if t parity differs from y parity, negate t.
+    const tIsOdd = (t & 1n) === 1n;
+    const tFinal = tIsOdd === yIsOdd ? t : mod(-t, FIELD_PRIME);
+
+    return Buffer.concat([u32, fieldElementToBuffer(tFinal)]);
+  }
+
+  // Statistically unreachable for valid inputs.
+  throw new Error("ellswiftCreate: PRNG exhausted without finding inverse");
 }
 
 /**
- * Try to compute t for a specific formula variant.
- *
- * Reference: secp256k1_ellswift_xswiftec_inv_var
+ * c1 = (sqrt(-3) - 1) / 2 = 0x851695d4...8e6afa40.
+ * Lazily computed once.
  */
-function tryEllswiftInverse(x: bigint, u: bigint, c: number): bigint | null {
-  const g = fCurve(x); // g = x^3 + 7
-  if (!isSquare(g)) return null;
+let _ellswiftC1: bigint | null = null;
+function ellswiftC1(): bigint {
+  if (_ellswiftC1 === null) {
+    const halfInv = modInverse(2n, FIELD_PRIME);
+    _ellswiftC1 = mod((sqrtMinus3() - 1n) * halfInv, FIELD_PRIME);
+  }
+  return _ellswiftC1;
+}
 
-  // Compute v based on c
+/** c2 = (-sqrt(-3) - 1) / 2. */
+let _ellswiftC2: bigint | null = null;
+function ellswiftC2(): bigint {
+  if (_ellswiftC2 === null) {
+    const halfInv = modInverse(2n, FIELD_PRIME);
+    _ellswiftC2 = mod((-sqrtMinus3() - 1n) * halfInv, FIELD_PRIME);
+  }
+  return _ellswiftC2;
+}
+
+/** c3 = (-sqrt(-3) + 1) / 2 = -c1. */
+function ellswiftC3(): bigint {
+  return mod(-ellswiftC1(), FIELD_PRIME);
+}
+
+/** c4 = (sqrt(-3) + 1) / 2 = -c2. */
+function ellswiftC4(): bigint {
+  return mod(-ellswiftC2(), FIELD_PRIME);
+}
+
+/**
+ * Check whether x is a valid X coordinate on secp256k1 (i.e. x^3 + 7 is a square).
+ */
+function xOnCurve(x: bigint): boolean {
+  return isSquare(fCurve(x));
+}
+
+/**
+ * Compute the inverse ElligatorSwift partial map: given (x, u, c), return a
+ * field element t such that decode(u, t) == x, or null if this branch
+ * cannot produce one.  At most one of c in 0..7 will succeed for a given
+ * (x, u).  Reference: secp256k1_ellswift_xswiftec_inv_var.
+ */
+function xswiftecInvVar(x: bigint, u: bigint, c: number): bigint | null {
   let s: bigint;
+  let v: bigint;
 
-  if (c < 4) {
-    // Formulas using s = x - u
+  if ((c & 2) === 0) {
+    // c in {0, 1, 4, 5}.  x1 / x2 branches.
+
+    // If (-u-x) is a valid X coordinate, fail (round-trips to x3 instead).
+    const negUX = mod(-(u + x), FIELD_PRIME);
+    if (xOnCurve(negUX)) return null;
+
+    // s = -(u^3+7)/(u^2+u*x+x^2).
+    const u2 = modPow(u, 2n, FIELD_PRIME);
+    const denom = mod(u2 + u * x + modPow(x, 2n, FIELD_PRIME), FIELD_PRIME);
+    if (denom === 0n) return null; // Spec proves impossible if -u-x off-curve, but guard.
+    const g = mod(modPow(u, 3n, FIELD_PRIME) + 7n, FIELD_PRIME);
+    s = mod(-g * modInverse(denom, FIELD_PRIME), FIELD_PRIME);
+    if (!isSquare(s)) return null;
+    v = x;
+  } else {
+    // c in {2, 3, 6, 7}.  x3 branch.
     s = mod(x - u, FIELD_PRIME);
-  } else {
-    // Formulas using s = -(x + u)
-    s = mod(-(x + u), FIELD_PRIME);
+    if (!isSquare(s)) return null;
+
+    // r = sqrt(-s*(4*(u^3+7)+3*u^2*s)).  Fail if not a square.
+    const u2 = modPow(u, 2n, FIELD_PRIME);
+    const u3 = modPow(u, 3n, FIELD_PRIME);
+    const inner = mod(4n * (u3 + 7n) + 3n * u2 * s, FIELD_PRIME);
+    const q = mod(-s * inner, FIELD_PRIME);
+    if (!isSquare(q)) return null;
+    const r = modSqrt(q);
+
+    // r=0 with (c & 1)=1 → fail (avoids generating a duplicate output).
+    if ((c & 1) === 1 && r === 0n) return null;
+
+    if (s === 0n) return null;
+
+    // v = (r/s - u) / 2.
+    const rOverS = mod(r * modInverse(s, FIELD_PRIME), FIELD_PRIME);
+    const halfInv = modInverse(2n, FIELD_PRIME);
+    v = mod((rOverS - u) * halfInv, FIELD_PRIME);
   }
 
-  // c mod 2 determines which branch
-  const branch = c & 1;
-  // c & 2 determines negation
-  const negate = (c & 2) !== 0;
+  // w = sqrt(s).  By construction s is a square at this point.
+  const w = modSqrt(s);
 
-  // Compute d = s^3 - 3*s^2 - s*(4*g + u^2) - g
-  const u2 = modPow(u, 2n, FIELD_PRIME);
-  const s2 = modPow(s, 2n, FIELD_PRIME);
-  const s3 = mod(s2 * s, FIELD_PRIME);
+  // Sign of w depends on (c & 5):
+  //   (c & 5) == 0 || (c & 5) == 5 → m = -w
+  //   else                          → m =  w
+  const fivebits = c & 5;
+  const m = fivebits === 0 || fivebits === 5 ? mod(-w, FIELD_PRIME) : w;
 
-  const fourG = mod(4n * g, FIELD_PRIME);
-  const d = mod(s3 - 3n * s2 - s * (fourG + u2) - g, FIELD_PRIME);
+  // u' = (c & 1) ? c4 * u : c3 * u
+  const cu = (c & 1) === 1 ? mod(ellswiftC4() * u, FIELD_PRIME) : mod(ellswiftC3() * u, FIELD_PRIME);
 
-  if (d === 0n) {
-    // Special case
-    if (branch === 0) {
-      // t = sqrt(-3) * u
-      let t = mod(sqrtMinus3() * u, FIELD_PRIME);
-      if (negate) t = mod(-t, FIELD_PRIME);
-      return t;
-    }
-    return null;
-  }
-
-  // Check if d/g is a square
-  const dOverG = mod(d * modInverse(g, FIELD_PRIME), FIELD_PRIME);
-  if (!isSquare(dOverG)) return null;
-
-  // Compute t = (sqrt(d/g) ± sqrt(-d/g)) / 2 + s + u
-  const sqrtDG = modSqrt(dOverG);
-
-  let t: bigint;
-  if (branch === 0) {
-    t = mod(sqrtDG * modInverse(2n, FIELD_PRIME) + s + u, FIELD_PRIME);
-  } else {
-    t = mod(-sqrtDG * modInverse(2n, FIELD_PRIME) + s + u, FIELD_PRIME);
-  }
-
-  if (negate) {
-    t = mod(-t, FIELD_PRIME);
-  }
-
-  // Verify the result
-  const decoded = ellswiftDecode(
-    Buffer.concat([fieldElementToBuffer(u), fieldElementToBuffer(t)])
-  );
-
-  if (decoded.x === x) {
-    return t;
-  }
-
-  return null;
+  // t = m * (u' + v)
+  return mod(m * mod(cu + v, FIELD_PRIME), FIELD_PRIME);
 }
 
 /**

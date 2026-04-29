@@ -1201,6 +1201,54 @@ export function serializeMessage(magic: number, msg: NetworkMessage): Buffer {
 }
 
 /**
+ * Serialize a message into its (command, payload) parts only — no v1 header.
+ *
+ * Used by the BIP-324 v2 path, which carries the command name in the
+ * encrypted contents (short ID or 12-byte long encoding) and authenticates
+ * the payload via Poly1305 instead of a 4-byte hash256 checksum.
+ *
+ * Re-uses {@link serializeMessage} by parsing back out the command + payload
+ * so we have a single source of truth for payload encoding.  Cheaper than
+ * re-implementing the giant switch.
+ */
+export function extractCommandAndPayload(
+  magic: number,
+  msg: NetworkMessage
+): { command: string; payload: Buffer } {
+  const full = serializeMessage(magic, msg);
+  const header = parseHeader(full);
+  if (!header) {
+    throw new Error("extractCommandAndPayload: parseHeader returned null");
+  }
+  return {
+    command: header.command,
+    payload: full.subarray(MESSAGE_HEADER_SIZE),
+  };
+}
+
+/**
+ * Deserialize a v2-decrypted message given its command name + payload.
+ *
+ * The BIP-324 transport authenticates each packet via Poly1305, so there
+ * is no v1 header / checksum to verify here.  We synthesize a fake header
+ * (with a correctly-recomputed checksum) and dispatch through the
+ * existing {@link deserializeMessage} switch to keep a single source of
+ * truth for payload parsing.
+ */
+export function deserializeV2Message(
+  command: string,
+  payload: Buffer
+): NetworkMessage {
+  const fakeHeader: MessageHeader = {
+    magic: 0,
+    command,
+    length: payload.length,
+    checksum: hash256(payload).subarray(0, 4),
+  };
+  return deserializeMessage(fakeHeader, payload);
+}
+
+/**
  * Deserialize a message payload given the parsed header.
  *
  * @param header - Parsed message header
