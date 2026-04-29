@@ -11,9 +11,10 @@
  *
  * hotbuns has no per-peer permission system, so we collapse the gate to
  * "did *we* advertise NODE_BLOOM?" — a function of the
- * `peerBloomFilters` config flag (default true, mirroring Core's
- * `-peerbloomfilters=1` default).  The bit then propagates into
- * `params.services` and is checked when the cli mempool handler fires.
+ * `peerBloomFilters` config flag (default false, mirroring Core's
+ * `DEFAULT_PEERBLOOMFILTERS = false` in net_processing.h).  The bit
+ * then propagates into `params.services` and is checked when the cli
+ * mempool handler fires.
  *
  * These tests exercise the gate predicate and the inv-emission shape
  * (MAX_INV_SZ = 50_000, witness-tx inv types) without spinning up the
