@@ -634,6 +634,16 @@ export class V2Transport {
   }
 
   /**
+   * True iff this transport was constructed in initiator (outbound) mode.
+   * Used by Peer to label v2-success log lines with the connection
+   * direction; the cross-impl BIP-324 interop matrix harness treats the
+   * "outbound|inbound" tag as the v2-success signal.
+   */
+  isInitiator(): boolean {
+    return this.initiator;
+  }
+
+  /**
    * Check if we should fall back to v1 transport.
    */
   shouldFallbackV1(): boolean {
