@@ -57,8 +57,8 @@ export interface NodeConfig {
   /**
    * Whether we advertise NODE_BLOOM (service bit 4) and therefore honor
    * BIP-35 "mempool" requests.  Mirrors Bitcoin Core's `-peerbloomfilters`.
-   * Default true, matching Core's current default and the BIP-111 wire
-   * advertisement.
+   * Default false, matching Bitcoin Core's `DEFAULT_PEERBLOOMFILTERS = false`
+   * (see bitcoin-core/src/net_processing.h).
    *
    * Reference: bitcoin-core net_processing.cpp ProcessMessage() handler
    * for NetMsgType::MEMPOOL — the gate is `peer.m_our_services & NODE_BLOOM`.
@@ -89,7 +89,7 @@ const DEFAULT_CONFIG: NodeConfig = {
   port: 8333,
   metricsPort: 9332,
   logLevel: "info",
-  peerBloomFilters: true,
+  peerBloomFilters: false,
 };
 
 /**
@@ -942,11 +942,12 @@ async function startNode(config: NodeConfig): Promise<void> {
   const fileConfig = await loadConfig(config.datadir);
   const mergedConfig = { ...config, ...fileConfig };
 
-  // BIP-35 / BIP-111: when peerBloomFilters is enabled (Core default), we
-  // OR NODE_BLOOM (=4) into the advertised services word.  This is the
-  // single source of truth gate that the BIP-35 mempool handler below
-  // checks before honoring an inbound `mempool` request.  Mirrors
-  // Bitcoin Core net.cpp Init: `nLocalServices |= NODE_BLOOM;`.
+  // BIP-35 / BIP-111: when peerBloomFilters is enabled, we OR NODE_BLOOM
+  // (=4) into the advertised services word.  This is the single source of
+  // truth gate that the BIP-35 mempool handler below checks before honoring
+  // an inbound `mempool` request.  Mirrors Bitcoin Core net.cpp Init:
+  // `nLocalServices |= NODE_BLOOM;` (gated on -peerbloomfilters, default
+  // false in Core per net_processing.h DEFAULT_PEERBLOOMFILTERS).
   const NODE_BLOOM_BIT = 4n;
   const params: import("../consensus/params.js").ConsensusParams = mergedConfig.peerBloomFilters
     ? { ...baseParams, services: baseParams.services | NODE_BLOOM_BIT }
