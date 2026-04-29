@@ -419,7 +419,7 @@ export class PeerManager {
           this.knownAddresses.set(key, {
             host,
             port,
-            services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS,
+            services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS | ServiceFlags.NODE_BLOOM,
             lastSeen: now,
             banScore: 0,
             lastConnected: 0,
@@ -439,7 +439,7 @@ export class PeerManager {
         this.knownAddresses.set(key, {
           host: ip,
           port: this.config.params.defaultPort,
-          services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS,
+          services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS | ServiceFlags.NODE_BLOOM,
           lastSeen: now,
           banScore: 0,
           lastConnected: 0,
@@ -455,7 +455,7 @@ export class PeerManager {
         this.knownAddresses.set(key, {
           host,
           port,
-          services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS,
+          services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS | ServiceFlags.NODE_BLOOM,
           lastSeen: now,
           banScore: 0,
           lastConnected: 0,
@@ -688,7 +688,7 @@ export class PeerManager {
         this.knownAddresses.set(key, {
           host,
           port,
-          services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS,
+          services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS | ServiceFlags.NODE_BLOOM,
           lastSeen: now,
           banScore: 0,
           lastConnected: now,
