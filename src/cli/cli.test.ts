@@ -193,9 +193,9 @@ describe("parseArgs", () => {
     expect(result.config.maxOutbound).toBe(8);
     expect(result.config.listen).toBe(true);
     expect(result.config.logLevel).toBe("info");
-    // BIP-35 / BIP-111: NODE_BLOOM advertisement defaults to ON, matching
-    // Bitcoin Core's `-peerbloomfilters=1` default.
-    expect(result.config.peerBloomFilters).toBe(true);
+    // BIP-35 / BIP-111: NODE_BLOOM advertisement defaults to OFF, matching
+    // Bitcoin Core's `DEFAULT_PEERBLOOMFILTERS = false` (net_processing.h).
+    expect(result.config.peerBloomFilters).toBe(false);
   });
 
   test("parses --peerbloomfilters=0 flag (disable BIP-35 gate)", () => {
