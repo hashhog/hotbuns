@@ -38,6 +38,21 @@ import {
   FEEFILTER_VERSION,
 } from "./feefilter.js";
 
+/**
+ * Maximum number of addresses retained in the v1-only fallback cache.
+ * Mirrors clearbit's V2_FALLBACK_CACHE_MAX (256) — bounded so we don't
+ * hold long-tail v1 hosts forever during DNS-seed churn.
+ */
+export const V1_ONLY_CACHE_MAX = 256;
+
+/**
+ * Time-to-live (ms) for v1-only fallback cache entries.  After this
+ * window we re-probe the address for v2 — a peer that was v1-only at
+ * t=0 may have been upgraded.  1h matches the order of magnitude of
+ * Bitcoin Core's v2 reconnect heuristic.
+ */
+export const V1_ONLY_CACHE_TTL_MS = 60 * 60 * 1000;
+
 /** Service bit flags for peer capabilities. */
 export const ServiceFlags = {
   NODE_NETWORK: 1n,          // Full node, can serve full blocks
@@ -283,6 +298,20 @@ export class PeerManager {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private tcpListener: any;
 
+  /**
+   * Per-address v1-only cache.  After a failed BIP-324 v2 outbound
+   * negotiation we record the address here so subsequent reconnect
+   * attempts skip the v2 probe and go straight to v1.  Map value is
+   * the time (ms since epoch) when the entry was added; entries older
+   * than {@link V1_ONLY_CACHE_TTL_MS} are evicted lazily on lookup.
+   *
+   * Reference: clearbit PeerManager.v2_fallback_set / markV1Only /
+   * isV1Only (clearbit src/peer.zig:1942-1958), but we use a
+   * timestamped Map for TTL-based eviction rather than a fixed-size
+   * AutoHashMap.
+   */
+  private v1OnlyCache: Map<string, number>;
+
   constructor(config: PeerManagerConfig) {
     this.config = {
       maxOutbound: config.maxOutbound ?? MAX_OUTBOUND_FULL_RELAY + MAX_OUTBOUND_BLOCK_RELAY,
@@ -318,6 +347,45 @@ export class PeerManager {
     });
     this.feeFilterInterval = null;
     this.tcpListener = null;
+    this.v1OnlyCache = new Map();
+  }
+
+  /**
+   * Mark `addr` (host:port key) as v1-only — future outbound attempts
+   * skip the v2 probe and go straight to v1.  Bounded at
+   * {@link V1_ONLY_CACHE_MAX} entries; oldest insertion is dropped on
+   * overflow.
+   */
+  markV1Only(addr: string): void {
+    if (this.v1OnlyCache.size >= V1_ONLY_CACHE_MAX) {
+      // Drop oldest entry by insertion order (Maps preserve insertion order).
+      const firstKey = this.v1OnlyCache.keys().next().value;
+      if (firstKey !== undefined) {
+        this.v1OnlyCache.delete(firstKey);
+      }
+    }
+    this.v1OnlyCache.set(addr, Date.now());
+  }
+
+  /**
+   * Returns true iff `addr` is in the v1-only cache and the entry has
+   * not expired.  Lazily evicts stale entries on lookup.
+   */
+  isV1Only(addr: string): boolean {
+    const ts = this.v1OnlyCache.get(addr);
+    if (ts === undefined) return false;
+    if (Date.now() - ts > V1_ONLY_CACHE_TTL_MS) {
+      this.v1OnlyCache.delete(addr);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Drop all entries from the v1-only cache (for testing).
+   */
+  clearV1OnlyCache(): void {
+    this.v1OnlyCache.clear();
   }
 
   /**
@@ -563,10 +631,43 @@ export class PeerManager {
       this.banManager.ban(peer.host, DEFAULT_BAN_TIME, reason);
     };
 
-    const peer = new Peer(config, events, onBan);
+    // Decide whether to attempt BIP-324 v2 first.  If outbound v2 is
+    // gated off globally (HOTBUNS_BIP324_V2 env var) or this address
+    // is in the v1-only cache, go straight to v1.  Otherwise try v2;
+    // on failure mark v1-only and reconnect on a fresh socket — sending
+    // v2 garbage to a v1 peer is destructive so the same socket cannot
+    // be reused (mirrors clearbit's connectOutboundNegotiated).
+    const tryV2 =
+      connectionType !== "inbound" &&
+      Peer.bip324V2Enabled() &&
+      !this.isV1Only(key);
+
+    let peer = new Peer(config, events, onBan);
 
     try {
-      await peer.connect();
+      if (tryV2) {
+        try {
+          await peer.connect(/* useV2 */ true);
+        } catch (v2Err) {
+          // Cipher-handshake failure (timeout, decrypt error, peer is v1).
+          // Mark v1-only and retry with a fresh Peer + fresh socket.
+          this.markV1Only(key);
+          try {
+            peer.disconnect("v2 handshake failed; falling back to v1");
+          } catch {
+            // ignore — disconnect is idempotent
+          }
+          peer = new Peer(config, events, onBan);
+          await peer.connect(/* useV2 */ false);
+          // We expose the v2 failure as a debug-level signal but do not
+          // throw — v1 succeeded.
+          const reason = v2Err instanceof Error ? v2Err.message : String(v2Err);
+          console.log(`P2P: BIP-324 v2 outbound failed peer=${key}: ${reason}; using v1`);
+        }
+      } else {
+        await peer.connect(/* useV2 */ false);
+      }
+
       this.peers.set(key, peer);
       this.lastActivity.set(key, Date.now());
 
