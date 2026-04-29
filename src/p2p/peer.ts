@@ -96,6 +96,16 @@ export const MINIMUM_CONNECT_TIME_MS = 30 * 1000;
 /** Maximum outbound peers to protect from stale tip disconnect. */
 export const MAX_OUTBOUND_PEERS_TO_PROTECT = 4;
 
+/**
+ * Maximum time to wait for the BIP-324 v2 cipher handshake to complete,
+ * in milliseconds.  After this we abandon the socket as v1-only and
+ * reconnect (sending v2 garbage is destructive on a v1 peer so the same
+ * socket cannot be reused).
+ *
+ * Reference: clearbit Peer.V2_HANDSHAKE_DEADLINE_MS = 30_000.
+ */
+export const V2_HANDSHAKE_DEADLINE_MS = 30_000;
+
 export class Peer {
   readonly host: string;
   readonly port: number;
@@ -296,9 +306,37 @@ export class Peer {
 
   /**
    * Initiate TCP connection using Bun.connect.
-   * On successful connection, immediately sends version message.
+   *
+   * The `useV2` flag (default: false) chooses between v1 and BIP-324 v2:
+   *
+   *   - v1 path (`useV2=false`): on socket open, immediately send our
+   *     plaintext v1 VERSION.  Historical default.
+   *   - v2 path (`useV2=true`): on socket open, write our 64-byte
+   *     ElligatorSwift pubkey + 0..32-byte garbage to the wire.  The
+   *     V2Transport state machine (already constructed in
+   *     {@link prepareV2Outbound}) processes inbound bytes; once we
+   *     observe the responder's pubkey + garbage + terminator + version
+   *     packet, the encrypted application VERSION is queued and the
+   *     normal handshake continues over the encrypted transport.
+   *
+   * On v2 cipher-handshake failure (timeout, decryption error, peer
+   * abruptly disconnects), the caller is expected to:
+   *   1. close this peer's socket,
+   *   2. mark the address as v1-only via PeerManager.markV1Only,
+   *   3. construct a fresh Peer and call connect(useV2=false).
+   *
+   * Sending v2 garbage is destructive on a v1 peer, so the same socket
+   * cannot be reused.  This mirrors clearbit's connectOutboundNegotiated
+   * pattern (clearbit src/peer.zig:1863).
+   *
+   * Reference: clearbit src/peer.zig:807 performV2Handshake (initiator
+   * loop) and clearbit src/peer.zig:1846 connectOutboundNegotiated
+   * (manager-level negotiation).
    */
-  async connect(): Promise<void> {
+  async connect(useV2: boolean = false): Promise<void> {
+    if (useV2) {
+      this.prepareV2Outbound();
+    }
     this.state = "connecting";
 
     const connectPromise = Bun.connect({
@@ -311,14 +349,31 @@ export class Peer {
           this.socket = socket;
           this.state = "handshaking";
           this.events.onConnect(this);
-          this.sendVersionMessage();
 
-          // Start handshake timeout
-          this.handshakeTimer = setTimeout(() => {
-            if (!this.handshakeComplete && this.state !== "disconnected") {
-              this.disconnect("handshake timeout");
-            }
-          }, HANDSHAKE_TIMEOUT_MS);
+          if (useV2) {
+            // Drain the V2Transport's queued ellswift pubkey + garbage to
+            // the wire.  Once the peer replies with their pubkey we can
+            // queue + send the garbage terminator + version packet and
+            // proceed with the encrypted application VERSION exchange
+            // (see processRecvBufferV2).
+            this.flushV2SendBuffer();
+            // Tighter deadline for the cipher handshake — the manager
+            // needs to know quickly whether to fall back to v1.
+            this.handshakeTimer = setTimeout(() => {
+              if (!this.handshakeComplete && this.state !== "disconnected") {
+                this.disconnect("v2 handshake timeout");
+              }
+            }, V2_HANDSHAKE_DEADLINE_MS);
+          } else {
+            // v1: send our VERSION immediately and arm the normal
+            // handshake timeout.
+            this.sendVersionMessage();
+            this.handshakeTimer = setTimeout(() => {
+              if (!this.handshakeComplete && this.state !== "disconnected") {
+                this.disconnect("handshake timeout");
+              }
+            }, HANDSHAKE_TIMEOUT_MS);
+          }
         },
         close: (_socket) => {
           this.cleanupHandshakeTimer();
@@ -353,6 +408,29 @@ export class Peer {
       this.state = "disconnected";
       throw error;
     }
+  }
+
+  /**
+   * Construct an initiator-mode V2Transport and stash it on this peer.
+   *
+   * Called from {@link connect} when v2 outbound is enabled.  The
+   * transport's constructor queues the 64-byte ElligatorSwift pubkey +
+   * 0..32-byte garbage into its send buffer; the actual flush to the
+   * socket happens in the `open` callback.
+   *
+   * Also flips transportMode to "v2" so subsequent {@link send}
+   * invocations route through the encrypted path (no-op until the
+   * cipher handshake completes — sendV2 guards via isHandshakeReady).
+   *
+   * Idempotent: repeated calls are no-ops if already prepared.
+   */
+  private prepareV2Outbound(): void {
+    if (this.transportMode === "v2" && this.v2Transport) return;
+    this.transportMode = "v2";
+    this.v2Transport = new V2Transport(
+      this.magicLE,
+      /* initiator */ true
+    );
   }
 
   /**
@@ -499,6 +577,28 @@ export class Peer {
    */
   static clearLocalNonces(): void {
     Peer.localNonces.clear();
+  }
+
+  /**
+   * Returns true iff outbound BIP-324 v2 negotiation is enabled.
+   *
+   * Gated behind the `HOTBUNS_BIP324_V2` env var.  Default OFF — outbound
+   * v2 is brand-new wiring (this commit is the first time hotbuns even
+   * attempts an initiator-side BIP-324 handshake) and we want to soak the
+   * code path in the wild before flipping the default.  Set
+   * `HOTBUNS_BIP324_V2=1` (or "true") to opt into outbound v2.  Inbound
+   * v2 (the responder path) is independently enabled by virtue of
+   * `acceptSocket` always classifying — no env-var gate.
+   *
+   * Reference: clearbit Peer.bip324V2Enabled (CLEARBIT_BIP324_V2 env var,
+   * but defaulted ON post-W90 once they had verified live-handshakes
+   * against Bitcoin Core 28.x).
+   */
+  static bip324V2Enabled(): boolean {
+    const v = process.env.HOTBUNS_BIP324_V2;
+    if (!v) return false;
+    if (v === "0" || v === "false" || v === "FALSE") return false;
+    return true;
   }
 
   /**
@@ -705,9 +805,29 @@ export class Peer {
    * version packet), and on first reaching the application phase emits
    * our v1-style VERSION over the encrypted transport.  Subsequent
    * decrypted messages are dispatched through {@link handleMessage}.
+   *
+   * Initiator-side fast v1 detection: the V2Transport in initiator mode
+   * unconditionally reads 64 bytes as the peer's ellswift pubkey.  If
+   * the peer is in fact v1, those bytes are the start of a v1 VERSION
+   * message (magic + "version\0\0\0\0\0" + ...) — the cipher init would
+   * succeed against the random-looking bytes and we'd waste 30s waiting
+   * for the rest of a packet that never arrives.  Short-circuit by
+   * checking for the v1 prefix once we have 16 inbound bytes.
    */
   private processRecvBufferV2(): void {
     if (!this.v2Transport) return;
+
+    // Initiator-side: detect a v1 peer by looking for magic + "version"
+    // command in the first 16 bytes.  Disconnect with a typed reason so
+    // the manager knows to mark the address v1-only and reconnect.
+    if (
+      !this.v2Transport.isReady() &&
+      this.recvBuffer.length >= V1_PREFIX_LEN &&
+      looksLikeV1Version(this.recvBuffer.subarray(0, V1_PREFIX_LEN), this.magicLE)
+    ) {
+      this.disconnect("v2 outbound: peer responded with v1 VERSION");
+      return;
+    }
 
     // One-shot: drive the state machine on whatever has accumulated.
     const inbound = this.recvBuffer;
@@ -715,15 +835,18 @@ export class Peer {
     const result = this.v2Transport.receiveBytes(inbound);
 
     // Flush whatever the state machine queued (responder pubkey + garbage
-    // + terminator + version packet, or just version packet if we are an
-    // initiator — currently unused here since outbound v2 is not wired).
+    // + terminator + version packet for the responder side; garbage
+    // terminator + version packet for the initiator side once cipher init
+    // completed).
     this.flushV2SendBuffer();
 
     if (result.fallbackV1) {
-      // Should not occur with skipV1Check=true (Peer pre-classifies the
-      // wire as not-v1 before constructing the V2Transport).  Defensive
-      // guard: treat any unexpected fallback as a transport-level error.
-      this.disconnect("v2 transport unexpectedly requested v1 fallback");
+      // Either (a) responder side hit the embedded v1-magic check (should
+      // not occur because acceptSocket pre-classifies with
+      // skipV1Check=true), or (b) initiator side observed v1 magic (also
+      // caught above, but the V2Transport could in principle re-flag it).
+      // Treat as a transport-level v1 fallback signal.
+      this.disconnect("v2 transport requested v1 fallback");
       return;
     }
     if (result.error) {
