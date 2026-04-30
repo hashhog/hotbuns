@@ -87,6 +87,22 @@ export const MAX_PACKAGE_COUNT = 25;
 export const MAX_PACKAGE_WEIGHT = 404_000;
 
 /**
+ * Standard transaction weight ceiling (BIP-141 / policy).
+ *
+ * `MAX_STANDARD_TX_WEIGHT` is the relay-policy gate Bitcoin Core enforces
+ * inside `IsStandardTx` (`bitcoin-core/src/policy/policy.cpp`). It is *not*
+ * a consensus rule — the consensus limit is the per-block weight ceiling
+ * (`maxBlockWeight = 4_000_000`). Standard txs are 10× tighter so a single
+ * relay tx cannot crowd out the rest of the block.
+ *
+ * Stored as a bigint because the rest of hotbuns's serialization layer
+ * uses bigints for 64-bit values.  Compared against `getTxWeight()` which
+ * returns a regular `number` — a `BigInt(weight)` cast happens at the
+ * comparison site to avoid bigint↔number mixing here.
+ */
+export const MAX_STANDARD_TX_WEIGHT = 400_000n;
+
+/**
  * Default mempool size (300 MB in vbytes).
  */
 const DEFAULT_MAX_SIZE = 300_000_000;
@@ -906,7 +922,21 @@ export class Mempool {
     const weight = getTxWeight(tx);
     const vsize = getTxVSize(tx);
 
-    // 8. Check weight limit
+    // 8a. Standard-tx relay-policy weight gate (IsStandardTx in
+    //     bitcoin-core/src/policy/policy.cpp).  Mempool txs above
+    //     MAX_STANDARD_TX_WEIGHT (400_000 WU = 100 kvB) are non-standard
+    //     and rejected at the relay layer even though they would be
+    //     consensus-valid as block contents.
+    if (BigInt(weight) > MAX_STANDARD_TX_WEIGHT) {
+      return {
+        accepted: false,
+        error: `tx-size: weight ${weight} exceeds standard limit ${MAX_STANDARD_TX_WEIGHT}`,
+      };
+    }
+
+    // 8b. Consensus block-weight ceiling (4 MWU). Defence-in-depth: a
+    //     well-formed standard tx will always pass 8a first, so this
+    //     branch only fires if the standard limit is ever raised.
     if (weight > this.params.maxBlockWeight) {
       return {
         accepted: false,

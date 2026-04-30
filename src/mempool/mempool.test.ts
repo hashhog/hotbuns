@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { ChainDB, UTXOEntry } from "../storage/database.js";
 import { UTXOManager } from "../chain/utxo.js";
 import { REGTEST } from "../consensus/params.js";
-import { Mempool, MempoolEntry } from "./mempool.js";
+import { Mempool, MempoolEntry, MAX_STANDARD_TX_WEIGHT } from "./mempool.js";
 import type { Transaction, OutPoint } from "../validation/tx.js";
 import { getTxId, getTxVSize } from "../validation/tx.js";
 import type { Block } from "../validation/block.js";
@@ -176,6 +176,49 @@ describe("Mempool", () => {
       const tx = createTestTx(
         [{ txid: inputTxid, vout: 0 }],
         [{ value: 49_00000000n }]
+      );
+
+      const result = await mempool.addTransaction(tx);
+      expect(result.accepted).toBe(true);
+    });
+
+    test("MAX_STANDARD_TX_WEIGHT is 400_000n (matches policy.cpp)", () => {
+      expect(MAX_STANDARD_TX_WEIGHT).toBe(400_000n);
+      expect(typeof MAX_STANDARD_TX_WEIGHT).toBe("bigint");
+    });
+
+    test("rejects oversized standard tx (weight > MAX_STANDARD_TX_WEIGHT)", async () => {
+      const inputTxid = Buffer.alloc(32, 0x77);
+      // Fund a high-value UTXO so the fee-rate gate is satisfied.
+      await setupUTXO(inputTxid, 0, 10_000_000_000n, 1, false);
+
+      // Build a tx with one fat OP_RETURN-like output. We can't blow past
+      // the consensus block limit and still hit the standard gate, so we
+      // size the output script so the *total weight* is just over 400 kWU.
+      // Output weight = 4 * (8 + varintLen(scriptLen) + scriptLen).
+      // With scriptLen = 100_500 (varintLen=5), one output ~= 402_052 WU,
+      // and the whole tx clears MAX_STANDARD_TX_WEIGHT but stays under
+      // the 4 MWU consensus cap.
+      const oversized = Buffer.alloc(100_500, 0x6a); // OP_RETURN + payload
+      const tx = createTestTx(
+        [{ txid: inputTxid, vout: 0 }],
+        [{ value: 9_000_000_000n, scriptPubKey: oversized }]
+      );
+
+      const result = await mempool.addTransaction(tx);
+      expect(result.accepted).toBe(false);
+      expect(result.error).toContain("tx-size");
+      expect(result.error).toContain("standard limit");
+    });
+
+    test("accepts standard-sized tx (weight <= MAX_STANDARD_TX_WEIGHT)", async () => {
+      const inputTxid = Buffer.alloc(32, 0x78);
+      await setupUTXO(inputTxid, 0, 10_000_000_000n, 1, false);
+
+      // Tiny tx well under the 400 kWU gate.
+      const tx = createTestTx(
+        [{ txid: inputTxid, vout: 0 }],
+        [{ value: 9_999_990_000n }]
       );
 
       const result = await mempool.addTransaction(tx);
