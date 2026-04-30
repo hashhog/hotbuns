@@ -64,6 +64,17 @@ export interface NodeConfig {
    * for NetMsgType::MEMPOOL — the gate is `peer.m_our_services & NODE_BLOOM`.
    */
   peerBloomFilters: boolean;
+  /**
+   * UTXO database cache size in MiB. Mirrors Bitcoin Core's `-dbcache`
+   * argument. Bitcoin Core defaults to `nDefaultDbCache = 450` MiB
+   * (init.cpp); hotbuns keeps the historical 512 MiB default that the
+   * test fixtures expect.
+   *
+   * Plumbed through to UTXOManager construction sites (state.ts,
+   * snapshot.ts, sync/blocks.ts, test/benchmark.ts) as
+   * `cacheBytes = dbcacheMB * 1024 * 1024`.
+   */
+  dbcacheMB: number;
 }
 
 /**
@@ -90,6 +101,7 @@ const DEFAULT_CONFIG: NodeConfig = {
   metricsPort: 9332,
   logLevel: "info",
   peerBloomFilters: false,
+  dbcacheMB: 512,
 };
 
 /**
@@ -236,6 +248,16 @@ export function parseArgs(argv: string[]): ParsedArgs {
             config.peerBloomFilters = false;
           }
           break;
+        case "dbcache":
+          // Bitcoin Core flag `-dbcache=N` — UTXO cache in MiB. Plumbed
+          // through to all UTXOManager construction sites.
+          if (value !== undefined) {
+            const dbcacheVal = parseInt(value, 10);
+            if (!isNaN(dbcacheVal) && dbcacheVal > 0) {
+              config.dbcacheMB = dbcacheVal;
+            }
+          }
+          break;
         case "password":
           // For wallet commands
           if (value) remainingArgs.push(`--password=${value}`);
@@ -361,6 +383,12 @@ export async function loadConfig(datadir: string): Promise<Partial<NodeConfig>> 
           break;
         case "peerbloomfilters":
           config.peerBloomFilters = value === "1" || value === "true";
+          break;
+        case "dbcache":
+          const dbcacheVal = parseInt(value, 10);
+          if (!isNaN(dbcacheVal) && dbcacheVal > 0) {
+            config.dbcacheMB = dbcacheVal;
+          }
           break;
       }
     }
@@ -958,8 +986,13 @@ async function startNode(config: NodeConfig): Promise<void> {
   const db = new ChainDB(dbPath);
   await db.open();
 
+  // Resolve dbcache → bytes once for all UTXOManager construction sites.
+  // Bitcoin Core init.cpp default is 450 MiB; hotbuns historical default is
+  // 512 MiB (kept for test-fixture stability).
+  const cacheBytes = (mergedConfig.dbcacheMB ?? 512) * 1024 * 1024;
+
   // 3. Load chain state from DB
-  const chainState = new ChainStateManager(db, params);
+  const chainState = new ChainStateManager(db, params, cacheBytes);
   await chainState.load();
 
   // 4. Initialize UTXO manager, mempool, fee estimator
@@ -1017,7 +1050,7 @@ async function startNode(config: NodeConfig): Promise<void> {
   headerSync.registerWithPeerManager(peerManager);
 
   // 7. Initialize block sync
-  const blockSync = new BlockSync(db, params, headerSync, peerManager, chainState, mergedConfig.scriptThreads);
+  const blockSync = new BlockSync(db, params, headerSync, peerManager, chainState, mergedConfig.scriptThreads, cacheBytes);
 
   // 7b. Wire mempool tx relay: accept incoming transactions via AcceptToMemoryPool
   // and relay accepted txs to peers via inventory trickling.
@@ -1589,6 +1622,7 @@ OPTIONS:
   --log-level=<level>   Log level: debug, info, warn, error (default: info)
   --connect=<host:port> Connect to specific peer
   --prune=<n>           Prune block storage to n MiB (minimum 550, 0 = disabled)
+  --dbcache=<n>         UTXO cache size in MiB (default: 512)
   --import-utxo=<path>  Import UTXO snapshot from HDOG file (AssumeUTXO)
   --password=<pass>     Wallet password (for wallet commands)
   --fee-rate=<n>        Fee rate in sat/vB (for wallet send)

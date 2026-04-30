@@ -217,6 +217,36 @@ describe("parseArgs", () => {
     const result = parseArgs(["bun", "script.ts", "--peerbloomfilters"]);
     expect(result.config.peerBloomFilters).toBe(true);
   });
+
+  test("defaults --dbcache to 512 MiB", () => {
+    const result = parseArgs(["bun", "script.ts"]);
+    expect(result.config.dbcacheMB).toBe(512);
+  });
+
+  test("parses --dbcache=256 (smaller cache)", () => {
+    const result = parseArgs(["bun", "script.ts", "--dbcache=256"]);
+    expect(result.config.dbcacheMB).toBe(256);
+  });
+
+  test("parses --dbcache=4096 (larger cache)", () => {
+    const result = parseArgs(["bun", "script.ts", "--dbcache=4096"]);
+    expect(result.config.dbcacheMB).toBe(4096);
+  });
+
+  test("rejects --dbcache=0 (falls back to default)", () => {
+    const result = parseArgs(["bun", "script.ts", "--dbcache=0"]);
+    expect(result.config.dbcacheMB).toBe(512);
+  });
+
+  test("rejects --dbcache=abc (falls back to default)", () => {
+    const result = parseArgs(["bun", "script.ts", "--dbcache=abc"]);
+    expect(result.config.dbcacheMB).toBe(512);
+  });
+
+  test("rejects negative --dbcache (falls back to default)", () => {
+    const result = parseArgs(["bun", "script.ts", "--dbcache=-100"]);
+    expect(result.config.dbcacheMB).toBe(512);
+  });
 });
 
 describe("loadConfig and saveConfig", () => {
@@ -305,6 +335,22 @@ rpcuser=bob
     const config = await loadConfig(tempDir);
     expect(config.peerBloomFilters).toBe(true);
   });
+
+  test("parses dbcache=2048 in config file", async () => {
+    const configPath = path.join(tempDir, "hotbuns.conf");
+    await Bun.write(configPath, `dbcache=2048\n`);
+
+    const config = await loadConfig(tempDir);
+    expect(config.dbcacheMB).toBe(2048);
+  });
+
+  test("ignores dbcache=0 in config file", async () => {
+    const configPath = path.join(tempDir, "hotbuns.conf");
+    await Bun.write(configPath, `dbcache=0\n`);
+
+    const config = await loadConfig(tempDir);
+    expect(config.dbcacheMB).toBeUndefined();
+  });
 });
 
 describe("formatRpcRequest", () => {
@@ -321,6 +367,7 @@ describe("formatRpcRequest", () => {
       logLevel: "info" as const,
       metricsPort: 0,
       peerBloomFilters: true,
+      dbcacheMB: 512,
     };
 
     const request = formatRpcRequest(config, "getblockchaininfo", []);
@@ -349,6 +396,7 @@ describe("formatRpcRequest", () => {
       logLevel: "info" as const,
       metricsPort: 0,
       peerBloomFilters: true,
+      dbcacheMB: 512,
     };
 
     const request = formatRpcRequest(config, "getblock", ["abc123", 1]);
@@ -371,6 +419,7 @@ describe("formatRpcRequest", () => {
       logLevel: "info" as const,
       metricsPort: 0,
       peerBloomFilters: true,
+      dbcacheMB: 512,
     };
 
     const request = formatRpcRequest(config, "test", []);
