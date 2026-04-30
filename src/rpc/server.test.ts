@@ -102,11 +102,19 @@ class MockPeerManager {
 }
 
 class MockFeeEstimator {
+  // Per-test override: when set, getBuckets() returns this array. Tests
+  // populate this to drive the estimaterawfee logic.
+  public buckets: any[] = [];
+
   estimateSmartFee(targetBlocks: number) {
     return {
       feeRate: 10,
       blocks: targetBlocks,
     };
+  }
+
+  getBuckets() {
+    return this.buckets;
   }
 }
 
@@ -539,6 +547,251 @@ describe("RPCServer", () => {
 
       expect(result.error).toBeDefined();
       expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+    });
+  });
+
+  describe("estimaterawfee", () => {
+    it("returns short/medium/long horizons with decay+scale even when no data", async () => {
+      const result = await rpcRequest(testPort, "estimaterawfee", [6]);
+
+      expect(result.error).toBeUndefined();
+      expect(result.result).toBeDefined();
+      for (const horizon of ["short", "medium", "long"]) {
+        const h = result.result[horizon];
+        expect(h).toBeDefined();
+        expect(typeof h.decay).toBe("number");
+        expect(typeof h.scale).toBe("number");
+        // No bucket data populated → must report errors and a fail bucket.
+        expect(Array.isArray(h.errors)).toBe(true);
+        expect(h.errors[0]).toContain("Insufficient data");
+        expect(h.fail).toBeDefined();
+      }
+    });
+
+    it("returns a passing bucket when threshold is met", async () => {
+      // Synthesize one fully-confirming bucket: 50 confirmations within 1
+      // block, no unconfirmed → probability = 1.0 ≥ 0.95 threshold.
+      mockFeeEstimator.buckets = [
+        {
+          feeRateRange: { min: 1, max: 2 },
+          totalConfirmed: 50,
+          totalUnconfirmed: 0,
+          confirmationBlocks: new Array(50).fill(1),
+          avgConfirmationBlocks: 1,
+        },
+      ];
+
+      const result = await rpcRequest(testPort, "estimaterawfee", [6, 0.95]);
+
+      expect(result.error).toBeUndefined();
+      const short = result.result.short;
+      expect(short.feerate).toBeDefined();
+      expect(short.pass).toBeDefined();
+      expect(short.pass.startrange).toBe(1);
+      expect(short.pass.withintarget).toBe(50);
+      expect(short.errors).toBeUndefined();
+    });
+
+    it("rejects out-of-range threshold", async () => {
+      const result = await rpcRequest(testPort, "estimaterawfee", [6, 1.5]);
+      expect(result.error).toBeDefined();
+      expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+      expect(result.error.message).toContain("threshold");
+    });
+
+    it("rejects non-integer conf_target", async () => {
+      const result = await rpcRequest(testPort, "estimaterawfee", ["nope"]);
+      expect(result.error).toBeDefined();
+      expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+    });
+  });
+
+  describe("getmempooldescendants", () => {
+    it("rejects malformed txid", async () => {
+      const result = await rpcRequest(testPort, "getmempooldescendants", ["xx"]);
+      expect(result.error).toBeDefined();
+      expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+    });
+
+    it("returns INVALID_ADDRESS_OR_KEY when tx not in mempool", async () => {
+      const txid = Buffer.alloc(32, 0xab).toString("hex");
+      const result = await rpcRequest(testPort, "getmempooldescendants", [txid]);
+      expect(result.error).toBeDefined();
+      expect(result.error.code).toBe(RPCErrorCodes.INVALID_ADDRESS_OR_KEY);
+    });
+
+    it("returns the transitive children list (non-verbose)", async () => {
+      // A → B → C chain. getmempooldescendants(A) should return [B, C].
+      const a = Buffer.alloc(32, 0x01);
+      const b = Buffer.alloc(32, 0x02);
+      const c = Buffer.alloc(32, 0x03);
+
+      mockMempool.addTestTransaction(a, {
+        spentBy: new Set([b.toString("hex")]),
+        dependsOn: new Set(),
+      });
+      mockMempool.addTestTransaction(b, {
+        spentBy: new Set([c.toString("hex")]),
+        dependsOn: new Set([a.toString("hex")]),
+      });
+      mockMempool.addTestTransaction(c, {
+        spentBy: new Set(),
+        dependsOn: new Set([b.toString("hex")]),
+      });
+
+      const result = await rpcRequest(testPort, "getmempooldescendants", [
+        a.toString("hex"),
+      ]);
+      expect(result.error).toBeUndefined();
+      expect(Array.isArray(result.result)).toBe(true);
+      expect(new Set(result.result)).toEqual(
+        new Set([b.toString("hex"), c.toString("hex")])
+      );
+    });
+
+    it("returns verbose entries when verbose=true", async () => {
+      const a = Buffer.alloc(32, 0x10);
+      const b = Buffer.alloc(32, 0x11);
+
+      mockMempool.addTestTransaction(a, {
+        spentBy: new Set([b.toString("hex")]),
+        dependsOn: new Set(),
+      });
+      mockMempool.addTestTransaction(b, {
+        spentBy: new Set(),
+        dependsOn: new Set([a.toString("hex")]),
+        vsize: 250,
+        weight: 1000,
+        fee: 2500n,
+      });
+
+      const result = await rpcRequest(testPort, "getmempooldescendants", [
+        a.toString("hex"),
+        true,
+      ]);
+      expect(result.error).toBeUndefined();
+      const child = result.result[b.toString("hex")];
+      expect(child).toBeDefined();
+      expect(child.vsize).toBe(250);
+      expect(child.weight).toBe(1000);
+      expect(child.depends).toEqual([a.toString("hex")]);
+      expect(child.spentby).toEqual([]);
+    });
+
+    it("returns empty list when leaf has no descendants", async () => {
+      const leaf = Buffer.alloc(32, 0x77);
+      mockMempool.addTestTransaction(leaf, {
+        spentBy: new Set(),
+        dependsOn: new Set(),
+      });
+
+      const result = await rpcRequest(testPort, "getmempooldescendants", [
+        leaf.toString("hex"),
+      ]);
+      expect(result.error).toBeUndefined();
+      expect(result.result).toEqual([]);
+    });
+  });
+
+  describe("signmessagewithprivkey / verifymessage", () => {
+    // Hashhog regtest WIF (compressed) for a deterministic key. Derived
+    // from privkey = 32 × 0x11 (well-known low-entropy test key) by
+    // base58CheckEncode(0xef, priv || 0x01). The corresponding regtest
+    // P2PKH address (version 0x6f, HASH160 of compressed pubkey) is
+    // n4XmX91N5FfccY678vaG1ELNtXh6skVES7. Both values are produced
+    // directly by hotbuns crypto primitives — see the bun -e snippet in
+    // the W122 PR description.
+    const TEST_WIF = "cN9spWsvaxA8taS7DFMxnk1yJD2gaF2PX1npuTpy3vuZFJdwavaw";
+    const TEST_ADDR = "n4XmX91N5FfccY678vaG1ELNtXh6skVES7";
+
+    it("round-trips: signmessagewithprivkey produces a verifymessage-OK signature", async () => {
+      const message = "hello hashhog";
+      const signed = await rpcRequest(testPort, "signmessagewithprivkey", [
+        TEST_WIF,
+        message,
+      ]);
+      expect(signed.error).toBeUndefined();
+      expect(typeof signed.result).toBe("string");
+      // Compact 65-byte signature → base64 length is 88 (with one '=' pad).
+      expect(signed.result.length).toBeGreaterThanOrEqual(86);
+
+      const verified = await rpcRequest(testPort, "verifymessage", [
+        TEST_ADDR,
+        signed.result,
+        message,
+      ]);
+      expect(verified.error).toBeUndefined();
+      expect(verified.result).toBe(true);
+    });
+
+    it("verifymessage returns false when message has been tampered with", async () => {
+      const signed = await rpcRequest(testPort, "signmessagewithprivkey", [
+        TEST_WIF,
+        "original",
+      ]);
+      const verified = await rpcRequest(testPort, "verifymessage", [
+        TEST_ADDR,
+        signed.result,
+        "tampered",
+      ]);
+      expect(verified.error).toBeUndefined();
+      expect(verified.result).toBe(false);
+    });
+
+    it("verifymessage returns INVALID_ADDRESS_OR_KEY for a malformed address", async () => {
+      const result = await rpcRequest(testPort, "verifymessage", [
+        "notabitcoinaddress",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "msg",
+      ]);
+      expect(result.error).toBeDefined();
+      expect(result.error.code).toBe(RPCErrorCodes.INVALID_ADDRESS_OR_KEY);
+    });
+
+    it("verifymessage rejects malformed base64 signatures", async () => {
+      const result = await rpcRequest(testPort, "verifymessage", [
+        TEST_ADDR,
+        "definitely-not-valid",
+        "msg",
+      ]);
+      expect(result.error).toBeDefined();
+      expect(result.error.code).toBe(RPCErrorCodes.INVALID_ADDRESS_OR_KEY);
+      expect(result.error.message).toContain("Malformed");
+    });
+
+    it("verifymessage rejects bech32 (non-PKH) addresses with ADDRESS_NO_KEY", async () => {
+      // A bech32 address is not Base58Check-decodable, so we expect
+      // INVALID_ADDRESS at the base58check stage. (Core distinguishes
+      // ERR_ADDRESS_NO_KEY for SegWit; hotbuns currently maps both
+      // failure modes to INVALID_ADDRESS_OR_KEY.)
+      const result = await rpcRequest(testPort, "verifymessage", [
+        "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwm7tkn",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "msg",
+      ]);
+      expect(result.error).toBeDefined();
+      expect(result.error.code).toBe(RPCErrorCodes.INVALID_ADDRESS_OR_KEY);
+    });
+
+    it("signmessagewithprivkey rejects an invalid WIF", async () => {
+      const result = await rpcRequest(testPort, "signmessagewithprivkey", [
+        "not-a-wif",
+        "msg",
+      ]);
+      expect(result.error).toBeDefined();
+      expect(result.error.code).toBe(RPCErrorCodes.INVALID_ADDRESS_OR_KEY);
+    });
+
+    it("signmessage (wallet RPC) is NOT registered when no wallet is configured", async () => {
+      // The fixture-level RPCServer in this file is constructed without a
+      // wallet, so signmessage must not be registered. This guards the
+      // wallet-conditional registration in registerBuiltinMethods().
+      const result = await rpcRequest(testPort, "signmessage", [
+        TEST_ADDR,
+        "msg",
+      ]);
+      expect(result.error).toBeDefined();
+      expect(result.error.code).toBe(RPCErrorCodes.METHOD_NOT_FOUND);
     });
   });
 

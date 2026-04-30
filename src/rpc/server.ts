@@ -63,6 +63,13 @@ import {
   type LoadSnapshotResult,
   type DumpSnapshotResult,
 } from "../chain/snapshot.js";
+import {
+  messageSign,
+  messageVerify,
+  MessageVerificationResult,
+} from "../crypto/signmessage.js";
+import { base58CheckDecode } from "../address/encoding.js";
+import { isValidPrivateKey } from "../crypto/primitives.js";
 
 /**
  * JSON-RPC request format.
@@ -594,6 +601,7 @@ export class RPCServer {
     this.registerMethod("getmempoolentry", (params) => this.getMempoolEntry(params));
     this.registerMethod("testmempoolaccept", (params) => this.testMempoolAccept(params));
     this.registerMethod("getmempoolancestors", (params) => this.getMempoolAncestors(params));
+    this.registerMethod("getmempooldescendants", (params) => this.getMempoolDescendants(params));
     this.registerMethod("savemempool", () => this.saveMempool());
     this.registerMethod("dumpmempool", () => this.saveMempool());
     this.registerMethod("loadmempool", () => this.doLoadMempool());
@@ -601,6 +609,15 @@ export class RPCServer {
     // Fee estimation
     this.registerMethod("estimatesmartfee", (params) =>
       this.estimateSmartFee(params)
+    );
+    this.registerMethod("estimaterawfee", (params) =>
+      this.estimateRawFee(params)
+    );
+
+    // Message signing / verification (BIP-137 / Core compatibility)
+    this.registerMethod("verifymessage", (params) => this.verifyMessage(params));
+    this.registerMethod("signmessagewithprivkey", (params) =>
+      this.signMessageWithPrivKey(params)
     );
 
     // Network methods
@@ -666,6 +683,7 @@ export class RPCServer {
       this.registerMethod("importdescriptors", (params) =>
         this.importDescriptors(params)
       );
+      this.registerMethod("signmessage", (params) => this.signMessage(params));
     }
 
     // Descriptor methods (work without wallet)
@@ -2589,6 +2607,85 @@ export class RPCServer {
     return result;
   }
 
+  /**
+   * getmempooldescendants: Get all in-mempool descendants of a transaction.
+   * Mirrors `getmempoolancestors` but walks the spentBy graph (children).
+   * @param params [txid, verbose?]
+   */
+  private async getMempoolDescendants(params: unknown[]): Promise<unknown> {
+    const [txidParam, verboseParam] = params;
+
+    if (typeof txidParam !== "string" || txidParam.length !== 64) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "txid must be a 64-character hex string"
+      );
+    }
+
+    const txid = Buffer.from(txidParam, "hex");
+    const entry = this.mempool.getTransaction(txid);
+
+    if (!entry) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "Transaction not in mempool"
+      );
+    }
+
+    const verbose = verboseParam === true;
+
+    // BFS over spentBy edges (children → grand-children → ...).
+    const descendants = new Set<string>();
+    const toVisit = [...entry.spentBy];
+    while (toVisit.length > 0) {
+      const childHex = toVisit.pop()!;
+      if (descendants.has(childHex)) continue;
+      descendants.add(childHex);
+
+      const childTxid = Buffer.from(childHex, "hex");
+      const childEntry = this.mempool.getTransaction(childTxid);
+      if (childEntry) {
+        for (const grandHex of childEntry.spentBy) {
+          if (!descendants.has(grandHex)) {
+            toVisit.push(grandHex);
+          }
+        }
+      }
+    }
+
+    if (!verbose) {
+      return Array.from(descendants);
+    }
+
+    // Verbose mode: return detailed entries (same shape as getmempoolancestors).
+    const result: Record<string, Record<string, unknown>> = {};
+    for (const descendantHex of descendants) {
+      const descendantTxid = Buffer.from(descendantHex, "hex");
+      const descendantEntry = this.mempool.getTransaction(descendantTxid);
+      if (descendantEntry) {
+        result[descendantHex] = {
+          vsize: descendantEntry.vsize,
+          weight: descendantEntry.weight,
+          fee: Number(descendantEntry.fee) / 100_000_000,
+          modifiedfee: Number(descendantEntry.fee) / 100_000_000,
+          time: descendantEntry.addedTime,
+          height: descendantEntry.height,
+          descendantcount: descendantEntry.spentBy.size + 1,
+          descendantsize: descendantEntry.vsize,
+          descendantfees: Number(descendantEntry.fee),
+          ancestorcount: descendantEntry.dependsOn.size + 1,
+          ancestorsize: descendantEntry.vsize,
+          ancestorfees: Number(descendantEntry.fee),
+          depends: Array.from(descendantEntry.dependsOn),
+          spentby: Array.from(descendantEntry.spentBy),
+          "bip125-replaceable": this.mempool.isReplaceable(descendantTxid),
+        };
+      }
+    }
+
+    return result;
+  }
+
   // ========== Fee Estimation ==========
 
   /**
@@ -2617,6 +2714,314 @@ export class RPCServer {
       feerate: estimate.feeRate / 100_000, // Convert sat/vB to BTC/kvB
       blocks: estimate.blocks,
     };
+  }
+
+  /**
+   * estimaterawfee: surface raw fee-bucket data per horizon.
+   *
+   * Mirrors Bitcoin Core's `estimaterawfee` (rpc/fees.cpp): for each
+   * horizon (short / medium / long), pick the lowest-fee bucket whose
+   * empirical confirmation rate within `conf_target` blocks meets the
+   * `threshold` proportion. Hotbuns has a single bucket-set (no
+   * short/medium/long horizons), so we report it under all three
+   * horizons. The shape matches Core so RPC clients (e.g. lightning
+   * fee daemons) can parse the response without a hotbuns-specific
+   * adapter.
+   *
+   * @param params [conf_target, threshold?]
+   */
+  private async estimateRawFee(params: unknown[]): Promise<Record<string, unknown>> {
+    const [confTargetParam, thresholdParam] = params;
+
+    if (typeof confTargetParam !== "number" || !Number.isInteger(confTargetParam)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "conf_target must be an integer"
+      );
+    }
+    const confTarget = Math.max(1, Math.min(1008, confTargetParam));
+
+    let threshold = 0.95;
+    if (thresholdParam !== undefined && thresholdParam !== null) {
+      if (typeof thresholdParam !== "number") {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "threshold must be a number"
+        );
+      }
+      threshold = thresholdParam;
+    }
+    if (threshold < 0 || threshold > 1) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "Invalid threshold"
+      );
+    }
+
+    const buckets = this.feeEstimator.getBuckets();
+
+    // Find the lowest-fee bucket where confirmedWithinTarget / total >= threshold.
+    // Walk from highest fee rate down so we can identify the boundary.
+    let pass: {
+      startrange: number;
+      endrange: number;
+      withintarget: number;
+      totalconfirmed: number;
+      inmempool: number;
+      leftmempool: number;
+    } | null = null;
+    let fail: {
+      startrange: number;
+      endrange: number;
+      withintarget: number;
+      totalconfirmed: number;
+      inmempool: number;
+      leftmempool: number;
+    } = {
+      startrange: -1,
+      endrange: -1,
+      withintarget: 0,
+      totalconfirmed: 0,
+      inmempool: 0,
+      leftmempool: 0,
+    };
+
+    for (let i = buckets.length - 1; i >= 0; i--) {
+      const b = buckets[i];
+      const within = b.confirmationBlocks.filter(
+        (blk) => blk <= confTarget
+      ).length;
+      const total = within + b.totalUnconfirmed;
+      if (total < 1) {
+        continue;
+      }
+      const probability = within / total;
+      const summary = {
+        startrange: b.feeRateRange.min,
+        endrange: Number.isFinite(b.feeRateRange.max) ? b.feeRateRange.max : -1,
+        withintarget: Math.round(within * 100) / 100,
+        totalconfirmed: Math.round(b.totalConfirmed * 100) / 100,
+        inmempool: Math.round(b.totalUnconfirmed * 100) / 100,
+        // hotbuns does not separately track timed-out unconfirmed txs.
+        leftmempool: 0,
+      };
+      if (probability >= threshold) {
+        pass = summary; // keep walking — we want the lowest passing bucket.
+      } else {
+        // First failure encountered while walking down; record it once.
+        if (fail.startrange === -1) {
+          fail = summary;
+        }
+        if (pass !== null) {
+          // We already had a passing higher bucket; the first failing
+          // bucket below is the boundary — Core stops here.
+          break;
+        }
+      }
+    }
+
+    // Decay & scale: surface the constants the estimator uses so callers
+    // can reason about the data freshness. hotbuns currently uses a
+    // single global decay factor (0.998 per block) and one bucket scale.
+    const decay = 0.998;
+    const scale = 1; // 1-block scale (no horizon multiplier)
+
+    const horizonResult: Record<string, unknown> = {
+      decay,
+      scale,
+    };
+
+    if (pass !== null) {
+      // feerate is reported in BTC/kvB to match estimatesmartfee.
+      horizonResult.feerate = pass.startrange / 100_000;
+      horizonResult.pass = pass;
+      if (fail.startrange !== -1) {
+        horizonResult.fail = fail;
+      }
+    } else {
+      horizonResult.fail = fail;
+      horizonResult.errors = [
+        "Insufficient data or no feerate found which meets threshold",
+      ];
+    }
+
+    // hotbuns has no short/medium/long horizon split, so we report the
+    // single bucket set under all three keys for Core-compatible clients.
+    return {
+      short: horizonResult,
+      medium: horizonResult,
+      long: horizonResult,
+    };
+  }
+
+  // ========== Message Signing / Verification ==========
+
+  /**
+   * verifymessage: verify a Bitcoin-Core-compatible message signature.
+   * @param params [address, signature(base64), message]
+   */
+  private async verifyMessage(params: unknown[]): Promise<boolean> {
+    const [addressParam, signatureParam, messageParam] = params;
+
+    if (
+      typeof addressParam !== "string" ||
+      typeof signatureParam !== "string" ||
+      typeof messageParam !== "string"
+    ) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "verifymessage requires (address, signature, message) strings"
+      );
+    }
+
+    const result = messageVerify(addressParam, signatureParam, messageParam);
+    switch (result) {
+      case MessageVerificationResult.OK:
+        return true;
+      case MessageVerificationResult.ERR_INVALID_ADDRESS:
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+          "Invalid address"
+        );
+      case MessageVerificationResult.ERR_ADDRESS_NO_KEY:
+        // Core uses RPC_TYPE_ERROR (-3); we do not export that constant
+        // separately, so reuse INVALID_ADDRESS_OR_KEY which is the
+        // closest semantic match.
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+          "Address does not refer to key"
+        );
+      case MessageVerificationResult.ERR_MALFORMED_SIGNATURE:
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+          "Malformed base64 encoding"
+        );
+      case MessageVerificationResult.ERR_PUBKEY_NOT_RECOVERED:
+      case MessageVerificationResult.ERR_NOT_SIGNED:
+        return false;
+    }
+  }
+
+  /**
+   * signmessagewithprivkey: sign a message with a WIF-encoded private key.
+   * @param params [privkey(WIF), message]
+   */
+  private async signMessageWithPrivKey(params: unknown[]): Promise<string> {
+    const [privkeyParam, messageParam] = params;
+
+    if (typeof privkeyParam !== "string" || typeof messageParam !== "string") {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "signmessagewithprivkey requires (privkey, message) strings"
+      );
+    }
+
+    let decoded: { version: number; hash: Buffer };
+    try {
+      decoded = base58CheckDecode(privkeyParam);
+    } catch {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "Invalid private key"
+      );
+    }
+
+    // WIF version byte: 0x80 mainnet, 0xef testnet/regtest.
+    if (decoded.version !== 0x80 && decoded.version !== 0xef) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "Invalid private key"
+      );
+    }
+
+    let privkey: Buffer;
+    let compressed: boolean;
+    if (decoded.hash.length === 33 && decoded.hash[32] === 0x01) {
+      privkey = decoded.hash.subarray(0, 32) as Buffer;
+      compressed = true;
+    } else if (decoded.hash.length === 32) {
+      privkey = decoded.hash;
+      compressed = false;
+    } else {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "Invalid private key"
+      );
+    }
+
+    if (!isValidPrivateKey(privkey)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "Invalid private key"
+      );
+    }
+
+    try {
+      return messageSign(privkey, messageParam, compressed);
+    } catch {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "Sign failed"
+      );
+    }
+  }
+
+  /**
+   * signmessage: sign a message with the private key for a wallet address.
+   *
+   * Wallet-only RPC (mirrors Bitcoin Core). The address must be a P2PKH
+   * legacy address whose key the wallet controls; SegWit / Taproot keys
+   * are not signable under the BIP-137 message-signature scheme.
+   *
+   * @param params [address, message]
+   */
+  private async signMessage(params: unknown[]): Promise<string> {
+    const [addressParam, messageParam] = params;
+
+    if (typeof addressParam !== "string" || typeof messageParam !== "string") {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "signmessage requires (address, message) strings"
+      );
+    }
+
+    // getCurrentWallet throws WALLET_NOT_FOUND if no wallet is loaded.
+    const wallet = this.getCurrentWallet();
+
+    // Validate address as P2PKH; Core returns TYPE_ERROR for non-PKH.
+    let decoded: { version: number; hash: Buffer };
+    try {
+      decoded = base58CheckDecode(addressParam);
+    } catch {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "Invalid address"
+      );
+    }
+    if (decoded.version !== 0x00 && decoded.version !== 0x6f) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "Address does not refer to key"
+      );
+    }
+
+    const key = wallet.getKey(addressParam);
+    if (!key || key.privateKey.length !== 32) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_ERROR,
+        "Private key not available"
+      );
+    }
+
+    // Wallet keys are stored compressed in hotbuns (BIP-32 derivation).
+    try {
+      return messageSign(key.privateKey, messageParam, /* compressed */ true);
+    } catch {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "Sign failed"
+      );
+    }
   }
 
   // ========== Network Methods ==========
