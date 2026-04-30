@@ -679,6 +679,34 @@ describe("RPCServer", () => {
     });
   });
 
+  describe("savemempool / dumpmempool / loadmempool", () => {
+    // The fixture-level RPC server in this file is configured WITHOUT a
+    // datadir, so both methods take the "no datadir configured" branch
+    // — this is the exact error operators see if hotbuns is started
+    // without `-datadir` and they hit the RPC.  End-to-end on-disk
+    // round-trips live in `src/mempool/persist.test.ts` against a real
+    // mempool + tmp directory.
+    it("savemempool returns MISC_ERROR when datadir is not configured", async () => {
+      const result = await rpcRequest(testPort, "savemempool");
+      expect(result.error).toBeDefined();
+      expect(result.error.code).toBe(RPCErrorCodes.MISC_ERROR);
+      expect(result.error.message).toContain("datadir");
+    });
+
+    it("dumpmempool is registered as an alias for savemempool", async () => {
+      const result = await rpcRequest(testPort, "dumpmempool");
+      expect(result.error).toBeDefined();
+      expect(result.error.code).toBe(RPCErrorCodes.MISC_ERROR);
+    });
+
+    it("loadmempool returns MISC_ERROR when datadir is not configured", async () => {
+      const result = await rpcRequest(testPort, "loadmempool");
+      expect(result.error).toBeDefined();
+      expect(result.error.code).toBe(RPCErrorCodes.MISC_ERROR);
+      expect(result.error.message).toContain("datadir");
+    });
+  });
+
   describe("validateaddress", () => {
     it("should validate a valid P2PKH address", async () => {
       // A valid regtest P2PKH address (starts with m or n)
