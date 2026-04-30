@@ -182,7 +182,8 @@ export class BlockSync {
     headerSync: HeaderSync,
     peerManager?: PeerManager,
     chainStateManager?: ChainStateManager,
-    scriptThreads?: number
+    scriptThreads?: number,
+    maxCacheBytes?: number
   ) {
     this.db = db;
     this.params = params;
@@ -197,7 +198,7 @@ export class BlockSync {
         : 4);
     this.windowSize = DEFAULT_WINDOW_SIZE;
     this.peerInFlight = new Map();
-    this.utxoManager = new UTXOManager(db);
+    this.utxoManager = new UTXOManager(db, maxCacheBytes);
     this.stallCheckInterval = null;
     this.logInterval = null;
     this.startTime = 0;
