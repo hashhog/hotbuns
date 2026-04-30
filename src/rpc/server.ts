@@ -10,6 +10,7 @@ import type { ChainStateManager } from "../chain/state.js";
 import type { ChainDB } from "../storage/database.js";
 import type { Mempool, MempoolEntry } from "../mempool/mempool.js";
 import { PackageValidationResult, MAX_PACKAGE_COUNT } from "../mempool/mempool.js";
+import { dumpMempool, loadMempool, mempoolDumpExists } from "../mempool/persist.js";
 import type { PeerManager } from "../p2p/manager.js";
 import type { FeeEstimator } from "../fees/estimator.js";
 import type { HeaderSync, HeaderChainEntry } from "../sync/headers.js";
@@ -593,6 +594,9 @@ export class RPCServer {
     this.registerMethod("getmempoolentry", (params) => this.getMempoolEntry(params));
     this.registerMethod("testmempoolaccept", (params) => this.testMempoolAccept(params));
     this.registerMethod("getmempoolancestors", (params) => this.getMempoolAncestors(params));
+    this.registerMethod("savemempool", () => this.saveMempool());
+    this.registerMethod("dumpmempool", () => this.saveMempool());
+    this.registerMethod("loadmempool", () => this.doLoadMempool());
 
     // Fee estimation
     this.registerMethod("estimatesmartfee", (params) =>
@@ -2432,6 +2436,75 @@ export class RPCServer {
     }
 
     return results;
+  }
+
+  /**
+   * savemempool / dumpmempool: Persist the in-memory mempool to
+   * `<datadir>/mempool.dat` in the Bitcoin Core MEMPOOL_DUMP_VERSION=2
+   * format (XOR-obfuscated payload, TX_WITH_WITNESS per entry).
+   *
+   * Returns: `{ filename, count, bytes }`. Mirrors the Core 28+ shape
+   * which adds the persisted filename so operators can confirm the
+   * write target without scraping logs.
+   */
+  private async saveMempool(): Promise<Record<string, unknown>> {
+    if (!this.config.datadir) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        "Cannot dump mempool: no datadir configured"
+      );
+    }
+    try {
+      const result = await dumpMempool(this.mempool, this.config.datadir);
+      return {
+        filename: result.path,
+        count: result.count,
+        bytes: result.bytes,
+      };
+    } catch (err) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        `Unable to dump mempool to disk: ${(err as Error).message}`
+      );
+    }
+  }
+
+  /**
+   * loadmempool: Re-import a previously persisted mempool.dat.  Each
+   * tx is replayed through `acceptToMemoryPool`, so post-restart relay
+   * policy gates (weight, fee rate, RBF, …) are re-applied — a stale
+   * dump cannot bypass a tightened rule.
+   *
+   * Returns counts of succeeded / failed / expired / unbroadcast txs
+   * mirroring Core's load summary log line.
+   */
+  private async doLoadMempool(): Promise<Record<string, unknown>> {
+    if (!this.config.datadir) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        "Cannot load mempool: no datadir configured"
+      );
+    }
+    if (!(await mempoolDumpExists(this.config.datadir))) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `mempool.dat not found in ${this.config.datadir}`
+      );
+    }
+    try {
+      const result = await loadMempool(this.mempool, this.config.datadir);
+      return {
+        succeeded: result.succeeded,
+        failed: result.failed,
+        expired: result.expired,
+        unbroadcast: result.unbroadcast,
+      };
+    } catch (err) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        `Unable to load mempool from disk: ${(err as Error).message}`
+      );
+    }
   }
 
   /**

@@ -13,6 +13,7 @@ import { BufferWriter } from "../wire/serialization.js";
 import { ChainStateManager } from "../chain/state.js";
 import { UTXOManager } from "../chain/utxo.js";
 import { Mempool } from "../mempool/mempool.js";
+import { dumpMempool, loadMempool } from "../mempool/persist.js";
 import { FeeEstimator } from "../fees/estimator.js";
 import { PeerManager } from "../p2p/manager.js";
 import { HeaderSync } from "../sync/headers.js";
@@ -451,6 +452,8 @@ interface NodeState {
   blockSync: BlockSync;
   feeEstimator: FeeEstimator;
   feeEstimatesPath: string;
+  mempool: Mempool;
+  datadir: string;
 }
 
 let runningNode: NodeState | null = null;
@@ -1014,6 +1017,25 @@ async function startNode(config: NodeConfig): Promise<void> {
   const bestBlock = chainState.getBestBlock();
   mempool.setTipHeight(bestBlock.height);
 
+  // 4a-bis. Restore persisted mempool from <datadir>/mempool.dat (if any).
+  // Mirrors Bitcoin Core's `LoadMempool` call from init.cpp's `ImportBlocks`
+  // path: each tx is replayed through `acceptToMemoryPool`, so a stale
+  // dump never bypasses tightened relay rules.  Skipped silently on the
+  // one-shot import paths below — those exits do not run a node.
+  if (!mergedConfig.importBlocks && !mergedConfig.importUtxo) {
+    try {
+      const loaded = await loadMempool(mempool, mergedConfig.datadir);
+      if (loaded.succeeded + loaded.failed + loaded.expired > 0) {
+        console.log(
+          `[mempool] Loaded ${loaded.succeeded} txs (${loaded.failed} failed, ` +
+            `${loaded.expired} expired, ${loaded.unbroadcast} unbroadcast) from mempool.dat`
+        );
+      }
+    } catch (e) {
+      console.error("[mempool] Load skipped:", (e as Error).message);
+    }
+  }
+
   // 4b. Block import mode (--import-blocks)
   if (mergedConfig.importBlocks) {
     await runBlockImport(mergedConfig.importBlocks, db, chainState, params);
@@ -1158,6 +1180,8 @@ async function startNode(config: NodeConfig): Promise<void> {
     blockSync,
     feeEstimator,
     feeEstimatesPath,
+    mempool,
+    datadir: mergedConfig.datadir,
   };
 
   // Set shutdown callback for RPC stop command
@@ -1245,6 +1269,18 @@ async function gracefulShutdown(): Promise<void> {
     console.log(`Fee estimates saved to ${runningNode.feeEstimatesPath}`);
   } catch (e) {
     console.error("Failed to save fee estimates:", e);
+  }
+
+  // 4b. Persist mempool to <datadir>/mempool.dat (Core-compatible v2).
+  // Best-effort: a failed dump must never block shutdown — the worst
+  // case is a cold start with an empty mempool.
+  try {
+    const dumped = await dumpMempool(runningNode.mempool, runningNode.datadir);
+    console.log(
+      `Mempool persisted to ${dumped.path} (${dumped.count} txs, ${dumped.bytes} bytes)`
+    );
+  } catch (e) {
+    console.error("Failed to dump mempool:", e);
   }
 
   // 5. Flush UTXO cache
