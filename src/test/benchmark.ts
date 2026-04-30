@@ -117,12 +117,19 @@ export async function benchDeserializeBlocks(): Promise<BenchmarkResult> {
 
 /**
  * Benchmark UTXO cache operations (insert, lookup, delete).
+ *
+ * @param entryCount      Number of entries to exercise.
+ * @param maxCacheBytes   Optional cache budget (bytes). Defaults to UTXOManager's
+ *                        compiled-in default (512 MiB) when undefined.
  */
-export async function benchUTXOCache(entryCount: number = 100000): Promise<BenchmarkResult[]> {
+export async function benchUTXOCache(
+  entryCount: number = 100000,
+  maxCacheBytes?: number,
+): Promise<BenchmarkResult[]> {
   console.log("\n=== UTXO Cache Benchmark ===");
 
   const { db, cleanup } = await createTestDB();
-  const cache = new UTXOManager(db);
+  const cache = new UTXOManager(db, maxCacheBytes);
 
   // Pre-generate test data
   const txids: Buffer[] = [];

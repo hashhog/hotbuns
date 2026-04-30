@@ -323,11 +323,12 @@ export class Chainstate {
     options?: {
       snapshotBaseBlockHash?: Buffer;
       status?: ChainstateStatus;
+      maxCacheBytes?: number;
     }
   ) {
     this.db = db;
     this.params = params;
-    this.utxoManager = new UTXOManager(db);
+    this.utxoManager = new UTXOManager(db, options?.maxCacheBytes);
     this.status = options?.status ?? ChainstateStatus.VALIDATED;
     this.snapshotBaseBlockHash = options?.snapshotBaseBlockHash ?? null;
     this.tipHash = params.genesisBlockHash;
@@ -384,10 +385,14 @@ export class ChainstateManager {
   /** Callback for background validation progress. */
   onBackgroundProgress?: (height: number, targetHeight: number) => void;
 
-  constructor(db: ChainDB, params: ConsensusParams) {
+  /** Cache budget propagated to every Chainstate this manager creates. */
+  private maxCacheBytes?: number;
+
+  constructor(db: ChainDB, params: ConsensusParams, maxCacheBytes?: number) {
     this.db = db;
     this.params = params;
-    this.activeChainstate = new Chainstate(db, params);
+    this.maxCacheBytes = maxCacheBytes;
+    this.activeChainstate = new Chainstate(db, params, { maxCacheBytes });
   }
 
   /**
@@ -434,6 +439,7 @@ export class ChainstateManager {
     const snapshotChainstate = new Chainstate(this.db, this.params, {
       snapshotBaseBlockHash: metadata.baseBlockHash,
       status: ChainstateStatus.UNVALIDATED,
+      maxCacheBytes: this.maxCacheBytes,
     });
     snapshotChainstate.tipHash = metadata.baseBlockHash;
     snapshotChainstate.tipHeight = auData.height;
@@ -512,6 +518,7 @@ export class ChainstateManager {
     // Create background chainstate for validation from genesis
     this.backgroundChainstate = new Chainstate(this.db, this.params, {
       status: ChainstateStatus.VALIDATED,
+      maxCacheBytes: this.maxCacheBytes,
     });
     this.backgroundChainstate.targetBlockHash = metadata.baseBlockHash;
 

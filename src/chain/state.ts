@@ -192,9 +192,9 @@ export class ChainStateManager {
   /** Last chain work when preciousblock was set. Used to reset sequence IDs. */
   private lastPreciousChainwork: bigint = 0n;
 
-  constructor(db: ChainDB, params: ConsensusParams) {
+  constructor(db: ChainDB, params: ConsensusParams, maxCacheBytes?: number) {
     this.db = db;
-    this.utxo = new UTXOManager(db);
+    this.utxo = new UTXOManager(db, maxCacheBytes);
     this.params = params;
     // Initialize with genesis state - will be overwritten by load()
     this.bestBlock = {
