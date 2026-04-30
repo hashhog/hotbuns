@@ -368,6 +368,8 @@ describe("formatRpcRequest", () => {
       metricsPort: 0,
       peerBloomFilters: true,
       dbcacheMB: 512,
+      daemon: false,
+      internalDaemonChild: false,
     };
 
     const request = formatRpcRequest(config, "getblockchaininfo", []);
@@ -397,6 +399,8 @@ describe("formatRpcRequest", () => {
       metricsPort: 0,
       peerBloomFilters: true,
       dbcacheMB: 512,
+      daemon: false,
+      internalDaemonChild: false,
     };
 
     const request = formatRpcRequest(config, "getblock", ["abc123", 1]);
@@ -420,6 +424,8 @@ describe("formatRpcRequest", () => {
       metricsPort: 0,
       peerBloomFilters: true,
       dbcacheMB: 512,
+      daemon: false,
+      internalDaemonChild: false,
     };
 
     const request = formatRpcRequest(config, "test", []);
@@ -482,5 +488,182 @@ describe("parseArgs edge cases", () => {
     const result = parseArgs(["bun", "script.ts", "stop", "getinfo"]);
     expect(result.command).toBe("stop");
     expect(result.args).toContain("getinfo");
+  });
+});
+
+describe("parseArgs operational flags", () => {
+  test("--daemon (bare) enables daemon mode", () => {
+    const result = parseArgs(["bun", "script.ts", "--daemon"]);
+    expect(result.config.daemon).toBe(true);
+    expect(result.config.internalDaemonChild).toBe(false);
+  });
+
+  test("--daemon=1 enables daemon mode", () => {
+    const result = parseArgs(["bun", "script.ts", "--daemon=1"]);
+    expect(result.config.daemon).toBe(true);
+  });
+
+  test("--daemon=0 explicitly disables daemon mode", () => {
+    const result = parseArgs(["bun", "script.ts", "--daemon=0"]);
+    expect(result.config.daemon).toBe(false);
+  });
+
+  test("--internal-daemon-child sets the internal flag", () => {
+    const result = parseArgs([
+      "bun",
+      "script.ts",
+      "--internal-daemon-child",
+    ]);
+    expect(result.config.internalDaemonChild).toBe(true);
+  });
+
+  test("--pid=<path> records pid file path", () => {
+    const result = parseArgs([
+      "bun",
+      "script.ts",
+      "--pid=/var/run/hotbuns.pid",
+    ]);
+    expect(result.config.pid).toBe("/var/run/hotbuns.pid");
+  });
+
+  test("--pid= (empty) preserves empty string sentinel for 'disabled'", () => {
+    const result = parseArgs(["bun", "script.ts", "--pid="]);
+    expect(result.config.pid).toBe("");
+  });
+
+  test("--conf=<path> stores override config path", () => {
+    const result = parseArgs([
+      "bun",
+      "script.ts",
+      "--conf=/etc/hotbuns/main.conf",
+    ]);
+    expect(result.config.conf).toBe("/etc/hotbuns/main.conf");
+  });
+
+  test("--printtoconsole (bare) enables console logging", () => {
+    const result = parseArgs(["bun", "script.ts", "--printtoconsole"]);
+    expect(result.config.printToConsole).toBe(true);
+  });
+
+  test("--print-to-console=0 disables console logging", () => {
+    const result = parseArgs(["bun", "script.ts", "--print-to-console=0"]);
+    expect(result.config.printToConsole).toBe(false);
+  });
+
+  test("--debug=net adds a single category", () => {
+    const result = parseArgs(["bun", "script.ts", "--debug=net"]);
+    expect(result.config.debug).toEqual(["net"]);
+  });
+
+  test("--debug repeats accumulate categories", () => {
+    const result = parseArgs([
+      "bun",
+      "script.ts",
+      "--debug=net",
+      "--debug=mempool",
+      "--debug=rpc",
+    ]);
+    expect(result.config.debug).toEqual(["net", "mempool", "rpc"]);
+  });
+
+  test("--debug (bare, no value) defaults to 'all'", () => {
+    const result = parseArgs(["bun", "script.ts", "--debug"]);
+    expect(result.config.debug).toEqual(["all"]);
+  });
+
+  test("--debug=all is preserved verbatim for the logger", () => {
+    const result = parseArgs(["bun", "script.ts", "--debug=all"]);
+    expect(result.config.debug).toEqual(["all"]);
+  });
+
+  test("--ready-fd=N parses to readyFd integer", () => {
+    const result = parseArgs(["bun", "script.ts", "--ready-fd=3"]);
+    expect(result.config.readyFd).toBe(3);
+  });
+
+  test("invalid --ready-fd is ignored", () => {
+    const result = parseArgs(["bun", "script.ts", "--ready-fd=abc"]);
+    expect(result.config.readyFd).toBeUndefined();
+  });
+
+  test("default config does not enable daemon or internal child", () => {
+    const result = parseArgs(["bun", "script.ts"]);
+    expect(result.config.daemon).toBe(false);
+    expect(result.config.internalDaemonChild).toBe(false);
+    expect(result.config.pid).toBeUndefined();
+    expect(result.config.conf).toBeUndefined();
+    expect(result.config.debug).toBeUndefined();
+    expect(result.config.printToConsole).toBeUndefined();
+    expect(result.config.readyFd).toBeUndefined();
+  });
+});
+
+describe("loadConfig with --conf override", () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = path.join(os.tmpdir(), `hotbuns-conf-test-${Date.now()}`);
+    await fs.promises.mkdir(tempDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  test("loads from explicit --conf absolute path", async () => {
+    const altPath = path.join(tempDir, "custom.conf");
+    await Bun.write(altPath, "network=testnet\nrpcuser=carol\n");
+
+    const config = await loadConfig(tempDir, altPath);
+    expect(config.network).toBe("testnet");
+    expect(config.rpcUser).toBe("carol");
+  });
+
+  test("loads from explicit --conf relative-to-datadir path", async () => {
+    const altPath = path.join(tempDir, "alt.conf");
+    await Bun.write(altPath, "network=regtest\n");
+
+    const config = await loadConfig(tempDir, "alt.conf");
+    expect(config.network).toBe("regtest");
+  });
+
+  test("--conf override ignores default hotbuns.conf", async () => {
+    // Default config file says testnet, override says regtest.  The override
+    // should win and the default should be ignored entirely.
+    const defaultPath = path.join(tempDir, "hotbuns.conf");
+    await Bun.write(defaultPath, "network=testnet\n");
+    const altPath = path.join(tempDir, "override.conf");
+    await Bun.write(altPath, "network=regtest\n");
+
+    const config = await loadConfig(tempDir, altPath);
+    expect(config.network).toBe("regtest");
+  });
+
+  test("parses daemon=1 in config file", async () => {
+    const altPath = path.join(tempDir, "hotbuns.conf");
+    await Bun.write(altPath, "daemon=1\n");
+    const config = await loadConfig(tempDir);
+    expect(config.daemon).toBe(true);
+  });
+
+  test("parses pid=<path> in config file", async () => {
+    const altPath = path.join(tempDir, "hotbuns.conf");
+    await Bun.write(altPath, "pid=/var/run/hotbuns.pid\n");
+    const config = await loadConfig(tempDir);
+    expect(config.pid).toBe("/var/run/hotbuns.pid");
+  });
+
+  test("parses debug=<cat> in config file", async () => {
+    const altPath = path.join(tempDir, "hotbuns.conf");
+    await Bun.write(altPath, "debug=net\ndebug=mempool\n");
+    const config = await loadConfig(tempDir);
+    expect(config.debug).toEqual(["net", "mempool"]);
+  });
+
+  test("parses printtoconsole=1 in config file", async () => {
+    const altPath = path.join(tempDir, "hotbuns.conf");
+    await Bun.write(altPath, "printtoconsole=1\n");
+    const config = await loadConfig(tempDir);
+    expect(config.printToConsole).toBe(true);
   });
 });

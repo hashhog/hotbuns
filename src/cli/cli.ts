@@ -24,6 +24,7 @@ import { getTxId, getTxVSize } from "../validation/tx.js";
 import { InvType, type NetworkMessage, type InvVector } from "../p2p/messages.js";
 import { Wallet } from "../wallet/wallet.js";
 import { MAINNET, TESTNET, TESTNET4, REGTEST, type ConsensusParams } from "../consensus/params.js";
+import { Logger, setLogger } from "../logger/logger.js";
 
 /**
  * Node configuration options.
@@ -48,6 +49,55 @@ export interface NodeConfig {
   importBlocks?: string;
   /** Path to HDOG UTXO snapshot file for AssumeUTXO import. */
   importUtxo?: string;
+  /**
+   * Daemonize the node (fork to background and detach).  Mirrors Bitcoin
+   * Core's `-daemon` (init.cpp via `util::ForkDaemon`).  hotbuns is built on
+   * Bun, which does not expose POSIX `daemon(3)`; instead the parent
+   * re-execs itself with `Bun.spawn(..., { stdio: "ignore" })` and the
+   * `--internal-daemon-child` flag, then exits.
+   */
+  daemon: boolean;
+  /**
+   * Marks the child of a `--daemon` re-exec.  Internal flag: the user
+   * never sets this; the parent invocation strips `--daemon` and adds
+   * this in the spawn argv.  The presence of this flag tells the child
+   * "you are the detached worker, do not fork again".
+   */
+  internalDaemonChild: boolean;
+  /**
+   * Optional path to an alternate config file.  When set, overrides the
+   * default `<datadir>/hotbuns.conf` lookup.  Mirrors Bitcoin Core's
+   * `-conf=<file>` argument.
+   */
+  conf?: string;
+  /**
+   * PID file path.  Defaults to `<datadir>/hotbuns.pid`.  When the node
+   * starts it writes its own PID to this file; on graceful shutdown the
+   * file is removed.  Mirrors Bitcoin Core's `g_pidfile_path` (init.cpp
+   * `CreatePidFile` / `RemovePidFile`).
+   */
+  pid?: string;
+  /**
+   * Force log output to console (stdout/stderr).  Mirrors Bitcoin Core's
+   * `-printtoconsole`; default is "on when no log file is configured,
+   * off otherwise".  Setting this explicitly (true) forces console-on
+   * regardless of file-logging state.
+   */
+  printToConsole?: boolean;
+  /**
+   * Repeatable debug categories (`-debug=net`, `-debug=mempool`, ...).
+   * `-debug=all` / `-debug=1` enables every category; `-debug=none` /
+   * `-debug=0` disables them.  Plumbed into the process logger by
+   * {@link startNode}.
+   */
+  debug?: string[];
+  /**
+   * Optional file descriptor that the supervisor passes via
+   * `Bun.spawn({ stdio })`. When set, the node writes "ready\n" to this
+   * fd once startup completes — equivalent to systemd's
+   * `Type=notify` / sd_notify("READY=1") protocol, but minimal.
+   */
+  readyFd?: number;
   /**
    * Number of parallel script-verification workers for IBD ConnectBlock.
    * 1  = sequential (benchmark baseline).
@@ -103,6 +153,8 @@ const DEFAULT_CONFIG: NodeConfig = {
   logLevel: "info",
   peerBloomFilters: false,
   dbcacheMB: 512,
+  daemon: false,
+  internalDaemonChild: false,
 };
 
 /**
@@ -259,6 +311,65 @@ export function parseArgs(argv: string[]): ParsedArgs {
             }
           }
           break;
+        case "daemon":
+          // Bitcoin Core flag `-daemon`. Bare flag or "=1" enables; "=0"
+          // disables (so a config-file `daemon=1` line can be overridden
+          // on the command line).
+          if (value === undefined || value === "1" || value === "true") {
+            config.daemon = true;
+          } else if (value === "0" || value === "false") {
+            config.daemon = false;
+          }
+          break;
+        case "internal-daemon-child":
+          // Internal handoff flag set by the parent of a `--daemon`
+          // re-exec.  Never set by the user.
+          config.internalDaemonChild = true;
+          break;
+        case "conf":
+          // Bitcoin Core flag `-conf=<file>`.  Promotes the config-file
+          // path from the fixed `<datadir>/hotbuns.conf` to a
+          // user-overridable absolute or relative path.
+          if (value) config.conf = value;
+          break;
+        case "pid":
+          // Bitcoin Core flag `-pid=<file>`. Default is
+          // `<datadir>/hotbuns.pid`; an explicit value (including a
+          // relative path) wins. `-pid=` (empty) disables PID-file
+          // writing.
+          if (value !== undefined) config.pid = value;
+          break;
+        case "printtoconsole":
+        case "print-to-console":
+          // Bitcoin Core flag `-printtoconsole`. Bare or `=1`/`=true`
+          // enables; `=0`/`=false` disables.
+          if (value === undefined || value === "1" || value === "true") {
+            config.printToConsole = true;
+          } else if (value === "0" || value === "false") {
+            config.printToConsole = false;
+          }
+          break;
+        case "debug":
+          // Bitcoin Core flag `-debug=<category>`. Repeatable; `=all`/`=1`
+          // enables every category, `=none`/`=0` disables.  An empty
+          // value (`--debug`) is treated as "all" to match Core.
+          if (value === undefined || value === "") {
+            config.debug = config.debug || [];
+            config.debug.push("all");
+          } else {
+            config.debug = config.debug || [];
+            config.debug.push(value);
+          }
+          break;
+        case "ready-fd":
+        case "readyfd":
+          // Optional supervisor fd for "ready\n" handoff. Mirrors a
+          // minimal slice of systemd `Type=notify`.
+          if (value !== undefined) {
+            const fd = parseInt(value, 10);
+            if (!isNaN(fd) && fd >= 0) config.readyFd = fd;
+          }
+          break;
         case "password":
           // For wallet commands
           if (value) remainingArgs.push(`--password=${value}`);
@@ -311,9 +422,22 @@ function parseFlag(arg: string): [string, string | undefined] {
 
 /**
  * Load configuration from file, or create with defaults.
+ *
+ * @param datadir Data directory used both for default config-file lookup
+ *   (`<datadir>/hotbuns.conf`) and to be created if missing.
+ * @param confOverride Optional `--conf=<path>` override.  When set, the
+ *   loader reads from that exact path instead of the default and ignores
+ *   any `<datadir>/hotbuns.conf`.  Mirrors Bitcoin Core's `-conf` arg.
  */
-export async function loadConfig(datadir: string): Promise<Partial<NodeConfig>> {
-  const configPath = path.join(datadir, "hotbuns.conf");
+export async function loadConfig(
+  datadir: string,
+  confOverride?: string
+): Promise<Partial<NodeConfig>> {
+  const configPath = confOverride
+    ? path.isAbsolute(confOverride)
+      ? confOverride
+      : path.join(datadir, confOverride)
+    : path.join(datadir, "hotbuns.conf");
   const config: Partial<NodeConfig> = {};
 
   // Ensure datadir exists
@@ -390,6 +514,20 @@ export async function loadConfig(datadir: string): Promise<Partial<NodeConfig>> 
           if (!isNaN(dbcacheVal) && dbcacheVal > 0) {
             config.dbcacheMB = dbcacheVal;
           }
+          break;
+        case "daemon":
+          config.daemon = value === "1" || value === "true";
+          break;
+        case "pid":
+          if (value) config.pid = value;
+          break;
+        case "printtoconsole":
+          config.printToConsole = value === "1" || value === "true";
+          break;
+        case "debug":
+          // Comma-separated list or repeated keys; we accept either.
+          config.debug = config.debug || [];
+          config.debug.push(value);
           break;
       }
     }
@@ -962,16 +1100,126 @@ async function runUtxoImport(
 }
 
 /**
+ * Daemonize: re-exec self with stdio detached and `--internal-daemon-child`,
+ * then exit the parent.  Bun has no POSIX `daemon(3)`; this mirrors the
+ * essential behaviour (background, no controlling tty, parent returns
+ * immediately) using `Bun.spawn`.
+ *
+ * Reference: bitcoin-core/src/init.cpp -daemon path → `util::ForkDaemon`.
+ */
+function daemonizeAndExit(originalArgv: string[]): never {
+  // Strip out the `--daemon` token (or the `=true`/`=1` form) and add
+  // `--internal-daemon-child` so the child knows not to fork again.
+  const childArgs = originalArgv
+    .slice(2)
+    .filter((arg) => {
+      if (arg === "--daemon") return false;
+      if (arg.startsWith("--daemon=")) return false;
+      return true;
+    });
+  childArgs.push("--internal-daemon-child");
+
+  // Use the same bun executable that's running the parent.
+  const bunExe = process.execPath;
+  const scriptPath = originalArgv[1];
+
+  const child = Bun.spawn([bunExe, "run", scriptPath, ...childArgs], {
+    stdio: ["ignore", "ignore", "ignore"],
+    // Detach so child outlives the parent.
+    cwd: process.cwd(),
+    env: process.env as Record<string, string>,
+  });
+  // Allow the parent to exit without waiting on the child.
+  child.unref?.();
+  console.log(`hotbuns daemonized as pid ${child.pid}`);
+  process.exit(0);
+}
+
+/**
+ * Write the PID of this process to `pidPath`.  Best-effort: a write
+ * failure is logged but does not abort startup.  Mirrors Core's
+ * `CreatePidFile` (init.cpp).
+ */
+async function writePidFile(pidPath: string): Promise<void> {
+  try {
+    await fs.promises.writeFile(pidPath, `${process.pid}\n`, { flag: "w" });
+  } catch (e) {
+    console.error(`Failed to write PID file ${pidPath}:`, (e as Error).message);
+  }
+}
+
+/**
+ * Remove the PID file written by {@link writePidFile}, if any.  Best-effort.
+ */
+function removePidFileSync(pidPath: string | null): void {
+  if (!pidPath) return;
+  try {
+    fs.unlinkSync(pidPath);
+  } catch {
+    // file may already be gone; ignore.
+  }
+}
+
+/** Track the active PID-file path for shutdown cleanup. */
+let activePidPath: string | null = null;
+
+/**
  * Start the hotbuns node.
  */
 async function startNode(config: NodeConfig): Promise<void> {
+  // If `--daemon` and we're not already the spawned child, fork+exit.
+  if (config.daemon && !config.internalDaemonChild) {
+    daemonizeAndExit(Bun.argv);
+  }
+
   console.log("hotbuns v0.1.0 starting...");
 
   const baseParams = getParams(config.network);
 
-  // 1. Load or create config file
-  const fileConfig = await loadConfig(config.datadir);
+  // 1. Load or create config file (honors --conf override).
+  const fileConfig = await loadConfig(config.datadir, config.conf);
   const mergedConfig = { ...config, ...fileConfig };
+  // Restore daemon-related flags from the CLI argv — file config should
+  // never be allowed to silently un-set the user's intent on these.
+  mergedConfig.daemon = config.daemon;
+  mergedConfig.internalDaemonChild = config.internalDaemonChild;
+  if (config.debug) mergedConfig.debug = config.debug;
+  if (config.printToConsole !== undefined) {
+    mergedConfig.printToConsole = config.printToConsole;
+  }
+  if (config.pid !== undefined) mergedConfig.pid = config.pid;
+  if (config.readyFd !== undefined) mergedConfig.readyFd = config.readyFd;
+
+  // 1b. Initialize the process-wide logger from the merged config.
+  const logger = new Logger({
+    level: mergedConfig.logLevel,
+    debugCategories: mergedConfig.debug,
+    printToConsole: mergedConfig.printToConsole,
+  });
+  setLogger(logger);
+
+  // 1c. Write PID file (default <datadir>/hotbuns.pid).  Empty string
+  // disables the PID file (matches Core's `-pid=` empty arg).
+  const pidPath =
+    mergedConfig.pid === ""
+      ? null
+      : mergedConfig.pid && path.isAbsolute(mergedConfig.pid)
+        ? mergedConfig.pid
+        : mergedConfig.pid
+          ? path.join(mergedConfig.datadir, mergedConfig.pid)
+          : path.join(mergedConfig.datadir, "hotbuns.pid");
+  if (pidPath) {
+    await fs.promises.mkdir(mergedConfig.datadir, { recursive: true });
+    await writePidFile(pidPath);
+    activePidPath = pidPath;
+  }
+
+  // 1d. SIGHUP handler — reopens the log file so external rotators can
+  //     move it out of the way.  No-op when the logger is console-only.
+  process.on("SIGHUP", () => {
+    console.log("Received SIGHUP, reopening log file...");
+    logger.reopenLog();
+  });
 
   // BIP-35 / BIP-111: when peerBloomFilters is enabled, we OR NODE_BLOOM
   // (=4) into the advertised services word.  This is the single source of
@@ -1205,13 +1453,32 @@ async function startNode(config: NodeConfig): Promise<void> {
   await blockSync.start();
   rpcServer.start();
 
-  // Start Prometheus metrics server
+  // Start Prometheus metrics server (also serves /health for supervisors).
   const metricsPort = mergedConfig.metricsPort;
   if (metricsPort > 0) {
     const metricsServer = Bun.serve({
       port: metricsPort,
       hostname: "0.0.0.0",
-      fetch: (_req) => {
+      fetch: (req) => {
+        const url = new URL(req.url);
+        // Liveness/readiness probe — minimal endpoint that supervisors
+        // (systemd, docker HEALTHCHECK, k8s) can hit on the metrics port.
+        if (url.pathname === "/health") {
+          const height = chainState.getBestBlock().height;
+          const peers = peerManager.getConnectedPeers().length;
+          return new Response(
+            JSON.stringify({
+              status: "ok",
+              network: mergedConfig.network,
+              height,
+              peers,
+              pid: process.pid,
+            }),
+            {
+              headers: { "Content-Type": "application/json" },
+            }
+          );
+        }
         const height = chainState.getBestBlock().height;
         const peers = peerManager.getConnectedPeers().length;
         const mempoolCount = mempool.getInfo().size;
@@ -1232,7 +1499,20 @@ async function startNode(config: NodeConfig): Promise<void> {
         });
       },
     });
-    console.log(`Prometheus metrics server listening on http://0.0.0.0:${metricsPort}`);
+    console.log(`Prometheus metrics server listening on http://0.0.0.0:${metricsPort} (/health probe enabled)`);
+  }
+
+  // Optional ready-fd handshake: write "ready\n" so a supervisor can
+  // synchronize on full startup.  Best-effort; a closed fd is not fatal.
+  if (typeof mergedConfig.readyFd === "number" && mergedConfig.readyFd >= 0) {
+    try {
+      fs.writeSync(mergedConfig.readyFd, "ready\n");
+    } catch (e) {
+      console.error(
+        `Failed to write to --ready-fd=${mergedConfig.readyFd}:`,
+        (e as Error).message
+      );
+    }
   }
 
   // 10. Log startup message
@@ -1289,6 +1569,10 @@ async function gracefulShutdown(): Promise<void> {
 
   // 6. Close database
   await runningNode.db.close();
+
+  // 7. Remove PID file (best-effort).
+  removePidFileSync(activePidPath);
+  activePidPath = null;
 
   console.log("Shutdown complete.");
   runningNode = null;
@@ -1649,6 +1933,7 @@ COMMANDS:
 
 OPTIONS:
   --datadir=<path>      Data directory (default: ~/.hotbuns)
+  --conf=<file>         Config file path (default: <datadir>/hotbuns.conf)
   --network=<net>       Network: mainnet, testnet, testnet4, regtest (default: mainnet)
   --rpc-port=<port>     RPC port (default: 8332/18332/18443)
   --metrics-port=<port> Prometheus metrics port (default: 9332, 0 = disabled)
@@ -1656,10 +1941,15 @@ OPTIONS:
   --rpc-password=<pass> RPC password (default: pass)
   --max-outbound=<n>    Max outbound connections (default: 8)
   --log-level=<level>   Log level: debug, info, warn, error (default: info)
+  --debug=<cat>         Enable debug logging for category (repeatable; 'all'/'1' = every category, 'none'/'0' = off)
+  --printtoconsole      Force log output to stdout/stderr
   --connect=<host:port> Connect to specific peer
   --prune=<n>           Prune block storage to n MiB (minimum 550, 0 = disabled)
   --dbcache=<n>         UTXO cache size in MiB (default: 512)
   --import-utxo=<path>  Import UTXO snapshot from HDOG file (AssumeUTXO)
+  --daemon              Fork to background and detach (re-execs self under Bun)
+  --pid=<file>          PID file path (default: <datadir>/hotbuns.pid; '' to disable)
+  --ready-fd=<N>        Write 'ready\\n' to this fd once startup completes
   --password=<pass>     Wallet password (for wallet commands)
   --fee-rate=<n>        Fee rate in sat/vB (for wallet send)
   --help                Show this help message
