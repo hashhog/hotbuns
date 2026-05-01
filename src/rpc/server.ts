@@ -57,6 +57,7 @@ import {
   serializeSnapshotMetadata,
   deserializeSnapshotMetadata,
   deserializeCoinFromSnapshot,
+  getLatestSnapshotHeightForRollback,
   SNAPSHOT_MAGIC,
   SNAPSHOT_VERSION,
   type SnapshotMetadata,
@@ -5333,38 +5334,272 @@ export class RPCServer {
   /**
    * dumptxoutset: Dump the current UTXO set to a snapshot file.
    *
-   * @param params - [path] Path for the output file
+   * Mirrors Bitcoin Core's `dumptxoutset` in `rpc/blockchain.cpp`:
+   *
+   *   dumptxoutset <path> [<type>] [<options>]
+   *
+   * Where `type` is one of:
+   *   - "" / "latest": dump the UTXO set at the current tip (default).
+   *   - "rollback":    temporarily roll the chainstate back to the latest
+   *                    assumeutxo snapshot height ≤ current tip, dump,
+   *                    then re-apply the disconnected blocks.
+   *   - explicit height/hash via `options.rollback`: same dance, but to
+   *                    the requested height/hash.
+   *
+   * Implements the rollback dance using `chainState.disconnectBlock` and
+   * `chainState.connectBlock` from `src/chain/state.ts` — analogous to
+   * Core's `TemporaryRollback` RAII (`InvalidateBlock` + `ReconsiderBlock`)
+   * but expressed as an explicit walk because hotbuns's `reconsiderBlock`
+   * does NOT auto-reorg back, it only clears the FAILED_VALID flags.
+   *
+   * The path of disconnected blocks is captured top-down before any
+   * mutation so we can replay them bottom-up after the dump completes,
+   * even if the dump throws — the `finally` re-applies what we removed
+   * to leave the chainstate in its original shape.
+   *
+   * @param params - [path, type?, options?]
    * @returns Dump result with coins written, base hash, height, path, and txoutset hash
    */
   private async dumpTxoutset(params: unknown[]): Promise<Record<string, unknown>> {
-    const [pathParam] = params;
+    const [pathParam, typeParam, optionsParam] = params;
 
     if (typeof pathParam !== "string") {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "path must be a string");
     }
 
-    // Create or get chainstate manager
+    const snapshotType =
+      typeof typeParam === "string" ? typeParam : "";
+    const options =
+      optionsParam && typeof optionsParam === "object" && !Array.isArray(optionsParam)
+        ? (optionsParam as Record<string, unknown>)
+        : {};
+    const hasRollbackOption = Object.prototype.hasOwnProperty.call(options, "rollback");
+
+    // Validate the type/options combo (matches Core
+    // rpc/blockchain.cpp:3116-3130 error wording).
+    if (hasRollbackOption && snapshotType !== "" && snapshotType !== "rollback") {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `Invalid snapshot type "${snapshotType}" specified with rollback option`
+      );
+    }
+    if (
+      snapshotType !== "" &&
+      snapshotType !== "latest" &&
+      snapshotType !== "rollback"
+    ) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `Invalid snapshot type "${snapshotType}" specified. Please specify "rollback" or "latest"`
+      );
+    }
+
+    const tip = this.chainState.getBestBlock();
+    let targetHeight = tip.height;
+    let targetHash: Buffer = tip.hash;
+
+    if (hasRollbackOption) {
+      const resolved = await this.resolveRollbackTarget(options.rollback, tip.height);
+      targetHeight = resolved.height;
+      targetHash = resolved.hash;
+    } else if (snapshotType === "rollback") {
+      const h = getLatestSnapshotHeightForRollback(this.params, tip.height);
+      if (h === null) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "No assumeutxo snapshot height available ≤ current tip"
+        );
+      }
+      const hashAtHeight = await this.db.getBlockHashByHeight(h);
+      if (!hashAtHeight) {
+        throw this.rpcError(
+          RPCErrorCodes.INTERNAL_ERROR,
+          `No block hash recorded for assumeutxo height ${h}`
+        );
+      }
+      targetHeight = h;
+      targetHash = hashAtHeight;
+    }
+
+    if (targetHeight > tip.height) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `Target height ${targetHeight} after current tip ${tip.height}`
+      );
+    }
+
+    // Lazily construct the snapshot manager, mirroring the existing
+    // loadtxoutset wiring above. Must happen BEFORE the rollback dance
+    // so a setup failure doesn't leave the chainstate disconnected.
     let chainstateManager = this.chainstateManager;
     if (!chainstateManager) {
       chainstateManager = new ChainstateManager(this.db, this.params);
       this.chainstateManager = chainstateManager;
     }
 
-    try {
-      const result = await chainstateManager.dumpSnapshot(pathParam);
+    // Capture the disconnected blocks top-down (tip → target) so we can
+    // replay them bottom-up (target+1 → tip) after the dump completes.
+    // Reading them up front means a torn read can't strand us in a
+    // partially-disconnected state.
+    const disconnected: Array<{ block: Block; height: number; hash: Buffer }> = [];
+    if (targetHeight < tip.height) {
+      let cursorHash: Buffer = tip.hash;
+      let cursorHeight: number = tip.height;
+      while (cursorHeight > targetHeight) {
+        const rawBlock = await this.db.getBlock(cursorHash);
+        if (!rawBlock) {
+          throw this.rpcError(
+            RPCErrorCodes.INTERNAL_ERROR,
+            `Missing block data for ${cursorHash.toString("hex")} at height ${cursorHeight} (cannot roll back)`
+          );
+        }
+        const block = deserializeBlock(new BufferReader(rawBlock));
+        disconnected.push({ block, height: cursorHeight, hash: Buffer.from(cursorHash) });
+        cursorHash = Buffer.from(block.header.prevBlock);
+        cursorHeight--;
+      }
+      if (!cursorHash.equals(targetHash)) {
+        throw this.rpcError(
+          RPCErrorCodes.INTERNAL_ERROR,
+          `Walked back to height ${cursorHeight} hash ${cursorHash.toString("hex")} but expected target hash ${targetHash.toString("hex")}`
+        );
+      }
+    }
 
-      return {
-        coins_written: Number(result.coinsWritten),
-        base_hash: result.baseHash,
-        base_height: result.baseHeight,
-        path: result.path,
-        txoutset_hash: result.txoutsetHash,
-        nchaintx: Number(result.nChainTx),
-      };
+    // Disconnect down to target. If anything below fails we still want to
+    // re-apply, so the dump itself goes inside try/finally.
+    for (const { block, height } of disconnected) {
+      await this.chainState.disconnectBlock(block, height);
+    }
+
+    let dumpResult: DumpSnapshotResult;
+    let dumpError: unknown = null;
+    try {
+      dumpResult = await chainstateManager.dumpSnapshot(pathParam);
     } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
+      dumpError = e;
+      // We still need to fall through to the finally-equivalent below so
+      // the chain is restored. Use a sentinel to avoid TS complaining
+      // about uninitialized `dumpResult`.
+      dumpResult = {
+        coinsWritten: 0n,
+        baseHash: "",
+        baseHeight: 0,
+        path: pathParam,
+        txoutsetHash: "",
+        nChainTx: 0n,
+      };
+    }
+
+    // Re-apply: bottom-up (target+1 → tip).
+    for (let i = disconnected.length - 1; i >= 0; i--) {
+      const { block, height } = disconnected[i];
+      try {
+        await this.chainState.connectBlock(block, height);
+      } catch (reapplyErr) {
+        // Re-application failure leaves the chain partially restored —
+        // this is recoverable on restart but we surface it loudly so the
+        // operator sees both the original dump error (if any) and the
+        // reapply error. Mirrors Core's
+        // "dumptxoutset failed to roll back to requested height" path.
+        const msg = reapplyErr instanceof Error ? reapplyErr.message : String(reapplyErr);
+        throw this.rpcError(
+          RPCErrorCodes.INTERNAL_ERROR,
+          `dumptxoutset rollback re-apply failed at height ${height}: ${msg}` +
+            (dumpError
+              ? ` (original dump error: ${dumpError instanceof Error ? dumpError.message : String(dumpError)})`
+              : "")
+        );
+      }
+    }
+
+    if (dumpError) {
+      const message = dumpError instanceof Error ? dumpError.message : String(dumpError);
       throw this.rpcError(RPCErrorCodes.INTERNAL_ERROR, `Failed to dump snapshot: ${message}`);
     }
+
+    return {
+      coins_written: Number(dumpResult.coinsWritten),
+      base_hash: dumpResult.baseHash,
+      base_height: dumpResult.baseHeight,
+      path: dumpResult.path,
+      txoutset_hash: dumpResult.txoutsetHash,
+      nchaintx: Number(dumpResult.nChainTx),
+    };
+  }
+
+  /**
+   * Resolve the `rollback=<height|hash>` named option to a (height, hash)
+   * pair on our active chain. Mirrors Core's `ParseHashOrHeight`.
+   */
+  private async resolveRollbackTarget(
+    rollback: unknown,
+    tipHeight: number
+  ): Promise<{ height: number; hash: Buffer }> {
+    let height: number | null = null;
+    let hash: Buffer | null = null;
+
+    if (typeof rollback === "number" && Number.isInteger(rollback)) {
+      height = rollback;
+    } else if (typeof rollback === "string") {
+      // Try height first (numeric string), then 32-byte hex hash.
+      if (/^\d+$/.test(rollback)) {
+        height = Number.parseInt(rollback, 10);
+      } else if (/^[0-9a-fA-F]{64}$/.test(rollback)) {
+        hash = Buffer.from(rollback, "hex").reverse();
+      } else {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "rollback option must be a height (integer) or 32-byte block hash hex string"
+        );
+      }
+    } else {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "rollback option must be a height or block hash"
+      );
+    }
+
+    if (height !== null) {
+      if (height < 0) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          `Target block height ${height} is negative`
+        );
+      }
+      if (height > tipHeight) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          `Target block height ${height} after current tip ${tipHeight}`
+        );
+      }
+      const hashAtHeight = await this.db.getBlockHashByHeight(height);
+      if (!hashAtHeight) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          `No block at height ${height}`
+        );
+      }
+      return { height, hash: hashAtHeight };
+    }
+
+    // hash != null
+    const idx = await this.db.getBlockIndex(hash!);
+    if (!idx) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `Block ${hash!.toString("hex")} not found`
+      );
+    }
+    // Make sure the hash is on our active chain.
+    const onChain = await this.db.getBlockHashByHeight(idx.height);
+    if (!onChain || !onChain.equals(hash!)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `Block ${hash!.toString("hex")} is not on the active chain`
+      );
+    }
+    return { height: idx.height, hash: hash! };
   }
 
   /**
