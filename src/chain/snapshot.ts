@@ -13,6 +13,12 @@
 
 import { hash256 } from "../crypto/primitives.js";
 import { BufferWriter, BufferReader, varIntSize } from "../wire/serialization.js";
+import {
+  serializeTxOutCompressed,
+  deserializeTxOutCompressed,
+  writeVarIntCore,
+  readVarIntCore,
+} from "../wire/compressor.js";
 import type { ChainDB, UTXOEntry, BatchOperation } from "../storage/database.js";
 import { DBPrefix } from "../storage/database.js";
 import type { ConsensusParams } from "../consensus/params.js";
@@ -180,35 +186,53 @@ export function deserializeSnapshotMetadata(reader: BufferReader, expectedMagic:
 }
 
 /**
- * Serialize a coin for snapshot storage.
- * Format: VARINT((height << 1) | coinbase) + TxOut
+ * Serialize a coin for snapshot storage in Bitcoin Core's wire-compatible
+ * format (Coin::Serialize from src/coins.h):
+ *
+ *   VARINT(nHeight * 2 + fCoinBase) || TxOutCompression
+ *
+ * Where TxOutCompression =
+ *   VARINT(CompressAmount(value)) || ScriptCompression(scriptPubKey)
+ *
+ * VARINT here is Pieter's variable-length encoding (NOT wire-protocol
+ * CompactSize). See src/wire/compressor.ts.
  */
 export function serializeCoinForSnapshot(coin: Coin): Buffer {
   const writer = new BufferWriter();
 
-  // Encode height and coinbase flag
-  const code = (coin.height << 1) | (coin.isCoinbase ? 1 : 0);
-  writer.writeVarInt(code);
+  // VARINT(code): height * 2 + fCoinBase.
+  const code = BigInt(coin.height) * 2n + (coin.isCoinbase ? 1n : 0n);
+  writeVarIntCore(writer, code);
 
-  // TxOut: value + scriptPubKey
-  writer.writeUInt64LE(coin.txOut.value);
-  writer.writeVarBytes(coin.txOut.scriptPubKey);
+  // TxOutCompression: compressed value + compressed script.
+  serializeTxOutCompressed(writer, coin.txOut.value, coin.txOut.scriptPubKey);
 
   return writer.toBuffer();
 }
 
 /**
- * Deserialize a coin from snapshot storage.
+ * Serialize a coin into an existing BufferWriter (avoids allocating an
+ * intermediate Buffer per coin during the dump fast-path).
+ */
+export function serializeCoinIntoWriter(writer: BufferWriter, coin: Coin): void {
+  const code = BigInt(coin.height) * 2n + (coin.isCoinbase ? 1n : 0n);
+  writeVarIntCore(writer, code);
+  serializeTxOutCompressed(writer, coin.txOut.value, coin.txOut.scriptPubKey);
+}
+
+/**
+ * Deserialize a coin from snapshot storage (Coin::Unserialize equivalent).
+ *
+ * Reads VARINT(code) || TxOutCompression and reconstructs height,
+ * isCoinbase, and the original (decompressed) txOut.
  */
 export function deserializeCoinFromSnapshot(reader: BufferReader): Coin {
-  // Decode height and coinbase flag
-  const code = reader.readVarInt();
-  const height = code >> 1;
-  const isCoinbase = (code & 1) === 1;
+  const codeBig = readVarIntCore(reader);
+  // Height fits in 31 bits in Core; safe as a JS number.
+  const height = Number(codeBig >> 1n);
+  const isCoinbase = (codeBig & 1n) === 1n;
 
-  // TxOut
-  const value = reader.readUInt64LE();
-  const scriptPubKey = reader.readVarBytes();
+  const { value, scriptPubKey } = deserializeTxOutCompressed(reader);
 
   return {
     txOut: { value, scriptPubKey },
@@ -218,32 +242,35 @@ export function deserializeCoinFromSnapshot(reader: BufferReader): Coin {
 }
 
 /**
- * Compute the UTXO set hash (HASH_SERIALIZED).
+ * Compute the UTXO set hash (HASH_SERIALIZED), Bitcoin Core compatible.
  *
- * This iterates all UTXOs in deterministic order and computes a hash
- * over all serialized (outpoint, coin) pairs.
+ * Mirrors kernel/coinstats.cpp ApplyCoinHash + TxOutSer:
+ *
+ *   HashWriter ss;
+ *   for each (outpoint, coin) in db iteration order:
+ *     ss << outpoint                              // 32-byte txid + uint32 vout
+ *     ss << uint32((coin.nHeight << 1) + coin.fCoinBase)
+ *     ss << coin.out                              // int64 nValue + CScript
+ *   return double_sha256(ss)
+ *
+ * Note: Core's HashWriter is DOUBLE-SHA256 (see hash.h) — finalize once,
+ * then re-hash the 32-byte digest. We use hash256() to match.
+ *
+ * Warning (verbatim from kernel/coinstats.cpp): "be very careful when
+ * changing this!" — the assumeutxo commitment depends on this exact
+ * byte layout.
  */
 export async function computeUTXOSetHash(
   db: ChainDB,
   interruptCheck?: () => boolean
 ): Promise<{ hash: Buffer; coinsCount: bigint }> {
-  // We'll use an incremental hash approach:
-  // For each UTXO, serialize (txid, vout, coin) and add to a running hash
-
-  // Create a SHA256 hasher
+  // Single-SHA256 streaming; finalize once, then hash the digest a second
+  // time to match Core's HashWriter::GetHash (double-SHA256).
   const hasher = new Bun.CryptoHasher("sha256");
 
   let coinsCount = 0n;
 
-  // Iterate all UTXOs in database order (lexicographic by key)
-  // The UTXO key is: prefix (1 byte) + txid (32 bytes) + vout (4 bytes LE)
   const utxoPrefix = Buffer.from([DBPrefix.UTXO]);
-
-  // We need to iterate the underlying LevelDB
-  // For now, use a simpler approach: read all UTXOs
-  // In production, this should use a proper iterator
-
-  // Use batch reads from database - we'll iterate over the raw level
   const iterator = (db as any).db.iterator({
     gte: utxoPrefix,
     lt: Buffer.concat([Buffer.from([DBPrefix.UTXO + 1])]),
@@ -255,25 +282,27 @@ export async function computeUTXOSetHash(
         throw new Error("Interrupted");
       }
 
-      // Key format: prefix (1 byte) + txid (32 bytes) + vout (4 bytes LE)
+      // Key format: prefix (1 byte) + txid (32 bytes) + vout (4 bytes LE).
       if (key.length !== 37) continue;
 
       const txid = key.subarray(1, 33);
       const vout = key.readUInt32LE(33);
 
-      // Deserialize the UTXO entry
+      // Deserialize the UTXO entry stored locally.
       const reader = new BufferReader(value);
       const height = reader.readUInt32LE();
       const coinbase = reader.readUInt8() === 1;
       const amount = reader.readUInt64LE();
       const scriptPubKey = reader.readVarBytes();
 
-      // Serialize for hash: txid + vout + code + txout
-      const code = (height << 1) | (coinbase ? 1 : 0);
+      // Match TxOutSer exactly:
+      //   COutPoint = txid (32 LE) + vout (uint32 LE)
+      //   uint32 = (height << 1) + coinbase                   <-- fixed 4 bytes
+      //   CTxOut = int64 nValue (LE) + CScript (CompactSize + bytes)
       const writer = new BufferWriter();
       writer.writeHash(txid);
       writer.writeUInt32LE(vout);
-      writer.writeVarInt(code);
+      writer.writeUInt32LE(((height << 1) + (coinbase ? 1 : 0)) >>> 0);
       writer.writeUInt64LE(amount);
       writer.writeVarBytes(scriptPubKey);
 
@@ -284,8 +313,9 @@ export async function computeUTXOSetHash(
     await iterator.close();
   }
 
-  // Final hash
-  const hash = Buffer.from(hasher.digest());
+  // Double-SHA256 to match Core's HashWriter::GetHash().
+  const inner = Buffer.from(hasher.digest());
+  const hash = hash256(inner);
 
   return { hash, coinsCount };
 }
@@ -578,27 +608,29 @@ export class ChainstateManager {
     });
 
     let currentTxid: Buffer | null = null;
-    let currentCoins: Array<{ vout: number; data: Buffer }> = [];
+    let currentCoins: Array<{ vout: number; coin: Coin }> = [];
     let coinsWritten = 0n;
 
+    // Mirrors Bitcoin Core's write_coins_to_file lambda in
+    // rpc/blockchain.cpp WriteUTXOSnapshot. The outer txid-group framing
+    // (txid, count, [vout, coin]...) uses wire-protocol CompactSize for
+    // count and vout, while each Coin uses Pieter's VARINT and
+    // TxOutCompression internally (see serializeCoinIntoWriter).
     const flushTx = () => {
       if (!currentTxid || currentCoins.length === 0) return;
 
-      // Write txid
-      writer.write(currentTxid);
-
-      // Write number of outputs
-      const countWriter = new BufferWriter();
-      countWriter.writeVarInt(currentCoins.length);
-      writer.write(countWriter.toBuffer());
-
-      // Write each output
-      for (const { vout, data } of currentCoins) {
-        const voutWriter = new BufferWriter();
-        voutWriter.writeVarInt(vout);
-        writer.write(voutWriter.toBuffer());
-        writer.write(data);
+      const groupWriter = new BufferWriter();
+      // txid (32 bytes, raw).
+      groupWriter.writeBytes(currentTxid);
+      // CompactSize: number of outputs in this group.
+      groupWriter.writeVarInt(currentCoins.length);
+      for (const { vout, coin } of currentCoins) {
+        // CompactSize: vout index.
+        groupWriter.writeVarInt(vout);
+        // Coin: VARINT(code) || TxOutCompression.
+        serializeCoinIntoWriter(groupWriter, coin);
       }
+      writer.write(groupWriter.toBuffer());
 
       currentCoins = [];
     };
@@ -614,19 +646,19 @@ export class ChainstateManager {
         const txid = key.subarray(1, 33);
         const vout = key.readUInt32LE(33);
 
-        // Deserialize UTXO entry
+        // Deserialize UTXO entry stored in the local DB (uncompressed,
+        // matches UTXOManager.serializeUTXO format).
         const entryReader = new BufferReader(value);
         const height = entryReader.readUInt32LE();
         const coinbase = entryReader.readUInt8() === 1;
         const amount = entryReader.readUInt64LE();
         const scriptPubKey = entryReader.readVarBytes();
 
-        // Serialize coin for snapshot
-        const coinWriter = new BufferWriter();
-        const code = (height << 1) | (coinbase ? 1 : 0);
-        coinWriter.writeVarInt(code);
-        coinWriter.writeUInt64LE(amount);
-        coinWriter.writeVarBytes(scriptPubKey);
+        const coin: Coin = {
+          txOut: { value: amount, scriptPubKey },
+          height,
+          isCoinbase: coinbase,
+        };
 
         // Check if new transaction
         if (!currentTxid || !txid.equals(currentTxid)) {
@@ -634,7 +666,7 @@ export class ChainstateManager {
           currentTxid = Buffer.from(txid);
         }
 
-        currentCoins.push({ vout, data: coinWriter.toBuffer() });
+        currentCoins.push({ vout, coin });
         coinsWritten++;
       }
 
