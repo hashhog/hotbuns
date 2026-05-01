@@ -11,6 +11,7 @@ import {
   serializeCoinForSnapshot,
   deserializeCoinFromSnapshot,
   computeUTXOSetHash,
+  computeUTXOSetMuHash,
   ChainstateManager,
   Chainstate,
   ChainstateStatus,
@@ -22,6 +23,7 @@ import {
   type SnapshotMetadata,
   type AssumeutxoData,
 } from "../chain/snapshot.js";
+import { hash256 } from "../crypto/primitives.js";
 import type { Coin } from "../chain/utxo.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import {
@@ -824,17 +826,27 @@ describe("assumeUTXO", () => {
   });
 
   // -----------------------------------------------------------------------
-  // MuHash3072 wiring: computeUTXOSetHash MUST be MuHash, AND the
-  // loadSnapshot strict-validation gate MUST refuse with Core's verbatim
-  // "Bad snapshot content hash: expected ..., got ..." string.
-  // Reference: bitcoin-core/src/validation.cpp:5912-5914 +
-  // bitcoin-core/src/kernel/coinstats.cpp::ApplyCoinHash(MuHash3072&, ...).
+  // HASH_SERIALIZED wiring (assumeutxo strict gate).
+  //
+  // `computeUTXOSetHash` MUST produce the SHA256d-via-HashWriter digest
+  // (CoinStatsHashType::HASH_SERIALIZED). The four hardcoded mainnet
+  // `m_assumeutxo_data.hash_serialized` values in chain params are this
+  // digest, NOT MuHash3072 outputs — see Core's
+  // `validation.cpp:5902-5914` (calls `ComputeUTXOStats` with
+  // `CoinStatsHashType::HASH_SERIALIZED`) and
+  // `kernel/coinstats.cpp:161-163` (the HASH_SERIALIZED case constructs a
+  // `HashWriter ss{}`, ingests TxOutSer bytes, returns `ss.GetHash()` =
+  // double-SHA256). MuHash3072 is reserved for `gettxoutsetinfo` only and
+  // is exercised separately below via `computeUTXOSetMuHash`.
+  //
+  // The loadSnapshot strict-validation gate MUST refuse with Core's
+  // verbatim "Bad snapshot content hash: expected ..., got ..." string.
   // -----------------------------------------------------------------------
-  describe("MuHash3072 wiring (assumeutxo HASH_SERIALIZED)", () => {
+  describe("HASH_SERIALIZED wiring (assumeutxo strict gate)", () => {
     let db: ChainDB;
 
     beforeEach(async () => {
-      db = new ChainDB(join(testDbPath, "muhash-wiring"));
+      db = new ChainDB(join(testDbPath, "hash-serialized-wiring"));
       await db.open();
     });
 
@@ -843,8 +855,8 @@ describe("assumeUTXO", () => {
     });
 
     /** Serialize a coin into TxOutSer bytes — manually duplicates the
-     *  layout `computeUTXOSetHash` feeds into MuHash, so the test pins
-     *  the exact byte format independent of internal helpers. */
+     *  layout `computeUTXOSetHash` feeds into the HashWriter, so the test
+     *  pins the exact byte format independent of internal helpers. */
     function txOutSer(
       txid: Buffer,
       vout: number,
@@ -862,7 +874,7 @@ describe("assumeUTXO", () => {
       return w.toBuffer();
     }
 
-    it("computeUTXOSetHash matches an independent MuHash3072 over TxOutSer", async () => {
+    it("computeUTXOSetHash matches SHA256d (HashWriter::GetHash) over concatenated TxOutSer bytes", async () => {
       // Two UTXOs with very different field values to exercise all paths.
       const txidA = Buffer.alloc(32, 0x11);
       const txidB = Buffer.alloc(32, 0x22);
@@ -885,58 +897,80 @@ describe("assumeUTXO", () => {
       const { hash, coinsCount } = await computeUTXOSetHash(db);
       expect(coinsCount).toBe(2n);
 
-      // Reproduce the same hash by feeding the canonical TxOutSer bytes
-      // into a fresh MuHash3072 — order-independent so we don't care
-      // which order the DB iterator returned them in.
-      const acc = new MuHash3072();
-      acc.add(txOutSer(txidA, 0, 12345, true, 50_00000000n, spkA));
-      acc.add(txOutSer(txidB, 7, 23456, false, 1_23456789n, spkB));
-      const expected = acc.finalize();
+      // The DB iterates in key order; reproduce the same digest by
+      // sorting our coins by (prefix||txid||vout) — exactly what
+      // ChainDB's UTXO iterator returns.
+      const recs = [
+        { txid: txidA, vout: 0, h: 12345, cb: true, amt: 50_00000000n, spk: spkA },
+        { txid: txidB, vout: 7, h: 23456, cb: false, amt: 1_23456789n, spk: spkB },
+      ].sort((a, b) => {
+        const ka = Buffer.concat([
+          a.txid,
+          (() => {
+            const b = Buffer.alloc(4);
+            b.writeUInt32LE(a.vout);
+            return b;
+          })(),
+        ]);
+        const kb = Buffer.concat([
+          b.txid,
+          (() => {
+            const buf = Buffer.alloc(4);
+            buf.writeUInt32LE(b.vout);
+            return buf;
+          })(),
+        ]);
+        return ka.compare(kb);
+      });
+
+      // HASH_SERIALIZED = double-SHA256 of the streamed TxOutSer bytes
+      // (HashWriter::GetHash is `hash256(sha256_finalize(stream))` —
+      // i.e. the standard Bitcoin double-SHA256 of the inner SHA-256
+      // digest). Reproduce it manually here.
+      const hasher = new Bun.CryptoHasher("sha256");
+      for (const r of recs) {
+        hasher.update(txOutSer(r.txid, r.vout, r.h, r.cb, r.amt, r.spk));
+      }
+      const inner = Buffer.from(hasher.digest());
+      const expected = hash256(inner);
 
       expect(hash.equals(expected)).toBe(true);
       expect(hash.length).toBe(32);
     });
 
-    it("computeUTXOSetHash is order-independent (MuHash multiset property)", async () => {
-      // Insert in one order, snapshot the hash, wipe + reinsert in a
-      // different order — MuHash should agree because the underlying
-      // primitive is a commutative+associative multiset hash.
-      const coins = [
-        { txid: Buffer.alloc(32, 0x01), vout: 0, height: 100, cb: true, amt: 5000n, spk: Buffer.from([0x6a, 0x01]) },
-        { txid: Buffer.alloc(32, 0x02), vout: 0, height: 200, cb: false, amt: 6000n, spk: Buffer.from([0x6a, 0x02]) },
-        { txid: Buffer.alloc(32, 0x03), vout: 0, height: 300, cb: false, amt: 7000n, spk: Buffer.from([0x6a, 0x03]) },
+    it("computeUTXOSetHash is order-dependent (HashWriter ingests in DB iter order)", async () => {
+      // HASH_SERIALIZED is NOT order-independent — Core's HashWriter
+      // streams bytes into SHA256, so the digest depends on the order
+      // they arrive (this is why the assumeutxo commitment pins a
+      // specific iteration order via leveldb's lexicographic byte
+      // ordering on (prefix||txid||vout) keys).
+      const recs = [
+        { txid: Buffer.alloc(32, 0x01), vout: 0, h: 100, cb: true, amt: 5000n, spk: Buffer.from([0x6a, 0x01]) },
+        { txid: Buffer.alloc(32, 0x02), vout: 0, h: 200, cb: false, amt: 6000n, spk: Buffer.from([0x6a, 0x02]) },
+        { txid: Buffer.alloc(32, 0x03), vout: 0, h: 300, cb: false, amt: 7000n, spk: Buffer.from([0x6a, 0x03]) },
       ];
 
-      for (const c of coins) {
-        await db.putUTXO(c.txid, c.vout, { height: c.height, coinbase: c.cb, amount: c.amt, scriptPubKey: c.spk });
-      }
-      const { hash: h1 } = await computeUTXOSetHash(db);
+      const fwd = new Bun.CryptoHasher("sha256");
+      for (const r of recs) fwd.update(txOutSer(r.txid, r.vout, r.h, r.cb, r.amt, r.spk));
+      const hashFwd = hash256(Buffer.from(fwd.digest()));
 
-      // The DB iterates in key order regardless, but the MuHash itself
-      // does not depend on iteration order — verify by hashing the same
-      // coin set in a deliberately reversed order via two MuHashes.
-      const accA = new MuHash3072();
-      const accB = new MuHash3072();
-      for (const c of coins) {
-        accA.add(txOutSer(c.txid, c.vout, c.height, c.cb, c.amt, c.spk));
-      }
-      for (const c of [...coins].reverse()) {
-        accB.add(txOutSer(c.txid, c.vout, c.height, c.cb, c.amt, c.spk));
-      }
-      const hA = accA.finalize();
-      const hB = accB.finalize();
-      expect(hA.equals(hB)).toBe(true);
-      expect(h1.equals(hA)).toBe(true);
+      const rev = new Bun.CryptoHasher("sha256");
+      for (const r of [...recs].reverse()) rev.update(txOutSer(r.txid, r.vout, r.h, r.cb, r.amt, r.spk));
+      const hashRev = hash256(Buffer.from(rev.digest()));
+
+      // Different orderings -> different digests under HASH_SERIALIZED.
+      expect(hashFwd.equals(hashRev)).toBe(false);
     });
 
-    it("empty UTXO set hashes to SHA256 of the all-zero 384-byte LE Num3072 (MuHash identity / 1)", async () => {
+    it("empty UTXO set hashes to double-SHA256 of zero bytes", async () => {
       const { hash, coinsCount } = await computeUTXOSetHash(db);
       expect(coinsCount).toBe(0n);
 
-      // Empty MuHash: numerator=denominator=1, finalize -> num/den=1,
-      // serialize LE_384(1) = 0x01 followed by 383 zero bytes, then SHA256.
-      const emptyAcc = new MuHash3072();
-      const expected = emptyAcc.finalize();
+      // Empty stream -> SHA-256 of "" -> double-SHA256("").
+      const empty = new Bun.CryptoHasher("sha256");
+      const inner = Buffer.from(empty.digest());
+      const expected = hash256(inner);
+
       expect(hash.equals(expected)).toBe(true);
     });
 
@@ -966,7 +1000,7 @@ describe("assumeUTXO", () => {
         ]),
       };
 
-      const dumpPath = join(testDbPath, "muhash-bad.dat");
+      const dumpPath = join(testDbPath, "strict-bad.dat");
       const dumpMgr = new ChainstateManager(db, params);
       await dumpMgr.dumpSnapshot(dumpPath);
 
@@ -998,9 +1032,78 @@ describe("assumeUTXO", () => {
       expect(caught!.message).toContain(badExpected.toString("hex"));
     });
 
-    it("loadSnapshot accepts a roundtripped snapshot whose hash matches the registered MuHash value", async () => {
-      // The complementary success path — register the *correct* MuHash
-      // we actually computed and confirm loadSnapshot does not throw.
+    it("loadSnapshot strict gate uses HASH_SERIALIZED, NOT MuHash3072", async () => {
+      // Regression guard for cb7488f: the strict gate MUST reject when
+      // we register a *MuHash3072* digest in chain params, even though
+      // the bytes are valid as a MuHash output. Per Core's
+      // validation.cpp:5902, the gate is HASH_SERIALIZED — registering
+      // a MuHash digest must therefore fail the comparison.
+      const tip = Buffer.alloc(32, 0xfb);
+      await db.putChainState({ bestBlockHash: tip, bestHeight: 13, totalWork: 1n });
+      await db.putBlockIndex(tip, {
+        height: 13,
+        header: Buffer.alloc(80, 0),
+        nTx: 1,
+        status: 0x1f,
+        dataPos: 0,
+      });
+
+      const txid = Buffer.alloc(32, 0xa3);
+      const spk = Buffer.from([0x76, 0xa9, 0x14, ...Buffer.alloc(20, 0x66), 0x88, 0xac]);
+      await db.putUTXO(txid, 0, { height: 13, coinbase: false, amount: 7n, scriptPubKey: spk });
+
+      // Compute BOTH digests and confirm they differ.
+      const { hash: serialized } = await computeUTXOSetHash(db);
+      const { hash: muhash } = await computeUTXOSetMuHash(db);
+      expect(serialized.equals(muhash)).toBe(false);
+
+      // Register the MuHash digest as `hashSerialized` in params — the
+      // strict gate must reject because the field semantically holds
+      // HASH_SERIALIZED, and we computed MuHash.
+      const params: ConsensusParams = {
+        ...REGTEST,
+        assumeutxo: new Map([
+          [tip.toString("hex"), { height: 13, hashSerialized: muhash, nChainTx: 1n, blockHash: tip }],
+        ]),
+      };
+
+      const dumpPath = join(testDbPath, "strict-muhash-rejected.dat");
+      const dumpMgr = new ChainstateManager(db, params);
+      await dumpMgr.dumpSnapshot(dumpPath);
+
+      // Wipe + reload.
+      const it = (db as any).db.iterator({
+        gte: Buffer.from([DBPrefix.UTXO]),
+        lt: Buffer.from([DBPrefix.UTXO + 1]),
+      });
+      const delKeys: Buffer[] = [];
+      for await (const [k] of it) delKeys.push(k);
+      await it.close();
+      await db.batch(
+        delKeys.map((k) => ({ type: "del" as const, prefix: k[0]!, key: k.subarray(1) }))
+      );
+
+      const loadMgr = new ChainstateManager(db, params);
+      let caught: Error | null = null;
+      try {
+        await loadMgr.loadSnapshot(dumpPath);
+      } catch (e) {
+        caught = e as Error;
+      }
+
+      // Strict gate rejects: digest registered as HASH_SERIALIZED was
+      // actually MuHash, so the SHA256d check fails.
+      expect(caught).not.toBeNull();
+      expect(caught!.message.startsWith("Bad snapshot content hash: expected ")).toBe(true);
+      // The "got" side is the SHA256d digest (what computeUTXOSetHash
+      // produces); confirm the message contains it, NOT the MuHash.
+      expect(caught!.message).toContain(serialized.toString("hex"));
+    });
+
+    it("loadSnapshot accepts a roundtripped snapshot whose hash matches the registered HASH_SERIALIZED value", async () => {
+      // The complementary success path — register the *correct*
+      // SHA256d digest we actually computed and confirm loadSnapshot
+      // does not throw.
       const tip = Buffer.alloc(32, 0xfd);
       await db.putChainState({ bestBlockHash: tip, bestHeight: 11, totalWork: 1n });
       await db.putBlockIndex(tip, {
@@ -1024,7 +1127,7 @@ describe("assumeUTXO", () => {
         ]),
       };
 
-      const dumpPath = join(testDbPath, "muhash-good.dat");
+      const dumpPath = join(testDbPath, "strict-good.dat");
       const dumpMgr = new ChainstateManager(db, params);
       await dumpMgr.dumpSnapshot(dumpPath);
 
@@ -1044,6 +1147,109 @@ describe("assumeUTXO", () => {
       const result = await loadMgr.loadSnapshot(dumpPath);
       expect(result.coinsLoaded).toBe(1n);
       expect(result.baseHeight).toBe(11);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // MuHash3072 wiring (gettxoutsetinfo hash_type=muhash).
+  //
+  // `computeUTXOSetMuHash` is the order-independent multiset hash; it is
+  // NOT the assumeutxo strict-gate hash. Reference:
+  // bitcoin-core/src/kernel/coinstats.cpp::ApplyCoinHash(MuHash3072&, ...).
+  // -----------------------------------------------------------------------
+  describe("MuHash3072 wiring (gettxoutsetinfo only)", () => {
+    let db: ChainDB;
+
+    beforeEach(async () => {
+      db = new ChainDB(join(testDbPath, "muhash-wiring"));
+      await db.open();
+    });
+
+    afterEach(async () => {
+      await db.close();
+    });
+
+    function txOutSer(
+      txid: Buffer,
+      vout: number,
+      height: number,
+      coinbase: boolean,
+      amount: bigint,
+      scriptPubKey: Buffer
+    ): Buffer {
+      const w = new BufferWriter();
+      w.writeHash(txid);
+      w.writeUInt32LE(vout);
+      w.writeUInt32LE(((height << 1) + (coinbase ? 1 : 0)) >>> 0);
+      w.writeUInt64LE(amount);
+      w.writeVarBytes(scriptPubKey);
+      return w.toBuffer();
+    }
+
+    it("computeUTXOSetMuHash matches an independent MuHash3072 over TxOutSer", async () => {
+      const txidA = Buffer.alloc(32, 0x11);
+      const txidB = Buffer.alloc(32, 0x22);
+      const spkA = Buffer.from([0x76, 0xa9, 0x14, ...Buffer.alloc(20, 0xaa), 0x88, 0xac]);
+      const spkB = Buffer.from([0xa9, 0x14, ...Buffer.alloc(20, 0xbb), 0x87]);
+
+      await db.putUTXO(txidA, 0, {
+        height: 12345,
+        coinbase: true,
+        amount: 50_00000000n,
+        scriptPubKey: spkA,
+      });
+      await db.putUTXO(txidB, 7, {
+        height: 23456,
+        coinbase: false,
+        amount: 1_23456789n,
+        scriptPubKey: spkB,
+      });
+
+      const { hash, coinsCount } = await computeUTXOSetMuHash(db);
+      expect(coinsCount).toBe(2n);
+
+      const acc = new MuHash3072();
+      acc.add(txOutSer(txidA, 0, 12345, true, 50_00000000n, spkA));
+      acc.add(txOutSer(txidB, 7, 23456, false, 1_23456789n, spkB));
+      const expected = acc.finalize();
+
+      expect(hash.equals(expected)).toBe(true);
+      expect(hash.length).toBe(32);
+    });
+
+    it("computeUTXOSetMuHash is order-independent (multiset property)", async () => {
+      const coins = [
+        { txid: Buffer.alloc(32, 0x01), vout: 0, height: 100, cb: true, amt: 5000n, spk: Buffer.from([0x6a, 0x01]) },
+        { txid: Buffer.alloc(32, 0x02), vout: 0, height: 200, cb: false, amt: 6000n, spk: Buffer.from([0x6a, 0x02]) },
+        { txid: Buffer.alloc(32, 0x03), vout: 0, height: 300, cb: false, amt: 7000n, spk: Buffer.from([0x6a, 0x03]) },
+      ];
+
+      for (const c of coins) {
+        await db.putUTXO(c.txid, c.vout, { height: c.height, coinbase: c.cb, amount: c.amt, scriptPubKey: c.spk });
+      }
+      const { hash: h1 } = await computeUTXOSetMuHash(db);
+
+      const accA = new MuHash3072();
+      const accB = new MuHash3072();
+      for (const c of coins) {
+        accA.add(txOutSer(c.txid, c.vout, c.height, c.cb, c.amt, c.spk));
+      }
+      for (const c of [...coins].reverse()) {
+        accB.add(txOutSer(c.txid, c.vout, c.height, c.cb, c.amt, c.spk));
+      }
+      const hA = accA.finalize();
+      const hB = accB.finalize();
+      expect(hA.equals(hB)).toBe(true);
+      expect(h1.equals(hA)).toBe(true);
+    });
+
+    it("empty UTXO set hashes to MuHash3072 identity (numerator=denominator=1)", async () => {
+      const { hash, coinsCount } = await computeUTXOSetMuHash(db);
+      expect(coinsCount).toBe(0n);
+
+      const emptyAcc = new MuHash3072();
+      const expected = emptyAcc.finalize();
+      expect(hash.equals(expected)).toBe(true);
     });
   });
 });
