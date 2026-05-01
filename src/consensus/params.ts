@@ -497,20 +497,68 @@ export const MAINNET: ConsensusParams = {
   ]),
   // Minimum chain work from Bitcoin Core (as of recent release)
   nMinimumChainWork: 0x0000000000000000000000000000000000000001128750f82f4c366153a3a030n,
-  // assumeUTXO snapshots (from Bitcoin Core chainparams.cpp)
+  // assumeUTXO snapshots — Bitcoin Core mainnet, kernel/chainparams.cpp
+  // m_assumeutxo_data. Map key is the block hash in display order (RPC
+  // byte order, big-endian); blockHash field is the same hash in wire
+  // order (little-endian). hash_serialized bytes mirror Core's
+  // AssumeutxoHash::ToString() output (which is BaseHash, internal-LE).
   assumeutxo: new Map([
-    // Height 840000 - example snapshot (these are placeholder values)
     [
       "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
       {
         height: 840000,
         hashSerialized: Buffer.from(
-          "a4a3c0e2e4c60e9a7ff4ab8f9e19dcb2c9a3b1e0d8c7b6a5948372615f4e3d2c",
+          "a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96",
           "hex"
         ),
-        nChainTx: 923_987_654n,
+        nChainTx: 991_032_194n,
         blockHash: Buffer.from(
           "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
+          "hex"
+        ).reverse(),
+      },
+    ],
+    [
+      "000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880",
+      {
+        height: 880000,
+        hashSerialized: Buffer.from(
+          "dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9",
+          "hex"
+        ),
+        nChainTx: 1_145_604_538n,
+        blockHash: Buffer.from(
+          "000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880",
+          "hex"
+        ).reverse(),
+      },
+    ],
+    [
+      "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+      {
+        height: 910000,
+        hashSerialized: Buffer.from(
+          "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568",
+          "hex"
+        ),
+        nChainTx: 1_226_586_151n,
+        blockHash: Buffer.from(
+          "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+          "hex"
+        ).reverse(),
+      },
+    ],
+    [
+      "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee",
+      {
+        height: 935000,
+        hashSerialized: Buffer.from(
+          "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050",
+          "hex"
+        ),
+        nChainTx: 1_305_397_408n,
+        blockHash: Buffer.from(
+          "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee",
           "hex"
         ).reverse(),
       },

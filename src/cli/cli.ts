@@ -11,6 +11,7 @@ import * as fs from "fs";
 import { ChainDB, BlockStatus, DBPrefix } from "../storage/database.js";
 import { BufferWriter } from "../wire/serialization.js";
 import { ChainStateManager } from "../chain/state.js";
+import { ChainstateManager } from "../chain/snapshot.js";
 import { UTXOManager } from "../chain/utxo.js";
 import { Mempool } from "../mempool/mempool.js";
 import { dumpMempool, loadMempool } from "../mempool/persist.js";
@@ -47,8 +48,15 @@ export interface NodeConfig {
   prune?: number;
   /** Path to directory with blk*.dat files, or "-" for framed stdin. */
   importBlocks?: string;
-  /** Path to HDOG UTXO snapshot file for AssumeUTXO import. */
-  importUtxo?: string;
+  /**
+   * Path to a Bitcoin Core-format UTXO snapshot file (assumeutxo).
+   * Surfaced as `--load-snapshot=<path>`. The file MUST be a Core
+   * snapshot — header is the 5-byte magic `utxo\xff` plus version 2
+   * metadata, followed by per-txid groups of compressed Coins.
+   *
+   * (HDOG, hotbuns' previous custom format, has been retired.)
+   */
+   loadSnapshot?: string;
   /**
    * Daemonize the node (fork to background and detach).  Mirrors Bitcoin
    * Core's `-daemon` (init.cpp via `util::ForkDaemon`).  hotbuns is built on
@@ -282,8 +290,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
         case "import-blocks":
           if (value) config.importBlocks = value;
           break;
-        case "import-utxo":
-          if (value) config.importUtxo = value;
+        case "load-snapshot":
+          if (value) config.loadSnapshot = value;
           break;
         case "script-threads":
           if (value) {
@@ -911,192 +919,60 @@ async function importFromBlkFiles(
 }
 
 /**
- * Import a UTXO snapshot in HDOG binary format.
+ * Load a Bitcoin Core-format UTXO snapshot file (assumeutxo).
  *
- * HDOG format:
- *   Header (52 bytes): "HDOG" (4B) + version (u32 LE) + blockHash (32B LE) + height (u32 LE) + utxoCount (u64 LE)
- *   Per UTXO: txid (32B) + vout (u32 LE) + amount (i64 LE) + heightCB (u32 LE) + scriptLen (u16 LE) + script (N B)
+ * Delegates to ChainstateManager.loadSnapshot, which:
+ *   - Parses the SnapshotMetadata header (5-byte magic + version + network
+ *     magic + base blockhash + coins count) — see src/chain/snapshot.ts.
+ *   - Iterates each per-txid group (txid + CompactSize count + per-coin
+ *     compressed entries) and writes uncompressed UTXOEntry rows into the
+ *     local LevelDB.
+ *   - Verifies the loaded set by recomputing HASH_SERIALIZED and comparing
+ *     against the consensus-hardcoded value in `params.assumeutxo`.
  *
- * Writes directly to LevelDB using the same key/value format as normal operation.
+ * After load, tip + block index are stitched up so subsequent IBD only
+ * needs to download blocks above the snapshot height.
  */
-async function runUtxoImport(
+async function runSnapshotLoad(
   snapshotPath: string,
   db: ChainDB,
   chainState: ChainStateManager,
+  params: ConsensusParams,
 ): Promise<void> {
-  const BATCH_SIZE = 50_000;
-  const PROGRESS_INTERVAL = 1_000_000;
+  console.log(`Loading Core-format UTXO snapshot: ${snapshotPath}`);
 
-  console.log(`Opening UTXO snapshot: ${snapshotPath}`);
+  const manager = new ChainstateManager(db, params);
+  const result = await manager.loadSnapshot(snapshotPath);
 
-  const file = Bun.file(snapshotPath);
-  if (!(await file.exists())) {
-    throw new Error(`Snapshot file not found: ${snapshotPath}`);
-  }
+  console.log(`Loaded ${result.coinsLoaded} coins`);
+  console.log(`  Base height: ${result.baseHeight}`);
+  console.log(
+    `  Base block:  ${Buffer.from(result.baseBlockHash).reverse().toString("hex")}`
+  );
 
-  const fileSize = file.size;
-  console.log(`Snapshot file size: ${fileSize} bytes (${(fileSize / (1024 * 1024 * 1024)).toFixed(2)} GB)`);
-
-  // Use Bun.file().stream() for streaming reads
-  const stream = file.stream();
-  const reader = stream.getReader();
-
-  let buf = Buffer.alloc(0);
-  let fileOffset = 0;
-
-  // Read exactly N bytes from stream
-  const readExact = async (n: number): Promise<Buffer> => {
-    while (buf.length < n) {
-      const { done, value } = await reader.read();
-      if (done) {
-        throw new Error(`Unexpected EOF at offset ${fileOffset + buf.length}, needed ${n} bytes, have ${buf.length}`);
-      }
-      buf = Buffer.concat([buf, Buffer.from(value)]);
-    }
-    const result = buf.subarray(0, n);
-    buf = buf.subarray(n);
-    fileOffset += n;
-    return result;
-  };
-
-  // --- Read header (52 bytes) ---
-  const header = await readExact(52);
-
-  // Magic: "HDOG"
-  const magic = header.subarray(0, 4).toString("ascii");
-  if (magic !== "HDOG") {
-    throw new Error(`Invalid HDOG magic: expected "HDOG", got "${magic}"`);
-  }
-
-  const version = header.readUInt32LE(4);
-  if (version !== 1) {
-    throw new Error(`Unsupported HDOG version: ${version}`);
-  }
-
-  const blockHash = Buffer.from(header.subarray(8, 40));
-  const blockHeight = header.readUInt32LE(40);
-  const utxoCount = header.readBigUInt64LE(44);
-
-  console.log(`HDOG header:`);
-  console.log(`  Version:    ${version}`);
-  console.log(`  Block hash: ${Buffer.from(blockHash).reverse().toString("hex")}`);
-  console.log(`  Height:     ${blockHeight}`);
-  console.log(`  UTXO count: ${utxoCount.toLocaleString()}`);
-
-  // --- Stream and write UTXOs ---
-  const importStart = Date.now();
-  let loaded = 0n;
-  let batchOps: Array<{ type: "put"; prefix: number; key: Buffer; value: Buffer }> = [];
-
-  for (let i = 0n; i < utxoCount; i++) {
-    // Read fixed portion: txid(32) + vout(4) + amount(8) + heightCB(4) + scriptLen(2) = 50 bytes
-    const fixed = await readExact(50);
-
-    const txid = Buffer.from(fixed.subarray(0, 32));
-    const vout = fixed.readUInt32LE(32);
-    const amount = fixed.readBigInt64LE(36);
-    const heightCB = fixed.readUInt32LE(44);
-    const scriptLen = fixed.readUInt16LE(48);
-
-    // Decode height and coinbase from packed field
-    const coinHeight = heightCB >>> 1;
-    const isCoinbase = (heightCB & 1) === 1;
-
-    // Read scriptPubKey
-    const script = scriptLen > 0 ? await readExact(scriptLen) : Buffer.alloc(0);
-
-    // Build DB key: txid (32 bytes) + vout (4 bytes LE)
-    const dbKey = Buffer.alloc(36);
-    txid.copy(dbKey, 0);
-    dbKey.writeUInt32LE(vout, 32);
-
-    // Build DB value matching serializeUTXO format:
-    // height (4B LE) + coinbase (1B) + amount (8B LE) + varint(scriptLen) + script
-    const writer = new BufferWriter();
-    writer.writeUInt32LE(coinHeight);
-    writer.writeUInt8(isCoinbase ? 1 : 0);
-    writer.writeUInt64LE(amount < 0n ? 0n : amount);
-    writer.writeVarBytes(script);
-    const dbValue = writer.toBuffer();
-
-    batchOps.push({
-      type: "put",
-      prefix: DBPrefix.UTXO,
-      key: dbKey,
-      value: dbValue,
-    });
-
-    loaded++;
-
-    // Flush batch
-    if (batchOps.length >= BATCH_SIZE) {
-      await db.batch(batchOps as any);
-      batchOps = [];
-
-      // Hint GC between batches
-      if (typeof globalThis.gc === "function") {
-        globalThis.gc();
-      } else if (typeof Bun !== "undefined" && typeof (Bun as any).gc === "function") {
-        (Bun as any).gc(false);
-      }
-
-      // Yield to event loop
-      await new Promise<void>(resolve => setTimeout(resolve, 0));
-    }
-
-    // Progress report
-    if (loaded % BigInt(PROGRESS_INTERVAL) === 0n) {
-      const elapsed = (Date.now() - importStart) / 1000;
-      const rate = Number(loaded) / elapsed;
-      const pct = (Number(loaded) * 100 / Number(utxoCount)).toFixed(2);
-      const bytesRead = fileOffset;
-      const bytePct = (bytesRead * 100 / fileSize).toFixed(2);
-      const eta = (Number(utxoCount) - Number(loaded)) / rate;
-      console.log(
-        `Progress: ${Number(loaded).toLocaleString()} / ${Number(utxoCount).toLocaleString()} UTXOs (${pct}%) | ` +
-        `${(bytesRead / (1024 * 1024 * 1024)).toFixed(2)} GB read (${bytePct}%) | ` +
-        `${rate.toFixed(0)} UTXOs/sec | ETA ${(eta / 60).toFixed(1)} min`
-      );
-    }
-  }
-
-  // Flush remaining batch
-  if (batchOps.length > 0) {
-    await db.batch(batchOps as any);
-    batchOps = [];
-  }
-
-  // --- Set chain tip ---
-  console.log(`Setting chain tip to height ${blockHeight}...`);
+  // Stitch chain tip + minimal block index so subsequent startup uses the
+  // snapshot baseline as the active tip. The real header will arrive via
+  // the network during follow-on IBD.
   await db.putChainState({
-    bestBlockHash: blockHash,
-    bestHeight: blockHeight,
-    totalWork: 0n, // Will be recalculated on startup from headers
+    bestBlockHash: result.baseBlockHash,
+    bestHeight: result.baseHeight,
+    totalWork: 0n,
   });
 
-  // Also create a minimal block index entry so the node knows about this block
-  // We need a dummy 80-byte header; the node will fetch the real one from peers
   const dummyHeader = Buffer.alloc(80);
-  await db.putBlockIndex(blockHash, {
-    height: blockHeight,
+  await db.putBlockIndex(result.baseBlockHash, {
+    height: result.baseHeight,
     header: dummyHeader,
     nTx: 0,
-    status: BlockStatus.HEADER_VALID | BlockStatus.TXS_VALID | BlockStatus.HAVE_DATA,
+    status:
+      BlockStatus.HEADER_VALID | BlockStatus.TXS_VALID | BlockStatus.HAVE_DATA,
     dataPos: 0,
   });
 
-  // Store height -> hash mapping
-  const heightKey = Buffer.alloc(4);
-  heightKey.writeUInt32BE(blockHeight, 0);
-
-  const totalElapsed = (Date.now() - importStart) / 1000;
-  const avgRate = Number(loaded) / totalElapsed;
-
-  console.log(`\nUTXO snapshot import complete!`);
-  console.log(`  UTXOs loaded: ${Number(loaded).toLocaleString()}`);
-  console.log(`  Time: ${totalElapsed.toFixed(1)}s (${(totalElapsed / 60).toFixed(1)} min)`);
-  console.log(`  Average rate: ${avgRate.toFixed(0)} UTXOs/sec`);
-  console.log(`  Chain tip: height ${blockHeight}, hash ${Buffer.from(blockHash).reverse().toString("hex")}`);
+  console.log(
+    `Snapshot load complete. Chain tip: height ${result.baseHeight}, hash ` +
+      Buffer.from(result.baseBlockHash).reverse().toString("hex")
+  );
 }
 
 /**
@@ -1270,7 +1146,7 @@ async function startNode(config: NodeConfig): Promise<void> {
   // path: each tx is replayed through `acceptToMemoryPool`, so a stale
   // dump never bypasses tightened relay rules.  Skipped silently on the
   // one-shot import paths below — those exits do not run a node.
-  if (!mergedConfig.importBlocks && !mergedConfig.importUtxo) {
+  if (!mergedConfig.importBlocks && !mergedConfig.loadSnapshot) {
     try {
       const loaded = await loadMempool(mempool, mergedConfig.datadir);
       if (loaded.succeeded + loaded.failed + loaded.expired > 0) {
@@ -1292,11 +1168,11 @@ async function startNode(config: NodeConfig): Promise<void> {
     return;
   }
 
-  // 4c. UTXO snapshot import mode (--import-utxo)
-  if (mergedConfig.importUtxo) {
-    await runUtxoImport(mergedConfig.importUtxo, db, chainState);
+  // 4c. UTXO snapshot load mode (--load-snapshot=<core-format-file>)
+  if (mergedConfig.loadSnapshot) {
+    await runSnapshotLoad(mergedConfig.loadSnapshot, db, chainState, params);
     await db.close();
-    console.log("Database closed. Import finished.");
+    console.log("Database closed. Snapshot load finished.");
     return;
   }
 
@@ -1946,7 +1822,7 @@ OPTIONS:
   --connect=<host:port> Connect to specific peer
   --prune=<n>           Prune block storage to n MiB (minimum 550, 0 = disabled)
   --dbcache=<n>         UTXO cache size in MiB (default: 512)
-  --import-utxo=<path>  Import UTXO snapshot from HDOG file (AssumeUTXO)
+  --load-snapshot=<path> Load Bitcoin Core-format UTXO snapshot (assumeutxo)
   --daemon              Fork to background and detach (re-execs self under Bun)
   --pid=<file>          PID file path (default: <datadir>/hotbuns.pid; '' to disable)
   --ready-fd=<N>        Write 'ready\\n' to this fd once startup completes
