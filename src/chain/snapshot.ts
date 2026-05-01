@@ -251,9 +251,10 @@ export function deserializeCoinFromSnapshot(reader: BufferReader): Coin {
  *   uint32     = (height << 1) + coinbase
  *   CTxOut     = int64 nValue (LE) || CScript (CompactSize len || bytes)
  *
- * Used by `computeUTXOSetHash` for each coin; broken out so the load-time
- * verifier can reuse the exact same bytes when re-hashing the freshly
- * loaded coins (without a second DB round-trip).
+ * Shared by `computeUTXOSetHash` (HASH_SERIALIZED, SHA256d via HashWriter)
+ * and `computeUTXOSetMuHash` (MUHASH, used by gettxoutsetinfo only); both
+ * hash types ingest the same canonical per-coin bytes — the difference is
+ * only how the bytes are folded into a digest.
  */
 function txOutSerBytes(
   txid: Buffer,
@@ -273,24 +274,32 @@ function txOutSerBytes(
 }
 
 /**
- * Compute the UTXO set hash, Bitcoin Core compatible.
+ * Compute the UTXO set hash (HASH_SERIALIZED), Bitcoin Core compatible.
  *
- * Uses MuHash3072 — mirrors `kernel/coinstats.cpp::ApplyCoinHash(MuHash3072&, ...)`:
+ * Mirrors `kernel/coinstats.cpp::ApplyCoinHash(HashWriter&, ...)` +
+ * `ComputeUTXOStats(... CoinStatsHashType::HASH_SERIALIZED ...)` at
+ * `kernel/coinstats.cpp:161-163`:
  *
- *   MuHash3072 muhash;
+ *   HashWriter ss{};
  *   for each (outpoint, coin) in db iteration order:
- *     DataStream ss; TxOutSer(ss, outpoint, coin); muhash.Insert(ss);
- *   return SHA256(LE_384(muhash.Finalize()));
+ *     ss << outpoint                              // 32-byte txid + uint32 vout
+ *     ss << uint32((coin.nHeight << 1) + coin.fCoinBase)
+ *     ss << coin.out                              // int64 nValue + CScript
+ *   return ss.GetHash();                          // double-SHA256
  *
- * MuHash is *order-independent* (multiset hash over a 3072-bit prime field),
- * so DB iteration order does not matter — unlike the legacy HashWriter
- * `HASH_SERIALIZED` path. The 32-byte digest is the SHA256 of the 384-byte
- * little-endian `Num3072` accumulator after `numerator/denominator`
- * reduction (see `MuHash3072::Finalize`).
+ * Note: Core's `HashWriter::GetHash()` finalizes a SHA-256 then re-hashes
+ * the digest (double-SHA256, see `hash.h`) — we use `hash256()` to match.
  *
- * The four hardcoded mainnet `m_assumeutxo_data.hash_serialized` values
- * (`a2a5521b...` at 840k, etc.) are produced by this exact routine in Core,
- * so the hex strings in `consensus/params.ts:506+` are MuHash3072 outputs.
+ * **This is the function that backs the assumeutxo strict gate**
+ * (`validation.cpp:5902-5914` calls `ComputeUTXOStats` with
+ * `CoinStatsHashType::HASH_SERIALIZED`, then compares against
+ * `m_assumeutxo_data.hash_serialized`). The four hardcoded mainnet hex
+ * strings (`a2a5521b...` at 840k, `dbd19098...` at 880k, `4daf8a17...` at
+ * 910k, `e4b90ef9...` at 935k) in `consensus/params.ts` are HASH_SERIALIZED
+ * (SHA256d-via-HashWriter) outputs, NOT MuHash3072 outputs.
+ *
+ * MuHash3072 is reserved for `gettxoutsetinfo hash_type=muhash` (see
+ * `computeUTXOSetMuHash`); it is NOT what assumeutxo commits to.
  *
  * Warning (verbatim from kernel/coinstats.cpp): "be very careful when
  * changing this!" — the assumeutxo commitment depends on this exact
@@ -300,7 +309,9 @@ export async function computeUTXOSetHash(
   db: ChainDB,
   interruptCheck?: () => boolean
 ): Promise<{ hash: Buffer; coinsCount: bigint }> {
-  const acc = new MuHash3072();
+  // Single-SHA256 streaming; finalize once, then hash the digest a second
+  // time to match Core's HashWriter::GetHash (double-SHA256).
+  const hasher = new Bun.CryptoHasher("sha256");
 
   let coinsCount = 0n;
 
@@ -329,7 +340,69 @@ export async function computeUTXOSetHash(
       const amount = reader.readUInt64LE();
       const scriptPubKey = reader.readVarBytes();
 
-      // Insert the canonical TxOutSer bytes into the MuHash accumulator.
+      hasher.update(txOutSerBytes(txid, vout, height, coinbase, amount, scriptPubKey));
+      coinsCount++;
+    }
+  } finally {
+    await iterator.close();
+  }
+
+  // Double-SHA256 to match Core's HashWriter::GetHash().
+  const inner = Buffer.from(hasher.digest());
+  const hash = hash256(inner);
+
+  return { hash, coinsCount };
+}
+
+/**
+ * Compute the UTXO set hash using MuHash3072 (CoinStatsHashType::MUHASH).
+ *
+ * Mirrors `kernel/coinstats.cpp::ApplyCoinHash(MuHash3072&, ...)` +
+ * `ComputeUTXOStats(... CoinStatsHashType::MUHASH ...)`:
+ *
+ *   MuHash3072 muhash;
+ *   for each (outpoint, coin) in db iteration order:
+ *     DataStream ss; TxOutSer(ss, outpoint, coin); muhash.Insert(ss);
+ *   muhash.Finalize(out);                         // SHA256(LE_384(num/den))
+ *
+ * MuHash is order-independent (multiset hash over a 3072-bit prime field).
+ *
+ * Used by `gettxoutsetinfo hash_type=muhash` ONLY. The assumeutxo strict
+ * gate uses `computeUTXOSetHash` (HASH_SERIALIZED) instead — see
+ * `validation.cpp:5902` (`CoinStatsHashType::HASH_SERIALIZED`).
+ */
+export async function computeUTXOSetMuHash(
+  db: ChainDB,
+  interruptCheck?: () => boolean
+): Promise<{ hash: Buffer; coinsCount: bigint }> {
+  const acc = new MuHash3072();
+
+  let coinsCount = 0n;
+
+  const utxoPrefix = Buffer.from([DBPrefix.UTXO]);
+  const iterator = (db as any).db.iterator({
+    gte: utxoPrefix,
+    lt: Buffer.concat([Buffer.from([DBPrefix.UTXO + 1])]),
+  });
+
+  try {
+    for await (const [key, value] of iterator) {
+      if (interruptCheck?.()) {
+        throw new Error("Interrupted");
+      }
+
+      // Key format: prefix (1 byte) + txid (32 bytes) + vout (4 bytes LE).
+      if (key.length !== 37) continue;
+
+      const txid = key.subarray(1, 33);
+      const vout = key.readUInt32LE(33);
+
+      const reader = new BufferReader(value);
+      const height = reader.readUInt32LE();
+      const coinbase = reader.readUInt8() === 1;
+      const amount = reader.readUInt64LE();
+      const scriptPubKey = reader.readVarBytes();
+
       acc.add(txOutSerBytes(txid, vout, height, coinbase, amount, scriptPubKey));
       coinsCount++;
     }
@@ -560,16 +633,22 @@ export class ChainstateManager {
 
     // Strict snapshot content-hash check.
     //
-    // Mirrors Bitcoin Core validation.cpp:5912-5914
+    // Mirrors Bitcoin Core validation.cpp:5902-5914
     // (PopulateAndValidateSnapshot):
     //
+    //   maybe_stats = ComputeUTXOStats(
+    //       CoinStatsHashType::HASH_SERIALIZED, ..., interruption_point);
+    //   ...
     //   if (AssumeutxoHash{maybe_stats->hashSerialized} != au_data.hash_serialized) {
     //       return util::Error{Untranslated(strprintf(
     //           "Bad snapshot content hash: expected %s, got %s", ...))};
     //   }
     //
-    // The hash is MuHash3072 over the same TxOutSer bytes Core uses (see
-    // `computeUTXOSetHash` above); refusing on mismatch is what makes
+    // Core uses HASH_SERIALIZED (SHA256d via HashWriter, see
+    // `kernel/coinstats.cpp:161-163`) for the strict gate, NOT MuHash3072.
+    // MuHash is for `gettxoutsetinfo hash_type=muhash` only; the
+    // `m_assumeutxo_data.hash_serialized` constants in chainparams.cpp are
+    // SHA256d-via-HashWriter outputs. Refusing on mismatch is what makes
     // `loadtxoutset` strict — a malformed or out-of-band snapshot cannot
     // poison the chainstate.
     const { hash: computedHash, coinsCount } = await computeUTXOSetHash(this.db, interruptCheck);
