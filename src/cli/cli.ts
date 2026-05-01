@@ -1330,9 +1330,13 @@ async function startNode(config: NodeConfig): Promise<void> {
   rpcServer.start();
 
   // Start Prometheus metrics server (also serves /health for supervisors).
+  // Bind failure is non-fatal: a busy port (e.g. another node already on
+  // 9332) should not crash the daemon. Log + continue without metrics —
+  // matches the nimrod fix in `f063545`.
   const metricsPort = mergedConfig.metricsPort;
   if (metricsPort > 0) {
-    const metricsServer = Bun.serve({
+    try {
+      const metricsServer = Bun.serve({
       port: metricsPort,
       hostname: "0.0.0.0",
       fetch: (req) => {
@@ -1376,6 +1380,12 @@ async function startNode(config: NodeConfig): Promise<void> {
       },
     });
     console.log(`Prometheus metrics server listening on http://0.0.0.0:${metricsPort} (/health probe enabled)`);
+    } catch (err) {
+      const msg = (err as Error)?.message ?? String(err);
+      console.error(
+        `[metrics] failed to bind port ${metricsPort}: ${msg} — continuing without metrics`
+      );
+    }
   }
 
   // Optional ready-fd handshake: write "ready\n" so a supervisor can
