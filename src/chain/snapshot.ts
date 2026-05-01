@@ -986,3 +986,47 @@ export function getAssumeutxoDataByHeight(
 
   return null;
 }
+
+/**
+ * Get all assumeUTXO snapshot heights from chain parameters, sorted ascending.
+ *
+ * Mirrors `ChainParams::GetAvailableSnapshotHeights()` from
+ * `bitcoin-core/src/kernel/chainparams.cpp` — returns the heights at which
+ * a hardcoded assumeutxo entry exists, used by `dumptxoutset rollback`
+ * (no explicit height) to pick the latest snapshot height that
+ * `loadtxoutset` could currently consume.
+ */
+export function getAvailableSnapshotHeights(params: ConsensusParams): number[] {
+  const assumeutxo = (params as any).assumeutxo as Map<string, AssumeutxoData> | undefined;
+  if (!assumeutxo) return [];
+
+  const heights: number[] = [];
+  for (const data of assumeutxo.values()) {
+    heights.push(data.height);
+  }
+  heights.sort((a, b) => a - b);
+  return heights;
+}
+
+/**
+ * Get the latest assumeUTXO snapshot height ≤ the given current tip height.
+ *
+ * Used by `dumptxoutset` with `type="rollback"` and no explicit height —
+ * matches Core's `dumptxoutset` behavior in `rpc/blockchain.cpp` (snapshot
+ * type "rollback" picks `max(GetAvailableSnapshotHeights())`, with the
+ * implicit constraint that the chosen height is reachable from the current
+ * tip).
+ */
+export function getLatestSnapshotHeightForRollback(
+  params: ConsensusParams,
+  currentTipHeight: number
+): number | null {
+  const heights = getAvailableSnapshotHeights(params);
+  let chosen: number | null = null;
+  for (const h of heights) {
+    if (h <= currentTipHeight) {
+      chosen = h;
+    }
+  }
+  return chosen;
+}
