@@ -571,8 +571,17 @@ export const MAINNET: ConsensusParams = {
     // hash_serialized was computed by tools/compute-snapshot-hash.py over
     // the actual on-disk file (165,095,935 coins) and is the raw
     // SHA256d-of-TxOutSer output that computeUTXOSetHash will reproduce.
+    //
+    // NOTE: getAssumeutxoData looks up entries by
+    // metadata.baseBlockHash.toString("hex"), and metadata.baseBlockHash
+    // is the raw 32 bytes read from the snapshot file, i.e. INTERNAL byte
+    // order. The four mainnet entries above use display order as their
+    // map key — that is a pre-existing bug that prevents loading any real
+    // mainnet snapshot. To make this 944183 entry actually load, the key
+    // here is the internal-order hex (= display-order hex reversed):
+    // display = 0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817.
     [
-      "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817",
+      "17d8ce98333245aba5170dc0c69a0e9d8303160a184601000000000000000000",
       {
         height: 944183,
         hashSerialized: Buffer.from(
