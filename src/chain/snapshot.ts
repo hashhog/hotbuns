@@ -13,7 +13,7 @@
 
 import { promises as fsp } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
-import { hash256 } from "../crypto/primitives.js";
+import { sha256Hash } from "../crypto/primitives.js";
 import { BufferWriter, BufferReader, varIntSize } from "../wire/serialization.js";
 import {
   serializeTxOutCompressed,
@@ -294,7 +294,10 @@ function txOutSerBytes(
  *   return ss.GetHash();                          // double-SHA256
  *
  * Note: Core's `HashWriter::GetHash()` finalizes a SHA-256 then re-hashes
- * the digest (double-SHA256, see `hash.h`) — we use `hash256()` to match.
+ * the digest (double-SHA256, see `hash.h`). The streaming `Bun.CryptoHasher`
+ * below already produces the inner SHA-256 of the byte stream, so we apply
+ * exactly ONE more SHA-256 (`sha256Hash`) — NOT `hash256()`, which would
+ * cascade two more SHA-256s and yield triple-SHA256.
  *
  * **This is the function that backs the assumeutxo strict gate**
  * (`validation.cpp:5902-5914` calls `ComputeUTXOStats` with
@@ -393,9 +396,17 @@ export async function computeUTXOSetHash(
     await iterator.close();
   }
 
-  // Double-SHA256 to match Core's HashWriter::GetHash().
+  // Core's HashWriter::GetHash() = SHA256(SHA256(stream)). The streaming
+  // hasher above produces the inner SHA256(stream); apply ONE more SHA256
+  // to get the full double-SHA256 — using `hash256()` here would chain
+  // two more SHA256s for a triple-SHA256, which is what previously made
+  // computeUTXOSetHash diverge from `compute-snapshot-hash.py` and Core's
+  // chainparams hash_serialized constants on the full mainnet UTXO set.
+  // Empirically: SHA256(<correct double-SHA256 a888bcbc...>)
+  // = 2075205e71f087f76533a3f108b66e22e2de42cdc8a44f5b1601c7b314c66097,
+  // exactly the wrong digest hotbuns produced before this line was fixed.
   const inner = Buffer.from(hasher.digest());
-  const hash = hash256(inner);
+  const hash = sha256Hash(inner);
 
   return { hash, coinsCount };
 }
