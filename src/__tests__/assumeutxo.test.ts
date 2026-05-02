@@ -1252,4 +1252,308 @@ describe("assumeUTXO", () => {
       expect(hash.equals(expected)).toBe(true);
     });
   });
+
+  // -----------------------------------------------------------------------
+  // High-vout iteration order regression test.
+  //
+  // Bug history: hotbuns LevelDB encodes UTXO keys as
+  // [prefix=0x75][txid 32B][vout uint32_LE]. LevelDB iterates byte-lex,
+  // so within a txid the vouts come out in LE-byte order rather than
+  // numeric order. Bitcoin Core uses `std::map<uint32_t, Coin>` keyed
+  // by vout (`kernel/coinstats.cpp:122-128` in ApplyStats /
+  // `rpc/blockchain.cpp` WriteUTXOSnapshot), which iterates vouts in
+  // NUMERIC order.
+  //
+  // For any txid with at least one vout >= 256 the two orderings differ
+  // (e.g. numeric [0,1,256,257] vs LE-byte [0,1,0,0,0,0,0,1,0,0,0,1,...]
+  // when serialized). Mainnet at h=940k has 183,859 of 114M txids with
+  // vout >= 256, max vout 13,106 — so a naive byte-lex ingestion of the
+  // DB produces a HASH_SERIALIZED digest that does NOT match Core's
+  // `m_assumeutxo_data.hash_serialized` constants and breaks
+  // dumptxoutset byte-identity vs Core.
+  //
+  // Fix lives in `computeUTXOSetHash` / `computeUTXOSetMuHash` /
+  // `dumpSnapshot` in src/chain/snapshot.ts (group per txid, sort by
+  // vout numerically before ingestion / before flushing). This test
+  // pins the regression by building a txid with vouts {0, 1, 256, 257,
+  // 13106} — the LE-byte and numeric orderings diverge, and any future
+  // refactor that drops the per-group sort will fail.
+  // -----------------------------------------------------------------------
+  describe("High-vout iteration order (regression)", () => {
+    let db: ChainDB;
+
+    beforeEach(async () => {
+      db = new ChainDB(join(testDbPath, "high-vout-order"));
+      await db.open();
+    });
+
+    afterEach(async () => {
+      await db.close();
+    });
+
+    /** Same TxOutSer layout as `computeUTXOSetHash` ingests. */
+    function txOutSer(
+      txid: Buffer,
+      vout: number,
+      height: number,
+      coinbase: boolean,
+      amount: bigint,
+      scriptPubKey: Buffer
+    ): Buffer {
+      const w = new BufferWriter();
+      w.writeHash(txid);
+      w.writeUInt32LE(vout);
+      w.writeUInt32LE(((height << 1) + (coinbase ? 1 : 0)) >>> 0);
+      w.writeUInt64LE(amount);
+      w.writeVarBytes(scriptPubKey);
+      return w.toBuffer();
+    }
+
+    /** Build the canonical (Core-order) digest for a set of coins.
+     *  Sorted by (txid lex ASC, vout NUMERIC ASC) — what Core produces. */
+    function canonicalCoreHash(
+      records: Array<{
+        txid: Buffer;
+        vout: number;
+        height: number;
+        coinbase: boolean;
+        amount: bigint;
+        spk: Buffer;
+      }>
+    ): Buffer {
+      // Group by txid (DB iterates txids in lex order anyway, since the
+      // first 32 bytes of the DB key are txid).
+      const sorted = [...records].sort((a, b) => {
+        const cmp = a.txid.compare(b.txid);
+        if (cmp !== 0) return cmp;
+        return a.vout - b.vout; // numeric, matches std::map<uint32_t, Coin>
+      });
+      const hasher = new Bun.CryptoHasher("sha256");
+      for (const r of sorted) {
+        hasher.update(txOutSer(r.txid, r.vout, r.height, r.coinbase, r.amount, r.spk));
+      }
+      const inner = Buffer.from(hasher.digest());
+      return hash256(inner);
+    }
+
+    it("computeUTXOSetHash matches Core canonical order for txid with vout >= 256", async () => {
+      // Single txid, vouts spanning the [0, 256+) boundary.
+      // The LE-byte ordering of vouts {0, 1, 256, 257, 13106} differs
+      // from the numeric ordering — vout=256 has key bytes [00,01,00,00]
+      // which sorts AFTER [00,00,00,00] but BEFORE [01,00,00,00] in
+      // little-endian byte-lex (matching numeric here), but for vouts
+      // like {255, 256} the LE-byte order is {255 -> ff,00,00,00,
+      // 256 -> 00,01,00,00} which puts 256 BEFORE 255 in byte-lex while
+      // numeric puts 255 first. We use the more dramatic {0,1,256,257,
+      // 13106} where multiple ones land in the "wrong" lex slot.
+      const txid = Buffer.alloc(32, 0xab);
+      const spk = Buffer.from([0x76, 0xa9, 0x14, ...Buffer.alloc(20, 0x55), 0x88, 0xac]);
+      const vouts = [0, 1, 256, 257, 13106];
+
+      const records = vouts.map((v) => ({
+        txid,
+        vout: v,
+        height: 800_000 + v, // distinct heights so order matters in digest
+        coinbase: false,
+        amount: BigInt(v + 1) * 1_000_000n,
+        spk,
+      }));
+
+      // Insert in numeric order (the order doesn't matter — DB will
+      // re-key by [prefix||txid||vout_LE], which sorts by LE-byte).
+      for (const r of records) {
+        await db.putUTXO(r.txid, r.vout, {
+          height: r.height,
+          coinbase: r.coinbase,
+          amount: r.amount,
+          scriptPubKey: r.spk,
+        });
+      }
+
+      const { hash, coinsCount } = await computeUTXOSetHash(db);
+      expect(coinsCount).toBe(BigInt(vouts.length));
+
+      const expected = canonicalCoreHash(
+        records.map((r) => ({
+          txid: r.txid,
+          vout: r.vout,
+          height: r.height,
+          coinbase: r.coinbase,
+          amount: r.amount,
+          spk: r.spk,
+        }))
+      );
+
+      // Sanity: the LE-byte permutation of vouts {0,1,256,257,13106}
+      // really does differ from the numeric one.
+      const leBytes = (n: number) => {
+        const b = Buffer.alloc(4);
+        b.writeUInt32LE(n);
+        return b;
+      };
+      const numericOrder = [...vouts].sort((a, b) => a - b);
+      const leByteOrder = [...vouts].sort((a, b) => leBytes(a).compare(leBytes(b)));
+      expect(JSON.stringify(numericOrder)).not.toBe(JSON.stringify(leByteOrder));
+
+      // The fix: hotbuns now produces the canonical (numeric) digest.
+      expect(hash.equals(expected)).toBe(true);
+
+      // And specifically NOT the LE-byte digest, which is what the
+      // bug produced. Build that one manually to pin the regression.
+      const wrongHasher = new Bun.CryptoHasher("sha256");
+      const wrongOrder = [...records].sort((a, b) =>
+        leBytes(a.vout).compare(leBytes(b.vout))
+      );
+      for (const r of wrongOrder) {
+        wrongHasher.update(txOutSer(r.txid, r.vout, r.height, r.coinbase, r.amount, r.spk));
+      }
+      const wrongInner = Buffer.from(wrongHasher.digest());
+      const wrongHash = hash256(wrongInner);
+      expect(hash.equals(wrongHash)).toBe(false);
+    });
+
+    it("computeUTXOSetHash multi-txid: per-txid numeric vout sort within lex-sorted txids", async () => {
+      // Three txids, each with mixed-vout. Verify the global digest is
+      // ((txid lex) outer, (vout numeric) inner) and not the byte-lex
+      // global ordering that LevelDB would naively produce.
+      const txidA = Buffer.alloc(32, 0x01);
+      const txidB = Buffer.alloc(32, 0x02);
+      const txidC = Buffer.alloc(32, 0x03);
+      const spk = Buffer.from([0x6a, 0xff]); // OP_RETURN 0xff
+
+      const records = [
+        // txidA: vouts {1, 256} — boundary
+        { txid: txidA, vout: 1, height: 100, coinbase: false, amount: 100n, spk },
+        { txid: txidA, vout: 256, height: 101, coinbase: false, amount: 200n, spk },
+        // txidB: vouts {0, 257, 999} — high vouts
+        { txid: txidB, vout: 0, height: 200, coinbase: true, amount: 300n, spk },
+        { txid: txidB, vout: 257, height: 201, coinbase: false, amount: 400n, spk },
+        { txid: txidB, vout: 999, height: 202, coinbase: false, amount: 500n, spk },
+        // txidC: single vout (no in-group ordering matters)
+        { txid: txidC, vout: 0, height: 300, coinbase: false, amount: 600n, spk },
+      ];
+
+      for (const r of records) {
+        await db.putUTXO(r.txid, r.vout, {
+          height: r.height,
+          coinbase: r.coinbase,
+          amount: r.amount,
+          scriptPubKey: r.spk,
+        });
+      }
+
+      const { hash, coinsCount } = await computeUTXOSetHash(db);
+      expect(coinsCount).toBe(BigInt(records.length));
+
+      const expected = canonicalCoreHash(records);
+      expect(hash.equals(expected)).toBe(true);
+    });
+
+    it("dumpSnapshot writes per-txid coins in numeric vout order (Core's WriteUTXOSnapshot)", async () => {
+      // Build a UTXO set with one high-vout txid, dump it, then read
+      // back the snapshot bytes and verify the vouts within the txid
+      // group come out in numeric ascending order — what
+      // rpc/blockchain.cpp WriteUTXOSnapshot produces from
+      // std::map<uint32_t, Coin>.
+      const tip = Buffer.alloc(32, 0xfe);
+      await db.putChainState({ bestBlockHash: tip, bestHeight: 850_000, totalWork: 1n });
+      await db.putBlockIndex(tip, {
+        height: 850_000,
+        header: Buffer.alloc(80, 0),
+        nTx: 1,
+        status: 0x1f,
+        dataPos: 0,
+      });
+
+      const txid = Buffer.alloc(32, 0xcd);
+      const spk = Buffer.from([0x76, 0xa9, 0x14, ...Buffer.alloc(20, 0x77), 0x88, 0xac]);
+      const vouts = [0, 1, 256, 257, 13106];
+
+      for (const v of vouts) {
+        await db.putUTXO(txid, v, {
+          height: 100_000 + v,
+          coinbase: false,
+          amount: BigInt(v + 1) * 1000n,
+          scriptPubKey: spk,
+        });
+      }
+
+      const dumpPath = "/tmp/hotbuns-high-vout-dump-" + Date.now() + ".dat";
+      const params: ConsensusParams = {
+        ...REGTEST,
+        // Empty assumeutxo map so dumpSnapshot doesn't try to look up
+        // a chainparams entry — dumpSnapshot doesn't gate on this.
+      };
+      const mgr = new ChainstateManager(db, params);
+      try {
+        const result = await mgr.dumpSnapshot(dumpPath);
+        expect(result.coinsWritten).toBe(BigInt(vouts.length));
+
+        // Read the snapshot bytes and verify vout ordering inside the
+        // group. Header is 51 bytes (5 magic + 2 version + 4 netmagic +
+        // 32 baseblockhash + 8 coinscount). Then groups of [txid 32B,
+        // CompactSize count, [CompactSize vout, VARINT(code),
+        // VARINT(amount), CompressedScript]+]. We only need to check
+        // the vout order — the field that was wrong before.
+        const file = Bun.file(dumpPath);
+        const bytes = Buffer.from(await file.arrayBuffer());
+        const reader = new BufferReader(bytes.subarray(51));
+
+        // First (and only) group.
+        const groupTxid = reader.readBytes(32);
+        expect(groupTxid.equals(txid)).toBe(true);
+
+        // CompactSize count.
+        const count = reader.readVarInt();
+        expect(count).toBe(vouts.length);
+
+        const observedVouts: number[] = [];
+        for (let i = 0; i < count; i++) {
+          observedVouts.push(reader.readVarInt());
+          // Skip the rest of the per-coin payload (code + amount +
+          // compressed script). We don't need to validate them here —
+          // a separate test (`computeUTXOSetHash`) covers digest
+          // correctness end-to-end. Use readVarIntCore for both code
+          // and amount (Pieter's VARINT, NOT CompactSize), then read
+          // the compressed-script header byte / payload.
+          readVarIntCore(reader); // code
+          readVarIntCore(reader); // compressed amount
+          const nSize = Number(readVarIntCore(reader));
+          // Special scripts (P2PKH, P2SH, P2PK) are 20/20/32 bytes;
+          // raw script: nSize - NUM_SPECIAL_SCRIPTS (=6) bytes.
+          // For our spk = P2PKH (nSize=0), payload is 20 bytes.
+          if (nSize === 0 || nSize === 1) {
+            reader.readBytes(20);
+          } else if (nSize === 2 || nSize === 3 || nSize === 4 || nSize === 5) {
+            reader.readBytes(32);
+          } else {
+            reader.readBytes(nSize - 6);
+          }
+        }
+
+        // Numeric ascending — what Core produces.
+        expect(observedVouts).toEqual([...vouts].sort((a, b) => a - b));
+        // Sanity: confirms this is NOT the LE-byte order (which differs
+        // for high vouts).
+        const leBytes = (n: number) => {
+          const b = Buffer.alloc(4);
+          b.writeUInt32LE(n);
+          return b;
+        };
+        const leByteOrder = [...vouts].sort((a, b) =>
+          leBytes(a).compare(leBytes(b))
+        );
+        expect(JSON.stringify(observedVouts)).not.toBe(
+          JSON.stringify(leByteOrder)
+        );
+      } finally {
+        try {
+          rmSync(dumpPath, { force: true });
+          rmSync(dumpPath + ".tmp", { force: true });
+        } catch {
+          // Ignore
+        }
+      }
+    });
+  });
 });
