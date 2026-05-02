@@ -8,6 +8,12 @@ import {
   bigIntToCompact,
   getGenesisBlock,
 } from "./params";
+import {
+  getAssumeutxoData,
+  serializeSnapshotMetadata,
+  deserializeSnapshotMetadata,
+} from "../chain/snapshot";
+import { BufferReader } from "../wire/serialization";
 
 describe("network constants", () => {
   test("mainnet network magic", () => {
@@ -268,5 +274,96 @@ describe("BIP activation heights", () => {
   test("regtest has early activation for all BIPs", () => {
     expect(REGTEST.segwitHeight).toBe(0);
     expect(REGTEST.taprootHeight).toBe(0);
+  });
+});
+
+describe("m_assumeutxo_data lookup (byte-order regression)", () => {
+  // The four mainnet entries are Core's chainparams.cpp m_assumeutxo_data
+  // (840k/880k/910k/935k), plus the hashhog-local 944183 snapshot. Map
+  // keys MUST be internal byte order, because getAssumeutxoData uses
+  // metadata.baseBlockHash.toString("hex") and baseBlockHash is read
+  // verbatim (internal LE) from the snapshot wire format. A previous bug
+  // had display-order keys, which silently prevented loadtxoutset from
+  // ever resolving any mainnet snapshot. This test pins the key encoding.
+  const expectedEntries: ReadonlyArray<{
+    height: number;
+    displayHash: string;
+    nChainTx: bigint;
+  }> = [
+    {
+      height: 840000,
+      displayHash: "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
+      nChainTx: 991_032_194n,
+    },
+    {
+      height: 880000,
+      displayHash: "000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880",
+      nChainTx: 1_145_604_538n,
+    },
+    {
+      height: 910000,
+      displayHash: "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+      nChainTx: 1_226_586_151n,
+    },
+    {
+      height: 935000,
+      displayHash: "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee",
+      nChainTx: 1_305_397_408n,
+    },
+    {
+      height: 944183,
+      displayHash: "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817",
+      nChainTx: 1_334_000_000n,
+    },
+  ];
+
+  for (const entry of expectedEntries) {
+    test(`looks up h=${entry.height} via internal-order baseBlockHash`, () => {
+      // Internal order = display-order bytes reversed.
+      const internalOrder = Buffer.from(entry.displayHash, "hex").reverse();
+      const data = getAssumeutxoData(MAINNET, internalOrder);
+      expect(data).not.toBeNull();
+      expect(data!.height).toBe(entry.height);
+      expect(data!.nChainTx).toBe(entry.nChainTx);
+      // blockHash field should equal the same internal-LE bytes.
+      expect(data!.blockHash.equals(internalOrder)).toBe(true);
+    });
+  }
+
+  test("does not match display-order baseBlockHash (sanity: keys are internal)", () => {
+    // Display-order hex → display-order bytes; this MUST NOT resolve.
+    // If this test starts passing, the keys have flipped back to
+    // display-order, which would make a real Core snapshot fail to load.
+    for (const entry of expectedEntries) {
+      const displayOrder = Buffer.from(entry.displayHash, "hex");
+      const data = getAssumeutxoData(MAINNET, displayOrder);
+      expect(data).toBeNull();
+    }
+  });
+
+  test("end-to-end: serialize then deserialize metadata, lookup by baseBlockHash", () => {
+    // Construct synthetic snapshot metadata for h=944183, serialize via
+    // the production writer, deserialize via the production reader, and
+    // confirm getAssumeutxoData(metadata.baseBlockHash) resolves. This
+    // exercises the exact code path that loadtxoutset takes against a
+    // real on-disk snapshot file's header.
+    const internalOrder = Buffer.from(
+      "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817",
+      "hex"
+    ).reverse();
+    const wire = serializeSnapshotMetadata({
+      networkMagic: MAINNET.networkMagic,
+      baseBlockHash: internalOrder,
+      coinsCount: 165_095_935n,
+    });
+    const meta = deserializeSnapshotMetadata(
+      new BufferReader(wire),
+      MAINNET.networkMagic
+    );
+    expect(meta.baseBlockHash.equals(internalOrder)).toBe(true);
+
+    const data = getAssumeutxoData(MAINNET, meta.baseBlockHash);
+    expect(data).not.toBeNull();
+    expect(data!.height).toBe(944183);
   });
 });

@@ -498,13 +498,26 @@ export const MAINNET: ConsensusParams = {
   // Minimum chain work from Bitcoin Core (as of recent release)
   nMinimumChainWork: 0x0000000000000000000000000000000000000001128750f82f4c366153a3a030n,
   // assumeUTXO snapshots — Bitcoin Core mainnet, kernel/chainparams.cpp
-  // m_assumeutxo_data. Map key is the block hash in display order (RPC
-  // byte order, big-endian); blockHash field is the same hash in wire
-  // order (little-endian). hash_serialized bytes mirror Core's
-  // AssumeutxoHash::ToString() output (which is BaseHash, internal-LE).
+  // m_assumeutxo_data.
+  //
+  // Map key MUST be the block hash in INTERNAL byte order (the raw 32
+  // bytes as serialized in the snapshot file's metadata header, the same
+  // bytes that hash256() produces). getAssumeutxoData() looks up by
+  // `metadata.baseBlockHash.toString("hex")`, and baseBlockHash is read
+  // verbatim from the snapshot wire format via reader.readHash() —
+  // that is internal LE order, not the display-order hex shown by RPC /
+  // block explorers. Using display-order keys would silently prevent
+  // loadtxoutset from ever resolving any mainnet snapshot.
+  //
+  // The block-explorer / RPC display-order hex is included as a comment
+  // above each entry for human cross-reference; the live key is the
+  // byte-reversed form. blockHash field stores the same 32 bytes as the
+  // key (internal LE), and hashSerialized mirrors Core's
+  // AssumeutxoHash::ToString() (BaseHash, internal LE).
   assumeutxo: new Map([
+    // 840000 display: 0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5
     [
-      "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
+      "a583da1c3ff29b687248ff737822f8ce4827033a282003000000000000000000",
       {
         height: 840000,
         hashSerialized: Buffer.from(
@@ -518,8 +531,9 @@ export const MAINNET: ConsensusParams = {
         ).reverse(),
       },
     ],
+    // 880000 display: 000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880
     [
-      "000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880",
+      "8028ca5cec8220cf1dfd2a9c9a960705403c3c28170b01000000000000000000",
       {
         height: 880000,
         hashSerialized: Buffer.from(
@@ -533,8 +547,9 @@ export const MAINNET: ConsensusParams = {
         ).reverse(),
       },
     ],
+    // 910000 display: 0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821
     [
-      "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+      "21a894914616bdb1dccd7ae1ea16d5ff2295cb0a970801000000000000000000",
       {
         height: 910000,
         hashSerialized: Buffer.from(
@@ -548,8 +563,9 @@ export const MAINNET: ConsensusParams = {
         ).reverse(),
       },
     ],
+    // 935000 display: 0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee
     [
-      "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee",
+      "eeb50f6fa5725eccea7b60ba1bb9b25216af5849034701000000000000000000",
       {
         height: 935000,
         hashSerialized: Buffer.from(
@@ -571,15 +587,7 @@ export const MAINNET: ConsensusParams = {
     // hash_serialized was computed by tools/compute-snapshot-hash.py over
     // the actual on-disk file (165,095,935 coins) and is the raw
     // SHA256d-of-TxOutSer output that computeUTXOSetHash will reproduce.
-    //
-    // NOTE: getAssumeutxoData looks up entries by
-    // metadata.baseBlockHash.toString("hex"), and metadata.baseBlockHash
-    // is the raw 32 bytes read from the snapshot file, i.e. INTERNAL byte
-    // order. The four mainnet entries above use display order as their
-    // map key — that is a pre-existing bug that prevents loading any real
-    // mainnet snapshot. To make this 944183 entry actually load, the key
-    // here is the internal-order hex (= display-order hex reversed):
-    // display = 0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817.
+    // 944183 display: 0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817
     [
       "17d8ce98333245aba5170dc0c69a0e9d8303160a184601000000000000000000",
       {
