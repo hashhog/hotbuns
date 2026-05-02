@@ -889,6 +889,16 @@ export class HeaderSync {
    * Save a header entry to the database.
    */
   private async saveHeaderEntry(entry: HeaderChainEntry): Promise<void> {
+    // Skip header persistence once shutdown has begun.  Without this guard,
+    // P2P-driven async header processing (handleHeadersMessage → processHeaders
+    // → saveHeaderEntry) racing with db.close() surfaces as noisy
+    // LEVEL_DATABASE_NOT_OPEN errors during graceful shutdown.  Any header we
+    // drop here will be re-fetched on the next startup; the in-memory chain
+    // is already updated.
+    if (this.db.isClosing()) {
+      return;
+    }
+
     const headerBuf = serializeBlockHeader(entry.header);
 
     // Status bitmask: 1 = header-valid
@@ -927,6 +937,10 @@ export class HeaderSync {
    * Uses a separate key to avoid confusion with the validated chain tip.
    */
   private async saveHeaderTip(entry: HeaderChainEntry): Promise<void> {
+    // Same shutdown guard as saveHeaderEntry — see comment there.
+    if (this.db.isClosing()) {
+      return;
+    }
     // Store header tip separately using a custom key
     // We use the CHAIN_STATE prefix with a special key suffix
     const key = Buffer.from(HEADER_TIP_KEY);

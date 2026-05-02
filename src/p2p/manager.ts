@@ -282,6 +282,17 @@ export class PeerManager {
   /** Track inbound peers for eviction */
   private inboundPeers: Set<string>;
 
+  /**
+   * Set true once {@link stop} has been entered.  Independent of
+   * {@link running} because tests (and the mainnet `connectPeer` path)
+   * exercise the manager without first calling {@link start}, so
+   * `running === false` does not imply "shutdown in progress".
+   * Used by {@link handlePeerMessage} to drop messages that arrive after
+   * shutdown begins, preventing P2P-driven async DB writes from racing
+   * `db.close()` and surfacing as `LEVEL_DATABASE_NOT_OPEN` log spam.
+   */
+  private shuttingDown: boolean;
+
   /** Interval for periodic ping checks (2 minutes). */
   private pingInterval: ReturnType<typeof setInterval> | null;
   /** Interval for stale tip checks (45 seconds). */
@@ -330,6 +341,7 @@ export class PeerManager {
     this.messageHandlers = new Map();
     this.maintainInterval = null;
     this.running = false;
+    this.shuttingDown = false;
     this.lastActivity = new Map();
     this.connectingPeers = new Set();
     this.banManager = new BanManager(config.datadir);
@@ -488,6 +500,9 @@ export class PeerManager {
    * Stop all peer connections and the maintenance loop.
    */
   async stop(): Promise<void> {
+    // Flip shuttingDown *before* running=false so any in-flight async
+    // dispatch sees the gate immediately.
+    this.shuttingDown = true;
     this.running = false;
 
     // Stop TCP listener
@@ -1419,6 +1434,16 @@ export class PeerManager {
    * Handle incoming message from a peer.
    */
   private handlePeerMessage(peer: Peer, msg: NetworkMessage): void {
+    // Drop any messages that arrive after stop() began.  Buffered socket
+    // data (a peer's pending headers/inv/etc.) can still flow through Bun's
+    // parser briefly after we begin shutdown; without this gate those
+    // messages would dispatch to handlers (e.g. headers → DB write) that
+    // race against db.close() and surface as LEVEL_DATABASE_NOT_OPEN.
+    // Approach A: stop dispatching as soon as the manager is shutting down.
+    if (this.shuttingDown) {
+      return;
+    }
+
     const key = `${peer.host}:${peer.port}`;
     this.lastActivity.set(key, Date.now());
 

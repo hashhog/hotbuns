@@ -505,6 +505,55 @@ describe("PeerManager", () => {
 
     await manager.stop();
   }, TEST_TIMEOUT);
+
+  test("does not dispatch messages after stop() — no DB writes can race db.close", async () => {
+    // Regression for hotbuns LEVEL_DATABASE_NOT_OPEN spam during graceful
+    // shutdown.  Pattern in production:
+    //   SIGTERM → gracefulShutdown → peerManager.stop() → db.close()
+    //   Buffered "headers" messages still flow → handler fires →
+    //   saveHeaderEntry → db.put() → throws LEVEL_DATABASE_NOT_OPEN.
+    // Fix (Approach A): handlePeerMessage bails when this.running === false.
+    const config: PeerManagerConfig = {
+      maxOutbound: 8,
+      maxInbound: 117,
+      params: REGTEST,
+      bestHeight: 0,
+      datadir: tempDir,
+    };
+
+    mockServer1.autoHandshake();
+
+    const manager = new PeerManager(config);
+
+    let dispatchedAfterStop = 0;
+    manager.onMessage("ping", () => {
+      dispatchedAfterStop++;
+    });
+
+    const peer = await manager.connectPeer("127.0.0.1", mockServer1.port);
+    await waitFor(() => peer.state === "connected");
+
+    // Sanity: handler fires BEFORE stop().
+    mockServer1.send({ type: "ping", payload: { nonce: 1n } });
+    await waitFor(() => dispatchedAfterStop > 0);
+    expect(dispatchedAfterStop).toBe(1);
+
+    // Begin shutdown.
+    await manager.stop();
+
+    // After stop(), any further dispatch attempts must be no-ops.  Simulate
+    // the production race by directly invoking the public message-handling
+    // path (the buffered-data pathway in real life) — handler must NOT fire.
+    // We use the "ping" handler as a proxy for the headers handler in
+    // headers.ts; the gate is in handlePeerMessage which is type-agnostic.
+    const before = dispatchedAfterStop;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (manager as any).handlePeerMessage(peer, {
+      type: "ping",
+      payload: { nonce: 2n },
+    });
+    expect(dispatchedAfterStop).toBe(before); // Still 1, not 2.
+  }, TEST_TIMEOUT);
 });
 
 describe("PeerManager address persistence", () => {

@@ -265,6 +265,13 @@ function bufferToBigInt(buf: Buffer): bigint {
  */
 export class ChainDB {
   private db: ClassicLevel<Buffer, Buffer>;
+  /**
+   * Set true at the start of {@link close}. Allows callers (e.g. P2P-driven
+   * async header writes) to short-circuit before invoking the underlying
+   * LevelDB so we don't surface `LEVEL_DATABASE_NOT_OPEN` errors as noise
+   * during graceful shutdown.
+   */
+  private closing: boolean;
 
   constructor(dbPath: string) {
     this.db = new ClassicLevel<Buffer, Buffer>(dbPath, {
@@ -281,6 +288,7 @@ export class ChainDB {
       // Default (1000) was contributing ~1-2GB of RSS.
       maxOpenFiles: 256,
     });
+    this.closing = false;
   }
 
   async open(): Promise<void> {
@@ -288,12 +296,33 @@ export class ChainDB {
   }
 
   async close(): Promise<void> {
+    // Flip the flag *before* awaiting close() so any in-flight async caller
+    // that races with us can observe the shutdown and bail early via
+    // {@link isClosing}.
+    this.closing = true;
     await this.db.close();
+  }
+
+  /**
+   * True once {@link close} has been entered.  Hot-path writers driven by
+   * P2P async tasks (e.g. {@link putBlockIndex} from headers.ts) consult
+   * this to skip writes that would otherwise throw `LEVEL_DATABASE_NOT_OPEN`
+   * during graceful shutdown.
+   */
+  isClosing(): boolean {
+    return this.closing;
   }
 
   // Block index operations
 
   async putBlockIndex(hash: Buffer, record: BlockIndexRecord): Promise<void> {
+    // Belt-and-suspenders: if shutdown is in progress, skip the write rather
+    // than racing db.close() and surfacing LEVEL_DATABASE_NOT_OPEN as noise.
+    // Caller (saveHeaderEntry) is best-effort during IBD; any header dropped
+    // here will be re-fetched and re-saved on the next startup.
+    if (this.closing) {
+      return;
+    }
     const key = makeKey(DBPrefix.BLOCK_INDEX, hash);
     const value = serializeBlockIndex(record);
     await this.db.put(key, value);
