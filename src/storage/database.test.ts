@@ -601,3 +601,68 @@ describe('ChainDB', () => {
     });
   });
 });
+
+/**
+ * Regression tests for the LEVEL_DATABASE_NOT_OPEN shutdown-race fix.
+ *
+ * These tests verify {@link ChainDB.isClosing} flips early in close() and
+ * that {@link ChainDB.putBlockIndex} short-circuits when shutdown is in
+ * progress, so P2P-driven async header writes can't race db.close() and
+ * surface as "Database is not open" log spam.
+ *
+ * These tests own their own ChainDB lifecycle (no shared beforeEach/afterEach
+ * since they intentionally close the DB mid-test).
+ */
+describe('ChainDB shutdown race', () => {
+  let dbPath: string;
+  let db: ChainDB;
+
+  beforeEach(async () => {
+    dbPath = await mkdtemp(join(tmpdir(), 'hotbuns-shutdown-test-'));
+    db = new ChainDB(dbPath);
+    await db.open();
+  });
+
+  afterEach(async () => {
+    // db may already be closed by the test; close() is idempotent on the
+    // closing flag but classic-level close() on an already-closed DB is a
+    // no-op too.
+    try {
+      await db.close();
+    } catch {
+      // already closed — ignore
+    }
+    await rm(dbPath, { recursive: true, force: true });
+  });
+
+  test('isClosing() is false before close()', () => {
+    expect(db.isClosing()).toBe(false);
+  });
+
+  test('isClosing() flips to true at the start of close()', async () => {
+    const closePromise = db.close();
+    // The flag is flipped synchronously *before* awaiting the underlying
+    // close — verify it's already true while close is still in flight.
+    expect(db.isClosing()).toBe(true);
+    await closePromise;
+    expect(db.isClosing()).toBe(true);
+  });
+
+  test('putBlockIndex during shutdown returns silently (no LEVEL_DATABASE_NOT_OPEN)', async () => {
+    const hash = Buffer.alloc(32, 0xee);
+    const record: BlockIndexRecord = {
+      height: 999_999,
+      header: Buffer.alloc(80, 0xcc),
+      nTx: 0,
+      status: 1,
+      dataPos: 0,
+    };
+
+    await db.close();
+    expect(db.isClosing()).toBe(true);
+
+    // Must NOT throw — this is the exact condition that produced the
+    // production noise.  saveHeaderEntry → putBlockIndex after close.
+    await expect(db.putBlockIndex(hash, record)).resolves.toBeUndefined();
+  });
+});
