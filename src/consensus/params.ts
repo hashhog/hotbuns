@@ -563,6 +563,29 @@ export const MAINNET: ConsensusParams = {
         ).reverse(),
       },
     ],
+    // hashhog-local snapshot at h=944183 (utxo-snapshot-raw.dat from
+    // /data/nvme1/hashhog-mainnet/), used to recover hotbuns + lunarblock
+    // mainnet nodes after chainstate corruption (CAMLCOIN-EBADF-LEAK
+    // sister bug, see CAMLCOIN-REVIVE-FEASIBILITY.md). NOT a Bitcoin Core
+    // chainparams entry — the four 840k/880k/910k/935k entries above ARE.
+    // hash_serialized was computed by tools/compute-snapshot-hash.py over
+    // the actual on-disk file (165,095,935 coins) and is the raw
+    // SHA256d-of-TxOutSer output that computeUTXOSetHash will reproduce.
+    [
+      "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817",
+      {
+        height: 944183,
+        hashSerialized: Buffer.from(
+          "a888bcbc200384747c0813c8e7f4650d9bc0847b5147791c3ca869567271af2e",
+          "hex"
+        ),
+        nChainTx: 1_334_000_000n,
+        blockHash: Buffer.from(
+          "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817",
+          "hex"
+        ).reverse(),
+      },
+    ],
   ]),
 };
 
