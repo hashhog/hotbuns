@@ -23,7 +23,7 @@ import {
   type SnapshotMetadata,
   type AssumeutxoData,
 } from "../chain/snapshot.js";
-import { hash256 } from "../crypto/primitives.js";
+import { sha256Hash } from "../crypto/primitives.js";
 import type { Coin } from "../chain/utxo.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import {
@@ -924,15 +924,18 @@ describe("assumeUTXO", () => {
       });
 
       // HASH_SERIALIZED = double-SHA256 of the streamed TxOutSer bytes
-      // (HashWriter::GetHash is `hash256(sha256_finalize(stream))` —
-      // i.e. the standard Bitcoin double-SHA256 of the inner SHA-256
-      // digest). Reproduce it manually here.
+      // (HashWriter::GetHash = sha256(sha256_finalize(stream))). The
+      // streaming `Bun.CryptoHasher` already produces the inner SHA-256,
+      // so we apply ONE more SHA-256 — `sha256Hash`, NOT `hash256`,
+      // which would chain two more SHA-256s and yield triple-SHA256
+      // (the bug that broke mainnet snapshot loads — see snapshot.ts
+      // computeUTXOSetHash final step).
       const hasher = new Bun.CryptoHasher("sha256");
       for (const r of recs) {
         hasher.update(txOutSer(r.txid, r.vout, r.h, r.cb, r.amt, r.spk));
       }
       const inner = Buffer.from(hasher.digest());
-      const expected = hash256(inner);
+      const expected = sha256Hash(inner);
 
       expect(hash.equals(expected)).toBe(true);
       expect(hash.length).toBe(32);
@@ -952,11 +955,11 @@ describe("assumeUTXO", () => {
 
       const fwd = new Bun.CryptoHasher("sha256");
       for (const r of recs) fwd.update(txOutSer(r.txid, r.vout, r.h, r.cb, r.amt, r.spk));
-      const hashFwd = hash256(Buffer.from(fwd.digest()));
+      const hashFwd = sha256Hash(Buffer.from(fwd.digest()));
 
       const rev = new Bun.CryptoHasher("sha256");
       for (const r of [...recs].reverse()) rev.update(txOutSer(r.txid, r.vout, r.h, r.cb, r.amt, r.spk));
-      const hashRev = hash256(Buffer.from(rev.digest()));
+      const hashRev = sha256Hash(Buffer.from(rev.digest()));
 
       // Different orderings -> different digests under HASH_SERIALIZED.
       expect(hashFwd.equals(hashRev)).toBe(false);
@@ -966,12 +969,59 @@ describe("assumeUTXO", () => {
       const { hash, coinsCount } = await computeUTXOSetHash(db);
       expect(coinsCount).toBe(0n);
 
-      // Empty stream -> SHA-256 of "" -> double-SHA256("").
+      // Empty stream -> SHA-256 of "" -> SHA-256(SHA-256("")) = double-SHA256("").
+      // Reproduce with one streaming SHA-256 + one more SHA-256, matching
+      // computeUTXOSetHash. (Don't use `hash256` here — that would triple-hash.)
       const empty = new Bun.CryptoHasher("sha256");
       const inner = Buffer.from(empty.digest());
-      const expected = hash256(inner);
+      const expected = sha256Hash(inner);
 
       expect(hash.equals(expected)).toBe(true);
+    });
+
+    // -----------------------------------------------------------------------
+    // Hard-coded SHA256d fixture — pins HASH_SERIALIZED against a value
+    // computed independently (Python `hashlib`) so a future refactor that
+    // re-introduces the triple-SHA256 bug fails this test.
+    //
+    // Bug history (wave 5, 2026-05-02): computeUTXOSetHash finalized
+    // `Bun.CryptoHasher` (one SHA-256 of the streamed TxOutSer bytes)
+    // and then called `hash256(inner)` — but `hash256(x) = sha256(sha256(x))`,
+    // so the chain became sha256(sha256(sha256(stream))) = TRIPLE SHA-256.
+    // On the mainnet 165 095 935-coin snapshot this produced
+    // `2075205e71f087f76533a3f108b66e22e2de42cdc8a44f5b1601c7b314c66097`
+    // = `sha256(a888bcbc...)` instead of `a888bcbc...` (the actual
+    // double-SHA256), failing the strict assumeutxo gate. Verified
+    // bit-for-bit by per-txid coin-stream diff vs the snapshot file:
+    // all 114 383 783 group hashes matched, proving the data was correct
+    // and the bug lived in the final fold-down. Fixed by replacing
+    // `hash256(inner)` with `sha256Hash(inner)` (one more SHA-256, not
+    // two more).
+    //
+    // Regression pin: empty UTXO set MUST hash to
+    //   SHA256(SHA256("")) = 5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456
+    // — NOT to triple-SHA256("") =
+    //     aa6ac2d4961882f42a345c7615f4133dde8e6d6e7c1b6b40ae4ff6ee52c393d0
+    // -----------------------------------------------------------------------
+    it("HASH_SERIALIZED is double-SHA256 (NOT triple) — empty UTXO fixture", async () => {
+      const { hash, coinsCount } = await computeUTXOSetHash(db);
+      expect(coinsCount).toBe(0n);
+
+      // Independently computed: SHA-256(SHA-256(b"")), via Python `hashlib`.
+      // This is what Core's HashWriter::GetHash() returns for an empty
+      // stream (see bitcoin-core/src/hash.h).
+      const expectedDouble = Buffer.from(
+        "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456",
+        "hex",
+      );
+      const tripleBuggy = Buffer.from(
+        "aa6ac2d4961882f42a345c7615f4133dde8e6d6e7c1b6b40ae4ff6ee52c393d0",
+        "hex",
+      );
+
+      expect(hash.equals(expectedDouble)).toBe(true);
+      // Pin the regression: the buggy triple-SHA256 must NOT match.
+      expect(hash.equals(tripleBuggy)).toBe(false);
     });
 
     it("loadSnapshot refuses with Core's verbatim 'Bad snapshot content hash' wording on mismatch", async () => {
@@ -1332,8 +1382,12 @@ describe("assumeUTXO", () => {
       for (const r of sorted) {
         hasher.update(txOutSer(r.txid, r.vout, r.height, r.coinbase, r.amount, r.spk));
       }
+      // Bun.CryptoHasher already gives the inner SHA-256 of the stream;
+      // one more SHA-256 yields Core's HashWriter::GetHash double-SHA256.
+      // (Calling `hash256` here would chain a third SHA-256 — the bug
+      // computeUTXOSetHash used to have, see snapshot.ts.)
       const inner = Buffer.from(hasher.digest());
-      return hash256(inner);
+      return sha256Hash(inner);
     }
 
     it("computeUTXOSetHash matches Core canonical order for txid with vout >= 256", async () => {
@@ -1408,7 +1462,7 @@ describe("assumeUTXO", () => {
         wrongHasher.update(txOutSer(r.txid, r.vout, r.height, r.coinbase, r.amount, r.spk));
       }
       const wrongInner = Buffer.from(wrongHasher.digest());
-      const wrongHash = hash256(wrongInner);
+      const wrongHash = sha256Hash(wrongInner);
       expect(hash.equals(wrongHash)).toBe(false);
     });
 
