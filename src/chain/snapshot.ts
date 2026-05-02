@@ -327,6 +327,39 @@ export async function computeUTXOSetHash(
     lt: Buffer.concat([Buffer.from([DBPrefix.UTXO + 1])]),
   });
 
+  // CRITICAL ORDERING FIX: Core uses `std::map<uint32_t, Coin>`
+  // (kernel/coinstats.cpp:122-128) which iterates vouts in NUMERIC order
+  // for each txid. LevelDB iterates by byte-lex on the
+  // [prefix=0x75][txid 32B][vout uint32_LE] key, so within a txid the
+  // vouts come out in LE-byte order, which differs from numeric order
+  // for any vout >= 256 (e.g. numeric [0,1,256,257] arrives as
+  // [0,1,0,0,0,0,0,1,0,0,0,1,0,0,0,1,1,0,0,0]). On mainnet at h=940k,
+  // 183,859 of 114M txids have at least one vout >= 256 (max 13,106),
+  // and the resulting digest diverges from Core's HASH_SERIALIZED by
+  // exactly the per-txid permutation. Fix: buffer all coins for a txid
+  // group, sort numerically by vout, then ingest.
+  let prevTxid: Buffer | null = null;
+  let group: Array<{
+    vout: number;
+    height: number;
+    coinbase: boolean;
+    amount: bigint;
+    scriptPubKey: Buffer;
+  }> = [];
+
+  const flush = () => {
+    if (!prevTxid || group.length === 0) return;
+    if (group.length > 1) {
+      group.sort((a, b) => a.vout - b.vout);
+    }
+    for (const c of group) {
+      hasher.update(
+        txOutSerBytes(prevTxid, c.vout, c.height, c.coinbase, c.amount, c.scriptPubKey),
+      );
+    }
+    group = [];
+  };
+
   try {
     for await (const [key, value] of iterator) {
       if (interruptCheck?.()) {
@@ -346,9 +379,16 @@ export async function computeUTXOSetHash(
       const amount = reader.readUInt64LE();
       const scriptPubKey = reader.readVarBytes();
 
-      hasher.update(txOutSerBytes(txid, vout, height, coinbase, amount, scriptPubKey));
+      if (!prevTxid || !txid.equals(prevTxid)) {
+        flush();
+        // The iterator key buffer may be reused on the next iteration —
+        // copy the txid so the group stays valid until we flush.
+        prevTxid = Buffer.from(txid);
+      }
+      group.push({ vout, height, coinbase, amount, scriptPubKey });
       coinsCount++;
     }
+    flush();
   } finally {
     await iterator.close();
   }
@@ -391,6 +431,33 @@ export async function computeUTXOSetMuHash(
     lt: Buffer.concat([Buffer.from([DBPrefix.UTXO + 1])]),
   });
 
+  // MuHash is order-invariant by math (multiset hash over a 3072-bit prime
+  // field), so this grouping is not strictly required for digest equality.
+  // We apply it anyway for parity with Core's `gettxoutsetinfo
+  // hash_type=muhash` ingestion order — same per-txid sort as
+  // `computeUTXOSetHash`, since both functions consume the same DB iterator.
+  let prevTxid: Buffer | null = null;
+  let group: Array<{
+    vout: number;
+    height: number;
+    coinbase: boolean;
+    amount: bigint;
+    scriptPubKey: Buffer;
+  }> = [];
+
+  const flush = () => {
+    if (!prevTxid || group.length === 0) return;
+    if (group.length > 1) {
+      group.sort((a, b) => a.vout - b.vout);
+    }
+    for (const c of group) {
+      acc.add(
+        txOutSerBytes(prevTxid, c.vout, c.height, c.coinbase, c.amount, c.scriptPubKey),
+      );
+    }
+    group = [];
+  };
+
   try {
     for await (const [key, value] of iterator) {
       if (interruptCheck?.()) {
@@ -409,9 +476,14 @@ export async function computeUTXOSetMuHash(
       const amount = reader.readUInt64LE();
       const scriptPubKey = reader.readVarBytes();
 
-      acc.add(txOutSerBytes(txid, vout, height, coinbase, amount, scriptPubKey));
+      if (!prevTxid || !txid.equals(prevTxid)) {
+        flush();
+        prevTxid = Buffer.from(txid);
+      }
+      group.push({ vout, height, coinbase, amount, scriptPubKey });
       coinsCount++;
     }
+    flush();
   } finally {
     await iterator.close();
   }
@@ -948,8 +1020,22 @@ export class ChainstateManager {
     // (txid, count, [vout, coin]...) uses wire-protocol CompactSize for
     // count and vout, while each Coin uses Pieter's VARINT and
     // TxOutCompression internally (see serializeCoinIntoWriter).
+    //
+    // CRITICAL ORDERING: Core's WriteUTXOSnapshot reads from a
+    // `std::map<uint32_t, Coin>` keyed by vout, so per-txid the vouts are
+    // emitted in NUMERIC order. LevelDB iterates this DB in byte-lex order
+    // on the [prefix=0x75][txid 32B][vout uint32_LE] key, which sorts
+    // vouts in LE-byte order — distinct from numeric order for any vout
+    // >= 256. Sorting `currentCoins` by `vout` numerically before flush
+    // restores byte-identity with Core's dumptxoutset on chains that
+    // contain high-vout txids (mainnet has 183,859 such txids at h=940k,
+    // max vout 13,106).
     const flushTx = () => {
       if (!currentTxid || currentCoins.length === 0) return;
+
+      if (currentCoins.length > 1) {
+        currentCoins.sort((a, b) => a.vout - b.vout);
+      }
 
       const groupWriter = new BufferWriter();
       // txid (32 bytes, raw).
