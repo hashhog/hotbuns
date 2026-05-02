@@ -11,6 +11,8 @@
  * and node/utxo_snapshot.cpp
  */
 
+import { promises as fsp } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import { hash256 } from "../crypto/primitives.js";
 import { BufferWriter, BufferReader, varIntSize } from "../wire/serialization.js";
 import {
@@ -18,6 +20,10 @@ import {
   deserializeTxOutCompressed,
   writeVarIntCore,
   readVarIntCore,
+  decompressAmount,
+  decompressScript,
+  getSpecialScriptSize,
+  NUM_SPECIAL_SCRIPTS,
 } from "../wire/compressor.js";
 import { MuHash3072 } from "../wire/muhash.js";
 import type { ChainDB, UTXOEntry, BatchOperation } from "../storage/database.js";
@@ -493,6 +499,179 @@ export class Chainstate {
 }
 
 /**
+ * Streaming snapshot file reader.
+ *
+ * Reason for existing: V8 / Bun's `Buffer.alloc` and `arrayBuffer()` are
+ * capped at 4 GiB (TypedArray-spec limit on `Buffer`/`Uint8Array`), so the
+ * old `Buffer.from(await Bun.file(p).arrayBuffer())` path silently dies on
+ * any mainnet `dumptxoutset` ≥ 4 GiB. Mainnet UTXO snapshots are ~9 GiB
+ * (165M coins post-h=940k), so loading the whole file at once is no
+ * longer viable on this runtime.
+ *
+ * This class holds a sliding 8 MiB window backed by a `node:fs` FileHandle
+ * and exposes the subset of `BufferReader`'s API that loadSnapshot uses
+ * (`readBytes`, `readUInt8/16/32LE`, `readUInt64LE`, `readVarInt`,
+ * `readVarIntBig`, `readVarBytes`, `readHash`). Reads are advanced by
+ * sliding the window forward; refill happens lazily when the next read
+ * would underrun. `readBytes` always returns an owned copy so callers
+ * cannot retain views into a buffer that the next refill will overwrite.
+ *
+ * Not exported: only loadSnapshot needs this codepath. Other consumers of
+ * snapshot.ts call deserializeSnapshotMetadata with a small in-memory
+ * Buffer and are unaffected.
+ */
+class StreamingBufferReader {
+  private fh: FileHandle;
+  private fileSize: number;
+  private filePos: number;       // next byte in file to read into the window
+  private window: Buffer;        // refill buffer
+  private windowEnd: number;     // valid bytes [0, windowEnd) inside window
+  private windowOff: number;     // next read offset within window
+  private bytesConsumed: number; // total bytes returned to caller (== file pos of windowOff)
+  private static readonly WINDOW_BYTES = 8 * 1024 * 1024;
+
+  constructor(fh: FileHandle, fileSize: number) {
+    this.fh = fh;
+    this.fileSize = fileSize;
+    this.filePos = 0;
+    this.window = Buffer.alloc(StreamingBufferReader.WINDOW_BYTES);
+    this.windowEnd = 0;
+    this.windowOff = 0;
+    this.bytesConsumed = 0;
+  }
+
+  get position(): number {
+    return this.bytesConsumed;
+  }
+
+  /**
+   * Ensure at least `n` bytes are available starting at windowOff. Compacts
+   * the unread tail to position 0 then refills from disk.
+   */
+  async ensure(n: number): Promise<void> {
+    if (n > this.window.length) {
+      // A single coin entry is bounded (script ≤ ~10kB, etc.); 8 MiB is
+      // plenty. If n grows beyond the window, that's a malformed snapshot.
+      throw new Error(
+        `StreamingBufferReader: requested ${n} bytes exceeds window ${this.window.length}`
+      );
+    }
+    if (this.windowEnd - this.windowOff >= n) return;
+    // Compact remaining tail to start of window.
+    const tailLen = this.windowEnd - this.windowOff;
+    if (tailLen > 0 && this.windowOff > 0) {
+      this.window.copy(this.window, 0, this.windowOff, this.windowEnd);
+    }
+    this.windowEnd = tailLen;
+    this.windowOff = 0;
+    // Fill from file.
+    while (this.windowEnd < n && this.filePos < this.fileSize) {
+      const want = Math.min(
+        this.window.length - this.windowEnd,
+        this.fileSize - this.filePos,
+      );
+      const { bytesRead } = await this.fh.read(
+        this.window,
+        this.windowEnd,
+        want,
+        this.filePos,
+      );
+      if (bytesRead === 0) break;
+      this.windowEnd += bytesRead;
+      this.filePos += bytesRead;
+    }
+    if (this.windowEnd - this.windowOff < n) {
+      throw new Error(
+        `StreamingBufferReader: underrun — wanted ${n} bytes but only ` +
+          `${this.windowEnd - this.windowOff} available (file pos ` +
+          `${this.bytesConsumed + this.windowOff}, file size ${this.fileSize})`
+      );
+    }
+  }
+
+  async readUInt8(): Promise<number> {
+    await this.ensure(1);
+    const v = this.window.readUInt8(this.windowOff);
+    this.windowOff += 1;
+    this.bytesConsumed += 1;
+    return v;
+  }
+
+  async readUInt16LE(): Promise<number> {
+    await this.ensure(2);
+    const v = this.window.readUInt16LE(this.windowOff);
+    this.windowOff += 2;
+    this.bytesConsumed += 2;
+    return v;
+  }
+
+  async readUInt32LE(): Promise<number> {
+    await this.ensure(4);
+    const v = this.window.readUInt32LE(this.windowOff);
+    this.windowOff += 4;
+    this.bytesConsumed += 4;
+    return v;
+  }
+
+  async readUInt64LE(): Promise<bigint> {
+    await this.ensure(8);
+    const v = this.window.readBigUInt64LE(this.windowOff);
+    this.windowOff += 8;
+    this.bytesConsumed += 8;
+    return v;
+  }
+
+  async readBytes(n: number): Promise<Buffer> {
+    await this.ensure(n);
+    // Copy: caller may retain references across subsequent reads which slide
+    // the window and overwrite the underlying memory.
+    const out = Buffer.from(this.window.subarray(this.windowOff, this.windowOff + n));
+    this.windowOff += n;
+    this.bytesConsumed += n;
+    return out;
+  }
+
+  async readHash(): Promise<Buffer> {
+    return this.readBytes(32);
+  }
+
+  async readVarIntBig(): Promise<bigint> {
+    const first = await this.readUInt8();
+    if (first <= 0xfc) return BigInt(first);
+    if (first === 0xfd) return BigInt(await this.readUInt16LE());
+    if (first === 0xfe) return BigInt(await this.readUInt32LE());
+    return await this.readUInt64LE();
+  }
+
+  async readVarInt(): Promise<number> {
+    const v = await this.readVarIntBig();
+    if (v > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error("readVarInt: value exceeds Number.MAX_SAFE_INTEGER");
+    }
+    return Number(v);
+  }
+
+  async readVarBytes(): Promise<Buffer> {
+    const len = await this.readVarInt();
+    return this.readBytes(len);
+  }
+
+  /**
+   * Read Bitcoin Core's per-byte VARINT (NOT CompactSize). Mirrors
+   * wire/compressor.ts:readVarIntCore but driven by this stream.
+   */
+  async readVarIntCore(): Promise<bigint> {
+    let n = 0n;
+    while (true) {
+      const ch = await this.readUInt8();
+      n = (n << 7n) | BigInt(ch & 0x7f);
+      if ((ch & 0x80) === 0) return n;
+      n += 1n;
+    }
+  }
+}
+
+/**
  * ChainstateManager manages dual chainstates for assumeUTXO.
  */
 export class ChainstateManager {
@@ -542,93 +721,132 @@ export class ChainstateManager {
     filePath: string,
     interruptCheck?: () => boolean
   ): Promise<LoadSnapshotResult> {
-    const file = Bun.file(filePath);
-
-    if (!await file.exists()) {
+    let stat;
+    try {
+      stat = await fsp.stat(filePath);
+    } catch {
       throw new Error(`Snapshot file not found: ${filePath}`);
     }
 
-    // Read the entire file into a buffer
-    const data = Buffer.from(await file.arrayBuffer());
-    const reader = new BufferReader(data);
-
-    // Parse metadata
-    const metadata = deserializeSnapshotMetadata(reader, this.params.networkMagic);
-
-    // Validate against assumeutxo parameters
-    const auData = getAssumeutxoData(this.params, metadata.baseBlockHash);
-    if (!auData) {
-      throw new Error(`No assumeutxo data for block ${metadata.baseBlockHash.toString("hex")}`);
-    }
-
-    // Create snapshot chainstate
-    const snapshotChainstate = new Chainstate(this.db, this.params, {
-      snapshotBaseBlockHash: metadata.baseBlockHash,
-      status: ChainstateStatus.UNVALIDATED,
-      maxCacheBytes: this.maxCacheBytes,
-    });
-    snapshotChainstate.tipHash = metadata.baseBlockHash;
-    snapshotChainstate.tipHeight = auData.height;
-
-    // Load coins from snapshot
+    // Stream the file via node:fs FileHandle. The previous implementation
+    // tried `Buffer.from(await Bun.file(p).arrayBuffer())`, but `Buffer`
+    // (and the underlying TypedArray) caps at 4 GiB on V8/Bun, so any
+    // mainnet snapshot ≥4 GiB silently killed the process. Mainnet UTXO
+    // dumps are ~9 GiB at h ≥940k, so we must stream.
+    const fh = await fsp.open(filePath, "r");
     let coinsLoaded = 0n;
-    let currentTxid: Buffer | null = null;
-    let coinsForTx: Array<{ vout: number; coin: Coin }> = [];
+    let metadata: SnapshotMetadata;
+    let auData: AssumeutxoData;
+    let snapshotChainstate: Chainstate;
+    try {
+      const stream = new StreamingBufferReader(fh, stat.size);
 
-    const batchOps: BatchOperation[] = [];
+      // Parse metadata (51 bytes).
+      const headerLen = SNAPSHOT_MAGIC.length + 2 + 4 + 32 + 8;
+      const headerBuf = await stream.readBytes(headerLen);
+      metadata = deserializeSnapshotMetadata(
+        new BufferReader(headerBuf),
+        this.params.networkMagic,
+      );
 
-    while (coinsLoaded < metadata.coinsCount) {
-      if (interruptCheck?.()) {
-        throw new Error("Interrupted");
+      // Validate against assumeutxo parameters.
+      const lookup = getAssumeutxoData(this.params, metadata.baseBlockHash);
+      if (!lookup) {
+        throw new Error(
+          `No assumeutxo data for block ${metadata.baseBlockHash.toString("hex")}`,
+        );
       }
+      auData = lookup;
 
-      // Read transaction ID
-      const txid = reader.readHash();
+      // Create snapshot chainstate.
+      snapshotChainstate = new Chainstate(this.db, this.params, {
+        snapshotBaseBlockHash: metadata.baseBlockHash,
+        status: ChainstateStatus.UNVALIDATED,
+        maxCacheBytes: this.maxCacheBytes,
+      });
+      snapshotChainstate.tipHash = metadata.baseBlockHash;
+      snapshotChainstate.tipHeight = auData.height;
 
-      // Read number of outputs for this transaction
-      const numOutputs = reader.readVarInt();
+      const batchOps: BatchOperation[] = [];
 
-      // Read each output
-      for (let i = 0; i < numOutputs; i++) {
-        const vout = reader.readVarInt();
-        const coin = deserializeCoinFromSnapshot(reader);
-
-        // Validate coin height
-        if (coin.height > auData.height) {
-          throw new Error(`Invalid coin height ${coin.height} > snapshot height ${auData.height}`);
+      while (coinsLoaded < metadata.coinsCount) {
+        if (interruptCheck?.()) {
+          throw new Error("Interrupted");
         }
 
-        // Add to batch
-        const key = Buffer.alloc(36);
-        txid.copy(key, 0);
-        key.writeUInt32LE(vout, 32);
+        // Read transaction ID.
+        const txid = await stream.readHash();
 
-        const writer = new BufferWriter();
-        writer.writeUInt32LE(coin.height);
-        writer.writeUInt8(coin.isCoinbase ? 1 : 0);
-        writer.writeUInt64LE(coin.txOut.value);
-        writer.writeVarBytes(coin.txOut.scriptPubKey);
+        // Read number of outputs for this transaction (CompactSize).
+        const numOutputs = await stream.readVarInt();
 
-        batchOps.push({
-          type: "put",
-          prefix: DBPrefix.UTXO,
-          key,
-          value: writer.toBuffer(),
-        });
+        for (let i = 0; i < numOutputs; i++) {
+          // vout index — CompactSize.
+          const vout = await stream.readVarInt();
 
-        coinsLoaded++;
+          // Coin payload: VARINT(code) + VARINT(CompressAmount(value)) +
+          // ScriptCompression(scriptPubKey). Mirrors
+          // deserializeCoinFromSnapshot/deserializeTxOutCompressed but
+          // driven by the streaming reader so we never allocate the full
+          // 9 GiB file in memory.
+          const codeBig = await stream.readVarIntCore();
+          const height = Number(codeBig >> 1n);
+          const isCoinbase = (codeBig & 1n) === 1n;
 
-        // Flush batch periodically
-        if (batchOps.length >= COINS_LOAD_BATCH_SIZE) {
-          await this.db.batch(batchOps);
-          batchOps.length = 0;
+          const compAmount = await stream.readVarIntCore();
+          const value = decompressAmount(compAmount);
+
+          const nSizeBig = await stream.readVarIntCore();
+          const nSize = Number(nSizeBig);
+          let scriptPubKey: Buffer;
+          if (nSize < NUM_SPECIAL_SCRIPTS) {
+            const payloadLen = getSpecialScriptSize(nSize);
+            const payload = await stream.readBytes(payloadLen);
+            scriptPubKey = decompressScript(nSize, payload);
+          } else {
+            const rawSize = nSize - NUM_SPECIAL_SCRIPTS;
+            scriptPubKey = await stream.readBytes(rawSize);
+          }
+
+          // Validate coin height (must be ≤ snapshot height).
+          if (height > auData.height) {
+            throw new Error(
+              `Invalid coin height ${height} > snapshot height ${auData.height}`,
+            );
+          }
+
+          // Add to batch.
+          const key = Buffer.alloc(36);
+          txid.copy(key, 0);
+          key.writeUInt32LE(vout, 32);
+
+          const writer = new BufferWriter();
+          writer.writeUInt32LE(height);
+          writer.writeUInt8(isCoinbase ? 1 : 0);
+          writer.writeUInt64LE(value);
+          writer.writeVarBytes(scriptPubKey);
+
+          batchOps.push({
+            type: "put",
+            prefix: DBPrefix.UTXO,
+            key,
+            value: writer.toBuffer(),
+          });
+
+          coinsLoaded++;
+
+          if (batchOps.length >= COINS_LOAD_BATCH_SIZE) {
+            await this.db.batch(batchOps);
+            batchOps.length = 0;
+          }
         }
       }
-    }
 
-    // Flush remaining ops
-    if (batchOps.length > 0) {
-      await this.db.batch(batchOps);
+      if (batchOps.length > 0) {
+        await this.db.batch(batchOps);
+      }
+    } finally {
+      await fh.close().catch(() => { /* close-on-error best-effort */ });
     }
 
     // Strict snapshot content-hash check.
