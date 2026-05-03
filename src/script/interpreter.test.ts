@@ -1059,4 +1059,46 @@ describe("script limits", () => {
       false
     );
   });
+
+  test("legacy script enforces MAX_OPS_PER_SCRIPT (201)", () => {
+    // 202 OP_NOP opcodes would exceed MAX_OPS_PER_SCRIPT in BASE sigversion.
+    const ops: number[] = [];
+    for (let i = 0; i < 202; i++) ops.push(Opcode.OP_NOP);
+    ops.push(Opcode.OP_1); // final true
+    const parsed = parseScript(Buffer.from(ops));
+    const ctx: ExecutionContext = {
+      stack: [],
+      altStack: [],
+      flags: defaultFlags(),
+      sigHasher: dummySigHasher,
+      sigVersion: SigVersion.BASE,
+    };
+    expect(executeScript(parsed, ctx)).toBe(false);
+  });
+
+  test("tapscript exempt from MAX_OPS_PER_SCRIPT (BIP-342)", () => {
+    // Regression: mainnet block 944,279 tx 8775be68... vin[1] has a
+    // 282 KB tapscript with ~701 non-push opcodes. Per BIP-342 / Core
+    // interpreter.cpp:450-455, MAX_OPS_PER_SCRIPT does NOT apply in
+    // tapscript. Hotbuns previously rejected such blocks.
+    const ops: number[] = [];
+    // Use OP_NOP — counts as a non-push opcode but does nothing.
+    for (let i = 0; i < 1000; i++) ops.push(Opcode.OP_NOP);
+    ops.push(Opcode.OP_1); // leave true on stack so script succeeds
+    const parsed = parseScript(Buffer.from(ops));
+    const ctx: ExecutionContext = {
+      stack: [],
+      altStack: [],
+      flags: defaultFlags(),
+      sigHasher: dummySigHasher,
+      sigVersion: SigVersion.TAPSCRIPT,
+      taprootSigHasher: () => Buffer.alloc(32),
+      sigopsBudget: 100000,
+    };
+    // Script should execute past the 201-op cap; final stack should be
+    // [OP_1] which is true. We assert that executeScript does NOT return
+    // false on opcount overflow.
+    expect(executeScript(parsed, ctx)).toBe(true);
+    expect(ctx.stack.length).toBe(1);
+  });
 });
