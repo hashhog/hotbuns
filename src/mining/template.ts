@@ -162,7 +162,7 @@ export class BlockTemplateBuilder {
     const height = bestBlock.height + 1;
 
     // Select transactions from mempool
-    const { txs: selectedEntries, totalFees, totalWeight: txWeight } = this.selectTransactions();
+    const { txs: selectedEntries, totalFees, totalWeight: txWeight, totalSigOps: selectedSigOps } = this.selectTransactions();
 
     // Get the selected transactions
     const transactions = selectedEntries.map(entry => entry.tx);
@@ -220,8 +220,8 @@ export class BlockTemplateBuilder {
     const headerWeight = 80 * 4; // 80 bytes * 4 = 320 weight units
     const totalWeight = headerWeight + coinbaseWeight + txWeight;
 
-    // For now, sigops tracking is simplified (would need per-tx sigop counting)
-    const totalSigOps = 0;
+    // Sigops total accumulated by selectTransactions() via per-entry sigOpCost.
+    const totalSigOps = selectedSigOps;
 
     return {
       header,
@@ -244,7 +244,7 @@ export class BlockTemplateBuilder {
    * - Parent-child dependencies (parent must be included before child)
    * - Transaction locktime (must be final at the target block height/time)
    */
-  private selectTransactions(): { txs: MempoolEntry[]; totalFees: bigint; totalWeight: number } {
+  private selectTransactions(): { txs: MempoolEntry[]; totalFees: bigint; totalWeight: number; totalSigOps: number } {
     const maxWeight = this.params.maxBlockWeight - COINBASE_WEIGHT_RESERVE - 80 * 4; // Subtract header weight too
     const maxSigOps = this.params.maxBlockSigOpsCost;
 
@@ -266,16 +266,6 @@ export class BlockTemplateBuilder {
 
     // Track entries that are not final (for skipping)
     const notFinal = new Set<string>();
-
-    // Helper to check if all dependencies are satisfied
-    const canInclude = (entry: MempoolEntry): boolean => {
-      for (const parentTxidHex of entry.dependsOn) {
-        if (!selectedTxids.has(parentTxidHex)) {
-          return false;
-        }
-      }
-      return true;
-    };
 
     // Helper to add an entry and its ancestors
     const addWithAncestors = (entry: MempoolEntry): boolean => {
@@ -311,19 +301,23 @@ export class BlockTemplateBuilder {
         }
       }
 
-      // Now we can add this entry
       // Check weight constraint
       if (totalWeight + entry.weight > maxWeight) {
         return false;
       }
 
-      // Note: For proper sigops tracking, we would need to count sigops per tx
-      // For now, we skip sigops checking as it requires script analysis
+      // Enforce sigops budget: drop tx if it would push block past MAX_BLOCK_SIGOPS_COST.
+      // Reference: Bitcoin Core BlockAssembler::TestChunkBlockLimits in node/miner.cpp
+      const txSigOpCost = entry.sigOpCost ?? 0;
+      if (totalSigOps + txSigOpCost > maxSigOps) {
+        return false;
+      }
 
       selected.push(entry);
       selectedTxids.add(txidHex);
       totalFees += entry.fee;
       totalWeight += entry.weight;
+      totalSigOps += txSigOpCost;
 
       return true;
     };
@@ -347,7 +341,7 @@ export class BlockTemplateBuilder {
       }
     }
 
-    return { txs: selected, totalFees, totalWeight };
+    return { txs: selected, totalFees, totalWeight, totalSigOps };
   }
 
   /**
