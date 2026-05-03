@@ -2650,21 +2650,50 @@ function verifyWitnessV0(
 }
 
 /**
- * Create default consensus flags for a given block height.
+ * Create consensus-only script verification flags for a given block height.
+ *
+ * Returns ONLY Bitcoin Core MANDATORY_SCRIPT_VERIFY_FLAGS:
+ *   P2SH | DERSIG | NULLDUMMY | CLTV | CSV | WITNESS | TAPROOT
+ * (each gated on its BIP deployment height).
+ *
+ * Policy-only flags (NULLFAIL, WITNESS_PUBKEYTYPE, LOW_S, STRICTENC, etc.)
+ * are NOT set here.  Use getStandardFlags() for mempool/relay purposes.
+ *
+ * Ref: Bitcoin Core policy/policy.h:105-111 + validation.cpp:2250-2289.
  */
 export function getConsensusFlags(height: number): ScriptFlags {
   return {
-    verifyP2SH: height >= 173805, // BIP 16
-    verifyDERSignatures: height >= 363725, // BIP 66
+    verifyP2SH: height >= 173805,             // BIP 16
+    verifyDERSignatures: height >= 363725,     // BIP 66
     verifyCheckLockTimeVerify: height >= 388381, // BIP 65
     verifyCheckSequenceVerify: height >= 419328, // BIP 112
-    verifyWitness: height >= 481824, // BIP 141
-    verifyNullDummy: height >= 481824, // BIP 147
-    verifyNullFail: height >= 481824, // BIP 146 (activated with SegWit)
-    verifyWitnessPubkeyType: height >= 481824, // BIP 141 (activated with SegWit)
-    verifyTaproot: height >= 709632, // BIP 341
-    // Policy flags - NOT consensus
-    verifyStrictEncoding: false,
-    verifyLowS: false,
+    verifyWitness: height >= 481824,           // BIP 141
+    verifyNullDummy: height >= 481824,         // BIP 147 (consensus)
+    verifyTaproot: height >= 709632,           // BIP 341
+    // Policy flags are always false in the consensus computer
+    verifyNullFail: false,                     // policy-only (BIP 146)
+    verifyWitnessPubkeyType: false,            // policy-only (BIP 141 standardness)
+    verifyStrictEncoding: false,               // policy-only
+    verifyLowS: false,                         // policy-only
+  };
+}
+
+/**
+ * Create standard (mempool/relay) script verification flags for a given height.
+ *
+ * Composes the consensus flags from getConsensusFlags() and adds the policy-only
+ * STANDARD_SCRIPT_VERIFY_FLAGS additions that Bitcoin Core uses in mempool
+ * acceptance (policy/policy.h:119-132).
+ *
+ * Do NOT use this for block validation — use getConsensusFlags() there.
+ */
+export function getStandardFlags(height: number): ScriptFlags {
+  const flags = getConsensusFlags(height);
+  return {
+    ...flags,
+    verifyNullFail: height >= 481824,          // policy: BIP 146
+    verifyWitnessPubkeyType: height >= 481824, // policy: BIP 141 standardness
+    verifyStrictEncoding: height >= 363725,    // policy: BIP 66 standardness
+    verifyLowS: height >= 363725,              // policy: BIP 62 rule 5
   };
 }

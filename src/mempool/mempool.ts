@@ -29,6 +29,7 @@ import { sha256Hash } from "../crypto/primitives.js";
 import {
   verifyScript,
   getConsensusFlags,
+  getStandardFlags,
   isP2A,
   type ScriptFlags,
 } from "../script/interpreter.js";
@@ -1083,7 +1084,8 @@ export class Mempool {
       skipScripts = skipResult.skip;
     }
 
-    const flags = getConsensusFlags(this.tipHeight);
+    // Mempool uses standard (policy) flags — stricter than consensus block flags.
+    const flags = getStandardFlags(this.tipHeight);
 
     if (!skipScripts) {
       for (let i = 0; i < tx.inputs.length; i++) {
