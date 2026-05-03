@@ -98,3 +98,111 @@ const REJECT_CODES: Record<ConsensusErrorCode, number> = {
   [ConsensusErrorCode.SEQUENCE_LOCK_NOT_SATISFIED]: 0x10,
   [ConsensusErrorCode.CHECKPOINT_MISMATCH]: 0x10,
 };
+
+/**
+ * Maps a ConsensusErrorCode or free-form validation error string to the
+ * canonical BIP-22 submitblock result string.
+ *
+ * BIP-22: https://github.com/bitcoin/bips/blob/master/bip-0022.mediawiki
+ * Reference: Bitcoin Core BIP22ValidationResult() in src/rpc/mining.cpp
+ *
+ * Returns null on success; a short ASCII reason string on rejection.
+ */
+export function bip22Result(code: ConsensusErrorCode | string | null | undefined): string | null {
+  if (code === null || code === undefined) {
+    return null; // success
+  }
+
+  switch (code) {
+    // Block-level errors
+    case ConsensusErrorCode.INVALID_POW:
+      return "high-hash";
+    case ConsensusErrorCode.BAD_MERKLE_ROOT:
+      return "bad-txnmrklroot";
+    case ConsensusErrorCode.BAD_WITNESS_COMMITMENT:
+      return "bad-witness-merkle-match";
+    case ConsensusErrorCode.BAD_COINBASE_VALUE:
+      return "bad-cb-amount";
+    case ConsensusErrorCode.BAD_SIGOPS_COST:
+      return "bad-blk-sigops";
+    case ConsensusErrorCode.BAD_COINBASE_HEIGHT:
+      return "bad-cb-height";
+    case ConsensusErrorCode.BLOCK_TIME_TOO_OLD:
+      return "time-too-old";
+    case ConsensusErrorCode.BLOCK_TIME_TOO_NEW:
+      return "time-too-new";
+
+    // Transaction errors
+    case ConsensusErrorCode.DUPLICATE_INPUTS:
+      return "bad-txns-duplicate";
+    case ConsensusErrorCode.MISSING_INPUTS:
+      return "bad-txns-inputs-missingorspent";
+    case ConsensusErrorCode.SCRIPT_VERIFY_FLAG_FAILED:
+    case ConsensusErrorCode.CHECKSIG_FAILED:
+    case ConsensusErrorCode.CHECKMULTISIG_FAILED:
+    case ConsensusErrorCode.WITNESS_PROGRAM_MISMATCH:
+      return "mandatory-script-verify-flag-failed";
+    case ConsensusErrorCode.SEQUENCE_LOCK_NOT_SATISFIED:
+      return "bad-txns-nonfinal";
+
+    default:
+      break;
+  }
+
+  // For free-form error strings (from validateBlock / connectBlock), match
+  // on substrings in the same precedence order as Bitcoin Core's reject reasons.
+  const s = String(code).toLowerCase();
+
+  if (s === "bad-cb-height") return "bad-cb-height"; // already canonical
+  if (s === "inconclusive") return "inconclusive";
+  if (s === "duplicate") return "duplicate";
+  if (s === "duplicate-invalid") return "duplicate-invalid";
+
+  if (s.includes("high-hash") || s.includes("proof of work") || s.includes("does not meet target")) {
+    return "high-hash";
+  }
+  if (s.includes("merkle root mismatch") || s.includes("bad-txnmrklroot")) {
+    return "bad-txnmrklroot";
+  }
+  if (s.includes("witness commitment") || s.includes("bad-witness-merkle-match")) {
+    return "bad-witness-merkle-match";
+  }
+  if (s.includes("coinbase value") || s.includes("bad-cb-amount") || s.includes("subsidy")) {
+    return "bad-cb-amount";
+  }
+  if (s.includes("sigop") || s.includes("bad-blk-sigops")) {
+    return "bad-blk-sigops";
+  }
+  if (s.includes("bad-cb-height") || s.includes("coinbase height")) {
+    return "bad-cb-height";
+  }
+  if (s.includes("non-final") || s.includes("nonfinal") || s.includes("not final") || s.includes("bad-txns-nonfinal")) {
+    return "bad-txns-nonfinal";
+  }
+  if (s.includes("duplicate") || s.includes("bad-txns-duplicate")) {
+    return "bad-txns-duplicate";
+  }
+  if (s.includes("missing") && s.includes("input")) {
+    return "bad-txns-inputs-missingorspent";
+  }
+  if (
+    s.includes("script") ||
+    s.includes("mandatory-script-verify-flag-failed") ||
+    s.includes("checksig") ||
+    s.includes("tapscript") ||
+    s.includes("witness program")
+  ) {
+    return "mandatory-script-verify-flag-failed";
+  }
+  if (s.includes("time-too-old") || (s.includes("timestamp") && s.includes("too old"))) {
+    return "time-too-old";
+  }
+  if (s.includes("time-too-new") || (s.includes("timestamp") && s.includes("too far"))) {
+    return "time-too-new";
+  }
+  if (s.includes("weight") || s.includes("oversize")) {
+    return "bad-blk-length";
+  }
+
+  return "rejected";
+}
