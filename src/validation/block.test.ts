@@ -31,6 +31,8 @@ import {
   getTransactionSigOpCost,
   getBlockSigOpsCost,
   validateBlockSigOps,
+  encodeBip34Height,
+  validateBip34Height,
 } from "./block";
 import { Transaction, getTxId, serializeTx } from "./tx";
 import { Opcode } from "../script/interpreter";
@@ -1123,5 +1125,97 @@ describe("block_weight sigop integration", () => {
 
     // Verify witness discount: same effective sigops, lower cost
     expect(segwitCost).toBeLessThan(legacyCost);
+  });
+});
+
+// =============================================================================
+// BIP-34 coinbase height encoding (Core ContextualCheckBlock parity)
+// Reference: Bitcoin Core validation.cpp:4151-4159, script.h:433-448
+// =============================================================================
+
+describe("encodeBip34Height canonical encoder", () => {
+  test("height 0 → OP_0 (0x00)", () => {
+    expect(encodeBip34Height(0)).toEqual(Buffer.from([0x00]));
+  });
+  test("height 1 → OP_1 (0x51)", () => {
+    expect(encodeBip34Height(1)).toEqual(Buffer.from([0x51]));
+  });
+  test("height 16 → OP_16 (0x60)", () => {
+    expect(encodeBip34Height(16)).toEqual(Buffer.from([0x60]));
+  });
+  test("height 17 → 1-byte push (0x01 0x11)", () => {
+    expect(encodeBip34Height(17)).toEqual(Buffer.from([0x01, 0x11]));
+  });
+  test("height 127 → no sign pad (0x01 0x7f)", () => {
+    expect(encodeBip34Height(127)).toEqual(Buffer.from([0x01, 0x7f]));
+  });
+  test("height 128 → sign pad at 0x80 (0x02 0x80 0x00)", () => {
+    expect(encodeBip34Height(128)).toEqual(Buffer.from([0x02, 0x80, 0x00]));
+  });
+  test("height 32768 → sign pad at 0x8000 (0x03 0x00 0x80 0x00)", () => {
+    expect(encodeBip34Height(32768)).toEqual(Buffer.from([0x03, 0x00, 0x80, 0x00]));
+  });
+  test("height 500000 (0x07A120 LE)", () => {
+    expect(encodeBip34Height(500000)).toEqual(Buffer.from([0x03, 0x20, 0xa1, 0x07]));
+  });
+});
+
+describe("validateBip34Height byte-prefix check", () => {
+  function makeCoinbaseTx(scriptSig: Buffer): Transaction {
+    return {
+      version: 1,
+      inputs: [{
+        prevTxId: Buffer.alloc(32, 0),
+        prevIndex: 0xffffffff,
+        scriptSig,
+        sequence: 0xffffffff,
+        witness: [],
+      }],
+      outputs: [{ value: BigInt(5000000000), scriptPubKey: Buffer.alloc(0) }],
+      lockTime: 0,
+    };
+  }
+
+  // --- Canonical forms: must pass ---
+  test("canonical OP_1 accepted for height 1", () => {
+    expect(validateBip34Height(makeCoinbaseTx(Buffer.from([0x51, 0x00])), 1)).toBe(true);
+  });
+  test("canonical OP_16 accepted for height 16", () => {
+    expect(validateBip34Height(makeCoinbaseTx(Buffer.from([0x60, 0x00])), 16)).toBe(true);
+  });
+  test("canonical 1-byte push for height 17", () => {
+    expect(validateBip34Height(makeCoinbaseTx(Buffer.from([0x01, 0x11])), 17)).toBe(true);
+  });
+  test("canonical sign-pad accepted for height 128", () => {
+    expect(validateBip34Height(makeCoinbaseTx(Buffer.from([0x02, 0x80, 0x00])), 128)).toBe(true);
+  });
+  test("canonical sign-pad accepted for height 32768", () => {
+    expect(validateBip34Height(makeCoinbaseTx(Buffer.from([0x03, 0x00, 0x80, 0x00])), 32768)).toBe(true);
+  });
+  test("extra bytes after canonical prefix are OK (prefix match)", () => {
+    expect(validateBip34Height(makeCoinbaseTx(Buffer.from([0x60, 0xde, 0xad])), 16)).toBe(true);
+  });
+
+  // --- Non-canonical / rejected forms ---
+  test("REJECT: length-prefixed [0x01,0x01] for height 1 (must be OP_1)", () => {
+    expect(validateBip34Height(makeCoinbaseTx(Buffer.from([0x01, 0x01])), 1)).toBe(false);
+  });
+  test("REJECT: length-prefixed [0x01,0x10] for height 16 (must be OP_16)", () => {
+    expect(validateBip34Height(makeCoinbaseTx(Buffer.from([0x01, 0x10])), 16)).toBe(false);
+  });
+  test("REJECT: zero-padded encoding for height 100 (0x02 0x64 0x00)", () => {
+    expect(validateBip34Height(makeCoinbaseTx(Buffer.from([0x02, 0x64, 0x00])), 100)).toBe(false);
+  });
+  test("REJECT: missing sign byte for height 128 (0x01 0x80 non-canonical)", () => {
+    expect(validateBip34Height(makeCoinbaseTx(Buffer.from([0x01, 0x80])), 128)).toBe(false);
+  });
+  test("REJECT: OP_PUSHDATA1 prefix for height 1", () => {
+    expect(validateBip34Height(makeCoinbaseTx(Buffer.from([0x4c, 0x01, 0x01])), 1)).toBe(false);
+  });
+  test("REJECT: wrong height", () => {
+    expect(validateBip34Height(makeCoinbaseTx(Buffer.from([0x01, 0xc8])), 100)).toBe(false);
+  });
+  test("REJECT: too short scriptSig", () => {
+    expect(validateBip34Height(makeCoinbaseTx(Buffer.alloc(0)), 100)).toBe(false);
   });
 });

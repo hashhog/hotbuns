@@ -300,6 +300,59 @@ export function validateBlockHeader(
 }
 
 /**
+ * Build the canonical BIP-34 byte encoding for a block height.
+ *
+ * Mirrors Bitcoin Core's CScript() << nHeight (script.h:433-448):
+ *   height == 0  → Buffer([0x00])         (OP_0, single byte)
+ *   1..16        → Buffer([0x51..0x60])   (OP_1..OP_16, single byte)
+ *   otherwise    → length-prefixed sign-magnitude CScriptNum
+ *
+ * Reference: Bitcoin Core validation.cpp:4151-4159, script.h:433-448
+ */
+export function encodeBip34Height(height: number): Buffer {
+  if (height === 0) {
+    return Buffer.from([0x00]); // OP_0
+  }
+  if (height >= 1 && height <= 16) {
+    return Buffer.from([0x50 + height]); // OP_1..OP_16
+  }
+  // CScriptNum: minimal little-endian sign-magnitude with length prefix.
+  const le: number[] = [];
+  let h = height;
+  while (h > 0) {
+    le.push(h & 0xff);
+    h = Math.floor(h / 256);
+  }
+  // If high bit of last byte is set, append zero sign byte.
+  if (le[le.length - 1] & 0x80) {
+    le.push(0x00);
+  }
+  return Buffer.from([le.length, ...le]);
+}
+
+/**
+ * Validate BIP-34 coinbase height encoding.
+ *
+ * Performs byte-exact PREFIX match against the canonical encoding of height,
+ * matching Bitcoin Core's ContextualCheckBlock (validation.cpp:4151-4159):
+ *   CScript expect = CScript() << nHeight;
+ *   sig.size() >= expect.size() && equal(expect, sig[:expect.size()])
+ *
+ * Non-canonical forms (OP_PUSHDATA1 prefix, zero-padded mantissa, redundant
+ * sign byte, length-prefixed for heights 1..16) are rejected.
+ */
+export function validateBip34Height(
+  coinbaseTx: Transaction,
+  height: number
+): boolean {
+  if (coinbaseTx.inputs.length === 0) return false;
+  const scriptSig = coinbaseTx.inputs[0].scriptSig;
+  const expect = encodeBip34Height(height);
+  if (scriptSig.length < expect.length) return false;
+  return scriptSig.subarray(0, expect.length).equals(expect);
+}
+
+/**
  * Validate a complete block against consensus rules.
  *
  * Checks:
@@ -307,6 +360,7 @@ export function validateBlockHeader(
  * - First transaction is coinbase
  * - No other transactions are coinbase
  * - Merkle root matches computed value
+ * - BIP34 coinbase height encoding (byte-exact prefix match, Core parity)
  * - Witness commitment matches (if segwit active)
  * - Total block weight within limit
  * - Each transaction is valid
@@ -393,6 +447,14 @@ export function validateBlock(
     return { valid: false, error: "Block weight exceeds maximum" };
   }
 
+  // BIP34: coinbase scriptSig must start with byte-exact canonical encoding of
+  // the block height. Core validation.cpp:4151-4159, script.h:433-448.
+  if (height >= params.bip34Height) {
+    if (!validateBip34Height(coinbaseTx, height)) {
+      return { valid: false, error: "bad-cb-height" };
+    }
+  }
+
   // Validate each transaction
   for (let i = 0; i < block.transactions.length; i++) {
     const tx = block.transactions[i];
@@ -403,7 +465,6 @@ export function validateBlock(
   }
 
   // Note: Full validation would also check:
-  // - BIP34 coinbase height encoding
   // - Coinbase output value <= subsidy + fees
   // - All inputs exist and are unspent (UTXO validation)
   // - Script validation for all inputs
