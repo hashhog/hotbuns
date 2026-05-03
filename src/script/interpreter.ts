@@ -39,9 +39,41 @@ const TAPROOT_CONTROL_NODE_SIZE = 32; // Size of each Merkle path node
 const TAPROOT_CONTROL_MAX_NODE_COUNT = 128; // Maximum depth of Merkle tree
 const TAPROOT_ANNEX_TAG = 0x50; // Annex starts with this byte
 
-// Sigops budget for tapscript
+// BIP-342 tapscript validation-weight constants (script.h):
+//   VALIDATION_WEIGHT_OFFSET            = 50  (initial budget bump)
+//   VALIDATION_WEIGHT_PER_SIGOP_PASSED  = 50  (per-sigop deduction)
 const TAPSCRIPT_SIGOPS_BUDGET_BASE = 50;
 const TAPSCRIPT_SIGOPS_PER_SIGCHECK = 50;
+
+/**
+ * Compute the byte length of a Bitcoin compact-size encoding for n.
+ * Mirrors Core's GetSizeOfCompactSize (serialize.h):
+ *   <  0xfd            -> 1 byte
+ *   <= 0xffff          -> 3 bytes
+ *   <= 0xffffffff      -> 5 bytes
+ *   else               -> 9 bytes
+ */
+export function compactSizeLen(n: number): number {
+  if (n < 0xfd) return 1;
+  if (n <= 0xffff) return 3;
+  if (n <= 0xffffffff) return 5;
+  return 9;
+}
+
+/**
+ * Compute the on-the-wire serialized size of a witness stack the way
+ * Core's `::GetSerializeSize(witness.stack)` does it: a compact-size
+ * item count followed by, for each item, its compact-size length
+ * prefix and the item bytes themselves. Used to seed the BIP-342
+ * tapscript validation-weight budget at the leaf entry point.
+ */
+export function serializedWitnessStackSize(items: Buffer[]): number {
+  let total = compactSizeLen(items.length);
+  for (const it of items) {
+    total += compactSizeLen(it.length) + it.length;
+  }
+  return total;
+}
 
 /**
  * Bitcoin Script opcodes.
@@ -1497,16 +1529,20 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
         let success = false;
 
         if (sigVersion === SigVersion.TAPSCRIPT) {
-          // Tapscript: use Schnorr signatures (BIP-342)
-          success = verifySchnorrSig(sig, pubkey, ctx, codeSepPos);
-
-          // Consume sigops budget
-          if (ctx.sigopsBudget !== undefined) {
+          // BIP-342 validation-weight budget: decrement by 50 BEFORE
+          // pubkey inspection, gated on sig.length > 0. Mirrors Core's
+          // `success = !sig.empty()` check at interpreter.cpp:357-366.
+          // Empty sigs do NOT consume budget. Per Core's comment,
+          // "Passing with an upgradable public key version is also
+          // counted", so the deduction fires for any non-empty sig.
+          if (sig.length > 0 && ctx.sigopsBudget !== undefined) {
             ctx.sigopsBudget -= TAPSCRIPT_SIGOPS_PER_SIGCHECK;
             if (ctx.sigopsBudget < 0) {
               throw new ScriptError("TAPSCRIPT_VALIDATION_WEIGHT");
             }
           }
+          // Tapscript: use Schnorr signatures (BIP-342)
+          success = verifySchnorrSig(sig, pubkey, ctx, codeSepPos);
         } else {
           // Legacy or witness v0: use ECDSA
 
@@ -2150,7 +2186,11 @@ export function verifyTaproot(
     return verifyTaprootKeyPath(outputKeyBytes, witnessStack[0], annexHash, taprootCtx);
   } else {
     // Script-path spending: witness = [...stack, script, control_block]
-    return verifyTaprootScriptPath(outputKeyBytes, witnessStack, annexHash, flags, taprootCtx);
+    // Pass the FULL pre-strip `witness` (annex INCLUDED) for the
+    // BIP-342 validation-weight budget seed — Core's
+    // ::GetSerializeSize(witness.stack) at interpreter.cpp:1981
+    // counts annex + control + script + args.
+    return verifyTaprootScriptPath(outputKeyBytes, witnessStack, witness, annexHash, flags, taprootCtx);
   }
 }
 
@@ -2219,6 +2259,10 @@ function verifyTaprootKeyPath(
  *
  * @param outputKey - 32-byte x-only output key from scriptPubKey
  * @param witnessStack - Witness elements (excluding annex): [...stack, script, control_block]
+ * @param fullWitness - The ORIGINAL pre-strip witness (annex INCLUDED).
+ *                     Used to seed the BIP-342 validation-weight budget
+ *                     via ::GetSerializeSize(witness.stack) at Core's
+ *                     interpreter.cpp:1981.
  * @param annexHash - SHA256 of annex if present
  * @param flags - Script verification flags
  * @param taprootCtx - Taproot context with sighash function
@@ -2226,6 +2270,7 @@ function verifyTaprootKeyPath(
 function verifyTaprootScriptPath(
   outputKey: Buffer,
   witnessStack: Buffer[],
+  fullWitness: Buffer[],
   annexHash: Buffer | undefined,
   flags: ScriptFlags,
   taprootCtx?: TaprootContext
@@ -2303,7 +2348,7 @@ function verifyTaprootScriptPath(
 
   // If leaf version is 0xC0 (tapscript), execute the script with BIP-342 rules
   if (leafVersion === TAPROOT_LEAF_TAPSCRIPT) {
-    return executeTapscript(tapscript, stack, leafHash, annexHash, flags, taprootCtx);
+    return executeTapscript(tapscript, stack, leafHash, annexHash, flags, taprootCtx, fullWitness);
   }
 
   // Unknown leaf version: succeed (future extensibility)
@@ -2417,7 +2462,8 @@ function executeTapscript(
   leafHash: Buffer,
   annexHash: Buffer | undefined,
   flags: ScriptFlags,
-  taprootCtx?: TaprootContext
+  taprootCtx?: TaprootContext,
+  fullWitness?: Buffer[],
 ): boolean {
   if (!taprootCtx) {
     throw new ScriptError("TAPROOT_CONTEXT_MISSING");
@@ -2436,13 +2482,23 @@ function executeTapscript(
     return false;
   }
 
-  // Compute sigops budget: 50 + (witness_size)
-  // We use a simple approximation based on stack size
-  let witnessSize = script.length;
-  for (const item of stack) {
-    witnessSize += item.length;
-  }
-  const sigopsBudget = TAPSCRIPT_SIGOPS_BUDGET_BASE + witnessSize;
+  // BIP-342 validation-weight budget (interpreter.cpp:1981):
+  //   m_validation_weight_left = ::GetSerializeSize(witness.stack)
+  //                              + VALIDATION_WEIGHT_OFFSET (50)
+  // `fullWitness` is the ORIGINAL pre-pop stack (annex INCLUDED,
+  // control block + script INCLUDED, args INCLUDED), matching what
+  // Core passes to ::GetSerializeSize. If a caller doesn't supply
+  // fullWitness (test entry points), fall back to a conservative
+  // approximation built from the post-pop stack + script bytes;
+  // this is NOT consensus-safe but preserves the previous test API.
+  const witnessForBudget = fullWitness
+    ? serializedWitnessStackSize(fullWitness)
+    : (() => {
+        let n = script.length;
+        for (const it of stack) n += it.length;
+        return n;
+      })();
+  const sigopsBudget = TAPSCRIPT_SIGOPS_BUDGET_BASE + witnessForBudget;
 
   // Create sighash function for tapscript
   const taprootSigHasher = (hashType: number, codeSepPos: number): Buffer => {

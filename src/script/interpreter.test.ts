@@ -18,6 +18,8 @@ import {
   scriptNumEncode,
   scriptNumDecode,
   getConsensusFlags,
+  compactSizeLen,
+  serializedWitnessStackSize,
   type ScriptFlags,
   type ExecutionContext,
   SigVersion,
@@ -1100,5 +1102,155 @@ describe("script limits", () => {
     // false on opcount overflow.
     expect(executeScript(parsed, ctx)).toBe(true);
     expect(ctx.stack.length).toBe(1);
+  });
+});
+
+// ===========================================================================
+// BIP-342 tapscript validation-weight budget (interpreter.cpp:362)
+// ===========================================================================
+describe("BIP-342 tapscript validation-weight budget", () => {
+  test("compactSizeLen matches Core's GetSizeOfCompactSize", () => {
+    expect(compactSizeLen(0)).toBe(1);
+    expect(compactSizeLen(0xfc)).toBe(1);
+    expect(compactSizeLen(0xfd)).toBe(3);
+    expect(compactSizeLen(0xffff)).toBe(3);
+    expect(compactSizeLen(0x10000)).toBe(5);
+    expect(compactSizeLen(0xffffffff)).toBe(5);
+    expect(compactSizeLen(0x100000000)).toBe(9);
+  });
+
+  test("serializedWitnessStackSize matches Core's ::GetSerializeSize", () => {
+    // Empty stack = just the count compact-size byte.
+    expect(serializedWitnessStackSize([])).toBe(1);
+    // One 64-byte item: 1 (count) + 1 (item len prefix) + 64 (bytes).
+    expect(serializedWitnessStackSize([Buffer.alloc(64)])).toBe(66);
+    // Two items, 100 + 33 bytes:
+    expect(serializedWitnessStackSize([Buffer.alloc(100), Buffer.alloc(33)]))
+      .toBe(1 + (1 + 100) + (1 + 33));
+  });
+
+  test("OP_CHECKSIG: exhausted budget aborts (32-byte pubkey)", () => {
+    // Budget = 49: a single non-empty sig MUST trip the gate.
+    // Stack (top-down): pubkey, sig.
+    const pubkey = Buffer.alloc(32, 0x02);
+    const sig = Buffer.alloc(64, 0x42);
+    const script = Buffer.from([Opcode.OP_CHECKSIG]);
+    const parsed = parseScript(script);
+    const ctx: ExecutionContext = {
+      stack: [sig, pubkey],
+      altStack: [],
+      flags: defaultFlags(),
+      sigHasher: dummySigHasher,
+      sigVersion: SigVersion.TAPSCRIPT,
+      taprootSigHasher: () => Buffer.alloc(32),
+      sigopsBudget: 49,
+    };
+    expect(() => executeScript(parsed, ctx)).toThrow("TAPSCRIPT_VALIDATION_WEIGHT");
+  });
+
+  test("OP_CHECKSIG: budget consumed once per non-empty sig (unknown pubkey path)", () => {
+    // Use a non-32-byte pubkey so verifySchnorrSig returns true without
+    // running real Schnorr crypto on the fake bytes (the BIP-342
+    // "Passing with an upgradable public key version is also counted"
+    // path — Core deducts BEFORE this branch). Budget 50 -> 0.
+    const pubkey = Buffer.alloc(33, 0x02);
+    const sig = Buffer.alloc(64, 0x42);
+    const script = Buffer.from([Opcode.OP_CHECKSIG]);
+    const parsed = parseScript(script);
+    const ctx: ExecutionContext = {
+      stack: [sig, pubkey],
+      altStack: [],
+      flags: defaultFlags(),
+      sigHasher: dummySigHasher,
+      sigVersion: SigVersion.TAPSCRIPT,
+      taprootSigHasher: () => Buffer.alloc(32),
+      sigopsBudget: 50,
+    };
+    // unknown-pubkey-type → success=true; budget 50 -> 0.
+    executeScript(parsed, ctx);
+    expect(ctx.sigopsBudget).toBe(0);
+  });
+
+  test("OP_CHECKSIG: empty sig consumes NO budget (regression)", () => {
+    // Pre-fix hotbuns decremented the budget unconditionally on the
+    // tapscript CHECKSIG path, which was wrong: Core only decrements
+    // when sig is non-empty (interpreter.cpp:357-366). With budget=0
+    // and an empty sig, this should succeed (push false), not throw.
+    const pubkey = Buffer.alloc(32, 0x02);
+    const sig = Buffer.alloc(0);
+    const script = Buffer.from([Opcode.OP_CHECKSIG]);
+    const parsed = parseScript(script);
+    const ctx: ExecutionContext = {
+      stack: [sig, pubkey],
+      altStack: [],
+      flags: defaultFlags(),
+      sigHasher: dummySigHasher,
+      sigVersion: SigVersion.TAPSCRIPT,
+      taprootSigHasher: () => Buffer.alloc(32),
+      sigopsBudget: 0,
+    };
+    // No throw: the gate only fires for non-empty sigs.
+    expect(executeScript(parsed, ctx)).toBe(true);
+    expect(ctx.sigopsBudget).toBe(0);
+  });
+
+  test("OP_CHECKSIGADD: exhausted budget aborts (with non-empty sig)", () => {
+    // Use a non-32-byte pubkey so verifySchnorrSig returns true on the
+    // forward-compat path. CHECKSIGADD verifies the sig FIRST in
+    // hotbuns then deducts budget, so the throw type might be
+    // SCHNORR_SIG before this fires for fake 32-byte pubkey bytes.
+    // The unknown-pubkey path returns true with no Schnorr crypto, so
+    // we cleanly hit the budget gate.
+    const pubkey = Buffer.alloc(33, 0x02);
+    const sig = Buffer.alloc(64, 0x42);
+    const script = Buffer.from([Opcode.OP_CHECKSIGADD]);
+    const parsed = parseScript(script);
+    const ctx: ExecutionContext = {
+      stack: [sig, scriptNumEncode(0), pubkey],
+      altStack: [],
+      flags: defaultFlags(),
+      sigHasher: dummySigHasher,
+      sigVersion: SigVersion.TAPSCRIPT,
+      taprootSigHasher: () => Buffer.alloc(32),
+      sigopsBudget: 0,
+    };
+    expect(() => executeScript(parsed, ctx)).toThrow("TAPSCRIPT_VALIDATION_WEIGHT");
+  });
+
+  test("OP_CHECKSIGADD: empty sig consumes NO budget", () => {
+    const pubkey = Buffer.alloc(32, 0x02);
+    const script = Buffer.from([Opcode.OP_CHECKSIGADD]);
+    const parsed = parseScript(script);
+    const ctx: ExecutionContext = {
+      stack: [Buffer.alloc(0), scriptNumEncode(5), pubkey],
+      altStack: [],
+      flags: defaultFlags(),
+      sigHasher: dummySigHasher,
+      sigVersion: SigVersion.TAPSCRIPT,
+      taprootSigHasher: () => Buffer.alloc(32),
+      sigopsBudget: 0,
+    };
+    // No throw; pushes 5 unchanged.
+    executeScript(parsed, ctx);
+    expect(ctx.sigopsBudget).toBe(0);
+    expect(scriptNumDecode(ctx.stack[0], 4, false)).toBe(5);
+  });
+
+  test("Legacy / SegWit-v0 CHECKSIG unaffected by budget", () => {
+    // Use a non-tapscript sig version. The path doesn't read sigopsBudget.
+    // Empty sig + uncompressed pubkey: legacy CHECKSIG pushes false.
+    const pubkey = Buffer.alloc(33, 0x02);
+    const sig = Buffer.alloc(0);
+    const script = Buffer.from([Opcode.OP_CHECKSIG]);
+    const parsed = parseScript(script);
+    const ctx: ExecutionContext = {
+      stack: [sig, pubkey],
+      altStack: [],
+      flags: { ...defaultFlags(), verifyNullFail: false },
+      sigHasher: dummySigHasher,
+      sigVersion: SigVersion.WITNESS_V0,
+      // No sigopsBudget on the legacy path.
+    };
+    expect(executeScript(parsed, ctx)).toBe(true);
   });
 });
