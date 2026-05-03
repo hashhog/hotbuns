@@ -126,6 +126,10 @@ class MockHeaderSync {
   };
   // Hashes that getHeader should return null for (simulate processHeaders failure)
   private unknownHashes = new Set<string>();
+  // Per-test override for getNextTarget; defaults to mainnet powLimit-equivalent
+  // bits value (matches the `bits: 0x1d00ffff` returned in the parent header
+  // entry below).
+  public nextTargetOverride: bigint | null = null;
 
   getBestHeader() {
     return this.bestHeader;
@@ -153,6 +157,19 @@ class MockHeaderSync {
 
   getMedianTimePast(_entry: any) {
     return 1234567890;
+  }
+
+  /**
+   * Real HeaderSync.getNextTarget delegates to consensus/pow.ts
+   * getNextWorkRequired.  For the mock we just echo the parent's bits
+   * (matching mainnet's non-retarget-block rule) unless a test overrides.
+   */
+  getNextTarget(parent: any, _blockTimestamp?: number): bigint {
+    if (this.nextTargetOverride !== null) {
+      return this.nextTargetOverride;
+    }
+    // Re-decode parent.bits the same way getNextTarget would.
+    return require("../consensus/params.js").compactToBigInt(parent.header.bits);
   }
 
   /** Make getHeader return undefined for a specific internal-order hash. */
@@ -1060,6 +1077,61 @@ describe("RPCServer", () => {
       expect(result.result).toBeDefined();
       expect(result.result.transactions.length).toBe(1);
       expect(result.result.transactions[0].fee).toBe(500);
+    });
+
+    // ─── P0-5 regression (CORE-PARITY-AUDIT/hotbuns-P0-FOUND.md) ─────────
+    // Pre-fix, getblocktemplate hard-coded `bits` and `target` to
+    // `params.powLimitBits` (genesis-difficulty).  A miner using hotbuns'
+    // template would mine to difficulty 1 and produce blocks that fail PoW
+    // on every other node — mining was operationally broken.
+    //
+    // The fix routes through HeaderSync.getNextTarget(parent, curtime)
+    // which delegates to consensus/pow.ts getNextWorkRequired().
+    it("returns the consensus next-target bits, not powLimitBits (P0-5)", async () => {
+      // Force a non-trivial next target so the assertion is meaningful.
+      // Pre-fix code returned compactToBigInt(REGTEST.powLimitBits) = the
+      // huge 2^255-ish target.  Setting nextTargetOverride to a value
+      // whose canonical bits differ from powLimitBits proves the new
+      // path actually consults getNextTarget rather than the hard-coded
+      // powLimitBits constant.
+      const { compactToBigInt, bigIntToCompact } = require("../consensus/params.js");
+      const nextBits = 0x1a08e040; // realistic mainnet-era difficulty
+      const nextTarget = compactToBigInt(nextBits);
+      mockHeaderSync.nextTargetOverride = nextTarget;
+
+      const result = await rpcRequest(testPort, "getblocktemplate", [
+        { rules: ["segwit"] },
+      ]);
+
+      expect(result.result).toBeDefined();
+      // bits is hex-encoded with at least 8 chars (4-byte int).  Compare
+      // the parsed numeric value, not the string, to avoid casing issues.
+      const returnedBits = parseInt(result.result.bits as string, 16);
+      expect(returnedBits).toBe(bigIntToCompact(nextTarget));
+
+      // Pre-fix the value was always equal to params.powLimitBits.  Assert
+      // we are NOT returning that value — this test would have failed
+      // against the old code.
+      expect(returnedBits).not.toBe(REGTEST.powLimitBits);
+
+      // The target hex must encode the same bigint.
+      expect(BigInt("0x" + (result.result.target as string))).toBe(nextTarget);
+    });
+
+    it("falls back to powLimit when parent header is unknown", async () => {
+      // If HeaderSync.getHeader returns undefined for the best block hash
+      // (detached header chain corner case) the implementation falls back
+      // to powLimit so getblocktemplate stays usable.  This is documented
+      // explicitly in the source comment.
+      mockHeaderSync.setUnknown(Buffer.alloc(32, 0));
+
+      const result = await rpcRequest(testPort, "getblocktemplate", [
+        { rules: ["segwit"] },
+      ]);
+
+      expect(result.result).toBeDefined();
+      const returnedBits = parseInt(result.result.bits as string, 16);
+      expect(returnedBits).toBe(REGTEST.powLimitBits);
     });
   });
 
