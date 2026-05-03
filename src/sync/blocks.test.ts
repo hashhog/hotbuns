@@ -21,7 +21,11 @@ import {
 import { Transaction, serializeTx, getTxId } from "../validation/tx.js";
 import { hash256 } from "../crypto/primitives.js";
 import { HeaderSync } from "./headers.js";
-import { BlockSync, type BlockDownloadState } from "./blocks.js";
+import {
+  BlockSync,
+  classifyCallbackError,
+  type BlockDownloadState,
+} from "./blocks.js";
 
 /** Create a mock peer for testing */
 function createMockPeer(host = "127.0.0.1", port = 8333): any {
@@ -754,5 +758,96 @@ describe("BlockSync getdata batching", () => {
     expect(multiItemGetdata).toBe(true);
 
     await bs.stop();
+  });
+});
+
+// 2026-05-02 diagnostic split (mirrors lunarblock d9d9af4):
+// classifyCallbackError must distinguish consensus-rule failures (script /
+// tx-validation; hotbuns bug, NOT chainstate corruption) from real on-disk
+// chainstate corruption (block body / undo missing). Pre-fix the bounded-
+// retry banner pinned blame on chainstate regardless of cause; the May 1
+// hotbuns 944,279 wedge (tapscript MAX_OPS_PER_SCRIPT) burned hours
+// chasing a chainstate ghost that didn't exist.
+describe("classifyCallbackError", () => {
+  test("classifies tapscript / script-rule errors as consensus", () => {
+    expect(
+      classifyCallbackError("tapscript execution failed: SCRIPT_SIZE")
+    ).toBe("consensus");
+    expect(classifyCallbackError("script number too long")).toBe(
+      "consensus"
+    );
+    expect(
+      classifyCallbackError("Script verification failed for input 3")
+    ).toBe("consensus");
+    expect(
+      classifyCallbackError(
+        "MAX_OPS_PER_SCRIPT exceeded in tapscript at h=944279"
+      )
+    ).toBe("consensus");
+    expect(classifyCallbackError("Invalid signature in tx ab12cd")).toBe(
+      "consensus"
+    );
+    expect(classifyCallbackError("merkle root mismatch")).toBe(
+      "consensus"
+    );
+    expect(classifyCallbackError("witness commitment mismatch")).toBe(
+      "consensus"
+    );
+    expect(classifyCallbackError("bad-txns-inputs-missingorspent")).toBe(
+      "consensus"
+    );
+    expect(
+      classifyCallbackError("Block sigops cost 80001 exceeds maximum 80000")
+    ).toBe("consensus");
+    // "Missing UTXO" reclassified as consensus per lunarblock 944,186
+    // evidence: it surfaces as a secondary effect of a script rule failure
+    // that left the cache half-applied.
+    expect(
+      classifyCallbackError("Missing UTXO for input 1 of tx 98a09ed2ba")
+    ).toBe("consensus");
+  });
+
+  test("classifies block-body / undo-missing errors as chainstate", () => {
+    expect(
+      classifyCallbackError(
+        "connect_pending_blocks: stalled — block_in_storage=no, header_in_mem=true"
+      )
+    ).toBe("chainstate");
+    expect(
+      classifyCallbackError("undo data missing for height 942100")
+    ).toBe("chainstate");
+    expect(
+      classifyCallbackError("failed to find block in chainstate")
+    ).toBe("chainstate");
+    expect(
+      classifyCallbackError("LEVEL_DATABASE_NOT_OPEN: db closed")
+    ).toBe("chainstate");
+    expect(classifyCallbackError("LevelDB: not found key=...")).toBe(
+      "chainstate"
+    );
+  });
+
+  test("returns 'unknown' on unrecognized error strings", () => {
+    expect(
+      classifyCallbackError("something exploded for unknown reasons")
+    ).toBe("unknown");
+    expect(classifyCallbackError("")).toBe("unknown");
+    expect(classifyCallbackError(null)).toBe("unknown");
+    expect(classifyCallbackError(undefined)).toBe("unknown");
+    expect(classifyCallbackError("ETIMEDOUT on rpc socket")).toBe(
+      "unknown"
+    );
+  });
+
+  test("accepts Error instances (extracts .message)", () => {
+    expect(
+      classifyCallbackError(new Error("tapscript execution failed"))
+    ).toBe("consensus");
+    expect(
+      classifyCallbackError(new Error("undo data missing"))
+    ).toBe("chainstate");
+    expect(
+      classifyCallbackError(new Error("totally fine, nothing to see"))
+    ).toBe("unknown");
   });
 });

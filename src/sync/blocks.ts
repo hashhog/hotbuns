@@ -44,6 +44,104 @@ import {
   type AssumeValidContext,
 } from "../consensus/assumevalid.js";
 
+/**
+ * Classify a connect-block error string into one of three buckets so the
+ * bounded-retry banner can name the right failure class.
+ *
+ * Pre-2026-05 the FATAL banner unconditionally claimed "Permanent UTXO
+ * corruption" regardless of why connectBlock failed. That was correct for
+ * genuine half-flushed-UTXO wedges (e.g. the Apr 28 lunarblock EMFILE event)
+ * but actively misleading for consensus-rule mismatches: the May tapscript
+ * MAX_OPS_PER_SCRIPT failure at height 944,279 fired the same chainstate-
+ * corruption banner and burned operator time chasing a chainstate ghost when
+ * the real fix was a script.ts rule.
+ *
+ *   "consensus"  — script / tx-validation rule mismatch with Bitcoin Core.
+ *                  Operator action: file a bug, do NOT wipe the datadir.
+ *   "chainstate" — block body / undo data missing on disk; the chain tip
+ *                  advanced past data that never persisted. Operator action:
+ *                  wipe and re-sync (or restore from a snapshot).
+ *   "unknown"    — couldn't classify; emit a neutral banner with the raw
+ *                  error string and let the operator triage.
+ *
+ * "Missing UTXO" classification: per the lunarblock 944,186 evidence and
+ * d9d9af4 commit, this is classified as a *consensus-failure* secondary
+ * effect. A script-rule failure mid-block can leave the in-memory cache
+ * half-applied; the next attempt then reports "Missing UTXO" as a downstream
+ * symptom of the original consensus failure. If we ever observe a Missing-
+ * UTXO without a preceding script-rule failure in the same block, the
+ * classification needs revisiting.
+ */
+export function classifyCallbackError(
+  err: unknown
+): "consensus" | "chainstate" | "unknown" {
+  if (err === null || err === undefined) return "unknown";
+  const raw = err instanceof Error ? err.message : String(err);
+  if (raw.length === 0) return "unknown";
+  const s = raw.toLowerCase();
+
+  // Consensus / script / tx-validation rule failures. Deterministic
+  // mismatches with Core's rules → bug in script.ts / tx.ts / block.ts,
+  // NOT a corrupt chainstate.
+  const consensusPatterns = [
+    "tapscript execution failed",
+    "tapscript",
+    "script number too long",
+    "script_size",
+    "max_ops",
+    "invalid signature",
+    "script verification failed",
+    "p2wpkh script verification failed",
+    "p2wsh script verification failed",
+    "taproot key-path signature verification failed",
+    "taproot verify returned false",
+    "parallel signature verification failed",
+    "merkle root mismatch",
+    "witness commitment mismatch",
+    "duplicate input",
+    "coinbase scriptsig",
+    "exceeds max_money",
+    "negative value",
+    "transaction has no inputs",
+    "transaction has no outputs",
+    "missing utxo", // secondary effect of script failure (see comment above)
+    "bip34 requires height",
+    "bad-txns",
+    "bad-blk",
+    "non-final",
+    "bad sigops",
+    "sigops cost",
+    "coinbase value",
+    "immature coinbase",
+    "sequence locks not satisfied",
+    "does not match expected header",
+  ];
+  for (const pat of consensusPatterns) {
+    if (s.includes(pat)) return "consensus";
+  }
+
+  // Genuine chainstate / on-disk corruption. The persisted chain tip has
+  // advanced past blocks whose body or undo data is missing. Operator
+  // should wipe + re-sync.
+  const chainstatePatterns = [
+    "block_in_storage=no",
+    "header_in_mem=true",
+    "undo data missing",
+    "missing undo",
+    "failed to find block in chainstate",
+    "chain_tip pointing at",
+    "block body is missing",
+    "lost in hard crash",
+    "level_database_not_open",
+    "leveldb: not found",
+  ];
+  for (const pat of chainstatePatterns) {
+    if (s.includes(pat)) return "chainstate";
+  }
+
+  return "unknown";
+}
+
 /** Maximum blocks in-flight at once (across all peers). */
 const DEFAULT_WINDOW_SIZE = 512;
 
@@ -162,6 +260,11 @@ export class BlockSync {
   private consecutiveFailures: number;
   private lastFailedHeight: number;
 
+  /** Most recent connectBlock failure message — captured by every warn/error
+   *  site that returns false. Read by the bounded-retry banner so it can
+   *  classify the failure as consensus vs chainstate vs unknown. */
+  private lastConnectError: string;
+
   /** Chain state manager — updated after each connected block so RPC
    *  methods like getblockcount reflect the latest chain tip. */
   private chainStateManager: ChainStateManager | null;
@@ -209,6 +312,7 @@ export class BlockSync {
     this.lastFlushedHeight = 0;
     this.consecutiveFailures = 0;
     this.lastFailedHeight = -1;
+    this.lastConnectError = "";
 
     this.state = {
       pendingBlocks: new Map(),
@@ -1040,6 +1144,20 @@ export class BlockSync {
       const success = await this.connectBlock(block, height);
 
       if (!success) {
+        // Capture the failure reason BEFORE any retry-recovery work mutates
+        // state — the classifier needs the raw error string to pick the
+        // right banner.
+        const failureMsg = this.lastConnectError;
+
+        // Try to extract failing input/tx coordinates from the error string
+        // for faster forensic triage. Mirrors lunarblock d9d9af4.
+        const inputMatch = failureMsg.match(/input (\d+)/);
+        const txMatch = failureMsg.match(/tx ([0-9a-fA-F]+)/);
+        const coords =
+          inputMatch || txMatch
+            ? ` [tx=${txMatch?.[1] ?? "?"} input=${inputMatch?.[1] ?? "?"}]`
+            : "";
+
         // Track consecutive failures at the same height to detect permanent
         // UTXO corruption (e.g. a coin was DELETEd from LevelDB during a
         // partial flush but the chain state height was never advanced).
@@ -1050,27 +1168,82 @@ export class BlockSync {
           this.lastFailedHeight = height;
         }
 
-        console.error(`Block validation failed at height ${height} (attempt ${this.consecutiveFailures}), discarding and re-requesting`);
+        console.error(
+          `Block validation failed at height ${height} (attempt ${this.consecutiveFailures})${coords}, discarding and re-requesting: ${failureMsg}`
+        );
         this.state.downloadedBlocks.delete(hashHex);
 
         // Reset the UTXO cache to avoid corrupt state from partial processing
         this.utxoManager.clearCache();
 
         if (this.consecutiveFailures >= 3) {
-          // The on-disk UTXO set is permanently corrupted at this height.
-          // During IBD assume-valid mode, undo data is not stored, so we
-          // cannot programmatically roll back the UTXO set.  The only
-          // recovery is to wipe the database and re-sync from genesis.
-          console.error(
-            `\n*** FATAL: Permanent UTXO corruption detected at height ${height}. ***\n` +
-            `The same block has failed validation ${this.consecutiveFailures} consecutive times.\n` +
-            `This means the on-disk UTXO set has entries that were partially flushed\n` +
-            `during a previous unclean shutdown.\n\n` +
-            `To recover, delete the data directory and restart:\n` +
-            `  rm -rf <datadir>/blocks.db && restart hotbuns\n`
-          );
-          // Exit with a distinctive code so monitoring scripts can detect this
-          process.exit(78); // EX_CONFIG from sysexits.h
+          // 2026-05-02 diagnostic split (mirrors lunarblock d9d9af4): classify
+          // the captured error so the bounded-retry banner names the right
+          // failure class. The original banner pinned blame on chainstate
+          // regardless of cause and burned hours of operator time on
+          // tapscript / script-rule mismatches (944,279 MAX_OPS_PER_SCRIPT).
+          const cls = classifyCallbackError(failureMsg);
+
+          if (cls === "consensus") {
+            // Consensus rule mismatch: the chainstate is recoverable; do NOT
+            // exit with EX_CONFIG (which signals the operator to wipe). The
+            // bounded retry will keep failing until the rule is fixed in
+            // code, but the on-disk UTXO set is fine.
+            console.error(
+              `\n*** [CONSENSUS-FAILURE] Block ${height} (${hashHex.slice(0, 16)}...) ` +
+                `failed validation ${this.consecutiveFailures} consecutive times${coords}. ***\n` +
+                `Error: ${failureMsg}\n\n` +
+                `This is a consensus rule mismatch with Bitcoin Core, NOT chainstate\n` +
+                `corruption — file a bug report against hotbuns. The chainstate is\n` +
+                `recoverable; do NOT wipe the data directory. Once the rule is fixed\n` +
+                `in code, restart and the bounded retry will resume from this height.\n`
+            );
+            // Rewind to last flushed height so the next attempt re-processes
+            // from a known-good DB state. Do NOT process.exit — keep the node
+            // alive so RPC remains queryable for triage.
+            const rewindTo = this.lastFlushedHeight + 1;
+            this.state.nextHeightToProcess = rewindTo;
+            this.state.nextHeightToRequest = rewindTo;
+          } else if (cls === "chainstate") {
+            // Genuine on-disk chainstate corruption: bodies/undo missing.
+            // Operator must wipe + re-sync (or restore from a snapshot).
+            console.error(
+              `\n*** [CHAINSTATE-CORRUPTION] Permanent UTXO corruption detected at height ${height}. ***\n` +
+                `Error: ${failureMsg}\n` +
+                `The same block has failed validation ${this.consecutiveFailures} consecutive times.\n` +
+                `This means the on-disk UTXO set has entries that were partially flushed\n` +
+                `during a previous unclean shutdown, or the chainstate is missing\n` +
+                `block-body / undo data.\n\n` +
+                `To recover, delete the data directory and restart:\n` +
+                `  rm -rf <datadir>/blocks.db && restart hotbuns\n`
+            );
+            // Exit with a distinctive code so monitoring scripts can detect this
+            process.exit(78); // EX_CONFIG from sysexits.h
+          } else {
+            // Unclassified: emit a neutral banner with the raw error so the
+            // operator can triage manually. Avoid the misleading
+            // "Permanent UTXO corruption" label here.
+            console.error(
+              `\n*** [CONNECT-FAILURE] Block ${height} (${hashHex.slice(0, 16)}...) ` +
+                `failed validation ${this.consecutiveFailures} consecutive times${coords}. ***\n` +
+                `Error: ${failureMsg}\n\n` +
+                `Triage:\n` +
+                `  - If the error looks like a script/tx-validation rule (tapscript,\n` +
+                `    SCRIPT_SIZE, MAX_OPS, signature, witness commitment, sigops, etc.),\n` +
+                `    treat as a consensus-rule bug and file against hotbuns. Do NOT wipe.\n` +
+                `  - If it looks like missing on-disk data (undo data missing, block\n` +
+                `    body missing, LEVEL_DATABASE_NOT_OPEN), treat as chainstate\n` +
+                `    corruption and wipe + re-sync.\n` +
+                `  - Add the new pattern to classifyCallbackError() in sync/blocks.ts\n` +
+                `    so future occurrences classify cleanly.\n`
+            );
+            // Conservative fallback: rewind and let the bounded retry keep
+            // running. Don't exit on unknown errors — that's been the most
+            // expensive misdiagnosis class.
+            const rewindTo = this.lastFlushedHeight + 1;
+            this.state.nextHeightToProcess = rewindTo;
+            this.state.nextHeightToRequest = rewindTo;
+          }
         } else {
           // Normal retry: rewind to last flushed height so we re-process
           // from a known-good DB state.
@@ -1168,12 +1341,25 @@ export class BlockSync {
   }
 
   /**
+   * Record a connectBlock failure reason so the bounded-retry banner can
+   * classify it (consensus vs chainstate vs unknown). Called by every
+   * warn/error site inside connectBlock that returns false.
+   */
+  private recordConnectError(msg: string): void {
+    this.lastConnectError = msg;
+  }
+
+  /**
    * Validate and connect a block.
    * Uses UTXOManager with proper layered cache for UTXO tracking.
    */
   async connectBlock(block: Block, height: number): Promise<boolean> {
     const blockHash = getBlockHash(block.header);
     const hashHex = blockHash.toString("hex");
+
+    // Reset captured error for this attempt; populated by recordConnectError()
+    // at every warn/error → return-false site below.
+    this.lastConnectError = "";
 
     // Under assume-valid, skip expensive structural checks (merkle root,
     // witness commitment, per-tx validation) for blocks we trust.
@@ -1183,9 +1369,9 @@ export class BlockSync {
       // Validate the block structure
       const validation = validateBlock(block, height, this.params);
       if (!validation.valid) {
-        console.warn(
-          `Block ${hashHex.slice(0, 16)}... at height ${height} failed validation: ${validation.error}`
-        );
+        const m = `Block ${hashHex.slice(0, 16)}... at height ${height} failed validation: ${validation.error}`;
+        console.warn(m);
+        this.recordConnectError(m);
         return false;
       }
     }
@@ -1193,9 +1379,9 @@ export class BlockSync {
     // Verify the block connects to the header chain
     const headerEntry = this.headerSync.getHeaderByHeight(height);
     if (!headerEntry || !headerEntry.hash.equals(blockHash)) {
-      console.warn(
-        `Block ${hashHex.slice(0, 16)}... does not match expected header at height ${height}`
-      );
+      const m = `Block ${hashHex.slice(0, 16)}... does not match expected header at height ${height}`;
+      console.warn(m);
+      this.recordConnectError(m);
       return false;
     }
 
@@ -1244,9 +1430,9 @@ export class BlockSync {
             if (!this.utxoManager.hasUTXO(input.prevOut)) {
               const loaded = await this.utxoManager.preloadUTXO(input.prevOut);
               if (!loaded) {
-                console.error(
-                  `Missing UTXO at height ${height}: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout}`
-                );
+                const m = `Missing UTXO at height ${height}: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout}`;
+                console.error(m);
+                this.recordConnectError(m);
                 return false;
               }
             }
@@ -1319,9 +1505,9 @@ export class BlockSync {
             if (!this.utxoManager.hasUTXO(input.prevOut)) {
               const loaded = await this.utxoManager.preloadUTXO(input.prevOut);
               if (!loaded) {
-                console.error(
-                  `Missing UTXO: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout} in tx ${txidHex.slice(0, 16)} at height ${height}`
-                );
+                const m = `Missing UTXO for input ${input.prevOut.vout} of tx ${txidHex.slice(0, 16)}: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout} at height ${height}`;
+                console.error(m);
+                this.recordConnectError(m);
                 return false;
               }
             }
@@ -1340,9 +1526,9 @@ export class BlockSync {
               if (utxo.coinbase) {
                 const maturity = height - utxo.height;
                 if (maturity < this.params.coinbaseMaturity) {
-                  console.warn(
-                    `Immature coinbase spend in tx ${txidHex.slice(0, 16)}: maturity ${maturity} < ${this.params.coinbaseMaturity}`
-                  );
+                  const m = `Immature coinbase spend in tx ${txidHex.slice(0, 16)}: maturity ${maturity} < ${this.params.coinbaseMaturity}`;
+                  console.warn(m);
+                  this.recordConnectError(m);
                   return false;
                 }
               }
@@ -1371,9 +1557,9 @@ export class BlockSync {
               utxoConfirmations
             );
             if (!seqLockValid) {
-              console.warn(
-                `Sequence locks not satisfied for tx ${txidHex.slice(0, 16)} at height ${height}`
-              );
+              const m = `Sequence locks not satisfied for tx ${txidHex.slice(0, 16)} at height ${height}`;
+              console.warn(m);
+              this.recordConnectError(m);
               return false;
             }
           }
@@ -1396,13 +1582,13 @@ export class BlockSync {
             }
 
             if (!scriptResult.valid) {
-              console.warn(
-                `Script verification failed in tx ${txidHex.slice(0, 16)} at height ${height}` +
-                  (scriptResult.failedInput !== undefined
-                    ? ` (input ${scriptResult.failedInput})`
-                    : "") +
-                  (scriptResult.error ? `: ${scriptResult.error}` : "")
-              );
+              const m = `Script verification failed in tx ${txidHex.slice(0, 16)} at height ${height}` +
+                (scriptResult.failedInput !== undefined
+                  ? ` (input ${scriptResult.failedInput})`
+                  : "") +
+                (scriptResult.error ? `: ${scriptResult.error}` : "");
+              console.warn(m);
+              this.recordConnectError(m);
               return false;
             }
           }
@@ -1434,9 +1620,9 @@ export class BlockSync {
       }
 
       if (totalSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
-        console.warn(
-          `Block sigops cost ${totalSigOpsCost} exceeds maximum ${MAX_BLOCK_SIGOPS_COST}`
-        );
+        const m = `Block sigops cost ${totalSigOpsCost} exceeds maximum ${MAX_BLOCK_SIGOPS_COST}`;
+        console.warn(m);
+        this.recordConnectError(m);
         return false;
       }
 
@@ -1451,9 +1637,9 @@ export class BlockSync {
       const maxCoinbaseValue = subsidy + fees;
 
       if (coinbaseOutputValue > maxCoinbaseValue) {
-        console.warn(
-          `Coinbase value ${coinbaseOutputValue} exceeds maximum ${maxCoinbaseValue} at height ${height}`
-        );
+        const m = `Coinbase value ${coinbaseOutputValue} exceeds maximum ${maxCoinbaseValue} at height ${height}`;
+        console.warn(m);
+        this.recordConnectError(m);
         return false;
       }
     }
