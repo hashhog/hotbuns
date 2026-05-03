@@ -613,6 +613,70 @@ describe("validateBlock", () => {
     const result = validateBlock(block, 1, REGTEST);
     expect(result.valid).toBe(true);
   });
+
+  // Coinbase scriptSig length enforcement: 2..100 bytes (Core bad-cb-length)
+  // Bitcoin Core: consensus/tx_check.cpp CheckTransaction
+  function makeCoinbaseWithScriptLen(len: number): Transaction {
+    return {
+      version: 1,
+      inputs: [
+        {
+          prevOut: { txid: Buffer.alloc(32, 0), vout: 0xffffffff },
+          scriptSig: Buffer.alloc(len, 0x51),
+          sequence: 0xffffffff,
+          witness: [],
+        },
+      ],
+      outputs: [{ value: 5000000000n, scriptPubKey: Buffer.from([0x51]) }],
+      lockTime: 0,
+    };
+  }
+
+  function makeBlockWith(coinbase: Transaction, height: number): import("./block").Block {
+    const txid = getTxId(coinbase);
+    return {
+      header: {
+        version: 0x20000000,
+        prevBlock: Buffer.alloc(32, 0),
+        merkleRoot: txid,
+        timestamp: Math.floor(Date.now() / 1000),
+        bits: REGTEST.powLimitBits,
+        nonce: 0,
+      },
+      transactions: [coinbase],
+    };
+  }
+
+  test("rejects coinbase scriptSig length 1 (too short, bad-cb-length)", () => {
+    const coinbase = makeCoinbaseWithScriptLen(1);
+    const block = makeBlockWith(coinbase, 1);
+    const result = validateBlock(block, 1, REGTEST);
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe("bad-cb-length");
+  });
+
+  test("rejects coinbase scriptSig length 101 (too long, bad-cb-length)", () => {
+    const coinbase = makeCoinbaseWithScriptLen(101);
+    const block = makeBlockWith(coinbase, 1);
+    const result = validateBlock(block, 1, REGTEST);
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe("bad-cb-length");
+  });
+
+  test("accepts coinbase scriptSig length 2 (minimum)", () => {
+    const coinbase = makeCoinbaseWithScriptLen(2);
+    const block = makeBlockWith(coinbase, 1);
+    const result = validateBlock(block, 1, REGTEST);
+    // height=1 is below REGTEST bip34Height so no bad-cb-height; only checking length here
+    expect(result.error).not.toBe("bad-cb-length");
+  });
+
+  test("accepts coinbase scriptSig length 100 (maximum)", () => {
+    const coinbase = makeCoinbaseWithScriptLen(100);
+    const block = makeBlockWith(coinbase, 1);
+    const result = validateBlock(block, 1, REGTEST);
+    expect(result.error).not.toBe("bad-cb-length");
+  });
 });
 
 describe("block weight", () => {

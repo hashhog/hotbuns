@@ -381,6 +381,14 @@ export function validateBlock(
     return { valid: false, error: "First transaction is not coinbase" };
   }
 
+  // Coinbase scriptSig must be 2..100 bytes.
+  // Bitcoin Core: consensus/tx_check.cpp CheckTransaction "bad-cb-length"
+  // (COINBASE_SCRIPT_SIZE_MIN=2, COINBASE_SCRIPT_SIZE_MAX=100)
+  const cbScriptLen = coinbaseTx.inputs[0].scriptSig.length;
+  if (cbScriptLen < 2 || cbScriptLen > 100) {
+    return { valid: false, error: "bad-cb-length" };
+  }
+
   // No other transaction can be coinbase
   for (let i = 1; i < block.transactions.length; i++) {
     if (isCoinbase(block.transactions[i])) {
