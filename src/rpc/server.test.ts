@@ -1354,4 +1354,52 @@ describe("RPCServer", () => {
       expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
     });
   });
+
+  // ========== NetworkDisable RAII (dumptxoutset rollback) ==========
+  // Mirrors Bitcoin Core's NetworkDisable wrapper around TemporaryRollback
+  // in rpc/blockchain.cpp::dumptxoutset. We exercise the flag directly
+  // and confirm submitblock short-circuits with a "paused" reject string
+  // before any deserialization.
+  describe("NetworkDisable rollback gate", () => {
+    it("isBlockSubmissionPaused defaults to false", () => {
+      expect(server.isBlockSubmissionPaused()).toBe(false);
+    });
+
+    it("setBlockSubmissionPausedForTest round-trips the flag", () => {
+      server.setBlockSubmissionPausedForTest(true);
+      expect(server.isBlockSubmissionPaused()).toBe(true);
+      server.setBlockSubmissionPausedForTest(false);
+      expect(server.isBlockSubmissionPaused()).toBe(false);
+    });
+
+    it("submitblock returns paused reject string while flag is set", async () => {
+      server.setBlockSubmissionPausedForTest(true);
+      try {
+        // Garbage hex is fine: the gate runs before deserialization.
+        const result = await rpcRequest(testPort, "submitblock", ["00"]);
+        // Bitcoin Core's submitblock returns the reject reason as a
+        // top-level string (or null on success). Our gate returns the
+        // string directly; the wrapper RPC framework surfaces it as
+        // `result.result`.
+        expect(result.error).toBeUndefined();
+        expect(typeof result.result).toBe("string");
+        expect(result.result as string).toContain("paused");
+      } finally {
+        server.setBlockSubmissionPausedForTest(false);
+      }
+    });
+
+    it("submitblock proceeds past the gate once flag is cleared", async () => {
+      server.setBlockSubmissionPausedForTest(true);
+      server.setBlockSubmissionPausedForTest(false);
+      // With the gate cleared, the handler must reach decode/inject.
+      // We feed garbage hex so it ultimately returns an error — the
+      // important assertion is that we DON'T see the "paused" reject.
+      const result = await rpcRequest(testPort, "submitblock", ["00"]);
+      const reason = result.result as string | undefined;
+      const errorMsg = (result.error?.message ?? "") as string;
+      expect(typeof reason === "string" && reason.includes("paused")).toBe(false);
+      expect(errorMsg.includes("paused")).toBe(false);
+    });
+  });
 });
