@@ -445,6 +445,68 @@ describe("assumeUTXO", () => {
 
       await db.close();
     });
+
+    it("dumpSnapshot uses atomic-write protocol (no .incomplete on success, refuses to overwrite)", async () => {
+      // Mirrors Bitcoin Core's rpc/blockchain.cpp::dumptxoutset which
+      // writes to "<path>.incomplete", fsyncs, and renames. After a
+      // successful write only <path> should exist; the .incomplete temp
+      // must be gone so that mid-dump observers never see a torn file.
+      // A second dump to the same path must refuse to overwrite,
+      // matching Core's "already exists" guard.
+      const fsp = await import("node:fs/promises");
+      const db = new ChainDB(join(testDbPath, "atomic-rt"));
+      await db.open();
+
+      const tip = Buffer.alloc(32, 0xee);
+      await db.putBlockIndex(tip, {
+        height: 1,
+        header: Buffer.alloc(80, 0),
+        nTx: 1,
+        status: 0x1f,
+        dataPos: 0,
+      });
+      await db.putChainState({
+        bestBlockHash: tip,
+        bestHeight: 1,
+        bestBlockTime: 0,
+        totalWork: 1n,
+      });
+
+      const snapshotPath = join(testDbPath, "atomic.dat");
+      const tempPath = `${snapshotPath}.incomplete`;
+      const params: ConsensusParams = { ...REGTEST };
+      const mgr = new ChainstateManager(db, params);
+
+      // First dump should succeed.
+      await mgr.dumpSnapshot(snapshotPath);
+
+      // <path> exists (resolves with no error from access()).
+      let pathExists = false;
+      try {
+        await fsp.access(snapshotPath);
+        pathExists = true;
+      } catch {
+        pathExists = false;
+      }
+      expect(pathExists).toBe(true);
+
+      // <path>.incomplete should NOT exist after a successful dump.
+      let tempExists = false;
+      try {
+        await fsp.access(tempPath);
+        tempExists = true;
+      } catch {
+        tempExists = false;
+      }
+      expect(tempExists).toBe(false);
+
+      // A second dump to the same path must refuse to overwrite.
+      await expect(mgr.dumpSnapshot(snapshotPath)).rejects.toThrow(
+        /already exists/
+      );
+
+      await db.close();
+    });
   });
 
   describe("Chainstate", () => {
