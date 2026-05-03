@@ -39,6 +39,13 @@ export interface ConsensusParams {
   readonly csvHeight: number; // BIP68/112/113 (relative timelocks)
   readonly segwitHeight: number;
   readonly taprootHeight: number;
+  /**
+   * BIP-30 exception heights: blocks that are permanently exempt from the
+   * duplicate-UTXO check. On mainnet these are h=91842 and h=91880, which
+   * predate BIP-30 and intentionally duplicate earlier coinbase txids.
+   * Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
+   */
+  readonly bip30ExceptionHeights: readonly number[];
   readonly protocolVersion: number;
   readonly services: bigint;
   readonly userAgent: string;
@@ -346,6 +353,9 @@ export const MAINNET: ConsensusParams = {
   csvHeight: 419328, // BIP68/112/113
   segwitHeight: 481824,
   taprootHeight: 709632,
+  // BIP-30: only h=91842 and h=91880 on mainnet are permanently exempt.
+  // Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
+  bip30ExceptionHeights: [91842, 91880],
   assumeValidHeight: 938343, // Bitcoin Core default assumevalid (block 938343)
   // Fleet-standard assumevalid hash (Bitcoin Core v28.0, block 938343).
   // Used by shouldSkipScripts() for the proper ancestor-check semantics.
@@ -629,6 +639,7 @@ export const TESTNET: ConsensusParams = {
   csvHeight: 770112, // BIP68/112/113
   segwitHeight: 834624,
   taprootHeight: 0,
+  bip30ExceptionHeights: [], // No BIP-30 exceptions on testnet3
   // Fleet-standard assumevalid hash for testnet3 (Bitcoin Core v28.0, block 123613).
   assumedValid: "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a",
   dnsSeed: [
@@ -740,6 +751,7 @@ export const TESTNET4: ConsensusParams = {
   csvHeight: 1,
   segwitHeight: 1,
   taprootHeight: 1,
+  bip30ExceptionHeights: [], // No BIP-30 exceptions on testnet4
   // Skip script/sigop verification for blocks at or below this height.
   // Testnet4 tip as of 2026-03: ~60k blocks, set conservatively.
   assumeValidHeight: 123613,
@@ -846,6 +858,7 @@ export const SIGNET: ConsensusParams = {
   csvHeight: 1,
   segwitHeight: 1,
   taprootHeight: 1,
+  bip30ExceptionHeights: [], // No BIP-30 exceptions on signet
   dnsSeed: [
     "seed.signet.bitcoin.sprovoost.nl",
   ],
@@ -890,6 +903,7 @@ export const REGTEST: ConsensusParams = {
   csvHeight: 0, // BIP68/112/113 always active on regtest
   segwitHeight: 0,
   taprootHeight: 0,
+  bip30ExceptionHeights: [], // No BIP-30 exceptions on regtest
   coinbaseMaturity: 100,
   difficultyAdjustmentInterval: 2016,
   dnsSeed: [],

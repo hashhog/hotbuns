@@ -254,6 +254,34 @@ export class ChainStateManager {
       throw new Error(checkpointResult.error);
     }
 
+    // BIP-30: reject any block that would overwrite an existing unspent output.
+    // Two mainnet blocks (h=91842, h=91880) are permanently exempt; they predate
+    // BIP-30 and intentionally duplicate earlier coinbase txids.
+    // After BIP-34 activation (h≥bip34Height), coinbase-height uniqueness makes
+    // duplicates practically impossible, so skip up to h=1,983,702. After that
+    // BIP-34 modular arithmetic begins to repeat pre-BIP34 heights, so re-enable.
+    // Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
+    const BIP34_IMPLIES_BIP30_LIMIT = 1_983_702;
+    const isExemptHeight = this.params.bip30ExceptionHeights.includes(height);
+    const bip34Active = height >= this.params.bip34Height;
+    const belowReenableLimit = height < BIP34_IMPLIES_BIP30_LIMIT;
+    const enforceBip30 = !isExemptHeight && !(bip34Active && belowReenableLimit);
+
+    if (enforceBip30) {
+      for (const tx of block.transactions) {
+        const txid = getTxId(tx);
+        for (let vout = 0; vout < tx.outputs.length; vout++) {
+          const exists = await this.utxo.hasUTXOAsync({ txid, vout });
+          if (exists) {
+            throw new ConsensusError(
+              ConsensusErrorCode.BIP30_DUPLICATE_OUTPUT,
+              `bad-txns-BIP30: tried to overwrite transaction ${txid.toString("hex")}:${vout}`
+            );
+          }
+        }
+      }
+    }
+
     const spentOutputs: SpentUTXO[] = [];
     let totalInputValue = 0n;
     let totalOutputValue = 0n;
@@ -450,7 +478,7 @@ export class ChainStateManager {
 
       // Remove outputs (they were created by this block)
       for (let vout = 0; vout < tx.outputs.length; vout++) {
-        this.utxo.removeUTXO(txid, vout);
+        await this.utxo.removeUTXO(txid, vout);
       }
 
       // Restore spent inputs (for non-coinbase)

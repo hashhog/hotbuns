@@ -62,6 +62,9 @@ export enum ConsensusErrorCode {
 
   // Checkpoint errors
   CHECKPOINT_MISMATCH = "CHECKPOINT_MISMATCH",
+
+  // BIP-30: block would overwrite an existing unspent output
+  BIP30_DUPLICATE_OUTPUT = "BIP30_DUPLICATE_OUTPUT",
 }
 
 /**
@@ -97,6 +100,7 @@ const REJECT_CODES: Record<ConsensusErrorCode, number> = {
   [ConsensusErrorCode.BAD_COINBASE_VALUE]: 0x10,
   [ConsensusErrorCode.SEQUENCE_LOCK_NOT_SATISFIED]: 0x10,
   [ConsensusErrorCode.CHECKPOINT_MISMATCH]: 0x10,
+  [ConsensusErrorCode.BIP30_DUPLICATE_OUTPUT]: 0x10,
 };
 
 /**
