@@ -3701,19 +3701,35 @@ export class RPCServer {
     const subsidy = this.getBlockSubsidy(height);
     const coinbaseValue = subsidy + totalFees;
 
-    // Calculate target from current difficulty
-    const target = compactToBigInt(this.params.powLimitBits);
-    const targetHex = target.toString(16).padStart(64, "0");
-
     // Get previous block hash
     const previousblockhash = Buffer.from(bestBlock.hash).reverse().toString("hex");
 
-    // Calculate current time and minimum time
+    // Compute the next-block target using the same retargeting code path the
+    // header validator uses (consensus/pow.ts getNextWorkRequired).  Returning
+    // powLimitBits here was a P0 mining bug: a miner using hotbuns'
+    // getblocktemplate would mine to genesis difficulty and every other node
+    // would reject the resulting block for failing PoW.  Ref:
+    // CORE-PARITY-AUDIT/hotbuns-P0-FOUND.md P0-5.
     const curtime = Math.floor(Date.now() / 1000);
-    const mintime = curtime; // Simplified; should be MTP + 1
+    const parentEntry = this.headerSync.getHeader(bestBlock.hash);
+    let nextTarget: bigint;
+    if (parentEntry) {
+      nextTarget = this.headerSync.getNextTarget(parentEntry, curtime);
+    } else {
+      // Genesis or detached header chain: fall back to powLimit (the only
+      // sensible value when there is no parent to retarget against).
+      nextTarget = compactToBigInt(this.params.powLimitBits);
+    }
+    const nextBits = bigIntToCompact(nextTarget);
+    const targetHex = nextTarget.toString(16).padStart(64, "0");
+    const bits = nextBits.toString(16).padStart(8, "0");
 
-    // Calculate bits (difficulty target in compact format)
-    const bits = this.params.powLimitBits.toString(16).padStart(8, "0");
+    // mintime is MTP(parent) + 1 so the new block's timestamp is strictly
+    // greater than median time past (consensus rule, validation.cpp
+    // ContextualCheckBlockHeader).
+    const mintime = parentEntry
+      ? this.headerSync.getMedianTimePast(parentEntry) + 1
+      : curtime;
 
     // Build the result
     const result: Record<string, unknown> = {
