@@ -207,6 +207,18 @@ export class RPCServer {
   /** Latched IBD state. Once false, cannot go back to true. */
   private latchedIsIBD: boolean = true;
 
+  /**
+   * NetworkDisable flag: when true, `submitblock` and any P2P block-handler
+   * callsite that consults this flag must refuse new blocks. Set during
+   * `dumptxoutset rollback`'s rewind→dump→replay dance to mirror Bitcoin
+   * Core's `NetworkDisable` RAII guard around `TemporaryRollback` in
+   * `rpc/blockchain.cpp::dumptxoutset`. Peers stay connected; only block
+   * acceptance is gated. JS is single-threaded so a plain boolean is
+   * sufficient; we use a class field rather than a module-level flag so
+   * tests can spin up multiple isolated RPCServer instances.
+   */
+  private blockSubmissionPaused: boolean = false;
+
   constructor(config: RPCServerConfig, deps: RPCServerDeps) {
     this.config = {
       port: config.port ?? 8332,
@@ -3556,6 +3568,14 @@ export class RPCServer {
    * @returns null on success, string error message on failure
    */
   private async submitBlock(params: unknown[]): Promise<unknown> {
+    // NetworkDisable gate: refuse submissions while a `dumptxoutset
+    // rollback` rewind→dump→replay dance is in progress. Mirrors Bitcoin
+    // Core's NetworkDisable RAII around TemporaryRollback in
+    // rpc/blockchain.cpp::dumptxoutset.
+    if (this.blockSubmissionPaused) {
+      return "rejected: block submission paused (dumptxoutset rollback in progress)";
+    }
+
     const [hexdata] = params;
     if (typeof hexdata !== "string") {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "hex string required");
@@ -5428,6 +5448,28 @@ export class RPCServer {
       );
     }
 
+    // Pruned-mode pre-check. Mirrors Bitcoin Core's
+    // rpc/blockchain.cpp:dumptxoutset:
+    //   if (IsPruneMode() &&
+    //       target_index->nHeight <
+    //       node.chainman->m_blockman.GetFirstBlock()->nHeight)
+    //       throw "Block height N not available (pruned data).
+    //              Use a height after M.";
+    // hotbuns tracks `getFirstUnprunedHeight()` (the lowest height with
+    // block data still on disk) on the PruneManager. We fail fast so a
+    // pruned datadir does not begin a rewind that is guaranteed to fail
+    // when disconnectBlock reads a pruned body.
+    if (this.pruneManager?.isPruneMode()) {
+      const firstAvailable = this.pruneManager.getFirstUnprunedHeight();
+      if (targetHeight < firstAvailable) {
+        throw this.rpcError(
+          RPCErrorCodes.MISC_ERROR,
+          `Block height ${targetHeight} not available (pruned data). ` +
+            `Use a height after ${firstAvailable - 1}.`
+        );
+      }
+    }
+
     // Lazily construct the snapshot manager, mirroring the existing
     // loadtxoutset wiring above. Must happen BEFORE the rollback dance
     // so a setup failure doesn't leave the chainstate disconnected.
@@ -5436,6 +5478,18 @@ export class RPCServer {
       chainstateManager = new ChainstateManager(this.db, this.params);
       this.chainstateManager = chainstateManager;
     }
+
+    // NetworkDisable RAII (TS try/finally). Mirrors Bitcoin Core's
+    // NetworkDisable wrapper around TemporaryRollback in
+    // rpc/blockchain.cpp::dumptxoutset. Pause inbound block acceptance
+    // for the duration of the rewind→dump→replay dance and restore on
+    // every exit path (success, error, exception). Only pause when
+    // there's actual rewind work; a "latest" dump doesn't need the gate.
+    const networkPauseActive = targetHeight < tip.height;
+    if (networkPauseActive) {
+      this.blockSubmissionPaused = true;
+    }
+    try {
 
     // Capture the disconnected blocks top-down (tip → target) so we can
     // replay them bottom-up (target+1 → tip) after the dump completes.
@@ -5526,6 +5580,33 @@ export class RPCServer {
       txoutset_hash: dumpResult.txoutsetHash,
       nchaintx: Number(dumpResult.nChainTx),
     };
+
+    } finally {
+      // NetworkDisable RAII restore: clear the pause flag on every exit
+      // path of the rollback dance (success, error, exception). Mirrors
+      // Core's NetworkDisable destructor.
+      if (networkPauseActive) {
+        this.blockSubmissionPaused = false;
+      }
+    }
+  }
+
+  /**
+   * Whether inbound block submission is currently gated by an active
+   * `dumptxoutset rollback` dance. Exposed for tests + observability.
+   */
+  isBlockSubmissionPaused(): boolean {
+    return this.blockSubmissionPaused;
+  }
+
+  /**
+   * Test-only helper to manipulate the NetworkDisable flag directly,
+   * mirroring how Core's tests construct a NetworkDisable guard outside
+   * a real rollback to assert downstream behaviour. Avoid in production
+   * code — the flag should only be flipped by the rollback dance.
+   */
+  setBlockSubmissionPausedForTest(paused: boolean): void {
+    this.blockSubmissionPaused = paused;
   }
 
   /**
