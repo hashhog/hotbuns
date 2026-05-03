@@ -545,6 +545,86 @@ describe("HeaderSync", () => {
       expect(headerSync2.getBestHeader()!.height).toBe(originalHeight);
     });
 
+    test("loadFromDB streams a 10k-header chain in <2s (perf shape)", async () => {
+      // Regression guard for the O(N) serial-async loadFromDB bottleneck
+      // that made hotbuns un-bootable post-snapshot at ~944k mainnet
+      // headers (~1.5 KB/s LevelDB read rate, 30+ minutes). The iterator
+      // refactor should complete in well under a second for 10k headers.
+      //
+      // We seed the DB *directly* (skipping processHeaders' PoW validation)
+      // so the test measures only the load path, not header validation.
+      const N = 10_000;
+      const genesis = headerSync.getBestHeader()!;
+      const bits = REGTEST.powLimitBits;
+
+      // Build a synthetic linear chain: each header's prevBlock = parent.hash.
+      // We don't bother with valid PoW because loadFromDB doesn't re-verify;
+      // it trusts the already-persisted block index.
+      let prevHash = genesis.hash;
+      let prevTs = genesis.header.timestamp;
+      let prevHashHex = prevHash.toString("hex");
+      const expectedTipHeights = new Map<string, number>();
+
+      for (let i = 1; i <= N; i++) {
+        prevTs += 600;
+        const header: BlockHeader = {
+          version: 4,
+          prevBlock: prevHash,
+          merkleRoot: Buffer.alloc(32, i & 0xff),
+          timestamp: prevTs,
+          bits,
+          nonce: i,
+        };
+        const headerBuf = serializeBlockHeader(header);
+        const hash = getBlockHash(header);
+
+        await db.putBlockIndex(hash, {
+          height: i,
+          header: headerBuf,
+          nTx: 0,
+          status: 1, // header-valid
+          dataPos: 0,
+        });
+
+        prevHash = hash;
+        prevHashHex = hash.toString("hex");
+        expectedTipHeights.set(prevHashHex, i);
+      }
+
+      // Persist the header tip pointer the same way saveHeaderTip does
+      // (UNDO prefix + "header_tip" key).
+      await db.putUndoData(Buffer.from("header_tip"), prevHash);
+
+      // Fresh HeaderSync — loadFromDB has to rebuild the in-memory chain
+      // entirely from the persisted index.
+      const headerSync2 = new HeaderSync(db, REGTEST);
+
+      const t0 = performance.now();
+      await headerSync2.loadFromDB();
+      const elapsedMs = performance.now() - t0;
+
+      // Must complete fast. Pre-fix this took O(N) serial async DB
+      // round-trips (multi-minute even at 10k); post-fix it's a single
+      // iterator pass.
+      expect(elapsedMs).toBeLessThan(2000);
+
+      // Chain integrity: tip height + hash + count line up.
+      const tip = headerSync2.getBestHeader();
+      expect(tip).not.toBeNull();
+      expect(tip!.height).toBe(N);
+      expect(tip!.hash.equals(prevHash)).toBe(true);
+      // Genesis (1) + N synthetic headers.
+      expect(headerSync2.getHeaderCount()).toBe(N + 1);
+
+      // Spot-check a few interior heights to confirm the by-height index
+      // was rebuilt correctly.
+      for (const h of [1, 100, 5000, N - 1, N]) {
+        const entry = headerSync2.getHeaderByHeight(h);
+        expect(entry).not.toBeUndefined();
+        expect(entry!.height).toBe(h);
+      }
+    });
+
     test("header tip is stored separately from chain state", async () => {
       const peer = createMockPeer();
       const genesis = headerSync.getBestHeader()!;
