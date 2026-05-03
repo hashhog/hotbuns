@@ -1399,98 +1399,17 @@ export function verifyInputSignature(
   const input = tx.inputs[inputIndex];
   const scriptPubKey = utxo.scriptPubKey;
 
-  // Check for P2WPKH: OP_0 <20 bytes>
-  if (scriptPubKey.length === 22 &&
-      scriptPubKey[0] === 0x00 &&
-      scriptPubKey[1] === 0x14) {
-    // Native P2WPKH
-    if (input.witness.length !== 2) {
-      return { valid: false, inputIndex, error: "P2WPKH requires 2 witness items" };
-    }
-
-    const signature = input.witness[0];
-    const pubkey = input.witness[1];
-
-    if (signature.length < 1) {
-      return { valid: false, inputIndex, error: "Empty signature" };
-    }
-
-    if (pubkey.length !== 33 && pubkey.length !== 65) {
-      return { valid: false, inputIndex, error: "Invalid public key length" };
-    }
-
-    // Extract sighash type from last byte of signature
-    const hashType = signature[signature.length - 1];
-    const derSig = signature.subarray(0, signature.length - 1);
-
-    // Build P2WPKH script code: OP_DUP OP_HASH160 <pubkeyhash> OP_EQUALVERIFY OP_CHECKSIG
-    const pubKeyHash = scriptPubKey.subarray(2, 22);
-    const scriptCode = Buffer.concat([
-      Buffer.from([0x76, 0xa9, 0x14]),
-      pubKeyHash,
-      Buffer.from([0x88, 0xac]),
-    ]);
-
-    // Compute sighash
-    const sighash = sigHashWitnessV0Cached(tx, inputIndex, scriptCode, utxo.amount, hashType, cache);
-
-    // Verify signature
-    const valid = ecdsaVerify(derSig, sighash, pubkey);
-    if (!valid) {
-      return { valid: false, inputIndex, error: "Signature verification failed" };
-    }
-
-    return { valid: true, inputIndex };
-  }
-
-  // Check for P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
-  if (scriptPubKey.length === 25 &&
-      scriptPubKey[0] === 0x76 &&
-      scriptPubKey[1] === 0xa9 &&
-      scriptPubKey[2] === 0x14 &&
-      scriptPubKey[23] === 0x88 &&
-      scriptPubKey[24] === 0xac) {
-    // Legacy P2PKH
-    if (input.scriptSig.length < 2) {
-      return { valid: false, inputIndex, error: "Empty scriptSig for P2PKH" };
-    }
-
-    // Parse scriptSig: <sig> <pubkey>
-    const reader = new BufferReader(input.scriptSig);
-
-    // Read signature (pushed with length prefix)
-    const sigLen = reader.readUInt8();
-    if (sigLen > reader.remaining + 1) {
-      return { valid: false, inputIndex, error: "Invalid signature length in scriptSig" };
-    }
-    const sigWithType = reader.readBytes(sigLen);
-
-    // Read public key
-    const pubkeyLen = reader.readUInt8();
-    if (pubkeyLen > reader.remaining + 1) {
-      return { valid: false, inputIndex, error: "Invalid pubkey length in scriptSig" };
-    }
-    const pubkey = reader.readBytes(pubkeyLen);
-
-    if (sigWithType.length < 1) {
-      return { valid: false, inputIndex, error: "Empty signature" };
-    }
-
-    // Extract sighash type and DER signature
-    const hashType = sigWithType[sigWithType.length - 1];
-    const derSig = sigWithType.subarray(0, sigWithType.length - 1);
-
-    // Compute legacy sighash with scriptPubKey as subscript
-    const sighash = sigHashLegacy(tx, inputIndex, scriptPubKey, hashType);
-
-    // Verify signature
-    const valid = ecdsaVerify(derSig, sighash, pubkey);
-    if (!valid) {
-      return { valid: false, inputIndex, error: "Signature verification failed" };
-    }
-
-    return { valid: true, inputIndex };
-  }
+  // P2PKH/P2WPKH fast paths previously short-circuited here with a hand-rolled
+  // <sig><pubkey> parser that called ecdsaVerify directly.  That bypassed the
+  // script interpreter entirely and skipped DERSIG (BIP-66), NULLDUMMY, push-only
+  // scriptSig enforcement, OP_PUSHDATA1/2/4 handling, OP_DUP/OP_HASH160/
+  // OP_EQUALVERIFY/OP_CHECKSIG opcode dispatch, and (for P2WPKH) the witness
+  // pubkey-type check.  An attacker-mined block carrying a non-strict-DER sig
+  // or a scriptSig with extra opcodes would have been silently accepted by
+  // hotbuns and rejected by Bitcoin Core — a latent consensus split.
+  //
+  // Both script types are now routed to the catch-all `verifyScript` branch
+  // below which calls the full interpreter with consensus flags.
 
   // BIP-341 P2TR: OP_1 <32 bytes>
   if (scriptPubKey.length === 34 &&
