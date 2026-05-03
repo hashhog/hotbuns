@@ -5,9 +5,11 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { RPCServer, RPCServerConfig, RPCServerDeps, RPCErrorCodes } from "./server.js";
 import { REGTEST } from "../consensus/params.js";
-import { getBlockHash, serializeBlockHeader, computeWitnessMerkleRoot } from "../validation/block.js";
+import { getBlockHash, serializeBlockHeader, serializeBlock, computeWitnessMerkleRoot, computeMerkleRoot } from "../validation/block.js";
+import { getTxId, serializeTx } from "../validation/tx.js";
 import { BufferReader } from "../wire/serialization.js";
 import { hash256 } from "../crypto/primitives.js";
+import { bip22Result, ConsensusErrorCode } from "../validation/errors.js";
 
 // Mock implementations for dependencies
 
@@ -1545,18 +1547,16 @@ describe("RPCServer", () => {
       expect(server.isBlockSubmissionPaused()).toBe(false);
     });
 
-    it("submitblock returns paused reject string while flag is set", async () => {
+    it("submitblock returns BIP-22 'rejected' string while paused flag is set", async () => {
       server.setBlockSubmissionPausedForTest(true);
       try {
         // Garbage hex is fine: the gate runs before deserialization.
         const result = await rpcRequest(testPort, "submitblock", ["00"]);
-        // Bitcoin Core's submitblock returns the reject reason as a
-        // top-level string (or null on success). Our gate returns the
-        // string directly; the wrapper RPC framework surfaces it as
-        // `result.result`.
+        // BIP-22: reject reason must be a plain string in the result field.
+        // The gate returns "rejected" (the canonical catch-all string), not a
+        // long message containing "paused" — that would be non-spec.
         expect(result.error).toBeUndefined();
-        expect(typeof result.result).toBe("string");
-        expect(result.result as string).toContain("paused");
+        expect(result.result).toBe("rejected");
       } finally {
         server.setBlockSubmissionPausedForTest(false);
       }
@@ -1573,6 +1573,255 @@ describe("RPCServer", () => {
       const errorMsg = (result.error?.message ?? "") as string;
       expect(typeof reason === "string" && reason.includes("paused")).toBe(false);
       expect(errorMsg.includes("paused")).toBe(false);
+    });
+
+    it("submitblock paused gate returns canonical BIP-22 'rejected' string", async () => {
+      server.setBlockSubmissionPausedForTest(true);
+      try {
+        const result = await rpcRequest(testPort, "submitblock", ["00"]);
+        // Must be the exact canonical BIP-22 string, not a long message
+        expect(result.error).toBeUndefined();
+        expect(result.result).toBe("rejected");
+      } finally {
+        server.setBlockSubmissionPausedForTest(false);
+      }
+    });
+  });
+
+  // ========== BIP-22 result string unit tests ==========
+  // Tests for the bip22Result() helper in validation/errors.ts.
+  // These are pure-function unit tests — no RPC server needed.
+  describe("bip22Result unit tests", () => {
+    it("null/undefined input returns null (success)", () => {
+      expect(bip22Result(null)).toBeNull();
+      expect(bip22Result(undefined)).toBeNull();
+    });
+
+    it("ConsensusErrorCode.INVALID_POW → 'high-hash'", () => {
+      expect(bip22Result(ConsensusErrorCode.INVALID_POW)).toBe("high-hash");
+    });
+
+    it("ConsensusErrorCode.BAD_MERKLE_ROOT → 'bad-txnmrklroot'", () => {
+      expect(bip22Result(ConsensusErrorCode.BAD_MERKLE_ROOT)).toBe("bad-txnmrklroot");
+    });
+
+    it("ConsensusErrorCode.BAD_WITNESS_COMMITMENT → 'bad-witness-merkle-match'", () => {
+      expect(bip22Result(ConsensusErrorCode.BAD_WITNESS_COMMITMENT)).toBe("bad-witness-merkle-match");
+    });
+
+    it("ConsensusErrorCode.BAD_COINBASE_VALUE → 'bad-cb-amount'", () => {
+      expect(bip22Result(ConsensusErrorCode.BAD_COINBASE_VALUE)).toBe("bad-cb-amount");
+    });
+
+    it("ConsensusErrorCode.BAD_SIGOPS_COST → 'bad-blk-sigops'", () => {
+      expect(bip22Result(ConsensusErrorCode.BAD_SIGOPS_COST)).toBe("bad-blk-sigops");
+    });
+
+    it("ConsensusErrorCode.BAD_COINBASE_HEIGHT → 'bad-cb-height'", () => {
+      expect(bip22Result(ConsensusErrorCode.BAD_COINBASE_HEIGHT)).toBe("bad-cb-height");
+    });
+
+    it("ConsensusErrorCode.SCRIPT_VERIFY_FLAG_FAILED → 'mandatory-script-verify-flag-failed'", () => {
+      expect(bip22Result(ConsensusErrorCode.SCRIPT_VERIFY_FLAG_FAILED)).toBe("mandatory-script-verify-flag-failed");
+    });
+
+    it("ConsensusErrorCode.DUPLICATE_INPUTS → 'bad-txns-duplicate'", () => {
+      expect(bip22Result(ConsensusErrorCode.DUPLICATE_INPUTS)).toBe("bad-txns-duplicate");
+    });
+
+    it("ConsensusErrorCode.MISSING_INPUTS → 'bad-txns-inputs-missingorspent'", () => {
+      expect(bip22Result(ConsensusErrorCode.MISSING_INPUTS)).toBe("bad-txns-inputs-missingorspent");
+    });
+
+    it("ConsensusErrorCode.SEQUENCE_LOCK_NOT_SATISFIED → 'bad-txns-nonfinal'", () => {
+      expect(bip22Result(ConsensusErrorCode.SEQUENCE_LOCK_NOT_SATISFIED)).toBe("bad-txns-nonfinal");
+    });
+
+    it("ConsensusErrorCode.BLOCK_TIME_TOO_NEW → 'time-too-new'", () => {
+      expect(bip22Result(ConsensusErrorCode.BLOCK_TIME_TOO_NEW)).toBe("time-too-new");
+    });
+
+    it("ConsensusErrorCode.BLOCK_TIME_TOO_OLD → 'time-too-old'", () => {
+      expect(bip22Result(ConsensusErrorCode.BLOCK_TIME_TOO_OLD)).toBe("time-too-old");
+    });
+
+    it("free-form 'Merkle root mismatch' → 'bad-txnmrklroot'", () => {
+      expect(bip22Result("Merkle root mismatch")).toBe("bad-txnmrklroot");
+    });
+
+    it("free-form 'Witness commitment mismatch' → 'bad-witness-merkle-match'", () => {
+      expect(bip22Result("Witness commitment mismatch")).toBe("bad-witness-merkle-match");
+    });
+
+    it("free-form 'bad-cb-height' already canonical → 'bad-cb-height'", () => {
+      expect(bip22Result("bad-cb-height")).toBe("bad-cb-height");
+    });
+
+    it("free-form 'non-final transaction' → 'bad-txns-nonfinal'", () => {
+      expect(bip22Result("contains non-final transaction (bad-txns-nonfinal)")).toBe("bad-txns-nonfinal");
+    });
+
+    it("free-form 'duplicate' passthrough", () => {
+      expect(bip22Result("duplicate")).toBe("duplicate");
+    });
+
+    it("free-form 'inconclusive' passthrough", () => {
+      expect(bip22Result("inconclusive")).toBe("inconclusive");
+    });
+
+    it("unknown error string → 'rejected' catch-all", () => {
+      expect(bip22Result("something totally unexpected")).toBe("rejected");
+      expect(bip22Result("ENOENT")).toBe("rejected");
+    });
+  });
+
+  // ========== BIP-22 via submitblock RPC ==========
+  // Test the full RPC path using a mock blockSync that returns specific strings.
+  describe("submitblock BIP-22 result strings", () => {
+    // Helper: build a minimal serialized block (coinbase-only, arbitrary nonce).
+    // The header's prevBlock is all-zeros so MockHeaderSync.getHeader returns an entry.
+    // When badMerkle=true the merkleRoot bytes are wrong to trigger bad-txnmrklroot.
+    function buildMinimalBlockHex(opts: {
+      badMerkle?: boolean;
+    } = {}): string {
+      // Minimal coinbase transaction using the correct Transaction field names.
+      // Coinbase: prevOut.txid must be all zeros (not 0xff) for isCoinbase() to pass.
+      const coinbaseTx: import("../validation/tx.js").Transaction = {
+        version: 1,
+        inputs: [{
+          prevOut: { txid: Buffer.alloc(32, 0), vout: 0xffffffff },
+          scriptSig: Buffer.from([0x01, 0x00]), // height = 0
+          sequence: 0xffffffff,
+          witness: [],
+        }],
+        outputs: [{
+          value: 50_0000_0000n,
+          scriptPubKey: Buffer.from([0x51]), // OP_1
+        }],
+        lockTime: 0,
+      };
+
+      const txid = getTxId(coinbaseTx);
+      const correctMerkle = computeMerkleRoot([txid]);
+
+      // Nonces pre-mined to produce a valid PoW hash (< REGTEST.powLimit).
+      // With prevBlock=0x00..00, timestamp=1296688602, bits=REGTEST.powLimitBits:
+      //   valid-merkle block:  nonce=1 → hash 0x4a9b3dad...
+      //   bad-merkle block:    nonce=0 → hash 0x0c345c94...
+      const nonce = opts.badMerkle ? 0 : 1;
+      const header: import("../validation/block.js").BlockHeader = {
+        version: 1,
+        prevBlock: Buffer.alloc(32, 0), // matches MockHeaderSync.getHeader returning an entry
+        merkleRoot: opts.badMerkle ? Buffer.alloc(32, 0xab) : correctMerkle,
+        timestamp: 1296688602,
+        bits: REGTEST.powLimitBits,
+        nonce,
+      };
+
+      const block: import("../validation/block.js").Block = {
+        header,
+        transactions: [coinbaseTx],
+      };
+
+      return serializeBlock(block).toString("hex");
+    }
+
+    // Helper: create a RPCServer with a mock blockSync, with regtest powLimit
+    // override so the PoW pre-check passes for minimal test blocks.
+    function makeServerWithBlockSync(port: number, blockSync: { injectBlock: (b: any) => Promise<string | null> }) {
+      // Override the mock headerSync to return regtest powLimit so PoW passes
+      mockHeaderSync.nextTargetOverride = REGTEST.powLimit;
+      const config: RPCServerConfig = { port, host: "127.0.0.1", noAuth: true };
+      const deps: RPCServerDeps = {
+        chainState: mockChainState as any,
+        mempool: mockMempool as any,
+        peerManager: mockPeerManager as any,
+        feeEstimator: mockFeeEstimator as any,
+        headerSync: mockHeaderSync as any,
+        db: mockDB as any,
+        params: REGTEST,
+        blockSync: blockSync as any,
+      };
+      return new RPCServer(config, deps);
+    }
+
+    it("mock blockSync returning null → submitblock result is null", async () => {
+      const port = getTestPort();
+      const mockBlockSync = { injectBlock: async (_block: any) => null };
+      const s = makeServerWithBlockSync(port, mockBlockSync);
+      s.start();
+      try {
+        const hex = buildMinimalBlockHex();
+        const result = await rpcRequest(port, "submitblock", [hex]);
+        // null result means success
+        expect(result.error).toBeUndefined();
+        expect(result.result).toBeNull();
+      } finally {
+        s.stop();
+        mockHeaderSync.nextTargetOverride = null;
+      }
+    });
+
+    it("mock blockSync returning 'duplicate' → submitblock result is 'duplicate'", async () => {
+      const port = getTestPort();
+      const mockBlockSync = { injectBlock: async (_block: any) => "duplicate" };
+      const s = makeServerWithBlockSync(port, mockBlockSync);
+      s.start();
+      try {
+        const hex = buildMinimalBlockHex();
+        const result = await rpcRequest(port, "submitblock", [hex]);
+        expect(result.error).toBeUndefined();
+        expect(result.result).toBe("duplicate");
+      } finally {
+        s.stop();
+        mockHeaderSync.nextTargetOverride = null;
+      }
+    });
+
+    it("mock blockSync returning 'inconclusive' → submitblock result is 'inconclusive'", async () => {
+      const port = getTestPort();
+      const mockBlockSync = { injectBlock: async (_block: any) => "inconclusive" };
+      const s = makeServerWithBlockSync(port, mockBlockSync);
+      s.start();
+      try {
+        const hex = buildMinimalBlockHex();
+        const result = await rpcRequest(port, "submitblock", [hex]);
+        expect(result.error).toBeUndefined();
+        expect(result.result).toBe("inconclusive");
+      } finally {
+        s.stop();
+        mockHeaderSync.nextTargetOverride = null;
+      }
+    });
+
+    it("block with bad merkle root → 'bad-txnmrklroot' before reaching blockSync", async () => {
+      const port = getTestPort();
+      let injectCalled = false;
+      const mockBlockSync = {
+        injectBlock: async (_block: any) => {
+          injectCalled = true;
+          return null;
+        },
+      };
+      const s = makeServerWithBlockSync(port, mockBlockSync);
+      s.start();
+      try {
+        const hex = buildMinimalBlockHex({ badMerkle: true });
+        const result = await rpcRequest(port, "submitblock", [hex]);
+        expect(result.error).toBeUndefined();
+        expect(result.result).toBe("bad-txnmrklroot");
+        // Pre-validation should have rejected before injectBlock
+        expect(injectCalled).toBe(false);
+      } finally {
+        s.stop();
+        mockHeaderSync.nextTargetOverride = null;
+      }
+    });
+
+    it("non-hex submitblock param returns JSON-RPC error, not BIP-22 string", async () => {
+      const result = await rpcRequest(testPort, "submitblock", [12345]);
+      expect(result.error).toBeDefined();
+      expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
     });
   });
 });
