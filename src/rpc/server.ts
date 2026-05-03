@@ -3615,6 +3615,16 @@ export class RPCServer {
       if (hashValue > requiredTarget) {
         return "high-hash";
       }
+
+      // BIP-113 / Core ContextualCheckBlockHeader (validation.cpp:4092):
+      // block timestamp must be strictly greater than the median-time-past
+      // of the previous 11 blocks. getMedianTimePast(parentEntry) returns
+      // the MTP of the current tip (the parent of the new block).
+      // Reference: bitcoin-core/src/validation.cpp:4092
+      const mtp = this.headerSync.getMedianTimePast(parentEntry);
+      if (block.header.timestamp <= mtp) {
+        return "time-too-old";
+      }
     } else {
       // Parent unknown — can't check PoW target; fall through to injectBlock
       // which will return "inconclusive" for orphan blocks.
