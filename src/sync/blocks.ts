@@ -43,6 +43,7 @@ import {
   shouldSkipScripts,
   type AssumeValidContext,
 } from "../consensus/assumevalid.js";
+import { isFinalTx } from "../mining/template.js";
 
 /**
  * Classify a connect-block error string into one of three buckets so the
@@ -1388,12 +1389,30 @@ export class BlockSync {
     // BIP68 (CSV) activation check
     const enforceBIP68 = !assumeValid && height >= this.params.csvHeight;
 
-    // Get the previous block's MTP for BIP68 time-based locks
+    // Get the previous block's MTP for BIP68 time-based locks and IsFinalTx.
+    // IsFinalTx always needs MTP when CSV is active (BIP-113), even under assumevalid.
     let blockPrevMTP = 0;
-    if (enforceBIP68) {
+    {
       const prevHeaderEntry = this.headerSync.getHeaderByHeight(height - 1);
       if (prevHeaderEntry) {
         blockPrevMTP = this.headerSync.getMedianTimePast(prevHeaderEntry);
+      }
+    }
+
+    // ContextualCheckBlock: enforce IsFinalTx for every transaction.
+    // (Bitcoin Core validation.cpp:4146). Consensus rule that runs even
+    // under assumevalid — assumevalid only skips script verification.
+    // lock_time_cutoff = MTP when CSV/BIP-113 is active, block timestamp otherwise.
+    const csvActive = height >= this.params.csvHeight;
+    const lockTimeCutoff = csvActive
+      ? blockPrevMTP
+      : block.header.timestamp;
+    for (const tx of block.transactions) {
+      if (!isFinalTx(tx, height, lockTimeCutoff)) {
+        const m = `Block ${hashHex.slice(0, 16)}... at height ${height} contains non-final transaction (bad-txns-nonfinal)`;
+        console.warn(m);
+        this.recordConnectError(m);
+        return false;
       }
     }
 
