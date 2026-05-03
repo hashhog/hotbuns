@@ -479,21 +479,24 @@ export class HeaderSync {
       return { valid: false, error: "Target exceeds powLimit" };
     }
 
-    // 6. Difficulty matches expected (from retarget calculation or same as parent)
-    // Pass the block's timestamp for testnet min-difficulty check
+    // 6. Difficulty matches expected (from retarget calculation or same as parent).
+    // Pass the block's timestamp for testnet min-difficulty check.
+    //
+    // STRICT equality - Bitcoin Core enforces this in validation.cpp's
+    // ContextualCheckBlockHeader:
+    //   if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
+    //     return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER,
+    //                          "bad-diffbits", ...);
+    // The previous "actualTarget within [expected/2, expected*2]" tolerance was
+    // a cheap-mining attack vector: every non-retarget block would have been
+    // accepted across a +/-50% difficulty range.
     const expectedTarget = this.getNextTarget(parent, header.timestamp);
     const expectedBits = bigIntToCompact(expectedTarget);
-
-    // Allow some tolerance for rounding in compact encoding
     if (header.bits !== expectedBits) {
-      // Check if the actual target is close enough (due to compact encoding precision)
-      const actualTarget = compactToBigInt(header.bits);
-      if (actualTarget > expectedTarget * 2n || actualTarget < expectedTarget / 2n) {
-        return {
-          valid: false,
-          error: `Difficulty mismatch: expected bits ${expectedBits.toString(16)}, got ${header.bits.toString(16)}`,
-        };
-      }
+      return {
+        valid: false,
+        error: `bad-diffbits: expected bits ${expectedBits.toString(16)}, got ${header.bits.toString(16)}`,
+      };
     }
 
     return { valid: true };
