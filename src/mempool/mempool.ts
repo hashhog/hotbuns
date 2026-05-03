@@ -15,6 +15,7 @@ import type { UTXOEntry } from "../storage/database.js";
 import type { UTXOManager } from "../chain/utxo.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import type { Block } from "../validation/block.js";
+import { getTransactionSigOpCost, WITNESS_SCALE_FACTOR } from "../validation/block.js";
 import type { Transaction, OutPoint } from "../validation/tx.js";
 import {
   validateTxBasic,
@@ -215,6 +216,13 @@ export interface MempoolEntry {
   ephemeralDustParents: Set<string>;
   /** True if this transaction has ephemeral dust outputs. */
   hasEphemeralDust: boolean;
+  /**
+   * Weighted sigop cost for this transaction.
+   * legacy sigops × WITNESS_SCALE_FACTOR + P2SH sigops × WITNESS_SCALE_FACTOR
+   * + witness sigops × 1.
+   * Reference: Bitcoin Core GetTransactionSigOpCost()
+   */
+  sigOpCost: number;
 }
 
 /**
@@ -1150,6 +1158,23 @@ export class Mempool {
     // Check if this tx has ephemeral dust outputs
     const txHasEphemeralDust = hasEphemeralDust(tx);
 
+    // Compute weighted sigop cost for this tx.
+    // prevOutputs must be in input order; fall back to empty Buffer for
+    // any input whose prevout is not in inputUtxos (defence-in-depth).
+    // Reference: Bitcoin Core GetTransactionSigOpCost() in consensus/tx_verify.cpp
+    const prevOutputsForSigOps: Buffer[] = tx.inputs.map((inp) => {
+      const utxoEntry = inputUtxos.find(
+        (u) => u.input === inp
+      );
+      return utxoEntry ? Buffer.from(utxoEntry.utxo.scriptPubKey) : Buffer.alloc(0);
+    });
+    const sigOpCost = getTransactionSigOpCost(
+      tx,
+      prevOutputsForSigOps,
+      /* verifyP2SH */ true,
+      /* verifyWitness */ true
+    );
+
     // Create the mempool entry
     const entry: MempoolEntry = {
       tx,
@@ -1170,6 +1195,7 @@ export class Mempool {
       miningScore: feeRate, // Will be updated by linearization
       ephemeralDustParents,
       hasEphemeralDust: txHasEphemeralDust,
+      sigOpCost,
     };
 
     // Add to mempool
