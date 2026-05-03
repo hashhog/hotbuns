@@ -25,7 +25,9 @@ import {
   getBlockHash,
   computeMerkleRoot,
   computeWitnessMerkleRoot,
+  validateBlock,
 } from "../validation/block.js";
+import { bip22Result } from "../validation/errors.js";
 import { checkProofOfWork } from "../consensus/pow.js";
 import { BlockTemplateBuilder } from "../mining/template.js";
 import type { Transaction } from "../validation/tx.js";
@@ -3573,7 +3575,8 @@ export class RPCServer {
     // Core's NetworkDisable RAII around TemporaryRollback in
     // rpc/blockchain.cpp::dumptxoutset.
     if (this.blockSubmissionPaused) {
-      return "rejected: block submission paused (dumptxoutset rollback in progress)";
+      // BIP-22: return canonical string in result field, not a JSON-RPC error.
+      return "rejected";
     }
 
     const [hexdata] = params;
@@ -3597,10 +3600,44 @@ export class RPCServer {
       );
     }
 
-    // If we have a BlockSync instance, inject the block directly
+    // BIP-22 stateless pre-validation: check PoW and structural block rules
+    // before handing off to injectBlock.  These checks are always cheap and
+    // return canonical BIP-22 strings immediately without touching the UTXO set.
+    const blockHash = getBlockHash(block.header);
+    const parentEntry = this.headerSync.getHeader(block.header.prevBlock);
+    if (parentEntry) {
+      // Check proof-of-work against the required target for this block.
+      // Use the required target (from getNextTarget) not the block's claimed bits,
+      // so a block with bad bits is always "high-hash" rather than misleadingly valid.
+      const requiredTarget = this.headerSync.getNextTarget(parentEntry, block.header.timestamp);
+      const blockHashReversed = Buffer.from(blockHash).reverse();
+      const hashValue = BigInt("0x" + blockHashReversed.toString("hex"));
+      if (hashValue > requiredTarget) {
+        return "high-hash";
+      }
+    } else {
+      // Parent unknown — can't check PoW target; fall through to injectBlock
+      // which will return "inconclusive" for orphan blocks.
+    }
+
+    // Stateless block structure validation (merkle root, witness commitment,
+    // weight, BIP34 height encoding).  Runs even if parent is unknown.
+    // Height is best-effort: use nextHeightToProcess from blockSync if available,
+    // otherwise fall back to 0 (which skips BIP34 check harmlessly pre-activation).
+    const bestHeader = this.headerSync.getBestHeader();
+    const approxHeight = bestHeader ? bestHeader.height + 1 : 0;
+    const structCheck = validateBlock(block, approxHeight, this.params);
+    if (!structCheck.valid) {
+      const reason = structCheck.error ?? "rejected";
+      return bip22Result(reason);
+    }
+
+    // If we have a BlockSync instance, inject the block directly.
+    // injectBlock returns: null = success, "duplicate" = known, "inconclusive" = orphan/full
     if (this.blockSync) {
       const result = await this.blockSync.injectBlock(block);
-      return result; // null = success, string = error reason
+      // injectBlock already returns BIP-22 canonical strings for the cases it handles.
+      return result;
     }
 
     throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Block sync not available");
