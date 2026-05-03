@@ -3663,10 +3663,18 @@ export class RPCServer {
     let totalWeight = 0;
     let totalSigOps = 0;
 
+    const MAX_BLOCK_SIGOPS_COST = this.params.maxBlockSigOpsCost; // 80,000
     let idx = 1; // 1-based index (coinbase is 0)
     for (const txid of mempoolTxids) {
       const entry = this.mempool.getTransaction(txid);
       if (!entry) continue;
+
+      // Enforce MAX_BLOCK_SIGOPS_COST budget.
+      // Reference: Bitcoin Core BlockAssembler::TestChunkBlockLimits in node/miner.cpp
+      const txSigOpCost = entry.sigOpCost ?? 0;
+      if (totalSigOps + txSigOpCost > MAX_BLOCK_SIGOPS_COST) {
+        continue; // tx would push block over sigops limit — skip
+      }
 
       const txidHex = Buffer.from(txid).reverse().toString("hex");
       txIndex.set(txidHex, idx);
@@ -3688,12 +3696,13 @@ export class RPCServer {
         hash: getWTxId(entry.tx).toString("hex"),
         depends,
         fee: Number(entry.fee),
-        sigops: 0, // Would need proper sigop counting
+        sigops: txSigOpCost,
         weight: entry.weight,
       });
 
       totalFees += entry.fee;
       totalWeight += entry.weight;
+      totalSigOps += txSigOpCost;
       idx++;
     }
 
@@ -3755,13 +3764,34 @@ export class RPCServer {
       height,
     };
 
-    // Add default witness commitment if we have transactions
-    if (transactions.length > 0) {
-      // The witness commitment would be calculated from the wtxids
-      // For now, we just indicate that it should be included
-      // In a full implementation, this would be the actual commitment script
-      const witnessCommitmentHeader = "6a24aa21a9ed";
-      result.default_witness_commitment = witnessCommitmentHeader + "0".repeat(64);
+    // BIP-141 §commitment structure: emit default_witness_commitment whenever
+    // segwit is active at the new height (even for coinbase-only blocks).
+    // This mirrors Core's GenerateCoinbaseCommitment + miner.cpp required_outputs
+    // logic which unconditionally adds the commitment when segwit is active.
+    //
+    // Algorithm (identical to generateToAddress and Core validation.cpp):
+    //   1. Build witness txid list: coinbase = 32 zeros, then getWTxId per tx.
+    //   2. witness_merkle_root = computeWitnessMerkleRoot(wtxids)
+    //   3. witness_commitment  = hash256(witness_merkle_root || zero_nonce_32)
+    //   4. commitment_script   = 0x6a || 0x24 || 0xaa21a9ed || commitment (38 bytes)
+    if (height >= this.params.segwitHeight) {
+      // Coinbase wtxid is always 32 zero bytes (BIP-141).
+      const wtxids: Buffer[] = [Buffer.alloc(32, 0)];
+      for (const tx of transactions) {
+        // `hash` field holds the wtxid hex (internal byte order, as set in the
+        // loop above by getWTxId(entry.tx).toString("hex")).
+        wtxids.push(Buffer.from(tx.hash as string, "hex"));
+      }
+      const witnessMerkleRoot = computeWitnessMerkleRoot(wtxids);
+      const witnessNonce = Buffer.alloc(32, 0);
+      const witnessCommitment = hash256(Buffer.concat([witnessMerkleRoot, witnessNonce]));
+
+      // 38-byte output scriptPubKey: OP_RETURN(1) PUSH36(1) header(4) commitment(32)
+      const commitmentScript = Buffer.concat([
+        Buffer.from([0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]),
+        witnessCommitment,
+      ]);
+      result.default_witness_commitment = commitmentScript.toString("hex");
     }
 
     return result;

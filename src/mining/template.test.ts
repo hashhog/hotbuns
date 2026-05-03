@@ -32,6 +32,28 @@ import {
 } from "../validation/block.js";
 import { hash256 } from "../crypto/primitives.js";
 
+// Module-level helper (also defined inside top-level describe for legacy scope)
+function createTestTx(
+  inputs: Array<{ txid: Buffer; vout: number }>,
+  outputs: Array<{ value: bigint; scriptPubKey?: Buffer }>,
+  witness?: Buffer[][]
+): Transaction {
+  return {
+    version: 2,
+    inputs: inputs.map((inp, i) => ({
+      prevOut: { txid: inp.txid, vout: inp.vout },
+      scriptSig: Buffer.alloc(0),
+      sequence: 0xffffffff,
+      witness: witness?.[i] ?? [],
+    })),
+    outputs: outputs.map((out) => ({
+      value: out.value,
+      scriptPubKey: out.scriptPubKey ?? Buffer.from([0x51]), // OP_TRUE
+    })),
+    lockTime: 0,
+  };
+}
+
 describe("BlockTemplateBuilder", () => {
   let tempDir: string;
   let db: ChainDB;
@@ -802,3 +824,152 @@ describe("locktime filtering in block template", () => {
     expect(template.transactions.length).toBe(1);
   });
 });
+
+// ============================================================================
+// Sigops budget enforcement (Core BlockAssembler parity)
+// Reference: bitcoin-core/src/node/miner.cpp TestChunkBlockLimits
+// MAX_BLOCK_SIGOPS_COST = 80,000
+// ============================================================================
+
+describe("sigops budget in block template", () => {
+  let tempDir: string;
+  let db: ChainDB;
+  let utxo: UTXOManager;
+  let chainState: ChainStateManager;
+  let mempool: Mempool;
+  let builder: BlockTemplateBuilder;
+
+  /**
+   * Build an OP_CHECKSIG-heavy scriptPubKey.
+   * n OP_CHECKSIG opcodes: legacy sigop cost = n * WITNESS_SCALE_FACTOR (4).
+   * Pattern: OP_TRUE (0x51) OP_CHECKSIG (0xac) repeated n times.
+   */
+  function checksigScript(n: number): Buffer {
+    const chunks: number[] = [];
+    for (let i = 0; i < n; i++) {
+      chunks.push(0x51, 0xac); // OP_TRUE OP_CHECKSIG
+    }
+    return Buffer.from(chunks);
+  }
+
+  async function setupUTXO(
+    txid: Buffer,
+    vout: number,
+    amount: bigint,
+    height: number = 1,
+    coinbase: boolean = false
+  ): Promise<void> {
+    const entry: UTXOEntry = {
+      height,
+      coinbase,
+      amount,
+      scriptPubKey: Buffer.from([0x51]), // OP_TRUE spendable
+    };
+    await db.putUTXO(txid, vout, entry);
+  }
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "sigops-test-"));
+    db = new ChainDB(tempDir);
+    await db.open();
+    utxo = new UTXOManager(db);
+    chainState = new ChainStateManager(db, REGTEST);
+    await chainState.load();
+    mempool = new Mempool(utxo, REGTEST, 1_000_000);
+    mempool.setTipHeight(200);
+    builder = new BlockTemplateBuilder(mempool, chainState, REGTEST);
+  });
+
+  afterEach(async () => {
+    await db.close();
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  test("per-tx sigOpCost is non-zero for tx with OP_CHECKSIG in output", async () => {
+    // 1 OP_CHECKSIG -> legacy sigop cost = 1 * 4 = 4
+    const inputTxid = Buffer.alloc(32, 0x01);
+    await setupUTXO(inputTxid, 0, 100_000n);
+
+    const tx = createTestTx(
+      [{ txid: inputTxid, vout: 0 }],
+      [{ value: 80_000n, scriptPubKey: checksigScript(1) }]
+    );
+    const result = await mempool.addTransaction(tx);
+    expect(result.accepted).toBe(true);
+
+    // The entry in the mempool should have sigOpCost > 0
+    const txid = getTxId(tx);
+    const entry = mempool.getTransaction(txid);
+    expect(entry).toBeDefined();
+    expect(entry!.sigOpCost).toBeGreaterThan(0);
+  });
+
+  test("totalSigOps in template is sum of selected tx sigop costs", async () => {
+    // 2 txs each with 5 OP_CHECKSIG -> cost 5*4=20 each; total=40
+    for (let i = 0; i < 2; i++) {
+      const inputTxid = Buffer.alloc(32, i + 1);
+      await setupUTXO(inputTxid, 0, 100_000n);
+
+      const tx = createTestTx(
+        [{ txid: inputTxid, vout: 0 }],
+        [{ value: 80_000n, scriptPubKey: checksigScript(5) }]
+      );
+      await mempool.addTransaction(tx);
+    }
+
+    const template = builder.createTemplate(Buffer.from([0x51]));
+    expect(template.transactions.length).toBe(2);
+    // Each tx: 5 legacy sigops * 4 = 20; total = 40
+    expect(template.totalSigOps).toBe(40);
+  });
+
+  test("running-total budget enforced: tx dropped when it would push block past 80,000 sigops", async () => {
+    // Two txs each with 15,000 OP_CHECKSIG: per-tx cost = 15,000 * 4 = 60,000.
+    // tx1 selected first (higher fee rate). Cumulative = 60,000 < 80,000 -> fits.
+    // tx2 would make cumulative = 120,000 > 80,000 -> dropped.
+    //
+    // Script size: 15,000 * 2 = 30,000 bytes. Vsize ~ 30,062 bytes.
+    // tx1 fee = 80,000 sat (rate ~2.66); tx2 fee = 35,000 sat (rate ~1.16).
+    // Both clear the 1 sat/vB minimum; tx1 is selected first due to higher rate.
+
+    const input1 = Buffer.alloc(32, 0x01);
+    const input2 = Buffer.alloc(32, 0x02);
+    // Give each input 10M sat so fee deduction is clear
+    await setupUTXO(input1, 0, 10_000_000n);
+    await setupUTXO(input2, 0, 10_000_000n);
+
+    // tx1: fee = 80,000 sat (rate ~2.66 sat/vB) -> selected first
+    const tx1 = createTestTx(
+      [{ txid: input1, vout: 0 }],
+      [{ value: 9_920_000n, scriptPubKey: checksigScript(15_000) }]
+    );
+    // tx2: fee = 35,000 sat (rate ~1.16 sat/vB) -> considered second, dropped
+    const tx2 = createTestTx(
+      [{ txid: input2, vout: 0 }],
+      [{ value: 9_965_000n, scriptPubKey: checksigScript(15_000) }]
+    );
+
+    const r1 = await mempool.addTransaction(tx1);
+    const r2 = await mempool.addTransaction(tx2);
+    expect(r1.accepted).toBe(true);
+    expect(r2.accepted).toBe(true);
+    expect(mempool.getSize()).toBe(2);
+
+    const template = builder.createTemplate(Buffer.from([0x51]));
+
+    const tx1Id = getTxId(tx1);
+    const tx2Id = getTxId(tx2);
+
+    const selectedIds = template.transactions.map(getTxId);
+    const has1 = selectedIds.some((id) => id.equals(tx1Id));
+    const has2 = selectedIds.some((id) => id.equals(tx2Id));
+
+    // tx1: cumulative 60,000 <= 79,999 -> included
+    expect(has1).toBe(true);
+    // tx2: cumulative would be 120,000 > 80,000 -> dropped
+    expect(has2).toBe(false);
+    // Running total must not exceed MAX_BLOCK_SIGOPS_COST
+    expect(template.totalSigOps).toBeLessThanOrEqual(REGTEST.maxBlockSigOpsCost);
+  });
+});
+
