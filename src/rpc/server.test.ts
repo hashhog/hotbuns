@@ -5,8 +5,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { RPCServer, RPCServerConfig, RPCServerDeps, RPCErrorCodes } from "./server.js";
 import { REGTEST } from "../consensus/params.js";
-import { getBlockHash, serializeBlockHeader } from "../validation/block.js";
+import { getBlockHash, serializeBlockHeader, computeWitnessMerkleRoot } from "../validation/block.js";
 import { BufferReader } from "../wire/serialization.js";
+import { hash256 } from "../crypto/primitives.js";
 
 // Mock implementations for dependencies
 
@@ -1132,6 +1133,106 @@ describe("RPCServer", () => {
       expect(result.result).toBeDefined();
       const returnedBits = parseInt(result.result.bits as string, 16);
       expect(returnedBits).toBe(REGTEST.powLimitBits);
+    });
+
+    // ─── BIP-141 witness commitment regression tests ──────────────────────
+    // Prior code emitted a placeholder "6a24aa21a9ed" + 32 zero bytes, which
+    // does not match the actual sha256d(witness_merkle_root || nonce).
+    // These tests verify the real algorithm is used.
+
+    it("empty template (coinbase-only) emits canonical witness commitment", async () => {
+      // REGTEST segwitHeight=1 and best height=100, so height 101 is post-segwit.
+      // Empty mempool → the block has only a coinbase.
+      // BIP-141: witness_merkle_root = merkle([0x00...00]) = 0x00...00
+      //          witness_commitment  = sha256d(zeros_32 || zeros_32)
+      //          commitment_script   = 0x6a24aa21a9ed || commitment (38 bytes)
+      const result = await rpcRequest(testPort, "getblocktemplate", [
+        { rules: ["segwit"] },
+      ]);
+
+      expect(result.result).toBeDefined();
+      const dwc: string = result.result.default_witness_commitment as string;
+      expect(dwc).toBeDefined();
+
+      // Script must be exactly 38 bytes = 76 hex chars.
+      expect(dwc.length).toBe(76);
+
+      // Must start with the BIP-141 OP_RETURN header.
+      expect(dwc.startsWith("6a24aa21a9ed")).toBe(true);
+
+      // Compute the expected commitment: sha256d(zero_32 || zero_32).
+      const wtxids = [Buffer.alloc(32, 0)]; // coinbase wtxid only
+      const witnessRoot = computeWitnessMerkleRoot(wtxids);
+      const commitment = hash256(Buffer.concat([witnessRoot, Buffer.alloc(32, 0)]));
+      const expected = "6a24aa21a9ed" + commitment.toString("hex");
+      expect(dwc).toBe(expected);
+    });
+
+    it("template with 3 mempool txs emits commitment over their wtxids", async () => {
+      // Add 3 non-witness transactions.  For legacy txs wtxid == txid (no
+      // witness field), so the commitment is sha256d(merkle([0, wtxid1, wtxid2, wtxid3]) || zeros).
+      const txid1 = Buffer.alloc(32, 1);
+      const txid2 = Buffer.alloc(32, 2);
+      const txid3 = Buffer.alloc(32, 3);
+
+      const makeLegacyTx = (txid: Buffer) => ({
+        tx: {
+          version: 2,
+          inputs: [{
+            prevOut: { txid: Buffer.alloc(32, 0), vout: 0 },
+            scriptSig: Buffer.alloc(0),
+            sequence: 0xffffffff,
+            witness: [],
+          }],
+          outputs: [{ value: 1000n, scriptPubKey: Buffer.alloc(25, 0) }],
+          lockTime: 0,
+        },
+        txid,
+        fee: 100n,
+        weight: 400,
+      });
+
+      mockMempool.addTestTransaction(txid1, makeLegacyTx(txid1));
+      mockMempool.addTestTransaction(txid2, makeLegacyTx(txid2));
+      mockMempool.addTestTransaction(txid3, makeLegacyTx(txid3));
+
+      const result = await rpcRequest(testPort, "getblocktemplate", [
+        { rules: ["segwit"] },
+      ]);
+
+      expect(result.result).toBeDefined();
+      expect(result.result.transactions).toHaveLength(3);
+
+      const dwc: string = result.result.default_witness_commitment as string;
+      expect(dwc).toBeDefined();
+      expect(dwc.length).toBe(76);
+      expect(dwc.startsWith("6a24aa21a9ed")).toBe(true);
+
+      // The `hash` field in each template tx is the wtxid (getWTxId result, hex).
+      // For legacy txs it equals the txid in internal byte order.
+      // Compute the expected commitment from the returned wtxids.
+      const templateTxs: Array<{ hash: string }> = result.result.transactions as any;
+      const wtxids = [
+        Buffer.alloc(32, 0), // coinbase zero
+        ...templateTxs.map(tx => Buffer.from(tx.hash, "hex")),
+      ];
+      const witnessRoot = computeWitnessMerkleRoot(wtxids);
+      const commitment = hash256(Buffer.concat([witnessRoot, Buffer.alloc(32, 0)]));
+      const expected = "6a24aa21a9ed" + commitment.toString("hex");
+      expect(dwc).toBe(expected);
+    });
+
+    it("commitment differs from the old placeholder zeros", async () => {
+      // Regression: the old code returned "6a24aa21a9ed" + "0".repeat(64)
+      // regardless of block content.  The real sha256d(zeros||zeros) is NOT
+      // 32 zero bytes.
+      const result = await rpcRequest(testPort, "getblocktemplate", [
+        { rules: ["segwit"] },
+      ]);
+
+      const dwc: string = result.result.default_witness_commitment as string;
+      const placeholder = "6a24aa21a9ed" + "0".repeat(64);
+      expect(dwc).not.toBe(placeholder);
     });
   });
 
