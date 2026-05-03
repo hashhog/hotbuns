@@ -990,6 +990,20 @@ export class ChainstateManager {
       throw new Error("No chain state available");
     }
 
+    // Refuse to overwrite an existing destination — matches Bitcoin Core's
+    // "<path> already exists. If you are sure this is what you want, move
+    // it out of the way first." guard in rpc/blockchain.cpp::dumptxoutset.
+    // The .incomplete temp is fine to overwrite (left over from a previous
+    // crashed dump).
+    try {
+      await fsp.access(filePath);
+      throw new Error(
+        `${filePath} already exists. If you are sure this is what you want, move it out of the way first.`
+      );
+    } catch (e: any) {
+      if (e?.code !== "ENOENT") throw e;
+    }
+
     // Compute UTXO set hash and count
     const { hash, coinsCount } = await computeUTXOSetHash(this.db, interruptCheck);
 
@@ -1006,127 +1020,160 @@ export class ChainstateManager {
       coinsCount,
     };
 
-    // Write to temporary file then rename
-    const tempPath = `${filePath}.tmp`;
-    const file = Bun.file(tempPath);
-    const writer = file.writer();
+    // Atomic-write protocol: write to "<path>.incomplete", fsync the fd,
+    // then atomically rename to <path>. Mirrors Bitcoin Core's flow in
+    // rpc/blockchain.cpp::dumptxoutset (temppath = path + ".incomplete";
+    // write; fsync; rename(temppath, path)). Until rename completes, the
+    // final path doesn't exist on disk so an operator copying it never
+    // sees a torn file.
+    const tempPath = `${filePath}.incomplete`;
+    let renamed = false;
+    let fh: FileHandle | null = null;
 
-    // Write header
-    const header = serializeSnapshotMetadata(metadata);
-    writer.write(header);
-
-    // Group coins by txid and write
-    const utxoPrefix = Buffer.from([DBPrefix.UTXO]);
-    const iterator = (this.db as any).db.iterator({
-      gte: utxoPrefix,
-      lt: Buffer.concat([Buffer.from([DBPrefix.UTXO + 1])]),
-    });
-
-    let currentTxid: Buffer | null = null;
-    let currentCoins: Array<{ vout: number; coin: Coin }> = [];
-    let coinsWritten = 0n;
-
-    // Mirrors Bitcoin Core's write_coins_to_file lambda in
-    // rpc/blockchain.cpp WriteUTXOSnapshot. The outer txid-group framing
-    // (txid, count, [vout, coin]...) uses wire-protocol CompactSize for
-    // count and vout, while each Coin uses Pieter's VARINT and
-    // TxOutCompression internally (see serializeCoinIntoWriter).
-    //
-    // CRITICAL ORDERING: Core's WriteUTXOSnapshot reads from a
-    // `std::map<uint32_t, Coin>` keyed by vout, so per-txid the vouts are
-    // emitted in NUMERIC order. LevelDB iterates this DB in byte-lex order
-    // on the [prefix=0x75][txid 32B][vout uint32_LE] key, which sorts
-    // vouts in LE-byte order — distinct from numeric order for any vout
-    // >= 256. Sorting `currentCoins` by `vout` numerically before flush
-    // restores byte-identity with Core's dumptxoutset on chains that
-    // contain high-vout txids (mainnet has 183,859 such txids at h=940k,
-    // max vout 13,106).
-    const flushTx = () => {
-      if (!currentTxid || currentCoins.length === 0) return;
-
-      if (currentCoins.length > 1) {
-        currentCoins.sort((a, b) => a.vout - b.vout);
+    const cleanupTemp = async () => {
+      try {
+        await fsp.unlink(tempPath);
+      } catch {
+        // Best-effort: missing temp is fine, surface nothing.
       }
-
-      const groupWriter = new BufferWriter();
-      // txid (32 bytes, raw).
-      groupWriter.writeBytes(currentTxid);
-      // CompactSize: number of outputs in this group.
-      groupWriter.writeVarInt(currentCoins.length);
-      for (const { vout, coin } of currentCoins) {
-        // CompactSize: vout index.
-        groupWriter.writeVarInt(vout);
-        // Coin: VARINT(code) || TxOutCompression.
-        serializeCoinIntoWriter(groupWriter, coin);
-      }
-      writer.write(groupWriter.toBuffer());
-
-      currentCoins = [];
     };
 
     try {
-      for await (const [key, value] of iterator) {
-        if (interruptCheck?.()) {
-          throw new Error("Interrupted");
+      fh = await fsp.open(tempPath, "w");
+
+      // Write header
+      const header = serializeSnapshotMetadata(metadata);
+      await fh.write(header);
+
+      // Group coins by txid and write
+      const utxoPrefix = Buffer.from([DBPrefix.UTXO]);
+      const iterator = (this.db as any).db.iterator({
+        gte: utxoPrefix,
+        lt: Buffer.concat([Buffer.from([DBPrefix.UTXO + 1])]),
+      });
+
+      let currentTxid: Buffer | null = null;
+      let currentCoins: Array<{ vout: number; coin: Coin }> = [];
+      let coinsWritten = 0n;
+
+      // Mirrors Bitcoin Core's write_coins_to_file lambda in
+      // rpc/blockchain.cpp WriteUTXOSnapshot. The outer txid-group
+      // framing (txid, count, [vout, coin]...) uses wire-protocol
+      // CompactSize for count and vout, while each Coin uses Pieter's
+      // VARINT and TxOutCompression internally (see
+      // serializeCoinIntoWriter).
+      //
+      // CRITICAL ORDERING: Core's WriteUTXOSnapshot reads from a
+      // `std::map<uint32_t, Coin>` keyed by vout, so per-txid the
+      // vouts are emitted in NUMERIC order. LevelDB iterates this DB
+      // in byte-lex order on the [prefix=0x75][txid 32B][vout
+      // uint32_LE] key, which sorts vouts in LE-byte order — distinct
+      // from numeric order for any vout >= 256. Sorting
+      // `currentCoins` by `vout` numerically before flush restores
+      // byte-identity with Core's dumptxoutset on chains that contain
+      // high-vout txids (mainnet has 183,859 such txids at h=940k,
+      // max vout 13,106).
+      const flushTx = async () => {
+        if (!currentTxid || currentCoins.length === 0) return;
+
+        if (currentCoins.length > 1) {
+          currentCoins.sort((a, b) => a.vout - b.vout);
         }
 
-        if (key.length !== 37) continue;
+        const groupWriter = new BufferWriter();
+        // txid (32 bytes, raw).
+        groupWriter.writeBytes(currentTxid);
+        // CompactSize: number of outputs in this group.
+        groupWriter.writeVarInt(currentCoins.length);
+        for (const { vout, coin } of currentCoins) {
+          // CompactSize: vout index.
+          groupWriter.writeVarInt(vout);
+          // Coin: VARINT(code) || TxOutCompression.
+          serializeCoinIntoWriter(groupWriter, coin);
+        }
+        await fh!.write(groupWriter.toBuffer());
 
-        const txid = key.subarray(1, 33);
-        const vout = key.readUInt32LE(33);
+        currentCoins = [];
+      };
 
-        // Deserialize UTXO entry stored in the local DB (uncompressed,
-        // matches UTXOManager.serializeUTXO format).
-        const entryReader = new BufferReader(value);
-        const height = entryReader.readUInt32LE();
-        const coinbase = entryReader.readUInt8() === 1;
-        const amount = entryReader.readUInt64LE();
-        const scriptPubKey = entryReader.readVarBytes();
+      try {
+        for await (const [key, value] of iterator) {
+          if (interruptCheck?.()) {
+            throw new Error("Interrupted");
+          }
 
-        const coin: Coin = {
-          txOut: { value: amount, scriptPubKey },
-          height,
-          isCoinbase: coinbase,
-        };
+          if (key.length !== 37) continue;
 
-        // Check if new transaction
-        if (!currentTxid || !txid.equals(currentTxid)) {
-          flushTx();
-          currentTxid = Buffer.from(txid);
+          const txid = key.subarray(1, 33);
+          const vout = key.readUInt32LE(33);
+
+          // Deserialize UTXO entry stored in the local DB
+          // (uncompressed, matches UTXOManager.serializeUTXO format).
+          const entryReader = new BufferReader(value);
+          const height = entryReader.readUInt32LE();
+          const coinbase = entryReader.readUInt8() === 1;
+          const amount = entryReader.readUInt64LE();
+          const scriptPubKey = entryReader.readVarBytes();
+
+          const coin: Coin = {
+            txOut: { value: amount, scriptPubKey },
+            height,
+            isCoinbase: coinbase,
+          };
+
+          // Check if new transaction
+          if (!currentTxid || !txid.equals(currentTxid)) {
+            await flushTx();
+            currentTxid = Buffer.from(txid);
+          }
+
+          currentCoins.push({ vout, coin });
+          coinsWritten++;
         }
 
-        currentCoins.push({ vout, coin });
-        coinsWritten++;
+        // Flush last transaction
+        await flushTx();
+      } finally {
+        await iterator.close();
       }
 
-      // Flush last transaction
-      flushTx();
+      // Durability barrier: fsync the fd before the atomic rename.
+      // Without this, a power loss between rename and dirty-page
+      // flush could leave <path> visible with zero-length / torn
+      // contents.
+      await fh.sync();
+      await fh.close();
+      fh = null;
+
+      // Atomic rename: temp -> final. After this point the snapshot
+      // file is visible to any concurrent reader.
+      await fsp.rename(tempPath, filePath);
+      renamed = true;
+
+      return {
+        coinsWritten,
+        baseHash: chainstate.bestBlockHash.toString("hex"),
+        baseHeight: chainstate.bestHeight,
+        path: filePath,
+        txoutsetHash: hash.toString("hex"),
+        nChainTx: 0n, // Would need to be computed from block index
+      };
     } finally {
-      await iterator.close();
+      // If we never made it to the rename, ensure the fd is closed
+      // and the .incomplete temp is removed so a SIGKILL or thrown
+      // exception leaves at most one orphan artifact (the temp,
+      // which can be cleaned up out-of-band) — never a torn <path>.
+      if (fh) {
+        try {
+          await fh.close();
+        } catch {
+          // Best-effort.
+        }
+      }
+      if (!renamed) {
+        await cleanupTemp();
+      }
     }
-
-    writer.end();
-
-    // Atomic rename
-    await Bun.write(filePath, Bun.file(tempPath));
-
-    // Delete temp file
-    try {
-      await Bun.file(tempPath).arrayBuffer(); // Force close
-      // Note: Bun doesn't have unlink, the temp file will be orphaned
-      // In production, use fs.unlink
-    } catch {
-      // Ignore
-    }
-
-    return {
-      coinsWritten,
-      baseHash: chainstate.bestBlockHash.toString("hex"),
-      baseHeight: chainstate.bestHeight,
-      path: filePath,
-      txoutsetHash: hash.toString("hex"),
-      nChainTx: 0n, // Would need to be computed from block index
-    };
   }
 
   /**
