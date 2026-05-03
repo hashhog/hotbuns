@@ -914,8 +914,13 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
       return false;
     }
 
-    // Count non-push opcodes
-    if (opcode > Opcode.OP_16) {
+    // Count non-push opcodes.
+    // BIP-342 (tapscript) exempts execution from MAX_OPS_PER_SCRIPT — Core's
+    // interpreter.cpp:450-455 only enforces this cap for SigVersion::BASE
+    // and SigVersion::WITNESS_V0. Inscriptions/ordinals routinely exceed
+    // 201 opcodes; e.g. mainnet block 944,279 tx 8775be68... vin[1] has
+    // ~701 non-push opcodes in a 282 KB tapscript.
+    if (opcode > Opcode.OP_16 && sigVersion !== SigVersion.TAPSCRIPT) {
       opCount++;
       if (opCount > MAX_OPS_PER_SCRIPT) {
         return false;
