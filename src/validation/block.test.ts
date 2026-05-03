@@ -15,6 +15,7 @@ import {
   getWitnessCommitment,
   validateBlockHeader,
   validateBlock,
+  computeMedianTimePast,
   getBlockWeight,
   getBlockBaseSize,
   getBlockTotalSize,
@@ -535,6 +536,111 @@ describe("validateBlockHeader", () => {
     const result = validateBlockHeader(genesisHeader, genesisHeader, REGTEST);
     expect(result.valid).toBe(false);
     expect(result.error).toContain("prevBlock");
+  });
+
+  // BIP-113 MTP-of-11 regression tests (Cat J fix -- 2026-05-03)
+  // Reference: bitcoin-core/src/validation.cpp:4092-4093
+
+  test("rejects block with timestamp == MTP (BIP-113 time-too-old)", () => {
+    // Core: block.GetBlockTime() <= pindexPrev->GetMedianTimePast() => INVALID.
+    // Equal is also rejected; the check is strictly-greater-than.
+    const genesis = getGenesisBlock(REGTEST);
+    const header: BlockHeader = {
+      version: genesis.header.version,
+      prevBlock: genesis.header.prevBlockHash,
+      merkleRoot: genesis.header.merkleRoot,
+      timestamp: genesis.header.timestamp,
+      bits: genesis.header.bits,
+      nonce: genesis.header.nonce,
+    };
+    // prevTimestamps[0] == genesis.timestamp, so MTP == genesis.timestamp
+    // header.timestamp == MTP -> must be rejected
+    const prevTimestamps = [genesis.header.timestamp];
+    const result = validateBlockHeader(header, null, REGTEST, prevTimestamps);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("time-too-old");
+  });
+
+  test("accepts block with timestamp = MTP + 1 (BIP-113)", () => {
+    // timestamp strictly greater than MTP must pass the gate.
+    const genesis = getGenesisBlock(REGTEST);
+    const mtp = genesis.header.timestamp;
+    const header: BlockHeader = {
+      version: genesis.header.version,
+      prevBlock: genesis.header.prevBlockHash,
+      merkleRoot: genesis.header.merkleRoot,
+      timestamp: mtp + 1,
+      bits: genesis.header.bits,
+      nonce: genesis.header.nonce,
+    };
+    const prevTimestamps = [mtp];
+    const result = validateBlockHeader(header, null, REGTEST, prevTimestamps);
+    expect(result.valid).toBe(true);
+  });
+
+  test("uses median of 11 timestamps, not just the latest (BIP-113)", () => {
+    // With timestamps [100, 200, 300, ..., 1100] the MTP (median of 11) = 600.
+    // A block with timestamp=601 must pass; timestamp=600 must fail.
+    const genesis = getGenesisBlock(REGTEST);
+    const prevTimestamps = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100];
+    const mtp = computeMedianTimePast(prevTimestamps); // should be 600
+
+    const headerFail: BlockHeader = {
+      version: genesis.header.version,
+      prevBlock: genesis.header.prevBlockHash,
+      merkleRoot: genesis.header.merkleRoot,
+      timestamp: mtp,    // == MTP -> fail
+      bits: genesis.header.bits,
+      nonce: genesis.header.nonce,
+    };
+    const resultFail = validateBlockHeader(headerFail, null, REGTEST, prevTimestamps);
+    expect(resultFail.valid).toBe(false);
+
+    const headerPass: BlockHeader = {
+      ...headerFail,
+      timestamp: mtp + 1, // > MTP -> pass
+    };
+    const resultPass = validateBlockHeader(headerPass, null, REGTEST, prevTimestamps);
+    expect(resultPass.valid).toBe(true);
+  });
+
+  test("skips MTP check when prevTimestamps is empty (genesis case)", () => {
+    // Empty prevTimestamps = no ancestors known; skip MTP check like Core does.
+    const genesis = getGenesisBlock(REGTEST);
+    const header: BlockHeader = {
+      version: genesis.header.version,
+      prevBlock: genesis.header.prevBlockHash,
+      merkleRoot: genesis.header.merkleRoot,
+      timestamp: genesis.header.timestamp,
+      bits: genesis.header.bits,
+      nonce: genesis.header.nonce,
+    };
+    const result = validateBlockHeader(header, null, REGTEST, []);
+    expect(result.valid).toBe(true);
+  });
+});
+
+describe("computeMedianTimePast", () => {
+  test("returns median of 11 timestamps", () => {
+    const ts = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100];
+    expect(computeMedianTimePast(ts)).toBe(600); // sorted[5] = 600
+  });
+
+  test("returns median of fewer than 11 timestamps", () => {
+    const ts = [300, 100, 200]; // sorted: [100,200,300], median = index 1 = 200
+    expect(computeMedianTimePast(ts)).toBe(200);
+  });
+
+  test("returns 0 for empty array", () => {
+    expect(computeMedianTimePast([])).toBe(0);
+  });
+
+  test("uses only first 11 when given more", () => {
+    // 15 timestamps; only first 11 are used, rest discarded
+    const ts = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15];
+    const result = computeMedianTimePast(ts);
+    // first 11: [1..11], sorted, median = index 5 = 6
+    expect(result).toBe(6);
   });
 });
 

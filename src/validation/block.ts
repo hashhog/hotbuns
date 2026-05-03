@@ -242,24 +242,57 @@ export function getWitnessCommitment(block: Block): Buffer | null {
 }
 
 /**
+ * Compute the Median Time Past (BIP-113) from an array of timestamps.
+ *
+ * Returns the median of up to 11 timestamps (sorted ascending, middle element).
+ * Returns 0 when the array is empty.
+ *
+ * Reference: Bitcoin Core chain.h GetMedianTimePast().
+ */
+export function computeMedianTimePast(timestamps: number[]): number {
+  if (timestamps.length === 0) return 0;
+  const n = Math.min(timestamps.length, 11);
+  const sorted = timestamps.slice(0, n).sort((a, b) => a - b);
+  return sorted[Math.floor(n / 2)];
+}
+
+/**
  * Validate a block header against consensus rules.
  *
  * Checks:
  * - Timestamp not too far in future (2 hours)
+ * - Timestamp > MTP-of-11 (BIP-113) when prevTimestamps are supplied
  * - Target does not exceed powLimit
  * - Proof of work (block hash <= target)
  * - prevBlock matches if provided
+ *
+ * @param prevTimestamps - Timestamps of the previous up to 11 blocks (index 0 =
+ *   the immediate parent), used to compute MTP-of-11 per BIP-113.  When omitted
+ *   or empty the MTP check is skipped (genesis / unknown ancestors).
+ *   Reference: bitcoin-core/src/validation.cpp:4092-4093.
  */
 export function validateBlockHeader(
   header: BlockHeader,
   prevHeader: BlockHeader | null,
-  params: ConsensusParams
+  params: ConsensusParams,
+  prevTimestamps?: number[]
 ): { valid: boolean; error?: string } {
   // Timestamp must not be more than 2 hours in the future
   // Check this first to avoid expensive PoW computation for obviously bad headers
   const maxFutureTime = Math.floor(Date.now() / 1000) + 2 * 60 * 60;
   if (header.timestamp > maxFutureTime) {
     return { valid: false, error: "Block timestamp too far in future" };
+  }
+
+  // BIP-113: block timestamp must be strictly greater than MTP of previous 11
+  // blocks.  Bitcoin Core validation.cpp:4092:
+  //   if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())
+  //     return state.Invalid(..., "time-too-old", ...)
+  if (prevTimestamps && prevTimestamps.length > 0) {
+    const mtp = computeMedianTimePast(prevTimestamps);
+    if (header.timestamp <= mtp) {
+      return { valid: false, error: `Block timestamp ${header.timestamp} <= MTP ${mtp} (time-too-old)` };
+    }
   }
 
   // Target must not exceed powLimit
@@ -285,14 +318,6 @@ export function validateBlockHeader(
     const prevHash = getBlockHash(prevHeader);
     if (!header.prevBlock.equals(prevHash)) {
       return { valid: false, error: "prevBlock does not match previous header hash" };
-    }
-
-    // Timestamp must be greater than median of previous 11 blocks
-    // (simplified: just check it's not before prev block)
-    // Full implementation would track median time past
-    if (header.timestamp <= prevHeader.timestamp - 7200) {
-      // Allow some leeway
-      return { valid: false, error: "Block timestamp too old" };
     }
   }
 
