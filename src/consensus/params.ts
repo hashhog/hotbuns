@@ -32,6 +32,7 @@ export interface ConsensusParams {
   readonly fPowAllowMinDifficultyBlocks: boolean; // true for testnet/regtest
   readonly fPowNoRetargeting: boolean; // true for regtest
   readonly enforce_BIP94: boolean; // true for testnet4
+  readonly bip16Height: number;
   readonly bip34Height: number;
   readonly bip65Height: number;
   readonly bip66Height: number;
@@ -338,6 +339,7 @@ export const MAINNET: ConsensusParams = {
   fPowAllowMinDifficultyBlocks: false,
   fPowNoRetargeting: false,
   enforce_BIP94: false,
+  bip16Height: 173805,
   bip34Height: 227931,
   bip65Height: 388381,
   bip66Height: 363725,
@@ -620,6 +622,7 @@ export const TESTNET: ConsensusParams = {
   fPowAllowMinDifficultyBlocks: true, // 20-minute rule enabled
   fPowNoRetargeting: false,
   enforce_BIP94: false,
+  bip16Height: 514,
   bip34Height: 21111,
   bip65Height: 581885,
   bip66Height: 330776,
@@ -730,6 +733,7 @@ export const TESTNET4: ConsensusParams = {
   fPowAllowMinDifficultyBlocks: true, // 20-minute rule enabled
   fPowNoRetargeting: false,
   enforce_BIP94: true, // Use first block of period for retargeting
+  bip16Height: 1,
   bip34Height: 1,
   bip65Height: 1,
   bip66Height: 1,
@@ -835,6 +839,7 @@ export const SIGNET: ConsensusParams = {
   fPowAllowMinDifficultyBlocks: false,
   fPowNoRetargeting: false,
   enforce_BIP94: false,
+  bip16Height: 1,
   bip34Height: 1,
   bip65Height: 1,
   bip66Height: 1,
@@ -878,6 +883,7 @@ export const REGTEST: ConsensusParams = {
   fPowAllowMinDifficultyBlocks: true,
   fPowNoRetargeting: true, // Always minimum difficulty
   enforce_BIP94: false,
+  bip16Height: 1,
   bip34Height: 500,
   bip65Height: 1351,
   bip66Height: 1251,
