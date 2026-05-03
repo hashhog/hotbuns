@@ -11,6 +11,7 @@
  */
 
 import type { ChainDB, BlockIndexRecord } from "../storage/database.js";
+import { DBPrefix } from "../storage/database.js";
 import {
   ConsensusParams,
   compactToBigInt,
@@ -786,6 +787,19 @@ export class HeaderSync {
 
   /**
    * Load header chain from database on startup.
+   *
+   * Performance: this used to walk the DB chain by prev-hash links via N
+   * serial async `getBlockIndex` calls (one round-trip per header on the
+   * back-walk *and* the forward-walk — ~2N round-trips total). At ~944k
+   * mainnet headers that pinned a single core at 100% CPU, ~1.5 KB/s
+   * LevelDB read rate, and made hotbuns effectively un-bootable post-IBD.
+   *
+   * The fast path uses a single LevelDB iterator pass over the
+   * `BLOCK_INDEX` keyspace to materialize every stored header record into
+   * an in-memory map (no async per-record), then walks the chain from
+   * genesis forward in pure-JS using the prevBlock pointers in each
+   * deserialized header. This is the same pattern used by
+   * `chain/snapshot.ts` for the UTXO set scan.
    */
   async loadFromDB(): Promise<void> {
     // Initialize genesis first
@@ -798,41 +812,73 @@ export class HeaderSync {
       return;
     }
 
-    // Load all headers from genesis to tip
-    // We'll rebuild the in-memory chain by loading each header
-    let currentHash = headerTip;
-    const headersToLoad: Buffer[] = [];
+    // ------------------------------------------------------------------
+    // Single-pass iterator: stream every BLOCK_INDEX record into RAM.
+    // Key   = [0x62] || hash(32)              -> 33 bytes
+    // Value = serialized BlockIndexRecord     -> 96 bytes
+    // ------------------------------------------------------------------
+    const blockIndexPrefix = Buffer.from([DBPrefix.BLOCK_INDEX]);
+    const blockIndexEnd = Buffer.from([DBPrefix.BLOCK_INDEX + 1]);
+    const iterator = (this.db as any).db.iterator({
+      gte: blockIndexPrefix,
+      lt: blockIndexEnd,
+    });
 
-    // Walk back from tip to genesis, collecting hashes
-    while (currentHash) {
-      const hashHex = currentHash.toString("hex");
-      if (this.headerChain.has(hashHex)) {
-        // We've reached a header we already have (genesis)
-        break;
+    /** hashHex -> { record, hash } */
+    const records = new Map<
+      string,
+      { record: BlockIndexRecord; hash: Buffer }
+    >();
+
+    try {
+      for await (const [key, value] of iterator) {
+        // Defensive: only consume well-formed [prefix(1) || hash(32)] keys.
+        if (key.length !== 33) continue;
+
+        // The iterator's key/value buffers may be reused on the next
+        // iteration in classic-level — copy what we keep.
+        const hash = Buffer.from(key.subarray(1, 33));
+        const hashHex = hash.toString("hex");
+
+        // Skip genesis: we already inserted a fully-formed entry via
+        // initGenesis() and it has no parent.
+        if (hashHex === this.params.genesisBlockHash.toString("hex")) {
+          continue;
+        }
+
+        // Deserialize the 96-byte fixed-layout BlockIndexRecord inline so
+        // we copy the header bytes once (the iterator buffer is volatile).
+        if (value.length < 96) continue;
+        const record: BlockIndexRecord = {
+          height: value.readUInt32LE(0),
+          header: Buffer.from(value.subarray(4, 84)),
+          nTx: value.readUInt32LE(84),
+          status: value.readUInt32LE(88),
+          dataPos: value.readUInt32LE(92),
+        };
+
+        records.set(hashHex, { record, hash });
       }
-
-      headersToLoad.unshift(currentHash);
-
-      // Get this header's record
-      const record = await this.db.getBlockIndex(currentHash);
-      if (!record) {
-        console.warn(`Missing block index for ${hashHex.slice(0, 16)}...`);
-        break;
-      }
-
-      // Extract prevBlock from header
-      const prevBlock = record.header.subarray(4, 36);
-      currentHash = prevBlock;
+    } finally {
+      await iterator.close();
     }
 
-    // Now load headers from genesis forward
-    for (const hash of headersToLoad) {
-      const record = await this.db.getBlockIndex(hash);
-      if (!record) {
-        continue;
-      }
+    if (records.size === 0) {
+      // Header tip was set but no records exist — degenerate state, nothing
+      // to load beyond genesis.
+      return;
+    }
 
-      // Parse header from record
+    // ------------------------------------------------------------------
+    // Build the chain in height order. Each record carries its height,
+    // so we can sort once and walk forward, computing chainWork from the
+    // parent already in `headerChain` (genesis is pre-seeded).
+    // ------------------------------------------------------------------
+    const sorted = Array.from(records.values()).sort(
+      (a, b) => a.record.height - b.record.height,
+    );
+
+    for (const { record, hash } of sorted) {
       const headerBuf = record.header;
       const header: BlockHeader = {
         version: headerBuf.readInt32LE(0),
@@ -843,37 +889,38 @@ export class HeaderSync {
         nonce: headerBuf.readUInt32LE(76),
       };
 
-      // Find parent
       const parentHashHex = header.prevBlock.toString("hex");
       const parent = this.headerChain.get(parentHashHex);
-
       if (!parent) {
-        console.warn(`Missing parent for header at height ${record.height}`);
+        // Parent not yet loaded — this can legitimately happen for
+        // orphans/forks whose ancestor chain wasn't persisted, or for a
+        // partially-corrupt index. Don't crash the boot; skip and let the
+        // header sync re-fetch on next round-trip.
+        console.warn(
+          `Missing parent for header at height ${record.height} ` +
+            `(${hash.toString("hex").slice(0, 16)}...)`,
+        );
         continue;
       }
 
-      // Calculate chain work
       const headerWork = this.getHeaderWork(header.bits);
       const chainWork = parent.chainWork + headerWork;
 
-      // Determine status from record
       let status: HeaderStatus = "valid-header";
       if ((record.status & 1) === 0) {
         status = "invalid";
       }
 
       const entry: HeaderChainEntry = {
-        hash: Buffer.from(hash),
+        hash,
         header,
         height: record.height,
         chainWork,
         status,
       };
 
-      const hashHex = hash.toString("hex");
-      this.headerChain.set(hashHex, entry);
+      this.headerChain.set(hash.toString("hex"), entry);
 
-      // Track best header
       if (!this.bestHeader || chainWork > this.bestHeader.chainWork) {
         this.bestHeader = entry;
       }
