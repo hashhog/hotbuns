@@ -509,4 +509,114 @@ describe("ChainStateManager", () => {
       expect(chainState.getBestBlock().height).toBe(3);
     });
   });
+
+  describe("BIP-30 exception heights", () => {
+    // Verify the params carry the correct exception heights.
+    // The enforcement logic is tested via connectBlock with a MAINNET-like
+    // params stub (since on REGTEST BIP-34 is always active, making the
+    // duplicate-check a no-op — exactly as Core behaves).
+    test("MAINNET has exception heights [91842, 91880]", async () => {
+      const { MAINNET } = await import("../consensus/params.js");
+      expect(MAINNET.bip30ExceptionHeights).toEqual([91842, 91880]);
+    });
+
+    test("REGTEST has empty exception heights []", async () => {
+      expect(REGTEST.bip30ExceptionHeights).toEqual([]);
+    });
+
+    test("old wrong heights 91722 and 91812 are NOT in MAINNET exceptions", async () => {
+      const { MAINNET } = await import("../consensus/params.js");
+      expect(MAINNET.bip30ExceptionHeights).not.toContain(91722);
+      expect(MAINNET.bip30ExceptionHeights).not.toContain(91812);
+    });
+
+    test("connectBlock with MAINNET-like params enforces BIP-30 at h=91843", async () => {
+      // Build a custom params where BIP34 is not yet active at h=91843.
+      // This allows us to test the enforcement path (outside the BIP34 skip window).
+      const { MAINNET } = await import("../consensus/params.js");
+      const customParams = {
+        ...MAINNET,
+        bip34Height: 200_000, // Push BIP34 past the test height
+      };
+
+      // Use a fresh ChainStateManager with custom params
+      const testDir = await mkdtemp(join(tmpdir(), "bip30-test-"));
+      const testDb = new ChainDB(testDir);
+      await testDb.open();
+      const testChainState = new ChainStateManager(testDb, customParams);
+      await testChainState.load();
+
+      try {
+        // Connect block 1 with a specific coinbase txid
+        const coinbase1 = createCoinbaseTx(1, 50_00000000n);
+        const block1 = createBlock(customParams.genesisBlockHash, [coinbase1]);
+        await testChainState.connectBlock(block1, 1);
+
+        // Get the txid of the coinbase we just connected
+        const coinbase1Txid = getTxId(coinbase1);
+
+        // Now build another block at h=91843 that reuses the SAME coinbase tx
+        // (different height so different BIP34 encoding, but in our custom params
+        // BIP34 is not active yet, so the same raw tx produces the same txid).
+        // Actually the simplest test: use a transaction whose txid collides with
+        // an already-connected UTXO. We'll craft a coinbase with the same
+        // scriptSig as coinbase1 (so same txid).
+        const coinbaseDup = { ...coinbase1 }; // exact same tx → same txid
+
+        // This block at h=91843 attempts to add outputs whose txid already exists
+        // in the UTXO set → must throw BIP30_DUPLICATE_OUTPUT.
+        const prevHash1 = getBlockHash(block1.header);
+        const blockDup = createBlock(prevHash1, [coinbaseDup]);
+
+        await expect(
+          testChainState.connectBlock(blockDup, 91843)
+        ).rejects.toThrow("bad-txns-BIP30");
+      } finally {
+        await testDb.close();
+        await rm(testDir, { recursive: true, force: true });
+      }
+    });
+
+    test("connectBlock with MAINNET-like params allows h=91842 (exempt)", async () => {
+      const { MAINNET } = await import("../consensus/params.js");
+      const customParams = {
+        ...MAINNET,
+        bip34Height: 200_000, // BIP34 not active at h=91842
+      };
+
+      const testDir = await mkdtemp(join(tmpdir(), "bip30-exempt-test-"));
+      const testDb = new ChainDB(testDir);
+      await testDb.open();
+      const testChainState = new ChainStateManager(testDb, customParams);
+      await testChainState.load();
+
+      try {
+        // Connect block 1
+        const coinbase1 = createCoinbaseTx(1, 50_00000000n);
+        const block1 = createBlock(customParams.genesisBlockHash, [coinbase1]);
+        await testChainState.connectBlock(block1, 1);
+
+        // Duplicate coinbase at h=91842 (exempt height) must NOT throw BIP30.
+        // It may fail for other reasons (e.g., coinbase maturity, subsidy), but
+        // not specifically "bad-txns-BIP30".
+        const coinbaseDup = { ...coinbase1 };
+        const prevHash1 = getBlockHash(block1.header);
+        const blockDup = createBlock(prevHash1, [coinbaseDup]);
+
+        let threwBip30 = false;
+        try {
+          await testChainState.connectBlock(blockDup, 91842);
+        } catch (e: unknown) {
+          if (e instanceof Error && e.message.includes("bad-txns-BIP30")) {
+            threwBip30 = true;
+          }
+          // Other errors (coinbase value, etc.) are fine — BIP30 is exempt
+        }
+        expect(threwBip30).toBe(false);
+      } finally {
+        await testDb.close();
+        await rm(testDir, { recursive: true, force: true });
+      }
+    });
+  });
 });
