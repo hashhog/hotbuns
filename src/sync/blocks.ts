@@ -1465,7 +1465,12 @@ export class BlockSync {
       // ============================================================
       // FULL VALIDATION PATH
       // ============================================================
-      const verifyP2SH = height >= this.params.bip34Height;
+      // BIP-16 (P2SH) activates at its own height, NOT BIP-34's. Mainnet:
+      // BIP-16 = 173,805; BIP-34 = 227,931. Pre-fix used bip34Height which
+      // gated P2SH-aware sigops counting on the wrong height (also passed
+      // to inline scriptFlags below, but those are dead-weight today since
+      // verifyInputSignature hardcodes the post-Taproot flag set).
+      const verifyP2SH = height >= this.params.bip16Height;
       const verifyWitness = height >= this.params.segwitHeight;
 
       let totalSigOpsCost = 0;
