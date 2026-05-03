@@ -318,24 +318,47 @@ describe("SCRIPT_VERIFY_NULLFAIL - OP_CHECKMULTISIG", () => {
   });
 });
 
-describe("SCRIPT_VERIFY_NULLFAIL - getConsensusFlags", () => {
-  test("NULLFAIL disabled before segwit activation (height 481823)", () => {
+/**
+ * NULLFAIL is a STANDARD_SCRIPT_VERIFY_FLAG (policy only) per Bitcoin Core
+ * policy/policy.h:125.  getConsensusFlags() must NOT include it at any height.
+ * Use getStandardFlags() for mempool acceptance which does include it.
+ *
+ * Ref: Bitcoin Core validation.cpp:2250-2289 (GetBlockScriptFlags).
+ */
+import { getStandardFlags } from "../script/interpreter.js";
+
+describe("SCRIPT_VERIFY_NULLFAIL - getConsensusFlags (consensus path)", () => {
+  test("NULLFAIL absent from consensus flags before segwit (height 481823)", () => {
     const flags = getConsensusFlags(481823);
     expect(flags.verifyNullFail).toBe(false);
   });
 
-  test("NULLFAIL enabled at segwit activation (height 481824)", () => {
+  test("NULLFAIL absent from consensus flags at segwit activation (height 481824)", () => {
+    // NULLFAIL is policy-only — must NOT be in the consensus block-script-flag computer.
     const flags = getConsensusFlags(481824);
-    expect(flags.verifyNullFail).toBe(true);
+    expect(flags.verifyNullFail).toBe(false);
   });
 
-  test("NULLFAIL enabled after segwit activation (height 500000)", () => {
+  test("NULLFAIL absent from consensus flags after segwit (height 500000)", () => {
     const flags = getConsensusFlags(500000);
+    expect(flags.verifyNullFail).toBe(false);
+  });
+
+  test("NULLFAIL absent from consensus flags at genesis (height 0)", () => {
+    const flags = getConsensusFlags(0);
+    expect(flags.verifyNullFail).toBe(false);
+  });
+});
+
+describe("SCRIPT_VERIFY_NULLFAIL - getStandardFlags (mempool path)", () => {
+  test("NULLFAIL present in standard flags at segwit activation (height 481824)", () => {
+    // Mempool uses getStandardFlags() which does include policy flags.
+    const flags = getStandardFlags(481824);
     expect(flags.verifyNullFail).toBe(true);
   });
 
-  test("NULLFAIL disabled at genesis (height 0)", () => {
-    const flags = getConsensusFlags(0);
+  test("NULLFAIL absent from standard flags before segwit (height 481823)", () => {
+    const flags = getStandardFlags(481823);
     expect(flags.verifyNullFail).toBe(false);
   });
 });
