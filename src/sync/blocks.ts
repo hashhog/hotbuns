@@ -143,6 +143,28 @@ export function classifyCallbackError(
   return "unknown";
 }
 
+/**
+ * Map a connectBlock error string to a canonical BIP-22 result token.
+ * Returns the most specific BIP-22 string possible, or "rejected" as fallback.
+ * Reference: Bitcoin Core BIP22ValidationResult() in src/rpc/mining.cpp.
+ */
+function bip22FromConnectError(err: string): string {
+  const s = err.toLowerCase();
+  if (s.includes("non-final") || s.includes("nonfinal") || s.includes("bad-txns-nonfinal"))
+    return "bad-txns-nonfinal";
+  if (s.includes("missing") && s.includes("utxo")) return "bad-txns-inputs-missingorspent";
+  if (s.includes("missing utxo") || s.includes("inputs-missingorspent"))
+    return "bad-txns-inputs-missingorspent";
+  if (s.includes("coinbase") && s.includes("immature")) return "bad-txns-premature-spend-of-coinbase";
+  if (s.includes("sigops")) return "bad-blk-sigops";
+  if (s.includes("merkle")) return "bad-txnmrklroot";
+  if (s.includes("witness commitment")) return "bad-witness-merkle-match";
+  if (s.includes("coinbase scriptsig") || s.includes("bad-cb-length")) return "bad-cb-length";
+  if (s.includes("bip34") || s.includes("bad-cb-height")) return "bad-cb-height";
+  if (s.includes("high-hash") || s.includes("proof of work")) return "high-hash";
+  return "rejected";
+}
+
 /** Maximum blocks in-flight at once (across all peers). */
 const DEFAULT_WINDOW_SIZE = 512;
 
@@ -660,11 +682,33 @@ export class BlockSync {
     // Store in downloaded blocks
     this.state.downloadedBlocks.set(hashHex, block);
 
+    // Snapshot height before processing so we can detect if the block
+    // was rejected (processOrderedBlocks is void — failure is implicit).
+    const heightBefore = this.state.nextHeightToProcess;
+    const injectedHeight = headerEntry.height;
+
     // Try to process blocks in order
     await this.processOrderedBlocks();
 
     // Request more blocks if needed
     this.requestBlocks();
+
+    // BIP-22 rejection propagation: if the injected block was next in line
+    // but nextHeightToProcess did not advance, connectBlock rejected it.
+    // Propagate the rejection reason as a BIP-22 string so the caller
+    // (submitblock RPC) can return the right error rather than null (= success).
+    // Without this, the harness sees chain-height unchanged → classifies as
+    // "accept (chain didn't advance)" which is incorrect.
+    if (injectedHeight === heightBefore && this.state.nextHeightToProcess <= heightBefore) {
+      const err = this.lastConnectError;
+      if (err.includes("non-final") || err.includes("nonfinal") || err.includes("bad-txns-nonfinal")) {
+        return "bad-txns-nonfinal";
+      }
+      if (err) {
+        // Map other connectBlock failures to BIP-22 strings.
+        return bip22FromConnectError(err);
+      }
+    }
 
     return null; // success
   }
