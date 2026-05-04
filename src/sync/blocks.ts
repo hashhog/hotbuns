@@ -156,6 +156,7 @@ function bip22FromConnectError(err: string): string {
   if (s.includes("missing utxo") || s.includes("inputs-missingorspent"))
     return "bad-txns-inputs-missingorspent";
   if (s.includes("coinbase") && s.includes("immature")) return "bad-txns-premature-spend-of-coinbase";
+  if ((s.includes("coinbase value") || s.includes("coinbase output")) && s.includes("exceeds")) return "bad-cb-amount";
   if (s.includes("sigops")) return "bad-blk-sigops";
   if (s.includes("merkle")) return "bad-txnmrklroot";
   if (s.includes("witness commitment")) return "bad-witness-merkle-match";
@@ -1479,9 +1480,17 @@ export class BlockSync {
     if (assumeValid) {
       // ============================================================
       // ASSUME-VALID FAST PATH: minimal work, no validation overhead.
-      // Skip: maturity checks, BIP68, sigops, coinbase value, undo data.
-      // Only: spend inputs, add outputs, compute txids.
+      // Skip: maturity checks, BIP68, sigops, undo data.
+      // Always run: coinbase-value check (consensus-critical arithmetic,
+      // never skipped by assumevalid in Bitcoin Core ConnectBlock).
+      // Reference: Bitcoin Core validation.cpp::ConnectBlock —
+      //   block_reward = nFees + GetBlockSubsidy(height);
+      //   if (block.vtx[0]->GetValueOut() > block_reward) → bad-cb-amount
+      // fScriptChecks (assumevalid) only gates signature/script checking.
       // ============================================================
+      let avTotalInputValue = 0n;
+      let avTotalOutputValue = 0n;
+
       for (const tx of block.transactions) {
         const txid = getTxId(tx);
         const isCoinbaseTx = isCoinbase(tx);
@@ -1499,11 +1508,34 @@ export class BlockSync {
                 return false;
               }
             }
-            this.utxoManager.spendOutput(input.prevOut);
+            const spentEntry = this.utxoManager.spendOutput(input.prevOut);
+            avTotalInputValue += spentEntry.amount;
           }
         }
 
+        for (const output of tx.outputs) {
+          avTotalOutputValue += output.value;
+        }
+
         this.utxoManager.addTransaction(txid, tx, height, isCoinbaseTx);
+      }
+
+      // Coinbase-value check: consensus-critical, runs even under assumevalid.
+      // Matches full-validation path below (lines ~1697-1712) and Bitcoin Core
+      // ConnectBlock (validation.cpp:2610-2614).
+      const avCoinbaseTx = block.transactions[0];
+      let avCoinbaseOutputValue = 0n;
+      for (const output of avCoinbaseTx.outputs) {
+        avCoinbaseOutputValue += output.value;
+      }
+      const avSubsidy = getBlockSubsidy(height, this.params);
+      const avFees = avTotalInputValue - (avTotalOutputValue - avCoinbaseOutputValue);
+      const avMaxCoinbaseValue = avSubsidy + avFees;
+      if (avCoinbaseOutputValue > avMaxCoinbaseValue) {
+        const m = `Coinbase value ${avCoinbaseOutputValue} exceeds maximum ${avMaxCoinbaseValue} at height ${height}`;
+        console.warn(m);
+        this.recordConnectError(m);
+        return false;
       }
     } else {
       // ============================================================
