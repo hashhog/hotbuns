@@ -151,7 +151,9 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
     case ConsensusErrorCode.CHECKSIG_FAILED:
     case ConsensusErrorCode.CHECKMULTISIG_FAILED:
     case ConsensusErrorCode.WITNESS_PROGRAM_MISMATCH:
-      return "mandatory-script-verify-flag-failed";
+      // Connect-block (submitblock) stage canonical string per Bitcoin Core
+      // validation.cpp:2122 strprintf("block-script-verify-flag-failed (%s)", ...).
+      return "block-script-verify-flag-failed";
     case ConsensusErrorCode.SEQUENCE_LOCK_NOT_SATISFIED:
       return "bad-txns-nonfinal";
 
@@ -209,12 +211,15 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
   }
   if (
     s.includes("script") ||
+    s.includes("block-script-verify-flag-failed") ||
     s.includes("mandatory-script-verify-flag-failed") ||
     s.includes("checksig") ||
     s.includes("tapscript") ||
     s.includes("witness program")
   ) {
-    return "mandatory-script-verify-flag-failed";
+    // Connect-block (submitblock) stage canonical string per Bitcoin Core
+    // validation.cpp:2122 strprintf("block-script-verify-flag-failed (%s)", ...).
+    return "block-script-verify-flag-failed";
   }
   if (s.includes("time-too-old") || (s.includes("timestamp") && s.includes("too old"))) {
     return "time-too-old";

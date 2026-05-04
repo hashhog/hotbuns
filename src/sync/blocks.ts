@@ -163,6 +163,12 @@ function bip22FromConnectError(err: string): string {
   if (s.includes("coinbase scriptsig") || s.includes("bad-cb-length")) return "bad-cb-length";
   if (s.includes("bip34") || s.includes("bad-cb-height")) return "bad-cb-height";
   if (s.includes("high-hash") || s.includes("proof of work")) return "high-hash";
+  // Connect-block script verification failures.
+  // Bitcoin Core validation.cpp:2122 uses "block-script-verify-flag-failed (%s)".
+  if (s.includes("script") || s.includes("checksig") || s.includes("tapscript") ||
+      s.includes("witness program") || s.includes("script verify") || s.includes("block-script-verify")) {
+    return "block-script-verify-flag-failed";
+  }
   return "rejected";
 }
 

@@ -911,7 +911,10 @@ export const REGTEST: ConsensusParams = {
   // No minimum work for regtest (allows immediate sync)
   nMinimumChainWork: 0n,
   // Regtest has NO assumevalid: every script is verified for test determinism.
-  // Explicitly override the MAINNET hash spread-in above.
+  // Explicitly override the MAINNET values spread-in above.
+  // assumeValidHeight must be 0 (not the mainnet 938343 inherited via ...MAINNET)
+  // so that assumeValid = (0 > 0 && ...) = false and all scripts run.
+  assumeValidHeight: 0,
   assumedValid: undefined,
   // assumeUTXO: regtest allows any snapshot for testing
   assumeutxo: new Map(),
