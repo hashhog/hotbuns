@@ -140,6 +140,9 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
     // Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
     case ConsensusErrorCode.BAD_TXNS_VOUT_NEGATIVE:
       return "bad-txns-vout-negative";
+    // Output value > MAX_MONEY (consensus/tx_check.cpp::CheckTransaction — Core parity)
+    case ConsensusErrorCode.BAD_TXNS_VOUT_TOOLARGE:
+      return "bad-txns-vout-toolarge";
     case ConsensusErrorCode.DUPLICATE_INPUTS:
       return "bad-txns-duplicate";
     case ConsensusErrorCode.MISSING_INPUTS:
@@ -198,6 +201,11 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
   // Mirrors consensus/tx_check.cpp::CheckTransaction.
   if (s.includes("negative output")) {
     return "bad-txns-vout-negative";
+  }
+  // Output value > MAX_MONEY: validateTxBasic returns "Output value exceeds maximum" (tx.ts).
+  // Mirrors consensus/tx_check.cpp::CheckTransaction.
+  if (s.includes("output value exceeds maximum")) {
+    return "bad-txns-vout-toolarge";
   }
   if (
     s.includes("script") ||
