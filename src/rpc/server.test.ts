@@ -5,7 +5,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { RPCServer, RPCServerConfig, RPCServerDeps, RPCErrorCodes } from "./server.js";
 import { REGTEST } from "../consensus/params.js";
-import { getBlockHash, serializeBlockHeader, serializeBlock, computeWitnessMerkleRoot, computeMerkleRoot } from "../validation/block.js";
+import { getBlockHash, serializeBlockHeader, serializeBlock, computeWitnessMerkleRoot, computeMerkleRoot, encodeBip34Height } from "../validation/block.js";
 import { getTxId, serializeTx } from "../validation/tx.js";
 import { BufferReader } from "../wire/serialization.js";
 import { hash256 } from "../crypto/primitives.js";
@@ -1686,11 +1686,17 @@ describe("RPCServer", () => {
     } = {}): string {
       // Minimal coinbase transaction using the correct Transaction field names.
       // Coinbase: prevOut.txid must be all zeros (not 0xff) for isCoinbase() to pass.
+      // approxHeight = bestHeader.height + 1 = 101; encode canonically (Core parity).
+      const approxHeight = 101;
+      const heightEnc = encodeBip34Height(approxHeight);
+      const scriptSig = heightEnc.length < 2
+        ? Buffer.concat([heightEnc, Buffer.from([0x00])])
+        : heightEnc;
       const coinbaseTx: import("../validation/tx.js").Transaction = {
         version: 1,
         inputs: [{
           prevOut: { txid: Buffer.alloc(32, 0), vout: 0xffffffff },
-          scriptSig: Buffer.from([0x01, 0x00]), // height = 0
+          scriptSig,
           sequence: 0xffffffff,
           witness: [],
         }],
