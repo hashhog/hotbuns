@@ -158,6 +158,7 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
   const s = String(code).toLowerCase();
 
   if (s === "bad-cb-height") return "bad-cb-height"; // already canonical
+  if (s === "bad-cb-length") return "bad-cb-length"; // already canonical
   if (s === "inconclusive") return "inconclusive";
   if (s === "duplicate") return "duplicate";
   if (s === "duplicate-invalid") return "duplicate-invalid";
