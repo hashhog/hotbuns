@@ -970,10 +970,19 @@ export function validateTxBasic(tx: Transaction): { valid: boolean; error?: stri
   }
 
   // Check output values
+  // NOTE: value is deserialized from wire as uint64 (readUInt64LE), but Bitcoin's
+  // wire format is signed int64.  A negative wire value (e.g. -1 = 0xffffffffffffffff)
+  // will have the high bit set, producing a large unsigned bigint.  We must
+  // reinterpret as signed before the negative check — mirrors Bitcoin Core
+  // consensus/tx_check.cpp::CheckTransaction (negative check before toolarge).
+  const INT64_MAX = 0x7fffffffffffffffn;
+  const UINT64_WRAP = 0x10000000000000000n; // 2^64
   let totalOutput = 0n;
   for (const output of tx.outputs) {
-    // Value must be non-negative
-    if (output.value < 0n) {
+    // Reinterpret uint64 as int64: if high bit is set, value is negative.
+    const signedValue = output.value > INT64_MAX ? output.value - UINT64_WRAP : output.value;
+    // Value must be non-negative (consensus/tx_check.cpp::CheckTransaction)
+    if (signedValue < 0n) {
       return { valid: false, error: "Negative output value" };
     }
 
