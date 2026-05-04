@@ -7502,7 +7502,7 @@ var init_params = __esm(() => {
     fPowNoRetargeting: true,
     enforce_BIP94: false,
     bip16Height: 1,
-    bip34Height: 500,
+    bip34Height: 1,
     bip65Height: 1351,
     bip66Height: 1251,
     csvHeight: 0,
@@ -7514,6 +7514,7 @@ var init_params = __esm(() => {
     dnsSeed: [],
     checkpoints: new Map,
     nMinimumChainWork: 0n,
+    assumeValidHeight: 0,
     assumedValid: undefined,
     assumeutxo: new Map
   };
@@ -9906,9 +9907,12 @@ function validateTxBasic(tx) {
     }
     seenOutpoints.add(key);
   }
+  const INT64_MAX = 0x7fffffffffffffffn;
+  const UINT64_WRAP = 0x10000000000000000n;
   let totalOutput = 0n;
   for (const output of tx.outputs) {
-    if (output.value < 0n) {
+    const signedValue = output.value > INT64_MAX ? output.value - UINT64_WRAP : output.value;
+    if (signedValue < 0n) {
       return { valid: false, error: "Negative output value" };
     }
     if (output.value > 2100000000000000n) {
@@ -11823,7 +11827,6 @@ function encodeFileNum(fileNum) {
 }
 
 // src/chain/state.ts
-init_params();
 init_block();
 init_tx();
 
@@ -12446,7 +12449,8 @@ var REJECT_CODES = {
   ["BAD_COINBASE_VALUE" /* BAD_COINBASE_VALUE */]: 16,
   ["SEQUENCE_LOCK_NOT_SATISFIED" /* SEQUENCE_LOCK_NOT_SATISFIED */]: 16,
   ["CHECKPOINT_MISMATCH" /* CHECKPOINT_MISMATCH */]: 16,
-  ["BIP30_DUPLICATE_OUTPUT" /* BIP30_DUPLICATE_OUTPUT */]: 16
+  ["BIP30_DUPLICATE_OUTPUT" /* BIP30_DUPLICATE_OUTPUT */]: 16,
+  ["CONNECT_BLOCK_FAILED" /* CONNECT_BLOCK_FAILED */]: 16
 };
 function bip22Result(code) {
   if (code === null || code === undefined) {
@@ -12469,6 +12473,10 @@ function bip22Result(code) {
       return "time-too-old";
     case "BLOCK_TIME_TOO_NEW" /* BLOCK_TIME_TOO_NEW */:
       return "time-too-new";
+    case "BAD_TXNS_VOUT_NEGATIVE" /* BAD_TXNS_VOUT_NEGATIVE */:
+      return "bad-txns-vout-negative";
+    case "BAD_TXNS_VOUT_TOOLARGE" /* BAD_TXNS_VOUT_TOOLARGE */:
+      return "bad-txns-vout-toolarge";
     case "DUPLICATE_INPUTS" /* DUPLICATE_INPUTS */:
       return "bad-txns-duplicate";
     case "MISSING_INPUTS" /* MISSING_INPUTS */:
@@ -12477,7 +12485,7 @@ function bip22Result(code) {
     case "CHECKSIG_FAILED" /* CHECKSIG_FAILED */:
     case "CHECKMULTISIG_FAILED" /* CHECKMULTISIG_FAILED */:
     case "WITNESS_PROGRAM_MISMATCH" /* WITNESS_PROGRAM_MISMATCH */:
-      return "mandatory-script-verify-flag-failed";
+      return "block-script-verify-flag-failed";
     case "SEQUENCE_LOCK_NOT_SATISFIED" /* SEQUENCE_LOCK_NOT_SATISFIED */:
       return "bad-txns-nonfinal";
     default:
@@ -12521,8 +12529,14 @@ function bip22Result(code) {
   if (s.includes("missing") && s.includes("input")) {
     return "bad-txns-inputs-missingorspent";
   }
-  if (s.includes("script") || s.includes("mandatory-script-verify-flag-failed") || s.includes("checksig") || s.includes("tapscript") || s.includes("witness program")) {
-    return "mandatory-script-verify-flag-failed";
+  if (s.includes("negative output")) {
+    return "bad-txns-vout-negative";
+  }
+  if (s.includes("output value exceeds maximum")) {
+    return "bad-txns-vout-toolarge";
+  }
+  if (s.includes("script") || s.includes("block-script-verify-flag-failed") || s.includes("mandatory-script-verify-flag-failed") || s.includes("checksig") || s.includes("tapscript") || s.includes("witness program")) {
+    return "block-script-verify-flag-failed";
   }
   if (s.includes("time-too-old") || s.includes("timestamp") && s.includes("too old")) {
     return "time-too-old";
@@ -12575,6 +12589,253 @@ class SigCache {
   }
 }
 var globalSigCache = new SigCache;
+
+// src/consensus/connect_block.ts
+init_params();
+init_block();
+init_tx();
+
+// src/mining/template.ts
+init_params();
+init_tx();
+init_block();
+init_primitives();
+var LOCKTIME_THRESHOLD = 500000000;
+function isFinalTx(tx, blockHeight, blockTime) {
+  if (tx.lockTime === 0) {
+    return true;
+  }
+  const lockTimeThreshold = tx.lockTime < LOCKTIME_THRESHOLD ? blockHeight : blockTime;
+  if (tx.lockTime < lockTimeThreshold) {
+    return true;
+  }
+  for (const input of tx.inputs) {
+    if (input.sequence !== 4294967295) {
+      return false;
+    }
+  }
+  return true;
+}
+var WITNESS_COMMITMENT_HEADER = Buffer.from([106, 36, 170, 33, 169, 237]);
+
+// src/consensus/connect_block.ts
+async function coreConnectBlockChecks(block, height, utxoManager, params, opts = {}) {
+  const {
+    assumeValid = false,
+    skipScripts = false,
+    prevMTP = 0,
+    enforceBIP68 = false,
+    scriptThreads = 4,
+    verifyP2SH = height >= params.bip16Height,
+    verifyWitness = height >= params.segwitHeight,
+    getUTXOMTP
+  } = opts;
+  {
+    const BIP34_IMPLIES_BIP30_LIMIT = 1983702;
+    const isExemptHeight = params.bip30ExceptionHeights.includes(height);
+    const bip34Active = height >= params.bip34Height;
+    const belowReenableLimit = height < BIP34_IMPLIES_BIP30_LIMIT;
+    const enforceBip30 = !isExemptHeight && !(bip34Active && belowReenableLimit);
+    if (enforceBip30) {
+      for (const tx of block.transactions) {
+        const txid = getTxId(tx);
+        for (let vout = 0;vout < tx.outputs.length; vout++) {
+          const exists = await utxoManager.hasUTXOAsync({ txid, vout });
+          if (exists) {
+            return {
+              ok: false,
+              error: `bad-txns-BIP30: tried to overwrite transaction ${txid.toString("hex")}:${vout} at height ${height}`
+            };
+          }
+        }
+      }
+    }
+  }
+  {
+    const csvActive = height >= params.csvHeight;
+    const lockTimeCutoff = csvActive ? prevMTP : block.header.timestamp;
+    for (const tx of block.transactions) {
+      if (!isFinalTx(tx, height, lockTimeCutoff)) {
+        return {
+          ok: false,
+          error: `Block at height ${height} contains non-final transaction (bad-txns-nonfinal)`
+        };
+      }
+    }
+  }
+  {
+    const allOutpoints = [];
+    for (const tx of block.transactions) {
+      if (!isCoinbase(tx)) {
+        for (const input of tx.inputs) {
+          allOutpoints.push(input.prevOut);
+        }
+      }
+    }
+    if (allOutpoints.length > 0) {
+      await utxoManager.preloadUTXOs(allOutpoints);
+    }
+  }
+  if (assumeValid) {
+    let avTotalInputValue = 0n;
+    let avTotalOutputValue = 0n;
+    for (const tx of block.transactions) {
+      const txid = getTxId(tx);
+      const isCoinbaseTx = isCoinbase(tx);
+      if (!isCoinbaseTx) {
+        for (const input of tx.inputs) {
+          if (!utxoManager.hasUTXO(input.prevOut)) {
+            const loaded = await utxoManager.preloadUTXO(input.prevOut);
+            if (!loaded) {
+              return {
+                ok: false,
+                error: `Missing UTXO at height ${height}: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout}`
+              };
+            }
+          }
+          const spentEntry = utxoManager.spendOutput(input.prevOut);
+          avTotalInputValue += spentEntry.amount;
+        }
+      }
+      for (const output of tx.outputs) {
+        avTotalOutputValue += output.value;
+      }
+      utxoManager.addTransaction(txid, tx, height, isCoinbaseTx);
+    }
+    const avCoinbaseTx = block.transactions[0];
+    let avCoinbaseOutputValue = 0n;
+    for (const output of avCoinbaseTx.outputs) {
+      avCoinbaseOutputValue += output.value;
+    }
+    const avSubsidy = getBlockSubsidy(height, params);
+    const avFees = avTotalInputValue - (avTotalOutputValue - avCoinbaseOutputValue);
+    const avMaxCoinbaseValue = avSubsidy + avFees;
+    if (avCoinbaseOutputValue > avMaxCoinbaseValue) {
+      return {
+        ok: false,
+        error: `Coinbase value ${avCoinbaseOutputValue} exceeds maximum ${avMaxCoinbaseValue} at height ${height}`
+      };
+    }
+    return {
+      ok: true,
+      spentOutputs: [],
+      totalInputValue: avTotalInputValue,
+      totalOutputValue: avTotalOutputValue,
+      coinbaseOutputValue: avCoinbaseOutputValue
+    };
+  }
+  let totalSigOpsCost = 0;
+  const spentOutputs = [];
+  let totalInputValue = 0n;
+  let totalOutputValue = 0n;
+  for (let txIndex = 0;txIndex < block.transactions.length; txIndex++) {
+    const tx = block.transactions[txIndex];
+    const txid = getTxId(tx);
+    const txidHex = txid.toString("hex");
+    const isCoinbaseTx = isCoinbase(tx);
+    const prevOutputs = [];
+    if (!isCoinbaseTx) {
+      for (const input of tx.inputs) {
+        if (!utxoManager.hasUTXO(input.prevOut)) {
+          const loaded = await utxoManager.preloadUTXO(input.prevOut);
+          if (!loaded) {
+            return {
+              ok: false,
+              error: `Missing UTXO for input ${input.prevOut.vout} of tx ${txidHex.slice(0, 16)}: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout} at height ${height}`
+            };
+          }
+        }
+      }
+      const utxoConfirmations = [];
+      const inputUTXOs = [];
+      for (const input of tx.inputs) {
+        const utxo = utxoManager.getUTXO(input.prevOut);
+        if (utxo) {
+          prevOutputs.push(utxo.scriptPubKey);
+          inputUTXOs.push(utxo);
+          if (utxo.coinbase) {
+            const maturity = height - utxo.height;
+            if (maturity < params.coinbaseMaturity) {
+              return {
+                ok: false,
+                error: `Immature coinbase spend in tx ${txidHex.slice(0, 16)}: maturity ${maturity} < ${params.coinbaseMaturity}`
+              };
+            }
+          }
+          const coinMTP = getUTXOMTP ? getUTXOMTP(utxo.height) : 0;
+          utxoConfirmations.push({ height: utxo.height, medianTimePast: coinMTP });
+        }
+      }
+      if (enforceBIP68 && tx.version >= 2) {
+        const seqLockValid = checkSequenceLocks(tx, enforceBIP68, height, prevMTP, utxoConfirmations);
+        if (!seqLockValid) {
+          return {
+            ok: false,
+            error: `Sequence locks not satisfied for tx ${txidHex.slice(0, 16)} at height ${height}`
+          };
+        }
+      }
+      if (!skipScripts) {
+        const scriptFlags = (verifyP2SH ? 1 /* VERIFY_P2SH */ : 0 /* VERIFY_NONE */) | (verifyWitness ? 2 /* VERIFY_WITNESS */ : 0 /* VERIFY_NONE */);
+        let scriptResult;
+        if (scriptThreads === 1) {
+          scriptResult = verifyAllInputsSequential(tx, inputUTXOs, scriptFlags);
+        } else {
+          scriptResult = await verifyAllInputsParallel(tx, inputUTXOs, scriptFlags);
+        }
+        if (!scriptResult.valid) {
+          const errSuffix = (scriptResult.failedInput !== undefined ? ` (input ${scriptResult.failedInput})` : "") + (scriptResult.error ? `: ${scriptResult.error}` : "");
+          return {
+            ok: false,
+            error: `Script verification failed in tx ${txidHex.slice(0, 16)} at height ${height}${errSuffix}`
+          };
+        }
+      }
+      for (const input of tx.inputs) {
+        const spentEntry = utxoManager.spendOutput(input.prevOut);
+        totalInputValue += spentEntry.amount;
+        spentOutputs.push({
+          txid: input.prevOut.txid,
+          vout: input.prevOut.vout,
+          entry: spentEntry
+        });
+      }
+    }
+    const txSigOpsCost = getTransactionSigOpCost(tx, prevOutputs, verifyP2SH, verifyWitness);
+    totalSigOpsCost += txSigOpsCost;
+    utxoManager.addTransaction(txid, tx, height, isCoinbaseTx);
+    for (const output of tx.outputs) {
+      totalOutputValue += output.value;
+    }
+  }
+  if (totalSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
+    return {
+      ok: false,
+      error: `Block sigops cost ${totalSigOpsCost} exceeds maximum ${MAX_BLOCK_SIGOPS_COST}`
+    };
+  }
+  const coinbaseTx = block.transactions[0];
+  let coinbaseOutputValue = 0n;
+  for (const output of coinbaseTx.outputs) {
+    coinbaseOutputValue += output.value;
+  }
+  const subsidy = getBlockSubsidy(height, params);
+  const fees = totalInputValue - (totalOutputValue - coinbaseOutputValue);
+  const maxCoinbaseValue = subsidy + fees;
+  if (coinbaseOutputValue > maxCoinbaseValue) {
+    return {
+      ok: false,
+      error: `Coinbase value ${coinbaseOutputValue} exceeds maximum ${maxCoinbaseValue} at height ${height}`
+    };
+  }
+  return {
+    ok: true,
+    spentOutputs,
+    totalInputValue,
+    totalOutputValue,
+    coinbaseOutputValue
+  };
+}
 
 // src/chain/state.ts
 function getLastCheckpointHeight(params) {
@@ -12665,80 +12926,20 @@ class ChainStateManager {
     if (!checkpointResult.valid) {
       throw new Error(checkpointResult.error);
     }
-    const BIP34_IMPLIES_BIP30_LIMIT = 1983702;
-    const isExemptHeight = this.params.bip30ExceptionHeights.includes(height);
-    const bip34Active = height >= this.params.bip34Height;
-    const belowReenableLimit = height < BIP34_IMPLIES_BIP30_LIMIT;
-    const enforceBip30 = !isExemptHeight && !(bip34Active && belowReenableLimit);
-    if (enforceBip30) {
-      for (const tx of block.transactions) {
-        const txid = getTxId(tx);
-        for (let vout = 0;vout < tx.outputs.length; vout++) {
-          const exists = await this.utxo.hasUTXOAsync({ txid, vout });
-          if (exists) {
-            throw new ConsensusError("BIP30_DUPLICATE_OUTPUT" /* BIP30_DUPLICATE_OUTPUT */, `bad-txns-BIP30: tried to overwrite transaction ${txid.toString("hex")}:${vout}`);
-          }
-        }
-      }
+    const csvActive = height >= this.params.csvHeight;
+    const result = await coreConnectBlockChecks(block, height, this.utxo, this.params, {
+      assumeValid: false,
+      skipScripts: false,
+      prevMTP: block.header.timestamp,
+      enforceBIP68: csvActive,
+      scriptThreads: 1,
+      verifyP2SH: height >= this.params.bip16Height,
+      verifyWitness: height >= this.params.segwitHeight
+    });
+    if (!result.ok) {
+      throw new ConsensusError("CONNECT_BLOCK_FAILED" /* CONNECT_BLOCK_FAILED */, result.error);
     }
-    const spentOutputs = [];
-    let totalInputValue = 0n;
-    let totalOutputValue = 0n;
-    const verifyP2SH = height >= this.params.bip34Height;
-    const verifyWitness = height >= this.params.segwitHeight;
-    let totalSigOpsCost = 0;
-    for (let txIndex = 0;txIndex < block.transactions.length; txIndex++) {
-      const tx = block.transactions[txIndex];
-      const txid = getTxId(tx);
-      const txIsCoinbase = isCoinbase(tx);
-      const prevOutputs = [];
-      if (!txIsCoinbase) {
-        for (const input of tx.inputs) {
-          const loaded = await this.utxo.preloadUTXO(input.prevOut);
-          if (!loaded) {
-            throw new Error(`Missing UTXO: ${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`);
-          }
-          const utxoEntry = this.utxo.getUTXO(input.prevOut);
-          if (utxoEntry) {
-            prevOutputs.push(utxoEntry.scriptPubKey);
-            if (utxoEntry.coinbase) {
-              const confirmations = height - utxoEntry.height;
-              if (confirmations < this.params.coinbaseMaturity) {
-                throw new ConsensusError("PREMATURE_COINBASE_SPEND" /* PREMATURE_COINBASE_SPEND */, `coinbase at height ${utxoEntry.height} has only ${confirmations} confirmations, need ${this.params.coinbaseMaturity}`);
-              }
-            }
-          }
-          const spentEntry = this.utxo.spendOutput(input.prevOut);
-          totalInputValue += spentEntry.amount;
-          spentOutputs.push({
-            txid: input.prevOut.txid,
-            vout: input.prevOut.vout,
-            entry: spentEntry
-          });
-        }
-      }
-      const txSigOpsCost = getTransactionSigOpCost(tx, prevOutputs, verifyP2SH, verifyWitness);
-      totalSigOpsCost += txSigOpsCost;
-      this.utxo.addTransaction(txid, tx, height, txIsCoinbase);
-      for (const output of tx.outputs) {
-        totalOutputValue += output.value;
-        if (txIsCoinbase) {}
-      }
-    }
-    if (totalSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
-      throw new Error(`Block sigops cost ${totalSigOpsCost} exceeds maximum ${MAX_BLOCK_SIGOPS_COST}`);
-    }
-    const coinbaseTx = block.transactions[0];
-    let coinbaseOutputValue = 0n;
-    for (const output of coinbaseTx.outputs) {
-      coinbaseOutputValue += output.value;
-    }
-    const subsidy = getBlockSubsidy(height, this.params);
-    const fees = totalInputValue - (totalOutputValue - coinbaseOutputValue);
-    const maxCoinbaseValue = subsidy + fees;
-    if (coinbaseOutputValue > maxCoinbaseValue) {
-      throw new Error(`Coinbase output (${coinbaseOutputValue}) exceeds subsidy + fees (${maxCoinbaseValue})`);
-    }
+    const { spentOutputs } = result;
     const undoData = serializeUndoData(spentOutputs);
     await this.db.putUndoData(blockHash, undoData);
     await this.utxo.flush();
@@ -21949,35 +22150,8 @@ class HeaderSync {
 }
 
 // src/sync/blocks.ts
-init_params();
 init_block();
-init_tx();
 init_serialization();
-
-// src/mining/template.ts
-init_params();
-init_tx();
-init_block();
-init_primitives();
-var LOCKTIME_THRESHOLD = 500000000;
-function isFinalTx(tx, blockHeight, blockTime) {
-  if (tx.lockTime === 0) {
-    return true;
-  }
-  const lockTimeThreshold = tx.lockTime < LOCKTIME_THRESHOLD ? blockHeight : blockTime;
-  if (tx.lockTime < lockTimeThreshold) {
-    return true;
-  }
-  for (const input of tx.inputs) {
-    if (input.sequence !== 4294967295) {
-      return false;
-    }
-  }
-  return true;
-}
-var WITNESS_COMMITMENT_HEADER = Buffer.from([106, 36, 170, 33, 169, 237]);
-
-// src/sync/blocks.ts
 function classifyCallbackError(err) {
   if (err === null || err === undefined)
     return "unknown";
@@ -22039,6 +22213,35 @@ function classifyCallbackError(err) {
       return "chainstate";
   }
   return "unknown";
+}
+function bip22FromConnectError(err) {
+  const s = err.toLowerCase();
+  if (s.includes("non-final") || s.includes("nonfinal") || s.includes("bad-txns-nonfinal") || s.includes("sequence locks not satisfied") || s.includes("sequence lock"))
+    return "bad-txns-nonfinal";
+  if (s.includes("missing") && s.includes("utxo"))
+    return "bad-txns-inputs-missingorspent";
+  if (s.includes("missing utxo") || s.includes("inputs-missingorspent"))
+    return "bad-txns-inputs-missingorspent";
+  if (s.includes("coinbase") && s.includes("immature"))
+    return "bad-txns-premature-spend-of-coinbase";
+  if ((s.includes("coinbase value") || s.includes("coinbase output")) && s.includes("exceeds"))
+    return "bad-cb-amount";
+  if (s.includes("sigops"))
+    return "bad-blk-sigops";
+  if (s.includes("merkle"))
+    return "bad-txnmrklroot";
+  if (s.includes("witness commitment"))
+    return "bad-witness-merkle-match";
+  if (s.includes("coinbase scriptsig") || s.includes("bad-cb-length"))
+    return "bad-cb-length";
+  if (s.includes("bip34") || s.includes("bad-cb-height"))
+    return "bad-cb-height";
+  if (s.includes("high-hash") || s.includes("proof of work"))
+    return "high-hash";
+  if (s.includes("script") || s.includes("checksig") || s.includes("tapscript") || s.includes("witness program") || s.includes("script verify") || s.includes("block-script-verify")) {
+    return "block-script-verify-flag-failed";
+  }
+  return "rejected";
 }
 var DEFAULT_WINDOW_SIZE = 512;
 var FLUSH_INTERVAL = 2000;
@@ -22297,8 +22500,20 @@ class BlockSync {
     }
     console.log(`INJECT: block height=${headerEntry.height} hash=${hashHex.slice(0, 16)} (submitblock)`);
     this.state.downloadedBlocks.set(hashHex, block);
+    const heightBefore = this.state.nextHeightToProcess;
+    const injectedHeight = headerEntry.height;
     await this.processOrderedBlocks();
     this.requestBlocks();
+    if (injectedHeight === heightBefore && this.state.nextHeightToProcess <= heightBefore) {
+      const err = this.lastConnectError;
+      const errL = err.toLowerCase();
+      if (errL.includes("non-final") || errL.includes("nonfinal") || errL.includes("bad-txns-nonfinal") || errL.includes("sequence locks not satisfied") || errL.includes("sequence lock")) {
+        return "bad-txns-nonfinal";
+      }
+      if (err) {
+        return bip22FromConnectError(err);
+      }
+    }
     return null;
   }
   async handleInv(peer, inventory) {
@@ -22732,198 +22947,58 @@ class BlockSync {
         blockPrevMTP = this.headerSync.getMedianTimePast(prevHeaderEntry);
       }
     }
-    const csvActive = height >= this.params.csvHeight;
-    const lockTimeCutoff = csvActive ? blockPrevMTP : block.header.timestamp;
-    for (const tx of block.transactions) {
-      if (!isFinalTx(tx, height, lockTimeCutoff)) {
-        const m = `Block ${hashHex.slice(0, 16)}... at height ${height} contains non-final transaction (bad-txns-nonfinal)`;
-        console.warn(m);
-        this.recordConnectError(m);
-        return false;
+    const bestHeader = this.headerSync.getBestHeader();
+    const currentHeaderEntry = this.headerSync.getHeaderByHeight(height);
+    const pindexTimestamp = currentHeaderEntry?.header.timestamp ?? 0;
+    const bestHeaderTimestamp = bestHeader?.header.timestamp ?? 0;
+    const avCtx = {
+      pindex: {
+        hash: hashHex,
+        height,
+        chainWork: currentHeaderEntry?.chainWork ?? 0n
+      },
+      assumedValidHash: this.params.assumedValid,
+      getBlockByHash: (h) => {
+        const entry = this.headerSync.getHeader(Buffer.from(h, "hex"));
+        if (!entry)
+          return null;
+        return { hash: entry.hash.toString("hex"), height: entry.height, chainWork: entry.chainWork };
+      },
+      getBlockAtHeight: (h) => {
+        const entry = this.headerSync.getHeaderByHeight(h);
+        if (!entry)
+          return null;
+        return { hash: entry.hash.toString("hex"), height: entry.height, chainWork: entry.chainWork };
+      },
+      bestHeader: bestHeader ? { hash: bestHeader.hash.toString("hex"), height: bestHeader.height, chainWork: bestHeader.chainWork } : null,
+      minimumChainWork: this.params.nMinimumChainWork,
+      pindexTimestamp,
+      bestHeaderTimestamp
+    };
+    const skipScriptsResult = shouldSkipScripts(avCtx);
+    const skipScripts = skipScriptsResult.skip;
+    const coreResult = await coreConnectBlockChecks(block, height, this.utxoManager, this.params, {
+      assumeValid,
+      skipScripts,
+      prevMTP: blockPrevMTP,
+      enforceBIP68,
+      scriptThreads: this.scriptThreads,
+      verifyP2SH: height >= this.params.bip16Height,
+      verifyWitness: height >= this.params.segwitHeight,
+      getUTXOMTP: (coinHeight) => {
+        if (coinHeight <= 0)
+          return 0;
+        const coinPrevHeader = this.headerSync.getHeaderByHeight(coinHeight - 1);
+        return coinPrevHeader ? this.headerSync.getMedianTimePast(coinPrevHeader) : 0;
       }
-    }
-    {
-      const allOutpoints = [];
-      for (const tx of block.transactions) {
-        if (!isCoinbase(tx)) {
-          for (const input of tx.inputs) {
-            allOutpoints.push(input.prevOut);
-          }
-        }
-      }
-      if (allOutpoints.length > 0) {
-        await this.utxoManager.preloadUTXOs(allOutpoints);
-      }
-    }
-    if (assumeValid) {
-      for (const tx of block.transactions) {
-        const txid = getTxId(tx);
-        const isCoinbaseTx = isCoinbase(tx);
-        if (!isCoinbaseTx) {
-          for (const input of tx.inputs) {
-            if (!this.utxoManager.hasUTXO(input.prevOut)) {
-              const loaded = await this.utxoManager.preloadUTXO(input.prevOut);
-              if (!loaded) {
-                const m = `Missing UTXO at height ${height}: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout}`;
-                console.error(m);
-                this.recordConnectError(m);
-                return false;
-              }
-            }
-            this.utxoManager.spendOutput(input.prevOut);
-          }
-        }
-        this.utxoManager.addTransaction(txid, tx, height, isCoinbaseTx);
-      }
-    } else {
-      const verifyP2SH = height >= this.params.bip16Height;
-      const verifyWitness = height >= this.params.segwitHeight;
-      let totalSigOpsCost = 0;
-      const spentOutputs = [];
-      let totalInputValue = 0n;
-      let totalOutputValue = 0n;
-      const bestHeader2 = this.headerSync.getBestHeader();
-      const currentHeaderEntry = this.headerSync.getHeaderByHeight(height);
-      const pindexTimestamp = currentHeaderEntry?.header.timestamp ?? 0;
-      const bestHeaderTimestamp = bestHeader2?.header.timestamp ?? 0;
-      const avCtx = {
-        pindex: {
-          hash: hashHex,
-          height,
-          chainWork: currentHeaderEntry?.chainWork ?? 0n
-        },
-        assumedValidHash: this.params.assumedValid,
-        getBlockByHash: (h) => {
-          const entry = this.headerSync.getHeader(Buffer.from(h, "hex"));
-          if (!entry)
-            return null;
-          return { hash: entry.hash.toString("hex"), height: entry.height, chainWork: entry.chainWork };
-        },
-        getBlockAtHeight: (h) => {
-          const entry = this.headerSync.getHeaderByHeight(h);
-          if (!entry)
-            return null;
-          return { hash: entry.hash.toString("hex"), height: entry.height, chainWork: entry.chainWork };
-        },
-        bestHeader: bestHeader2 ? { hash: bestHeader2.hash.toString("hex"), height: bestHeader2.height, chainWork: bestHeader2.chainWork } : null,
-        minimumChainWork: this.params.nMinimumChainWork,
-        pindexTimestamp,
-        bestHeaderTimestamp
-      };
-      const skipScriptsResult = shouldSkipScripts(avCtx);
-      const skipScripts = skipScriptsResult.skip;
-      for (let txIndex = 0;txIndex < block.transactions.length; txIndex++) {
-        const tx = block.transactions[txIndex];
-        const txid = getTxId(tx);
-        const txidHex = txid.toString("hex");
-        const isCoinbaseTx = isCoinbase(tx);
-        const prevOutputs = [];
-        if (!isCoinbaseTx) {
-          for (const input of tx.inputs) {
-            if (!this.utxoManager.hasUTXO(input.prevOut)) {
-              const loaded = await this.utxoManager.preloadUTXO(input.prevOut);
-              if (!loaded) {
-                const m = `Missing UTXO for input ${input.prevOut.vout} of tx ${txidHex.slice(0, 16)}: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout} at height ${height}`;
-                console.error(m);
-                this.recordConnectError(m);
-                return false;
-              }
-            }
-          }
-          const utxoConfirmations = [];
-          const inputUTXOs = [];
-          for (const input of tx.inputs) {
-            const utxo = this.utxoManager.getUTXO(input.prevOut);
-            if (utxo) {
-              prevOutputs.push(utxo.scriptPubKey);
-              inputUTXOs.push(utxo);
-              if (utxo.coinbase) {
-                const maturity = height - utxo.height;
-                if (maturity < this.params.coinbaseMaturity) {
-                  const m = `Immature coinbase spend in tx ${txidHex.slice(0, 16)}: maturity ${maturity} < ${this.params.coinbaseMaturity}`;
-                  console.warn(m);
-                  this.recordConnectError(m);
-                  return false;
-                }
-              }
-              if (enforceBIP68) {
-                let coinMTP = 0;
-                if (utxo.height > 0) {
-                  const coinPrevHeader = this.headerSync.getHeaderByHeight(utxo.height - 1);
-                  if (coinPrevHeader) {
-                    coinMTP = this.headerSync.getMedianTimePast(coinPrevHeader);
-                  }
-                }
-                utxoConfirmations.push({ height: utxo.height, medianTimePast: coinMTP });
-              } else {
-                utxoConfirmations.push({ height: utxo.height, medianTimePast: 0 });
-              }
-            }
-          }
-          if (enforceBIP68 && tx.version >= 2) {
-            const seqLockValid = checkSequenceLocks(tx, enforceBIP68, height, blockPrevMTP, utxoConfirmations);
-            if (!seqLockValid) {
-              const m = `Sequence locks not satisfied for tx ${txidHex.slice(0, 16)} at height ${height}`;
-              console.warn(m);
-              this.recordConnectError(m);
-              return false;
-            }
-          }
-          if (!skipScripts) {
-            const scriptFlags = (verifyP2SH ? 1 /* VERIFY_P2SH */ : 0 /* VERIFY_NONE */) | (verifyWitness ? 2 /* VERIFY_WITNESS */ : 0 /* VERIFY_NONE */);
-            let scriptResult;
-            if (this.scriptThreads === 1) {
-              scriptResult = verifyAllInputsSequential(tx, inputUTXOs, scriptFlags);
-            } else {
-              scriptResult = await verifyAllInputsParallel(tx, inputUTXOs, scriptFlags);
-            }
-            if (!scriptResult.valid) {
-              const m = `Script verification failed in tx ${txidHex.slice(0, 16)} at height ${height}` + (scriptResult.failedInput !== undefined ? ` (input ${scriptResult.failedInput})` : "") + (scriptResult.error ? `: ${scriptResult.error}` : "");
-              console.warn(m);
-              this.recordConnectError(m);
-              return false;
-            }
-          }
-          for (const input of tx.inputs) {
-            const spentEntry = this.utxoManager.spendOutput(input.prevOut);
-            totalInputValue += spentEntry.amount;
-            spentOutputs.push({
-              txid: input.prevOut.txid,
-              vout: input.prevOut.vout,
-              entry: spentEntry
-            });
-          }
-        }
-        const txSigOpsCost = getTransactionSigOpCost(tx, prevOutputs, verifyP2SH, verifyWitness);
-        totalSigOpsCost += txSigOpsCost;
-        this.utxoManager.addTransaction(txid, tx, height, isCoinbaseTx);
-        for (const output of tx.outputs) {
-          totalOutputValue += output.value;
-        }
-      }
-      if (totalSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
-        const m = `Block sigops cost ${totalSigOpsCost} exceeds maximum ${MAX_BLOCK_SIGOPS_COST}`;
-        console.warn(m);
-        this.recordConnectError(m);
-        return false;
-      }
-      const coinbaseTx = block.transactions[0];
-      let coinbaseOutputValue = 0n;
-      for (const output of coinbaseTx.outputs) {
-        coinbaseOutputValue += output.value;
-      }
-      const subsidy = getBlockSubsidy(height, this.params);
-      const fees = totalInputValue - (totalOutputValue - coinbaseOutputValue);
-      const maxCoinbaseValue = subsidy + fees;
-      if (coinbaseOutputValue > maxCoinbaseValue) {
-        const m = `Coinbase value ${coinbaseOutputValue} exceeds maximum ${maxCoinbaseValue} at height ${height}`;
-        console.warn(m);
-        this.recordConnectError(m);
-        return false;
-      }
+    });
+    if (!coreResult.ok) {
+      const m = coreResult.error;
+      console.warn(m);
+      this.recordConnectError(m);
+      return false;
     }
     this.utxoManager.setBestBlock(blockHash);
-    const bestHeader = this.headerSync.getBestHeader();
     const atTip = !bestHeader || height >= bestHeader.height;
     const shouldFlush = atTip || height % FLUSH_INTERVAL === 0;
     if (atTip) {

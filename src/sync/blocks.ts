@@ -137,7 +137,10 @@ export function classifyCallbackError(
  */
 function bip22FromConnectError(err: string): string {
   const s = err.toLowerCase();
-  if (s.includes("non-final") || s.includes("nonfinal") || s.includes("bad-txns-nonfinal"))
+  // IsFinalTx (nLockTime) and BIP-68 SequenceLocks failures both map to
+  // "bad-txns-nonfinal" per Core validation.cpp:2558 + :4147.
+  if (s.includes("non-final") || s.includes("nonfinal") || s.includes("bad-txns-nonfinal") ||
+      s.includes("sequence locks not satisfied") || s.includes("sequence lock"))
     return "bad-txns-nonfinal";
   if (s.includes("missing") && s.includes("utxo")) return "bad-txns-inputs-missingorspent";
   if (s.includes("missing utxo") || s.includes("inputs-missingorspent"))
@@ -695,7 +698,9 @@ export class BlockSync {
     // "accept (chain didn't advance)" which is incorrect.
     if (injectedHeight === heightBefore && this.state.nextHeightToProcess <= heightBefore) {
       const err = this.lastConnectError;
-      if (err.includes("non-final") || err.includes("nonfinal") || err.includes("bad-txns-nonfinal")) {
+      const errL = err.toLowerCase();
+      if (errL.includes("non-final") || errL.includes("nonfinal") || errL.includes("bad-txns-nonfinal") ||
+          errL.includes("sequence locks not satisfied") || errL.includes("sequence lock")) {
         return "bad-txns-nonfinal";
       }
       if (err) {
