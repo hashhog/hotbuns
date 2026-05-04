@@ -56,8 +56,13 @@ function createBlockHeader(): BlockHeader {
  * Helper to create a coinbase transaction.
  */
 function createCoinbaseTx(height: number = 0): Transaction {
-  // Encode height in scriptSig (BIP34)
-  const heightScript = Buffer.from([0x01, height & 0xff]);
+  // Encode height using canonical BIP-34 encoding (Core CScript() << nHeight).
+  // heights 1..16 → OP_N (0x51..0x60), heights ≥17 → length-prefixed CScriptNum.
+  const heightEnc = encodeBip34Height(height);
+  // Pad to minimum 2 bytes if needed (Bitcoin Core consensus/tx_check.cpp:49)
+  const heightScript = heightEnc.length < 2
+    ? Buffer.concat([heightEnc, Buffer.from([0x00])])
+    : heightEnc;
 
   return {
     version: 1,
@@ -773,7 +778,7 @@ describe("validateBlock", () => {
     const coinbase = makeCoinbaseWithScriptLen(2);
     const block = makeBlockWith(coinbase, 1);
     const result = validateBlock(block, 1, REGTEST);
-    // height=1 is below REGTEST bip34Height so no bad-cb-height; only checking length here
+    // scriptSig starts with 0x51 (OP_1), which is the canonical BIP-34 encoding for height=1.
     expect(result.error).not.toBe("bad-cb-length");
   });
 

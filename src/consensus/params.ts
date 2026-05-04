@@ -897,7 +897,7 @@ export const REGTEST: ConsensusParams = {
   fPowNoRetargeting: true, // Always minimum difficulty
   enforce_BIP94: false,
   bip16Height: 1,
-  bip34Height: 500,
+  bip34Height: 1, // Bitcoin Core kernel/chainparams.cpp:536: consensus.BIP34Height = 1
   bip65Height: 1351,
   bip66Height: 1251,
   csvHeight: 0, // BIP68/112/113 always active on regtest
