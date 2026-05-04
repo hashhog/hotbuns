@@ -12486,6 +12486,8 @@ function bip22Result(code) {
   const s = String(code).toLowerCase();
   if (s === "bad-cb-height")
     return "bad-cb-height";
+  if (s === "bad-cb-length")
+    return "bad-cb-length";
   if (s === "inconclusive")
     return "inconclusive";
   if (s === "duplicate")
