@@ -1467,6 +1467,38 @@ export class BlockSync {
       }
     }
 
+    // BIP-30: reject any block that would overwrite an existing unspent output.
+    // Two mainnet blocks (h=91842, h=91880) are permanently exempt; they predate
+    // BIP-30 and intentionally duplicate earlier coinbase txids.
+    // After BIP-34 activation (h≥bip34Height), coinbase-height uniqueness makes
+    // duplicates practically impossible, so skip up to h=1,983,702. After that
+    // BIP-34 modular arithmetic begins to repeat pre-BIP34 heights, so re-enable.
+    // Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
+    // NOTE: This check is consensus-critical and must run even under assumevalid —
+    // assumevalid only skips script verification, not UTXO-integrity rules.
+    {
+      const BIP34_IMPLIES_BIP30_LIMIT = 1_983_702;
+      const isExemptHeight = this.params.bip30ExceptionHeights.includes(height);
+      const bip34Active = height >= this.params.bip34Height;
+      const belowReenableLimit = height < BIP34_IMPLIES_BIP30_LIMIT;
+      const enforceBip30 = !isExemptHeight && !(bip34Active && belowReenableLimit);
+
+      if (enforceBip30) {
+        for (const tx of block.transactions) {
+          const txid = getTxId(tx);
+          for (let vout = 0; vout < tx.outputs.length; vout++) {
+            const exists = await this.utxoManager.hasUTXOAsync({ txid, vout });
+            if (exists) {
+              const m = `bad-txns-BIP30: tried to overwrite transaction ${txid.toString("hex")}:${vout} at height ${height}`;
+              console.warn(m);
+              this.recordConnectError(m);
+              return false;
+            }
+          }
+        }
+      }
+    }
+
     // Pre-load ALL UTXOs needed by this block in one parallel batch.
     // This turns N sequential LevelDB reads into N parallel reads.
     {
