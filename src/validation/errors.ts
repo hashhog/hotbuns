@@ -137,6 +137,9 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
       return "time-too-new";
 
     // Transaction errors
+    // Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
+    case ConsensusErrorCode.BAD_TXNS_VOUT_NEGATIVE:
+      return "bad-txns-vout-negative";
     case ConsensusErrorCode.DUPLICATE_INPUTS:
       return "bad-txns-duplicate";
     case ConsensusErrorCode.MISSING_INPUTS:
@@ -189,6 +192,12 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
   }
   if (s.includes("missing") && s.includes("input")) {
     return "bad-txns-inputs-missingorspent";
+  }
+  // Negative output value: validateTxBasic returns "Negative output value" (tx.ts)
+  // which arrives here as "transaction N: negative output value" after wrapping.
+  // Mirrors consensus/tx_check.cpp::CheckTransaction.
+  if (s.includes("negative output")) {
+    return "bad-txns-vout-negative";
   }
   if (
     s.includes("script") ||
