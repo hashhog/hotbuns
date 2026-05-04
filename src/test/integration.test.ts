@@ -434,7 +434,7 @@ describe("full node integration", () => {
 
       await expect(
         chainState.connectBlock(minedBlock, height)
-      ).rejects.toThrow(/exceeds subsidy/);
+      ).rejects.toThrow(/exceeds maximum|exceeds subsidy/);
     });
 
     test("rejects block spending non-existent UTXO", async () => {

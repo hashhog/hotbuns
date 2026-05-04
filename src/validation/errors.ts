@@ -65,6 +65,9 @@ export enum ConsensusErrorCode {
 
   // BIP-30: block would overwrite an existing unspent output
   BIP30_DUPLICATE_OUTPUT = "BIP30_DUPLICATE_OUTPUT",
+
+  // Generic connect-block failure (wraps errors from coreConnectBlockChecks).
+  CONNECT_BLOCK_FAILED = "CONNECT_BLOCK_FAILED",
 }
 
 /**
@@ -101,6 +104,7 @@ const REJECT_CODES: Record<ConsensusErrorCode, number> = {
   [ConsensusErrorCode.SEQUENCE_LOCK_NOT_SATISFIED]: 0x10,
   [ConsensusErrorCode.CHECKPOINT_MISMATCH]: 0x10,
   [ConsensusErrorCode.BIP30_DUPLICATE_OUTPUT]: 0x10,
+  [ConsensusErrorCode.CONNECT_BLOCK_FAILED]: 0x10,
 };
 
 /**

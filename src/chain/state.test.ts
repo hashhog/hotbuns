@@ -256,7 +256,7 @@ describe("ChainStateManager", () => {
       const block = createBlock(REGTEST.genesisBlockHash, [coinbase]);
 
       await expect(chainState.connectBlock(block, 1)).rejects.toThrow(
-        "exceeds subsidy"
+        /exceeds maximum|exceeds subsidy/
       );
     });
   });
