@@ -8,22 +8,17 @@
 import type { ChainDB, ChainState, UTXOEntry, BlockIndexRecord } from "../storage/database.js";
 import { BlockStatus } from "../storage/database.js";
 import type { ConsensusParams } from "../consensus/params.js";
-import { getBlockSubsidy } from "../consensus/params.js";
 import type { Block, BlockHeader } from "../validation/block.js";
 import {
   getBlockHash,
   serializeBlock,
   serializeBlockHeader,
   deserializeBlock,
-  getTransactionSigOpCost,
-  MAX_BLOCK_SIGOPS_COST,
 } from "../validation/block.js";
-import type { Transaction, UTXOConfirmation } from "../validation/tx.js";
+import type { Transaction } from "../validation/tx.js";
 import {
   getTxId,
   isCoinbase,
-  checkSequenceLocks,
-  SEQUENCE_LOCKTIME_DISABLE_FLAG,
 } from "../validation/tx.js";
 import type { HeaderChainEntry } from "../sync/headers.js";
 import {
@@ -35,6 +30,9 @@ import {
 import { ConsensusError, ConsensusErrorCode } from "../validation/errors.js";
 import { BufferReader } from "../wire/serialization.js";
 import { globalSigCache } from "../validation/sig_cache.js";
+import {
+  coreConnectBlockChecks,
+} from "../consensus/connect_block.js";
 
 /**
  * Result of transaction input validation.
@@ -236,14 +234,18 @@ export class ChainStateManager {
   /**
    * Connect a validated block: update UTXOs, store block, update chain tip.
    *
-   * Flow:
-   * 1. For each transaction in the block (in order):
-   *    a. For non-coinbase: validate and spend each input. Accumulate spent UTXOs for undo data.
-   *    b. For all: add each output as new UTXOs.
-   * 2. Verify sigops cost is within limit.
-   * 3. Verify total fees + subsidy match coinbase output value.
-   * 4. Serialize undo data and store via db.putUndoData().
-   * 5. Flush UTXO changes, store block, update chain state.
+   * Delegates consensus checks + UTXO mutations to coreConnectBlockChecks
+   * (src/consensus/connect_block.ts), then handles the DB persistence that is
+   * specific to this path (undo data, block store, block index, chain state).
+   *
+   * Error handling: throws on any consensus or DB failure.
+   *
+   * Callers:
+   *   - rpc/server.ts: generateblock (regtest mining)
+   *   - rpc/server.ts: dumptxoutset rollback re-apply
+   *   - chain/state.ts::reorganize (reconnect blocks on new chain branch)
+   *
+   * Reference: Bitcoin Core validation.cpp::ConnectBlock
    */
   async connectBlock(block: Block, height: number): Promise<void> {
     const blockHash = getBlockHash(block.header);
@@ -254,140 +256,35 @@ export class ChainStateManager {
       throw new Error(checkpointResult.error);
     }
 
-    // BIP-30: reject any block that would overwrite an existing unspent output.
-    // Two mainnet blocks (h=91842, h=91880) are permanently exempt; they predate
-    // BIP-30 and intentionally duplicate earlier coinbase txids.
-    // After BIP-34 activation (h≥bip34Height), coinbase-height uniqueness makes
-    // duplicates practically impossible, so skip up to h=1,983,702. After that
-    // BIP-34 modular arithmetic begins to repeat pre-BIP34 heights, so re-enable.
-    // Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
-    const BIP34_IMPLIES_BIP30_LIMIT = 1_983_702;
-    const isExemptHeight = this.params.bip30ExceptionHeights.includes(height);
-    const bip34Active = height >= this.params.bip34Height;
-    const belowReenableLimit = height < BIP34_IMPLIES_BIP30_LIMIT;
-    const enforceBip30 = !isExemptHeight && !(bip34Active && belowReenableLimit);
+    // Delegate all consensus checks (BIP-30, IsFinalTx, maturity, BIP-68, scripts,
+    // sigops, coinbase value) and UTXO mutations (spendOutput + addTransaction)
+    // to the shared helper.  This eliminates the previous duplication with
+    // sync/blocks.ts::connectBlock and ensures both paths run the same checks.
+    //
+    // This path runs full validation (no assumevalid) because:
+    //   - generateblock (regtest) is mining new blocks that haven't been validated
+    //   - dumptxoutset re-apply reconnects already-validated blocks, but we still
+    //     re-run checks for correctness (cheap relative to DB I/O)
+    //   - reorganize reconnects blocks from a previously validated alternative chain
+    const csvActive = height >= this.params.csvHeight;
+    const result = await coreConnectBlockChecks(block, height, this.utxo, this.params, {
+      assumeValid: false,
+      skipScripts: false,
+      prevMTP: block.header.timestamp, // no HeaderSync here; use block timestamp as MTP fallback
+      enforceBIP68: csvActive,
+      scriptThreads: 1, // this path is not IBD-hot; serial is fine
+      verifyP2SH: height >= this.params.bip16Height,
+      verifyWitness: height >= this.params.segwitHeight,
+    });
 
-    if (enforceBip30) {
-      for (const tx of block.transactions) {
-        const txid = getTxId(tx);
-        for (let vout = 0; vout < tx.outputs.length; vout++) {
-          const exists = await this.utxo.hasUTXOAsync({ txid, vout });
-          if (exists) {
-            throw new ConsensusError(
-              ConsensusErrorCode.BIP30_DUPLICATE_OUTPUT,
-              `bad-txns-BIP30: tried to overwrite transaction ${txid.toString("hex")}:${vout}`
-            );
-          }
-        }
-      }
-    }
-
-    const spentOutputs: SpentUTXO[] = [];
-    let totalInputValue = 0n;
-    let totalOutputValue = 0n;
-
-    // Determine which consensus rules are active at this height
-    const verifyP2SH = height >= this.params.bip34Height;
-    const verifyWitness = height >= this.params.segwitHeight;
-
-    // Track sigops cost and prevOutputs for each transaction
-    let totalSigOpsCost = 0;
-
-    // Process transactions in order
-    for (let txIndex = 0; txIndex < block.transactions.length; txIndex++) {
-      const tx = block.transactions[txIndex];
-      const txid = getTxId(tx);
-      const txIsCoinbase = isCoinbase(tx);
-
-      // Collect prevOutputs for sigop counting
-      const prevOutputs: Buffer[] = [];
-
-      // For non-coinbase transactions, spend inputs
-      if (!txIsCoinbase) {
-        for (const input of tx.inputs) {
-          // Pre-load the UTXO if not in cache
-          const loaded = await this.utxo.preloadUTXO(input.prevOut);
-          if (!loaded) {
-            throw new Error(
-              `Missing UTXO: ${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`
-            );
-          }
-
-          // Get the UTXO for sigop counting before spending
-          const utxoEntry = this.utxo.getUTXO(input.prevOut);
-          if (utxoEntry) {
-            prevOutputs.push(utxoEntry.scriptPubKey);
-
-            // Check coinbase maturity: coinbase outputs require COINBASE_MATURITY (100) confirmations
-            if (utxoEntry.coinbase) {
-              const confirmations = height - utxoEntry.height;
-              if (confirmations < this.params.coinbaseMaturity) {
-                throw new ConsensusError(
-                  ConsensusErrorCode.PREMATURE_COINBASE_SPEND,
-                  `coinbase at height ${utxoEntry.height} has only ${confirmations} confirmations, need ${this.params.coinbaseMaturity}`
-                );
-              }
-            }
-          }
-
-          // Spend the UTXO
-          const spentEntry = this.utxo.spendOutput(input.prevOut);
-          totalInputValue += spentEntry.amount;
-
-          // Store for undo data
-          spentOutputs.push({
-            txid: input.prevOut.txid,
-            vout: input.prevOut.vout,
-            entry: spentEntry,
-          });
-        }
-      }
-
-      // Count sigops for this transaction
-      const txSigOpsCost = getTransactionSigOpCost(
-        tx,
-        prevOutputs,
-        verifyP2SH,
-        verifyWitness
-      );
-      totalSigOpsCost += txSigOpsCost;
-
-      // Add outputs as new UTXOs
-      this.utxo.addTransaction(txid, tx, height, txIsCoinbase);
-
-      // Sum output values
-      for (const output of tx.outputs) {
-        totalOutputValue += output.value;
-        if (txIsCoinbase) {
-          // Track coinbase output separately for fee verification
-        }
-      }
-    }
-
-    // Verify sigops cost is within limit
-    if (totalSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
-      throw new Error(
-        `Block sigops cost ${totalSigOpsCost} exceeds maximum ${MAX_BLOCK_SIGOPS_COST}`
+    if (!result.ok) {
+      throw new ConsensusError(
+        ConsensusErrorCode.CONNECT_BLOCK_FAILED,
+        result.error
       );
     }
 
-    // Calculate total coinbase output value
-    const coinbaseTx = block.transactions[0];
-    let coinbaseOutputValue = 0n;
-    for (const output of coinbaseTx.outputs) {
-      coinbaseOutputValue += output.value;
-    }
-
-    // Verify coinbase output <= subsidy + fees
-    const subsidy = getBlockSubsidy(height, this.params);
-    const fees = totalInputValue - (totalOutputValue - coinbaseOutputValue);
-    const maxCoinbaseValue = subsidy + fees;
-
-    if (coinbaseOutputValue > maxCoinbaseValue) {
-      throw new Error(
-        `Coinbase output (${coinbaseOutputValue}) exceeds subsidy + fees (${maxCoinbaseValue})`
-      );
-    }
+    const { spentOutputs } = result;
 
     // Serialize and store undo data
     const undoData = serializeUndoData(spentOutputs);

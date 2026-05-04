@@ -9,7 +9,6 @@
 import type { ChainDB, BlockIndexRecord, BatchOperation } from "../storage/database.js";
 import { DBPrefix } from "../storage/database.js";
 import type { ConsensusParams } from "../consensus/params.js";
-import { getBlockSubsidy } from "../consensus/params.js";
 import type { Peer } from "../p2p/peer.js";
 import type { PeerManager } from "../p2p/manager.js";
 import type { NetworkMessage, InvVector } from "../p2p/messages.js";
@@ -24,26 +23,14 @@ import {
   serializeBlock,
   serializeBlockHeader,
   validateBlock,
-  getTransactionSigOpCost,
-  MAX_BLOCK_SIGOPS_COST,
 } from "../validation/block.js";
-import {
-  getTxId,
-  isCoinbase,
-  checkSequenceLocks,
-  verifyAllInputsParallel,
-  verifyAllInputsSequential,
-  ScriptFlags,
-  type UTXOConfirmation,
-} from "../validation/tx.js";
-import type { UTXOEntry } from "../storage/database.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
-import { UTXOManager, type SpentUTXO } from "../chain/utxo.js";
+import { UTXOManager } from "../chain/utxo.js";
 import {
   shouldSkipScripts,
   type AssumeValidContext,
 } from "../consensus/assumevalid.js";
-import { isFinalTx } from "../mining/template.js";
+import { coreConnectBlockChecks } from "../consensus/connect_block.js";
 
 /**
  * Classify a connect-block error string into one of three buckets so the
@@ -1403,7 +1390,18 @@ export class BlockSync {
 
   /**
    * Validate and connect a block.
-   * Uses UTXOManager with proper layered cache for UTXO tracking.
+   *
+   * Delegates consensus checks + UTXO mutations to coreConnectBlockChecks
+   * (src/consensus/consensus/connect_block.ts), which is also used by the
+   * chain/state.ts path (rollback re-apply, reorg, generateblock).
+   *
+   * This method handles the sync-specific pre-checks (block structure
+   * validation, header-chain linkage, assumevalid gate via shouldSkipScripts)
+   * and post-processing (IBD flush optimisation, tip/peer updates) that do
+   * not belong in the shared helper.
+   *
+   * Error contract: returns false on any failure; stores the error string in
+   * this.lastConnectError for classifyCallbackError / bip22FromConnectError.
    */
   async connectBlock(block: Block, height: number): Promise<boolean> {
     const blockHash = getBlockHash(block.header);
@@ -1440,7 +1438,7 @@ export class BlockSync {
     // BIP68 (CSV) activation check
     const enforceBIP68 = !assumeValid && height >= this.params.csvHeight;
 
-    // Get the previous block's MTP for BIP68 time-based locks and IsFinalTx.
+    // Get the previous block's MTP for BIP-68 time-based locks and IsFinalTx.
     // IsFinalTx always needs MTP when CSV is active (BIP-113), even under assumevalid.
     let blockPrevMTP = 0;
     {
@@ -1450,343 +1448,87 @@ export class BlockSync {
       }
     }
 
-    // ContextualCheckBlock: enforce IsFinalTx for every transaction.
-    // (Bitcoin Core validation.cpp:4146). Consensus rule that runs even
-    // under assumevalid — assumevalid only skips script verification.
-    // lock_time_cutoff = MTP when CSV/BIP-113 is active, block timestamp otherwise.
-    const csvActive = height >= this.params.csvHeight;
-    const lockTimeCutoff = csvActive
-      ? blockPrevMTP
-      : block.header.timestamp;
-    for (const tx of block.transactions) {
-      if (!isFinalTx(tx, height, lockTimeCutoff)) {
-        const m = `Block ${hashHex.slice(0, 16)}... at height ${height} contains non-final transaction (bad-txns-nonfinal)`;
-        console.warn(m);
-        this.recordConnectError(m);
-        return false;
-      }
-    }
+    // ── P2-OPT-ROUND-2: assumevalid gate for script verification ──
+    // Build the context once per block and check whether scripts should be
+    // skipped.  On regtest assumedValid is undefined, so every script fires
+    // (good for tests).  On mainnet the 6-condition check applies.
+    const bestHeader = this.headerSync.getBestHeader();
+    const currentHeaderEntry = this.headerSync.getHeaderByHeight(height);
+    const pindexTimestamp = currentHeaderEntry?.header.timestamp ?? 0;
+    const bestHeaderTimestamp = bestHeader?.header.timestamp ?? 0;
 
-    // BIP-30: reject any block that would overwrite an existing unspent output.
-    // Two mainnet blocks (h=91842, h=91880) are permanently exempt; they predate
-    // BIP-30 and intentionally duplicate earlier coinbase txids.
-    // After BIP-34 activation (h≥bip34Height), coinbase-height uniqueness makes
-    // duplicates practically impossible, so skip up to h=1,983,702. After that
-    // BIP-34 modular arithmetic begins to repeat pre-BIP34 heights, so re-enable.
-    // Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
-    // NOTE: This check is consensus-critical and must run even under assumevalid —
-    // assumevalid only skips script verification, not UTXO-integrity rules.
-    {
-      const BIP34_IMPLIES_BIP30_LIMIT = 1_983_702;
-      const isExemptHeight = this.params.bip30ExceptionHeights.includes(height);
-      const bip34Active = height >= this.params.bip34Height;
-      const belowReenableLimit = height < BIP34_IMPLIES_BIP30_LIMIT;
-      const enforceBip30 = !isExemptHeight && !(bip34Active && belowReenableLimit);
+    const avCtx: AssumeValidContext = {
+      pindex: {
+        hash: hashHex,
+        height,
+        chainWork: currentHeaderEntry?.chainWork ?? 0n,
+      },
+      assumedValidHash: this.params.assumedValid,
+      getBlockByHash: (h) => {
+        const entry = this.headerSync.getHeader(Buffer.from(h, "hex"));
+        if (!entry) return null;
+        return { hash: entry.hash.toString("hex"), height: entry.height, chainWork: entry.chainWork };
+      },
+      getBlockAtHeight: (h) => {
+        const entry = this.headerSync.getHeaderByHeight(h);
+        if (!entry) return null;
+        return { hash: entry.hash.toString("hex"), height: entry.height, chainWork: entry.chainWork };
+      },
+      bestHeader: bestHeader
+        ? { hash: bestHeader.hash.toString("hex"), height: bestHeader.height, chainWork: bestHeader.chainWork }
+        : null,
+      minimumChainWork: this.params.nMinimumChainWork,
+      pindexTimestamp,
+      bestHeaderTimestamp,
+    };
 
-      if (enforceBip30) {
-        for (const tx of block.transactions) {
-          const txid = getTxId(tx);
-          for (let vout = 0; vout < tx.outputs.length; vout++) {
-            const exists = await this.utxoManager.hasUTXOAsync({ txid, vout });
-            if (exists) {
-              const m = `bad-txns-BIP30: tried to overwrite transaction ${txid.toString("hex")}:${vout} at height ${height}`;
-              console.warn(m);
-              this.recordConnectError(m);
-              return false;
-            }
-          }
-        }
-      }
-    }
+    const skipScriptsResult = shouldSkipScripts(avCtx);
+    const skipScripts = skipScriptsResult.skip;
 
-    // Pre-load ALL UTXOs needed by this block in one parallel batch.
-    // This turns N sequential LevelDB reads into N parallel reads.
-    {
-      const allOutpoints: import("../validation/tx.js").OutPoint[] = [];
-      for (const tx of block.transactions) {
-        if (!isCoinbase(tx)) {
-          for (const input of tx.inputs) {
-            allOutpoints.push(input.prevOut);
-          }
-        }
-      }
-      if (allOutpoints.length > 0) {
-        await this.utxoManager.preloadUTXOs(allOutpoints);
-      }
-    }
-
-    if (assumeValid) {
-      // ============================================================
-      // ASSUME-VALID FAST PATH: minimal work, no validation overhead.
-      // Skip: maturity checks, BIP68, sigops, undo data.
-      // Always run: coinbase-value check (consensus-critical arithmetic,
-      // never skipped by assumevalid in Bitcoin Core ConnectBlock).
-      // Reference: Bitcoin Core validation.cpp::ConnectBlock —
-      //   block_reward = nFees + GetBlockSubsidy(height);
-      //   if (block.vtx[0]->GetValueOut() > block_reward) → bad-cb-amount
-      // fScriptChecks (assumevalid) only gates signature/script checking.
-      // ============================================================
-      let avTotalInputValue = 0n;
-      let avTotalOutputValue = 0n;
-
-      for (const tx of block.transactions) {
-        const txid = getTxId(tx);
-        const isCoinbaseTx = isCoinbase(tx);
-
-        if (!isCoinbaseTx) {
-          for (const input of tx.inputs) {
-            // All inputs should be in cache from block-level preload or
-            // earlier txs in this block. Fallback to async load if missing.
-            if (!this.utxoManager.hasUTXO(input.prevOut)) {
-              const loaded = await this.utxoManager.preloadUTXO(input.prevOut);
-              if (!loaded) {
-                const m = `Missing UTXO at height ${height}: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout}`;
-                console.error(m);
-                this.recordConnectError(m);
-                return false;
-              }
-            }
-            const spentEntry = this.utxoManager.spendOutput(input.prevOut);
-            avTotalInputValue += spentEntry.amount;
-          }
-        }
-
-        for (const output of tx.outputs) {
-          avTotalOutputValue += output.value;
-        }
-
-        this.utxoManager.addTransaction(txid, tx, height, isCoinbaseTx);
-      }
-
-      // Coinbase-value check: consensus-critical, runs even under assumevalid.
-      // Matches full-validation path below (lines ~1697-1712) and Bitcoin Core
-      // ConnectBlock (validation.cpp:2610-2614).
-      const avCoinbaseTx = block.transactions[0];
-      let avCoinbaseOutputValue = 0n;
-      for (const output of avCoinbaseTx.outputs) {
-        avCoinbaseOutputValue += output.value;
-      }
-      const avSubsidy = getBlockSubsidy(height, this.params);
-      const avFees = avTotalInputValue - (avTotalOutputValue - avCoinbaseOutputValue);
-      const avMaxCoinbaseValue = avSubsidy + avFees;
-      if (avCoinbaseOutputValue > avMaxCoinbaseValue) {
-        const m = `Coinbase value ${avCoinbaseOutputValue} exceeds maximum ${avMaxCoinbaseValue} at height ${height}`;
-        console.warn(m);
-        this.recordConnectError(m);
-        return false;
-      }
-    } else {
-      // ============================================================
-      // FULL VALIDATION PATH
-      // ============================================================
-      // BIP-16 (P2SH) activates at its own height, NOT BIP-34's. Mainnet:
-      // BIP-16 = 173,805; BIP-34 = 227,931. Pre-fix used bip34Height which
-      // gated P2SH-aware sigops counting on the wrong height (also passed
-      // to inline scriptFlags below, but those are dead-weight today since
-      // verifyInputSignature hardcodes the post-Taproot flag set).
-      const verifyP2SH = height >= this.params.bip16Height;
-      const verifyWitness = height >= this.params.segwitHeight;
-
-      let totalSigOpsCost = 0;
-      const spentOutputs: SpentUTXO[] = [];
-      let totalInputValue = 0n;
-      let totalOutputValue = 0n;
-
-      // ── P2-OPT-ROUND-2: assumevalid gate for script verification ──
-      // Build the context once per block and check whether scripts should
-      // be skipped.  On regtest assumedValid is undefined, so every script
-      // fires (good for tests).  On mainnet the 6-condition check applies.
-      const bestHeader = this.headerSync.getBestHeader();
-      const currentHeaderEntry = this.headerSync.getHeaderByHeight(height);
-      const pindexTimestamp = currentHeaderEntry?.header.timestamp ?? 0;
-      const bestHeaderTimestamp = bestHeader?.header.timestamp ?? 0;
-
-      const avCtx: AssumeValidContext = {
-        pindex: {
-          hash: hashHex,
-          height,
-          chainWork: currentHeaderEntry?.chainWork ?? 0n,
+    // ── Delegate consensus checks + UTXO mutations to the shared helper. ──
+    //
+    // coreConnectBlockChecks handles:
+    //   BIP-30, IsFinalTx, bulk-UTXO preload, coinbase maturity, BIP-68/CSV,
+    //   script verification, sigops ceiling, coinbase-value check,
+    //   spendOutput, addTransaction (in block-order for intra-block chaining).
+    //
+    // On return ok=true the utxoManager reflects the post-block state.
+    // On return ok=false nothing has been flushed; the error is recorded.
+    const coreResult = await coreConnectBlockChecks(
+      block,
+      height,
+      this.utxoManager,
+      this.params,
+      {
+        assumeValid,
+        skipScripts,
+        prevMTP: blockPrevMTP,
+        enforceBIP68,
+        scriptThreads: this.scriptThreads,
+        verifyP2SH: height >= this.params.bip16Height,
+        verifyWitness: height >= this.params.segwitHeight,
+        // Per-coin MTP for accurate BIP-68 time-based sequence lock enforcement.
+        // Uses HeaderSync to look up the MTP at (coinHeight - 1).
+        getUTXOMTP: (coinHeight: number) => {
+          if (coinHeight <= 0) return 0;
+          const coinPrevHeader = this.headerSync.getHeaderByHeight(coinHeight - 1);
+          return coinPrevHeader ? this.headerSync.getMedianTimePast(coinPrevHeader) : 0;
         },
-        assumedValidHash: this.params.assumedValid,
-        getBlockByHash: (h) => {
-          const entry = this.headerSync.getHeader(Buffer.from(h, "hex"));
-          if (!entry) return null;
-          return { hash: entry.hash.toString("hex"), height: entry.height, chainWork: entry.chainWork };
-        },
-        getBlockAtHeight: (h) => {
-          const entry = this.headerSync.getHeaderByHeight(h);
-          if (!entry) return null;
-          return { hash: entry.hash.toString("hex"), height: entry.height, chainWork: entry.chainWork };
-        },
-        bestHeader: bestHeader
-          ? { hash: bestHeader.hash.toString("hex"), height: bestHeader.height, chainWork: bestHeader.chainWork }
-          : null,
-        minimumChainWork: this.params.nMinimumChainWork,
-        pindexTimestamp,
-        bestHeaderTimestamp,
-      };
-
-      const skipScriptsResult = shouldSkipScripts(avCtx);
-      const skipScripts = skipScriptsResult.skip;
-
-      for (let txIndex = 0; txIndex < block.transactions.length; txIndex++) {
-        const tx = block.transactions[txIndex];
-        const txid = getTxId(tx);
-        const txidHex = txid.toString("hex");
-        const isCoinbaseTx = isCoinbase(tx);
-
-        const prevOutputs: Buffer[] = [];
-
-        if (!isCoinbaseTx) {
-          // Check all inputs are in cache
-          for (const input of tx.inputs) {
-            if (!this.utxoManager.hasUTXO(input.prevOut)) {
-              const loaded = await this.utxoManager.preloadUTXO(input.prevOut);
-              if (!loaded) {
-                const m = `Missing UTXO for input ${input.prevOut.vout} of tx ${txidHex.slice(0, 16)}: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout} at height ${height}`;
-                console.error(m);
-                this.recordConnectError(m);
-                return false;
-              }
-            }
-          }
-
-          const utxoConfirmations: UTXOConfirmation[] = [];
-          // Collect UTXOEntries for script verification (parallel or sequential).
-          const inputUTXOs: UTXOEntry[] = [];
-
-          for (const input of tx.inputs) {
-            const utxo = this.utxoManager.getUTXO(input.prevOut);
-            if (utxo) {
-              prevOutputs.push(utxo.scriptPubKey);
-              inputUTXOs.push(utxo);
-
-              if (utxo.coinbase) {
-                const maturity = height - utxo.height;
-                if (maturity < this.params.coinbaseMaturity) {
-                  const m = `Immature coinbase spend in tx ${txidHex.slice(0, 16)}: maturity ${maturity} < ${this.params.coinbaseMaturity}`;
-                  console.warn(m);
-                  this.recordConnectError(m);
-                  return false;
-                }
-              }
-
-              if (enforceBIP68) {
-                let coinMTP = 0;
-                if (utxo.height > 0) {
-                  const coinPrevHeader = this.headerSync.getHeaderByHeight(utxo.height - 1);
-                  if (coinPrevHeader) {
-                    coinMTP = this.headerSync.getMedianTimePast(coinPrevHeader);
-                  }
-                }
-                utxoConfirmations.push({ height: utxo.height, medianTimePast: coinMTP });
-              } else {
-                utxoConfirmations.push({ height: utxo.height, medianTimePast: 0 });
-              }
-            }
-          }
-
-          if (enforceBIP68 && tx.version >= 2) {
-            const seqLockValid = checkSequenceLocks(
-              tx,
-              enforceBIP68,
-              height,
-              blockPrevMTP,
-              utxoConfirmations
-            );
-            if (!seqLockValid) {
-              const m = `Sequence locks not satisfied for tx ${txidHex.slice(0, 16)} at height ${height}`;
-              console.warn(m);
-              this.recordConnectError(m);
-              return false;
-            }
-          }
-
-          // ── P2-OPT-ROUND-2: parallel script verification ──
-          // Fires for every non-coinbase tx in the full-validation path unless
-          // the assumevalid 6-condition gate says to skip.
-          if (!skipScripts) {
-            const scriptFlags =
-              (verifyP2SH ? ScriptFlags.VERIFY_P2SH : ScriptFlags.VERIFY_NONE) |
-              (verifyWitness ? ScriptFlags.VERIFY_WITNESS : ScriptFlags.VERIFY_NONE);
-
-            let scriptResult;
-            if (this.scriptThreads === 1) {
-              // Benchmark baseline: serial path so callers can compare timings.
-              scriptResult = verifyAllInputsSequential(tx, inputUTXOs, scriptFlags);
-            } else {
-              // Production path: parallel (Promise.all across all inputs).
-              scriptResult = await verifyAllInputsParallel(tx, inputUTXOs, scriptFlags);
-            }
-
-            if (!scriptResult.valid) {
-              const m = `Script verification failed in tx ${txidHex.slice(0, 16)} at height ${height}` +
-                (scriptResult.failedInput !== undefined
-                  ? ` (input ${scriptResult.failedInput})`
-                  : "") +
-                (scriptResult.error ? `: ${scriptResult.error}` : "");
-              console.warn(m);
-              this.recordConnectError(m);
-              return false;
-            }
-          }
-
-          for (const input of tx.inputs) {
-            const spentEntry = this.utxoManager.spendOutput(input.prevOut);
-            totalInputValue += spentEntry.amount;
-            spentOutputs.push({
-              txid: input.prevOut.txid,
-              vout: input.prevOut.vout,
-              entry: spentEntry,
-            });
-          }
-        }
-
-        const txSigOpsCost = getTransactionSigOpCost(
-          tx,
-          prevOutputs,
-          verifyP2SH,
-          verifyWitness
-        );
-        totalSigOpsCost += txSigOpsCost;
-
-        this.utxoManager.addTransaction(txid, tx, height, isCoinbaseTx);
-
-        for (const output of tx.outputs) {
-          totalOutputValue += output.value;
-        }
       }
+    );
 
-      if (totalSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
-        const m = `Block sigops cost ${totalSigOpsCost} exceeds maximum ${MAX_BLOCK_SIGOPS_COST}`;
-        console.warn(m);
-        this.recordConnectError(m);
-        return false;
-      }
-
-      const coinbaseTx = block.transactions[0];
-      let coinbaseOutputValue = 0n;
-      for (const output of coinbaseTx.outputs) {
-        coinbaseOutputValue += output.value;
-      }
-
-      const subsidy = getBlockSubsidy(height, this.params);
-      const fees = totalInputValue - (totalOutputValue - coinbaseOutputValue);
-      const maxCoinbaseValue = subsidy + fees;
-
-      if (coinbaseOutputValue > maxCoinbaseValue) {
-        const m = `Coinbase value ${coinbaseOutputValue} exceeds maximum ${maxCoinbaseValue} at height ${height}`;
-        console.warn(m);
-        this.recordConnectError(m);
-        return false;
-      }
+    if (!coreResult.ok) {
+      const m = coreResult.error;
+      console.warn(m);
+      this.recordConnectError(m);
+      return false;
     }
 
     // During IBD, skip per-block DB writes (block data, undo, index) except
     // near the tip. Only update UTXO set in memory and flush periodically.
     // This eliminates the biggest I/O bottleneck: a LevelDB batch write per block.
     this.utxoManager.setBestBlock(blockHash);
-    const bestHeader = this.headerSync.getBestHeader();
+    // bestHeader was already fetched in the preamble for the assumevalid gate.
     const atTip = !bestHeader || height >= bestHeader.height;
     const shouldFlush = atTip || height % FLUSH_INTERVAL === 0;
 
