@@ -16,7 +16,7 @@ import type { UTXOManager } from "../chain/utxo.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import type { Block } from "../validation/block.js";
 import { getTransactionSigOpCost, WITNESS_SCALE_FACTOR } from "../validation/block.js";
-import type { Transaction, OutPoint } from "../validation/tx.js";
+import type { Transaction, OutPoint, UTXOConfirmation } from "../validation/tx.js";
 import {
   validateTxBasic,
   getTxId,
@@ -25,7 +25,9 @@ import {
   getTxVSize,
   isCoinbase,
   serializeTx,
+  checkSequenceLocks,
 } from "../validation/tx.js";
+import { isFinalTx } from "../mining/template.js";
 import { sha256Hash } from "../crypto/primitives.js";
 import {
   verifyScript,
@@ -670,6 +672,9 @@ export class Mempool {
   /** Current chain tip height. */
   private tipHeight: number;
 
+  /** Median Time Past of the current chain tip (BIP-113 / BIP-68). */
+  private tipMTP: number;
+
   /** Incremental relay fee rate (sat/vB). Replacement must pay this per vbyte over replaced fees. */
   private incrementalRelayFee: number;
 
@@ -713,6 +718,7 @@ export class Mempool {
     this.minFeeRate = DEFAULT_MIN_FEE_RATE;
     this.incrementalRelayFee = DEFAULT_INCREMENTAL_RELAY_FEE;
     this.tipHeight = 0;
+    this.tipMTP = 0;
     this.clusters = new UnionFind();
     this.clusterCache = new Map();
     this.clusterCacheDirty = false;
@@ -760,6 +766,23 @@ export class Mempool {
    */
   getTipHeight(): number {
     return this.tipHeight;
+  }
+
+  /**
+   * Set the Median Time Past of the current chain tip.
+   * Used for BIP-113 IsFinalTx and BIP-68 SequenceLocks checks.
+   *
+   * @param mtp - MTP in Unix timestamp seconds
+   */
+  setTipMTP(mtp: number): void {
+    this.tipMTP = mtp;
+  }
+
+  /**
+   * Get the current chain tip MTP.
+   */
+  getTipMTP(): number {
+    return this.tipMTP;
   }
 
   /**
@@ -951,6 +974,53 @@ export class Mempool {
         accepted: false,
         error: `Transaction weight ${weight} exceeds max ${this.params.maxBlockWeight}`,
       };
+    }
+
+    // 8c. BIP-113 IsFinalTx: nLockTime must be satisfied at the next block.
+    //     Reference: Bitcoin Core CheckFinalTxAtTip() (validation.cpp).
+    //     nextHeight = tipHeight + 1; lockTimeCutoff = MTP (BIP-113 MTP rule).
+    //     If headerSync is available, compute MTP from the best header; otherwise
+    //     fall back to the cached tipMTP value (set via setTipMTP).
+    const nextHeight = this.tipHeight + 1;
+    let currentMTP = this.tipMTP;
+    if (this.headerSync) {
+      const bestHdr = this.headerSync.getBestHeader();
+      if (bestHdr) {
+        currentMTP = this.headerSync.getMedianTimePast(bestHdr);
+      }
+    }
+    if (!isFinalTx(tx, nextHeight, currentMTP)) {
+      return {
+        accepted: false,
+        error: "non-final: bad-txns-nonfinal",
+      };
+    }
+
+    // 8d. BIP-68 SequenceLocks: per-input relative locktimes (CSV).
+    //     Reference: Bitcoin Core CheckSequenceLocksAtTip() (validation.cpp).
+    //     For confirmed UTXOs: use tipMTP conservatively as coin MTP (may
+    //     false-reject time-locked txs near the boundary but never false-admits).
+    //     For mempool parents: synthetic height = tipHeight + 1 (Core convention).
+    const enforceBIP68 =
+      tx.version >= 2 &&
+      this.tipHeight >= (this.params.csvHeight ?? 0);
+    if (enforceBIP68) {
+      const utxoConfirmations: UTXOConfirmation[] = inputUtxos.map(({ utxo, isMempool: isMp }) => {
+        if (isMp) {
+          // Unconfirmed parent: treat as mined at tipHeight + 1 with currentMTP.
+          return { height: nextHeight, medianTimePast: currentMTP };
+        } else {
+          // Confirmed UTXO: height from DB; use currentMTP conservatively for MTP.
+          const confirmedUtxo = utxo as UTXOEntry;
+          return { height: confirmedUtxo.height, medianTimePast: currentMTP };
+        }
+      });
+      if (!checkSequenceLocks(tx, enforceBIP68, nextHeight, currentMTP, utxoConfirmations)) {
+        return {
+          accepted: false,
+          error: "non-BIP68-final: bad-txns-nonfinal",
+        };
+      }
     }
 
     // 6. Check fee rate
