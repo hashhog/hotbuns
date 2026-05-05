@@ -788,16 +788,24 @@ export class RPCServer {
       tipTimestamp
     );
 
+    // Compute bits/target/time from tip header
+    const tipBitsNum = headerEntry ? headerEntry.header.bits : 0x1d00ffff;
+    const tipBitsHex = tipBitsNum.toString(16).padStart(8, "0");
+    const tipTargetHex = compactToBigInt(tipBitsNum).toString(16).padStart(64, "0");
+
     const result: Record<string, unknown> = {
       chain,
       blocks: bestBlock.height,
       headers: headers,
       bestblockhash: Buffer.from(bestBlock.hash).reverse().toString("hex"),
       difficulty,
+      time: tipTimestamp,
       mediantime,
       verificationprogress,
       initialblockdownload,
       chainwork: bestBlock.chainWork.toString(16).padStart(64, "0"),
+      bits: tipBitsHex,
+      target: tipTargetHex,
       pruned: pruneInfo.pruned,
       softforks,
       warnings: "",
@@ -1010,6 +1018,26 @@ export class RPCServer {
       }
     }
 
+    // Compute target from compact bits
+    const blockBitsHex = block.header.bits.toString(16).padStart(8, "0");
+    const blockTargetHex = compactToBigInt(block.header.bits).toString(16).padStart(64, "0");
+
+    // Build coinbase_tx from first transaction's first input (Core 27+ field)
+    let coinbaseTxObj: Record<string, unknown> | null = null;
+    if (block.transactions.length > 0) {
+      const cbTx = block.transactions[0];
+      const cbInput = cbTx.inputs.length > 0 ? cbTx.inputs[0] : null;
+      coinbaseTxObj = {
+        version: cbTx.version,
+        locktime: cbTx.lockTime,
+        sequence: cbInput ? cbInput.sequence : 0xffffffff,
+        coinbase: cbInput ? cbInput.scriptSig.toString("hex") : "",
+      };
+      if (cbInput && cbInput.witness.length > 0) {
+        (coinbaseTxObj as Record<string, unknown>).witness = cbInput.witness[0].toString("hex");
+      }
+    }
+
     // Verbosity 1 or 2: return JSON
     const result: Record<string, unknown> = {
       hash: blockhashParam,
@@ -1026,11 +1054,13 @@ export class RPCServer {
         ? this.headerSync.getMedianTimePast(headerEntry)
         : block.header.timestamp,
       nonce: block.header.nonce,
-      bits: block.header.bits.toString(16).padStart(8, "0"),
+      bits: blockBitsHex,
+      target: blockTargetHex,
       difficulty: this.calculateDifficultyFromBits(block.header.bits),
       chainwork: chainWorkHex,
       nTx: block.transactions.length,
       previousblockhash: Buffer.from(block.header.prevBlock).reverse().toString("hex"),
+      coinbase_tx: coinbaseTxObj,
     };
 
     // Add next block hash if available
@@ -5881,14 +5911,28 @@ export class RPCServer {
 
   private async getMiningInfo(): Promise<Record<string, unknown>> {
     const best = this.chainState.getBestBlock();
-    // Note: currentblocksize and currentblocktx were removed from Bitcoin Core
-    // in v0.25.0; we omit them here to match Core 31.99 parity.
+    // Get tip bits from header sync or fall back to genesis default
+    const tipHeaderEntry = this.headerSync.getHeader(best.hash);
+    const tipBitsNum = tipHeaderEntry ? tipHeaderEntry.header.bits : 0x1d00ffff;
+    const tipBitsHex = tipBitsNum.toString(16).padStart(8, "0");
+    const tipTargetHex = compactToBigInt(tipBitsNum).toString(16).padStart(64, "0");
+    const difficulty = this.calculateDifficultyFromBits(tipBitsNum);
+    const nextHeight = best.height + 1;
     return {
       blocks: best.height,
-      difficulty: this.calculateDifficultyFromBits(0x207fffff),
+      bits: tipBitsHex,
+      difficulty,
+      target: tipTargetHex,
+      blockmintxfee: 0.00001000,
       networkhashps: 0,
       pooledtx: this.mempool.getSize(),
       chain: this.getNetworkType(),
+      next: {
+        height: nextHeight,
+        bits: tipBitsHex,
+        difficulty,
+        target: tipTargetHex,
+      },
       warnings: "",
     };
   }
