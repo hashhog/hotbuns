@@ -487,6 +487,20 @@ export async function coreConnectBlockChecks(
   }
   const subsidy = getBlockSubsidy(height, params);
   const fees = totalInputValue - (totalOutputValue - coinbaseOutputValue);
+
+  // ── 6a. Non-coinbase output-exceeds-input check (bad-txns-in-belowout).
+  //
+  // Must be checked BEFORE the coinbase check because a negative fees value
+  // would otherwise cause a spurious "Coinbase value exceeds maximum" error.
+  // Core consensus/tx_verify.cpp::CheckTxInputs:
+  //   state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout", ...)
+  if (fees < 0n) {
+    return {
+      ok: false,
+      error: `Transaction outputs exceed inputs: non-coinbase output sum exceeds input sum (bad-txns-in-belowout)`,
+    };
+  }
+
   const maxCoinbaseValue = subsidy + fees;
   if (coinbaseOutputValue > maxCoinbaseValue) {
     return {
