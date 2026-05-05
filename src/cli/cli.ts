@@ -1213,8 +1213,15 @@ async function startNode(config: NodeConfig): Promise<void> {
   });
 
   // Handle incoming tx messages: validate via AcceptToMemoryPool and relay
+  // Reference: bitcoin-core/src/net_processing.cpp ProcessMessage(NetMsgType::TX)
+  // Core returns early at line 4395: if (m_chainman.IsInitialBlockDownload()) return;
+  // Reason: during IBD the UTXO set is incomplete so we cannot validate scripts or
+  // check coinbase maturity; accepting into the mempool would pollute it with txs
+  // that may be unconfirmable once the full chain is known.
   peerManager.onMessage("tx", async (peer: import("../p2p/peer.js").Peer, msg: NetworkMessage) => {
     if (msg.type !== "tx") return;
+    // IBD skip gate — mirrors Core net_processing.cpp:4395
+    if (!blockSync.isIBDComplete()) return;
     const tx = msg.payload.tx;
     const result = await mempool.acceptToMemoryPool(tx);
     if (result.accepted) {
