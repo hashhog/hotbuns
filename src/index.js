@@ -22600,8 +22600,31 @@ class BlockSync {
     }
   }
   async handleGetData(peer, inventory) {
+    // BIP-159 peer-served-blocks gate.  When prune mode is on, refuse to
+    // serve blocks below tip - 288 (NODE_NETWORK_LIMITED_MIN_BLOCKS).
+    // Mirrors Core's net_processing.cpp short-circuit; emits notfound
+    // rather than reading a possibly-deleted block file.
+    const MIN_BLOCKS_TO_KEEP = 288;
+    const pruneActive = this.peerManager &&
+      this.peerManager.config &&
+      this.peerManager.config.pruneMode === true;
+    let pruneHorizon = -1;
+    if (pruneActive) {
+      const bestHeader = this.headerSync.getBestHeader();
+      if (bestHeader && bestHeader.height > MIN_BLOCKS_TO_KEEP) {
+        pruneHorizon = bestHeader.height - MIN_BLOCKS_TO_KEEP;
+      }
+    }
+    const notFound = [];
     for (const inv of inventory) {
       if (inv.type === 2 /* MSG_BLOCK */ || inv.type === 1073741826 /* MSG_WITNESS_BLOCK */) {
+        if (pruneHorizon >= 0) {
+          const entry = this.headerSync.getHeader(inv.hash);
+          if (entry && entry.height < pruneHorizon) {
+            notFound.push(inv);
+            continue;
+          }
+        }
         const rawBlock = await this.db.getBlock(inv.hash);
         if (rawBlock) {
           const block = deserializeBlock(new BufferReader(rawBlock));
@@ -22610,8 +22633,13 @@ class BlockSync {
             payload: { block }
           };
           peer.send(blockMsg);
+        } else {
+          notFound.push(inv);
         }
       }
+    }
+    if (notFound.length > 0) {
+      peer.send({ type: "notfound", payload: { inventory: notFound } });
     }
   }
   requestBlocks() {
@@ -32262,7 +32290,11 @@ async function startNode(config) {
     datadir: mergedConfig.datadir,
     connect: config.connect,
     listen: mergedConfig.listen,
-    port: mergedConfig.port
+    port: mergedConfig.port,
+    // BIP-159: signal NODE_NETWORK_LIMITED in version handshake when
+    // prune mode is on so peers know we serve only the recent ~288-block
+    // keep window. Mirrors Core's init.cpp `IsPruneMode()` gate.
+    pruneMode: typeof mergedConfig.prune === "number" && mergedConfig.prune > 0
   });
   headerSync.registerWithPeerManager(peerManager);
   const blockSync = new BlockSync(db, params, headerSync, peerManager, chainState, mergedConfig.scriptThreads, cacheBytes);
