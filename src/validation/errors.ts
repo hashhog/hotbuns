@@ -160,6 +160,10 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
       return "block-script-verify-flag-failed";
     case ConsensusErrorCode.SEQUENCE_LOCK_NOT_SATISFIED:
       return "bad-txns-nonfinal";
+    // Non-coinbase tx where sum(inputs) < sum(outputs).
+    // Core consensus/tx_verify.cpp::CheckTxInputs "bad-txns-in-belowout".
+    case ConsensusErrorCode.INPUTS_NOT_EQUAL_OUTPUTS:
+      return "bad-txns-in-belowout";
 
     default:
       break;
@@ -212,6 +216,13 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
   // Mirrors consensus/tx_check.cpp::CheckTransaction.
   if (s.includes("output value exceeds maximum")) {
     return "bad-txns-vout-toolarge";
+  }
+  // Non-coinbase tx where sum(inputs) < sum(outputs).
+  // Core consensus/tx_verify.cpp::CheckTxInputs:
+  //   state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout", ...)
+  // connect_block.ts emits "...outputs exceed inputs...(bad-txns-in-belowout)".
+  if (s.includes("bad-txns-in-belowout") || s.includes("outputs exceed inputs")) {
+    return "bad-txns-in-belowout";
   }
   if (
     s.includes("script") ||

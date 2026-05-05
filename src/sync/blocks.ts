@@ -146,6 +146,10 @@ function bip22FromConnectError(err: string): string {
   if (s.includes("missing utxo") || s.includes("inputs-missingorspent"))
     return "bad-txns-inputs-missingorspent";
   if (s.includes("coinbase") && s.includes("immature")) return "bad-txns-premature-spend-of-coinbase";
+  // Non-coinbase tx where sum(inputs) < sum(outputs).
+  // Core consensus/tx_verify.cpp::CheckTxInputs "bad-txns-in-belowout".
+  // connect_block.ts emits "...outputs exceed inputs...(bad-txns-in-belowout)".
+  if (s.includes("bad-txns-in-belowout") || s.includes("outputs exceed inputs")) return "bad-txns-in-belowout";
   if ((s.includes("coinbase value") || s.includes("coinbase output")) && s.includes("exceeds")) return "bad-cb-amount";
   if (s.includes("sigops")) return "bad-blk-sigops";
   if (s.includes("merkle")) return "bad-txnmrklroot";
