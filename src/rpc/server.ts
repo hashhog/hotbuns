@@ -179,6 +179,131 @@ export const MAX_BATCH_SIZE = 1000;
  */
 export const DEFAULT_MAX_FEE_RATE = 0.1; // BTC/kvB
 
+// ============================================================================
+// Wave-47b: Partial Merkle Tree helpers (mirrors Bitcoin Core merkleblock.cpp)
+// ============================================================================
+
+/** CalcTreeWidth: (nTx + (1<<height) - 1) >> height. height 0 = leaves. */
+function w47bTreeWidth(nTx: number, height: number): number {
+  return (nTx + (1 << height) - 1) >> height;
+}
+
+/** CalcHash: height 0 = leaf (txid), height > 0 = combine children. */
+function w47bCalcHash(height: number, pos: number, txids: Buffer[]): Buffer {
+  if (height === 0) return txids[pos]!;
+  const nTx = txids.length;
+  const left = w47bCalcHash(height - 1, pos * 2, txids);
+  const right = pos * 2 + 1 < w47bTreeWidth(nTx, height - 1)
+    ? w47bCalcHash(height - 1, pos * 2 + 1, txids)
+    : left;
+  return hash256(Buffer.concat([left, right]));
+}
+
+/** TraverseAndBuild: returns { hashes, bits } in pre-order DFS. */
+function w47bTraverseAndBuild(
+  nTx: number,
+  txids: Buffer[],
+  matchFlags: boolean[]
+): { hashes: Buffer[]; bits: boolean[] } {
+  if (nTx === 0) return { hashes: [], bits: [] };
+  let nHeight = 0;
+  while (w47bTreeWidth(nTx, nHeight) > 1) nHeight++;
+
+  const hashes: Buffer[] = [];
+  const bits: boolean[] = [];
+
+  function traverse(height: number, pos: number): void {
+    // fParentOfMatch: any match in range [pos<<height, (pos+1)<<height)
+    const lo = pos << height;
+    const hi = Math.min((pos + 1) << height, nTx);
+    let parentMatch = false;
+    for (let p = lo; p < hi; p++) {
+      if (matchFlags[p]) { parentMatch = true; break; }
+    }
+    bits.push(parentMatch);
+    if (height === 0 || !parentMatch) {
+      hashes.push(w47bCalcHash(height, pos, txids));
+    } else {
+      traverse(height - 1, pos * 2);
+      if (pos * 2 + 1 < w47bTreeWidth(nTx, height - 1)) {
+        traverse(height - 1, pos * 2 + 1);
+      }
+    }
+  }
+  traverse(nHeight, 0);
+  return { hashes, bits };
+}
+
+/** BitsToBytes: pack bits LSB-first into bytes. */
+function w47bBitsToBytes(bits: boolean[]): Buffer {
+  const nBytes = Math.ceil(bits.length / 8);
+  const buf = Buffer.alloc(nBytes, 0);
+  for (let i = 0; i < bits.length; i++) {
+    if (bits[i]) buf[i >> 3] |= 1 << (i & 7);
+  }
+  return buf;
+}
+
+/** BytesToBits: unpack bytes into bit array (LSB-first). */
+function w47bBytesToBits(flagBytes: Buffer): boolean[] {
+  const len = flagBytes.length * 8;
+  return Array.from({ length: len }, (_, i) => ((flagBytes[i >> 3]! >> (i & 7)) & 1) === 1);
+}
+
+/** Encode Bitcoin varint into a Buffer. */
+function w47bEncodeVarInt(v: number): Buffer {
+  if (v < 0xfd) {
+    const b = Buffer.alloc(1); b[0] = v; return b;
+  } else if (v <= 0xffff) {
+    const b = Buffer.alloc(3); b[0] = 0xfd; b.writeUInt16LE(v, 1); return b;
+  } else {
+    const b = Buffer.alloc(5); b[0] = 0xfe; b.writeUInt32LE(v, 1); return b;
+  }
+}
+
+/** Read Bitcoin varint from buffer at pos. Returns [value, newPos]. */
+function w47bReadVarInt(buf: Buffer, pos: number): [number, number] {
+  const b = buf[pos]!;
+  if (b < 0xfd) return [b, pos + 1];
+  if (b === 0xfd) return [buf.readUInt16LE(pos + 1), pos + 3];
+  if (b === 0xfe) return [buf.readUInt32LE(pos + 1), pos + 5];
+  return [buf.readUInt32LE(pos + 1), pos + 9]; // truncate 8-byte to 4-byte
+}
+
+/** TraverseAndExtract: parse CMerkleBlock proof, return matched txids. */
+function w47bTraverseAndExtract(
+  nTx: number,
+  hashes: Buffer[],
+  flagBytes: Buffer
+): string[] {
+  if (nTx === 0) return [];
+  let nHeight = 0;
+  while (w47bTreeWidth(nTx, nHeight) > 1) nHeight++;
+
+  const bits = w47bBytesToBits(flagBytes);
+  let bitPos = 0;
+  let hashPos = 0;
+  const matched: string[] = [];
+
+  function extract(height: number, pos: number): Buffer {
+    const flag = bits[bitPos++] ?? false;
+    if (height === 0 || !flag) {
+      const h = hashes[hashPos++]!;
+      if (height === 0 && flag) {
+        matched.push(Buffer.from(h).reverse().toString("hex"));
+      }
+      return h;
+    }
+    const left = extract(height - 1, pos * 2);
+    const right = pos * 2 + 1 < w47bTreeWidth(nTx, height - 1)
+      ? extract(height - 1, pos * 2 + 1)
+      : left;
+    return hash256(Buffer.concat([left, right]));
+  }
+  extract(nHeight, 0);
+  return matched;
+}
+
 /**
  * JSON-RPC 2.0 server for Bitcoin node control and queries.
  */
@@ -727,6 +852,13 @@ export class RPCServer {
 
     // ZMQ methods
     this.registerMethod("getzmqnotifications", () => this.getZMQNotifications());
+
+    // Wave-47b methods
+    this.registerMethod("gettxoutsetinfo", (params) => this.getTxOutSetInfo(params));
+    this.registerMethod("getnetworkhashps", (params) => this.getNetworkHashPS(params));
+    this.registerMethod("gettxoutproof", (params) => this.getTxOutProof(params));
+    this.registerMethod("verifytxoutproof", (params) => this.verifyTxOutProof(params));
+    this.registerMethod("getrpcinfo", () => this.getRpcInfo());
   }
 
   // ========== Blockchain Methods ==========
@@ -6048,5 +6180,163 @@ export class RPCServer {
   private async help(params: unknown[]): Promise<string> {
     const methods = Array.from(this.methods.keys()).sort().join("\n");
     return methods;
+  }
+
+  // ========== Wave-47b Methods ==========
+
+  /**
+   * gettxoutsetinfo: Returns statistics about the unspent transaction output set.
+   */
+  private async getTxOutSetInfo(params: unknown[]): Promise<Record<string, unknown>> {
+    const chainState = await this.db.getChainState();
+    if (!chainState) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "No chain state available");
+    }
+    const bestBlock = this.chainState.getBestBlock();
+    const bestBlockHashHex = Buffer.from(bestBlock.hash).reverse().toString("hex");
+
+    // Compute hash_serialized_3 via the shared helper
+    const { hash, coinsCount } = await computeUTXOSetHash(this.db);
+    return {
+      height: bestBlock.height,
+      bestblock: bestBlockHashHex,
+      txouts: Number(coinsCount),
+      transactions: Number(coinsCount),
+      bogosize: 0,
+      hash_serialized_3: hash.reverse().toString("hex"),
+      total_amount: 0,
+    };
+  }
+
+  /**
+   * getnetworkhashps: Estimated network hash rate over the last nblocks blocks.
+   * Mirrors Bitcoin Core: workDiff / timeDiff over a sliding window.
+   */
+  private async getNetworkHashPS(params: unknown[]): Promise<number> {
+    const nblocks = typeof params[0] === "number" ? params[0] : 120;
+    const bestBlock = this.chainState.getBestBlock();
+    const tipHeight = bestBlock.height;
+    if (tipHeight < 2) return 0;
+
+    const window = nblocks <= 0 ? 120 : Math.min(nblocks, tipHeight);
+    const hiHeight = tipHeight;
+    const loHeight = hiHeight - window;
+
+    const hiEntry = this.headerSync.getHeaderByHeight(hiHeight);
+    const loEntry = this.headerSync.getHeaderByHeight(loHeight);
+    if (!hiEntry || !loEntry) return 0;
+
+    const workDiff = hiEntry.chainWork - loEntry.chainWork;
+    const timeDiff = hiEntry.header.timestamp - loEntry.header.timestamp;
+    if (timeDiff <= 0) return 0;
+
+    // workDiff is bigint; divide using bigint arithmetic, convert to number for JSON
+    const hashps = workDiff / BigInt(timeDiff);
+    // Number() is safe here: Bitcoin mainnet hashrate is ~10^21 H/s which exceeds
+    // Number.MAX_SAFE_INTEGER but JSON clients expect a numeric result. Use Number()
+    // which converts to float — same as Bitcoin Core's return type.
+    return Number(hashps);
+  }
+
+  /**
+   * gettxoutproof: Returns a CMerkleBlock hex proof that a txid is in a block.
+   */
+  private async getTxOutProof(params: unknown[]): Promise<string> {
+    if (!Array.isArray(params) || !Array.isArray(params[0])) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameters: expected [txids] or [txids, blockhash]");
+    }
+    const txidHexList: string[] = params[0] as string[];
+    const blockHashHexParam = typeof params[1] === "string" ? params[1] : null;
+
+    // Convert display-order txids to internal order
+    const reqTxids = txidHexList.map((h) => Buffer.from(h, "hex").reverse());
+
+    // Find the block containing the first txid
+    let blockHashInternal: Buffer;
+    if (blockHashHexParam) {
+      blockHashInternal = Buffer.from(blockHashHexParam, "hex").reverse();
+    } else {
+      const first = reqTxids[0];
+      if (!first) throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "No txids provided");
+      const entry = await this.db.getTxIndex(first);
+      if (!entry) throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Transaction not found in block index");
+      blockHashInternal = entry.blockHash;
+    }
+
+    const blockData = await this.db.getBlock(blockHashInternal);
+    if (!blockData) throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Block not found");
+
+    const reader = new BufferReader(blockData);
+    const block = deserializeBlock(reader);
+
+    const allTxids = block.transactions.map((tx) => getTxId(tx) as Buffer);
+    const nTx = allTxids.length;
+    const matchFlags = allTxids.map((txid) =>
+      reqTxids.some((req) => req.equals(txid))
+    );
+
+    const { hashes, bits } = w47bTraverseAndBuild(nTx, allTxids, matchFlags);
+
+    // Encode CMerkleBlock: 80-byte header | nTx LE | varint hashes | hashes | varint flags | flags
+    const hdrCs = serializeBlockHeader(block.header);
+
+    const parts: Buffer[] = [hdrCs];
+    const nTxBuf = Buffer.alloc(4);
+    nTxBuf.writeUInt32LE(nTx, 0);
+    parts.push(nTxBuf);
+    parts.push(w47bEncodeVarInt(hashes.length));
+    for (const h of hashes) parts.push(h);
+    const flagBytes = w47bBitsToBytes(bits);
+    parts.push(w47bEncodeVarInt(flagBytes.length));
+    parts.push(flagBytes);
+
+    return Buffer.concat(parts).toString("hex");
+  }
+
+  /**
+   * verifytxoutproof: Verifies a CMerkleBlock proof and returns matched txids.
+   */
+  private async verifyTxOutProof(params: unknown[]): Promise<string[]> {
+    if (typeof params[0] !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameters: expected [proof_hex]");
+    }
+    const proofBuf = Buffer.from(params[0] as string, "hex");
+    if (proofBuf.length < 84) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Proof too short");
+    }
+
+    const nTx = proofBuf.readUInt32LE(80);
+    if (nTx === 0) return [];
+
+    let pos = 84;
+    const [hashCount, pos2] = w47bReadVarInt(proofBuf, pos);
+    pos = pos2;
+    if (proofBuf.length < pos + hashCount * 32) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Proof truncated (hashes)");
+    }
+    const hashes: Buffer[] = [];
+    for (let i = 0; i < hashCount; i++) {
+      hashes.push(proofBuf.subarray(pos + i * 32, pos + i * 32 + 32));
+    }
+    pos += hashCount * 32;
+
+    const [flagCount, pos3] = w47bReadVarInt(proofBuf, pos);
+    pos = pos3;
+    if (proofBuf.length < pos + flagCount) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Proof truncated (flags)");
+    }
+    const flagBytes = proofBuf.subarray(pos, pos + flagCount);
+
+    return w47bTraverseAndExtract(nTx, hashes, flagBytes);
+  }
+
+  /**
+   * getrpcinfo: Returns runtime information about the RPC server.
+   */
+  private async getRpcInfo(): Promise<Record<string, unknown>> {
+    return {
+      active_commands: [],
+      logpath: "",
+    };
   }
 }
