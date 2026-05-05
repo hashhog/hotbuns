@@ -220,6 +220,8 @@ export class RPCServer {
    * tests can spin up multiple isolated RPCServer instances.
    */
   private blockSubmissionPaused: boolean = false;
+  /** Unix timestamp (seconds) when this server was constructed; used by `uptime`. */
+  private readonly startedAt: number = Math.floor(Date.now() / 1000);
 
   constructor(config: RPCServerConfig, deps: RPCServerDeps) {
     this.config = {
@@ -666,8 +668,12 @@ export class RPCServer {
     this.registerMethod("reconsiderblock", (params) => this.reconsiderBlockRPC(params));
     this.registerMethod("preciousblock", (params) => this.preciousBlockRPC(params));
 
+    // UTXO query
+    this.registerMethod("gettxout", (params) => this.getTxOut(params));
+
     // Control methods
     this.registerMethod("stop", () => this.stopNode());
+    this.registerMethod("uptime", () => this.getUptime());
 
     // Multi-wallet management methods (always available if walletManager is present)
     if (this.walletManager) {
@@ -5875,15 +5881,80 @@ export class RPCServer {
 
   private async getMiningInfo(): Promise<Record<string, unknown>> {
     const best = this.chainState.getBestBlock();
+    // Note: currentblocksize and currentblocktx were removed from Bitcoin Core
+    // in v0.25.0; we omit them here to match Core 31.99 parity.
     return {
       blocks: best.height,
-      currentblocksize: 0,
-      currentblocktx: 0,
       difficulty: this.calculateDifficultyFromBits(0x207fffff),
       networkhashps: 0,
       pooledtx: this.mempool.getSize(),
       chain: this.getNetworkType(),
       warnings: "",
+    };
+  }
+
+  private async getUptime(): Promise<number> {
+    return Math.floor(Date.now() / 1000) - this.startedAt;
+  }
+
+  /**
+   * gettxout — return details about an unspent transaction output.
+   * Reference: Bitcoin Core src/rpc/blockchain.cpp::gettxout
+   */
+  private async getTxOut(params: unknown[]): Promise<Record<string, unknown> | null> {
+    if (!params[0] || typeof params[0] !== "string") {
+      throw this.rpcError(-8, "txid must be a string");
+    }
+    if (params[1] === undefined || params[1] === null) {
+      throw this.rpcError(-8, "vout index required");
+    }
+    const txidHex = params[0] as string;
+    const vout = Number(params[1]);
+    const includeMempool = params[2] !== false;
+
+    if (txidHex.length !== 64) {
+      throw this.rpcError(-5, "Invalid txid");
+    }
+
+    // txid in display format is reversed; convert to internal byte order
+    const txidBuf = Buffer.from(txidHex, "hex").reverse();
+    const bestBlock = this.chainState.getBestBlock();
+    const bestBlockHash = Buffer.from(bestBlock.hash).reverse().toString("hex");
+
+    // Check mempool first if requested
+    if (includeMempool) {
+      // txidBuf is internal byte order (already reversed above); mempool keys by internal order
+      const mpEntry = this.mempool.getTransaction(txidBuf);
+      if (mpEntry) {
+        const tx = mpEntry.tx;
+        if (vout >= 0 && vout < tx.outputs.length) {
+          const output = tx.outputs[vout];
+          return {
+            bestblock: bestBlockHash,
+            confirmations: 0,
+            value: Number(output.value) / 1e8,
+            scriptPubKey: this.formatScriptPubKey(output.scriptPubKey),
+            coinbase: false,
+          };
+        }
+      }
+    }
+
+    // Look up in chainstate UTXO set
+    const utxoManager = this.chainState.getUTXOManager();
+    const outpoint = { txid: txidBuf, vout };
+    const entry = await utxoManager.getUTXOAsync(outpoint);
+    if (!entry) {
+      return null;
+    }
+
+    const confirmations = bestBlock.height - entry.height + 1;
+    return {
+      bestblock: bestBlockHash,
+      confirmations,
+      value: Number(entry.amount) / 1e8,
+      scriptPubKey: this.formatScriptPubKey(entry.scriptPubKey),
+      coinbase: entry.coinbase,
     };
   }
 
