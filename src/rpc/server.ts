@@ -5580,8 +5580,39 @@ export class RPCServer {
   /**
    * loadtxoutset: Load a UTXO snapshot from a file.
    *
-   * @param params - [path] Path to the snapshot file
-   * @returns Load result with coins loaded, base hash, height, and path
+   * Refused with `RPC_INTERNAL_ERROR`. The handler used to call
+   * `ChainstateManager.loadSnapshot(path)` which streams coins into
+   * `DBPrefix.UTXO` and sets `manager.activeChainstate`, but it did
+   * NOT call:
+   *
+   *   - `db.putChainState({ bestBlockHash, bestHeight, ... })`
+   *   - `db.putBlockIndex(baseBlockHash, { height, header, status, ... })`
+   *
+   * Both of those calls are made by the CLI path (`runSnapshotLoad` in
+   * `src/cli/cli.ts`) AFTER `manager.loadSnapshot` returns. Without
+   * them, the UTXO rows for the snapshot height live in the DB while
+   * `getChainState()` still reports the pre-load tip (typically
+   * genesis on a fresh datadir). Subsequent IBD will silently
+   * re-download the entire chain from genesis and overwrite the
+   * snapshot UTXOs — a slow, silent corruption that the RPC reported
+   * as "success".
+   *
+   * Wiring the missing put-* calls in-handler is also not enough on
+   * its own: the running daemon's header-sync / block-download
+   * components were initialised at boot from the pre-load chainstate
+   * and have no in-handler refresh path. The CLI is the only entry
+   * point that runs BEFORE those components start, so there's no
+   * stale in-memory tip to swap.
+   *
+   * Mirrors rustoshi's `option B` fix from 2026-05-05 (rustoshi
+   * 1d0a325): refuse the RPC at the gate, leave the datadir
+   * untouched, point the operator at the CLI flag. Same JSON-RPC
+   * error code Bitcoin Core uses in
+   * `bitcoin-core/src/rpc/blockchain.cpp::loadtxoutset` when
+   * `ActivateSnapshot` cannot proceed.
+   *
+   * @param params - [path] Path to the snapshot file (validated for
+   *                 shape only; never opened)
    */
   private async loadTxoutset(params: unknown[]): Promise<Record<string, unknown>> {
     const [pathParam] = params;
@@ -5590,26 +5621,15 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "path must be a string");
     }
 
-    // Create or get chainstate manager
-    let chainstateManager = this.chainstateManager;
-    if (!chainstateManager) {
-      chainstateManager = new ChainstateManager(this.db, this.params);
-      this.chainstateManager = chainstateManager;
-    }
-
-    try {
-      const result = await chainstateManager.loadSnapshot(pathParam);
-
-      return {
-        coins_loaded: Number(result.coinsLoaded),
-        tip_hash: result.baseBlockHash.toString("hex"),
-        base_height: result.baseHeight,
-        path: result.path,
-      };
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      throw this.rpcError(RPCErrorCodes.INTERNAL_ERROR, `Failed to load snapshot: ${message}`);
-    }
+    throw this.rpcError(
+      RPCErrorCodes.INTERNAL_ERROR,
+      "loadtxoutset RPC is disabled in this build because the live daemon "
+        + "cannot atomically activate a UTXO snapshot once the header-sync "
+        + "and block-download components have started. Use the CLI flag "
+        + "--load-snapshot=<path> at startup instead — that path imports "
+        + "the snapshot, pins the chain tip, and writes the block index "
+        + "before any P2P/sync components are constructed."
+    );
   }
 
   /**
