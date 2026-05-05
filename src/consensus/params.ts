@@ -361,7 +361,12 @@ export const MAINNET: ConsensusParams = {
   // Used by shouldSkipScripts() for the proper ancestor-check semantics.
   assumedValid: "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac",
   protocolVersion: 70016,
-  services: 0x0409n, // NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED
+  // Default-advertised services: NODE_NETWORK | NODE_WITNESS = 0x09.
+  // BIP-159 NODE_NETWORK_LIMITED (0x400) is OR'd in by PeerManager when
+  // prune mode is enabled (config.pruneMode === true).  Mirrors Core's
+  // init.cpp (`nLocalServices |= NODE_NETWORK_LIMITED` only when
+  // `IsPruneMode()` is true).
+  services: 0x09n, // NODE_NETWORK | NODE_WITNESS
   userAgent: "/hotbuns:0.1.0/",
   dnsSeed: [
     "seed.bitcoin.sipa.be",

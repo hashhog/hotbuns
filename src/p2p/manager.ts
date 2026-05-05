@@ -78,6 +78,15 @@ export interface PeerManagerConfig {
   listen?: boolean;
   /** P2P port to listen on (default: network default port) */
   port?: number;
+  /**
+   * BIP-159: when true, OR `NODE_NETWORK_LIMITED` (1<<10 = 0x400)
+   * into the advertised services bitfield in outbound version handshakes.
+   * Set when prune mode is enabled (--prune > 0).  Mirrors Core's
+   * `init.cpp` (`nLocalServices |= NODE_NETWORK_LIMITED` when
+   * `IsPruneMode()` is true).  Peers seeing this bit must not request
+   * blocks below the recent-`MIN_BLOCKS_TO_KEEP` (288) keep window.
+   */
+  pruneMode?: boolean;
 }
 
 /** Stored information about a known peer address. */
@@ -623,12 +632,19 @@ export class PeerManager {
 
     this.connectingPeers.add(key);
 
+    // BIP-159: OR `NODE_NETWORK_LIMITED` (1<<10) into the advertised
+    // services when prune mode is on.  Otherwise advertise the
+    // network-default services from `params.services`.
+    const advertisedServices = this.config.pruneMode
+      ? (this.config.params.services | ServiceFlags.NODE_NETWORK_LIMITED)
+      : this.config.params.services;
+
     const config: PeerConfig = {
       host,
       port,
       magic: this.config.params.networkMagic,
       protocolVersion: this.config.params.protocolVersion,
-      services: this.config.params.services,
+      services: advertisedServices,
       userAgent: this.config.params.userAgent,
       bestHeight: this.config.bestHeight,
       relay: connectionType !== "block_relay", // Block-relay-only connections don't relay txs
@@ -1860,13 +1876,19 @@ export class PeerManager {
               manager.disconnectPeer(evicted);
             }
 
+            // BIP-159: same NODE_NETWORK_LIMITED gate as outbound; advertise
+            // the bit if and only if prune mode is on.
+            const inAdvertisedServices = manager.config.pruneMode
+              ? (manager.config.params.services | ServiceFlags.NODE_NETWORK_LIMITED)
+              : manager.config.params.services;
+
             // Create a Peer for this inbound connection
             const peerConfig: PeerConfig = {
               host,
               port: 0, // remote ephemeral port; not meaningful for inbound
               magic: manager.config.params.networkMagic,
               protocolVersion: manager.config.params.protocolVersion,
-              services: manager.config.params.services,
+              services: inAdvertisedServices,
               userAgent: manager.config.params.userAgent,
               bestHeight: manager.config.bestHeight,
               relay: true,
