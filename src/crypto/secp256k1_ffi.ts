@@ -392,8 +392,16 @@ export function ecdsaVerifyLaxFFI(
     return false;
   }
 
-  // Do NOT normalize to low-S — lax verification intentionally allows high-S.
-  // The interpreter checks SCRIPT_VERIFY_LOW_S separately.
+  // Normalize to low-S before verify.
+  // libsecp256k1's secp256k1_ecdsa_verify only accepts low-S form; high-S
+  // signatures return 0 unless normalized first.  Normalization is NOT the
+  // same as enforcing SCRIPT_VERIFY_LOW_S: it just converts the mathematical
+  // representation to the canonical form so that verify succeeds.  Whether
+  // the signature is policy-rejected as high-S is gated separately by the
+  // interpreter's checkSignatureEncoding (flags.verifyLowS).
+  // Reference: Bitcoin Core src/script/interpreter.cpp ~line 212:
+  //   secp256k1_ecdsa_signature_normalize(secp256k1_context_static, &sig, &sig);
+  _syms!.secp256k1_ecdsa_signature_normalize(_ctx, _sigPtr, _sigPtr);
 
   const msgPtr = ptr(msgHash as Uint8Array);
   return _syms!.secp256k1_ecdsa_verify(_ctx, _sigPtr, msgPtr, _pubkeyPtr) === 1;
