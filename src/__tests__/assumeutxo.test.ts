@@ -468,7 +468,6 @@ describe("assumeUTXO", () => {
       await db.putChainState({
         bestBlockHash: tip,
         bestHeight: 1,
-        bestBlockTime: 0,
         totalWork: 1n,
       });
 

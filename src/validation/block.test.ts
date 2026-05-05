@@ -1340,8 +1340,7 @@ describe("validateBip34Height byte-prefix check", () => {
     return {
       version: 1,
       inputs: [{
-        prevTxId: Buffer.alloc(32, 0),
-        prevIndex: 0xffffffff,
+        prevOut: { txid: Buffer.alloc(32, 0), vout: 0xffffffff },
         scriptSig,
         sequence: 0xffffffff,
         witness: [],

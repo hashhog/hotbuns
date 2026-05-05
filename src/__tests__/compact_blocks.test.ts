@@ -141,6 +141,7 @@ function createMockMempool(txs: Transaction[]): {
     miningScore: 1,
     ephemeralDustParents: new Set<string>(),
     hasEphemeralDust: false,
+    sigOpCost: 0,
   }));
 
   const txidMap = new Map<string, MempoolEntry>();

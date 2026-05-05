@@ -228,6 +228,7 @@ function createMempoolEntry(tx: Transaction): MempoolEntry {
     miningScore: 10,
     ephemeralDustParents: new Set(),
     hasEphemeralDust: false,
+    sigOpCost: 0,
   };
 }
 
