@@ -1,4 +1,4 @@
-// @bun
+import { createRequire } from "node:module";
 var __create = Object.create;
 var __getProtoOf = Object.getPrototypeOf;
 var __defProp = Object.defineProperty;
@@ -62,7 +62,7 @@ var __export = (target, all) => {
     });
 };
 var __esm = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
-var __require = import.meta.require;
+var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // node_modules/level-supports/index.js
 var require_level_supports = __commonJS((exports) => {
@@ -6190,7 +6190,7 @@ function schnorrGetExtPubKey(priv) {
 function lift_x(x) {
   const Fp = Fpk1;
   if (!Fp.isValidNot0(x))
-    throw new Error("invalid x: Fail if x \u2265 p");
+    throw new Error("invalid x: Fail if x ≥ p");
   const xx = Fp.create(x * x);
   const c = Fp.create(xx * x + BigInt(7));
   let y = Fp.sqrt(c);
@@ -6472,6 +6472,7 @@ function ecdsaVerifyLaxFFI(signature, msgHash, publicKey) {
   if (_syms.secp256k1_ecdsa_signature_parse_compact(_ctx, _sigPtr, compactPtr) !== 1) {
     return false;
   }
+  _syms.secp256k1_ecdsa_signature_normalize(_ctx, _sigPtr, _sigPtr);
   const msgPtr = ptr(msgHash);
   return _syms.secp256k1_ecdsa_verify(_ctx, _sigPtr, msgPtr, _pubkeyPtr) === 1;
 }
@@ -6508,9 +6509,9 @@ var init_secp256k1_ffi = __esm(() => {
   _xonlyPubkeyBuf = new Uint8Array(OPAQUE_BUF_SIZE);
   FFI_AVAILABLE = initFFI();
   if (FFI_AVAILABLE) {
-    console.error("[secp256k1_ffi] libsecp256k1 0.5.0 FFI ready \u2014 ECDSA/Schnorr via C library");
+    console.error("[secp256k1_ffi] libsecp256k1 0.5.0 FFI ready — ECDSA/Schnorr via C library");
   } else {
-    console.warn("[secp256k1_ffi] libsecp256k1 unavailable \u2014 callers fall back to @noble/curves");
+    console.warn("[secp256k1_ffi] libsecp256k1 unavailable — callers fall back to @noble/curves");
   }
 });
 
@@ -6542,7 +6543,7 @@ __export(exports_primitives, {
   ecdsaSign: () => ecdsaSign,
   computeMerkleRootOptimized: () => computeMerkleRootOptimized
 });
-import { createHash } from "crypto";
+import { createHash } from "node:crypto";
 function sha256NodeCrypto(data) {
   return createHash("sha256").update(data).digest();
 }
@@ -12488,6 +12489,8 @@ function bip22Result(code) {
       return "block-script-verify-flag-failed";
     case "SEQUENCE_LOCK_NOT_SATISFIED" /* SEQUENCE_LOCK_NOT_SATISFIED */:
       return "bad-txns-nonfinal";
+    case "INPUTS_NOT_EQUAL_OUTPUTS" /* INPUTS_NOT_EQUAL_OUTPUTS */:
+      return "bad-txns-in-belowout";
     default:
       break;
   }
@@ -12534,6 +12537,9 @@ function bip22Result(code) {
   }
   if (s.includes("output value exceeds maximum")) {
     return "bad-txns-vout-toolarge";
+  }
+  if (s.includes("bad-txns-in-belowout") || s.includes("outputs exceed inputs")) {
+    return "bad-txns-in-belowout";
   }
   if (s.includes("script") || s.includes("block-script-verify-flag-failed") || s.includes("mandatory-script-verify-flag-failed") || s.includes("checksig") || s.includes("tapscript") || s.includes("witness program")) {
     return "block-script-verify-flag-failed";
@@ -12821,6 +12827,12 @@ async function coreConnectBlockChecks(block, height, utxoManager, params, opts =
   }
   const subsidy = getBlockSubsidy(height, params);
   const fees = totalInputValue - (totalOutputValue - coinbaseOutputValue);
+  if (fees < 0n) {
+    return {
+      ok: false,
+      error: `Transaction outputs exceed inputs: non-coinbase output sum exceeds input sum (bad-txns-in-belowout)`
+    };
+  }
   const maxCoinbaseValue = subsidy + fees;
   if (coinbaseOutputValue > maxCoinbaseValue) {
     return {
@@ -13426,7 +13438,7 @@ class ChainStateManager {
 // src/chain/snapshot.ts
 init_primitives();
 init_serialization();
-import { promises as fsp2 } from "fs";
+import { promises as fsp2 } from "node:fs";
 
 // src/wire/compressor.ts
 init_secp256k1();
@@ -14544,7 +14556,7 @@ class StreamingBufferReader {
       this.filePos += bytesRead;
     }
     if (this.windowEnd - this.windowOff < n) {
-      throw new Error(`StreamingBufferReader: underrun \u2014 wanted ${n} bytes but only ` + `${this.windowEnd - this.windowOff} available (file pos ` + `${this.bytesConsumed + this.windowOff}, file size ${this.fileSize})`);
+      throw new Error(`StreamingBufferReader: underrun — wanted ${n} bytes but only ` + `${this.windowEnd - this.windowOff} available (file pos ` + `${this.bytesConsumed + this.windowOff}, file size ${this.fileSize})`);
     }
   }
   async readUInt8() {
@@ -15001,7 +15013,7 @@ function shouldSkipScripts(ctx) {
   }
   return {
     skip: true,
-    reason: "block is ancestor of assumevalid and all safety conditions met \u2014 SKIP scripts"
+    reason: "block is ancestor of assumevalid and all safety conditions met — SKIP scripts"
   };
 }
 
@@ -15227,6 +15239,7 @@ class Mempool {
   params;
   minFeeRate;
   tipHeight;
+  tipMTP;
   incrementalRelayFee;
   clusters;
   clusterCache;
@@ -15244,6 +15257,7 @@ class Mempool {
     this.minFeeRate = DEFAULT_MIN_FEE_RATE;
     this.incrementalRelayFee = DEFAULT_INCREMENTAL_RELAY_FEE;
     this.tipHeight = 0;
+    this.tipMTP = 0;
     this.clusters = new UnionFind;
     this.clusterCache = new Map;
     this.clusterCacheDirty = false;
@@ -15264,6 +15278,12 @@ class Mempool {
   }
   getTipHeight() {
     return this.tipHeight;
+  }
+  setTipMTP(mtp) {
+    this.tipMTP = mtp;
+  }
+  getTipMTP() {
+    return this.tipMTP;
   }
   async acceptToMemoryPool(tx) {
     return this.addTransaction(tx);
@@ -15383,6 +15403,37 @@ class Mempool {
         accepted: false,
         error: `Transaction weight ${weight} exceeds max ${this.params.maxBlockWeight}`
       };
+    }
+    const nextHeight = this.tipHeight + 1;
+    let currentMTP = this.tipMTP;
+    if (this.headerSync) {
+      const bestHdr = this.headerSync.getBestHeader();
+      if (bestHdr) {
+        currentMTP = this.headerSync.getMedianTimePast(bestHdr);
+      }
+    }
+    if (!isFinalTx(tx, nextHeight, currentMTP)) {
+      return {
+        accepted: false,
+        error: "non-final: bad-txns-nonfinal"
+      };
+    }
+    const enforceBIP68 = tx.version >= 2 && this.tipHeight >= (this.params.csvHeight ?? 0);
+    if (enforceBIP68) {
+      const utxoConfirmations = inputUtxos.map(({ utxo, isMempool: isMp }) => {
+        if (isMp) {
+          return { height: nextHeight, medianTimePast: currentMTP };
+        } else {
+          const confirmedUtxo = utxo;
+          return { height: confirmedUtxo.height, medianTimePast: currentMTP };
+        }
+      });
+      if (!checkSequenceLocks(tx, enforceBIP68, nextHeight, currentMTP, utxoConfirmations)) {
+        return {
+          accepted: false,
+          error: "non-BIP68-final: bad-txns-nonfinal"
+        };
+      }
     }
     const feeRate = Number(fee) / vsize;
     if (feeRate < this.minFeeRate) {
@@ -16614,8 +16665,8 @@ function validatePackage(transactions) {
 // src/mempool/persist.ts
 init_serialization();
 init_tx();
-import { promises as fsp3 } from "fs";
-import * as path from "path";
+import { promises as fsp3 } from "node:fs";
+import * as path from "node:path";
 var MEMPOOL_DUMP_VERSION = 2n;
 var MEMPOOL_DUMP_VERSION_NO_XOR_KEY = 1n;
 var OBFUSCATION_KEY_SIZE = 8;
@@ -20879,7 +20930,7 @@ class PeerManager {
           this.anchors.push({ host, port });
         }
         try {
-          const fs = await import("fs/promises");
+          const fs = await import("node:fs/promises");
           await fs.unlink(path2);
         } catch {}
       }
@@ -22224,6 +22275,8 @@ function bip22FromConnectError(err) {
     return "bad-txns-inputs-missingorspent";
   if (s.includes("coinbase") && s.includes("immature"))
     return "bad-txns-premature-spend-of-coinbase";
+  if (s.includes("bad-txns-in-belowout") || s.includes("outputs exceed inputs"))
+    return "bad-txns-in-belowout";
   if ((s.includes("coinbase value") || s.includes("coinbase output")) && s.includes("exceeds"))
     return "bad-cb-amount";
   if (s.includes("sigops"))
@@ -22834,7 +22887,7 @@ class BlockSync {
 ` + `Error: ${failureMsg}
 
 ` + `This is a consensus rule mismatch with Bitcoin Core, NOT chainstate
-` + `corruption \u2014 file a bug report against hotbuns. The chainstate is
+` + `corruption — file a bug report against hotbuns. The chainstate is
 ` + `recoverable; do NOT wipe the data directory. Once the rule is fixed
 ` + `in code, restart and the bounded retry will resume from this height.
 `);
@@ -28869,7 +28922,7 @@ class RPCServer {
     } else if (snapshotType === "rollback") {
       const h = getLatestSnapshotHeightForRollback(this.params, tip.height);
       if (h === null) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "No assumeutxo snapshot height available \u2264 current tip");
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "No assumeutxo snapshot height available ≤ current tip");
       }
       const hashAtHeight = await this.db.getBlockHashByHeight(h);
       if (!hashAtHeight) {
@@ -29879,7 +29932,7 @@ init_encoding();
 init_serialization();
 init_tx();
 init_secp256k1();
-import * as crypto2 from "crypto";
+import * as crypto2 from "node:crypto";
 var HARDENED_OFFSET2 = 2147483648;
 var CURVE_ORDER2 = BigInt("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
 var TAPTWEAK_TAG2 = "TapTweak";
@@ -32031,7 +32084,7 @@ async function importFromBlkFiles(blocksDir, startHeight, db, chainState, params
   while (true) {
     const hashBuf = await db.getBlockHashByHeight(height);
     if (!hashBuf) {
-      console.log(`No header at height ${height} \u2014 end of header chain. Imported ${imported} blocks.`);
+      console.log(`No header at height ${height} — end of header chain. Imported ${imported} blocks.`);
       break;
     }
     const hashHex = hashBuf.toString("hex");
@@ -32344,7 +32397,7 @@ bitcoin_mempool_size ${mempoolCount}
       console.log(`Prometheus metrics server listening on http://0.0.0.0:${metricsPort} (/health probe enabled)`);
     } catch (err) {
       const msg = err?.message ?? String(err);
-      console.error(`[metrics] failed to bind port ${metricsPort}: ${msg} \u2014 continuing without metrics`);
+      console.error(`[metrics] failed to bind port ${metricsPort}: ${msg} — continuing without metrics`);
     }
   }
   if (typeof mergedConfig.readyFd === "number" && mergedConfig.readyFd >= 0) {
