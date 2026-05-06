@@ -1559,11 +1559,22 @@ export class BlockSync {
    * chain/state.ts because that path has its own UTXOManager
    * instance — see the dual-UTXOManager note in the Pattern B fix
    * commit for details.
+   *
+   * Multi-block atomicity (Pattern D, post-`9b10550`): if `pendingOps`
+   * is provided, the txindex deletes are APPENDED to it instead of
+   * being written via a standalone `db.batchWrite`.  The caller
+   * (`handleReorgUtxoAndCollect` → `connectBlock`) then funnels the
+   * accumulated ops through `UTXOManager.flushDirty(extraOps)` so the
+   * full reorg (N disconnects + M reconnects + new-tip connect) lands
+   * in a single ClassicLevel batch.  When `pendingOps` is undefined
+   * (e.g. unit tests that exercise this path in isolation), falls
+   * back to the legacy direct-write behaviour for backwards compat.
    */
   private async disconnectBlockUtxo(
     block: Block,
     height: number,
-    blockHash: Buffer
+    blockHash: Buffer,
+    pendingOps?: BatchOperation[]
   ): Promise<boolean> {
     const undoData = await this.db.getUndoData(blockHash);
     if (!undoData) {
@@ -1634,7 +1645,21 @@ export class BlockSync {
     // findTxInBlock fallback) — Pattern C in the audit.  See
     // CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
     // for the cross-impl table and Core-vs-fleet expected behavior.
-    await this.deleteTxIndexForBlock(block, blockHash);
+    //
+    // Pattern D (multi-block atomicity): when called from
+    // handleReorgUtxoAndCollect, the txindex deletes accumulate in the
+    // shared `pendingOps` buffer so they ride the same final batch as
+    // the UTXO + chain-state writes.  When called standalone (legacy
+    // unit-test path), fall back to the per-block batch helper.
+    if (pendingOps) {
+      const { getTxId } = await import("../validation/tx.js");
+      for (const tx of block.transactions) {
+        const txid = getTxId(tx);
+        pendingOps.push(this.db.buildTxIndexDeleteOp(txid));
+      }
+    } else {
+      await this.deleteTxIndexForBlock(block, blockHash);
+    }
 
     return true;
   }
@@ -1644,22 +1669,57 @@ export class BlockSync {
    * reconnect intermediate new-chain blocks, and collect old-chain
    * non-coinbase txs for mempool refill.  Caller passes a mutable
    * `disconnectedTxsOut` array which is populated in OLD-chain
-   * disconnect order (newest first).  Returns true when the UTXO set
-   * has been successfully repositioned at the fork point AND
-   * intermediate blocks have been connected — i.e. the next
-   * `coreConnectBlockChecks` call will see the correct context.
-   * Returns false on any step that couldn't complete (missing undo,
-   * missing intermediate body, etc.); caller should fall back to the
+   * disconnect order (newest first), and an optional `pendingOps`
+   * buffer which accumulates every disk write the reorg would
+   * otherwise issue piecemeal (txindex deletes, intermediate undo
+   * data, intermediate txindex puts).
+   *
+   * Returns true when the UTXO set has been successfully
+   * repositioned at the fork point AND intermediate blocks have
+   * been connected — i.e. the next `coreConnectBlockChecks` call
+   * will see the correct context.  Returns false on any step that
+   * couldn't complete (missing undo, missing intermediate body,
+   * intermediate connect failure, MAX_REORG_DEPTH exceeded,
+   * MAX_REORG_BATCH_OPS exceeded); caller should fall back to the
    * legacy in-place connect (Pattern Y closure path) and accept the
    * UTXO divergence vs Core.
+   *
+   * Multi-block atomicity (Pattern D, post-`9b10550`): the
+   * `pendingOps` buffer is appended to but not written.  The caller
+   * funnels it through `UTXOManager.flushDirty(extraOps)` after the
+   * new-tip connect succeeds, so the full reorg (N disconnects + M
+   * reconnects + new-tip connect + chain-state) lands in a single
+   * ClassicLevel batch.  Mirrors Bitcoin Core's `CDBBatch` pattern
+   * in `validation.cpp::ActivateBestChainStep`, where every
+   * disconnect/connect inside one chain-activation step rides one
+   * batch.
+   *
+   * Bounded by `MAX_REORG_DEPTH` (depth of the old/new walks) and
+   * `MAX_REORG_BATCH_OPS` (size of the accumulated batch buffer)
+   * to cap memory growth on a malicious or pathological reorg.
    */
   private async handleReorgUtxoAndCollect(
     newTipBlock: Block,
     newTipHeight: number,
     oldTipHash: Buffer,
-    disconnectedTxsOut: Transaction[]
+    disconnectedTxsOut: Transaction[],
+    pendingOps?: BatchOperation[]
   ): Promise<boolean> {
-    const MAX_REORG_DEPTH = 10000;
+    // Bitcoin Core's `nMaxReorgDepth` default is 100 (validation.cpp).
+    // The pre-Pattern-D value (10000) was an internal walk-depth guard
+    // that long predated the audit and effectively unbounded; lower it
+    // to the Core default so a runaway reorg attempt aborts cleanly
+    // instead of blowing up memory.  See the multi-block-atomicity
+    // refactor commit message for the audit reference.
+    const MAX_REORG_DEPTH = 100;
+    // Memory cap on the accumulated batch buffer.  100 reorged blocks
+    // × ~hundreds of txindex ops + a handful of undo/chain-state ops
+    // tops out near ~250k entries on regtest fixtures; production
+    // mainnet blocks (~3-4k txs) would hit the cap on a depth-60
+    // reorg.  Aborting the reorg on overflow is the same fail-safe
+    // behaviour as missing undo data — caller falls back to the
+    // legacy in-place connect.
+    const MAX_REORG_BATCH_OPS = 250_000;
 
     // Step 1: walk back NEW chain from newTipBlock's prevBlock to
     // find the fork point.  We keep both the hash list (in
@@ -1739,11 +1799,14 @@ export class BlockSync {
             disconnectedTxsOut.push(tx);
           }
         }
-        // Disconnect UTXO (restore from undo data).
+        // Disconnect UTXO (restore from undo data).  Pattern D:
+        // `pendingOps` collects the txindex deletes so they land in
+        // the same atomic batch as everything else in this reorg.
         const ok = await this.disconnectBlockUtxo(
           oldBlock,
           cursorHeight,
-          cursor
+          cursor,
+          pendingOps
         );
         if (!ok) {
           // Undo data missing — partial disconnect already happened
@@ -1751,6 +1814,12 @@ export class BlockSync {
           // chain advances.  Surface as a loud log line.
           console.warn(
             `[reorg] aborting reorg-disconnect at height ${cursorHeight}; UTXO state will diverge from Core`
+          );
+          return false;
+        }
+        if (pendingOps && pendingOps.length > MAX_REORG_BATCH_OPS) {
+          console.warn(
+            `[reorg] batch buffer exceeded ${MAX_REORG_BATCH_OPS} ops at disconnect-height ${cursorHeight}; aborting reorg dispatch`
           );
           return false;
         }
@@ -1813,11 +1882,20 @@ export class BlockSync {
         return false;
       }
       // Persist undo data for the intermediate so a subsequent
-      // reorg in the OTHER direction can also disconnect.
+      // reorg in the OTHER direction can also disconnect.  Pattern D
+      // (multi-block atomicity): when `pendingOps` is provided, the
+      // undo write rides the same atomic batch as every other reorg
+      // op.  Falls back to a standalone `db.putUndoData` when called
+      // outside the atomic-batch path (defensive, kept for symmetry
+      // with `disconnectBlockUtxo`).
       try {
         const { serializeUndoData } = await import("../chain/utxo.js");
         const undoData = serializeUndoData(intermResult.spentOutputs);
-        await this.db.putUndoData(intermediate.hash, undoData);
+        if (pendingOps) {
+          pendingOps.push(this.db.buildUndoDataPutOp(intermediate.hash, undoData));
+        } else {
+          await this.db.putUndoData(intermediate.hash, undoData);
+        }
       } catch {
         // Best-effort; ignore.
       }
@@ -1826,7 +1904,26 @@ export class BlockSync {
       // side-branch via the duplicate path of injectBlock, lines
       // 696-707); we mirror that gate by only writing the index when
       // the body retrieve succeeded above (we already used `rawBlock`).
-      await this.writeTxIndexForBlock(intermBlock, intermediate.hash);
+      //
+      // Pattern D: when `pendingOps` is provided, the txindex puts
+      // accumulate in the buffer instead of issuing a standalone
+      // batch write.  The legacy `writeTxIndexForBlock` path is kept
+      // for the standalone call sites (atTip connect outside reorg).
+      if (pendingOps) {
+        const { getTxId } = await import("../validation/tx.js");
+        for (const tx of intermBlock.transactions) {
+          const txid = getTxId(tx);
+          pendingOps.push(this.db.buildTxIndexPutOp(txid, intermediate.hash));
+        }
+      } else {
+        await this.writeTxIndexForBlock(intermBlock, intermediate.hash);
+      }
+      if (pendingOps && pendingOps.length > MAX_REORG_BATCH_OPS) {
+        console.warn(
+          `[reorg] batch buffer exceeded ${MAX_REORG_BATCH_OPS} ops at intermediate-height ${intermediate.height}; aborting reorg dispatch`
+        );
+        return false;
+      }
       this.utxoManager.setBestBlock(intermediate.hash);
       console.log(
         `[reorg] reconnected intermediate block ${intermediate.hash.toString("hex").slice(0, 16)} at height ${intermediate.height}`
@@ -1855,7 +1952,10 @@ export class BlockSync {
     oldTipHash: Buffer,
     newChainAncestorHashes: Set<string>
   ): Promise<Transaction[]> {
-    const MAX_REORG_DEPTH = 10000;
+    // Lowered from 10000 to 100 in the Pattern-D multi-block atomicity
+    // refactor so this legacy refill walk matches the dispatch-side
+    // bound in `handleReorgUtxoAndCollect` (Bitcoin Core's nMaxReorgDepth).
+    const MAX_REORG_DEPTH = 100;
     const collected: Transaction[] = [];
     let cursor: Buffer | null = oldTipHash;
     let steps = 0;
@@ -1956,6 +2056,17 @@ export class BlockSync {
     // surfaces the divergence.
     let reorgDisconnectedTxs: Transaction[] = [];
     let reorgUtxoFixed = false;
+    // Pattern D (multi-block atomicity, post-`9b10550`): collect every
+    // disk write the reorg dispatch would otherwise issue piecemeal
+    // (per-block txindex deletes, per-intermediate undo data, per-
+    // intermediate txindex puts) into one buffer.  After the new-tip
+    // connect succeeds, this buffer rides the same `flushDirty`
+    // ClassicLevel batch as the new-tip block-index + chain-state +
+    // UTXO writes — so the entire reorg lands atomically and a crash
+    // mid-reorg leaves either the pre or post state, never a partial
+    // mix.  Mirrors Bitcoin Core's `CDBBatch` pattern in
+    // `validation.cpp::ActivateBestChainStep`.
+    const reorgPendingOps: BatchOperation[] = [];
     if (
       oldTipBeforeConnect !== null &&
       this.chainStateManager !== null &&
@@ -1966,7 +2077,8 @@ export class BlockSync {
         block,
         height,
         oldTipBeforeConnect,
-        reorgDisconnectedTxs
+        reorgDisconnectedTxs,
+        reorgPendingOps
       );
     }
 
@@ -2106,6 +2218,16 @@ export class BlockSync {
     // Reference: Bitcoin Core validation.cpp::ConnectBlock writes
     // `CBlockUndo` to `blocks/rev*.dat` for every connected block.
     // (See bitcoin-core/src/validation.cpp::WriteUndoDataForBlock.)
+    //
+    // Pattern D (multi-block atomicity, post-`9b10550`): the new-tip
+    // undo write rides the same `flushDirty(extraOps)` batch as the
+    // chain-state, block-index, header, txindex, and reorg-pending
+    // ops.  This was previously a standalone `db.putUndoData`; under
+    // a reorg it landed BEFORE the reorg's disconnect-side deletes,
+    // so a crash window between the undo write and the final flush
+    // could leave the chainstate inconsistent.  Now they ride one
+    // ClassicLevel batch.
+    let newTipUndoOp: BatchOperation | null = null;
     {
       const bestHeaderForUndo = bestHeader;
       const atTipForUndo = !bestHeaderForUndo || height >= bestHeaderForUndo.height;
@@ -2113,7 +2235,7 @@ export class BlockSync {
         try {
           const { serializeUndoData } = await import("../chain/utxo.js");
           const undoData = serializeUndoData(coreResult.spentOutputs);
-          await this.db.putUndoData(blockHash, undoData);
+          newTipUndoOp = this.db.buildUndoDataPutOp(blockHash, undoData);
         } catch (err) {
           // Undo persistence is best-effort — never fail a block
           // connect because of a serialization hiccup.  A missing
@@ -2138,6 +2260,18 @@ export class BlockSync {
 
     // Store raw block data when near the tip so we can serve blocks to
     // peers via getdata.  During deep IBD this is skipped for performance.
+    //
+    // Note: `db.putBlock` is a flat-file/LevelDB write that lives
+    // outside the chain-state batch.  Pattern D's atomicity guarantee
+    // covers the chainstate (UTXO + chain-state + block-index +
+    // header + txindex + undo), not the block body file.  A
+    // crash between `putBlock` and the final `flushDirty` leaves the
+    // body on disk but no chain-state pointer to it — which the
+    // restart path treats as "block missing", same as if it were
+    // never written.  Mirrors Bitcoin Core's split between
+    // `blocks/blk*.dat` (body, written first) and the LevelDB
+    // chainstate batch (validation.cpp:WriteBlockToDisk).
+    let newTipTxIndexOps: BatchOperation[] = [];
     if (atTip) {
       const rawBlock = serializeBlock(block);
       await this.db.putBlock(blockHash, rawBlock);
@@ -2165,13 +2299,49 @@ export class BlockSync {
       //
       // Reference: bitcoin-core/src/index/txindex.cpp::CustomAppend
       // writes one (txid -> CDiskTxPos) entry per tx in the block.
-      await this.writeTxIndexForBlock(block, blockHash);
+      //
+      // Pattern D: when a flush is going to happen this same call
+      // (shouldFlush is true), accumulate the txindex puts so they
+      // ride the same batch as chain-state + reorg ops.  Otherwise
+      // (deep-IBD non-flush), fall back to a standalone batch write
+      // — which already happens to be atomic vs. the on-disk state
+      // because no chain-state advance occurs without a flush.
+      if (shouldFlush) {
+        const { getTxId } = await import("../validation/tx.js");
+        for (const tx of block.transactions) {
+          const txid = getTxId(tx);
+          newTipTxIndexOps.push(this.db.buildTxIndexPutOp(txid, blockHash));
+        }
+      } else {
+        await this.writeTxIndexForBlock(block, blockHash);
+      }
     }
 
     if (shouldFlush) {
       // On flush, write chain state atomically with UTXO changes.
       // Also write block index + height mapping so we can resume from here.
+      // Pattern D: the reorg dispatch's accumulated buffer
+      // (`reorgPendingOps`) is folded in here so the entire reorg
+      // (N disconnects + M intermediate reconnects + new-tip connect
+      //  + chain-state) lands in ONE ClassicLevel batch.
       const extraOps: BatchOperation[] = [];
+
+      // Reorg-side ops first (txindex deletes for disconnected blocks,
+      // intermediate undo + txindex puts).  Order doesn't matter for
+      // correctness — LevelDB batches are atomic — but writing
+      // disconnect-side ops first matches Bitcoin Core's ordering in
+      // ActivateBestChainStep (DisconnectTip then ConnectTip).
+      if (reorgPendingOps.length > 0) {
+        extraOps.push(...reorgPendingOps);
+      }
+
+      // New-tip undo + txindex (riding the same batch).
+      if (newTipUndoOp) {
+        extraOps.push(newTipUndoOp);
+      }
+      if (newTipTxIndexOps.length > 0) {
+        extraOps.push(...newTipTxIndexOps);
+      }
 
       const blockRecord: BlockIndexRecord = {
         height,
@@ -2211,8 +2381,24 @@ export class BlockSync {
         });
       }
 
+      // Single atomic flush: UTXO + (reorg ops) + new-tip undo + new-tip
+      // txindex + block-index + header + chain-state.
       await this.utxoManager.flushDirty(extraOps);
       this.lastFlushedHeight = height;
+    } else {
+      // No flush this iteration — but if a reorg accumulated ops we
+      // MUST commit them somewhere atomic.  Force a flush in that
+      // case (rare: reorg-during-deep-IBD); the alternative is
+      // dropping reorg ops on the floor, which would leave the
+      // txindex out of sync with the chain.
+      if (reorgPendingOps.length > 0 || newTipUndoOp || newTipTxIndexOps.length > 0) {
+        const extraOps: BatchOperation[] = [];
+        if (reorgPendingOps.length > 0) extraOps.push(...reorgPendingOps);
+        if (newTipUndoOp) extraOps.push(newTipUndoOp);
+        if (newTipTxIndexOps.length > 0) extraOps.push(...newTipTxIndexOps);
+        await this.utxoManager.flushDirty(extraOps);
+        this.lastFlushedHeight = height;
+      }
     }
 
     // Update peer manager's best height

@@ -1125,3 +1125,187 @@ describe("BlockSync mempool refill on reorg (Pattern B)", () => {
     expect(collected.length).toBe(0);
   });
 });
+
+// ── Pattern D multi-block atomicity ──
+// Reference: post-9b10550 single-block atomicity, scope-extended to N
+// disconnect + M reconnect blocks per chain reorg.  A reorg now funnels
+// EVERY disconnect-side and reconnect-side write (txindex deletes,
+// intermediate undo, intermediate txindex puts) plus the new-tip writes
+// (undo, txindex, block-index, header, chain-state) plus the UTXO flush
+// into ONE ClassicLevel batch via UTXOManager.flushDirty(extraOps).  A
+// crash mid-reorg either lands the entire batch (post state) or none of
+// it (pre state) — never a partial mix.
+//
+// These tests exercise the buffer-accumulation contract at the helper
+// level (driving the full reorg dispatch end-to-end requires real undo
+// data on disk + live UTXO state, which is covered by the diff-test
+// corpus regression entries: post-reorg-consistency, reorg-via-submitblock,
+// txindex-revert-on-reorg, mempool-refill-on-reorg).
+describe("BlockSync reorg multi-block atomicity (Pattern D)", () => {
+  // BIP-34 / 65 / 66 are not the subject; relax so the fixture coinbase
+  // (4-byte LE) connects without tripping bad-cb-height.  Mirrors the
+  // override pattern used in the Pattern C0 describe block above.
+  const D_PARAMS = {
+    ...REGTEST,
+    bip34Height: 1_000_000,
+    bip65Height: 1_000_000,
+    bip66Height: 1_000_000,
+  };
+
+  let dbPath: string;
+  let db: ChainDB;
+  let headerSync: HeaderSync;
+  let blockSync: BlockSync;
+
+  beforeEach(async () => {
+    dbPath = await mkdtemp(join(tmpdir(), "hotbuns-blocks-d-test-"));
+    db = new ChainDB(dbPath);
+    await db.open();
+    headerSync = new HeaderSync(db, D_PARAMS);
+    headerSync.initGenesis();
+    blockSync = new BlockSync(db, D_PARAMS, headerSync);
+  });
+
+  afterEach(async () => {
+    await blockSync.stop();
+    await db.close();
+    await rm(dbPath, { recursive: true, force: true });
+  });
+
+  test("disconnectBlockUtxo with pendingOps appends txindex deletes without firing db.batch", async () => {
+    // Connect a block so we have undo data on disk + a UTXO entry
+    // to disconnect.
+    const peer = createMockPeer();
+    const genesis = headerSync.getBestHeader()!;
+    const block1 = createValidBlock(
+      genesis.hash,
+      genesis.header.timestamp + 600,
+      1
+    );
+    await headerSync.processHeaders([block1.header], peer);
+    const ok = await blockSync.connectBlock(block1, 1);
+    expect(ok).toBe(true);
+
+    // Spy on db.batch (the underlying ClassicLevel-backed funnel that
+    // every BatchOperation list ultimately rides) and on
+    // db.batchWrite (the fallback path used by the legacy
+    // `deleteTxIndexForBlock` helper).
+    const originalBatch = db.batch.bind(db);
+    const originalBatchWrite = db.batchWrite.bind(db);
+    let batchCalls = 0;
+    let batchWriteCalls = 0;
+    (db as any).batch = async (ops: any[]) => {
+      batchCalls++;
+      return originalBatch(ops);
+    };
+    (db as any).batchWrite = async (ops: any[]) => {
+      batchWriteCalls++;
+      return originalBatchWrite(ops);
+    };
+
+    // Drive the disconnect via the package-private helper, passing a
+    // pendingOps buffer.  Pattern D: ops accumulate, no batch fires.
+    const blockHash = getBlockHash(block1.header);
+    const pendingOps: any[] = [];
+    try {
+      const result = await (blockSync as any).disconnectBlockUtxo(
+        block1,
+        1,
+        blockHash,
+        pendingOps
+      );
+      expect(result).toBe(true);
+    } finally {
+      (db as any).batch = originalBatch;
+      (db as any).batchWrite = originalBatchWrite;
+    }
+
+    // Pattern D contract:
+    //   • At least one txindex-delete op accumulated per tx.
+    //   • No db.batch / db.batchWrite call fired during the helper —
+    //     the caller (handleReorgUtxoAndCollect → connectBlock) is
+    //     responsible for the eventual single atomic flush.
+    expect(pendingOps.length).toBe(block1.transactions.length);
+    expect(pendingOps.every((o) => o.type === "del")).toBe(true);
+    // 0x74 == DBPrefix.TX_INDEX
+    expect(pendingOps.every((o) => o.prefix === 0x74)).toBe(true);
+    expect(batchCalls).toBe(0);
+    expect(batchWriteCalls).toBe(0);
+  });
+
+  test("disconnectBlockUtxo without pendingOps falls back to direct batch write (legacy path)", async () => {
+    // Backwards-compat: callers that don't pass pendingOps (the
+    // existing Pattern C0 unit test, e.g.) keep getting the legacy
+    // standalone `deleteTxIndexForBlock` write.  This pins the
+    // fallback so a future refactor doesn't accidentally leak ops.
+    const peer = createMockPeer();
+    const genesis = headerSync.getBestHeader()!;
+    const block1 = createValidBlock(
+      genesis.hash,
+      genesis.header.timestamp + 600,
+      1
+    );
+    await headerSync.processHeaders([block1.header], peer);
+    const ok = await blockSync.connectBlock(block1, 1);
+    expect(ok).toBe(true);
+
+    const originalBatchWrite = db.batchWrite.bind(db);
+    let batchWriteCalls = 0;
+    (db as any).batchWrite = async (ops: any[]) => {
+      batchWriteCalls++;
+      return originalBatchWrite(ops);
+    };
+
+    const blockHash = getBlockHash(block1.header);
+    try {
+      const result = await (blockSync as any).disconnectBlockUtxo(
+        block1,
+        1,
+        blockHash
+        // no pendingOps argument
+      );
+      expect(result).toBe(true);
+    } finally {
+      (db as any).batchWrite = originalBatchWrite;
+    }
+
+    // Legacy path: exactly one db.batchWrite for the txindex deletes.
+    // (This is the call inside `deleteTxIndexForBlock`.)
+    expect(batchWriteCalls).toBe(1);
+  });
+
+  test("MAX_REORG_DEPTH is the Bitcoin Core default of 100 (memory cap)", async () => {
+    // Defence-in-depth: the dispatch-side cap matches Bitcoin Core's
+    // nMaxReorgDepth default.  Pre-Pattern-D this was 10000 — an
+    // unbounded internal-walk guard inherited from earlier scaffolding
+    // that would let a malicious peer drive the in-memory ops buffer
+    // arbitrarily large.  Lowering to 100 mirrors Core's cap.
+    //
+    // We assert the constant via source inspection rather than
+    // observable behaviour because driving 101 valid blocks through
+    // the dispatch in a unit test would require ~100 calls to
+    // coreConnectBlockChecks — too heavy for a regression test.
+    // The diff-test corpus exercises the dispatch end-to-end.
+    const blocksTs = (
+      await import("node:fs/promises")
+    ).readFile;
+    const src = (
+      await blocksTs(
+        new URL("./blocks.ts", import.meta.url),
+        "utf8"
+      )
+    ).toString();
+    // The dispatch uses MAX_REORG_DEPTH = 100.  The legacy
+    // collectDisconnectedTxs path is also lowered to 100 for
+    // consistency.  Either occurrence pinned at 100 confirms.
+    const matches = src.match(/MAX_REORG_DEPTH\s*=\s*(\d+)/g) ?? [];
+    expect(matches.length).toBeGreaterThanOrEqual(1);
+    for (const m of matches) {
+      const n = Number(m.split("=")[1].trim());
+      // Allow either the dispatch's 100 or the per-batch overflow
+      // cap MAX_REORG_BATCH_OPS (a different constant entirely);
+      // we look only at MAX_REORG_DEPTH matches.
+      expect(n).toBe(100);
+    }
+  });
+});
