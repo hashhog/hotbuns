@@ -3800,10 +3800,29 @@ export class RPCServer {
 
     // Stateless block structure validation (merkle root, witness commitment,
     // weight, BIP34 height encoding).  Runs even if parent is unknown.
-    // Height is best-effort: use nextHeightToProcess from blockSync if available,
-    // otherwise fall back to 0 (which skips BIP34 check harmlessly pre-activation).
-    const bestHeader = this.headerSync.getBestHeader();
-    const approxHeight = bestHeader ? bestHeader.height + 1 : 0;
+    //
+    // BIP-34 height MUST be derived from the BLOCK'S PARENT in the block
+    // index, not from the active chain tip — Core
+    // ContextualCheckBlockHeader (validation.cpp::ContextualCheckBlockHeader)
+    // uses `pindexPrev->nHeight + 1` where pindexPrev is the parent in the
+    // FULL block index, not the active tip.  Using the active tip rejects
+    // legitimate side-branch reorg candidates with `bad-cb-height`: e.g.
+    // when chain A {A1,A2} is the active tip at h=112 and a competing
+    // chain B's first block B1 (h=111) is submitted, the coinbase encodes
+    // 111 but the active-tip-relative check expects 113.  This is the
+    // Pattern X bug observed in
+    // CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md.
+    //
+    // Fall-back order: parent in index → active-tip + 1 → 0 (orphan path
+    // where parent is unknown; injectBlock returns "inconclusive" anyway,
+    // so a benign approxHeight that skips BIP-34 is fine).
+    let approxHeight: number;
+    if (parentEntry) {
+      approxHeight = parentEntry.height + 1;
+    } else {
+      const bestHeader = this.headerSync.getBestHeader();
+      approxHeight = bestHeader ? bestHeader.height + 1 : 0;
+    }
     const structCheck = validateBlock(block, approxHeight, this.params);
     if (!structCheck.valid) {
       const reason = structCheck.error ?? "rejected";
