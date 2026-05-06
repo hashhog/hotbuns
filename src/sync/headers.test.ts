@@ -766,4 +766,63 @@ describe("HeaderSync version checks", () => {
     expect(resultV1AtBip34.valid).toBe(false);
     expect(resultV1AtBip34.error).toContain("Version");
   });
+
+  // Core parity: per-peer unconnecting-headers counter must tolerate up
+  // to MAX_NUM_UNCONNECTING_HEADERS_MSGS=10 successive unlinked batches
+  // before the caller bans the peer.  Mirrors Bitcoin Core's
+  // nUnconnectingHeaders accounting in
+  // net_processing.cpp::ProcessHeadersMessage.  Pre-fix, hotbuns banned
+  // on the first anti-DoS failure inside handleHeadersMessage; see
+  // CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+  // (Pattern B).
+  describe("unconnecting headers counter", () => {
+    test("under threshold does not signal exceeded", () => {
+      const peerKey = "1.2.3.4:8333";
+      // Bump 10 times — all under threshold.
+      for (let i = 1; i <= 10; i++) {
+        const exceeded = headerSync.noteUnconnectingHeaders(peerKey);
+        expect(exceeded).toBe(false);
+        expect(headerSync.getUnconnectingHeadersCount(peerKey)).toBe(i);
+      }
+    });
+
+    test("11th unconnecting message exceeds threshold", () => {
+      const peerKey = "1.2.3.4:8333";
+      for (let i = 0; i < 10; i++) {
+        headerSync.noteUnconnectingHeaders(peerKey);
+      }
+      const exceeded = headerSync.noteUnconnectingHeaders(peerKey);
+      expect(exceeded).toBe(true);
+    });
+
+    test("counter resets on connecting batch (resetUnconnectingHeaders)", () => {
+      const peerKey = "1.2.3.4:8333";
+      for (let i = 0; i < 5; i++) {
+        headerSync.noteUnconnectingHeaders(peerKey);
+      }
+      expect(headerSync.getUnconnectingHeadersCount(peerKey)).toBe(5);
+      headerSync.resetUnconnectingHeaders(peerKey);
+      expect(headerSync.getUnconnectingHeadersCount(peerKey)).toBe(0);
+      // Subsequent unconnecting starts fresh.
+      headerSync.noteUnconnectingHeaders(peerKey);
+      expect(headerSync.getUnconnectingHeadersCount(peerKey)).toBe(1);
+    });
+
+    test("per-peer counters are independent", () => {
+      const peerA = "1.2.3.4:8333";
+      const peerB = "5.6.7.8:8333";
+      for (let i = 0; i < 10; i++) {
+        headerSync.noteUnconnectingHeaders(peerA);
+      }
+      // Peer B's first message starts at 1 — independent of A's saturated counter.
+      expect(headerSync.getUnconnectingHeadersCount(peerA)).toBe(10);
+      expect(headerSync.getUnconnectingHeadersCount(peerB)).toBe(0);
+      const exceededB = headerSync.noteUnconnectingHeaders(peerB);
+      expect(exceededB).toBe(false);
+      expect(headerSync.getUnconnectingHeadersCount(peerB)).toBe(1);
+      // Peer A's 11th message exceeds.
+      const exceededA = headerSync.noteUnconnectingHeaders(peerA);
+      expect(exceededA).toBe(true);
+    });
+  });
 });

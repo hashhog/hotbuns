@@ -62,6 +62,21 @@ export interface HeaderChainEntry {
 const HEADER_TIP_KEY = "header_tip";
 
 /**
+ * Bitcoin Core's MAX_NUM_UNCONNECTING_HEADERS_MSGS (net_processing.cpp).
+ *
+ * A peer is allowed up to this many successive unconnecting-headers
+ * messages before being disconnected (banned via the misbehavior
+ * pipeline).  Pre-fix, hotbuns dropped the peer on the FIRST anti-DoS
+ * failure inside `handleHeadersMessage` via
+ * `peer.misbehaving(HEADERS_DONT_CONNECT, …)` — see the 2026-05-06
+ * audit's Pattern B
+ * (CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md).
+ * Tolerating up to 10 transient failures matches Core and avoids
+ * banning honest peers caught in a brief reorg.
+ */
+export const MAX_NUM_UNCONNECTING_HEADERS_MSGS = 10;
+
+/**
  * Per-peer anti-DoS sync state.
  */
 interface PeerSyncState {
@@ -94,6 +109,17 @@ export class HeaderSync {
   /** Per-peer anti-DoS sync state machines. */
   private peerSyncStates: Map<string, PeerSyncState>;
 
+  /**
+   * Per-peer counter of consecutive unconnecting-headers messages.
+   * Mirrors Bitcoin Core's `nUnconnectingHeaders` accounting in
+   * net_processing.cpp::ProcessHeadersMessage.  Keyed by peer host:port.
+   * Incremented when an unconnecting batch arrives; reset to zero on
+   * any successful direct (non-anti-DoS) headers processing pass; the
+   * peer is `peer.misbehaving(HEADERS_DONT_CONNECT)`'d only when the
+   * counter would exceed MAX_NUM_UNCONNECTING_HEADERS_MSGS.
+   */
+  private unconnectingHeadersCount: Map<string, number>;
+
   /** Anti-DoS sync parameters. */
   private syncParams: HeadersSyncParams;
 
@@ -109,8 +135,39 @@ export class HeaderSync {
     this.peerManager = null;
     this.syncingPeers = new Set();
     this.peerSyncStates = new Map();
+    this.unconnectingHeadersCount = new Map();
     this.syncParams = syncParams ?? DEFAULT_HEADERS_SYNC_PARAMS;
     this.headersProcessedCallbacks = [];
+  }
+
+  /**
+   * Increment the unconnecting-headers counter for `peerKey` and return
+   * `true` if the counter has exceeded MAX_NUM_UNCONNECTING_HEADERS_MSGS
+   * (caller MUST disconnect/misbehavior-score the peer).  Returns
+   * `false` to indicate the counter is still under the bound — caller
+   * should re-issue getheaders to drive the FindForkInGlobalIndex
+   * behavior instead of banning.  Mirrors Bitcoin Core's
+   * `nUnconnectingHeaders` increment in
+   * net_processing.cpp::ProcessHeadersMessage.
+   */
+  noteUnconnectingHeaders(peerKey: string): boolean {
+    const next = (this.unconnectingHeadersCount.get(peerKey) ?? 0) + 1;
+    this.unconnectingHeadersCount.set(peerKey, next);
+    return next > MAX_NUM_UNCONNECTING_HEADERS_MSGS;
+  }
+
+  /**
+   * Reset the unconnecting-headers counter for `peerKey` (typically on
+   * any successful connecting headers batch from this peer).  Mirrors
+   * Core's `nUnconnectingHeaders = 0` in the success path.
+   */
+  resetUnconnectingHeaders(peerKey: string): void {
+    this.unconnectingHeadersCount.delete(peerKey);
+  }
+
+  /** Read the current unconnecting-headers count (used by tests). */
+  getUnconnectingHeadersCount(peerKey: string): number {
+    return this.unconnectingHeadersCount.get(peerKey) ?? 0;
   }
 
   /**
@@ -736,11 +793,25 @@ export class HeaderSync {
       const result = peerState.syncState.processNextHeaders(headers, fullMessage);
 
       if (!result.success) {
-        // Anti-DoS check failed - peer sent bad headers
+        // Anti-DoS check failed — could be a genuine attack (bad PoW,
+        // wrong commitment) or an honest peer caught in a transient
+        // reorg whose first header doesn't connect to our last.  Use
+        // the per-peer unconnecting-headers counter (Core parity) so
+        // honest peers are tolerated up to 10 misses before banning.
+        // See CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+        // (Pattern B) — pre-fix this was an unconditional misbehaving call.
         console.warn(`Anti-DoS check failed for peer ${peerKey}`);
         this.cleanupPeerSyncState(peerKey);
-        if (peer) {
-          peer.misbehaving(BanScores.HEADERS_DONT_CONNECT, "headers don't connect to our chain");
+        const exceeded = this.noteUnconnectingHeaders(peerKey);
+        if (exceeded && peer) {
+          console.warn(
+            `Peer ${peerKey} exceeded MAX_NUM_UNCONNECTING_HEADERS_MSGS=${MAX_NUM_UNCONNECTING_HEADERS_MSGS}, banning`
+          );
+          peer.misbehaving(
+            BanScores.HEADERS_DONT_CONNECT,
+            "too many unconnecting / failed-anti-DoS headers"
+          );
+          this.resetUnconnectingHeaders(peerKey);
         }
         return;
       }
@@ -749,6 +820,10 @@ export class HeaderSync {
       if (result.powValidatedHeaders.length > 0) {
         await this.processHeaders(result.powValidatedHeaders, peer);
       }
+
+      // Successful anti-DoS pass — reset the unconnecting counter for
+      // this peer (Core's nUnconnectingHeaders = 0 in the success path).
+      this.resetUnconnectingHeaders(peerKey);
 
       if (result.requestMore) {
         // Anti-DoS state needs more headers
@@ -760,6 +835,10 @@ export class HeaderSync {
     } else {
       // No anti-DoS state - process directly
       await this.processHeaders(headers, peer);
+
+      // Successful direct processing also resets the per-peer counter
+      // (mirrors Core's nUnconnectingHeaders = 0 path).
+      this.resetUnconnectingHeaders(peerKey);
 
       // If we received max headers, request more
       if (fullMessage) {
