@@ -5,7 +5,13 @@
  * maintaining UTXO consistency, and handling chain reorganizations.
  */
 
-import type { ChainDB, ChainState, UTXOEntry, BlockIndexRecord } from "../storage/database.js";
+import type {
+  BatchOperation,
+  ChainDB,
+  ChainState,
+  UTXOEntry,
+  BlockIndexRecord,
+} from "../storage/database.js";
 import { BlockStatus } from "../storage/database.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import type { Block, BlockHeader } from "../validation/block.js";
@@ -420,50 +426,56 @@ export class ChainStateManager {
       }
     }
 
-    // Flush UTXO changes
-    await this.utxo.flush();
-
-    // ── Pattern C0: revert txindex on disconnect ──
+    // ── Pattern D: single-batch atomicity for disconnectBlock ──
     //
-    // Mirrors bitcoin-core/src/index/txindex.cpp's
-    // BaseIndex::BlockDisconnected → CustomRemove.  Pairs with the
-    // connect-side put above so reorg leaves the txindex in a state
-    // consistent with the active chain.  See
-    // CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
-    // (Pattern C0, hotbuns row).  Best-effort: del failures are logged
-    // and ignored.
-    try {
-      for (const tx of block.transactions) {
-        const txid = getTxId(tx);
-        await this.db.deleteTxIndex(txid);
-      }
-    } catch (err) {
-      console.warn(
-        `[txindex] failed to delete entries for block ${blockHash
-          .toString("hex")
-          .slice(0, 16)}: ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
-
-    // Update chain state to previous block
+    // Compute the post-disconnect chain state, then commit it together
+    // with the txindex deletes and the UTXO flush in ONE ClassicLevel
+    // batch.  Mirrors bitcoin-core/src/validation.cpp::DisconnectTip,
+    // which routes every disconnect-side write through a single
+    // `CDBBatch`.  Prior to this fix `disconnectBlock` issued three
+    // separate awaits (utxo.flush + putChainState + deleteTxIndex
+    // loop); a crash between any two left the chainstate inconsistent.
+    // See CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md
+    // (Pattern D, hotbuns row — flagged as the worst single-block
+    // atomicity exposure in the fleet).
+    //
+    // Pattern C0 (txindex revert on disconnect) rides along inside the
+    // same atomic batch.  Best-effort framing is preserved at the
+    // call-site level: a serialization failure here aborts the whole
+    // disconnect rather than leaving a half-written state, which is the
+    // correct safety property — Core also aborts on undo-write failure.
     const prevHeight = height - 1;
     const prevHash = block.header.prevBlock;
-
-    // Calculate previous chain work
     const work = this.calculateWork(block.header.bits);
     const prevChainWork = this.bestBlock.chainWork - work;
 
+    const extraOps: BatchOperation[] = [];
+
+    // Pattern C0: txindex deletes (was: per-tx await db.deleteTxIndex).
+    for (const tx of block.transactions) {
+      const txid = getTxId(tx);
+      extraOps.push(this.db.buildTxIndexDeleteOp(txid));
+    }
+
+    // Pattern D: chain-state write rides the same batch.
+    extraOps.push(
+      this.db.buildChainStateOp({
+        bestBlockHash: prevHash,
+        bestHeight: prevHeight,
+        totalWork: prevChainWork,
+      })
+    );
+
+    // Single atomic flush: UTXO changes + txindex deletes + chain state.
+    await this.utxo.flush(extraOps);
+
+    // In-memory tip update happens AFTER the batch lands so a thrown
+    // error from flush() leaves the in-memory view aligned with disk.
     this.bestBlock = {
       hash: prevHash,
       height: prevHeight,
       chainWork: prevChainWork,
     };
-
-    await this.db.putChainState({
-      bestBlockHash: prevHash,
-      bestHeight: prevHeight,
-      totalWork: prevChainWork,
-    });
 
     // Clear signature cache on disconnect (verifications may no longer be valid)
     globalSigCache.clear();
