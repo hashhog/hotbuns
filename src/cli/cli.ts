@@ -1198,6 +1198,20 @@ async function startNode(config: NodeConfig): Promise<void> {
   // 7. Initialize block sync
   const blockSync = new BlockSync(db, params, headerSync, peerManager, chainState, mergedConfig.scriptThreads, cacheBytes);
 
+  // 7a. Wire mempool for refill-on-reorg (Pattern B,
+  // CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md).
+  // BlockSync.connectBlock detects reorgs via tip-mismatch and re-feeds
+  // disconnected non-coinbase txs back to the mempool, matching Bitcoin
+  // Core's MaybeUpdateMempoolForReorg.  Must be wired BEFORE start() —
+  // otherwise the first reorg-after-startup runs through with no refill.
+  blockSync.setMempool(mempool);
+  // Also wire mempool into chainState so invalidateblock / reconsiderblock
+  // can invoke removeTransaction on conflicting mempool entries (the
+  // chain/state.ts::invalidateBlock site at line 932 was already coded
+  // to call this.mempool.removeTransaction but the setter was never
+  // invoked from cli.ts — pre-existing latent gap surfaced by Pattern B).
+  chainState.setMempool(mempool);
+
   // 7b. Wire mempool tx relay: accept incoming transactions via AcceptToMemoryPool
   // and relay accepted txs to peers via inventory trickling.
   const txRelay = new InventoryRelay((peer, inventory) => {

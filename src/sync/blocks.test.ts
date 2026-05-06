@@ -851,3 +851,174 @@ describe("classifyCallbackError", () => {
     ).toBe("unknown");
   });
 });
+
+// Pattern B regression: mempool refill on chain reorg.
+//
+// Cross-impl audit:
+// CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md
+// Pre-fix, hotbuns hit Pattern B1 ("no refill at all") in the corpus
+// entry: after a B-chain reorg, A-chain non-coinbase txs were silently
+// dropped instead of being re-fed into the mempool.  Camlcoin
+// lib/sync.ml:2354-2363 is the canonical reference shape.
+//
+// These tests exercise the helper `collectDisconnectedTxs` (private,
+// reached via `as any`) in isolation: walking back from the OLD tip
+// via persisted block bodies, collecting non-coinbase txs, and
+// stopping at the first hash shared with the NEW chain ancestor set
+// (the fork point).  An end-to-end test that drives a real reorg via
+// connectBlock + mempool would require mining two competing chains
+// with valid PoW and full coreConnectBlockChecks compliance, which is
+// covered by the diff-test corpus
+// (`tools/diff-test-corpus/regression/mempool-refill-on-reorg`); the
+// unit harness here pins the helper's behavior so future refactors
+// can't silently drop the refill loop.
+describe("BlockSync mempool refill on reorg (Pattern B)", () => {
+  let dbPath: string;
+  let db: ChainDB;
+  let headerSync: HeaderSync;
+  let blockSync: BlockSync;
+
+  beforeEach(async () => {
+    dbPath = await mkdtemp(join(tmpdir(), "hotbuns-blocks-reorg-test-"));
+    db = new ChainDB(dbPath);
+    await db.open();
+    headerSync = new HeaderSync(db, REGTEST);
+    headerSync.initGenesis();
+    blockSync = new BlockSync(db, REGTEST, headerSync);
+  });
+
+  afterEach(async () => {
+    await blockSync.stop();
+    await db.close();
+    await rm(dbPath, { recursive: true, force: true });
+  });
+
+  test("setMempool wires the refill helper without touching other state", () => {
+    // Pre-fix, no setMempool method existed at all on BlockSync; the
+    // chainState.setMempool defined in chain/state.ts:216 was never
+    // called from cli.ts.  The setter is the entry point for the
+    // refill code path; this test pins its public contract.
+    const fakeMempool = {
+      readdTransactions: mock(async () => {}),
+    } as any;
+    expect(typeof (blockSync as any).setMempool).toBe("function");
+    blockSync.setMempool(fakeMempool);
+    expect((blockSync as any).mempool).toBe(fakeMempool);
+  });
+
+  test("collectDisconnectedTxs walks old chain, collects non-coinbase txs, stops at fork", async () => {
+    // Build genesis → A1 → A2 with a fake non-coinbase tx in each
+    // A-block (T1 in A1, T2 in A2).  Fake tx because we are testing
+    // the WALK + COLLECT logic, not consensus validation; the helper
+    // only reads bodies via db.getBlock and skips the coinbase by
+    // index (i > 0) + isCoinbase guard.
+    const genesis = headerSync.getBestHeader()!;
+    const a1 = createValidBlock(
+      genesis.hash,
+      genesis.header.timestamp + 600,
+      1
+    );
+    // Inject a synthetic non-coinbase tx (T1) into A1.  This avoids
+    // re-mining (which would invalidate the PoW because merkleRoot
+    // would change) — instead we serialize/store the synthetic block
+    // directly into the DB without touching chainstate.  The merkle
+    // mismatch is irrelevant here because connectBlock isn't being
+    // called; only db.getBlock(hash) deserializes the body for the
+    // walk.
+    const t1: Transaction = {
+      version: 1,
+      inputs: [
+        {
+          prevOut: { txid: Buffer.alloc(32, 0xaa), vout: 0 },
+          scriptSig: Buffer.from([0x51]), // OP_TRUE
+          sequence: 0xffffffff,
+          witness: [],
+        },
+      ],
+      outputs: [
+        { value: 1000n, scriptPubKey: Buffer.from([0x51]) },
+      ],
+      lockTime: 0,
+    };
+    a1.transactions.push(t1);
+    const a1Hash = getBlockHash(a1.header);
+    await db.putBlock(
+      a1Hash,
+      (
+        await import("../validation/block.js")
+      ).serializeBlock(a1)
+    );
+
+    const a2 = createValidBlock(a1Hash, a1.header.timestamp + 600, 2);
+    const t2: Transaction = {
+      version: 1,
+      inputs: [
+        {
+          prevOut: { txid: Buffer.alloc(32, 0xbb), vout: 0 },
+          scriptSig: Buffer.from([0x51]),
+          sequence: 0xffffffff,
+          witness: [],
+        },
+      ],
+      outputs: [
+        { value: 2000n, scriptPubKey: Buffer.from([0x51]) },
+      ],
+      lockTime: 0,
+    };
+    a2.transactions.push(t2);
+    const a2Hash = getBlockHash(a2.header);
+    await db.putBlock(
+      a2Hash,
+      (
+        await import("../validation/block.js")
+      ).serializeBlock(a2)
+    );
+
+    // New chain ancestor set: only genesis is shared (the fork
+    // point).  Helper should walk A2 → A1 → genesis, stop AT genesis,
+    // and collect [T2, T1] (in that order — newest disconnect first,
+    // matching camlcoin lib/sync.ml:2304-2308 reverse-iteri semantics).
+    const newChainAncestors = new Set<string>([genesis.hash.toString("hex")]);
+
+    const collected: Transaction[] = await (blockSync as any).collectDisconnectedTxs(
+      a2Hash,
+      newChainAncestors
+    );
+
+    // Two non-coinbase txs collected, A2's first then A1's.
+    expect(collected.length).toBe(2);
+    // Identify by the unique scriptSig prevOut txid byte we set above.
+    expect(collected[0].inputs[0].prevOut.txid[0]).toBe(0xbb); // T2 first
+    expect(collected[1].inputs[0].prevOut.txid[0]).toBe(0xaa); // T1 second
+  });
+
+  test("collectDisconnectedTxs stops immediately if old tip equals fork point", async () => {
+    // Edge case: oldTip itself is in newChainAncestors (no actual
+    // reorg, or zero-depth reorg).  Should return empty array
+    // without attempting any DB read.
+    const someHash = Buffer.alloc(32, 0xcc);
+    const newChainAncestors = new Set<string>([someHash.toString("hex")]);
+    const collected: Transaction[] = await (blockSync as any).collectDisconnectedTxs(
+      someHash,
+      newChainAncestors
+    );
+    expect(collected.length).toBe(0);
+  });
+
+  test("collectDisconnectedTxs gracefully aborts when an old block body is missing", async () => {
+    // Pruning / deep-IBD path can leave the OLD chain body absent
+    // from DB.  Helper must NOT throw — it returns whatever was
+    // collected up to the missing-body point.  This guards against
+    // a single missing body breaking refill on what is otherwise a
+    // valid reorg.
+    const missingHash = Buffer.alloc(32, 0xdd);
+    // newChainAncestors does NOT contain missingHash, so the helper
+    // proceeds to db.getBlock(missingHash), gets null, and returns.
+    const newChainAncestors = new Set<string>();
+    const collected: Transaction[] = await (blockSync as any).collectDisconnectedTxs(
+      missingHash,
+      newChainAncestors
+    );
+    expect(collected.length).toBe(0);
+  });
+});
