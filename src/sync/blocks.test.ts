@@ -659,6 +659,109 @@ describe("BlockSync", () => {
     });
   });
 
+  // ── Pattern C0: txindex wired into connect/disconnect ──
+  // Reference: CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
+  // Stacks on Pattern X (29879e5) + Pattern B (4fdbc4f) which set up
+  // side-branch storage and undo persistence respectively.  parent
+  // commit `153c60c` (BIP-141 witness-commitment audit).
+  describe("txindex wiring (Pattern C0)", () => {
+    // BIP-34 isn't the subject of this fix; relax the height check so
+    // the fixture coinbase (4-byte LE encoding) connects without
+    // tripping bad-cb-height.  Mirrors the bip34Height=0 override in
+    // src/__tests__/parallel_script_verify_ibd.test.ts.
+    let txDb: ChainDB;
+    let txDbPath: string;
+    let txHeaderSync: HeaderSync;
+    let txBlockSync: BlockSync;
+    // Skip the BIP-34 / BIP-65 / BIP-66 contextual checks: this fix
+    // is purely about index wiring and the fixture's `createCoinbaseTx`
+    // doesn't bother with canonical CScriptNum encoding.  Push the
+    // activation heights past the test heights so the height-only
+    // validateBlock guard skips them.
+    const TX_PARAMS = {
+      ...REGTEST,
+      bip34Height: 1_000_000,
+      bip65Height: 1_000_000,
+      bip66Height: 1_000_000,
+    };
+
+    beforeEach(async () => {
+      txDbPath = await mkdtemp(join(tmpdir(), "hotbuns-blocks-c0-test-"));
+      txDb = new ChainDB(txDbPath);
+      await txDb.open();
+      txHeaderSync = new HeaderSync(txDb, TX_PARAMS);
+      txHeaderSync.initGenesis();
+      txBlockSync = new BlockSync(txDb, TX_PARAMS, txHeaderSync);
+    });
+
+    afterEach(async () => {
+      await txBlockSync.stop();
+      await txDb.close();
+      await rm(txDbPath, { recursive: true, force: true });
+    });
+
+    test("connectBlock writes a txindex entry pointing at the connected block", async () => {
+      const peer = createMockPeer();
+
+      const genesis = txHeaderSync.getBestHeader()!;
+      const block1 = createValidBlock(
+        genesis.hash,
+        genesis.header.timestamp + 600,
+        1
+      );
+      await txHeaderSync.processHeaders([block1.header], peer);
+
+      const ok = await txBlockSync.connectBlock(block1, 1);
+      expect(ok).toBe(true);
+
+      // Pre-fix: db.getTxIndex(coinbaseTxid) returns null (txindex
+      // helper exists but is never wired into the connect callback —
+      // see audit "Pattern C0 / hotbuns" row).  Post-fix: the entry
+      // exists and points at the connected block.
+      const coinbaseTxid = getTxId(block1.transactions[0]);
+      const entry = await txDb.getTxIndex(coinbaseTxid);
+      expect(entry).not.toBeNull();
+      expect(entry!.blockHash.equals(getBlockHash(block1.header))).toBe(true);
+    });
+
+    test("disconnectBlockUtxo reverts txindex entries for the disconnected block", async () => {
+      const peer = createMockPeer();
+
+      const genesis = txHeaderSync.getBestHeader()!;
+      const block1 = createValidBlock(
+        genesis.hash,
+        genesis.header.timestamp + 600,
+        1
+      );
+      await txHeaderSync.processHeaders([block1.header], peer);
+
+      const ok = await txBlockSync.connectBlock(block1, 1);
+      expect(ok).toBe(true);
+
+      const coinbaseTxid = getTxId(block1.transactions[0]);
+      // Sanity: connect wrote the entry.
+      expect(await txDb.getTxIndex(coinbaseTxid)).not.toBeNull();
+
+      // Use the package-private disconnect path the reorg dispatch
+      // exercises (handleReorgUtxoAndCollect → disconnectBlockUtxo).
+      // The `any`-cast mirrors the access pattern used elsewhere in
+      // this file to drive private helpers.
+      const blockHash = getBlockHash(block1.header);
+      const result = await (txBlockSync as any).disconnectBlockUtxo(
+        block1,
+        1,
+        blockHash
+      );
+      expect(result).toBe(true);
+
+      // Post-fix: the txindex entry is gone (mirroring Core's
+      // BaseIndex::BlockDisconnected → CustomRemove).  Pre-fix this
+      // would still resolve, surfacing as the audit's Pattern C
+      // stale-confirmations bug once the read path is exercised.
+      expect(await txDb.getTxIndex(coinbaseTxid)).toBeNull();
+    });
+  });
+
   describe("peer request distribution", () => {
     test("distributes requests across multiple peers", async () => {
       const peer1 = createMockPeer("192.168.1.1", 8333);
