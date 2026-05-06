@@ -1448,6 +1448,105 @@ export class BlockSync {
   }
 
   /**
+   * Write txindex entries for every transaction in a connected block
+   * (Pattern C0 connect side).
+   *
+   * Mirrors the put loop in
+   * `bitcoin-core/src/index/txindex.cpp::CustomAppend` — one
+   * (txid -> { blockHash, offset=0, length=0 }) entry per tx.  Offset
+   * and length are placeholders: the hotbuns read path
+   * (rpc/server.ts::findTxInBlock) iterates the block body to locate
+   * the matching tx, so the precise byte offset isn't load-bearing.
+   * If a future change wants to seek directly into the block body, the
+   * fields are already serialized into the on-disk entry by
+   * `db.putTxIndex`.
+   *
+   * Best-effort: a put failure is logged and ignored.  txindex is an
+   * optional secondary index in Bitcoin Core (see init.cpp's
+   * `-txindex` flag); a missing entry surfaces as
+   * `getrawtransaction → "no such tx"`, never as chain-state
+   * corruption.
+   *
+   * Reference:
+   *   - CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
+   *     (Pattern C0, hotbuns row)
+   *   - sibling Pattern X commit `29879e5` (BIP-34 ancestor-relative)
+   *     and Pattern B commit `4fdbc4f` (mempool refill on reorg) which
+   *     established the side-branch storage + mempool-refill scaffolding
+   *     this entry stacks on.
+   *   - parent commit `153c60c` (BIP-141 witness-commitment audit).
+   */
+  private async writeTxIndexForBlock(
+    block: Block,
+    blockHash: Buffer
+  ): Promise<void> {
+    const ops: BatchOperation[] = [];
+    const { getTxId } = await import("../validation/tx.js");
+    for (const tx of block.transactions) {
+      const txid = getTxId(tx);
+      // Serialize entry inline so we don't take a dependency on the
+      // private serializeTxIndex helper in database.ts.  Format must
+      // match: hash(32) || offset(uint32 LE) || length(uint32 LE).
+      const value = Buffer.alloc(40);
+      blockHash.copy(value, 0);
+      // offset and length default to 0 (placeholder; see helper docstring).
+      ops.push({
+        type: "put",
+        prefix: DBPrefix.TX_INDEX,
+        key: txid,
+        value,
+      });
+    }
+    if (ops.length === 0) return;
+    try {
+      await this.db.batchWrite(ops);
+    } catch (err) {
+      console.warn(
+        `[txindex] failed to write entries for block ${blockHash
+          .toString("hex")
+          .slice(0, 16)}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  /**
+   * Delete txindex entries for every transaction in a disconnected
+   * block (Pattern C0 revert side).  Mirrors
+   * `bitcoin-core/src/index/txindex.cpp` — `BaseIndex::BlockDisconnected`
+   * removes the entries that `CustomAppend` wrote on connect.
+   *
+   * Called from `disconnectBlockUtxo` (the BlockSync reorg path) and
+   * from chain/state.ts::disconnectBlock (the generateblock /
+   * dumptxoutset rollback path).  Best-effort: a del failure is
+   * logged and ignored — same rationale as `writeTxIndexForBlock`.
+   */
+  private async deleteTxIndexForBlock(
+    block: Block,
+    blockHash: Buffer
+  ): Promise<void> {
+    const ops: BatchOperation[] = [];
+    const { getTxId } = await import("../validation/tx.js");
+    for (const tx of block.transactions) {
+      const txid = getTxId(tx);
+      ops.push({
+        type: "del",
+        prefix: DBPrefix.TX_INDEX,
+        key: txid,
+      });
+    }
+    if (ops.length === 0) return;
+    try {
+      await this.db.batchWrite(ops);
+    } catch (err) {
+      console.warn(
+        `[txindex] failed to delete entries for block ${blockHash
+          .toString("hex")
+          .slice(0, 16)}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  /**
    * Disconnect a single block at `height`, restoring spent UTXOs from
    * undo data and removing UTXOs the block created.  Best-effort:
    * returns false (and logs) if undo data is missing on disk, in
@@ -1525,6 +1624,18 @@ export class BlockSync {
         }
       }
     }
+
+    // ── Pattern C0: revert txindex on disconnect ──
+    //
+    // Mirrors bitcoin-core/src/index/txindex.cpp's
+    // `BaseIndex::BlockDisconnected` → `CustomRemove`.  Without this,
+    // post-reorg `getrawtransaction(<old-tx>, true)` would still resolve
+    // to the disconnected block (or report stale `confirmations` in the
+    // findTxInBlock fallback) — Pattern C in the audit.  See
+    // CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
+    // for the cross-impl table and Core-vs-fleet expected behavior.
+    await this.deleteTxIndexForBlock(block, blockHash);
+
     return true;
   }
 
@@ -1710,6 +1821,12 @@ export class BlockSync {
       } catch {
         // Best-effort; ignore.
       }
+      // Pattern C0: write txindex for the now-active intermediate block.
+      // The block body must already be in the DB (it was stored as a
+      // side-branch via the duplicate path of injectBlock, lines
+      // 696-707); we mirror that gate by only writing the index when
+      // the body retrieve succeeded above (we already used `rawBlock`).
+      await this.writeTxIndexForBlock(intermBlock, intermediate.hash);
       this.utxoManager.setBestBlock(intermediate.hash);
       console.log(
         `[reorg] reconnected intermediate block ${intermediate.hash.toString("hex").slice(0, 16)} at height ${intermediate.height}`
@@ -2024,6 +2141,31 @@ export class BlockSync {
     if (atTip) {
       const rawBlock = serializeBlock(block);
       await this.db.putBlock(blockHash, rawBlock);
+
+      // ── Pattern C0: write txindex on connect ──
+      //
+      // The audit's reorg-correctness fleet result (2026-05-05) caught
+      // hotbuns' txindex helper (`db.putTxIndex` / `TxIndexManager`)
+      // existing but never wired into the connect callback, so
+      // `getrawtransaction(<txid>, true)` errored out for every
+      // confirmed tx — pre AND post reorg.  See
+      // CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
+      // (Pattern C0, hotbuns row).
+      //
+      // Gated on `atTip` so writes mirror `db.putBlock`: the txindex
+      // is pointless without the block body persisted (the read path
+      // in rpc/server.ts::findTxInBlock walks the block to locate the
+      // tx).  Deep IBD blocks are skipped for the same throughput
+      // reasons that skip the body write.
+      //
+      // The TxIndexEntry's `offset`/`length` fields are unused by the
+      // current read path (rpc/server.ts:1515-1521 calls
+      // findTxInBlock which walks the block); we still emit canonical
+      // zeros so the on-disk format matches `db.putTxIndex`.
+      //
+      // Reference: bitcoin-core/src/index/txindex.cpp::CustomAppend
+      // writes one (txid -> CDiskTxPos) entry per tx in the block.
+      await this.writeTxIndexForBlock(block, blockHash);
     }
 
     if (shouldFlush) {
