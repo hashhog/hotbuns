@@ -318,6 +318,87 @@ describe("ChainStateManager", () => {
         "tip block"
       );
     });
+
+    // ── Pattern D atomicity regression ──
+    //
+    // disconnectBlock used to issue THREE separate awaits:
+    //   1. utxo.flush()
+    //   2. db.deleteTxIndex(txid)  (per-tx loop)
+    //   3. db.putChainState(...)
+    // A crash between any two left the chainstate inconsistent.  After
+    // the Pattern D fix all three write categories must funnel through
+    // a single ChainDB.batch() call so they land atomically (Bitcoin Core
+    // CDBBatch parity).  This test spies on db.batch and the per-call
+    // direct-write paths to assert that contract.
+    test("commits utxo + chain-state + txindex revert via a single atomic batch", async () => {
+      // Build + connect block 1.
+      const coinbase = createCoinbaseTx(1, 50_00000000n);
+      const block = createBlock(REGTEST.genesisBlockHash, [coinbase]);
+      await chainState.connectBlock(block, 1);
+
+      // Force-flush so the connect-side writes are out of the way and
+      // the disconnect-side flush is the only batch we're observing.
+      const utxoManager = chainState.getUTXOManager();
+      await utxoManager.flush();
+
+      // Wrap db.batch to record every BatchOperation list it sees.
+      const originalBatch = db.batch.bind(db);
+      const batches: Array<Array<{ type: string; prefix: number }>> = [];
+      (db as any).batch = async (ops: any[]) => {
+        batches.push(ops.map((o: any) => ({ type: o.type, prefix: o.prefix })));
+        return originalBatch(ops);
+      };
+
+      // Track any DIRECT (non-batch) writes that hit the disconnect-side
+      // helpers.  After Pattern D these must NOT fire from disconnectBlock.
+      let directChainStatePuts = 0;
+      let directTxIndexDels = 0;
+      const originalPutChainState = db.putChainState.bind(db);
+      const originalDeleteTxIndex = db.deleteTxIndex.bind(db);
+      (db as any).putChainState = async (...args: any[]) => {
+        directChainStatePuts++;
+        return originalPutChainState(...(args as [any]));
+      };
+      (db as any).deleteTxIndex = async (...args: any[]) => {
+        directTxIndexDels++;
+        return originalDeleteTxIndex(...(args as [any]));
+      };
+
+      try {
+        await chainState.disconnectBlock(block, 1);
+      } finally {
+        (db as any).batch = originalBatch;
+        (db as any).putChainState = originalPutChainState;
+        (db as any).deleteTxIndex = originalDeleteTxIndex;
+      }
+
+      // 1) The disconnect-side direct-write helpers must NOT have been
+      //    invoked.  All three writes ride the batch path now.
+      expect(directChainStatePuts).toBe(0);
+      expect(directTxIndexDels).toBe(0);
+
+      // 2) Exactly one ChainDB.batch() call must cover the disconnect.
+      //    (UTXOManager.flush funnels UTXO + extraOps into one
+      //    CoinsViewDB.batchWrite, which calls db.batch exactly once.)
+      expect(batches.length).toBe(1);
+
+      const ops = batches[0];
+
+      // 3) That single batch must carry the chain-state put.
+      const CHAIN_STATE_PREFIX = 0x73; // 's' — see DBPrefix.CHAIN_STATE
+      const TX_INDEX_PREFIX = 0x74;    // 't' — see DBPrefix.TX_INDEX
+      const chainStatePuts = ops.filter(
+        (o) => o.type === "put" && o.prefix === CHAIN_STATE_PREFIX
+      );
+      expect(chainStatePuts.length).toBe(1);
+
+      // 4) That single batch must also carry the txindex delete for the
+      //    coinbase tx (Pattern C0 revert riding inside the same batch).
+      const txIndexDels = ops.filter(
+        (o) => o.type === "del" && o.prefix === TX_INDEX_PREFIX
+      );
+      expect(txIndexDels.length).toBe(block.transactions.length);
+    });
   });
 
   describe("validateTxInputs", () => {
