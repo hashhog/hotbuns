@@ -422,6 +422,47 @@ export class ChainDB {
     await this.db.put(key, value);
   }
 
+  /**
+   * Build a {@link BatchOperation} that puts the canonical chain-state record.
+   *
+   * Use this when callers (e.g. `chain/state.ts::disconnectBlock`,
+   * `sync/blocks.ts::connectBlock`) need to commit a chain-state update
+   * atomically alongside UTXO and txindex writes via {@link batch} or
+   * {@link UTXOManager.flush}'s `extraOps`.  Encapsulates the prefix +
+   * serialization details so call sites don't have to duplicate them.
+   *
+   * Mirrors Bitcoin Core's pattern of building all DisconnectTip writes
+   * onto a single `CDBBatch` (validation.cpp:DisconnectTip), so a crash
+   * mid-disconnect cannot leave the chainstate inconsistent.
+   */
+  buildChainStateOp(state: ChainState): BatchOperation {
+    return {
+      type: 'put',
+      prefix: DBPrefix.CHAIN_STATE,
+      key: Buffer.alloc(0),
+      value: serializeChainState(state),
+    };
+  }
+
+  /**
+   * Build a {@link BatchOperation} that deletes a txindex entry.
+   *
+   * Pairs with {@link buildChainStateOp} so the Pattern C0 disconnect-side
+   * txindex revert (see `chain/state.ts::disconnectBlock`) can ride along
+   * inside the same atomic batch as the UTXO + chain-state writes.  Without
+   * this, the txindex deletes were three separate awaits; a crash between
+   * them was the worst single-block atomicity exposure in the fleet (see
+   * `CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md`,
+   * Pattern D).
+   */
+  buildTxIndexDeleteOp(txid: Buffer): BatchOperation {
+    return {
+      type: 'del',
+      prefix: DBPrefix.TX_INDEX,
+      key: txid,
+    };
+  }
+
   async getChainState(): Promise<ChainState | null> {
     const key = makeKey(DBPrefix.CHAIN_STATE, Buffer.alloc(0));
     const value = await this.db.get(key);
