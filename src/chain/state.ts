@@ -307,6 +307,33 @@ export class ChainStateManager {
       dataPos: 1, // block data exists
     });
 
+    // ── Pattern C0: write txindex on connect ──
+    //
+    // Mirrors the sync/blocks.ts::connectBlock connect-side wiring
+    // added by this fix.  This path runs for generateblock /
+    // dumptxoutset re-apply / chain/state.ts::reorganize — they all
+    // need the same index entries so getrawtransaction works after
+    // a regtest mine or a snapshot rollback.  See
+    // CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
+    // (Pattern C0, hotbuns row).  Best-effort: a put failure is logged
+    // and ignored — txindex is an optional secondary index in Core.
+    try {
+      for (const tx of block.transactions) {
+        const txid = getTxId(tx);
+        await this.db.putTxIndex(txid, {
+          blockHash,
+          offset: 0,
+          length: 0,
+        });
+      }
+    } catch (err) {
+      console.warn(
+        `[txindex] failed to write entries for block ${blockHash
+          .toString("hex")
+          .slice(0, 16)}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+
     // Calculate chain work (approximate - should come from header chain)
     // Work = 2^256 / (target + 1), but we use a simplified version here
     const work = this.calculateWork(block.header.bits);
@@ -395,6 +422,28 @@ export class ChainStateManager {
 
     // Flush UTXO changes
     await this.utxo.flush();
+
+    // ── Pattern C0: revert txindex on disconnect ──
+    //
+    // Mirrors bitcoin-core/src/index/txindex.cpp's
+    // BaseIndex::BlockDisconnected → CustomRemove.  Pairs with the
+    // connect-side put above so reorg leaves the txindex in a state
+    // consistent with the active chain.  See
+    // CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
+    // (Pattern C0, hotbuns row).  Best-effort: del failures are logged
+    // and ignored.
+    try {
+      for (const tx of block.transactions) {
+        const txid = getTxId(tx);
+        await this.db.deleteTxIndex(txid);
+      }
+    } catch (err) {
+      console.warn(
+        `[txindex] failed to delete entries for block ${blockHash
+          .toString("hex")
+          .slice(0, 16)}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
 
     // Update chain state to previous block
     const prevHeight = height - 1;

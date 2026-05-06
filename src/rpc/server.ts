@@ -1460,7 +1460,15 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "txid must be a string");
     }
 
-    const txid = Buffer.from(txidParam, "hex");
+    // Bitcoin RPC convention: txid hex is display-order (big-endian);
+    // the on-disk / in-memory key is wire-order (little-endian).  The
+    // sibling blockhash branch on line 1498 below already does this
+    // reverse — getrawtransaction was missing it, which made
+    // db.getTxIndex(txid) miss against the entries written by
+    // sync/blocks.ts::writeTxIndexForBlock (Pattern C0 wiring).
+    // Surfaced by the txindex-revert-on-reorg corpus entry against
+    // the cross-impl reference txid `ec14e5fbd6a0...` (display order).
+    const txid = Buffer.from(txidParam, "hex").reverse();
     if (txid.length !== 32) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid txid length");
     }

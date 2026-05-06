@@ -324,12 +324,17 @@ describe("getrawtransaction", () => {
   });
 
   describe("mempool transactions", () => {
+    // Bitcoin Core RPC convention: txid hex is display-order
+    // (reversed wire bytes).  hotbuns matched this for blockhash but
+    // not txid pre-fix; the Pattern C0 wiring closure (2026-05-06)
+    // also reverses the txid input, so these tests now feed display
+    // hex like Core does.
     it("should return raw hex for mempool tx with verbose=false", async () => {
       const tx = createP2PKHTx(Buffer.alloc(32, 0x01), 0, 49000000n);
       const txid = mockMempool.addTestTransaction(tx);
 
       const res = await rpcRequest(testPort, "getrawtransaction", [
-        txid.toString("hex"),
+        Buffer.from(txid).reverse().toString("hex"),
         false,
       ]);
 
@@ -343,7 +348,7 @@ describe("getrawtransaction", () => {
       const txid = mockMempool.addTestTransaction(tx);
 
       const res = await rpcRequest(testPort, "getrawtransaction", [
-        txid.toString("hex"),
+        Buffer.from(txid).reverse().toString("hex"),
         true,
       ]);
 
@@ -371,7 +376,7 @@ describe("getrawtransaction", () => {
       const txid = mockMempool.addTestTransaction(tx);
 
       const res = await rpcRequest(testPort, "getrawtransaction", [
-        txid.toString("hex"),
+        Buffer.from(txid).reverse().toString("hex"),
         1,
       ]);
 
@@ -385,7 +390,7 @@ describe("getrawtransaction", () => {
       const txid = mockMempool.addTestTransaction(tx);
 
       const res = await rpcRequest(testPort, "getrawtransaction", [
-        txid.toString("hex"),
+        Buffer.from(txid).reverse().toString("hex"),
         true,
       ]);
 
@@ -551,7 +556,7 @@ describe("getrawtransaction", () => {
       mockChainState.setBestBlock(blockHash, 100, 1000n);
 
       const res = await rpcRequest(testPort, "getrawtransaction", [
-        coinbaseTxid.toString("hex"),
+        Buffer.from(coinbaseTxid).reverse().toString("hex"),
         true,
       ]);
 
@@ -616,7 +621,7 @@ describe("getrawtransaction", () => {
       const txid = getTxId(tx);
 
       const res = await rpcRequest(testPort, "getrawtransaction", [
-        txid.toString("hex"),
+        Buffer.from(txid).reverse().toString("hex"),
         true,
       ]);
 
@@ -639,7 +644,7 @@ describe("getrawtransaction", () => {
       const txid = getTxId(tx);
 
       const res = await rpcRequest(testPort, "getrawtransaction", [
-        txid.toString("hex"),
+        Buffer.from(txid).reverse().toString("hex"),
         true,
       ]);
 
