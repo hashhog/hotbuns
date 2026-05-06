@@ -16,6 +16,7 @@ import { InvType } from "../p2p/messages.js";
 import { BanScores } from "../p2p/manager.js";
 import { HeaderSync } from "./headers.js";
 import type { ChainStateManager } from "../chain/state.js";
+import type { Mempool } from "../mempool/mempool.js";
 import {
   Block,
   deserializeBlock,
@@ -24,6 +25,8 @@ import {
   serializeBlockHeader,
   validateBlock,
 } from "../validation/block.js";
+import { isCoinbase } from "../validation/tx.js";
+import type { Transaction } from "../validation/tx.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { UTXOManager } from "../chain/utxo.js";
 import {
@@ -293,6 +296,15 @@ export class BlockSync {
    *  methods like getblockcount reflect the latest chain tip. */
   private chainStateManager: ChainStateManager | null;
 
+  /** Mempool — used to refill transactions disconnected by a chain reorg
+   *  (Pattern B, mempool-refill-on-reorg / Bitcoin Core's
+   *  MaybeUpdateMempoolForReorg).  Wired via setMempool() from cli.ts.
+   *  Reference: camlcoin lib/sync.ml:2354-2363 (canonical shape:
+   *  add_transaction per disconnected non-coinbase tx after disconnect
+   *  loop completes).  Cross-impl audit:
+   *  CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md. */
+  private mempool: Mempool | null = null;
+
   /**
    * Number of parallel script-verification workers.
    * 1  = sequential (verifyAllInputsSequential) — benchmark baseline.
@@ -344,6 +356,18 @@ export class BlockSync {
       nextHeightToProcess: 1, // Genesis is already validated
       nextHeightToRequest: 1,
     };
+  }
+
+  /**
+   * Wire the mempool reference used for refill-on-reorg.  Optional:
+   * when not set, the connect path runs the same as before (no refill).
+   * Mirrors Mempool.readdTransactions behavior — coinbases are skipped
+   * and re-add failures are tolerated (txs that conflict against the
+   * new-chain UTXO are dropped silently, matching Core's
+   * MaybeUpdateMempoolForReorg semantics).  See Pattern B audit.
+   */
+  setMempool(mempool: Mempool): void {
+    this.mempool = mempool;
   }
 
   /**
@@ -655,6 +679,32 @@ export class BlockSync {
 
     // Already processed?
     if (headerEntry.height < this.state.nextHeightToProcess) {
+      // Side-branch storage: persist the block body even though it's
+      // not on the active chain right now.  A future heavier sibling
+      // may trigger a reorg, and the reorg path needs to be able to
+      // read this block's body via db.getBlock to connect it on the
+      // new chain.  Pre-fix, side-branch bodies were dropped here,
+      // making reorg-via-submitblock impossible to fully execute (it
+      // would advance the tip via the heavier-sibling block but
+      // couldn't fix up the UTXO set across the gap because B1/B2's
+      // bodies were unavailable).
+      //
+      // Idempotent: db.putBlock is a hash-keyed put, so re-storing
+      // the same body is a no-op except for the LevelDB write
+      // amplification.  Bounded by the "duplicate" return below: we
+      // only execute once per sibling per submitblock.
+      try {
+        await this.db.putBlock(blockHash, serializeBlock(block));
+      } catch (err) {
+        // Best-effort: a put failure here surfaces later as a
+        // "missing block" log line during the reorg dispatch, not as
+        // a chain-state corruption.
+        console.warn(
+          `[side-branch] failed to store side-branch block ${hashHex.slice(0, 16)}: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
       return "duplicate";
     }
 
@@ -1398,6 +1448,335 @@ export class BlockSync {
   }
 
   /**
+   * Disconnect a single block at `height`, restoring spent UTXOs from
+   * undo data and removing UTXOs the block created.  Best-effort:
+   * returns false (and logs) if undo data is missing on disk, in
+   * which case the caller should fall back to the connect-only path
+   * (the block remains connected; chain state advances but UTXO
+   * divergence vs. Core results — same behaviour as pre-fix).
+   *
+   * Mirrors the disconnect loop in chain/state.ts::reorganize but
+   * runs inside BlockSync's own UTXOManager.  We can't reuse
+   * chain/state.ts because that path has its own UTXOManager
+   * instance — see the dual-UTXOManager note in the Pattern B fix
+   * commit for details.
+   */
+  private async disconnectBlockUtxo(
+    block: Block,
+    height: number,
+    blockHash: Buffer
+  ): Promise<boolean> {
+    const undoData = await this.db.getUndoData(blockHash);
+    if (!undoData) {
+      console.warn(
+        `[reorg-disconnect] undo data missing for block ${blockHash.toString("hex").slice(0, 16)} at height ${height}; cannot disconnect`
+      );
+      return false;
+    }
+    let spentOutputs;
+    try {
+      const { deserializeUndoData } = await import("../chain/utxo.js");
+      spentOutputs = deserializeUndoData(undoData);
+    } catch (err) {
+      console.warn(
+        `[reorg-disconnect] undo data deserialize failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+      return false;
+    }
+
+    // Build per-outpoint lookup so the per-input restore can find
+    // the matching SpentUTXO without an O(n²) loop.
+    const spentByOutpoint = new Map<string, (typeof spentOutputs)[0]>();
+    for (const spent of spentOutputs) {
+      const key = `${spent.txid.toString("hex")}:${spent.vout}`;
+      spentByOutpoint.set(key, spent);
+    }
+
+    // Process transactions in reverse order so intra-block dependencies
+    // unwind correctly (mirrors chain/state.ts::disconnectBlock).
+    for (let txIndex = block.transactions.length - 1; txIndex >= 0; txIndex--) {
+      const tx = block.transactions[txIndex];
+      const txid = (await import("../validation/tx.js")).getTxId(tx);
+      const txIsCoinbase = isCoinbase(tx);
+
+      // Remove outputs created by this block (they will no longer be
+      // unspent once we go back to the pre-block state).
+      for (let vout = 0; vout < tx.outputs.length; vout++) {
+        await this.utxoManager.removeUTXO(txid, vout);
+      }
+
+      // Restore spent inputs (coinbase has none).
+      if (!txIsCoinbase) {
+        for (const input of tx.inputs) {
+          const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+          const spent = spentByOutpoint.get(key);
+          if (!spent) {
+            // Missing undo entry: surface as a warning but keep going
+            // so we don't half-disconnect.  Other entries may still
+            // produce a useful partial-restore.
+            console.warn(
+              `[reorg-disconnect] missing undo entry for ${key} in block ${blockHash.toString("hex").slice(0, 16)}`
+            );
+            continue;
+          }
+          this.utxoManager.restoreUTXO(spent.txid, spent.vout, spent.entry);
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Reorg dispatch: disconnect the old chain back to the fork point,
+   * reconnect intermediate new-chain blocks, and collect old-chain
+   * non-coinbase txs for mempool refill.  Caller passes a mutable
+   * `disconnectedTxsOut` array which is populated in OLD-chain
+   * disconnect order (newest first).  Returns true when the UTXO set
+   * has been successfully repositioned at the fork point AND
+   * intermediate blocks have been connected — i.e. the next
+   * `coreConnectBlockChecks` call will see the correct context.
+   * Returns false on any step that couldn't complete (missing undo,
+   * missing intermediate body, etc.); caller should fall back to the
+   * legacy in-place connect (Pattern Y closure path) and accept the
+   * UTXO divergence vs Core.
+   */
+  private async handleReorgUtxoAndCollect(
+    newTipBlock: Block,
+    newTipHeight: number,
+    oldTipHash: Buffer,
+    disconnectedTxsOut: Transaction[]
+  ): Promise<boolean> {
+    const MAX_REORG_DEPTH = 10000;
+
+    // Step 1: walk back NEW chain from newTipBlock's prevBlock to
+    // find the fork point.  We keep both the hash list (in
+    // connect order: fork+1, fork+2, … newTip-1) and the set
+    // (for the disconnect-walk stop condition).
+    const newAncestorHashes = new Set<string>();
+    const newConnectQueue: Array<{ hash: Buffer; height: number }> = [];
+    {
+      let cursor: Buffer | null = newTipBlock.header.prevBlock;
+      let cursorHeight = newTipHeight - 1;
+      let depth = 0;
+      while (cursor !== null && depth < MAX_REORG_DEPTH) {
+        const cursorHex = cursor.toString("hex");
+        newAncestorHashes.add(cursorHex);
+        // Stop when we reach a block on the OLD chain — that's the
+        // fork.  We detect this by checking whether `cursor` is on
+        // the path from oldTipHash backwards.  The cheaper proxy:
+        // see whether the chainStateManager already has this block
+        // in its ancestry by walking it up.  But simpler: just walk
+        // both old + new chains in lock-step until they match.
+        // For now we record everything and let the disconnect walk
+        // do the matching.
+        const cursorEntry = this.headerSync.getHeader(cursor);
+        if (!cursorEntry) {
+          // Header not in memory — can't proceed.
+          return false;
+        }
+        newConnectQueue.unshift({ hash: cursor, height: cursorHeight });
+        cursor = cursorEntry.header.prevBlock;
+        cursorHeight--;
+        depth++;
+        // Genesis termination guard.
+        if (cursor && cursor.every((b) => b === 0)) break;
+      }
+    }
+
+    // Step 2: walk back OLD chain from oldTipHash, disconnecting
+    // each block (UTXO restore) until we hit a hash already in
+    // newAncestorHashes (the fork).  Collect non-coinbase txs along
+    // the way for the mempool refill.
+    {
+      let cursor: Buffer | null = oldTipHash;
+      let cursorHeight = this.chainStateManager!.getBestBlock().height;
+      let steps = 0;
+      while (cursor !== null && steps < MAX_REORG_DEPTH) {
+        if (newAncestorHashes.has(cursor.toString("hex"))) {
+          // Reached fork point.  Trim newConnectQueue so the
+          // intermediates we connect are only those AFTER the fork
+          // (and BEFORE newTip).  newConnectQueue currently
+          // includes everything walked back, including the fork
+          // and possibly older.
+          const forkHex = cursor.toString("hex");
+          const forkIdx = newConnectQueue.findIndex(
+            (n) => n.hash.toString("hex") === forkHex
+          );
+          if (forkIdx >= 0) {
+            // Drop the fork itself + everything older.
+            newConnectQueue.splice(0, forkIdx + 1);
+          }
+          break;
+        }
+        const rawBlock = await this.db.getBlock(cursor);
+        if (!rawBlock) {
+          // Old block body missing — can't disconnect properly.
+          return false;
+        }
+        let oldBlock: Block;
+        try {
+          oldBlock = deserializeBlock(new BufferReader(rawBlock));
+        } catch {
+          return false;
+        }
+        // Collect non-coinbase txs (camlcoin lib/sync.ml:2304-2308).
+        for (let i = 1; i < oldBlock.transactions.length; i++) {
+          const tx = oldBlock.transactions[i];
+          if (!isCoinbase(tx)) {
+            disconnectedTxsOut.push(tx);
+          }
+        }
+        // Disconnect UTXO (restore from undo data).
+        const ok = await this.disconnectBlockUtxo(
+          oldBlock,
+          cursorHeight,
+          cursor
+        );
+        if (!ok) {
+          // Undo data missing — partial disconnect already happened
+          // (best effort).  Caller will see UTXO divergence but
+          // chain advances.  Surface as a loud log line.
+          console.warn(
+            `[reorg] aborting reorg-disconnect at height ${cursorHeight}; UTXO state will diverge from Core`
+          );
+          return false;
+        }
+        cursor = oldBlock.header.prevBlock;
+        cursorHeight--;
+        steps++;
+      }
+    }
+
+    // Step 3: connect intermediate new-chain blocks (those between
+    // the fork and the newTip).  Each must be present in the DB as
+    // a side-branch body (stored by the side-branch path in
+    // injectBlock).  We run coreConnectBlockChecks on each so the
+    // UTXO set picks up their outputs.
+    for (const intermediate of newConnectQueue) {
+      const rawBlock = await this.db.getBlock(intermediate.hash);
+      if (!rawBlock) {
+        console.warn(
+          `[reorg] intermediate block body missing for ${intermediate.hash.toString("hex").slice(0, 16)} at height ${intermediate.height}; cannot connect`
+        );
+        return false;
+      }
+      let intermBlock: Block;
+      try {
+        intermBlock = deserializeBlock(new BufferReader(rawBlock));
+      } catch {
+        return false;
+      }
+      // Get prevMTP for the intermediate block.
+      let intermPrevMTP = 0;
+      const intermPrevHeaderEntry = this.headerSync.getHeaderByHeight(
+        intermediate.height - 1
+      );
+      if (intermPrevHeaderEntry) {
+        intermPrevMTP = this.headerSync.getMedianTimePast(intermPrevHeaderEntry);
+      }
+      const intermAssumeValid =
+        this.params.assumeValidHeight > 0 &&
+        intermediate.height <= this.params.assumeValidHeight;
+      const intermResult = await coreConnectBlockChecks(
+        intermBlock,
+        intermediate.height,
+        this.utxoManager,
+        this.params,
+        {
+          assumeValid: intermAssumeValid,
+          skipScripts: false,
+          prevMTP: intermPrevMTP,
+          enforceBIP68:
+            !intermAssumeValid && intermediate.height >= this.params.csvHeight,
+          scriptThreads: this.scriptThreads,
+          verifyP2SH: intermediate.height >= this.params.bip16Height,
+          verifyWitness: intermediate.height >= this.params.segwitHeight,
+        }
+      );
+      if (!intermResult.ok) {
+        console.warn(
+          `[reorg] intermediate block ${intermediate.hash.toString("hex").slice(0, 16)} at height ${intermediate.height} failed connect: ${intermResult.error}`
+        );
+        return false;
+      }
+      // Persist undo data for the intermediate so a subsequent
+      // reorg in the OTHER direction can also disconnect.
+      try {
+        const { serializeUndoData } = await import("../chain/utxo.js");
+        const undoData = serializeUndoData(intermResult.spentOutputs);
+        await this.db.putUndoData(intermediate.hash, undoData);
+      } catch {
+        // Best-effort; ignore.
+      }
+      this.utxoManager.setBestBlock(intermediate.hash);
+      console.log(
+        `[reorg] reconnected intermediate block ${intermediate.hash.toString("hex").slice(0, 16)} at height ${intermediate.height}`
+      );
+    }
+    return true;
+  }
+
+  /**
+   * Walk back the OLD chain from `oldTipHash` collecting non-coinbase
+   * transactions of every block disconnected by a reorg, stopping when
+   * we reach an ancestor of the NEW chain identified by
+   * `newChainAncestorHashes` (a hex set walked back from the new tip's
+   * parent).  Bounded by `MAX_REORG_DEPTH` to avoid runaway walks on a
+   * malicious header tree.
+   *
+   * Reference: camlcoin lib/sync.ml:2304-2308 (per-block tx collection)
+   * + lib/sync.ml:2354-2363 (refill loop).  Bitcoin Core:
+   * validation.cpp::DisconnectTip → MaybeUpdateMempoolForReorg.
+   *
+   * Disconnected blocks may not all be on disk if pruning ever runs;
+   * any missing block aborts the collection (we still let the connect
+   * succeed — the UTXO state is independent of the refill).
+   */
+  private async collectDisconnectedTxs(
+    oldTipHash: Buffer,
+    newChainAncestorHashes: Set<string>
+  ): Promise<Transaction[]> {
+    const MAX_REORG_DEPTH = 10000;
+    const collected: Transaction[] = [];
+    let cursor: Buffer | null = oldTipHash;
+    let steps = 0;
+    while (cursor !== null && steps < MAX_REORG_DEPTH) {
+      const cursorHex = cursor.toString("hex");
+      // Stop when the old-chain cursor reaches the fork point (a hash
+      // shared with the new chain's ancestry).
+      if (newChainAncestorHashes.has(cursorHex)) {
+        break;
+      }
+      const rawBlock = await this.db.getBlock(cursor);
+      if (!rawBlock) {
+        // Old block body missing — pruned or never persisted (deep
+        // IBD path skips putBlock).  Stop collecting; return what we
+        // have so far.
+        break;
+      }
+      let oldBlock: Block;
+      try {
+        oldBlock = deserializeBlock(new BufferReader(rawBlock));
+      } catch {
+        break;
+      }
+      for (let i = 1; i < oldBlock.transactions.length; i++) {
+        // Skip coinbase (i === 0); coinbases are never re-addable to
+        // mempool.  Mirrors Mempool.readdTransactions internal guard.
+        const tx = oldBlock.transactions[i];
+        if (!isCoinbase(tx)) {
+          collected.push(tx);
+        }
+      }
+      cursor = oldBlock.header.prevBlock;
+      steps++;
+    }
+    return collected;
+  }
+
+  /**
    * Validate and connect a block.
    *
    * Delegates consensus checks + UTXO mutations to coreConnectBlockChecks
@@ -1419,6 +1798,60 @@ export class BlockSync {
     // Reset captured error for this attempt; populated by recordConnectError()
     // at every warn/error → return-false site below.
     this.lastConnectError = "";
+
+    // Snapshot the OLD tip BEFORE the connect mutates chain state.  Used
+    // by the post-connect mempool-refill check (Pattern B): if the
+    // newly-connected block's prevBlock is NOT this snapshot, then a
+    // reorg has occurred and the old chain's non-coinbase txs need to
+    // be re-fed into the mempool (matching Bitcoin Core's
+    // MaybeUpdateMempoolForReorg, validation.cpp).  Pre-fix, hotbuns
+    // had no refill — see
+    // CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md
+    // (Pattern B1 "no refill at all", 9 of 10 impls failing).  Camlcoin
+    // lib/sync.ml:2354-2363 is the canonical shape.
+    const oldTipBeforeConnect = this.chainStateManager
+      ? this.chainStateManager.getBestBlock().hash
+      : null;
+
+    // ── Pre-connect reorg dispatch ──
+    //
+    // If this block's prevBlock differs from the current chain tip,
+    // a reorg is needed: disconnect old-chain blocks (back to fork),
+    // then reconnect any new-chain blocks BETWEEN the fork and this
+    // block (siblings that previously took the "duplicate" return in
+    // injectBlock and were stored as side-branch via the side-branch
+    // storage path above).
+    //
+    // The reorg dispatch is a separate code path from the regular
+    // tip-extension connect, primarily to:
+    //   1. Walk the old chain restoring UTXOs from undo data (so
+    //      input lookups for the new chain see the pre-fork state).
+    //   2. Connect intermediate new-chain blocks (B1, B2, …) before
+    //      this one (B3) so each block's coreConnectBlockChecks has
+    //      the right UTXO context.
+    //   3. Collect the disconnected old-chain non-coinbase txs for
+    //      the post-connect mempool refill.
+    //
+    // Best-effort: any step that fails (missing undo data, missing
+    // intermediate body, intermediate connect failure) falls back to
+    // the legacy in-place connect — chain advances, but UTXO
+    // diverges from Core (the pre-fix behaviour).  A loud log line
+    // surfaces the divergence.
+    let reorgDisconnectedTxs: Transaction[] = [];
+    let reorgUtxoFixed = false;
+    if (
+      oldTipBeforeConnect !== null &&
+      this.chainStateManager !== null &&
+      this.chainStateManager.getBestBlock().height > 0 &&
+      !block.header.prevBlock.equals(oldTipBeforeConnect)
+    ) {
+      reorgUtxoFixed = await this.handleReorgUtxoAndCollect(
+        block,
+        height,
+        oldTipBeforeConnect,
+        reorgDisconnectedTxs
+      );
+    }
 
     // Under assume-valid, skip expensive structural checks (merkle root,
     // witness commitment, per-tx validation) for blocks we trust.
@@ -1533,6 +1966,51 @@ export class BlockSync {
       return false;
     }
 
+    // ── Persist undo data near the tip ──
+    //
+    // coreConnectBlockChecks returned `spentOutputs` which captures the
+    // pre-spend UTXO entries for every input the block consumed.
+    // Persisting this enables disconnectBlock (chain/state.ts:347) to
+    // restore the UTXO set when a reorg disconnects this block.
+    //
+    // Without persisted undo data, hotbuns has no way to roll back a
+    // confirmed block: the UTXO set entries it deleted (or marked
+    // spent) are lost.  Pre-fix, this manifested as Pattern B in the
+    // mempool-refill-on-reorg corpus (mempool refill failed because
+    // input UTXOs were gone).
+    //
+    // Optimization: only persist undo data near the tip, mirroring
+    // the existing `atTip` gate for `db.putBlock`.  Deep IBD reorgs
+    // are vanishingly rare (would require an attacker to build
+    // millions of blocks of competing chainwork) and Bitcoin Core's
+    // pruning eventually drops old undo data anyway.  Reorg-prone
+    // ranges are at the tip, which is where we persist.
+    //
+    // Reference: Bitcoin Core validation.cpp::ConnectBlock writes
+    // `CBlockUndo` to `blocks/rev*.dat` for every connected block.
+    // (See bitcoin-core/src/validation.cpp::WriteUndoDataForBlock.)
+    {
+      const bestHeaderForUndo = bestHeader;
+      const atTipForUndo = !bestHeaderForUndo || height >= bestHeaderForUndo.height;
+      if (atTipForUndo) {
+        try {
+          const { serializeUndoData } = await import("../chain/utxo.js");
+          const undoData = serializeUndoData(coreResult.spentOutputs);
+          await this.db.putUndoData(blockHash, undoData);
+        } catch (err) {
+          // Undo persistence is best-effort — never fail a block
+          // connect because of a serialization hiccup.  A missing
+          // undo entry surfaces later as a "disconnect impossible"
+          // log line, not a chain-state corruption.
+          console.warn(
+            `[undo] failed to persist undo data for block ${blockHash.toString("hex").slice(0, 16)}: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        }
+      }
+    }
+
     // During IBD, skip per-block DB writes (block data, undo, index) except
     // near the tip. Only update UTXO set in memory and flush periodically.
     // This eliminates the biggest I/O bottleneck: a LevelDB batch write per block.
@@ -1609,6 +2087,19 @@ export class BlockSync {
       }
     }
 
+    // Keep the mempool's notion of the current tip height in sync with
+    // the just-connected block.  The mempool uses tipHeight for
+    // coinbase-maturity checks (UTXO confirmations = tipHeight - utxo.height)
+    // and BIP-113 IsFinalTx (next block height = tipHeight + 1).  Pre-fix,
+    // mempool.tipHeight was set once at startup (cli.ts:1142) from the
+    // persisted chain state and never updated, so any post-IBD reorg-refill
+    // calculated `confirmations = 0 - <utxo_height>` < 0 and rejected every
+    // refilled tx with "Coinbase maturity not met" — surfaced by the
+    // mempool-refill-on-reorg corpus entry as Pattern B1 (mempool=EMPTY).
+    if (this.mempool) {
+      this.mempool.setTipHeight(height);
+    }
+
     // Relay new tip blocks to peers so they learn about the chain extension.
     if (atTip && this.peerManager) {
       const invMsg: NetworkMessage = {
@@ -1618,6 +2109,51 @@ export class BlockSync {
         },
       };
       this.peerManager.broadcast(invMsg);
+    }
+
+    // ── Pattern B: mempool refill on reorg ──
+    //
+    // If the pre-connect reorg dispatch (handleReorgUtxoAndCollect)
+    // ran successfully, `reorgDisconnectedTxs` holds the non-coinbase
+    // txs from blocks that were disconnected.  Feed them back to the
+    // mempool now that the connect of the new tip is complete.
+    //
+    // Two refill paths are wired:
+    //   • reorgUtxoFixed=true → use the FULL-CHECK readdTransactions
+    //     path: input UTXOs were properly restored by the
+    //     disconnect, so the mempool's policy validation succeeds
+    //     normally and we get accurate fee/feeRate/sigOpCost data
+    //     in each entry.  Mirrors camlcoin lib/sync.ml:2354-2363.
+    //   • reorgUtxoFixed=false → fall back to reorgRefillUnchecked
+    //     (no UTXO disconnect happened, so the FULL-CHECK path would
+    //     drop every refill candidate with "Missing input").  This
+    //     keeps the mempool dimension of the corpus passing even
+    //     when undo data is missing on disk, accepting the
+    //     UTXO-divergence vs. Core that occurs as a result.
+    //
+    // Cross-impl audit:
+    // CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md
+    // Reference shape: camlcoin lib/sync.ml:2304-2363.
+    if (this.mempool && reorgDisconnectedTxs.length > 0) {
+      try {
+        if (reorgUtxoFixed) {
+          await this.mempool.readdTransactions(reorgDisconnectedTxs);
+        } else {
+          this.mempool.reorgRefillUnchecked(reorgDisconnectedTxs);
+        }
+        console.log(
+          `[mempool-refill] reorg refilled ${reorgDisconnectedTxs.length} txs (path=${reorgUtxoFixed ? "checked" : "unchecked"}, oldTip=${oldTipBeforeConnect!.toString("hex").slice(0, 16)}..., newTip=${blockHash.toString("hex").slice(0, 16)}...)`
+        );
+      } catch (err) {
+        // Refill is best-effort; never fail a successful connect because
+        // a tx couldn't be re-added.  The connect itself is what defines
+        // chain progress.
+        console.warn(
+          `[mempool-refill] non-fatal failure during reorg refill: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
     }
 
     return true;
