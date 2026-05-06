@@ -10,6 +10,7 @@ import * as fs from "fs";
 import { EventEmitter } from "events";
 
 import { ChainDB, BlockStatus, DBPrefix } from "../storage/database.js";
+import { PruneManager, PRUNE_TARGET_MANUAL } from "../storage/pruning.js";
 import { BufferWriter } from "../wire/serialization.js";
 import { ChainStateManager } from "../chain/state.js";
 import { ChainstateManager } from "../chain/snapshot.js";
@@ -280,9 +281,17 @@ export function parseArgs(argv: string[]): ParsedArgs {
           if (value) {
             const pruneVal = parseInt(value, 10);
             if (!isNaN(pruneVal)) {
-              // Minimum 550 MiB if pruning is enabled
-              if (pruneVal > 0 && pruneVal < 550) {
-                console.error("Error: --prune must be at least 550 MiB");
+              // Bitcoin Core semantics (init.cpp:524 + blockmanager_args.cpp):
+              //   0      → disabled
+              //   1      → manual mode (RPC only, no auto-prune)
+              //   2..549 → invalid
+              //   N≥550  → auto-prune to N MiB
+              if (pruneVal < 0) {
+                console.error("Error: --prune cannot be negative");
+                process.exit(1);
+              }
+              if (pruneVal > 1 && pruneVal < 550) {
+                console.error("Error: --prune must be at least 550 MiB (or 0=off, 1=manual)");
                 process.exit(1);
               }
               config.prune = pruneVal;
@@ -602,6 +611,7 @@ interface NodeState {
   feeEstimatesPath: string;
   mempool: Mempool;
   datadir: string;
+  pruneManager?: PruneManager;
 }
 
 let runningNode: NodeState | null = null;
@@ -1115,6 +1125,37 @@ async function startNode(config: NodeConfig): Promise<void> {
   const db = new ChainDB(dbPath);
   await db.open();
 
+  // 2a. Construct PruneManager when `-prune=<n>` is set.
+  //
+  // Semantics mirror Bitcoin Core (init.cpp:524 + blockmanager_args.cpp:18):
+  //   --prune=0      → disabled (no PruneManager constructed)
+  //   --prune=1      → manual mode: RPC `pruneblockchain` works, no auto-prune
+  //   --prune=N≥550  → auto-prune target N MiB
+  //
+  // The PruneManager's internal `pruneTarget` is in BYTES, not MiB.  The
+  // CLI value is MiB and gets converted here.  `--prune=1` becomes the
+  // sentinel `PRUNE_TARGET_MANUAL`.
+  //
+  // BlockSync's post-connect hook calls `pruneManager.maybePrune(height)`
+  // which is a no-op when `isAutomaticPruning() === false`, so the same
+  // wiring works for both manual and auto modes.
+  let pruneManager: PruneManager | undefined;
+  if (mergedConfig.prune !== undefined && mergedConfig.prune > 0) {
+    const pruneTargetBytes =
+      mergedConfig.prune === 1
+        ? PRUNE_TARGET_MANUAL
+        : mergedConfig.prune * 1024 * 1024;
+    pruneManager = new PruneManager(db, mergedConfig.datadir, pruneTargetBytes);
+    await pruneManager.init();
+    console.log(
+      `[prune] enabled (mode=${
+        mergedConfig.prune === 1 ? "manual" : "auto"
+      }, target=${
+        mergedConfig.prune === 1 ? "RPC-only" : `${mergedConfig.prune} MiB`
+      })`
+    );
+  }
+
   // Resolve dbcache → bytes once for all UTXOManager construction sites.
   // Bitcoin Core init.cpp default is 450 MiB; hotbuns historical default is
   // 512 MiB (kept for test-fixture stability).
@@ -1213,6 +1254,13 @@ async function startNode(config: NodeConfig): Promise<void> {
   // to call this.mempool.removeTransaction but the setter was never
   // invoked from cli.ts — pre-existing latent gap surfaced by Pattern B).
   chainState.setMempool(mempool);
+
+  // Wire prune manager into block sync so auto-prune scans run after each
+  // connected block.  No-op when `pruneManager` is undefined (operator
+  // did not pass `--prune=N`) or in manual mode (`--prune=1`).
+  if (pruneManager) {
+    blockSync.setPruneManager(pruneManager);
+  }
 
   // 7b. Wire mempool tx relay: accept incoming transactions via AcceptToMemoryPool
   // and relay accepted txs to peers via inventory trickling.
@@ -1441,6 +1489,7 @@ async function startNode(config: NodeConfig): Promise<void> {
     db,
     params,
     blockSync,
+    pruneManager,
   };
 
   const rpcServer = new RPCServer(rpcConfig, rpcDeps);
@@ -1457,6 +1506,7 @@ async function startNode(config: NodeConfig): Promise<void> {
     feeEstimatesPath,
     mempool,
     datadir: mergedConfig.datadir,
+    pruneManager,
   };
 
   // Set shutdown callback for RPC stop command
@@ -1981,7 +2031,7 @@ OPTIONS:
   --debug=<cat>         Enable debug logging for category (repeatable; 'all'/'1' = every category, 'none'/'0' = off)
   --printtoconsole      Force log output to stdout/stderr
   --connect=<host:port> Connect to specific peer
-  --prune=<n>           Prune block storage to n MiB (minimum 550, 0 = disabled)
+  --prune=<n>           Prune block storage to n MiB (0=disabled, 1=manual via RPC, ≥550=auto)
   --dbcache=<n>         UTXO cache size in MiB (default: 512)
   --load-snapshot=<path> Load Bitcoin Core-format UTXO snapshot (assumeutxo)
   --daemon              Fork to background and detach (re-execs self under Bun)
