@@ -1032,8 +1032,43 @@ export class Mempool {
       };
     }
 
-    // RBF replacement checks (BIP 125 Rule #3 and #4)
+    // RBF replacement checks (BIP 125 Rule #2, #3, #4)
     if (isReplacement) {
+      // Rule #2 (BIP-125, ref bitcoin-core/src/policy/rbf.cpp::HasNoNewUnconfirmed
+      //         pre-removal era): the replacement may only spend an
+      //         unconfirmed input if that input was already known —
+      //         either an in-mempool ancestor of one of the conflicts
+      //         being replaced, or one of the conflicts themselves.
+      //         Any new unconfirmed input → reject.
+      //
+      // Build the set of "already-known" mempool txids: union of conflicts
+      // plus all mempool ancestors of the conflicts. Then walk the
+      // replacement's inputs; any input whose prev-out points at a mempool
+      // tx outside this set is a new unconfirmed input.
+      const conflictTxids = new Set<string>();
+      const conflictParents = new Set<string>();
+      for (const conflict of conflictsToEvict) {
+        conflictTxids.add(conflict.txid.toString("hex"));
+        for (const p of conflict.dependsOn) conflictParents.add(p);
+      }
+      const conflictAncestors = this.getAncestorSet(conflictParents);
+      // The "already-known" set is conflicts ∪ ancestors-of-conflicts.
+      const allowedUnconfirmed = new Set<string>([
+        ...conflictTxids,
+        ...conflictAncestors,
+      ]);
+      for (const input of tx.inputs) {
+        const parentHex = input.prevOut.txid.toString("hex");
+        // Only inputs that reference an in-mempool tx need to be checked;
+        // confirmed (chainstate) inputs are always allowed by Rule 2.
+        if (this.entries.has(parentHex) && !allowedUnconfirmed.has(parentHex)) {
+          return {
+            accepted: false,
+            error: `RBF replacement adds new unconfirmed input ${parentHex.slice(0, 16)}...:${input.prevOut.vout} (BIP-125 Rule 2)`,
+          };
+        }
+      }
+
       // Rule #3: Replacement must pay a higher absolute fee
       if (fee <= totalConflictingFee) {
         return {
