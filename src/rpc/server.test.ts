@@ -133,8 +133,19 @@ class MockHeaderSync {
   // bits value (matches the `bits: 0x1d00ffff` returned in the parent header
   // entry below).
   public nextTargetOverride: bigint | null = null;
+  // Per-test override for the height returned by getHeader(<any>).  Used by
+  // the BIP-34 reorg-via-submitblock side-branch test to simulate a parent
+  // that is in the block index but is NOT the active tip (parentHeight=110,
+  // bestHeader.height=112 → side-branch B1 at h=111).
+  public parentHeightOverride: number | null = null;
+  // Per-test override for bestHeader.height (mutated under test to simulate
+  // the active chain advancing past the fork point).
+  public bestHeaderHeightOverride: number | null = null;
 
   getBestHeader() {
+    if (this.bestHeaderHeightOverride !== null) {
+      return { ...this.bestHeader, height: this.bestHeaderHeightOverride };
+    }
     return this.bestHeader;
   }
 
@@ -152,7 +163,7 @@ class MockHeaderSync {
         bits: 0x1d00ffff,
         nonce: 0,
       },
-      height: 100,
+      height: this.parentHeightOverride !== null ? this.parentHeightOverride : 100,
       chainWork: 1000n,
       status: "valid-header" as const,
     };
@@ -1681,13 +1692,16 @@ describe("RPCServer", () => {
     // Helper: build a minimal serialized block (coinbase-only, arbitrary nonce).
     // The header's prevBlock is all-zeros so MockHeaderSync.getHeader returns an entry.
     // When badMerkle=true the merkleRoot bytes are wrong to trigger bad-txnmrklroot.
+    // When cbHeight is set, encodes that height into the coinbase scriptSig
+    // instead of the default 101 (used by the BIP-34 side-branch test).
     function buildMinimalBlockHex(opts: {
       badMerkle?: boolean;
+      cbHeight?: number;
     } = {}): string {
       // Minimal coinbase transaction using the correct Transaction field names.
       // Coinbase: prevOut.txid must be all zeros (not 0xff) for isCoinbase() to pass.
       // approxHeight = bestHeader.height + 1 = 101; encode canonically (Core parity).
-      const approxHeight = 101;
+      const approxHeight = opts.cbHeight ?? 101;
       const heightEnc = encodeBip34Height(approxHeight);
       const scriptSig = heightEnc.length < 2
         ? Buffer.concat([heightEnc, Buffer.from([0x00])])
@@ -1828,6 +1842,86 @@ describe("RPCServer", () => {
       const result = await rpcRequest(testPort, "submitblock", [12345]);
       expect(result.error).toBeDefined();
       expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+    });
+
+    // BIP-34 side-branch / Pattern X regression
+    // (CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md).
+    //
+    // Setup: active best chain at height 112 (chain A's tip), parent of the
+    // submitted block is at height 110 (the fork point).  The submitted
+    // block's coinbase encodes height 111 — correct relative to its
+    // parent, NOT relative to the active tip.  Pre-fix, hotbuns derived
+    // approxHeight = bestHeader.height + 1 = 113, so the BIP-34 byte-exact
+    // prefix match against the coinbase scriptSig (which encodes 111)
+    // failed and submitblock returned `bad-cb-height`.  Post-fix,
+    // approxHeight = parentEntry.height + 1 = 111, the BIP-34 check
+    // passes, and the block is forwarded to injectBlock.
+    it("submitblock side-branch parent.height+1 (not active-tip+1) for BIP-34", async () => {
+      const port = getTestPort();
+      let injectCalled = false;
+      const mockBlockSync = {
+        injectBlock: async (_block: any) => {
+          injectCalled = true;
+          return null;
+        },
+      };
+      const s = makeServerWithBlockSync(port, mockBlockSync);
+      // Active tip at h=112 (chain A's tip).  Parent of submitted block
+      // (B1) is at h=110 (the fork point shared with A1).  Submitted
+      // coinbase encodes 111 — parent.height + 1.
+      mockHeaderSync.bestHeaderHeightOverride = 112;
+      mockHeaderSync.parentHeightOverride = 110;
+      s.start();
+      try {
+        const hex = buildMinimalBlockHex({ cbHeight: 111 });
+        const result = await rpcRequest(port, "submitblock", [hex]);
+        // Pre-fix: result.result = "bad-cb-height" (block rejected before
+        //   injectBlock ran).
+        // Post-fix: result.result = null (success, structural check passes
+        //   and blockSync mock accepted).
+        expect(result.error).toBeUndefined();
+        expect(result.result).toBeNull();
+        expect(injectCalled).toBe(true);
+      } finally {
+        s.stop();
+        mockHeaderSync.nextTargetOverride = null;
+        mockHeaderSync.bestHeaderHeightOverride = null;
+        mockHeaderSync.parentHeightOverride = null;
+      }
+    });
+
+    // Negative companion: confirms that the active-tip fallback still
+    // fires when the parent is genuinely unknown (orphan path).  In that
+    // case, the block forwards to injectBlock which returns
+    // "inconclusive" — exercising the else branch of the height
+    // derivation introduced by the Pattern X fix.
+    it("submitblock orphan (parent unknown) falls back to active-tip+1", async () => {
+      const port = getTestPort();
+      let injectCalled = false;
+      const mockBlockSync = {
+        injectBlock: async (_block: any) => {
+          injectCalled = true;
+          return "inconclusive";
+        },
+      };
+      const s = makeServerWithBlockSync(port, mockBlockSync);
+      // Mark the parent (all-zeros prevBlock) as unknown so getHeader
+      // returns undefined and we exercise the active-tip fallback.
+      mockHeaderSync.setUnknown(Buffer.alloc(32, 0));
+      mockHeaderSync.bestHeaderHeightOverride = 100;
+      s.start();
+      try {
+        const hex = buildMinimalBlockHex({ cbHeight: 101 });
+        const result = await rpcRequest(port, "submitblock", [hex]);
+        expect(result.error).toBeUndefined();
+        expect(result.result).toBe("inconclusive");
+        expect(injectCalled).toBe(true);
+      } finally {
+        s.stop();
+        mockHeaderSync.nextTargetOverride = null;
+        mockHeaderSync.bestHeaderHeightOverride = null;
+        mockHeaderSync.parentHeightOverride = null;
+      }
     });
   });
 });
