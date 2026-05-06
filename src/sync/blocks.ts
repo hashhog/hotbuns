@@ -201,6 +201,14 @@ const MAX_GETDATA_ITEMS = 50000;
  *  are processed fast enough that a larger buffer isn't needed. */
 const MAX_DOWNLOADED_BUFFER = 32;
 
+/** How often (in connected blocks) to ask the prune manager whether files
+ *  should be pruned.  Bitcoin Core checks during chainstate flushes; hotbuns
+ *  flushes every FLUSH_INTERVAL (2000) blocks during IBD, but we run the
+ *  prune scan a bit more often near the tip so disk usage doesn't drift far
+ *  past target.  100 is small enough to bound overshoot and large enough that
+ *  the O(file_count) iteration is rare. */
+const PRUNE_CHECK_INTERVAL = 100;
+
 /**
  * Tracks a pending block request.
  */
@@ -305,6 +313,22 @@ export class BlockSync {
    *  CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md. */
   private mempool: Mempool | null = null;
 
+  /** Prune manager — wired via setPruneManager() from cli.ts when the
+   *  operator passes `--prune=N`.  After every successful connectBlock,
+   *  we call `pruneManager.maybePrune(height)` which is a no-op outside
+   *  automatic-prune mode (manual mode `--prune=1` only triggers via the
+   *  `pruneblockchain` RPC).  Mirrors Bitcoin Core's
+   *  `validation.cpp::ConnectTip` → `m_blockman.FindFilesToPrune` call. */
+  private pruneManager: import("../storage/pruning.js").PruneManager | null = null;
+
+  /** Throttle counter for auto-prune scans.  Auto-prune iterates over all
+   *  block-file-info records to compute current usage, which is O(file_count)
+   *  — cheap, but pointless to run on every single connected block during
+   *  IBD.  We scan once per `PRUNE_CHECK_INTERVAL` blocks, matching Core's
+   *  per-flush cadence (it checks during chainstate flushes, ~every 100
+   *  blocks during IBD). */
+  private blocksSincePruneCheck: number = 0;
+
   /**
    * Number of parallel script-verification workers.
    * 1  = sequential (verifyAllInputsSequential) — benchmark baseline.
@@ -368,6 +392,25 @@ export class BlockSync {
    */
   setMempool(mempool: Mempool): void {
     this.mempool = mempool;
+  }
+
+  /**
+   * Wire the prune manager.
+   *
+   * When the operator passes `--prune=N` (N≥550 MiB or N=1 manual mode),
+   * cli.ts constructs a PruneManager and registers it here so we can call
+   * `maybePrune(height)` after every successful connectBlock.
+   *
+   * Mirrors Bitcoin Core's `m_blockman.FindFilesToPrune` invocation in
+   * `validation.cpp::FlushStateToDisk` (called from `ConnectTip`).
+   *
+   * No-op outside automatic-prune mode: in manual mode (`-prune=1`) the
+   * scan is gated on `pruneManager.isAutomaticPruning()` inside
+   * `findFilesToPrune`, and the manual `pruneblockchain` RPC handles its
+   * own dispatch via `pruneManager.pruneBlockchain(targetHeight, ...)`.
+   */
+  setPruneManager(pruneManager: import("../storage/pruning.js").PruneManager): void {
+    this.pruneManager = pruneManager;
   }
 
   /**
@@ -2481,6 +2524,38 @@ export class BlockSync {
             err instanceof Error ? err.message : String(err)
           }`
         );
+      }
+    }
+
+    // ── Auto-prune hook ──
+    //
+    // Mirrors Bitcoin Core's `m_blockman.FindFilesToPrune` call in
+    // `validation.cpp::FlushStateToDisk` (invoked from `ConnectTip`):
+    // after every accepted block, ask the prune manager whether the
+    // current usage has crossed the target.  No-op when:
+    //   • pruneManager is unwired (operator did NOT pass `--prune=N`)
+    //   • manual mode (`--prune=1`) — `findFilesToPrune` short-circuits
+    //     on `isAutomaticPruning()`, leaving the only entry point as the
+    //     `pruneblockchain` RPC.
+    //
+    // Throttled to once per PRUNE_CHECK_INTERVAL blocks so the
+    // O(file_count) usage scan doesn't run on every IBD block.  Errors
+    // are swallowed: pruning is opportunistic, never block-validation
+    // critical, and a bad unlink (e.g. EBUSY on Windows) must not
+    // strand the chain.
+    if (this.pruneManager && this.pruneManager.isAutomaticPruning()) {
+      this.blocksSincePruneCheck++;
+      if (this.blocksSincePruneCheck >= PRUNE_CHECK_INTERVAL) {
+        this.blocksSincePruneCheck = 0;
+        try {
+          await this.pruneManager.maybePrune(height);
+        } catch (err) {
+          console.warn(
+            `[prune] non-fatal failure during auto-prune at height ${height}: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        }
       }
     }
 

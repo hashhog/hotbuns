@@ -27,6 +27,22 @@ import {
 /** Minimum prune target in bytes (550 MiB). */
 export const MIN_PRUNE_TARGET = 550 * 1024 * 1024;
 
+/**
+ * Sentinel value for "manual prune mode" (`-prune=1` in Bitcoin Core).
+ *
+ * When the operator passes `--prune=1`, automatic background pruning is
+ * disabled but the `pruneblockchain` RPC still works.  This mirrors Core's
+ * `BlockManager::PRUNE_TARGET_MANUAL` (= `std::numeric_limits<uint64_t>::max()`,
+ * see `bitcoin-core/src/node/blockstorage.h:408`); we use
+ * `Number.MAX_SAFE_INTEGER` because that's the largest exact integer a
+ * JS `number` can hold (uint64::max would silently round).
+ *
+ * The semantic test is: `pruneTarget === PRUNE_TARGET_MANUAL` ⇒ manual mode.
+ * `pruneTarget === 0` ⇒ disabled.  Any other positive value ⇒ auto-prune
+ * to that byte count (with `MIN_PRUNE_TARGET` as a floor).
+ */
+export const PRUNE_TARGET_MANUAL = Number.MAX_SAFE_INTEGER;
+
 /** Minimum blocks to keep from the tip (288 = ~2 days of blocks). */
 export const MIN_BLOCKS_TO_KEEP = 288;
 
@@ -105,10 +121,24 @@ export class PruneManager {
   }
 
   /**
-   * Check if pruning is enabled.
+   * Check if pruning is enabled (auto OR manual).
+   *
+   * Returns true for both `-prune=1` (manual) and `-prune=N` (auto).
+   * Use `isAutomaticPruning()` to distinguish.
    */
   isPruneMode(): boolean {
     return this.pruneTarget > 0;
+  }
+
+  /**
+   * Check if automatic (background) pruning is enabled.
+   *
+   * Mirrors Bitcoin Core's `automatic_pruning` field in
+   * `getblockchaininfo` (rpc/blockchain.cpp:1452):
+   *   `chainman.m_blockman.GetPruneTarget() != PRUNE_TARGET_MANUAL`
+   */
+  isAutomaticPruning(): boolean {
+    return this.pruneTarget > 0 && this.pruneTarget !== PRUNE_TARGET_MANUAL;
   }
 
   /**
@@ -210,7 +240,10 @@ export class PruneManager {
   async findFilesToPrune(chainHeight: number): Promise<Set<number>> {
     const setFilesToPrune = new Set<number>();
 
-    if (!this.isPruneMode() || chainHeight < 0) {
+    // Auto-prune is a no-op in manual mode (`-prune=1`) and when pruning
+    // is disabled.  The manual-pruning RPC (`pruneblockchain`) is still
+    // honored — see `findFilesToPruneManual` / `pruneBlockchain`.
+    if (!this.isAutomaticPruning() || chainHeight < 0) {
       return setFilesToPrune;
     }
 
@@ -446,6 +479,7 @@ export class PruneManager {
       };
     }
 
+    const automatic = this.isAutomaticPruning();
     const result: {
       pruned: boolean;
       pruneheight?: number;
@@ -453,9 +487,15 @@ export class PruneManager {
       prune_target_size?: number;
     } = {
       pruned: this.havePruned,
-      automatic_pruning: true,
-      prune_target_size: this.pruneTarget,
+      automatic_pruning: automatic,
     };
+
+    // Mirrors Bitcoin Core rpc/blockchain.cpp:1454-1456:
+    // `prune_target_size` is only emitted when `automatic_pruning` is true
+    // (i.e. NOT in `-prune=1` manual mode).
+    if (automatic) {
+      result.prune_target_size = this.pruneTarget;
+    }
 
     if (this.havePruned) {
       result.pruneheight = this.getFirstUnprunedHeight();
