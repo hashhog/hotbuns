@@ -52,6 +52,33 @@ export const MAX_MESSAGE_SIZE = 32 * 1024 * 1024;
 /** Message header size in bytes */
 export const MESSAGE_HEADER_SIZE = 24;
 
+// ============================================================================
+// Wire-decode caps (DoS protection)
+//
+// Adversarial peers may craft a varint count larger than the protocol bounds
+// to force gigabyte-scale allocation before the loop fails to find more wire
+// bytes. Each peer-supplied count MUST be checked against the corresponding
+// Core protocol limit BEFORE allocating / looping. Values mirror Bitcoin Core
+// `src/net_processing.cpp` / `src/net_processing.h`.
+// ============================================================================
+
+/** Maximum entries in an inv / getdata / notfound message (Core MAX_INV_SZ). */
+export const MAX_INV_SZ = 50_000;
+
+/** Maximum headers per `headers` message (Core MAX_HEADERS_RESULTS). */
+export const MAX_HEADERS_RESULTS = 2_000;
+
+/** Maximum addresses per `addr` / `addrv2` message (Core MAX_ADDR_TO_SEND). */
+export const MAX_ADDR_TO_SEND = 1_000;
+
+/**
+ * Maximum hashes in a `getblocks` / `getheaders` block locator.
+ *
+ * Core `chain.h:MAX_LOCATOR_SZ = 101` (log2(maxHeight)+10). We cap at 101 to
+ * mirror Core; honest peers send well under this.
+ */
+export const MAX_LOCATOR_SZ = 101;
+
 /**
  * Bitcoin P2P message header (24 bytes).
  */
@@ -813,6 +840,10 @@ function deserializeInvVector(reader: BufferReader): InvVector {
 
 function deserializeInvPayload(reader: BufferReader): InvPayload {
   const count = reader.readVarInt();
+  // DoS cap: reject before allocating (Core MAX_INV_SZ = 50000).
+  if (count > MAX_INV_SZ) {
+    throw new Error(`inv/getdata/notfound count exceeds MAX_INV_SZ: ${count} > ${MAX_INV_SZ}`);
+  }
   const inventory: InvVector[] = [];
   for (let i = 0; i < count; i++) {
     inventory.push(deserializeInvVector(reader));
@@ -823,6 +854,10 @@ function deserializeInvPayload(reader: BufferReader): InvPayload {
 function deserializeBlockLocator(reader: BufferReader): { version: number; locatorHashes: Buffer[]; hashStop: Buffer } {
   const version = reader.readUInt32LE();
   const count = reader.readVarInt();
+  // DoS cap: reject before allocating (Core MAX_LOCATOR_SZ = 101).
+  if (count > MAX_LOCATOR_SZ) {
+    throw new Error(`block locator count exceeds MAX_LOCATOR_SZ: ${count} > ${MAX_LOCATOR_SZ}`);
+  }
   const locatorHashes: Buffer[] = [];
   for (let i = 0; i < count; i++) {
     locatorHashes.push(reader.readHash());
@@ -833,6 +868,10 @@ function deserializeBlockLocator(reader: BufferReader): { version: number; locat
 
 function deserializeHeadersPayload(reader: BufferReader): HeadersPayload {
   const count = reader.readVarInt();
+  // DoS cap: reject before allocating (Core MAX_HEADERS_RESULTS = 2000).
+  if (count > MAX_HEADERS_RESULTS) {
+    throw new Error(`headers count exceeds MAX_HEADERS_RESULTS: ${count} > ${MAX_HEADERS_RESULTS}`);
+  }
   const headers: BlockHeader[] = [];
   for (let i = 0; i < count; i++) {
     const header = deserializeBlockHeader(reader);
@@ -845,6 +884,10 @@ function deserializeHeadersPayload(reader: BufferReader): HeadersPayload {
 
 function deserializeAddrPayload(reader: BufferReader): AddrPayload {
   const count = reader.readVarInt();
+  // DoS cap: reject before allocating (Core MAX_ADDR_TO_SEND = 1000).
+  if (count > MAX_ADDR_TO_SEND) {
+    throw new Error(`addr count exceeds MAX_ADDR_TO_SEND: ${count} > ${MAX_ADDR_TO_SEND}`);
+  }
   const addrs: { timestamp: number; addr: NetworkAddress }[] = [];
   for (let i = 0; i < count; i++) {
     const timestamp = reader.readUInt32LE();

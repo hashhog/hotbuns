@@ -5,6 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import { MAINNET } from "../consensus/params.js";
 import { hash256 } from "../crypto/primitives.js";
+import { BufferWriter } from "../wire/serialization.js";
 import {
   MessageHeader,
   NetworkMessage,
@@ -14,6 +15,10 @@ import {
   InvVector,
   MESSAGE_HEADER_SIZE,
   MAX_MESSAGE_SIZE,
+  MAX_INV_SZ,
+  MAX_HEADERS_RESULTS,
+  MAX_ADDR_TO_SEND,
+  MAX_LOCATOR_SZ,
   serializeMessage,
   deserializeMessage,
   serializeHeader,
@@ -956,5 +961,130 @@ describe("message constants", () => {
 
   test("MAX_MESSAGE_SIZE is 32 MiB", () => {
     expect(MAX_MESSAGE_SIZE).toBe(32 * 1024 * 1024);
+  });
+});
+
+// ============================================================================
+// Wire-decode caps (DoS protection)
+//
+// An adversarial peer can send a varint count larger than the protocol limit
+// to force gigabyte-scale allocation before the loop runs out of payload bytes
+// and fails. Each peer-supplied count MUST be checked BEFORE allocating.
+//
+// Reference: bitcoin-core/src/net_processing.cpp / src/net_processing.h.
+// Cross-impl audit: CORE-PARITY-AUDIT/_dos-misbehavior-cross-impl-audit-2026-05-06.md.
+// ============================================================================
+
+describe("wire-decode caps (DoS protection)", () => {
+  /** Helper: build a fake header for a given command + payload. */
+  function makeHeader(command: string, payload: Buffer): MessageHeader {
+    return {
+      magic: MAGIC,
+      command,
+      length: payload.length,
+      checksum: hash256(payload).subarray(0, 4),
+    };
+  }
+
+  test("MAX_INV_SZ is 50000", () => {
+    expect(MAX_INV_SZ).toBe(50_000);
+  });
+
+  test("MAX_HEADERS_RESULTS is 2000", () => {
+    expect(MAX_HEADERS_RESULTS).toBe(2_000);
+  });
+
+  test("MAX_ADDR_TO_SEND is 1000", () => {
+    expect(MAX_ADDR_TO_SEND).toBe(1_000);
+  });
+
+  test("MAX_LOCATOR_SZ is 101", () => {
+    expect(MAX_LOCATOR_SZ).toBe(101);
+  });
+
+  test("inv: count > MAX_INV_SZ throws before allocating", () => {
+    const writer = new BufferWriter();
+    writer.writeVarInt(MAX_INV_SZ + 1);
+    // Don't bother filling actual inv vectors — the cap MUST trigger first.
+    const payload = writer.toBuffer();
+    const header = makeHeader("inv", payload);
+    expect(() => deserializeMessage(header, payload)).toThrow(/MAX_INV_SZ/);
+  });
+
+  test("inv: count = 0xFEFFFFFFFF (~1.1e9) attacker payload throws before alloc", () => {
+    // Reproducer from the audit doc: varint 0xFEFFFFFFFF -> 4-byte 0xFFFFFFFF
+    const writer = new BufferWriter();
+    writer.writeVarInt(0xffffffff);
+    const payload = writer.toBuffer();
+    const header = makeHeader("inv", payload);
+    expect(() => deserializeMessage(header, payload)).toThrow(/MAX_INV_SZ/);
+  });
+
+  test("getdata: count > MAX_INV_SZ throws (shares deserializer)", () => {
+    const writer = new BufferWriter();
+    writer.writeVarInt(MAX_INV_SZ + 1);
+    const payload = writer.toBuffer();
+    const header = makeHeader("getdata", payload);
+    expect(() => deserializeMessage(header, payload)).toThrow(/MAX_INV_SZ/);
+  });
+
+  test("notfound: count > MAX_INV_SZ throws (shares deserializer)", () => {
+    const writer = new BufferWriter();
+    writer.writeVarInt(MAX_INV_SZ + 1);
+    const payload = writer.toBuffer();
+    const header = makeHeader("notfound", payload);
+    expect(() => deserializeMessage(header, payload)).toThrow(/MAX_INV_SZ/);
+  });
+
+  test("inv: count = MAX_INV_SZ (boundary) does NOT trip cap", () => {
+    // The cap rejects strictly greater than MAX_INV_SZ. At exactly the limit
+    // we expect a buffer-underrun error (we didn't supply 50000 inv vectors).
+    const writer = new BufferWriter();
+    writer.writeVarInt(MAX_INV_SZ);
+    const payload = writer.toBuffer();
+    const header = makeHeader("inv", payload);
+    expect(() => deserializeMessage(header, payload)).not.toThrow(/MAX_INV_SZ/);
+  });
+
+  test("headers: count > MAX_HEADERS_RESULTS throws before allocating", () => {
+    const writer = new BufferWriter();
+    writer.writeVarInt(MAX_HEADERS_RESULTS + 1);
+    const payload = writer.toBuffer();
+    const header = makeHeader("headers", payload);
+    expect(() => deserializeMessage(header, payload)).toThrow(/MAX_HEADERS_RESULTS/);
+  });
+
+  test("headers: count = MAX_HEADERS_RESULTS (boundary) does NOT trip cap", () => {
+    const writer = new BufferWriter();
+    writer.writeVarInt(MAX_HEADERS_RESULTS);
+    const payload = writer.toBuffer();
+    const header = makeHeader("headers", payload);
+    expect(() => deserializeMessage(header, payload)).not.toThrow(/MAX_HEADERS_RESULTS/);
+  });
+
+  test("addr: count > MAX_ADDR_TO_SEND throws before allocating", () => {
+    const writer = new BufferWriter();
+    writer.writeVarInt(MAX_ADDR_TO_SEND + 1);
+    const payload = writer.toBuffer();
+    const header = makeHeader("addr", payload);
+    expect(() => deserializeMessage(header, payload)).toThrow(/MAX_ADDR_TO_SEND/);
+  });
+
+  test("getheaders locator: count > MAX_LOCATOR_SZ throws before allocating", () => {
+    const writer = new BufferWriter();
+    writer.writeUInt32LE(70016); // protocol version
+    writer.writeVarInt(MAX_LOCATOR_SZ + 1);
+    const payload = writer.toBuffer();
+    const header = makeHeader("getheaders", payload);
+    expect(() => deserializeMessage(header, payload)).toThrow(/MAX_LOCATOR_SZ/);
+  });
+
+  test("getblocks locator: count > MAX_LOCATOR_SZ throws before allocating", () => {
+    const writer = new BufferWriter();
+    writer.writeUInt32LE(70016);
+    writer.writeVarInt(MAX_LOCATOR_SZ + 1);
+    const payload = writer.toBuffer();
+    const header = makeHeader("getblocks", payload);
+    expect(() => deserializeMessage(header, payload)).toThrow(/MAX_LOCATOR_SZ/);
   });
 });
