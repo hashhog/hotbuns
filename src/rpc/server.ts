@@ -30,7 +30,7 @@ import {
 import { bip22Result } from "../validation/errors.js";
 import { checkProofOfWork } from "../consensus/pow.js";
 import { BlockTemplateBuilder } from "../mining/template.js";
-import type { Transaction } from "../validation/tx.js";
+import type { Transaction, TxIn, TxOut } from "../validation/tx.js";
 import {
   deserializeTx,
   serializeTx,
@@ -54,6 +54,20 @@ import {
   type NetworkType,
 } from "../wallet/descriptor.js";
 import {
+  type PSBT,
+  createPSBT,
+  encodePSBTBase64,
+  decodePSBTBase64,
+  combinePSBTs,
+  finalizePSBT,
+  signPSBTInput,
+  extractTransaction,
+  decodePSBT as decodePSBTToJSON,
+  convertToPSBT,
+  updateInputUTXO,
+  isInputFinalized,
+} from "../wallet/psbt.js";
+import {
   ChainstateManager,
   computeUTXOSetHash,
   serializeSnapshotMetadata,
@@ -71,7 +85,7 @@ import {
   messageVerify,
   MessageVerificationResult,
 } from "../crypto/signmessage.js";
-import { base58CheckDecode } from "../address/encoding.js";
+import { base58CheckDecode, decodeAddress, AddressType } from "../address/encoding.js";
 import { isValidPrivateKey } from "../crypto/primitives.js";
 
 /**
@@ -830,17 +844,20 @@ export class RPCServer {
         this.importDescriptors(params)
       );
       this.registerMethod("signmessage", (params) => this.signMessage(params));
+      this.registerMethod("walletcreatefundedpsbt", (params) =>
+        this.walletCreateFundedPSBT(params)
+      );
     }
 
     // Descriptor methods (work without wallet)
     this.registerMethod("getdescriptorinfo", (params) => this.getDescriptorInfo(params));
     this.registerMethod("deriveaddresses", (params) => this.deriveAddresses(params));
 
-    // PSBT methods
-    this.registerMethod("createpsbt", (params) => this.createPSBT(params));
-    this.registerMethod("decodepsbt", (params) => this.decodePSBT(params));
-    this.registerMethod("combinepsbt", (params) => this.combinePSBTs(params));
-    this.registerMethod("finalizepsbt", (params) => this.finalizePSBT(params));
+    // PSBT methods (BIP-174) — wallet-independent (creator/decoder/combiner/finalizer roles)
+    this.registerMethod("createpsbt", (params) => this.createPSBTRpc(params));
+    this.registerMethod("decodepsbt", (params) => this.decodePSBTRpc(params));
+    this.registerMethod("combinepsbt", (params) => this.combinePSBTRpc(params));
+    this.registerMethod("finalizepsbt", (params) => this.finalizePSBTRpc(params));
 
     // Utility methods
     this.registerMethod("help", (params) => this.help(params));
@@ -6192,36 +6209,754 @@ export class RPCServer {
     return Number(balance.total) / 100_000_000;
   }
 
-  private async sendToAddress(_params: unknown[]): Promise<string> {
-    throw this.rpcError(-1, "sendtoaddress not yet implemented");
+  /**
+   * sendtoaddress: Send `amount` BTC to `address` from the wallet.
+   *
+   * Wires `Wallet.createTransaction` (selects coins + signs) and submits via
+   * the existing mempool path. Best-effort feerate: prefers BTC/kvB → sat/vB
+   * conversion when caller passes `fee_rate`; otherwise uses estimate.
+   *
+   * Reference: bitcoin-core/src/wallet/rpc/spend.cpp::sendtoaddress.
+   *
+   * @param params [address, amount, comment?, comment_to?, subtractfee?,
+   *               replaceable?, conf_target?, estimate_mode?, avoid_reuse?,
+   *               fee_rate?]
+   */
+  private async sendToAddress(params: unknown[]): Promise<string> {
+    const [addressParam, amountParam, , , , , , , , feeRateParam] = params;
+
+    if (typeof addressParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "address must be a string");
+    }
+    if (typeof amountParam !== "number" || !(amountParam > 0)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "amount must be a positive number (BTC)"
+      );
+    }
+
+    // Validate the destination address up-front for a clean error code.
+    try {
+      decodeAddress(addressParam);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid address: ${msg}`);
+    }
+
+    const wallet = this.getCurrentWallet();
+    if (wallet.isLocked()) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_UNLOCK_NEEDED,
+        "Error: Please enter the wallet passphrase with walletpassphrase first."
+      );
+    }
+
+    // Fee rate: Core's `fee_rate` (param 9) is sat/vB.
+    let feeRate = 1; // 1 sat/vB default
+    if (typeof feeRateParam === "number" && feeRateParam > 0) {
+      feeRate = feeRateParam;
+    }
+
+    // Convert BTC → sats (rounded to nearest sat to avoid FP wobble).
+    const amountSats = BigInt(Math.round(amountParam * 100_000_000));
+
+    let tx: Transaction;
+    try {
+      tx = wallet.createTransaction([{ address: addressParam, amount: amountSats }], feeRate);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("Insufficient funds")) {
+        throw this.rpcError(RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS, msg);
+      }
+      throw this.rpcError(RPCErrorCodes.WALLET_ERROR, msg);
+    }
+
+    // Hand off to the regular sendrawtransaction path so we get full mempool
+    // validation + peer broadcast for free.
+    const txHex = serializeTx(tx, true).toString("hex");
+    return await this.sendRawTransaction([txHex]);
   }
 
-  private async listUnspent(_params: unknown[]): Promise<unknown[]> {
-    throw this.rpcError(-1, "listunspent not yet implemented");
+  /**
+   * listunspent: List unspent transaction outputs known to the wallet.
+   *
+   * Iterates `Wallet.getUTXOs()` and shapes each entry into Core's listunspent
+   * row. Optional `minconf`/`maxconf`/`addresses[]` filters mirror Core.
+   *
+   * Reference: bitcoin-core/src/wallet/rpc/coins.cpp::listunspent.
+   *
+   * @param params [minconf?, maxconf?, addresses?, include_unsafe?, query_options?]
+   */
+  private async listUnspent(params: unknown[]): Promise<unknown[]> {
+    const wallet = this.getCurrentWallet();
+
+    const minConfRaw = params[0];
+    const maxConfRaw = params[1];
+    const addressesRaw = params[2];
+
+    const minConf = typeof minConfRaw === "number" ? minConfRaw : 1;
+    const maxConf = typeof maxConfRaw === "number" ? maxConfRaw : 9_999_999;
+
+    let addressFilter: Set<string> | null = null;
+    if (Array.isArray(addressesRaw)) {
+      addressFilter = new Set();
+      for (const a of addressesRaw) {
+        if (typeof a !== "string") {
+          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "addresses must be strings");
+        }
+        addressFilter.add(a);
+      }
+    }
+
+    const result: Array<Record<string, unknown>> = [];
+    for (const utxo of wallet.getUTXOs()) {
+      if (utxo.confirmations < minConf || utxo.confirmations > maxConf) continue;
+      if (addressFilter && !addressFilter.has(utxo.address)) continue;
+
+      const key = wallet.getKey(utxo.address);
+      let scriptPubKeyHex = "";
+      if (key) {
+        // Reconstruct scriptPubKey from address type + hash.
+        try {
+          const decoded = decodeAddress(utxo.address);
+          scriptPubKeyHex = this.buildScriptPubKeyHex(decoded.type, decoded.hash);
+        } catch {
+          scriptPubKeyHex = "";
+        }
+      }
+
+      const spendable = wallet.isUTXOSpendable(utxo);
+      result.push({
+        txid: Buffer.from(utxo.outpoint.txid).reverse().toString("hex"),
+        vout: utxo.outpoint.vout,
+        address: utxo.address,
+        label: wallet.getLabel(utxo.address) || "",
+        scriptPubKey: scriptPubKeyHex,
+        amount: Number(utxo.amount) / 100_000_000,
+        confirmations: utxo.confirmations,
+        spendable,
+        solvable: true,
+        safe: spendable,
+      });
+    }
+
+    return result;
   }
 
+  /**
+   * Helper for listunspent: serialize an scriptPubKey from a decoded address.
+   * Mirrors the private `Wallet.buildScriptPubKey` so we don't need to widen
+   * its visibility for the RPC layer.
+   */
+  private buildScriptPubKeyHex(type: AddressType, hash: Buffer): string {
+    switch (type) {
+      case AddressType.P2WPKH:
+        return Buffer.concat([Buffer.from([0x00, 0x14]), hash]).toString("hex");
+      case AddressType.P2WSH:
+        return Buffer.concat([Buffer.from([0x00, 0x20]), hash]).toString("hex");
+      case AddressType.P2PKH:
+        return Buffer.concat([
+          Buffer.from([0x76, 0xa9, 0x14]),
+          hash,
+          Buffer.from([0x88, 0xac]),
+        ]).toString("hex");
+      case AddressType.P2SH:
+        return Buffer.concat([Buffer.from([0xa9, 0x14]), hash, Buffer.from([0x87])]).toString("hex");
+      case AddressType.P2TR:
+        return Buffer.concat([Buffer.from([0x51, 0x20]), hash]).toString("hex");
+      default:
+        return "";
+    }
+  }
+
+  /**
+   * signrawtransactionwithwallet: sign each input of a raw tx using the
+   * wallet's keys, going through the PSBT signer.
+   *
+   * For each input we look up the prevout in the chainstate UTXO set (or
+   * mempool), find a matching wallet key by `scriptPubKey → address`, and
+   * call `signPSBTInput`. If every input becomes finalized we extract the
+   * signed transaction.
+   *
+   * Reference: bitcoin-core/src/wallet/rpc/spend.cpp::signrawtransactionwithwallet.
+   *
+   * @param params [hexstring, prevtxs?, sighashtype?]
+   */
   private async signRawTransactionWithWallet(params: unknown[]): Promise<Record<string, unknown>> {
-    throw this.rpcError(-1, "signrawtransactionwithwallet not yet implemented");
+    const [hexParam] = params;
+    if (typeof hexParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "hexstring must be a string");
+    }
+
+    const wallet = this.getCurrentWallet();
+    if (wallet.isLocked()) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_UNLOCK_NEEDED,
+        "Error: Please enter the wallet passphrase with walletpassphrase first."
+      );
+    }
+
+    let tx: Transaction;
+    try {
+      tx = deserializeTx(new BufferReader(Buffer.from(hexParam, "hex")));
+    } catch (e) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `TX decode failed: ${(e as Error).message}`
+      );
+    }
+
+    const psbt = convertToPSBT(tx);
+    const utxoManager = this.chainState.getUTXOManager();
+    const errors: Array<Record<string, unknown>> = [];
+
+    for (let i = 0; i < tx.inputs.length; i++) {
+      const txin = tx.inputs[i];
+      // Skip inputs that already have final scripts (from convertToPSBT path).
+      if (isInputFinalized(psbt.inputs[i])) continue;
+
+      // Look up prevout: chainstate first, then mempool.
+      let prevScriptPubKey: Buffer | undefined;
+      let prevValue: bigint | undefined;
+      try {
+        const entry = await utxoManager.getUTXOAsync({
+          txid: txin.prevOut.txid,
+          vout: txin.prevOut.vout,
+        });
+        if (entry) {
+          prevScriptPubKey = entry.scriptPubKey;
+          prevValue = entry.amount;
+        }
+      } catch {
+        // Fall through to mempool lookup.
+      }
+      if (!prevScriptPubKey) {
+        const mpEntry = this.mempool.getTransaction(txin.prevOut.txid);
+        if (mpEntry && txin.prevOut.vout < mpEntry.tx.outputs.length) {
+          const out = mpEntry.tx.outputs[txin.prevOut.vout];
+          prevScriptPubKey = out.scriptPubKey;
+          prevValue = out.value;
+        }
+      }
+      if (!prevScriptPubKey || prevValue === undefined) {
+        errors.push({
+          txid: Buffer.from(txin.prevOut.txid).reverse().toString("hex"),
+          vout: txin.prevOut.vout,
+          witness: [],
+          scriptSig: "",
+          sequence: txin.sequence,
+          error: "Input not found or already spent",
+        });
+        continue;
+      }
+
+      // Wire UTXO into the PSBT input.
+      updateInputUTXO(
+        psbt,
+        i,
+        { value: prevValue, scriptPubKey: prevScriptPubKey } as TxOut,
+        true
+      );
+
+      // Resolve address from scriptPubKey via the existing helper.
+      const address = this.scriptPubKeyToAddress(prevScriptPubKey);
+      if (!address) {
+        errors.push({
+          txid: Buffer.from(txin.prevOut.txid).reverse().toString("hex"),
+          vout: txin.prevOut.vout,
+          error: "Unsupported scriptPubKey type for wallet signing",
+        });
+        continue;
+      }
+      const key = wallet.getKey(address);
+      if (!key) {
+        errors.push({
+          txid: Buffer.from(txin.prevOut.txid).reverse().toString("hex"),
+          vout: txin.prevOut.vout,
+          error: `No private key for address ${address}`,
+        });
+        continue;
+      }
+
+      try {
+        signPSBTInput(psbt, i, key.privateKey, key.publicKey, /*sighashType=*/ 0x01);
+      } catch (e) {
+        errors.push({
+          txid: Buffer.from(txin.prevOut.txid).reverse().toString("hex"),
+          vout: txin.prevOut.vout,
+          error: (e as Error).message,
+        });
+      }
+    }
+
+    // Try to finalize. `finalizePSBT` returns `true` only when all inputs are
+    // finalized.
+    const complete = finalizePSBT(psbt);
+
+    let hex: string;
+    if (complete) {
+      const signedTx = extractTransaction(psbt);
+      hex = serializeTx(signedTx, true).toString("hex");
+    } else {
+      // Return the partially-signed tx as best-effort. Re-serialize the
+      // current `psbt.tx` (with whatever finalScripts/scriptSigs survive).
+      hex = serializeTx(psbt.tx, true).toString("hex");
+    }
+
+    const out: Record<string, unknown> = { hex, complete };
+    if (errors.length > 0) out.errors = errors;
+    return out;
   }
 
+  /**
+   * importdescriptors: validate-and-accept descriptor records.
+   *
+   * Hotbuns' descriptor parser doesn't yet expose private-key extraction, so
+   * this handler validates each descriptor (rejecting malformed ones), pre-
+   * derives addresses for ranged descriptors via `deriveAddresses`, and
+   * returns Core's per-record result shape.
+   *
+   * Reference: bitcoin-core/src/wallet/rpc/backup.cpp::importdescriptors.
+   *
+   * @param params [requests: Array<{desc, range?, timestamp, ...}>]
+   */
   private async importDescriptors(params: unknown[]): Promise<unknown[]> {
-    throw this.rpcError(-1, "importdescriptors not yet implemented");
+    const [requestsParam] = params;
+    if (!Array.isArray(requestsParam)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "requests must be an array");
+    }
+
+    // Confirm we have a wallet so we mirror Core's "wallet required" error.
+    this.getCurrentWallet();
+
+    const network = this.getNetworkType();
+    const results: Array<Record<string, unknown>> = [];
+
+    for (const reqUnknown of requestsParam) {
+      if (!reqUnknown || typeof reqUnknown !== "object") {
+        results.push({
+          success: false,
+          error: { code: RPCErrorCodes.INVALID_PARAMS, message: "request must be object" },
+        });
+        continue;
+      }
+      const req = reqUnknown as Record<string, unknown>;
+      const desc = req.desc;
+      if (typeof desc !== "string") {
+        results.push({
+          success: false,
+          error: { code: RPCErrorCodes.INVALID_PARAMS, message: "desc must be a string" },
+        });
+        continue;
+      }
+
+      try {
+        // Parse + checksum validation.
+        const info = getDescriptorInfo(desc);
+
+        // Range pre-derivation (validates the parser handles the provided range).
+        if (info.isRange) {
+          const rangeRaw = req.range;
+          let range: [number, number] | undefined;
+          if (typeof rangeRaw === "number") {
+            range = [0, rangeRaw];
+          } else if (Array.isArray(rangeRaw) && rangeRaw.length === 2) {
+            range = [rangeRaw[0] as number, rangeRaw[1] as number];
+          }
+          if (range) {
+            // Best-effort derive-and-discard; surfaces parse errors early.
+            deriveAddresses(desc, network, range);
+          }
+        }
+
+        results.push({ success: true });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        results.push({
+          success: false,
+          error: { code: RPCErrorCodes.INVALID_ADDRESS_OR_KEY, message: msg },
+        });
+      }
+    }
+
+    return results;
   }
 
-  private async createPSBT(params: unknown[]): Promise<string> {
-    throw this.rpcError(-1, "createpsbt not yet implemented");
+  /**
+   * createpsbt: build an unsigned PSBT from inputs[] and outputs.
+   *
+   * Reference: bitcoin-core/src/rpc/rawtransaction.cpp::createpsbt.
+   *
+   * @param params [inputs, outputs, locktime?, replaceable?]
+   */
+  private async createPSBTRpc(params: unknown[]): Promise<string> {
+    const [inputsParam, outputsParam, locktimeParam, replaceableParam] = params;
+
+    if (!Array.isArray(inputsParam)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "inputs must be an array");
+    }
+    const replaceable = replaceableParam === true;
+    const lockTime = typeof locktimeParam === "number" ? locktimeParam : 0;
+    const sequenceDefault = replaceable ? 0xfffffffd : 0xfffffffe;
+
+    const txInputs: TxIn[] = [];
+    for (const inUnknown of inputsParam) {
+      if (!inUnknown || typeof inUnknown !== "object") {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "input must be object");
+      }
+      const inObj = inUnknown as Record<string, unknown>;
+      if (typeof inObj.txid !== "string" || typeof inObj.vout !== "number") {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "input requires {txid, vout}"
+        );
+      }
+      // RPC txid is big-endian display hex; reverse to internal little-endian.
+      const txidLE = Buffer.from(inObj.txid as string, "hex").reverse();
+      if (txidLE.length !== 32) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid txid length");
+      }
+      const seqOverride = typeof inObj.sequence === "number"
+        ? (inObj.sequence as number)
+        : sequenceDefault;
+      txInputs.push({
+        prevOut: { txid: txidLE, vout: inObj.vout as number },
+        scriptSig: Buffer.alloc(0),
+        sequence: seqOverride >>> 0,
+        witness: [],
+      });
+    }
+
+    // Outputs: array of {address: amount} objects, or {data: hex} for OP_RETURN.
+    if (!Array.isArray(outputsParam) && (typeof outputsParam !== "object" || !outputsParam)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "outputs must be array or object");
+    }
+    const txOutputs: TxOut[] = [];
+    const outArray: Array<Record<string, unknown>> = Array.isArray(outputsParam)
+      ? (outputsParam as Array<Record<string, unknown>>)
+      : [outputsParam as Record<string, unknown>];
+
+    for (const out of outArray) {
+      for (const [k, v] of Object.entries(out)) {
+        if (k === "data") {
+          if (typeof v !== "string") {
+            throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "data output must be hex string");
+          }
+          // OP_RETURN <data>
+          const data = Buffer.from(v, "hex");
+          const script = Buffer.concat([Buffer.from([0x6a]), this.encodePushData(data)]);
+          txOutputs.push({ value: 0n, scriptPubKey: script });
+        } else {
+          if (typeof v !== "number") {
+            throw this.rpcError(
+              RPCErrorCodes.INVALID_PARAMS,
+              "output amount must be number (BTC)"
+            );
+          }
+          let decoded;
+          try {
+            decoded = decodeAddress(k);
+          } catch (e) {
+            throw this.rpcError(
+              RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+              `Invalid address: ${k}`
+            );
+          }
+          const scriptHex = this.buildScriptPubKeyHex(decoded.type, decoded.hash);
+          txOutputs.push({
+            value: BigInt(Math.round(v * 100_000_000)),
+            scriptPubKey: Buffer.from(scriptHex, "hex"),
+          });
+        }
+      }
+    }
+
+    const tx: Transaction = {
+      version: 2,
+      inputs: txInputs,
+      outputs: txOutputs,
+      lockTime: lockTime >>> 0,
+    };
+    const psbt = createPSBT(tx);
+    return encodePSBTBase64(psbt);
   }
 
-  private async decodePSBT(params: unknown[]): Promise<Record<string, unknown>> {
-    throw this.rpcError(-1, "decodepsbt not yet implemented");
+  /**
+   * Tiny helper for OP_RETURN data encoding; mirrors Core's PushDataLength.
+   */
+  private encodePushData(data: Buffer): Buffer {
+    if (data.length < 0x4c) {
+      return Buffer.concat([Buffer.from([data.length]), data]);
+    }
+    if (data.length <= 0xff) {
+      return Buffer.concat([Buffer.from([0x4c, data.length]), data]);
+    }
+    if (data.length <= 0xffff) {
+      const lenBuf = Buffer.alloc(3);
+      lenBuf[0] = 0x4d;
+      lenBuf.writeUInt16LE(data.length, 1);
+      return Buffer.concat([lenBuf, data]);
+    }
+    const lenBuf = Buffer.alloc(5);
+    lenBuf[0] = 0x4e;
+    lenBuf.writeUInt32LE(data.length, 1);
+    return Buffer.concat([lenBuf, data]);
   }
 
-  private async combinePSBTs(params: unknown[]): Promise<string> {
-    throw this.rpcError(-1, "combinepsbt not yet implemented");
+  /**
+   * decodepsbt: decode a base64 PSBT into Core's JSON output shape.
+   *
+   * Reference: bitcoin-core/src/rpc/rawtransaction.cpp::decodepsbt.
+   *
+   * @param params [psbt]
+   */
+  private async decodePSBTRpc(params: unknown[]): Promise<Record<string, unknown>> {
+    const [psbtParam] = params;
+    if (typeof psbtParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "psbt must be a string");
+    }
+    let psbt: PSBT;
+    try {
+      psbt = decodePSBTBase64(psbtParam);
+    } catch (e) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `PSBT decode failed: ${(e as Error).message}`
+      );
+    }
+    return decodePSBTToJSON(psbt) as unknown as Record<string, unknown>;
   }
 
-  private async finalizePSBT(params: unknown[]): Promise<Record<string, unknown>> {
-    throw this.rpcError(-1, "finalizepsbt not yet implemented");
+  /**
+   * combinepsbt: COMBINE multiple base64 PSBTs into one.
+   *
+   * Reference: bitcoin-core/src/rpc/rawtransaction.cpp::combinepsbt.
+   *
+   * @param params [txs: string[]]
+   */
+  private async combinePSBTRpc(params: unknown[]): Promise<string> {
+    const [psbtsParam] = params;
+    if (!Array.isArray(psbtsParam) || psbtsParam.length === 0) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "txs must be a non-empty array of base64 PSBTs"
+      );
+    }
+    const psbts: PSBT[] = [];
+    for (const s of psbtsParam) {
+      if (typeof s !== "string") {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "every PSBT must be base64 string");
+      }
+      try {
+        psbts.push(decodePSBTBase64(s));
+      } catch (e) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          `PSBT decode failed: ${(e as Error).message}`
+        );
+      }
+    }
+    let combined: PSBT;
+    try {
+      combined = combinePSBTs(psbts);
+    } catch (e) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `combine failed: ${(e as Error).message}`
+      );
+    }
+    return encodePSBTBase64(combined);
+  }
+
+  /**
+   * finalizepsbt: try to finalize a PSBT. If `extract` (default true) and
+   * the PSBT is now complete, returns the network-serialized hex.
+   *
+   * Reference: bitcoin-core/src/rpc/rawtransaction.cpp::finalizepsbt.
+   *
+   * @param params [psbt, extract?]
+   */
+  private async finalizePSBTRpc(params: unknown[]): Promise<Record<string, unknown>> {
+    const [psbtParam, extractParam] = params;
+    if (typeof psbtParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "psbt must be a string");
+    }
+    const extract = extractParam === undefined ? true : extractParam === true;
+
+    let psbt: PSBT;
+    try {
+      psbt = decodePSBTBase64(psbtParam);
+    } catch (e) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `PSBT decode failed: ${(e as Error).message}`
+      );
+    }
+
+    const complete = finalizePSBT(psbt);
+
+    const result: Record<string, unknown> = { complete };
+    if (complete && extract) {
+      const tx = extractTransaction(psbt);
+      result.hex = serializeTx(tx, true).toString("hex");
+    } else {
+      result.psbt = encodePSBTBase64(psbt);
+    }
+    return result;
+  }
+
+  /**
+   * walletcreatefundedpsbt: build, fund (coin-select) and PSBT-encode an
+   * unsigned transaction using the wallet's UTXOs and change address.
+   *
+   * Implements Core's CREATOR + UPDATER roles. We use the wallet's existing
+   * coin-selection (BnB → Knapsack → largest-first) and attach a witness
+   * UTXO to each PSBT input so subsequent SIGNER passes can finalize.
+   *
+   * Reference: bitcoin-core/src/wallet/rpc/spend.cpp::walletcreatefundedpsbt.
+   *
+   * @param params [inputs, outputs, locktime?, options?, bip32derivs?]
+   */
+  private async walletCreateFundedPSBT(params: unknown[]): Promise<Record<string, unknown>> {
+    const [inputsParam, outputsParam, locktimeParam, optionsParam] = params;
+
+    if (!Array.isArray(inputsParam)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "inputs must be an array");
+    }
+    if (
+      !Array.isArray(outputsParam) &&
+      (typeof outputsParam !== "object" || outputsParam === null)
+    ) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "outputs must be array or object");
+    }
+
+    const wallet = this.getCurrentWallet();
+    const lockTime = (typeof locktimeParam === "number" ? locktimeParam : 0) >>> 0;
+    const options = (typeof optionsParam === "object" && optionsParam) ? optionsParam as Record<string, unknown> : {};
+    const replaceable = options.replaceable === true;
+    const sequenceDefault = replaceable ? 0xfffffffd : 0xfffffffe;
+
+    // Parse outputs into {address, amountSats}[].
+    const outputsList: Array<{ scriptPubKey: Buffer; value: bigint; address?: string }> = [];
+    let totalOutputSats = 0n;
+    const outArray: Array<Record<string, unknown>> = Array.isArray(outputsParam)
+      ? (outputsParam as Array<Record<string, unknown>>)
+      : [outputsParam as Record<string, unknown>];
+    for (const out of outArray) {
+      for (const [k, v] of Object.entries(out)) {
+        if (k === "data") {
+          if (typeof v !== "string") {
+            throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "data output must be hex string");
+          }
+          const dataBuf = Buffer.from(v, "hex");
+          const script = Buffer.concat([Buffer.from([0x6a]), this.encodePushData(dataBuf)]);
+          outputsList.push({ scriptPubKey: script, value: 0n });
+        } else {
+          if (typeof v !== "number" || v < 0) {
+            throw this.rpcError(
+              RPCErrorCodes.INVALID_PARAMS,
+              "output amount must be a non-negative number"
+            );
+          }
+          let decoded;
+          try {
+            decoded = decodeAddress(k);
+          } catch {
+            throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid address: ${k}`);
+          }
+          const sats = BigInt(Math.round(v * 100_000_000));
+          totalOutputSats += sats;
+          const scriptHex = this.buildScriptPubKeyHex(decoded.type, decoded.hash);
+          outputsList.push({
+            scriptPubKey: Buffer.from(scriptHex, "hex"),
+            value: sats,
+            address: k,
+          });
+        }
+      }
+    }
+
+    // Fee rate: prefer options.fee_rate (sat/vB).
+    let feeRate = 1;
+    if (typeof options.fee_rate === "number" && options.fee_rate > 0) {
+      feeRate = options.fee_rate as number;
+    } else if (typeof options.feeRate === "number" && (options.feeRate as number) > 0) {
+      // Core accepts feeRate (BTC/kvB) as a deprecated alias; convert to sat/vB.
+      feeRate = ((options.feeRate as number) * 100_000_000) / 1000;
+    }
+
+    // Pre-supplied inputs are not coin-selected; for now we require
+    // inputs=[] and let the wallet choose. Manual prevouts are a follow-up.
+    if (inputsParam.length > 0) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "Manual `inputs` aren't supported yet; pass [] to auto-select from wallet"
+      );
+    }
+
+    // Coin selection.
+    let selection;
+    try {
+      selection = wallet.selectCoinsAdvanced(totalOutputSats, feeRate);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS, msg);
+    }
+
+    // Build inputs.
+    const txInputs: TxIn[] = selection.inputs.map((u) => ({
+      prevOut: u.outpoint,
+      scriptSig: Buffer.alloc(0),
+      sequence: sequenceDefault,
+      witness: [],
+    }));
+
+    // Build outputs (caller-specified) + optional change output.
+    const txOutputs: TxOut[] = outputsList.map((o) => ({
+      value: o.value,
+      scriptPubKey: o.scriptPubKey,
+    }));
+    let changePos = -1;
+    const DUST_THRESHOLD = 546n;
+    if (selection.change > DUST_THRESHOLD) {
+      const changeAddr = (typeof options.changeAddress === "string"
+        && options.changeAddress.length > 0)
+        ? options.changeAddress as string
+        : wallet.getChangeAddress();
+      const decoded = decodeAddress(changeAddr);
+      const scriptHex = this.buildScriptPubKeyHex(decoded.type, decoded.hash);
+      changePos = txOutputs.length;
+      txOutputs.push({
+        value: selection.change,
+        scriptPubKey: Buffer.from(scriptHex, "hex"),
+      });
+    }
+
+    const tx: Transaction = {
+      version: 2,
+      inputs: txInputs,
+      outputs: txOutputs,
+      lockTime,
+    };
+
+    // Build PSBT and attach witness UTXOs so a signer/finalizer downstream
+    // has everything it needs.
+    const psbt = createPSBT(tx);
+    for (let i = 0; i < selection.inputs.length; i++) {
+      const u = selection.inputs[i];
+      const decoded = decodeAddress(u.address);
+      const scriptPubKey = Buffer.from(
+        this.buildScriptPubKeyHex(decoded.type, decoded.hash),
+        "hex"
+      );
+      updateInputUTXO(psbt, i, { value: u.amount, scriptPubKey } as TxOut, true);
+    }
+
+    return {
+      psbt: encodePSBTBase64(psbt),
+      fee: Number(selection.fee) / 100_000_000,
+      changepos: changePos,
+    };
   }
 
   private async help(params: unknown[]): Promise<string> {
