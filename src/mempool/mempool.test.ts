@@ -288,6 +288,135 @@ describe("Mempool", () => {
       expect(mempool.hasTransaction(getTxId(tx1))).toBe(false);
       expect(mempool.hasTransaction(getTxId(tx2))).toBe(true);
     });
+
+    // BIP-125 Rule 2: replacement may only spend confirmed inputs or
+    // inputs that were already in the in-mempool ancestor set of the
+    // tx being replaced. Adding a *new* unconfirmed input must reject.
+    // Reference: bitcoin-core/src/policy/rbf.cpp::HasNoNewUnconfirmed
+    // (pre-removal era).
+    test("BIP-125 Rule 2: replacement spending only old-mempool/confirmed inputs accepts", async () => {
+      // Two confirmed UTXOs: A (used by original) and B (also confirmed,
+      // used by replacement). Replacement spends both — both are confirmed
+      // so Rule 2 must allow.
+      const utxoA = Buffer.alloc(32, 0x91);
+      const utxoB = Buffer.alloc(32, 0x92);
+      await setupUTXO(utxoA, 0, 10_000n);
+      await setupUTXO(utxoB, 0, 10_000n);
+
+      // Original conflicts with utxoA only.
+      const original = createTestTx(
+        [{ txid: utxoA, vout: 0 }],
+        [{ value: 9_000n }] // 1000 sat fee
+      );
+      await mempool.addTransaction(original);
+
+      // Replacement double-spends utxoA (the conflict) + adds utxoB (confirmed).
+      // utxoB is confirmed → Rule 2 allows it.
+      const replacement = createTestTx(
+        [
+          { txid: utxoA, vout: 0 },
+          { txid: utxoB, vout: 0 },
+        ],
+        [{ value: 17_000n }] // 3000 sat fee, well above replaced
+      );
+
+      const result = await mempool.addTransaction(replacement);
+      expect(result.accepted).toBe(true);
+      expect(mempool.hasTransaction(getTxId(original))).toBe(false);
+      expect(mempool.hasTransaction(getTxId(replacement))).toBe(true);
+    });
+
+    test("BIP-125 Rule 2: replacement adding a new unconfirmed input rejects", async () => {
+      // Setup: confirmed UTXO A (parent of `original`), and unrelated
+      // confirmed UTXO C — we'll use C to fund an *unrelated* mempool tx
+      // that the replacement then tries to additionally spend. That tx
+      // is NOT an ancestor of `original`, so spending its output is a
+      // new unconfirmed input → Rule 2 must reject.
+      const utxoA = Buffer.alloc(32, 0x93);
+      const utxoC = Buffer.alloc(32, 0x94);
+      await setupUTXO(utxoA, 0, 10_000n);
+      await setupUTXO(utxoC, 0, 10_000n);
+
+      // Unrelated mempool tx (funded by C) — its output becomes a *new*
+      // unconfirmed UTXO that has no relation to `original`'s ancestor set.
+      const unrelated = createTestTx(
+        [{ txid: utxoC, vout: 0 }],
+        [{ value: 9_000n }] // 1000 sat fee
+      );
+      const unrelatedRes = await mempool.addTransaction(unrelated);
+      expect(unrelatedRes.accepted).toBe(true);
+
+      // Original spends only confirmed utxoA. Its ancestor set is empty.
+      const original = createTestTx(
+        [{ txid: utxoA, vout: 0 }],
+        [{ value: 9_000n }] // 1000 sat fee
+      );
+      const origRes = await mempool.addTransaction(original);
+      expect(origRes.accepted).toBe(true);
+
+      // Replacement: double-spends utxoA AND tries to additionally spend
+      // unrelated's mempool output — that's a new unconfirmed input not
+      // in `original`'s ancestor chain.
+      const unrelatedTxid = getTxId(unrelated);
+      const replacement = createTestTx(
+        [
+          { txid: utxoA, vout: 0 },
+          { txid: unrelatedTxid, vout: 0 },
+        ],
+        [{ value: 16_000n }] // plenty of fee — should still reject on Rule 2
+      );
+
+      const result = await mempool.addTransaction(replacement);
+      expect(result.accepted).toBe(false);
+      expect(result.error).toContain("Rule 2");
+      // Original must still be in mempool (replacement was rejected).
+      expect(mempool.hasTransaction(getTxId(original))).toBe(true);
+      expect(mempool.hasTransaction(getTxId(replacement))).toBe(false);
+    });
+
+    test("BIP-125 Rule 2: replacement spending an in-mempool ancestor of the conflict accepts", async () => {
+      // Setup: confirmed UTXO funds parent → child. Replacement
+      // double-spends child's input (= parent's output) AND additionally
+      // spends a *different* output of parent. Parent is an in-mempool
+      // ancestor of child, so Rule 2 allows the second input.
+      const utxoX = Buffer.alloc(32, 0x95);
+      await setupUTXO(utxoX, 0, 20_000n);
+
+      // Parent has two outputs.
+      const parent = createTestTx(
+        [{ txid: utxoX, vout: 0 }],
+        [
+          { value: 9_500n },
+          { value: 9_500n },
+        ] // 1000 sat fee total
+      );
+      await mempool.addTransaction(parent);
+      const parentTxid = getTxId(parent);
+
+      // Child (= the "original" in the RBF) spends parent's vout 0.
+      const child = createTestTx(
+        [{ txid: parentTxid, vout: 0 }],
+        [{ value: 8_500n }] // 1000 sat fee
+      );
+      await mempool.addTransaction(child);
+
+      // Replacement: double-spends parent's vout 0 (the conflict input)
+      // AND additionally spends parent's vout 1. Parent IS an ancestor
+      // of child (the replaced tx), so vout 1 is a known unconfirmed
+      // input — Rule 2 allows it.
+      const replacement = createTestTx(
+        [
+          { txid: parentTxid, vout: 0 },
+          { txid: parentTxid, vout: 1 },
+        ],
+        [{ value: 16_000n }] // 3000 sat fee — clears Rule 3 + Rule 4
+      );
+
+      const result = await mempool.addTransaction(replacement);
+      expect(result.accepted).toBe(true);
+      expect(mempool.hasTransaction(getTxId(child))).toBe(false);
+      expect(mempool.hasTransaction(getTxId(replacement))).toBe(true);
+    });
   });
 
   describe("chained transactions", () => {
