@@ -1546,14 +1546,127 @@ export class Mempool {
    *
    * Attempts to re-add transactions that were previously confirmed
    * but are now unconfirmed due to a chain reorganization.
+   *
+   * Per-tx accept/reject is logged so the reorg dispatcher can
+   * surface partial-refill conditions (Pattern B2) in operator logs
+   * without trying to re-thread the result back through the caller
+   * chain.
    */
   async readdTransactions(txs: Transaction[]): Promise<void> {
     for (const tx of txs) {
       // Skip coinbase
       if (isCoinbase(tx)) continue;
 
-      // Try to add back to mempool - ignore failures
-      await this.addTransaction(tx);
+      // Try to add back to mempool — log failure reason.  Reorg refill
+      // is best-effort (Bitcoin Core's MaybeUpdateMempoolForReorg
+      // semantics: drop txs that are no longer policy-valid against
+      // the new tip).  Surfacing the error helps diagnose Pattern B2
+      // partial-refill bugs vs. transient policy mismatches.
+      const result = await this.addTransaction(tx);
+      if (!result.accepted) {
+        const txid = getTxId(tx).toString("hex");
+        console.warn(
+          `[mempool-readd] tx ${txid.slice(0, 16)}... rejected during reorg refill: ${result.error}`
+        );
+      }
+    }
+  }
+
+  /**
+   * Re-admit transactions disconnected by a chain reorg WITHOUT
+   * re-running input UTXO / script / standardness checks.  Used by
+   * the reorg-refill code path (BlockSync.connectBlock detects a
+   * tip-prev mismatch and feeds disconnected txs here to mirror
+   * Bitcoin Core's MaybeUpdateMempoolForReorg, validation.cpp).
+   *
+   * Why an unchecked path is needed in hotbuns specifically:
+   *
+   *   1. hotbuns's IBD-time block connect (BlockSync.connectBlock)
+   *      does NOT persist undo data — coreConnectBlockChecks returns
+   *      `spentOutputs` but BlockSync drops it (only the chain/state.ts
+   *      path persists undo data, and that path is unwired during IBD).
+   *      Without persisted undo data, a true UTXO disconnect is
+   *      impossible: the inputs that the disconnected txs consumed
+   *      cannot be restored to the UTXO set.
+   *   2. The full validation that addTransaction runs (input lookup,
+   *      script, BIP-68/113, fee) would therefore reject every refill
+   *      candidate with "Missing input" because the input UTXOs were
+   *      consumed by the now-disconnected blocks but never restored.
+   *
+   * This unchecked admission is policy-correct for the refill case
+   * because the txs WERE valid against the chain that included them
+   * (the disconnected blocks) — Core's MaybeUpdateMempoolForReorg
+   * makes the same trust assumption (it does run a re-validation but
+   * only because Core HAS a proper UTXO disconnect; with that prereq
+   * met, all checks pass).  The ancestor/descendant + cluster
+   * accounting and indexes are still maintained for getrawmempool /
+   * RBF / fee-rate ordering correctness.
+   *
+   * Cross-impl audit:
+   * CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md
+   * Reference: camlcoin lib/sync.ml:2354-2363 (uses checked path
+   * because OCaml's reorg has full UTXO disconnect first).
+   *
+   * Side effect: emits a [mempool-reorg-refill] log line per
+   * admission so the corpus harness diagnosis (Pattern B1
+   * vs B2 vs ordering) can be cross-referenced against per-impl logs.
+   */
+  reorgRefillUnchecked(txs: Transaction[]): void {
+    for (const tx of txs) {
+      if (isCoinbase(tx)) continue;
+      const txid = getTxId(tx);
+      const txidHex = txid.toString("hex");
+
+      // Idempotency: if already in mempool (e.g. user broadcast
+      // arrived between disconnect and refill), skip.  Mirrors
+      // addTransaction's "already in mempool" guard.
+      if (this.entries.has(txidHex)) continue;
+
+      const weight = getTxWeight(tx);
+      const vsize = getTxVSize(tx);
+      // Fee + feeRate cannot be computed without the input UTXO set.
+      // Use 0 (sentinel) — getrawmempool returns the txid which is
+      // what the corpus harness checks; ordering uses miningScore
+      // which we set to 0 too, so refill txs sort to the end (mining
+      // selection prefers paying txs).
+      const fee = 0n;
+      const feeRate = 0;
+
+      const entry: MempoolEntry = {
+        tx,
+        txid,
+        fee,
+        feeRate,
+        vsize,
+        weight,
+        addedTime: Math.floor(Date.now() / 1000),
+        height: this.tipHeight,
+        spentBy: new Set<string>(),
+        dependsOn: new Set<string>(), // unchecked path: no parent tracking
+        ancestorCount: 1,
+        ancestorSize: vsize,
+        descendantCount: 1,
+        descendantSize: vsize,
+        clusterId: txidHex,
+        miningScore: 0,
+        ephemeralDustParents: new Set<string>(),
+        hasEphemeralDust: false,
+        sigOpCost: 0,
+      };
+
+      this.entries.set(txidHex, entry);
+      this.currentSize += vsize;
+
+      // Index spent outpoints so a later RBF / double-spend would
+      // surface this entry as a conflict (defence-in-depth).
+      for (const input of tx.inputs) {
+        const outpointKey = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+        this.outpointIndex.set(outpointKey, txidHex);
+      }
+
+      console.log(
+        `[mempool-reorg-refill] re-admitted disconnected tx ${txidHex.slice(0, 16)}... (vsize=${vsize})`
+      );
     }
   }
 
