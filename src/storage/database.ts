@@ -463,6 +463,54 @@ export class ChainDB {
     };
   }
 
+  /**
+   * Build a {@link BatchOperation} that writes a txindex entry pointing at
+   * the block that contains `txid`.
+   *
+   * Pairs with {@link buildTxIndexDeleteOp} so the connect-side write of a
+   * reorg-reconnected intermediate block can ride the same atomic batch as
+   * the disconnect-side deletes and the UTXO + chain-state writes.  The
+   * on-disk format is `blockHash(32) || offset(uint32 LE) || length(uint32 LE)`
+   * and matches {@link putTxIndex}.  Pattern D (multi-block) — pairs with
+   * the single-block Pattern D `9b10550`.
+   */
+  buildTxIndexPutOp(
+    txid: Buffer,
+    blockHash: Buffer,
+    offset: number = 0,
+    length: number = 0,
+  ): BatchOperation {
+    const value = Buffer.alloc(40);
+    blockHash.copy(value, 0);
+    value.writeUInt32LE(offset >>> 0, 32);
+    value.writeUInt32LE(length >>> 0, 36);
+    return {
+      type: 'put',
+      prefix: DBPrefix.TX_INDEX,
+      key: txid,
+      value,
+    };
+  }
+
+  /**
+   * Build a {@link BatchOperation} that puts undo data for a connected block.
+   *
+   * Used by the multi-block reorg dispatch (sync/blocks.ts) so the undo
+   * persistence for every reconnected intermediate block rides inside the
+   * same atomic batch as the txindex + UTXO + chain-state writes.  Without
+   * this, undo persistence for intermediates was a standalone `db.put`,
+   * leaving a multi-block reorg with N+1 separate commits.  Pattern D
+   * (multi-block).
+   */
+  buildUndoDataPutOp(blockHash: Buffer, data: Buffer): BatchOperation {
+    return {
+      type: 'put',
+      prefix: DBPrefix.UNDO,
+      key: blockHash,
+      value: data,
+    };
+  }
+
   async getChainState(): Promise<ChainState | null> {
     const key = makeKey(DBPrefix.CHAIN_STATE, Buffer.alloc(0));
     const value = await this.db.get(key);
