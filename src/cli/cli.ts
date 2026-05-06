@@ -7,6 +7,7 @@
 import * as os from "os";
 import * as path from "path";
 import * as fs from "fs";
+import { EventEmitter } from "events";
 
 import { ChainDB, BlockStatus, DBPrefix } from "../storage/database.js";
 import { BufferWriter } from "../wire/serialization.js";
@@ -14,6 +15,7 @@ import { ChainStateManager } from "../chain/state.js";
 import { ChainstateManager } from "../chain/snapshot.js";
 import { UTXOManager } from "../chain/utxo.js";
 import { Mempool } from "../mempool/mempool.js";
+import { OrphanPool } from "../mempool/orphan_pool.js";
 import { dumpMempool, loadMempool } from "../mempool/persist.js";
 import { FeeEstimator } from "../fees/estimator.js";
 import { PeerManager } from "../p2p/manager.js";
@@ -1218,12 +1220,86 @@ async function startNode(config: NodeConfig): Promise<void> {
     peer.send({ type: "inv", payload: { inventory } });
   });
 
+  // 7b-bis. Orphan-tx pool: hold txs whose inputs reference parents we have
+  // not yet seen, so they can be re-evaluated on parent arrival rather than
+  // silently dropped. Mirrors Bitcoin Core's `TxOrphanage`
+  // (src/node/txorphanage.{h,cpp}); see also today's nimrod wiring at
+  // 00656ba and the cross-impl DoS audit at
+  // CORE-PARITY-AUDIT/_dos-misbehavior-cross-impl-audit-2026-05-06.md.
+  // Closes the Pattern-A "module shipped, not wired" footnote from the
+  // hotbuns DoS wave (commit 63b060c).
+  const orphanPool = new OrphanPool();
+  // Bound on cascade-promote depth when a parent's arrival promotes
+  // children that themselves promote grandchildren. Mirrors Core's
+  // `MAX_ORPHAN_RESOLUTIONS_PER_TX` worklist guard — large enough to
+  // resolve real chains, small enough to bound work on adversarial input.
+  const ORPHAN_PROMOTE_MAX_ITER = 64;
+
+  // Stable per-peer key. Matches the `host:port` shape used by
+  // PeerManager.handlePeerDisconnect so eraseForPeer correlates correctly
+  // across the connect/disconnect lifecycle.
+  function peerKey(peer: import("../p2p/peer.js").Peer): string {
+    return `${peer.host}:${peer.port}`;
+  }
+
+  // Mempool returns a string error when admission fails. The "missing input"
+  // path is the only one the orphan pool should hold; everything else
+  // (script fail, fee too low, double-spend) is a definitive reject and
+  // would be a DoS hole if held.
+  function isMissingInputError(err: string | undefined): boolean {
+    return typeof err === "string" && err.startsWith("Missing input:");
+  }
+
+  // Block-connected hook: drop orphans that just got mined (Core's
+  // `EraseForBlock`). chainState already emits `blockConnected` whenever a
+  // notification emitter is wired; we plumb a single shared emitter here so
+  // mempool ZMQ-style txAccepted/txRemoved events and orphan housekeeping
+  // share the same notification bus.
+  const chainEvents = new EventEmitter();
+  chainState.setNotificationEmitter(chainEvents);
+  mempool.setNotificationEmitter(chainEvents);
+  chainEvents.on("blockConnected", (block: import("../validation/block.js").Block) => {
+    try {
+      const confirmedTxids = block.transactions.map((tx) => getTxId(tx));
+      const removed = orphanPool.eraseForBlock(confirmedTxids);
+      if (removed > 0) {
+        console.log(`[orphan-pool] erased ${removed} orphans confirmed in block`);
+      }
+      // Some confirmed txs may have been parents to orphans still in the
+      // pool. Cascade-promote so their children can re-attempt admission
+      // now that the chain has caught up.
+      void Promise.all(block.transactions.map((tx) => processOrphanCascade(tx))).catch(
+        (err) =>
+          console.warn(
+            `[orphan-pool] cascade error on block-connect: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          )
+      );
+    } catch (err) {
+      console.warn(
+        `[orphan-pool] eraseForBlock failure: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  });
+
   // Register all connected peers for relay
   peerManager.onMessage("__connect__", (peer) => {
     txRelay.addPeer(peer, true);
   });
   peerManager.onMessage("__disconnect__", (peer) => {
     txRelay.removePeer(peer);
+    // Drop any orphans this peer announced — Core's TxOrphanage::EraseForPeer.
+    // Cheap (peer-keyed scan over <=100 entries); avoids a misbehaving peer's
+    // orphans lingering after disconnect and consuming cap slots.
+    const dropped = orphanPool.eraseForPeer(peerKey(peer));
+    if (dropped > 0) {
+      console.log(
+        `[orphan-pool] erased ${dropped} orphans on disconnect of ${peerKey(peer)}`
+      );
+    }
   });
 
   // Handle incoming tx messages: validate via AcceptToMemoryPool and relay
@@ -1239,14 +1315,68 @@ async function startNode(config: NodeConfig): Promise<void> {
     const tx = msg.payload.tx;
     const result = await mempool.acceptToMemoryPool(tx);
     if (result.accepted) {
+      // Successful admission. Relay to peers and cascade-promote any orphans
+      // that were waiting on this tx as a parent.
       const txid = getTxId(tx);
       const txidHex = txid.toString("hex");
       const entry = mempool.getTransaction(txid);
       const feeRate = entry ? entry.feeRate : 0;
       txRelay.queueTxToAllFiltered(txidHex, feeRate);
       console.log(`[mempool] Accepted tx ${txidHex.slice(0, 16)}... from ${peer.host}`);
+      await processOrphanCascade(tx);
+    } else if (isMissingInputError(result.error)) {
+      // Missing input — try the orphan pool. Core's net_processing.cpp
+      // routes TX_MISSING_INPUTS into AddTx() instead of marking the tx
+      // recently-rejected, so the real parent can still be requested
+      // (it will arrive via a peer's INV/HEADERS/getdata flow).
+      const admit = orphanPool.add(tx, peerKey(peer));
+      if (admit.ok) {
+        console.log(
+          `[orphan-pool] held ${admit.entry.txid.toString("hex").slice(0, 16)}... ` +
+            `from ${peer.host} (pool=${orphanPool.size()})`
+        );
+      }
+      // ok=false is a quiet drop — duplicate / oversize / peer-cap bounds.
     }
   });
+
+  /**
+   * Cascade-promote orphans whose parent just resolved (entered mempool or
+   * was confirmed in a connected block). Bounded worklist mirroring Core's
+   * `ProcessOrphanTx` retry loop — children promoted in one round can
+   * themselves resolve grandchildren, but the iteration cap protects us
+   * from adversarially-deep chains.
+   */
+  async function processOrphanCascade(parent: import("../validation/tx.js").Transaction): Promise<void> {
+    const worklist: import("../validation/tx.js").Transaction[] = [parent];
+    let iter = 0;
+    while (worklist.length > 0 && iter < ORPHAN_PROMOTE_MAX_ITER) {
+      iter++;
+      const next = worklist.shift()!;
+      const children = orphanPool.onParentAdmitted(next);
+      for (const child of children) {
+        const childResult = await mempool.acceptToMemoryPool(child.tx);
+        if (childResult.accepted) {
+          orphanPool.eraseTx(child.wtxid);
+          const childTxidHex = child.txid.toString("hex");
+          const childEntry = mempool.getTransaction(child.txid);
+          const childFeeRate = childEntry ? childEntry.feeRate : 0;
+          txRelay.queueTxToAllFiltered(childTxidHex, childFeeRate);
+          console.log(
+            `[orphan-pool] promoted ${childTxidHex.slice(0, 16)}... ` +
+              `(parent ${getTxId(next).toString("hex").slice(0, 16)}...)`
+          );
+          // This child may itself have children waiting on it; queue.
+          worklist.push(child.tx);
+        } else if (!isMissingInputError(childResult.error)) {
+          // Definitively-bad orphan (script fail, fee too low, etc.) — drop
+          // it so cap slots are freed. Still-missing-input means another
+          // ancestor is missing; leave it in the pool for the next parent.
+          orphanPool.eraseTx(child.wtxid);
+        }
+      }
+    }
+  }
 
   // BIP-35: respond to "mempool" with one or more "inv" messages enumerating
   // every txid in our mempool. Reference: bitcoin-core net_processing.cpp,
