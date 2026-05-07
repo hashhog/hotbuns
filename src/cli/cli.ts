@@ -1378,6 +1378,12 @@ async function startNode(config: NodeConfig): Promise<void> {
     filterIndex = new BlockFilterIndex(db, true);
     await filterIndex.init();
     blockSync.setBlockFilterIndex(filterIndex);
+    // BIP-157 Phase 2: wire the same filterIndex into ChainStateManager so
+    // the dumptxoutset rollback dance and generateblock reorg path also
+    // rewind the filter-header chain on disconnect (symmetric with
+    // BlockSync's connect-side append). Same instance, same DB — both
+    // write paths share state via the FILTER_TIP singleton.
+    chainState.setBlockFilterIndex(filterIndex);
     console.log("[blockfilterindex] BIP-157/158 basic filter index enabled");
   }
 

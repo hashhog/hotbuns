@@ -727,6 +727,128 @@ describe("BlockFilterIndex", () => {
 
     expect(filterIndex.getHeight()).toBe(1);
   });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // BIP-157 Phase 2: removeBlock (reorg-aware filter chain rollback)
+  //
+  // Reference: bitcoin-core/src/index/blockfilterindex.cpp::CustomRemove.
+  // The filter-header chain must rewind on disconnect so a subsequent
+  // reconnected block at the same height computes its filter header
+  // against the *active* prev-header, not the disconnected fork's.
+  // ──────────────────────────────────────────────────────────────────────
+
+  it("removeBlock rewinds the filter-index tip to height-1", async () => {
+    // Build a 2-block chain on top of zero genesis.
+    const cb1 = createCoinbaseTx(1);
+    const block1 = createBlock([cb1], Buffer.alloc(32, 0), 1);
+    const block1Hash = getBlockHash(block1.header);
+
+    const cb2 = createCoinbaseTx(2);
+    const block2 = createBlock([cb2], block1Hash, 2);
+
+    await filterIndex.indexBlock(block1, 1, []);
+    await filterIndex.indexBlock(block2, 2, []);
+    expect(filterIndex.getHeight()).toBe(2);
+
+    // Capture block1's stored filter header — this is what the
+    // in-memory `currentHeader` should rewind to after removing block2.
+    const block1FilterHeader = await filterIndex.getFilterHeader(block1Hash);
+    expect(block1FilterHeader).not.toBeNull();
+    expect(block1FilterHeader!.length).toBe(32);
+
+    // Disconnect block2 (the tip).
+    await filterIndex.removeBlock(block2, 2);
+
+    expect(filterIndex.getHeight()).toBe(1);
+
+    // Hash-keyed entries for the disconnected block stay queryable
+    // (Core symmetry: `getfilter <disconnected_hash>` still works,
+    // mirroring CopyHeightIndexToHashIndex on the height-keyed branch).
+    const block2FilterStillThere = await filterIndex.getFilter(
+      getBlockHash(block2.header)
+    );
+    expect(block2FilterStillThere).not.toBeNull();
+
+    // Idempotent: calling removeBlock again with the same block is a
+    // no-op (we already rewound past it).
+    await filterIndex.removeBlock(block2, 2);
+    expect(filterIndex.getHeight()).toBe(1);
+  });
+
+  it("removeBlock + indexBlock rewinds the filter-header chain across reorg", async () => {
+    // Simulate a 1-block reorg:
+    //   pre-reorg chain:  G -> A1 -> A2(old tip)
+    //   post-reorg chain: G -> A1 -> B2(new tip)
+    //
+    // The filter-header at the new tip B2 must be computed from
+    // block A1's filter header, NOT from A2's.  This is the
+    // load-bearing invariant that BIP-157 light clients verify.
+
+    const cbA1 = createCoinbaseTx(1);
+    const blockA1 = createBlock([cbA1], Buffer.alloc(32, 0), 1);
+    const blockA1Hash = getBlockHash(blockA1.header);
+
+    const cbA2 = createCoinbaseTx(2);
+    const blockA2 = createBlock([cbA2], blockA1Hash, 2);
+
+    // Different B2: distinct merkle root + nonce -> different block hash,
+    // different filter, different filter header against the same prev.
+    const cbB2 = createCoinbaseTx(0x42);
+    const blockB2 = createBlock([cbB2], blockA1Hash, 0x42);
+
+    // Build the pre-reorg chain.
+    await filterIndex.indexBlock(blockA1, 1, []);
+    const headerA1 = await filterIndex.getFilterHeader(blockA1Hash);
+    expect(headerA1).not.toBeNull();
+
+    await filterIndex.indexBlock(blockA2, 2, []);
+    const headerA2OldChain = await filterIndex.getFilterHeader(
+      getBlockHash(blockA2.header)
+    );
+    expect(headerA2OldChain).not.toBeNull();
+
+    // Independently compute what B2's filter header SHOULD be when
+    // computed from A1's filter header (the active chain's prev).
+    const expectedB2Filter = filterIndex.buildFilter(blockB2, []);
+    const expectedB2FilterHeader = computeFilterHeader(
+      expectedB2Filter.getHash(),
+      headerA1!
+    );
+
+    // Reorg: disconnect A2, then connect B2.  The intermediate
+    // currentHeader should rewind to A1's filter header so that
+    // indexBlock(B2, 2, ...) computes its filter header against the
+    // correct prev.
+    await filterIndex.removeBlock(blockA2, 2);
+    expect(filterIndex.getHeight()).toBe(1);
+
+    await filterIndex.indexBlock(blockB2, 2, []);
+    expect(filterIndex.getHeight()).toBe(2);
+
+    // The on-disk filter header for B2 must equal the value we'd get
+    // by chaining: hash(filter_hash(B2) || filter_header(A1)).  This
+    // is the BIP-157 chain-correctness invariant.
+    const headerB2 = await filterIndex.getFilterHeader(
+      getBlockHash(blockB2.header)
+    );
+    expect(headerB2).not.toBeNull();
+    expect(headerB2!.equals(expectedB2FilterHeader)).toBe(true);
+
+    // And it must NOT equal the old A2 filter header (different prev,
+    // different filter).
+    expect(headerB2!.equals(headerA2OldChain!)).toBe(false);
+  });
+
+  it("removeBlock is a no-op when the index is disabled", async () => {
+    const disabled = new BlockFilterIndex(mockDB as any);
+    const cb = createCoinbaseTx(1);
+    const block = createBlock([cb], Buffer.alloc(32, 0), 1);
+
+    // Should not throw, should not write anything.
+    await disabled.removeBlock(block, 1);
+
+    expect(disabled.getHeight()).toBe(-1);
+  });
 });
 
 // =============================================================================

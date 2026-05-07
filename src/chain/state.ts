@@ -189,6 +189,18 @@ export class ChainStateManager {
   private mempool: import("../mempool/mempool.js").Mempool | null = null;
   /** Header sync for coordinating header chain state. */
   private headerSync: import("../sync/headers.js").HeaderSync | null = null;
+  /** Optional BIP-157/158 compact-block-filter index. Wired via
+   *  `setBlockFilterIndex()` from cli.ts when `--blockfilterindex=1`.
+   *  When set, `disconnectBlock` calls `filterIndex.removeBlock(...)`
+   *  so the filter-header chain rewinds in lockstep with the chain
+   *  tip — symmetric with `BlockSync.connectBlock` which calls
+   *  `filterIndex.indexBlock(...)`. Mirrors Bitcoin Core's
+   *  `BlockFilterIndex::CustomRemove` (src/index/blockfilterindex.cpp).
+   *
+   *  Used by the dumptxoutset rollback dance (rpc/server.ts) and the
+   *  generateblock RPC reorg path. The IBD reorg path (BlockSync)
+   *  has its own copy of this reference. */
+  private filterIndex: import("../storage/indexes.js").BlockFilterIndex | null = null;
   /** Precious block for tie-breaking. null if no precious block set. */
   private preciousBlockHash: Buffer | null = null;
   /** Sequence ID for precious block tie-breaking. Lower = more precious. */
@@ -221,6 +233,23 @@ export class ChainStateManager {
    */
   setMempool(mempool: import("../mempool/mempool.js").Mempool): void {
     this.mempool = mempool;
+  }
+
+  /**
+   * Wire the BIP-157/158 compact-block-filter index so disconnect
+   * paths invoked through the chain-state manager (dumptxoutset
+   * rollback, generateblock reorg) keep the filter-header chain in
+   * sync with the chain tip.
+   *
+   * No-op when not wired (default off, matches Bitcoin Core's
+   * `DEFAULT_BLOCKFILTERINDEX = false`).
+   *
+   * Reference: bitcoin-core/src/index/blockfilterindex.cpp::CustomRemove.
+   */
+  setBlockFilterIndex(
+    filterIndex: import("../storage/indexes.js").BlockFilterIndex
+  ): void {
+    this.filterIndex = filterIndex;
   }
 
   /**
@@ -476,6 +505,33 @@ export class ChainStateManager {
       height: prevHeight,
       chainWork: prevChainWork,
     };
+
+    // ── BIP-157 Phase 2: filter-chain rewind on disconnect ──
+    //
+    // Symmetric with `BlockSync.connectBlock`, which advances the
+    // filter chain via `filterIndex.indexBlock(...)`. On disconnect,
+    // rewind the filter-header chain so the next reconnected block at
+    // height computes its filter header against the *previous* block's
+    // filter header (matching the new active chain), not against the
+    // disconnected block's filter header.
+    //
+    // Mirrors bitcoin-core/src/index/blockfilterindex.cpp::CustomRemove,
+    // which the BaseIndex worker invokes per `BlockDisconnected` notif.
+    // Best-effort: a filter-index hiccup must NOT roll back the chain
+    // disconnect — surface as a warning, mirroring Core's IndexFailure
+    // handling in BaseIndex.
+    if (this.filterIndex && this.filterIndex.isEnabled()) {
+      try {
+        await this.filterIndex.removeBlock(block, height);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[blockfilterindex] failed to remove block ${blockHash
+            .toString("hex")
+            .slice(0, 16)} at h=${height}: ${msg} (continuing)`
+        );
+      }
+    }
 
     // Clear signature cache on disconnect (verifications may no longer be valid)
     globalSigCache.clear();

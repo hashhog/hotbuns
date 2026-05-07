@@ -1737,6 +1737,39 @@ export class BlockSync {
       await this.deleteTxIndexForBlock(block, blockHash);
     }
 
+    // ── BIP-157 Phase 2: filter-chain rewind on disconnect ──
+    //
+    // Symmetric with the `filterIndex.indexBlock(...)` call in
+    // `connectBlock` (line ~2418): the filter-header chain must rewind
+    // to the previous block's filter header so that the subsequent
+    // intermediate reconnect (in `handleReorgUtxoAndCollect`) and final
+    // new-tip connect compute their filter headers against the active
+    // chain's prev-header, not the disconnected fork's.
+    //
+    // Mirrors bitcoin-core/src/index/blockfilterindex.cpp::CustomRemove
+    // — the BaseIndex worker's `BlockDisconnected` notification handler.
+    //
+    // Best-effort: a filter-build/storage failure must NOT roll back
+    // the disconnect.  Mirrors Core's IndexFailure handling in
+    // BaseIndex which logs + sets m_synced = false rather than killing
+    // the chain rewind.  Issued OUTSIDE `pendingOps` because the
+    // FILTER_TIP write is small (~36 bytes), idempotent on
+    // double-call (guarded by `currentHeight === height`), and the
+    // filter index uses its own DB prefix range so cannot conflict
+    // with the reorg batch.
+    if (this.filterIndex && this.filterIndex.isEnabled()) {
+      try {
+        await this.filterIndex.removeBlock(block, height);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[blockfilterindex] failed to remove block ${blockHash
+            .toString("hex")
+            .slice(0, 16)} at h=${height}: ${msg} (continuing)`
+        );
+      }
+    }
+
     return true;
   }
 
@@ -1993,6 +2026,36 @@ export class BlockSync {
         }
       } else {
         await this.writeTxIndexForBlock(intermBlock, intermediate.hash);
+      }
+      // ── BIP-157 Phase 2: extend filter chain on intermediate reconnect ──
+      //
+      // The new-tip block's filter is appended in `connectBlock` itself
+      // (line ~2418, after the reorg dispatch returns). Intermediates
+      // (B1, B2, … between fork and new tip) need their own appends here
+      // so the filter-header chain stays in lockstep with the chain.
+      // Without this, `currentHeader` after the reorg dispatch reflects
+      // the disconnected old-tip's prev rather than the latest connected
+      // intermediate, and the new-tip filter header would be computed
+      // against the wrong prev — chain divergence on every multi-block
+      // reorg.
+      //
+      // Best-effort: failures here log and continue, matching the
+      // connect-side gate in `BlockSync.connectBlock`.
+      if (this.filterIndex && this.filterIndex.isEnabled()) {
+        try {
+          await this.filterIndex.indexBlock(
+            intermBlock,
+            intermediate.height,
+            intermResult.spentOutputs
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(
+            `[blockfilterindex] failed to index intermediate block ${intermediate.hash
+              .toString("hex")
+              .slice(0, 16)} at h=${intermediate.height}: ${msg} (continuing)`
+          );
+        }
       }
       if (pendingOps && pendingOps.length > MAX_REORG_BATCH_OPS) {
         console.warn(
