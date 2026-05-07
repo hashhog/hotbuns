@@ -50,6 +50,7 @@ import {
 } from "../validation/tx.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import type { TxIndexManager, BlockFilterIndex } from "../storage/indexes.js";
+import { bigIntJsonReplacer } from "./server.js";
 
 /**
  * Supported REST response formats.
@@ -254,7 +255,10 @@ export class RESTServer {
   ): Response {
     switch (format) {
       case "json":
-        return new Response(JSON.stringify(data) + "\n", {
+        // `bigIntJsonReplacer` matches the JSON-RPC server's response path:
+        // any field that's still a `bigint` becomes a number (when it fits)
+        // or a decimal string, instead of crashing serialization.
+        return new Response(JSON.stringify(data, bigIntJsonReplacer) + "\n", {
           status: 200,
           headers: { "Content-Type": "application/json" },
         });

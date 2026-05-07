@@ -193,6 +193,36 @@ export const MAX_BATCH_SIZE = 1000;
  */
 export const DEFAULT_MAX_FEE_RATE = 0.1; // BTC/kvB
 
+/**
+ * `JSON.stringify` replacer that converts native `bigint` values to a
+ * JSON-serializable form. Without this, any RPC handler that returns a
+ * `bigint`-typed field (e.g. a forgotten `Number(x)` cast on satoshis,
+ * chainwork, fees, or witness counts) would crash the response path with
+ * "JSON.stringify cannot serialize BigInt".
+ *
+ * Conversion rule:
+ *   - `bigint` that fits in `[Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]`
+ *     → `number` (preserves Bitcoin Core's numeric shape for fields like
+ *      `vsize`, `weight`, plain integer counters).
+ *   - Otherwise → decimal string (matches how Core renders chainwork/work
+ *      stats and avoids silent precision loss for >2^53 values such as the
+ *      mainnet hashrate or accumulated chainwork).
+ *
+ * Use as the second argument to `JSON.stringify(value, bigIntJsonReplacer)`.
+ */
+export function bigIntJsonReplacer(_key: string, value: unknown): unknown {
+  if (typeof value === "bigint") {
+    if (
+      value <= BigInt(Number.MAX_SAFE_INTEGER) &&
+      value >= BigInt(Number.MIN_SAFE_INTEGER)
+    ) {
+      return Number(value);
+    }
+    return value.toString();
+  }
+  return value;
+}
+
 // ============================================================================
 // Wave-47b: Partial Merkle Tree helpers (mirrors Bitcoin Core merkleblock.cpp)
 // ============================================================================
@@ -558,11 +588,14 @@ export class RPCServer {
         );
       }
 
-      // Process all requests in the batch (order preserved)
+      // Process all requests in the batch (order preserved).
+      // `bigIntJsonReplacer` guards against handlers that forget to convert
+      // `bigint` fields (e.g. satoshi amounts, chainwork) — without it,
+      // `JSON.stringify` throws "cannot serialize BigInt" on the response.
       const responses = await Promise.all(
         body.map((request) => this.processRequest(request))
       );
-      return new Response(JSON.stringify(responses), {
+      return new Response(JSON.stringify(responses, bigIntJsonReplacer), {
         status: 200,
         headers: { "Content-Type": "application/json", "Connection": "close" },
       });
@@ -583,8 +616,11 @@ export class RPCServer {
       );
     }
 
+    // Single-request response. `bigIntJsonReplacer` is the safety net for
+    // handlers that return a `bigint`-typed field; without it `JSON.stringify`
+    // throws and the RPC client sees a connection drop / 500.
     const response = await this.processRequest(body);
-    return new Response(JSON.stringify(response), {
+    return new Response(JSON.stringify(response, bigIntJsonReplacer), {
       status: 200,
       headers: { "Content-Type": "application/json", "Connection": "close" },
     });
