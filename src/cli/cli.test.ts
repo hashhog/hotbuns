@@ -370,6 +370,8 @@ describe("formatRpcRequest", () => {
       dbcacheMB: 512,
       daemon: false,
       internalDaemonChild: false,
+      rest: false,
+      blockfilterindex: false,
     };
 
     const request = formatRpcRequest(config, "getblockchaininfo", []);
@@ -401,6 +403,8 @@ describe("formatRpcRequest", () => {
       dbcacheMB: 512,
       daemon: false,
       internalDaemonChild: false,
+      rest: false,
+      blockfilterindex: false,
     };
 
     const request = formatRpcRequest(config, "getblock", ["abc123", 1]);
@@ -426,6 +430,8 @@ describe("formatRpcRequest", () => {
       dbcacheMB: 512,
       daemon: false,
       internalDaemonChild: false,
+      rest: false,
+      blockfilterindex: false,
     };
 
     const request = formatRpcRequest(config, "test", []);
