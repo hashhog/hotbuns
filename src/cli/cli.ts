@@ -23,6 +23,8 @@ import { PeerManager } from "../p2p/manager.js";
 import { HeaderSync } from "../sync/headers.js";
 import { BlockSync } from "../sync/blocks.js";
 import { RPCServer, type RPCServerConfig, type RPCServerDeps } from "../rpc/server.js";
+import { RESTServer, type RESTServerConfig, type RESTServerDeps } from "../rpc/rest.js";
+import { BlockFilterIndex } from "../storage/indexes.js";
 import { InventoryRelay } from "../p2p/relay.js";
 import { getTxId, getTxVSize } from "../validation/tx.js";
 import { InvType, type NetworkMessage, type InvVector } from "../p2p/messages.js";
@@ -137,6 +139,40 @@ export interface NodeConfig {
    * `cacheBytes = dbcacheMB * 1024 * 1024`.
    */
   dbcacheMB: number;
+  /**
+   * Enable the read-only REST API server (`/rest/*`). Mirrors Bitcoin
+   * Core's `-rest` (default OFF in init.cpp via `DEFAULT_REST_ENABLE =
+   * false`). When true, the RESTServer binds on `restPort` (or rpcPort
+   * if not separately set) at 127.0.0.1 — same auth-free, GET-only
+   * surface as Core's REST.
+   *
+   * Reference: bitcoin-core/src/rest.cpp, bitcoin-core/src/init.cpp
+   * (`-rest` arg + `RegisterHTTPHandler("/rest/", ...)`).
+   */
+  rest: boolean;
+  /**
+   * Optional dedicated REST listener port. When undefined, REST shares
+   * the RPC port — Core's behavior when `-rest=1` is set without a
+   * separate listener (REST handlers are registered on the existing
+   * HTTPServer). hotbuns runs RPC and REST as two separate Bun.serve
+   * instances, so we default to `rpcPort + 1` when REST is enabled and
+   * no `--rest-port` was given.
+   */
+  restPort?: number;
+  /**
+   * Enable the BIP-157/158 compact block filter index. Mirrors Bitcoin
+   * Core's `-blockfilterindex=basic` (only filtertype Core ships).
+   * Default OFF (matches Core's `DEFAULT_BLOCKFILTERINDEX = false`).
+   *
+   * When enabled, every connected block produces a GCS filter (over
+   * output scriptPubKeys + spent input scriptPubKeys) which is stored
+   * in the chain DB under prefix `BLOCK_FILTER` + filter-header chain
+   * under `FILTER_HEADER`. Used by `/rest/blockfilter/...` and
+   * `/rest/blockfilterheaders/...` endpoints.
+   *
+   * Reference: BIP-157, BIP-158, bitcoin-core/src/index/blockfilterindex.cpp
+   */
+  blockfilterindex: boolean;
 }
 
 /**
@@ -166,6 +202,8 @@ const DEFAULT_CONFIG: NodeConfig = {
   dbcacheMB: 512,
   daemon: false,
   internalDaemonChild: false,
+  rest: false,
+  blockfilterindex: false,
 };
 
 /**
@@ -389,6 +427,40 @@ export function parseArgs(argv: string[]): ParsedArgs {
             if (!isNaN(fd) && fd >= 0) config.readyFd = fd;
           }
           break;
+        case "rest":
+          // Bitcoin Core flag `-rest`. Bare or `=1`/`=true` enables;
+          // `=0`/`=false` disables. Default OFF (matches Core's
+          // `DEFAULT_REST_ENABLE = false`).
+          if (value === undefined || value === "1" || value === "true") {
+            config.rest = true;
+          } else if (value === "0" || value === "false") {
+            config.rest = false;
+          }
+          break;
+        case "rest-port":
+        case "restport":
+          if (value !== undefined) {
+            const restPortVal = parseInt(value, 10);
+            if (!isNaN(restPortVal) && restPortVal > 0) config.restPort = restPortVal;
+          }
+          break;
+        case "blockfilterindex":
+          // Bitcoin Core flag `-blockfilterindex=basic`. Bare flag,
+          // `=1`/`=true`/`=basic` enables; `=0`/`=false` disables.
+          // Default OFF (matches Core's
+          // `DEFAULT_BLOCKFILTERINDEX = false`). Only the `basic`
+          // filter type is supported (BIP-158).
+          if (
+            value === undefined ||
+            value === "1" ||
+            value === "true" ||
+            value === "basic"
+          ) {
+            config.blockfilterindex = true;
+          } else if (value === "0" || value === "false") {
+            config.blockfilterindex = false;
+          }
+          break;
         case "password":
           // For wallet commands
           if (value) remainingArgs.push(`--password=${value}`);
@@ -548,6 +620,22 @@ export async function loadConfig(
           config.debug = config.debug || [];
           config.debug.push(value);
           break;
+        case "rest":
+          config.rest = value === "1" || value === "true";
+          break;
+        case "restport":
+          {
+            const restPortVal = parseInt(value, 10);
+            if (!isNaN(restPortVal) && restPortVal > 0) {
+              config.restPort = restPortVal;
+            }
+          }
+          break;
+        case "blockfilterindex":
+          // Mirror CLI: 0/false = off; 1/true/basic = on.
+          config.blockfilterindex =
+            value === "1" || value === "true" || value === "basic";
+          break;
       }
     }
   }
@@ -605,6 +693,12 @@ interface NodeState {
   chainState: ChainStateManager;
   peerManager: PeerManager;
   rpcServer: RPCServer;
+  /**
+   * Optional read-only REST server. Constructed only when `--rest=1`
+   * (default OFF, matches Bitcoin Core). Stopped during gracefulShutdown
+   * before the RPC server.
+   */
+  restServer?: RESTServer;
   headerSync: HeaderSync;
   blockSync: BlockSync;
   feeEstimator: FeeEstimator;
@@ -612,6 +706,14 @@ interface NodeState {
   mempool: Mempool;
   datadir: string;
   pruneManager?: PruneManager;
+  /**
+   * Optional BIP-157/158 compact-block-filter index. Constructed only
+   * when `--blockfilterindex=1`. Wired into BlockSync.connectBlock so
+   * each connected block gets a filter + filter-header entry; surfaced
+   * via the REST API at `/rest/blockfilter/<filtertype>/<hash>` and
+   * `/rest/blockfilterheaders/<filtertype>/<count>/<hash>`.
+   */
+  filterIndex?: BlockFilterIndex;
 }
 
 let runningNode: NodeState | null = null;
@@ -1262,6 +1364,23 @@ async function startNode(config: NodeConfig): Promise<void> {
     blockSync.setPruneManager(pruneManager);
   }
 
+  // 7a-bis. Wire BIP-157/158 compact-block-filter index when
+  // `--blockfilterindex=1`. The index ships in src/storage/indexes.ts
+  // (`BlockFilterIndex`) but was previously never instantiated outside
+  // tests. Constructing it here + handing it to BlockSync via the new
+  // setter populates filters on every connected block; the REST server
+  // (below) reads them via getFilter / getFilterHeader.
+  //
+  // Default OFF (matches Bitcoin Core's `DEFAULT_BLOCKFILTERINDEX = false`,
+  // src/index/blockfilterindex.h).
+  let filterIndex: BlockFilterIndex | undefined;
+  if (mergedConfig.blockfilterindex) {
+    filterIndex = new BlockFilterIndex(db, true);
+    await filterIndex.init();
+    blockSync.setBlockFilterIndex(filterIndex);
+    console.log("[blockfilterindex] BIP-157/158 basic filter index enabled");
+  }
+
   // 7b. Wire mempool tx relay: accept incoming transactions via AcceptToMemoryPool
   // and relay accepted txs to peers via inventory trickling.
   const txRelay = new InventoryRelay((peer, inventory) => {
@@ -1494,12 +1613,53 @@ async function startNode(config: NodeConfig): Promise<void> {
 
   const rpcServer = new RPCServer(rpcConfig, rpcDeps);
 
+  // 8a. Optional REST server (Core-parity `-rest`).
+  //
+  // Bitcoin Core registers REST handlers on the same HTTPServer as the
+  // JSON-RPC. hotbuns runs RPC and REST as two separate Bun.serve
+  // instances (Bun.serve is one-handler-per-server), so when REST is
+  // enabled without an explicit `--rest-port` we default to
+  // `rpcPort + 1` to avoid an EADDRINUSE collision with the RPC
+  // listener. Operators wanting REST on the same port as Core can
+  // simply not enable RPC, or pick a free port via `--rest-port`.
+  //
+  // REST is opt-in via `--rest=1` (default OFF, matching
+  // Core's `DEFAULT_REST_ENABLE = false` in init.cpp). The bind is
+  // 127.0.0.1 (no auth, GET-only — same as Core).
+  let restServer: RESTServer | undefined;
+  if (mergedConfig.rest) {
+    const restPort = mergedConfig.restPort ?? mergedConfig.rpcPort + 1;
+    const restConfig: RESTServerConfig = {
+      port: restPort,
+      host: "127.0.0.1",
+      txIndexEnabled: false, // hotbuns has no `-txindex` user-facing flag yet; mempool lookup still works.
+    };
+    const restDeps: RESTServerDeps = {
+      chainState,
+      mempool,
+      headerSync,
+      db,
+      params,
+      filterIndex,
+    };
+    try {
+      restServer = new RESTServer(restConfig, restDeps);
+    } catch (err) {
+      const msg = (err as Error)?.message ?? String(err);
+      console.error(
+        `[rest] failed to construct REST server on 127.0.0.1:${restPort}: ${msg} — continuing without REST`
+      );
+      restServer = undefined;
+    }
+  }
+
   // Store running node state
   runningNode = {
     db,
     chainState,
     peerManager,
     rpcServer,
+    restServer,
     headerSync,
     blockSync,
     feeEstimator,
@@ -1507,6 +1667,7 @@ async function startNode(config: NodeConfig): Promise<void> {
     mempool,
     datadir: mergedConfig.datadir,
     pruneManager,
+    filterIndex,
   };
 
   // Set shutdown callback for RPC stop command
@@ -1529,6 +1690,21 @@ async function startNode(config: NodeConfig): Promise<void> {
   await peerManager.start();
   await blockSync.start();
   rpcServer.start();
+  // Start REST server (opt-in via --rest=1). Bind failure is non-fatal:
+  // a busy REST port should not crash the daemon — log + continue.
+  if (restServer) {
+    try {
+      restServer.start();
+    } catch (err) {
+      const msg = (err as Error)?.message ?? String(err);
+      console.error(
+        `[rest] failed to bind REST listener: ${msg} — continuing without REST`
+      );
+      // Drop the reference so shutdown doesn't try to stop a server that never started.
+      restServer = undefined;
+      if (runningNode) runningNode.restServer = undefined;
+    }
+  }
 
   // Start Prometheus metrics server (also serves /health for supervisors).
   // Bind failure is non-fatal: a busy port (e.g. another node already on
@@ -1620,8 +1796,17 @@ async function gracefulShutdown(): Promise<void> {
 
   console.log("Stopping services...");
 
-  // 1. Stop RPC server
+  // 1. Stop RPC + REST servers
   runningNode.rpcServer.stop();
+  if (runningNode.restServer) {
+    try {
+      runningNode.restServer.stop();
+    } catch (err) {
+      // Idempotent best-effort stop — log and continue.
+      const msg = (err as Error)?.message ?? String(err);
+      console.error(`[rest] stop failed: ${msg}`);
+    }
+  }
 
   // 2. Stop block sync
   await runningNode.blockSync.stop();
@@ -2023,6 +2208,9 @@ OPTIONS:
   --conf=<file>         Config file path (default: <datadir>/hotbuns.conf)
   --network=<net>       Network: mainnet, testnet, testnet4, regtest (default: mainnet)
   --rpc-port=<port>     RPC port (default: 8332/18332/18443)
+  --rest                Enable read-only REST API (default: off; Core parity)
+  --rest-port=<port>    REST port when --rest is set (default: rpcPort+1)
+  --blockfilterindex    Enable BIP-157/158 compact block filter index (default: off)
   --metrics-port=<port> Prometheus metrics port (default: 9332, 0 = disabled)
   --rpc-user=<user>     RPC username (default: user)
   --rpc-password=<pass> RPC password (default: pass)

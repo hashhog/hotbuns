@@ -11,6 +11,7 @@ import type { ChainStateManager } from "../chain/state.js";
 import type { Mempool, MempoolEntry } from "../mempool/mempool.js";
 import type { HeaderSync, HeaderChainEntry } from "../sync/headers.js";
 import type { ChainDB, UTXOEntry, BlockIndexRecord, TxIndexEntry } from "../storage/database.js";
+import type { BlockFilterIndex } from "../storage/indexes.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import { REGTEST } from "../consensus/params.js";
 import type { Transaction } from "../validation/tx.js";
@@ -95,6 +96,44 @@ class MockHeaderSync implements Partial<HeaderSync> {
 
   getMedianTimePast(_entry: HeaderChainEntry): number {
     return Math.floor(Date.now() / 1000);
+  }
+}
+
+/**
+ * Minimal mock of BlockFilterIndex.  REST tests only exercise the
+ * read surface (isEnabled / getFilter / getFilterHeader); mock
+ * stores by hash hex.
+ */
+class MockBlockFilterIndex implements Partial<BlockFilterIndex> {
+  private filters = new Map<string, Buffer>();
+  private headers = new Map<string, Buffer>();
+  private enabled: boolean;
+
+  constructor(enabled: boolean = true) {
+    this.enabled = enabled;
+  }
+
+  isEnabled(): boolean {
+    return this.enabled;
+  }
+
+  setEnabled(enabled: boolean): void {
+    this.enabled = enabled;
+  }
+
+  addFilter(blockHash: Buffer, filter: Buffer, header: Buffer) {
+    this.filters.set(blockHash.toString("hex"), filter);
+    this.headers.set(blockHash.toString("hex"), header);
+  }
+
+  async getFilter(blockHash: Buffer): Promise<Buffer | null> {
+    if (!this.enabled) return null;
+    return this.filters.get(blockHash.toString("hex")) ?? null;
+  }
+
+  async getFilterHeader(blockHash: Buffer): Promise<Buffer | null> {
+    if (!this.enabled) return null;
+    return this.headers.get(blockHash.toString("hex")) ?? null;
   }
 }
 
@@ -689,6 +728,375 @@ describe("REST API", () => {
       expect(json.blocks).toBe(100);
       expect(typeof json.bestblockhash).toBe("string");
       expect(typeof json.chainwork).toBe("string");
+    });
+  });
+
+  describe("rest_blockfilter (BIP-157)", () => {
+    /**
+     * Helper: spin up a dedicated REST server with a MockBlockFilterIndex
+     * dependency. Each test owns its own port + server so we don't have
+     * to retrofit the suite-level baseUrl server.
+     */
+    async function withFilterServer(
+      enabled: boolean,
+      seed: (mock: MockBlockFilterIndex, db: MockDB) => void,
+      portOffset: number
+    ): Promise<{
+      server: RESTServer;
+      url: string;
+      mockFilterIndex: MockBlockFilterIndex;
+      mockDB: MockDB;
+    }> {
+      const localPort = 18332 + 2000 + portOffset;
+      const localDB = new MockDB();
+      const mockFilter = new MockBlockFilterIndex(enabled);
+      seed(mockFilter, localDB);
+
+      const config: RESTServerConfig = {
+        port: localPort,
+        host: "127.0.0.1",
+        txIndexEnabled: false,
+      };
+      const deps: RESTServerDeps = {
+        chainState: mockChainState as any,
+        mempool: mockMempool as any,
+        headerSync: mockHeaderSync as any,
+        db: localDB as any,
+        params: REGTEST,
+        filterIndex: mockFilter as any,
+      };
+      const localServer = new RESTServer(config, deps);
+      localServer.start();
+      await new Promise((r) => setTimeout(r, 50));
+      return {
+        server: localServer,
+        url: `http://127.0.0.1:${localPort}`,
+        mockFilterIndex: mockFilter,
+        mockDB: localDB,
+      };
+    }
+
+    test("GET /rest/blockfilter/basic/<hash>.json returns filter hex", async () => {
+      const block = createTestBlock(800);
+      const blockHash = getBlockHash(block.header);
+      const headerBuf = serializeBlockHeader(block.header);
+      const encodedFilter = Buffer.from([0x01, 0xab]); // varint(1) + 1 byte filter
+      const filterHeader = Buffer.alloc(32, 0x42);
+
+      const ctx = await withFilterServer(
+        true,
+        (mock, db) => {
+          db.addBlock(blockHash, serializeBlock(block), 800, headerBuf);
+          mock.addFilter(blockHash, encodedFilter, filterHeader);
+        },
+        1
+      );
+
+      try {
+        const res = await fetch(
+          `${ctx.url}/rest/blockfilter/basic/${blockHash.toString("hex")}.json`
+        );
+        expect(res.status).toBe(200);
+        expect(res.headers.get("Content-Type")).toBe("application/json");
+
+        const json: any = await res.json();
+        // Core's shape: { "filter": "<hex of encoded GCS filter>" }
+        expect(json.filter).toBe(encodedFilter.toString("hex"));
+      } finally {
+        ctx.server.stop();
+      }
+    });
+
+    test("GET /rest/blockfilter/basic/<hash>.bin matches Core wire format", async () => {
+      const block = createTestBlock(801);
+      const blockHash = getBlockHash(block.header);
+      const headerBuf = serializeBlockHeader(block.header);
+      const encodedFilter = Buffer.from([0x02, 0xff, 0xee]); // varint(2) + 2 bytes
+      const filterHeader = Buffer.alloc(32, 0x33);
+
+      const ctx = await withFilterServer(
+        true,
+        (mock, db) => {
+          db.addBlock(blockHash, serializeBlock(block), 801, headerBuf);
+          mock.addFilter(blockHash, encodedFilter, filterHeader);
+        },
+        2
+      );
+
+      try {
+        const res = await fetch(
+          `${ctx.url}/rest/blockfilter/basic/${blockHash.toString("hex")}.bin`
+        );
+        expect(res.status).toBe(200);
+        expect(res.headers.get("Content-Type")).toBe(
+          "application/octet-stream"
+        );
+
+        const body = Buffer.from(await res.arrayBuffer());
+        // Wire shape: uint8 type=0 || uint256 hash (LE, 32B) || compactSize(N) || N bytes
+        expect(body[0]).toBe(0); // BlockFilterType::BASIC
+        expect(body.subarray(1, 33).equals(blockHash)).toBe(true);
+        // compactSize(3) = single byte 0x03 (since len <= 0xfc)
+        expect(body[33]).toBe(3);
+        expect(body.subarray(34).equals(encodedFilter)).toBe(true);
+      } finally {
+        ctx.server.stop();
+      }
+    });
+
+    test("GET /rest/blockfilter/basic/<hash>.hex returns hex of bin", async () => {
+      const block = createTestBlock(802);
+      const blockHash = getBlockHash(block.header);
+      const headerBuf = serializeBlockHeader(block.header);
+      const encodedFilter = Buffer.from([0x01, 0x55]);
+      const filterHeader = Buffer.alloc(32, 0x77);
+
+      const ctx = await withFilterServer(
+        true,
+        (mock, db) => {
+          db.addBlock(blockHash, serializeBlock(block), 802, headerBuf);
+          mock.addFilter(blockHash, encodedFilter, filterHeader);
+        },
+        3
+      );
+
+      try {
+        const res = await fetch(
+          `${ctx.url}/rest/blockfilter/basic/${blockHash.toString("hex")}.hex`
+        );
+        expect(res.status).toBe(200);
+        expect(res.headers.get("Content-Type")).toBe("text/plain");
+
+        const text = (await res.text()).trim();
+        // Should equal hex of full bin payload.
+        const expected =
+          Buffer.concat([
+            Buffer.from([0]),
+            blockHash,
+            Buffer.from([encodedFilter.length]),
+            encodedFilter,
+          ]).toString("hex");
+        expect(text).toBe(expected);
+      } finally {
+        ctx.server.stop();
+      }
+    });
+
+    test("rejects unknown filtertype with 400", async () => {
+      const ctx = await withFilterServer(true, () => {}, 4);
+      try {
+        const goodHash = Buffer.alloc(32, 0xaa).toString("hex");
+        const res = await fetch(
+          `${ctx.url}/rest/blockfilter/extended/${goodHash}.json`
+        );
+        expect(res.status).toBe(400);
+        const text = await res.text();
+        expect(text).toContain("Unknown filtertype");
+      } finally {
+        ctx.server.stop();
+      }
+    });
+
+    test("returns 400 when index not enabled", async () => {
+      const ctx = await withFilterServer(false, () => {}, 5);
+      try {
+        const goodHash = Buffer.alloc(32, 0xaa).toString("hex");
+        const res = await fetch(
+          `${ctx.url}/rest/blockfilter/basic/${goodHash}.json`
+        );
+        expect(res.status).toBe(400);
+        const text = await res.text();
+        expect(text).toContain("Index is not enabled");
+      } finally {
+        ctx.server.stop();
+      }
+    });
+
+    test("returns 404 when block hash unknown", async () => {
+      const ctx = await withFilterServer(true, () => {}, 6);
+      try {
+        const unknownHash = Buffer.alloc(32, 0xee).toString("hex");
+        const res = await fetch(
+          `${ctx.url}/rest/blockfilter/basic/${unknownHash}.json`
+        );
+        expect(res.status).toBe(404);
+      } finally {
+        ctx.server.stop();
+      }
+    });
+
+    test("returns 404 when filter not yet built", async () => {
+      const block = createTestBlock(810);
+      const blockHash = getBlockHash(block.header);
+      const headerBuf = serializeBlockHeader(block.header);
+
+      // Block is in the chain (db.getBlockIndex hits) but filter is missing.
+      const ctx = await withFilterServer(
+        true,
+        (_mock, db) => {
+          db.addBlock(blockHash, serializeBlock(block), 810, headerBuf);
+        },
+        7
+      );
+      try {
+        const res = await fetch(
+          `${ctx.url}/rest/blockfilter/basic/${blockHash.toString("hex")}.json`
+        );
+        expect(res.status).toBe(404);
+      } finally {
+        ctx.server.stop();
+      }
+    });
+
+    test("returns 400 for invalid hash", async () => {
+      const ctx = await withFilterServer(true, () => {}, 8);
+      try {
+        const res = await fetch(
+          `${ctx.url}/rest/blockfilter/basic/notahash.json`
+        );
+        expect(res.status).toBe(400);
+      } finally {
+        ctx.server.stop();
+      }
+    });
+  });
+
+  describe("rest_blockfilterheaders (BIP-157)", () => {
+    async function setup(portOffset: number) {
+      const localPort = 18332 + 3000 + portOffset;
+      const localDB = new MockDB();
+      const mockFilter = new MockBlockFilterIndex(true);
+
+      // Build a 3-block chain h=900..902 with deterministic filter
+      // headers so we can verify the walk.
+      const blocks: Array<{ hash: Buffer; header: Buffer }> = [];
+      for (let h = 900; h <= 902; h++) {
+        const block = createTestBlock(h);
+        const blockHash = getBlockHash(block.header);
+        const headerBuf = serializeBlockHeader(block.header);
+        localDB.addBlock(blockHash, serializeBlock(block), h, headerBuf);
+        const filterHeader = Buffer.alloc(32, h & 0xff);
+        mockFilter.addFilter(blockHash, Buffer.from([0x00]), filterHeader);
+        blocks.push({ hash: blockHash, header: filterHeader });
+      }
+
+      const config: RESTServerConfig = {
+        port: localPort,
+        host: "127.0.0.1",
+        txIndexEnabled: false,
+      };
+      const deps: RESTServerDeps = {
+        chainState: mockChainState as any,
+        mempool: mockMempool as any,
+        headerSync: mockHeaderSync as any,
+        db: localDB as any,
+        params: REGTEST,
+        filterIndex: mockFilter as any,
+      };
+      const localServer = new RESTServer(config, deps);
+      localServer.start();
+      await new Promise((r) => setTimeout(r, 50));
+      return {
+        server: localServer,
+        url: `http://127.0.0.1:${localPort}`,
+        blocks,
+      };
+    }
+
+    test("deprecated form: /rest/blockfilterheaders/basic/<count>/<hash>.json", async () => {
+      const ctx = await setup(1);
+      try {
+        const startHash = ctx.blocks[0].hash;
+        const res = await fetch(
+          `${ctx.url}/rest/blockfilterheaders/basic/3/${startHash.toString("hex")}.json`
+        );
+        expect(res.status).toBe(200);
+        const json: any = await res.json();
+        expect(Array.isArray(json)).toBe(true);
+        expect(json.length).toBe(3);
+        // Big-endian (Core .GetHex()) — 32 bytes reversed.
+        expect(json[0]).toBe(
+          Buffer.from(ctx.blocks[0].header).reverse().toString("hex")
+        );
+        expect(json[2]).toBe(
+          Buffer.from(ctx.blocks[2].header).reverse().toString("hex")
+        );
+      } finally {
+        ctx.server.stop();
+      }
+    });
+
+    test("new form: /rest/blockfilterheaders/basic/<hash>.json?count=2", async () => {
+      const ctx = await setup(2);
+      try {
+        const startHash = ctx.blocks[1].hash;
+        const res = await fetch(
+          `${ctx.url}/rest/blockfilterheaders/basic/${startHash.toString("hex")}.json?count=2`
+        );
+        expect(res.status).toBe(200);
+        const json: any = await res.json();
+        expect(Array.isArray(json)).toBe(true);
+        expect(json.length).toBe(2);
+        expect(json[0]).toBe(
+          Buffer.from(ctx.blocks[1].header).reverse().toString("hex")
+        );
+        expect(json[1]).toBe(
+          Buffer.from(ctx.blocks[2].header).reverse().toString("hex")
+        );
+      } finally {
+        ctx.server.stop();
+      }
+    });
+
+    test("bin format returns concatenated 32-byte headers", async () => {
+      const ctx = await setup(3);
+      try {
+        const startHash = ctx.blocks[0].hash;
+        const res = await fetch(
+          `${ctx.url}/rest/blockfilterheaders/basic/2/${startHash.toString("hex")}.bin`
+        );
+        expect(res.status).toBe(200);
+        expect(res.headers.get("Content-Type")).toBe(
+          "application/octet-stream"
+        );
+        const body = Buffer.from(await res.arrayBuffer());
+        // 2 headers * 32 bytes = 64.
+        expect(body.length).toBe(64);
+        expect(body.subarray(0, 32).equals(ctx.blocks[0].header)).toBe(true);
+        expect(body.subarray(32, 64).equals(ctx.blocks[1].header)).toBe(true);
+      } finally {
+        ctx.server.stop();
+      }
+    });
+
+    test("rejects out-of-range count with 400", async () => {
+      const ctx = await setup(4);
+      try {
+        const startHash = ctx.blocks[0].hash;
+        const res = await fetch(
+          `${ctx.url}/rest/blockfilterheaders/basic/0/${startHash.toString("hex")}.json`
+        );
+        expect(res.status).toBe(400);
+        const res2 = await fetch(
+          `${ctx.url}/rest/blockfilterheaders/basic/2001/${startHash.toString("hex")}.json`
+        );
+        expect(res2.status).toBe(400);
+      } finally {
+        ctx.server.stop();
+      }
+    });
+
+    test("rejects unknown filtertype with 400", async () => {
+      const ctx = await setup(5);
+      try {
+        const startHash = ctx.blocks[0].hash;
+        const res = await fetch(
+          `${ctx.url}/rest/blockfilterheaders/extended/3/${startHash.toString("hex")}.json`
+        );
+        expect(res.status).toBe(400);
+      } finally {
+        ctx.server.stop();
+      }
     });
   });
 

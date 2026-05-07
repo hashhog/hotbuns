@@ -10,9 +10,18 @@
  * - /rest/getutxos/<checkmempool>/<txid-vout>/....<format>
  * - /rest/mempool/info.json
  * - /rest/mempool/contents.json
+ * - /rest/chaininfo.json
+ * - /rest/blockfilter/<filtertype>/<hash>.<format>                 (BIP-157, requires --blockfilterindex)
+ * - /rest/blockfilterheaders/<filtertype>/<count>/<hash>.<format>  (BIP-157)
  *
  * Formats: .json, .bin, .hex
  * No authentication required (read-only).
+ *
+ * Wired into production by cli.ts when `--rest=1` is passed (default
+ * OFF, matching Bitcoin Core's `DEFAULT_REST_ENABLE = false`).  This
+ * class was previously written but never instantiated outside tests;
+ * the cli.ts wiring closes the dead-code gap flagged by
+ * CORE-PARITY-AUDIT/_rest-api-cross-impl-audit-2026-05-06-part2.md (R1).
  *
  * Reference: /home/max/hashhog/bitcoin/src/rest.cpp
  */
@@ -40,7 +49,7 @@ import {
   isCoinbase,
 } from "../validation/tx.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
-import type { TxIndexManager } from "../storage/indexes.js";
+import type { TxIndexManager, BlockFilterIndex } from "../storage/indexes.js";
 
 /**
  * Supported REST response formats.
@@ -79,6 +88,17 @@ export interface RESTServerDeps {
   db: ChainDB;
   params: ConsensusParams;
   txIndex?: TxIndexManager;
+  /**
+   * Optional BIP-157/158 compact-block-filter index. When provided +
+   * enabled, the REST server exposes:
+   *   /rest/blockfilter/<filtertype>/<HASH>.{bin,hex,json}
+   *   /rest/blockfilterheaders/<filtertype>/<COUNT>/<HASH>.{bin,hex,json}
+   * Otherwise those endpoints return HTTP 400 ("Index is not enabled
+   * for filtertype basic"), matching Bitcoin Core's behavior in
+   * src/rest.cpp::rest_block_filter when GetBlockFilterIndex returns
+   * nullptr.
+   */
+  filterIndex?: BlockFilterIndex;
 }
 
 /**
@@ -96,6 +116,7 @@ export class RESTServer {
   private db: ChainDB;
   private params: ConsensusParams;
   private txIndex?: TxIndexManager;
+  private filterIndex?: BlockFilterIndex;
 
   constructor(config: RESTServerConfig, deps: RESTServerDeps) {
     this.config = {
@@ -109,6 +130,7 @@ export class RESTServer {
     this.db = deps.db;
     this.params = deps.params;
     this.txIndex = deps.txIndex;
+    this.filterIndex = deps.filterIndex;
   }
 
   /**
@@ -156,9 +178,17 @@ export class RESTServer {
     const restPath = path.slice(6); // Remove "/rest/"
 
     try {
-      // Route to appropriate handler
+      // Route to appropriate handler. NB longer prefixes must precede
+      // shorter ones (`blockfilterheaders/` before `blockfilter/` before
+      // `block/`) — first-match wins.
       if (restPath.startsWith("block/notxdetails/")) {
         return await this.handleBlockNoTxDetails(restPath.slice(18));
+      }
+      if (restPath.startsWith("blockfilterheaders/")) {
+        return await this.handleBlockFilterHeaders(req, restPath.slice(19));
+      }
+      if (restPath.startsWith("blockfilter/")) {
+        return await this.handleBlockFilter(restPath.slice(12));
       }
       if (restPath.startsWith("block/")) {
         return await this.handleBlock(restPath.slice(6));
@@ -868,6 +898,201 @@ export class RESTServer {
       warnings: "",
     };
 
+    return this.formatResponse(json, format);
+  }
+
+  // ========== Block Filter Endpoints (BIP-157) ==========
+
+  /**
+   * GET /rest/blockfilter/<filtertype>/<HASH>.<format>
+   *
+   * Mirrors Bitcoin Core's `rest_block_filter`
+   * (bitcoin-core/src/rest.cpp). The body for bin/hex is the
+   * `BlockFilter::Serialize` wire format:
+   *
+   *   uint8 filter_type || uint256 block_hash (LE) ||
+   *   compactSize(filter_len) || filter_bytes
+   *
+   * For json the response is `{"filter": "<hex of encoded GCS filter>"}`
+   * — the same shape Core emits.
+   *
+   * Errors:
+   *   400 — invalid URI / unknown filter type / index disabled
+   *   404 — block hash not in chain (or filter not built yet)
+   */
+  private async handleBlockFilter(pathParam: string): Promise<Response> {
+    const { path, format } = this.parseFormat(pathParam);
+
+    // Expected layout: <filtertype>/<blockhash>
+    const parts = path.split("/").filter((p) => p.length > 0);
+    if (parts.length !== 2) {
+      return this.errorResponse(
+        400,
+        "Invalid URI format. Expected /rest/blockfilter/<filtertype>/<blockhash>"
+      );
+    }
+
+    const [filterTypeName, hashStr] = parts;
+
+    // Bitcoin Core only ships filter type "basic" (BIP-158). Reject any
+    // other token to match `BlockFilterTypeByName` semantics.
+    if (filterTypeName !== "basic") {
+      return this.errorResponse(400, "Unknown filtertype " + filterTypeName);
+    }
+
+    if (!this.filterIndex || !this.filterIndex.isEnabled()) {
+      // Mirrors Core's `if (!index)` branch — returned as 400 there too.
+      return this.errorResponse(
+        400,
+        "Index is not enabled for filtertype " + filterTypeName
+      );
+    }
+
+    const hash = this.parseBlockHash(hashStr);
+    if (!hash) {
+      return this.errorResponse(400, "Invalid hash: " + hashStr);
+    }
+
+    // Verify the block is known. Mirrors Core's
+    // chainman.m_blockman.LookupBlockIndex check (404 on miss).
+    const blockIndex = await this.db.getBlockIndex(hash);
+    if (!blockIndex) {
+      return this.errorResponse(404, hashStr + " not found");
+    }
+
+    const filter = await this.filterIndex.getFilter(hash);
+    if (!filter) {
+      return this.errorResponse(
+        404,
+        "Filter not found. Block filters are still in the process of being indexed."
+      );
+    }
+
+    // Filter type byte for "basic" is 0 per BIP-157 (BlockFilterType::BASIC = 0).
+    const filterTypeByte = 0;
+
+    if (format === "bin" || format === "hex") {
+      const writer = new BufferWriter();
+      writer.writeUInt8(filterTypeByte);
+      writer.writeHash(hash); // 32 bytes LE — same byte order Core emits.
+      writer.writeVarBytes(filter); // compactSize(len) || bytes
+      return this.formatResponse(null, format, writer.toBuffer());
+    }
+
+    // JSON: { "filter": "<hex>" } — Core's exact key + shape.
+    return this.formatResponse({ filter: filter.toString("hex") }, format);
+  }
+
+  /**
+   * GET /rest/blockfilterheaders/<filtertype>/<COUNT>/<HASH>.<format>
+   * GET /rest/blockfilterheaders/<filtertype>/<HASH>.<format>?count=<COUNT>
+   *
+   * Mirrors Bitcoin Core's `rest_filter_header`. Walks forward
+   * `count` consecutive blocks starting at `<HASH>` and returns each
+   * block's filter header.
+   *
+   * Body shapes:
+   *   bin: count * 32-byte raw filter headers, concatenated.
+   *   hex: same bytes, hex-encoded with trailing `\n`.
+   *   json: array of 64-char hex strings, one per filter header.
+   *
+   * Filter headers chain via `header[i] = SHA256d(filter_hash[i] ||
+   * header[i-1])` (BIP-157). The chain originates at all-zeros for
+   * the genesis predecessor.
+   */
+  private async handleBlockFilterHeaders(
+    req: Request,
+    pathParam: string
+  ): Promise<Response> {
+    const { path, format } = this.parseFormat(pathParam);
+
+    // Need to extract query string before path-trimming because
+    // parseFormat already strips it. Reach into the URL.
+    const url = new URL(req.url);
+
+    const parts = path.split("/").filter((p) => p.length > 0);
+    let filterTypeName: string;
+    let count: number;
+    let hashStr: string;
+
+    if (parts.length === 3) {
+      // Deprecated form: /rest/blockfilterheaders/<filtertype>/<count>/<hash>
+      filterTypeName = parts[0];
+      count = parseInt(parts[1], 10);
+      hashStr = parts[2];
+    } else if (parts.length === 2) {
+      // New form: /rest/blockfilterheaders/<filtertype>/<hash>?count=<count>
+      filterTypeName = parts[0];
+      hashStr = parts[1];
+      const countStr = url.searchParams.get("count") ?? "5";
+      count = parseInt(countStr, 10);
+    } else {
+      return this.errorResponse(
+        400,
+        "Invalid URI format. Expected /rest/blockfilterheaders/<filtertype>/<blockhash>.<ext>?count=<count>"
+      );
+    }
+
+    if (isNaN(count) || count < 1 || count > MAX_REST_HEADERS_RESULTS) {
+      return this.errorResponse(
+        400,
+        `Header count is invalid or out of acceptable range (1-${MAX_REST_HEADERS_RESULTS})`
+      );
+    }
+
+    if (filterTypeName !== "basic") {
+      return this.errorResponse(400, "Unknown filtertype " + filterTypeName);
+    }
+
+    if (!this.filterIndex || !this.filterIndex.isEnabled()) {
+      return this.errorResponse(
+        400,
+        "Index is not enabled for filtertype " + filterTypeName
+      );
+    }
+
+    const hash = this.parseBlockHash(hashStr);
+    if (!hash) {
+      return this.errorResponse(400, "Invalid hash: " + hashStr);
+    }
+
+    // Walk forward through the active chain. We use db.getBlockHashByHeight
+    // (the height->hash index) as the "active chain" oracle, mirroring
+    // Core's `active_chain.Next(pindex)` walk.
+    const startBlockIndex = await this.db.getBlockIndex(hash);
+    if (!startBlockIndex) {
+      return this.errorResponse(404, hashStr + " not found");
+    }
+
+    const headers: Buffer[] = [];
+    let currentHash: Buffer | null = hash;
+    let currentHeight = startBlockIndex.height;
+
+    for (let i = 0; i < count; i++) {
+      if (!currentHash) break;
+      const filterHeader = await this.filterIndex.getFilterHeader(currentHash);
+      if (!filterHeader) {
+        return this.errorResponse(
+          404,
+          "Filter not found. Block filters are still in the process of being indexed."
+        );
+      }
+      headers.push(filterHeader);
+      currentHeight += 1;
+      currentHash = await this.db.getBlockHashByHeight(currentHeight);
+    }
+
+    if (format === "bin" || format === "hex") {
+      const writer = new BufferWriter();
+      for (const h of headers) {
+        writer.writeHash(h); // 32 bytes each, no length prefix — Core's wire format.
+      }
+      return this.formatResponse(null, format, writer.toBuffer());
+    }
+
+    // JSON: array of 64-char hex strings, big-endian display order
+    // (.reverse() to match Core's GetHex on uint256).
+    const json = headers.map((h) => Buffer.from(h).reverse().toString("hex"));
     return this.formatResponse(json, format);
   }
 

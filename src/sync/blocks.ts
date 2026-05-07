@@ -329,6 +329,19 @@ export class BlockSync {
    *  blocks during IBD). */
   private blocksSincePruneCheck: number = 0;
 
+  /** Optional BIP-157/158 compact-block-filter index. Wired via
+   *  `setBlockFilterIndex()` from cli.ts when `--blockfilterindex=1`.
+   *  When set, every successful new-tip block connect calls
+   *  `filterIndex.indexBlock(...)` so the filter + filter-header chain
+   *  stays in lockstep with the chain.  Mirrors Bitcoin Core's
+   *  `BlockFilterIndex::CustomAppend` (src/index/blockfilterindex.cpp),
+   *  which the BaseIndex worker invokes per `BlockConnected` notification.
+   *
+   *  Surface: REST `/rest/blockfilter/<filtertype>/<hash>` and
+   *  `/rest/blockfilterheaders/<filtertype>/<count>/<hash>` (rest.ts).
+   *  Reference: BIP-157, BIP-158. */
+  private filterIndex: import("../storage/indexes.js").BlockFilterIndex | null = null;
+
   /**
    * Number of parallel script-verification workers.
    * 1  = sequential (verifyAllInputsSequential) — benchmark baseline.
@@ -411,6 +424,26 @@ export class BlockSync {
    */
   setPruneManager(pruneManager: import("../storage/pruning.js").PruneManager): void {
     this.pruneManager = pruneManager;
+  }
+
+  /**
+   * Wire the BIP-157/158 compact-block-filter index.
+   *
+   * When the operator passes `--blockfilterindex=1`, cli.ts constructs a
+   * `BlockFilterIndex` and registers it here. Every successful
+   * `connectBlock` calls `filterIndex.indexBlock(block, height,
+   * spentOutputs)` after the block is persisted so the filter +
+   * filter-header chain advances in lockstep with the chain tip.
+   *
+   * No-op when not wired (default off, matches Bitcoin Core's
+   * `DEFAULT_BLOCKFILTERINDEX = false`).
+   *
+   * Reference: bitcoin-core/src/index/blockfilterindex.cpp::CustomAppend.
+   */
+  setBlockFilterIndex(
+    filterIndex: import("../storage/indexes.js").BlockFilterIndex
+  ): void {
+    this.filterIndex = filterIndex;
   }
 
   /**
@@ -2357,6 +2390,37 @@ export class BlockSync {
         }
       } else {
         await this.writeTxIndexForBlock(block, blockHash);
+      }
+    }
+
+    // ── BIP-157/158 compact-block-filter index ──
+    //
+    // When the operator passed `--blockfilterindex=1`, cli.ts wires a
+    // BlockFilterIndex into this BlockSync via setBlockFilterIndex().
+    // Each connected block produces a GCS filter (over output
+    // scriptPubKeys + spent input scriptPubKeys from undo data) which
+    // is stored in the chain DB.  The filter-header chain is
+    // monotonically advanced by `currentHeader` inside the index, so
+    // we run this on every connect (not gated by atTip) — matching
+    // Bitcoin Core's `BlockFilterIndex::CustomAppend` cadence.
+    //
+    // Best-effort: a filter-build failure must NOT roll back the
+    // block connect.  An exception here would otherwise abort IBD on
+    // an unrelated subsystem.  Mirrors Core's `IndexFailure` handling
+    // in BaseIndex which logs + sets m_synced = false rather than
+    // killing the chain advance.
+    //
+    // Surfaced via REST: `/rest/blockfilter/<filtertype>/<hash>` and
+    // `/rest/blockfilterheaders/<filtertype>/<count>/<hash>`
+    // (src/rpc/rest.ts handleBlockFilter / handleBlockFilterHeaders).
+    if (this.filterIndex && this.filterIndex.isEnabled()) {
+      try {
+        await this.filterIndex.indexBlock(block, height, coreResult.spentOutputs);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[blockfilterindex] failed to index block ${blockHash.toString("hex").slice(0, 16)} at h=${height}: ${msg} (continuing)`
+        );
       }
     }
 
