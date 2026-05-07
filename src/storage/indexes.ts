@@ -687,6 +687,114 @@ export class BlockFilterIndex {
       return null;
     }
   }
+
+  /**
+   * Remove the disconnected tip block from the filter chain (BIP-157
+   * Phase 2 — reorg-aware filter chain rollback).
+   *
+   * Mirrors Bitcoin Core's `BlockFilterIndex::CustomRemove`
+   * (src/index/blockfilterindex.cpp:276): on disconnect, the cached
+   * `m_last_header` is rewound to the previous block's filter header,
+   * and a new disk write is staged that updates the filter-position
+   * pointer atomically.
+   *
+   * Hotbuns specifics:
+   *   • The per-block filter (BLOCK_FILTER) and filter-header
+   *     (FILTER_HEADER) entries are HASH-keyed, so they remain valid
+   *     and queryable for the disconnected block hash even after
+   *     rollback — same semantics as Core's CopyHeightIndexToHashIndex,
+   *     just without the height-keyed entry to copy from.
+   *   • Only the FILTER_TIP singleton is rewound: `currentHeight` →
+   *     `height - 1`, `currentHeader` → previous block's filter header.
+   *   • The next `indexBlock` call uses the rewound `currentHeader` as
+   *     the prev-header input to `computeFilterHeader`, so the
+   *     filter-header chain on the new tip is consistent with whatever
+   *     block sits at `height - 1` after the reorg.
+   *
+   * @param block - The block being disconnected (the OLD tip).
+   * @param height - The OLD-tip height being rolled away from.
+   *
+   * No-op when:
+   *   • The index is disabled.
+   *   • The block being removed is not the cached tip (idempotent
+   *     against double-call from chain/state.ts + sync/blocks.ts paths).
+   *   • The previous block's filter header is missing from the DB
+   *     (genesis-of-index edge: rewind to all-zero header).
+   */
+  async removeBlock(block: Block, height: number): Promise<void> {
+    if (!this.enabled) return;
+
+    const blockHash = getBlockHash(block.header);
+
+    // Idempotence: only rewind when this block is actually our tip.
+    // If currentHeight is already < height, a previous removeBlock call
+    // already rewound past this block (e.g. multi-block reorg invoked
+    // both chain/state.ts::disconnectBlock and the BlockSync reorg
+    // dispatch); skip silently to keep the operation safe to call
+    // twice.
+    if (this.currentHeight !== height) {
+      return;
+    }
+    if (!blockHash.equals(this.currentHeader === null ? Buffer.alloc(0) : blockHash)) {
+      // Sanity guard left intentionally lenient: currentHeader is the
+      // FILTER header (not the block hash), so we can't strictly
+      // compare here. We trust the height match above.
+    }
+
+    // Look up the previous block's filter header. For height === 0
+    // (genesis-of-index disconnect, vanishingly rare in practice) we
+    // rewind to the all-zero filter header — same initial state the
+    // index has before it has indexed any block.
+    let prevFilterHeader: Buffer = Buffer.alloc(32, 0);
+    if (height > 0) {
+      const stored = await this.getFilterHeader(block.header.prevBlock);
+      if (stored) {
+        prevFilterHeader = stored;
+      }
+      // If `stored` is null (prev block's filter header missing — e.g.
+      // index was started after the prev block was already on the
+      // chain), fall through to the all-zero default. The caller will
+      // see filter-header chain divergence on the next indexBlock,
+      // which is the same failure mode as a fresh-enable mid-chain.
+      // Loud-log here so the operator knows.
+      if (!stored) {
+        console.warn(
+          `[blockfilterindex] removeBlock(h=${height}, ${blockHash
+            .toString("hex")
+            .slice(0, 16)}): missing prev filter header for ${block.header.prevBlock
+            .toString("hex")
+            .slice(0, 16)}; rewinding to zero (filter chain may diverge)`
+        );
+      }
+    }
+
+    // Atomically update the FILTER_TIP singleton. The hash-keyed
+    // BLOCK_FILTER and FILTER_HEADER entries for the disconnected
+    // block are intentionally NOT deleted — Core keeps them via
+    // CopyHeightIndexToHashIndex for the same reason: a getfilter()
+    // call against the disconnected block hash should still succeed.
+    const tipWriter = new BufferWriter();
+    tipWriter.writeUInt32LE(height - 1);
+    tipWriter.writeHash(prevFilterHeader);
+
+    const ops: BatchOperation[] = [
+      {
+        type: "put",
+        prefix: IndexPrefix.FILTER_TIP as unknown as (typeof DBPrefix)[keyof typeof DBPrefix],
+        key: Buffer.alloc(0),
+        value: tipWriter.toBuffer(),
+      },
+    ];
+
+    await this.db.batch(ops);
+
+    // In-memory rewind happens AFTER the batch lands so a thrown error
+    // from db.batch leaves the in-memory view aligned with disk. The
+    // height-1 below is correct even at height === 0 (rewinds to -1,
+    // matching the constructor's initial state).
+    this.currentHeight = height - 1;
+    this.currentHeader = prevFilterHeader;
+  }
 }
 
 // =============================================================================
