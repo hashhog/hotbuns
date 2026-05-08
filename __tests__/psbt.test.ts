@@ -1120,3 +1120,191 @@ describe("PSBT Version", () => {
     expect(psbt.version === undefined || psbt.version === 0).toBe(true);
   });
 });
+
+// =============================================================================
+// W34-A: Subarray-aliasing regression tests (W32-B JS analog)
+//
+// `BufferReader.readVarBytes()` returns a `Buffer.subarray()` view over the
+// caller-provided input buffer. Every other PSBT-deserialize storage site
+// wraps with `Buffer.from(...)` to detach from the caller's bytes; the two
+// fixed sites (PSBT_IN_SCRIPTWITNESS, PSBT_OUT_TAP_TREE) didn't, and
+// `combine()`'s shallow array-ref copy propagated the aliasing across PSBTs.
+// =============================================================================
+
+describe("PSBT subarray-aliasing defensive copy (W34-A)", () => {
+  test("deserialize defensively copies finalScriptWitness items", () => {
+    // Build a PSBT with a non-trivial finalScriptWitness (sentinel bytes
+    // that we can detect post-mutation).
+    const psbt = createTestPSBT();
+    const sigSentinel = Buffer.alloc(71, 0xab);
+    const pubkeySentinel = Buffer.alloc(33, 0xcd);
+    psbt.inputs[0].finalScriptWitness = [sigSentinel, pubkeySentinel];
+
+    const serialized = serializePSBT(psbt);
+
+    // Use a single owning Buffer.from() so we have something to mutate.
+    const sourceBuffer = Buffer.from(serialized);
+    const deserialized = deserializePSBT(sourceBuffer);
+
+    expect(deserialized.inputs[0].finalScriptWitness).toBeDefined();
+    expect(deserialized.inputs[0].finalScriptWitness!.length).toBe(2);
+
+    // Snapshot the items as hex BEFORE mutating the source.
+    const item0Hex = deserialized.inputs[0].finalScriptWitness![0].toString("hex");
+    const item1Hex = deserialized.inputs[0].finalScriptWitness![1].toString("hex");
+    expect(item0Hex).toBe(sigSentinel.toString("hex"));
+    expect(item1Hex).toBe(pubkeySentinel.toString("hex"));
+
+    // Mutate the source buffer in place — overwrite EVERYTHING. If the
+    // deserialized PSBT held subarray views, this would corrupt the
+    // witness items (W32-B JS analog).
+    sourceBuffer.fill(0xff);
+
+    // Witness bytes in the in-memory PSBT must be unaffected.
+    expect(deserialized.inputs[0].finalScriptWitness![0].toString("hex")).toBe(
+      item0Hex,
+    );
+    expect(deserialized.inputs[0].finalScriptWitness![1].toString("hex")).toBe(
+      item1Hex,
+    );
+
+    // Round-trip: re-serializing must still yield the original witness bytes.
+    const reserialized = serializePSBT(deserialized);
+    const round = deserializePSBT(reserialized);
+    expect(round.inputs[0].finalScriptWitness![0].toString("hex")).toBe(
+      sigSentinel.toString("hex"),
+    );
+    expect(round.inputs[0].finalScriptWitness![1].toString("hex")).toBe(
+      pubkeySentinel.toString("hex"),
+    );
+  });
+
+  test("deserialize defensively copies tapTree leaf scripts", () => {
+    const psbt = createTestPSBT();
+    psbt.outputs[0].tapInternalKey = Buffer.alloc(32, 0x11);
+    const leaf0Script = Buffer.alloc(40, 0xde);
+    const leaf1Script = Buffer.alloc(50, 0xbe);
+    psbt.outputs[0].tapTree = [
+      { depth: 1, leafVersion: 0xc0, script: leaf0Script },
+      { depth: 1, leafVersion: 0xc0, script: leaf1Script },
+    ];
+
+    const serialized = serializePSBT(psbt);
+    const sourceBuffer = Buffer.from(serialized);
+    const deserialized = deserializePSBT(sourceBuffer);
+
+    expect(deserialized.outputs[0].tapTree?.length).toBe(2);
+    const leaf0Hex = deserialized.outputs[0].tapTree![0].script.toString("hex");
+    const leaf1Hex = deserialized.outputs[0].tapTree![1].script.toString("hex");
+    expect(leaf0Hex).toBe(leaf0Script.toString("hex"));
+    expect(leaf1Hex).toBe(leaf1Script.toString("hex"));
+
+    // Mutate source in place — if scripts are subarray views, they'd corrupt.
+    sourceBuffer.fill(0xff);
+
+    expect(deserialized.outputs[0].tapTree![0].script.toString("hex")).toBe(
+      leaf0Hex,
+    );
+    expect(deserialized.outputs[0].tapTree![1].script.toString("hex")).toBe(
+      leaf1Hex,
+    );
+
+    const reserialized = serializePSBT(deserialized);
+    const round = deserializePSBT(reserialized);
+    expect(round.outputs[0].tapTree![0].script.toString("hex")).toBe(
+      leaf0Script.toString("hex"),
+    );
+    expect(round.outputs[0].tapTree![1].script.toString("hex")).toBe(
+      leaf1Script.toString("hex"),
+    );
+  });
+
+  test("combine() deep-copies tapTree so source mutation cannot corrupt combined", () => {
+    // psbt1 has NO tapTree on output[0]; psbt2 DOES. The merge path at
+    // src→dst exercises the fix: dstOutput.tapTree was undefined, so the
+    // src tapTree is copied across — and must be deep-copied.
+    const psbt1 = createTestPSBT();
+    const psbt2 = createTestPSBT();
+
+    psbt2.outputs[0].tapInternalKey = Buffer.alloc(32, 0x22);
+    const srcLeafScript = Buffer.alloc(60, 0x77);
+    psbt2.outputs[0].tapTree = [
+      { depth: 1, leafVersion: 0xc0, script: srcLeafScript },
+    ];
+
+    // Serialize + deserialize psbt2 from an owning buffer so the in-memory
+    // psbt2.outputs[0].tapTree[0].script is itself derived from the buffer
+    // (post-fix: a defensive copy; pre-fix: a subarray view).
+    const psbt2Bytes = Buffer.from(serializePSBT(psbt2));
+    const psbt2Reloaded = deserializePSBT(psbt2Bytes);
+
+    const combined = combinePSBTs([psbt1, psbt2Reloaded]);
+    expect(combined.outputs[0].tapTree?.length).toBe(1);
+
+    const combinedScriptHexBefore = combined.outputs[0].tapTree![0].script.toString("hex");
+    expect(combinedScriptHexBefore).toBe(srcLeafScript.toString("hex"));
+
+    // Now mutate the SOURCE psbt2's bytes AND its in-memory leaf script.
+    // Pre-fix, both could alias into the combined PSBT's leaf:
+    //   - psbt2Bytes mutation would corrupt psbt2Reloaded's view, which the
+    //     combined inherited by reference at the array level.
+    //   - mutating psbt2Reloaded.outputs[0].tapTree[0].script in place would
+    //     corrupt the combined's leaf script directly (shared Buffer ref).
+    psbt2Bytes.fill(0xff);
+    psbt2Reloaded.outputs[0].tapTree![0].script.fill(0x00);
+
+    // Combined PSBT must be unaffected.
+    expect(combined.outputs[0].tapTree![0].script.toString("hex")).toBe(
+      combinedScriptHexBefore,
+    );
+
+    // And re-serializing the combined PSBT yields the original leaf bytes.
+    const reserialized = serializePSBT(combined);
+    const round = deserializePSBT(reserialized);
+    expect(round.outputs[0].tapTree![0].script.toString("hex")).toBe(
+      srcLeafScript.toString("hex"),
+    );
+  });
+
+  test("combine() deep-copies finalScriptWitness so source mutation cannot corrupt combined", () => {
+    // Same shape as the tapTree test, for the finalScriptWitness merge.
+    const psbt1 = createTestPSBT();
+    const psbt2 = createTestPSBT();
+
+    const sigBytes = Buffer.alloc(71, 0x33);
+    const pubkeyBytes = Buffer.alloc(33, 0x44);
+    psbt2.inputs[0].finalScriptWitness = [sigBytes, pubkeyBytes];
+
+    const psbt2Bytes = Buffer.from(serializePSBT(psbt2));
+    const psbt2Reloaded = deserializePSBT(psbt2Bytes);
+
+    const combined = combinePSBTs([psbt1, psbt2Reloaded]);
+    expect(combined.inputs[0].finalScriptWitness?.length).toBe(2);
+
+    const combinedSigHex = combined.inputs[0].finalScriptWitness![0].toString("hex");
+    const combinedPkHex = combined.inputs[0].finalScriptWitness![1].toString("hex");
+    expect(combinedSigHex).toBe(sigBytes.toString("hex"));
+    expect(combinedPkHex).toBe(pubkeyBytes.toString("hex"));
+
+    // Mutate source bytes AND in-memory items.
+    psbt2Bytes.fill(0xff);
+    psbt2Reloaded.inputs[0].finalScriptWitness![0].fill(0x00);
+    psbt2Reloaded.inputs[0].finalScriptWitness![1].fill(0x00);
+
+    expect(combined.inputs[0].finalScriptWitness![0].toString("hex")).toBe(
+      combinedSigHex,
+    );
+    expect(combined.inputs[0].finalScriptWitness![1].toString("hex")).toBe(
+      combinedPkHex,
+    );
+
+    const reserialized = serializePSBT(combined);
+    const round = deserializePSBT(reserialized);
+    expect(round.inputs[0].finalScriptWitness![0].toString("hex")).toBe(
+      sigBytes.toString("hex"),
+    );
+    expect(round.inputs[0].finalScriptWitness![1].toString("hex")).toBe(
+      pubkeyBytes.toString("hex"),
+    );
+  });
+});
