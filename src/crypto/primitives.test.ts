@@ -402,6 +402,80 @@ describe("Taproot tweak operations", () => {
     const expectedPubKey = privateKeyToXOnlyPubKey(tweakPrivateKey(privateKey, tweak));
     expect(tweakedPubKey.toString("hex")).toBe(expectedPubKey.toString("hex"));
   });
+
+  // BIP-86/BIP-341 even-Y negation regression test (W20).
+  //
+  // For an internal pubkey P = d*G with ODD Y, the BIP-341 spec mandates:
+  //   d' = (n - d + t) mod n
+  // not the naive
+  //   d' = (d + t) mod n
+  // because the on-chain x-only output key Q = lift_x(P) + t*G uses the
+  // even-Y branch of P. The pre-W20 implementation skipped this negation,
+  // so ~50% of internal keys produced a tweaked secret whose corresponding
+  // pubkey did NOT match Q, and Schnorr verification failed.
+  test("tweakPrivateKey: pubkey(d') matches tweaked output key for odd-Y internal key", () => {
+    // d=6 has ODD-Y internal pubkey (verified empirically; secp256k1 gen-3.G).
+    const skOddY = Buffer.alloc(32);
+    skOddY[31] = 6;
+    const compressed = privateKeyToPublicKey(skOddY, true);
+    expect(compressed[0]).toBe(0x03); // sanity: confirm odd-Y
+
+    const tweakHex = "1111111111111111111111111111111111111111111111111111111111111111";
+    const t = Buffer.from(tweakHex, "hex");
+
+    const dPrime = tweakPrivateKey(skOddY, t);
+
+    // pubkey of d' must equal the tweaked x-only output key.
+    const xOnlyP = compressed.subarray(1, 33);
+    const expectedQ = tweakPublicKey(xOnlyP, t);
+    const actualQ = privateKeyToXOnlyPubKey(dPrime);
+    expect(actualQ.toString("hex")).toBe(expectedQ.toString("hex"));
+  });
+
+  test("tweakPrivateKey: even-Y path unchanged (d=1 + t=5 == 6)", () => {
+    // d=1 has even-Y. With or without the BIP-341 negation patch, the
+    // result must be d + t = 6. This guards against accidentally negating
+    // *every* key.
+    const skEvenY = Buffer.alloc(32);
+    skEvenY[31] = 1;
+    const t = Buffer.alloc(32);
+    t[31] = 5;
+    const dPrime = tweakPrivateKey(skEvenY, t);
+    const expected = Buffer.alloc(32);
+    expected[31] = 6;
+    expect(dPrime.toString("hex")).toBe(expected.toString("hex"));
+  });
+
+  test("tweakPrivateKey + tweakPublicKey agree on 32 random keys", () => {
+    // Round-trip property: for every random internal key, the x-only of
+    // d' = tweakPrivateKey(d, t) MUST equal tweakPublicKey(x(d*G), t).
+    // Pre-fix this passed ~50% of the time; post-fix must be 32/32.
+    let pass = 0;
+    for (let i = 0; i < 32; i++) {
+      const sk = Buffer.from(
+        require("node:crypto").randomBytes(32) as Buffer
+      );
+      // ensure 0 < sk < n; @noble rejects out-of-range internally on use
+      if (!isValidPrivateKey(sk)) continue;
+      const compressed = privateKeyToPublicKey(sk, true);
+      const xOnlyP = compressed.subarray(1, 33);
+      const t = Buffer.from(
+        require("node:crypto").randomBytes(32) as Buffer
+      );
+      // Tweak must be < n; rerun if not (vanishingly unlikely).
+      const tBig = BigInt("0x" + t.toString("hex"));
+      const n = BigInt(
+        "0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141"
+      );
+      if (tBig === 0n || tBig >= n) continue;
+
+      const dPrime = tweakPrivateKey(sk, t);
+      const qFromPriv = privateKeyToXOnlyPubKey(dPrime);
+      const qFromPub = tweakPublicKey(xOnlyP, t);
+      if (qFromPriv.toString("hex") === qFromPub.toString("hex")) pass++;
+    }
+    expect(pass).toBeGreaterThanOrEqual(28); // allow a few skips on RNG misses
+  });
 });
 
 describe("sha256d64 (Merkle tree optimization)", () => {

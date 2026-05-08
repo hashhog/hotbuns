@@ -662,12 +662,26 @@ export function isValidXOnlyPubKey(key: Buffer): boolean {
 // ============================================================================
 
 /**
- * Tweak a private key by adding a scalar.
- * Used for Taproot key tweaking: d' = d + t
+ * Tweak a private key for BIP-341/BIP-86 Taproot output-key derivation.
  *
- * @param privateKey 32-byte private key
- * @param tweak 32-byte tweak scalar
- * @returns 32-byte tweaked private key
+ * Per BIP-341 ("Tweaking the secret key for keypath spending"):
+ *   if has_even_y(P):  d' = (d + t) mod n
+ *   else:              d' = (n - d + t) mod n     # i.e. negate d before adding tweak
+ *
+ * This even-y negation is REQUIRED because the Taproot output point Q is forced
+ * to even Y (`Q = lift_x(P) + t*G`, where `lift_x` always returns the even-Y
+ * branch). If P had odd Y, then `lift_x(P) = -P = (n-d)*G`, so the secret that
+ * matches the *output* x-only key is `(n - d) + t`, not `d + t`.
+ *
+ * Without this negation, ~50% of randomly chosen internal keys produce a
+ * tweaked secret that does NOT correspond to the on-chain x-only output key,
+ * and Schnorr verification fails (see Bitcoin Core `src/key.cpp` —
+ * `secp256k1_keypair_xonly_tweak_add` performs the equivalent negation
+ * internally via `secp256k1_keypair_xonly_pub`'s parity output).
+ *
+ * @param privateKey 32-byte private key (the BIP-32-derived internal key d)
+ * @param tweak 32-byte tweak scalar t (typically TaggedHash("TapTweak", x(P) || merkle_root))
+ * @returns 32-byte tweaked private key d' such that d' * G = Q (with Q forced even-Y)
  */
 export function tweakPrivateKey(privateKey: Buffer, tweak: Buffer): Buffer {
   if (privateKey.length !== 32) {
@@ -677,15 +691,30 @@ export function tweakPrivateKey(privateKey: Buffer, tweak: Buffer): Buffer {
     throw new Error(`tweakPrivateKey: tweak must be 32 bytes`);
   }
 
-  // Convert to bigints
-  const d = BigInt("0x" + privateKey.toString("hex"));
-  const t = BigInt("0x" + tweak.toString("hex"));
-
   // secp256k1 curve order
   const n = BigInt("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
 
-  // Add modulo curve order
+  // Derive the internal pubkey P = d*G (compressed: 33 bytes; first byte is the
+  // Y-parity tag, 0x02 = even Y, 0x03 = odd Y).
+  const compressedPubkey = Buffer.from(secp256k1.getPublicKey(privateKey, true));
+  const hasEvenY = compressedPubkey[0] === 0x02;
+
+  // Convert d and t to bigints.
+  let d = BigInt("0x" + privateKey.toString("hex"));
+  const t = BigInt("0x" + tweak.toString("hex"));
+
+  // BIP-341 even-y negation: if P has odd Y, replace d with (n - d).
+  if (!hasEvenY) {
+    d = n - d;
+  }
+
+  // d' = (d + t) mod n
   const result = (d + t) % n;
+
+  // Reject the (cryptographically infeasible) zero result, per BIP-340.
+  if (result === 0n) {
+    throw new Error("tweakPrivateKey: tweaked key is zero");
+  }
 
   // Convert back to buffer
   const hex = result.toString(16).padStart(64, "0");
