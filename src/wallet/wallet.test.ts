@@ -3,7 +3,14 @@ import { rmSync, mkdirSync } from "fs";
 import { Wallet, type WalletConfig, type WalletUTXO } from "./wallet";
 import { AddressType, decodeAddress } from "../address/encoding";
 import { hash160, privateKeyToPublicKey, ecdsaVerify } from "../crypto/primitives";
-import { sigHashWitnessV0, SIGHASH_ALL, type Transaction } from "../validation/tx";
+import {
+  sigHashWitnessV0,
+  sigHashTaproot,
+  SIGHASH_ALL,
+  type Transaction,
+  type TaprootSigHashCache,
+} from "../validation/tx";
+import { schnorr } from "@noble/curves/secp256k1.js";
 
 const TEST_DATADIR = "/tmp/hotbuns-wallet-test";
 
@@ -937,5 +944,181 @@ describe("Advanced coin selection", () => {
     // Should select inputs
     expect(result.inputs.length).toBeGreaterThanOrEqual(1);
     expect(result.fee).toBeGreaterThan(0n);
+  });
+});
+
+/**
+ * BIP-86 / BIP-341 P2TR signing tests (W20).
+ *
+ * Pre-W20 hotbuns had two correctness bugs:
+ *   P0-1: tweakPrivateKey skipped BIP-341 even-y negation (~50% sigs invalid).
+ *   P0-2: signP2TRInput's sigHashTaproot was a stub: zero-buffer placeholder
+ *         for sha_scriptPubKeys, only the active input's amount in
+ *         sha_amounts, hard-coded spend_type 0.
+ *
+ * These tests drive the full createTransaction → signP2TRInput path and
+ * verify the resulting witness against the on-chain x-only output key with
+ * BIP-340 schnorr.verify. A failing P0-1 produces sigs that fail verify
+ * roughly half the time; a failing P0-2 produces sigs that disagree with
+ * consensus for any tx with >1 input.
+ */
+describe("P2TR signing (BIP-86 + BIP-341)", () => {
+  beforeEach(() => {
+    mkdirSync(TEST_DATADIR, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(TEST_DATADIR, { recursive: true, force: true });
+  });
+
+  // BIP-86 mainnet vector 1.
+  test("BIP-86 vector 1: m/86'/0'/0'/0/0 from abandon mnemonic = bc1p5cyx...drcr", () => {
+    const wallet = Wallet.create(createTestConfig("mainnet"), TEST_MNEMONIC);
+    const addr = wallet.getNewAddress("bech32m");
+    expect(addr).toBe(
+      "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"
+    );
+  });
+
+  /**
+   * Helper: spin a fresh wallet, fund it with `numInputs` P2TR UTXOs at
+   * `addr`, build a tx that pays half the total to a P2WPKH change addr,
+   * sign it via createTransaction, then verify each P2TR witness against
+   * the corresponding output key Q. Returns true iff all signatures verify.
+   */
+  function signAndVerifyP2TR(
+    wallet: Wallet,
+    addr: string,
+    numInputs: number,
+    perUtxoAmount: bigint
+  ): { tx: Transaction; allValid: boolean; details: string[] } {
+    // Fund the wallet.
+    for (let i = 0; i < numInputs; i++) {
+      const txid = Buffer.alloc(32);
+      txid[0] = i + 1;
+      wallet.addUTXO({
+        outpoint: { txid, vout: 0 },
+        amount: perUtxoAmount,
+        address: addr,
+        keyPath: "m/86'/0'/0'/0/0",
+        confirmations: 6,
+        addressType: AddressType.P2TR,
+        isCoinbase: false,
+      });
+    }
+
+    const total = perUtxoAmount * BigInt(numInputs);
+    const sendAmount = total / 2n; // leave room for fee + change
+    const dest = "bc1q8c6fshw2dlwun7ekn9qwf37cu2rn755upcp6el"; // P2WPKH
+
+    const tx = wallet.createTransaction(
+      [{ address: dest, amount: sendAmount }],
+      1
+    );
+
+    // Re-derive the prevOuts vector that signing committed to. Since we know
+    // every input came from `addr`, the scriptPubKey is OP_1 <x-only(Q)>.
+    const dec = decodeAddress(addr);
+    expect(dec.type).toBe(AddressType.P2TR);
+    const spk = Buffer.concat([Buffer.from([0x51, 0x20]), dec.hash]);
+    const prevOuts = tx.inputs.map(() => ({
+      scriptPubKey: spk,
+      value: perUtxoAmount,
+    }));
+
+    // Verify every P2TR witness signature against the tweaked output key.
+    const details: string[] = [];
+    let allValid = true;
+    for (let i = 0; i < tx.inputs.length; i++) {
+      const witness = tx.inputs[i].witness;
+      // SIGHASH_DEFAULT → 64-byte sig with no trailing byte.
+      if (witness.length !== 1) {
+        allValid = false;
+        details.push(`input ${i}: witness has ${witness.length} items, expected 1`);
+        continue;
+      }
+      const sig = witness[0];
+      if (sig.length !== 64) {
+        allValid = false;
+        details.push(`input ${i}: sig length ${sig.length}, expected 64`);
+        continue;
+      }
+
+      const cache: TaprootSigHashCache = {};
+      const sighash = sigHashTaproot(
+        tx,
+        i,
+        prevOuts,
+        0x00, // SIGHASH_DEFAULT
+        0,
+        undefined,
+        undefined,
+        undefined,
+        0xffffffff,
+        cache
+      );
+      const ok = schnorr.verify(sig, sighash, dec.hash);
+      if (!ok) {
+        allValid = false;
+        details.push(`input ${i}: schnorr.verify FAILED`);
+      }
+    }
+    return { tx, allValid, details };
+  }
+
+  test("single-input P2TR sign + Schnorr verify (sanity, post-P0-1 fix)", () => {
+    const wallet = Wallet.create(createTestConfig("mainnet"), TEST_MNEMONIC);
+    const addr = wallet.getNewAddress("bech32m");
+    const result = signAndVerifyP2TR(wallet, addr, 1, 200_000n);
+    expect(result.allValid).toBe(true);
+  });
+
+  // The hard test: 3-input multi-output. Pre-P0-2 the placeholder
+  // sha_scriptPubKeys + truncated sha_amounts produces a sighash that
+  // disagrees with consensus, and `schnorr.verify` against the real
+  // output key fails.
+  test("3-input multi-output P2TR sign + Schnorr verify (full BIP-341)", () => {
+    const wallet = Wallet.create(createTestConfig("mainnet"), TEST_MNEMONIC);
+    const addr = wallet.getNewAddress("bech32m");
+    const result = signAndVerifyP2TR(wallet, addr, 3, 100_000n);
+    if (!result.allValid) {
+      // Help debug if this fails.
+      // eslint-disable-next-line no-console
+      console.error("multi-input P2TR verify failed:", result.details);
+    }
+    expect(result.allValid).toBe(true);
+  });
+
+  // 16-iteration random round-trip. Pre-P0-1 + P0-2 this would fail
+  // ~50% of the time on the even-y negation alone.
+  test("16-iteration random round-trip: sign + Schnorr verify (16/16 must pass)", () => {
+    let pass = 0;
+    const failures: string[] = [];
+    for (let iter = 0; iter < 16; iter++) {
+      const dir = `${TEST_DATADIR}-iter-${iter}`;
+      try {
+        rmSync(dir, { recursive: true, force: true });
+        mkdirSync(dir, { recursive: true });
+        // Random seed via a randomly-derived "mnemonic"-shaped wallet.
+        // We use Wallet.create with no mnemonic (random seed) so each
+        // iteration exercises a different internal key.
+        const wallet = Wallet.create({ datadir: dir, network: "mainnet" });
+        const addr = wallet.getNewAddress("bech32m");
+        const numInputs = 1 + (iter % 3); // 1, 2, or 3 inputs
+        const result = signAndVerifyP2TR(wallet, addr, numInputs, 250_000n);
+        if (result.allValid) {
+          pass++;
+        } else {
+          failures.push(`iter ${iter}: ${result.details.join(", ")}`);
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    if (pass !== 16) {
+      // eslint-disable-next-line no-console
+      console.error("Random P2TR round-trip failures:", failures);
+    }
+    expect(pass).toBe(16);
   });
 });
