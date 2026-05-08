@@ -19,6 +19,11 @@ import { randomBytes } from "@noble/ciphers/utils.js";
 import * as crypto from "node:crypto";
 
 import {
+  validateMnemonic as bip39ValidateMnemonic,
+  parseMnemonicString as bip39ParseMnemonicString,
+} from "./bip39.js";
+
+import {
   hash160,
   privateKeyToPublicKey,
   ecdsaSign,
@@ -241,14 +246,27 @@ export class Wallet {
   /**
    * Create a new wallet from a BIP-39 mnemonic or random seed.
    * If no mnemonic is provided, generates a random 32-byte seed.
+   *
+   * NOTE: Per BIP-39 spec, `mnemonicToSeed` (the PBKDF2-SHA512 call below)
+   * does NOT validate — any UTF-8 string produces *some* seed. The checksum
+   * gate must be applied at the user-input boundary so that a typo'd
+   * mnemonic fails loudly here instead of silently producing a different
+   * but plausible-looking wallet. (Same UX hazard the W21 ouroboros agent
+   * flagged for `WalletManager.create_wallet`.)
    */
   static create(config: WalletConfig, mnemonic?: string): Wallet {
     const wallet = new Wallet(config);
 
     if (mnemonic) {
-      // BIP-39: Convert mnemonic to seed using PBKDF2
-      // Password is "mnemonic" + optional passphrase (empty here)
-      const mnemonicBuffer = Buffer.from(mnemonic.normalize("NFKD"), "utf-8");
+      // Validate the mnemonic at the boundary: word count, wordlist
+      // membership, and checksum. Throws with a clear error on failure.
+      const words = bip39ParseMnemonicString(mnemonic);
+      bip39ValidateMnemonic(words);
+
+      // BIP-39: Convert mnemonic to seed using PBKDF2.
+      // Password is "mnemonic" + optional passphrase (empty here).
+      // We feed the normalized space-joined sentence (NFKD per spec).
+      const mnemonicBuffer = Buffer.from(words.join(" ").normalize("NFKD"), "utf-8");
       const salt = Buffer.from("mnemonic", "utf-8");
       wallet.seed = Buffer.from(
         pbkdf2(sha512, mnemonicBuffer, salt, { c: 2048, dkLen: 64 })
