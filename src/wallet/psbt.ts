@@ -781,7 +781,11 @@ function deserializePSBTInput(pairs: Array<[Buffer, Buffer]>): PSBTInput {
         const witnessCount = witnessReader.readVarInt();
         input.finalScriptWitness = [];
         for (let i = 0; i < witnessCount; i++) {
-          input.finalScriptWitness.push(witnessReader.readVarBytes());
+          // W34-A: Buffer.from() defensive copy to detach from the caller's
+          // input Buffer. readVarBytes returns a subarray view; without this
+          // copy, mutating the source PSBT bytes after deserialize would
+          // corrupt our stored witness items (W32-B JS analog).
+          input.finalScriptWitness.push(Buffer.from(witnessReader.readVarBytes()));
         }
         seenKeys.add(keyHex);
         break;
@@ -972,7 +976,11 @@ function deserializePSBTOutput(pairs: Array<[Buffer, Buffer]>): PSBTOutput {
         while (treeReader.remaining > 0) {
           const depth = treeReader.readUInt8();
           const leafVersion = treeReader.readUInt8();
-          const script = treeReader.readVarBytes();
+          // W34-A: Buffer.from() defensive copy to detach from the caller's
+          // input Buffer. readVarBytes returns a subarray view; without this
+          // copy, mutating the source PSBT bytes after deserialize would
+          // corrupt our stored tapTree script (W32-B JS analog).
+          const script = Buffer.from(treeReader.readVarBytes());
           output.tapTree.push({ depth, leafVersion, script });
         }
         seenKeys.add(keyHex);
@@ -1525,7 +1533,13 @@ export function combinePSBTs(psbts: PSBT[]): PSBT {
         dstInput.finalScriptSig = srcInput.finalScriptSig;
       }
       if (srcInput.finalScriptWitness && !dstInput.finalScriptWitness) {
-        dstInput.finalScriptWitness = srcInput.finalScriptWitness;
+        // W34-A: deep-copy each Buffer when shallow-copying the array ref.
+        // Otherwise the combined PSBT shares underlying buffers with the
+        // source PSBT — a later mutation of the source's bytes (or the
+        // caller's deserialized buffer) would corrupt the combined PSBT.
+        dstInput.finalScriptWitness = srcInput.finalScriptWitness.map((b) =>
+          Buffer.from(b),
+        );
       }
 
       // Merge taproot
@@ -1584,7 +1598,14 @@ export function combinePSBTs(psbts: PSBT[]): PSBT {
         dstOutput.tapInternalKey = srcOutput.tapInternalKey;
       }
       if (srcOutput.tapTree && !dstOutput.tapTree) {
-        dstOutput.tapTree = srcOutput.tapTree;
+        // W34-A: deep-copy each leaf's script Buffer when shallow-copying
+        // the array ref. Otherwise the combined PSBT shares underlying
+        // script buffers with the source PSBT.
+        dstOutput.tapTree = srcOutput.tapTree.map((leaf) => ({
+          depth: leaf.depth,
+          leafVersion: leaf.leafVersion,
+          script: Buffer.from(leaf.script),
+        }));
       }
 
       for (const [key, value] of srcOutput.bip32Derivation) {
