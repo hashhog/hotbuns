@@ -1818,6 +1818,48 @@ export function finalizePSBTInput(psbt: PSBT, inputIndex: number): boolean {
       clearSigningData(input);
       return true;
     }
+
+    // Legacy P2SH-multisig (BIP-11):
+    //   redeemScript = OP_M <pk1> ... <pkN> OP_N OP_CHECKMULTISIG
+    //
+    // Build scriptSig = OP_0 sig1 ... sigM PUSH(redeemScript). Signatures must
+    // be ordered to match pubkey-position in the redeemScript (CHECKMULTISIG
+    // is order-sensitive — see ProduceSignature in bitcoin-core/src/script/sign.cpp
+    // and the existing buildP2WSHWitness logic above).
+    {
+      const parsed = parseMultisigScript(redeemScript);
+      if (parsed) {
+        const { m, pubkeys } = parsed;
+
+        const orderedSigs: Buffer[] = [];
+        for (const pk of pubkeys) {
+          const entry = input.partialSigs.get(pk.toString("hex"));
+          if (entry) {
+            orderedSigs.push(entry.signature);
+            if (orderedSigs.length === m) {
+              break;
+            }
+          }
+        }
+        if (orderedSigs.length < m) {
+          return false;
+        }
+
+        // Bare CHECKMULTISIG dummy must be the empty pushdata in legacy P2SH
+        // too (NULLDUMMY: STANDARD post-BIP-147).
+        const parts: Buffer[] = [Buffer.from([0x00])];
+        for (const sig of orderedSigs) {
+          parts.push(pushData(sig));
+        }
+        parts.push(pushData(redeemScript));
+
+        input.finalScriptSig = Buffer.concat(parts);
+        input.finalScriptWitness = undefined;
+
+        clearSigningData(input);
+        return true;
+      }
+    }
   }
 
   // Native P2WSH: OP_0 <32 bytes>
