@@ -44,10 +44,13 @@ describe("network constants", () => {
     expect(MAINNET.maxCoins).toBe(2_100_000_000_000_000n);
   });
 
-  test("services field has correct flags", () => {
-    // NODE_NETWORK (1) | NODE_WITNESS (8) | NODE_NETWORK_LIMITED (1024)
-    expect(MAINNET.services).toBe(0x0409n);
-    expect(MAINNET.services).toBe(1n | 8n | 1024n);
+  test("services field defaults to NETWORK | WITNESS (NETWORK_LIMITED is conditional)", () => {
+    // NODE_NETWORK (1) | NODE_WITNESS (8) = 9.
+    // NODE_NETWORK_LIMITED (1024) is OR'd in by PeerManager when --prune>0
+    // (see p2p/manager.ts:638-640, mirrors Core's init.cpp).  Tested
+    // separately in p2p/manager.test.ts via getAdvertisedServices().
+    expect(MAINNET.services).toBe(0x09n);
+    expect(MAINNET.services).toBe(1n | 8n);
   });
 
   test("difficulty adjustment interval is 2016 blocks", () => {

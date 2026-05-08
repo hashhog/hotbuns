@@ -344,6 +344,11 @@ export class PeerManager {
       connect: config.connect,
       listen: config.listen ?? true,
       port: config.port ?? config.params.defaultPort,
+      // BIP-159: must be retained so the OR-in sites at lines ~638 (outbound)
+      // and ~1881 (inbound) can advertise NODE_NETWORK_LIMITED when the
+      // operator passed --prune>0.  Previously dropped, defeating the
+      // service-bit-gate even when cli.ts plumbed the flag through.
+      pruneMode: config.pruneMode ?? false,
     };
     this.peers = new Map();
     this.knownAddresses = new Map();
@@ -407,6 +412,20 @@ export class PeerManager {
    */
   clearV1OnlyCache(): void {
     this.v1OnlyCache.clear();
+  }
+
+  /**
+   * Resolved service-bit field advertised in outbound + inbound version
+   * handshakes, identical to the value computed at the connect/listen sites
+   * (lines ~638 and ~1881).  When `pruneMode === true`, OR's in
+   * NODE_NETWORK_LIMITED (1<<10 = 0x400) per BIP-159 / Core's
+   * `init.cpp` rule.  Exposed primarily so tests can pin the
+   * --prune→service-bit wiring without poking at private state.
+   */
+  getAdvertisedServices(): bigint {
+    return this.config.pruneMode
+      ? (this.config.params.services | ServiceFlags.NODE_NETWORK_LIMITED)
+      : this.config.params.services;
   }
 
   /**
