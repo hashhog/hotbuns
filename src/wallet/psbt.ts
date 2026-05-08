@@ -26,6 +26,7 @@ import {
 } from "../validation/tx.js";
 import {
   hash160,
+  sha256Hash,
   ecdsaSign,
   ecdsaVerify,
   taggedHash,
@@ -1334,7 +1335,7 @@ export function signPSBTInput(
     // Legacy P2PKH
     sighash = sigHashLegacy(psbt.tx, inputIndex, scriptPubKey, sighashType);
   }
-  // Check for P2SH-P2WPKH
+  // Check for P2SH-wrapped: OP_HASH160 <20 bytes> OP_EQUAL
   else if (
     scriptPubKey.length === 23 &&
     scriptPubKey[0] === 0xa9 &&
@@ -1342,8 +1343,14 @@ export function signPSBTInput(
     scriptPubKey[22] === 0x87 &&
     input.redeemScript
   ) {
-    // P2SH-P2WPKH: check if redeem script is P2WPKH
     const redeemScript = input.redeemScript;
+
+    // Verify redeemScript hashes to scriptPubKey commitment.
+    if (!hash160(redeemScript).equals(scriptPubKey.subarray(2, 22))) {
+      throw new Error("redeemScript does not match P2SH scriptPubKey");
+    }
+
+    // P2SH-P2WPKH: redeemScript = OP_0 <20 bytes>
     if (
       redeemScript.length === 22 &&
       redeemScript[0] === 0x00 &&
@@ -1364,9 +1371,46 @@ export function signPSBTInput(
       ]);
 
       sighash = sigHashWitnessV0(psbt.tx, inputIndex, scriptCode, utxo.value, sighashType);
+    }
+    // P2SH-P2WSH: redeemScript = OP_0 <32 bytes>
+    else if (
+      redeemScript.length === 34 &&
+      redeemScript[0] === 0x00 &&
+      redeemScript[1] === 0x20 &&
+      input.witnessScript
+    ) {
+      const witnessScript = input.witnessScript;
+
+      // BIP-143: scriptCode for P2WSH sighash is sha256(witnessScript) committed in
+      // the redeemScript; verify match.
+      const wsHash = sha256Hash(witnessScript);
+      if (!redeemScript.subarray(2).equals(wsHash)) {
+        throw new Error("witnessScript does not match P2SH-P2WSH redeemScript commitment");
+      }
+
+      // For P2WSH the BIP-143 scriptCode IS the witnessScript itself.
+      sighash = sigHashWitnessV0(psbt.tx, inputIndex, witnessScript, utxo.value, sighashType);
     } else {
       throw new Error("Unsupported P2SH script type");
     }
+  }
+  // Native P2WSH: OP_0 <32 bytes>
+  else if (
+    scriptPubKey.length === 34 &&
+    scriptPubKey[0] === 0x00 &&
+    scriptPubKey[1] === 0x20 &&
+    input.witnessScript
+  ) {
+    const witnessScript = input.witnessScript;
+
+    // Verify witnessScript hashes to the scriptPubKey commitment.
+    const wsHash = sha256Hash(witnessScript);
+    if (!scriptPubKey.subarray(2).equals(wsHash)) {
+      throw new Error("witnessScript does not match P2WSH scriptPubKey");
+    }
+
+    // BIP-143: scriptCode for P2WSH sighash is the witnessScript itself.
+    sighash = sigHashWitnessV0(psbt.tx, inputIndex, witnessScript, utxo.value, sighashType);
   } else {
     throw new Error("Unsupported script type for signing");
   }
@@ -1638,7 +1682,7 @@ export function finalizePSBTInput(psbt: PSBT, inputIndex: number): boolean {
     return true;
   }
 
-  // P2SH-P2WPKH
+  // P2SH-wrapped (P2SH-P2WPKH or P2SH-P2WSH)
   if (
     scriptPubKey.length === 23 &&
     scriptPubKey[0] === 0xa9 &&
@@ -1648,7 +1692,7 @@ export function finalizePSBTInput(psbt: PSBT, inputIndex: number): boolean {
   ) {
     const redeemScript = input.redeemScript;
 
-    // Check if P2WPKH wrapped in P2SH
+    // P2SH-P2WPKH: redeemScript = OP_0 <20 bytes>
     if (
       redeemScript.length === 22 &&
       redeemScript[0] === 0x00 &&
@@ -1669,10 +1713,163 @@ export function finalizePSBTInput(psbt: PSBT, inputIndex: number): boolean {
       clearSigningData(input);
       return true;
     }
+
+    // P2SH-P2WSH: redeemScript = OP_0 <32 bytes>
+    if (
+      redeemScript.length === 34 &&
+      redeemScript[0] === 0x00 &&
+      redeemScript[1] === 0x20 &&
+      input.witnessScript
+    ) {
+      const witnessScript = input.witnessScript;
+      const witness = buildP2WSHWitness(witnessScript, input.partialSigs);
+      if (!witness) {
+        return false;
+      }
+
+      // scriptSig wraps the segwit redeemScript
+      input.finalScriptSig = pushData(redeemScript);
+      input.finalScriptWitness = witness;
+
+      clearSigningData(input);
+      return true;
+    }
+  }
+
+  // Native P2WSH: OP_0 <32 bytes>
+  if (
+    scriptPubKey.length === 34 &&
+    scriptPubKey[0] === 0x00 &&
+    scriptPubKey[1] === 0x20 &&
+    input.witnessScript
+  ) {
+    const witnessScript = input.witnessScript;
+    const witness = buildP2WSHWitness(witnessScript, input.partialSigs);
+    if (!witness) {
+      return false;
+    }
+
+    input.finalScriptSig = Buffer.alloc(0);
+    input.finalScriptWitness = witness;
+
+    clearSigningData(input);
+    return true;
   }
 
   // Unsupported script type
   return false;
+}
+
+/**
+ * Build the witness stack for a P2WSH input given a witnessScript and a set of
+ * partial signatures.
+ *
+ * Currently supports two witnessScript shapes:
+ *   • Single-key CHECKSIG: `<pubkey> OP_CHECKSIG` → witness `[sig, witnessScript]`
+ *   • Bare M-of-N CHECKMULTISIG (BIP-11):
+ *       `OP_M <pubkey1> ... <pubkeyN> OP_N OP_CHECKMULTISIG`
+ *     → witness `[OP_0 dummy, sig1, ..., sigM, witnessScript]`
+ *     where signatures are ordered to match the order of their pubkeys in
+ *     witnessScript (CHECKMULTISIG checks signatures in pubkey order).
+ *
+ * Returns `undefined` if the script is unsupported or the partial-signature set
+ * is insufficient.
+ */
+function buildP2WSHWitness(
+  witnessScript: Buffer,
+  partialSigs: Map<string, { pubkey: Buffer; signature: Buffer }>
+): Buffer[] | undefined {
+  const parsed = parseMultisigScript(witnessScript);
+  if (parsed) {
+    const { m, pubkeys } = parsed;
+
+    // Pick the first M signatures whose pubkey appears in the script,
+    // preserving script-pubkey order (CHECKMULTISIG bug requires this).
+    const orderedSigs: Buffer[] = [];
+    for (const pk of pubkeys) {
+      const entry = partialSigs.get(pk.toString("hex"));
+      if (entry) {
+        orderedSigs.push(entry.signature);
+        if (orderedSigs.length === m) {
+          break;
+        }
+      }
+    }
+    if (orderedSigs.length < m) {
+      return undefined;
+    }
+
+    // CHECKMULTISIG expects an extra dummy item on the stack (the OP_CHECKMULTISIG
+    // off-by-one bug).  In bare segwit-v0 P2WSH that dummy MUST be the empty
+    // pushdata (NULLDUMMY: STANDARD post-BIP-147, MANDATORY post-segwit).
+    return [Buffer.alloc(0), ...orderedSigs, witnessScript];
+  }
+
+  // Single-key CHECKSIG: <pubkey> OP_CHECKSIG
+  // Layout: 0x21 <33-byte pubkey> 0xac  → length 35
+  if (
+    witnessScript.length === 35 &&
+    witnessScript[0] === 0x21 &&
+    witnessScript[34] === 0xac
+  ) {
+    const pubkey = witnessScript.subarray(1, 34);
+    const entry = partialSigs.get(pubkey.toString("hex"));
+    if (!entry) {
+      return undefined;
+    }
+    return [entry.signature, witnessScript];
+  }
+
+  // Unknown witnessScript shape — caller can still pre-populate
+  // finalScriptWitness manually if needed.
+  return undefined;
+}
+
+/**
+ * Parse a bare M-of-N CHECKMULTISIG script (BIP-11 layout):
+ *   OP_M <pubkey1> ... <pubkeyN> OP_N OP_CHECKMULTISIG
+ *
+ * Each pubkey may be 33 (compressed) or 65 (uncompressed) bytes; we accept
+ * either shape because P2WSH script validation does not enforce compression.
+ *
+ * Returns `undefined` if the script does not match the multisig template.
+ */
+function parseMultisigScript(
+  script: Buffer
+): { m: number; n: number; pubkeys: Buffer[] } | undefined {
+  if (script.length < 1 + 1 + 1) return undefined;
+  // Trailing byte must be OP_CHECKMULTISIG (0xae).
+  if (script[script.length - 1] !== 0xae) return undefined;
+
+  // OP_1..OP_16 are 0x51..0x60 in the interpreter.
+  const mOp = script[0];
+  if (mOp < 0x51 || mOp > 0x60) return undefined;
+  const m = mOp - 0x50;
+
+  const nOp = script[script.length - 2];
+  if (nOp < 0x51 || nOp > 0x60) return undefined;
+  const n = nOp - 0x50;
+
+  if (m < 1 || m > n || n > 16) return undefined;
+
+  // Walk pubkeys between OP_M and OP_N.  Each pubkey is a single push:
+  //   0x21 <33 bytes>   (compressed)
+  //   0x41 <65 bytes>   (uncompressed)
+  const pubkeys: Buffer[] = [];
+  let i = 1;
+  const end = script.length - 2;
+  while (i < end) {
+    const pushLen = script[i];
+    if (pushLen !== 0x21 && pushLen !== 0x41) return undefined;
+    const expected = pushLen;
+    if (i + 1 + expected > end) return undefined;
+    pubkeys.push(script.subarray(i + 1, i + 1 + expected));
+    i += 1 + expected;
+  }
+  if (i !== end) return undefined;
+  if (pubkeys.length !== n) return undefined;
+
+  return { m, n, pubkeys };
 }
 
 /**
