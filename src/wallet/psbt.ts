@@ -1157,6 +1157,23 @@ export function decodePSBTBase64(base64: string): PSBT {
 
 /**
  * Get the UTXO for a PSBT input.
+ *
+ * When both `witnessUtxo` and `nonWitnessUtxo` are present, this function
+ * cross-checks that the `witnessUtxo` agrees byte-for-byte with the
+ * outpoint-indexed entry from the full prevtx (`nonWitnessUtxo.outputs[vout]`).
+ * A mismatch is rejected with a clear error rather than silently trusting the
+ * witness amount.
+ *
+ * This is the post-CVE-2020-14199 amount oracle defense: a malicious upstream
+ * party can lie about a `witnessUtxo.value` to trick the signer into
+ * authorizing a much larger fee than it intended. Bitcoin Core mitigates this
+ * in `wallet/scriptpubkeyman.cpp` by re-deriving the amount from the
+ * `nonWitnessUtxo` whenever it's available; we fail closed if the two
+ * disagree (either tampering or operator error). Mirrors `PSBTInput::IsSane`
+ * (`bitcoin-core/src/psbt.cpp`) intent.
+ *
+ * Note: A1 (`nonWitnessUtxo` txid vs outpoint) is enforced earlier on
+ * deserialize at `deserializePSBT` (psbt.ts:1107-1116) and is preserved.
  */
 export function getInputUTXO(psbt: PSBT, inputIndex: number): TxOut | undefined {
   if (inputIndex < 0 || inputIndex >= psbt.inputs.length) {
@@ -1165,6 +1182,37 @@ export function getInputUTXO(psbt: PSBT, inputIndex: number): TxOut | undefined 
 
   const input = psbt.inputs[inputIndex];
   const txInput = psbt.tx.inputs[inputIndex];
+
+  // CVE-2020-14199 cross-check: when both UTXO fields are present, the
+  // `witnessUtxo` MUST match the corresponding output of `nonWitnessUtxo`.
+  // This prevents a hostile updater from feeding the signer a forged amount
+  // that bypasses BIP-143's value commitment guarantee. Bitcoin Core's
+  // wallet code performs the equivalent rederivation in
+  // `wallet/scriptpubkeyman.cpp`.
+  if (input.witnessUtxo && input.nonWitnessUtxo) {
+    const vout = txInput.prevOut.vout;
+    if (vout >= input.nonWitnessUtxo.outputs.length) {
+      throw new Error(
+        `PSBT input ${inputIndex}: vout ${vout} out of range for nonWitnessUtxo ` +
+          `(${input.nonWitnessUtxo.outputs.length} outputs)`
+      );
+    }
+    const fromFullTx = input.nonWitnessUtxo.outputs[vout];
+    if (input.witnessUtxo.value !== fromFullTx.value) {
+      throw new Error(
+        `PSBT input ${inputIndex}: witnessUtxo.value (${input.witnessUtxo.value}) ` +
+          `does not match nonWitnessUtxo.outputs[${vout}].value (${fromFullTx.value}); ` +
+          `refusing to sign (CVE-2020-14199)`
+      );
+    }
+    if (!input.witnessUtxo.scriptPubKey.equals(fromFullTx.scriptPubKey)) {
+      throw new Error(
+        `PSBT input ${inputIndex}: witnessUtxo.scriptPubKey does not match ` +
+          `nonWitnessUtxo.outputs[${vout}].scriptPubKey; refusing to sign ` +
+          `(CVE-2020-14199)`
+      );
+    }
+  }
 
   // Prefer witness UTXO
   if (input.witnessUtxo) {
