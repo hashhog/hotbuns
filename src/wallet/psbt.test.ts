@@ -23,8 +23,11 @@ import {
   SIGHASH_ALL,
 } from "../validation/tx";
 import {
+  addPartialSignature,
   createPSBT,
+  finalizePSBTInput,
   getInputUTXO,
+  isInputFinalized,
   signPSBTInput,
 } from "./psbt";
 
@@ -236,5 +239,147 @@ describe("PSBT WITNESS_UTXO cross-check (CVE-2020-14199, W41)", () => {
     psbt.inputs[0].witnessUtxo = { value, scriptPubKey };
 
     expect(() => getInputUTXO(psbt, 0)).toThrow(/out of range/);
+  });
+});
+
+// =============================================================================
+// W43: legacy P2SH-multisig finalize branch
+//
+// Regression for W42-A: finalizePSBTInput was missing a branch for legacy
+// P2SH-multisig (only P2SH-P2WPKH and P2SH-P2WSH were dispatched on a
+// redeemScript). A pure-multisig redeemScript fell through to `return false`,
+// which made `tools/psbt-multi-input-test.sh` impossible to pass for hotbuns
+// (input 0 of the W40-C fixture is exactly this case).
+//
+// The new branch must order signatures by pubkey-position in the redeemScript
+// (CHECKMULTISIG is order-sensitive), NOT by partialSig insertion order. We
+// exercise that explicitly by inserting the partial sigs in REVERSE pubkey
+// order and asserting the resulting scriptSig still spells them in script
+// order.
+//
+// Reference: existing buildP2WSHWitness (psbt.ts) and ProduceSignature in
+// bitcoin-core/src/script/sign.cpp.
+// =============================================================================
+
+describe("PSBT finalize: legacy P2SH-multisig (W43)", () => {
+  /** Build a 2-of-2 P2SH-multisig redeemScript for two distinct pubkeys. */
+  function build2of2Redeem(pubA: Buffer, pubB: Buffer): Buffer {
+    // OP_2 <0x21 pubA> <0x21 pubB> OP_2 OP_CHECKMULTISIG
+    return Buffer.concat([
+      Buffer.from([0x52]), // OP_2
+      Buffer.from([0x21]),
+      pubA,
+      Buffer.from([0x21]),
+      pubB,
+      Buffer.from([0x52]), // OP_2
+      Buffer.from([0xae]), // OP_CHECKMULTISIG
+    ]);
+  }
+
+  /** P2SH scriptPubKey: OP_HASH160 <hash160(redeem)> OP_EQUAL. */
+  function p2shScript(redeem: Buffer): Buffer {
+    return Buffer.concat([
+      Buffer.from([0xa9, 0x14]),
+      hash160(redeem),
+      Buffer.from([0x87]),
+    ]);
+  }
+
+  test("finalize 2-of-2 P2SH-multisig with sigs inserted in REVERSE pubkey order — scriptSig follows redeemScript order", () => {
+    // Use distinct seeds to guarantee asymmetric pubkey bytes (W32-B).
+    const kA = makeKey(241);
+    const kB = makeKey(242);
+    expect(kA.pub.equals(kB.pub)).toBe(false);
+
+    const redeem = build2of2Redeem(kA.pub, kB.pub);
+    const spk = p2shScript(redeem);
+    const value = 271_828n;
+
+    const prevTx = makePrevTx(spk, value, 0xa3);
+    const spendTx = makeSpendTx(makeAsymTxid(0xa3), value);
+
+    const psbt = createPSBT(spendTx);
+    psbt.inputs[0].nonWitnessUtxo = prevTx;
+    psbt.inputs[0].redeemScript = redeem;
+
+    // Asymmetric, distinguishable fake-DER signatures (NOT real ECDSA — we
+    // only exercise the finalize/assembly path, not signature verification).
+    // Each sig is unique so we can assert ordering precisely.
+    const sigA = Buffer.alloc(72);
+    for (let i = 0; i < 72; i++) sigA[i] = (i * 11 + 0xa1) & 0xff;
+    sigA[0] = 0x30;
+    sigA[71] = 0x01; // SIGHASH_ALL
+
+    const sigB = Buffer.alloc(71);
+    for (let i = 0; i < 71; i++) sigB[i] = (i * 13 + 0xb2) & 0xff;
+    sigB[0] = 0x30;
+    sigB[70] = 0x01; // SIGHASH_ALL
+
+    expect(sigA.equals(sigB)).toBe(false);
+    expect(sigA[0]).not.toBe(sigA[sigA.length - 1]);
+    expect(sigB[0]).not.toBe(sigB[sigB.length - 1]);
+
+    // Insert in REVERSE pubkey order (B first, then A). The finalizer must
+    // STILL emit them in script order (A then B).
+    addPartialSignature(psbt, 0, kB.pub, sigB);
+    addPartialSignature(psbt, 0, kA.pub, sigA);
+
+    const ok = finalizePSBTInput(psbt, 0);
+    expect(ok).toBe(true);
+    expect(isInputFinalized(psbt.inputs[0])).toBe(true);
+
+    const ss = psbt.inputs[0].finalScriptSig!;
+    expect(ss).toBeDefined();
+    expect(psbt.inputs[0].finalScriptWitness).toBeUndefined();
+
+    // Expected layout: OP_0 <push sigA> <push sigB> <push redeem>
+    //                   sigA before sigB because kA is first in redeem.
+    const pushSigA = Buffer.concat([Buffer.from([sigA.length]), sigA]);
+    const pushSigB = Buffer.concat([Buffer.from([sigB.length]), sigB]);
+    // redeem is < 0x4c bytes? No — 2-of-2 redeem is 1+1+33+1+33+1+1 = 71
+    // bytes which is still < 0x4c (76). Use the same single-byte length push.
+    expect(redeem.length).toBeLessThan(0x4c);
+    const pushRedeem = Buffer.concat([Buffer.from([redeem.length]), redeem]);
+
+    const expected = Buffer.concat([
+      Buffer.from([0x00]), // OP_0 (CHECKMULTISIG dummy / NULLDUMMY)
+      pushSigA,
+      pushSigB,
+      pushRedeem,
+    ]);
+    expect(ss.equals(expected)).toBe(true);
+
+    // Sentinel: clearSigningData ran (W41 cleanup parity).
+    expect(psbt.inputs[0].partialSigs.size).toBe(0);
+    expect(psbt.inputs[0].redeemScript).toBeUndefined();
+  });
+
+  test("finalize fails (returns false) when only 1 of 2 partial sigs are present", () => {
+    const kA = makeKey(243);
+    const kB = makeKey(244);
+    const redeem = build2of2Redeem(kA.pub, kB.pub);
+    const spk = p2shScript(redeem);
+    const value = 314_159n;
+
+    const prevTx = makePrevTx(spk, value, 0xa4);
+    const spendTx = makeSpendTx(makeAsymTxid(0xa4), value);
+
+    const psbt = createPSBT(spendTx);
+    psbt.inputs[0].nonWitnessUtxo = prevTx;
+    psbt.inputs[0].redeemScript = redeem;
+
+    const sigA = Buffer.alloc(70);
+    for (let i = 0; i < 70; i++) sigA[i] = (i * 17 + 0xc1) & 0xff;
+    sigA[0] = 0x30;
+    sigA[69] = 0x01;
+
+    addPartialSignature(psbt, 0, kA.pub, sigA);
+
+    const ok = finalizePSBTInput(psbt, 0);
+    expect(ok).toBe(false);
+    expect(isInputFinalized(psbt.inputs[0])).toBe(false);
+    // Partial sigs must NOT be cleared on failure.
+    expect(psbt.inputs[0].partialSigs.size).toBe(1);
+    expect(psbt.inputs[0].redeemScript).toBeDefined();
   });
 });
