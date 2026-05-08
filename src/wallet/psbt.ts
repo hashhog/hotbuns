@@ -1459,7 +1459,16 @@ export function combinePSBTs(psbts: PSBT[]): PSBT {
     }
   }
 
-  // Create combined PSBT starting from the first one
+  // Create combined PSBT starting from the first one.
+  //
+  // W35-A: The {...input}/{...output} spreads shallow-copy every field by ref,
+  // including the array-of-Buffer fields finalScriptWitness (Input) and
+  // tapTree (Output). With W34-A's deserialize fix landed (7f9e272), the
+  // underlying bytes are no longer aliased into the source PSBT's input
+  // buffer — but psbts[0]'s in-memory items are still shared with `result`
+  // via the spread. A caller mutating psbts[0].inputs[i].finalScriptWitness[k]
+  // after combine() would corrupt the combined PSBT directly. Deep-copy
+  // array-of-Buffer fields the same way the merge path (i>=1) does.
   const result: PSBT = {
     tx: psbts[0].tx,
     xpubs: new Map(psbts[0].xpubs),
@@ -1472,11 +1481,17 @@ export function combinePSBTs(psbts: PSBT[]): PSBT {
       hash160Preimages: new Map(input.hash160Preimages),
       hash256Preimages: new Map(input.hash256Preimages),
       unknown: new Map(input.unknown),
+      finalScriptWitness: input.finalScriptWitness?.map((b) => Buffer.from(b)),
     })),
     outputs: psbts[0].outputs.map((output) => ({
       ...output,
       bip32Derivation: new Map(output.bip32Derivation),
       unknown: new Map(output.unknown),
+      tapTree: output.tapTree?.map((leaf) => ({
+        depth: leaf.depth,
+        leafVersion: leaf.leafVersion,
+        script: Buffer.from(leaf.script),
+      })),
     })),
     version: psbts[0].version,
     unknown: new Map(psbts[0].unknown),

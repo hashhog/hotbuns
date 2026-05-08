@@ -1307,4 +1307,102 @@ describe("PSBT subarray-aliasing defensive copy (W34-A)", () => {
       pubkeyBytes.toString("hex"),
     );
   });
+
+  test("combine() deep-copies psbts[0].inputs[*].finalScriptWitness on the initial spread (W35-A 5th site)", () => {
+    // W34-A's combine fix only deep-copied buffers on the merge path
+    // (psbts[i>=1] → result). The initial spread {...input} on psbts[0]
+    // shallow-copies the finalScriptWitness array ref, so combined and
+    // psbts[0] shared the same Buffer entries. Mutating psbts[0]'s
+    // in-memory item in-place corrupts the combined PSBT.
+    const psbt1 = createTestPSBT();
+    const psbt2 = createTestPSBT();
+
+    const sigBytes = Buffer.alloc(71, 0x55);
+    const pubkeyBytes = Buffer.alloc(33, 0x66);
+    psbt1.inputs[0].finalScriptWitness = [sigBytes, pubkeyBytes];
+
+    const combined = combinePSBTs([psbt1, psbt2]);
+    expect(combined.inputs[0].finalScriptWitness?.length).toBe(2);
+
+    const sigHexBefore = combined.inputs[0].finalScriptWitness![0].toString("hex");
+    const pkHexBefore = combined.inputs[0].finalScriptWitness![1].toString("hex");
+    expect(sigHexBefore).toBe(sigBytes.toString("hex"));
+    expect(pkHexBefore).toBe(pubkeyBytes.toString("hex"));
+
+    // Mutate psbts[0]'s in-memory witness items in place. Pre-fix, these
+    // Buffer refs were shared with combined.inputs[0].finalScriptWitness
+    // via the {...input} spread, so the mutation would corrupt the
+    // combined PSBT directly.
+    psbt1.inputs[0].finalScriptWitness![0].fill(0xff);
+    psbt1.inputs[0].finalScriptWitness![1].fill(0xff);
+
+    expect(combined.inputs[0].finalScriptWitness![0].toString("hex")).toBe(
+      sigHexBefore,
+    );
+    expect(combined.inputs[0].finalScriptWitness![1].toString("hex")).toBe(
+      pkHexBefore,
+    );
+
+    // And re-serializing the combined PSBT yields the original witness bytes.
+    // (sigBytes/pubkeyBytes were mutated above — they're the same Buffer
+    // refs we just filled with 0xff. Compare against the pre-mutation hex
+    // snapshots, which are what the combined PSBT preserved.)
+    const reserialized = serializePSBT(combined);
+    const round = deserializePSBT(reserialized);
+    expect(round.inputs[0].finalScriptWitness![0].toString("hex")).toBe(
+      sigHexBefore,
+    );
+    expect(round.inputs[0].finalScriptWitness![1].toString("hex")).toBe(
+      pkHexBefore,
+    );
+  });
+
+  test("combine() deep-copies psbts[0].outputs[*].tapTree on the initial spread (W35-A 5th site)", () => {
+    // Same shape, for the tapTree array on the Output spread at
+    // psbts[0].outputs.map(...).
+    const psbt1 = createTestPSBT();
+    const psbt2 = createTestPSBT();
+
+    psbt1.outputs[0].tapInternalKey = Buffer.alloc(32, 0x88);
+    const leaf0Script = Buffer.alloc(40, 0x99);
+    const leaf1Script = Buffer.alloc(50, 0xaa);
+    psbt1.outputs[0].tapTree = [
+      { depth: 1, leafVersion: 0xc0, script: leaf0Script },
+      { depth: 2, leafVersion: 0xc0, script: leaf1Script },
+    ];
+
+    const combined = combinePSBTs([psbt1, psbt2]);
+    expect(combined.outputs[0].tapTree?.length).toBe(2);
+
+    const leaf0HexBefore = combined.outputs[0].tapTree![0].script.toString("hex");
+    const leaf1HexBefore = combined.outputs[0].tapTree![1].script.toString("hex");
+    expect(leaf0HexBefore).toBe(leaf0Script.toString("hex"));
+    expect(leaf1HexBefore).toBe(leaf1Script.toString("hex"));
+
+    // Pre-fix: the combined.outputs[0].tapTree was the same Array ref
+    // (shallow-copied via spread), so each leaf object — and crucially
+    // each leaf.script Buffer — was shared with psbt1. Mutating psbt1's
+    // leaf script in-place would corrupt the combined PSBT.
+    psbt1.outputs[0].tapTree![0].script.fill(0x00);
+    psbt1.outputs[0].tapTree![1].script.fill(0x00);
+
+    expect(combined.outputs[0].tapTree![0].script.toString("hex")).toBe(
+      leaf0HexBefore,
+    );
+    expect(combined.outputs[0].tapTree![1].script.toString("hex")).toBe(
+      leaf1HexBefore,
+    );
+
+    // Re-serialize the combined PSBT — original leaf bytes preserved.
+    // (leaf0Script/leaf1Script were mutated in-place above, so compare
+    // against the snapshotted hex strings.)
+    const reserialized = serializePSBT(combined);
+    const round = deserializePSBT(reserialized);
+    expect(round.outputs[0].tapTree![0].script.toString("hex")).toBe(
+      leaf0HexBefore,
+    );
+    expect(round.outputs[0].tapTree![1].script.toString("hex")).toBe(
+      leaf1HexBefore,
+    );
+  });
 });
