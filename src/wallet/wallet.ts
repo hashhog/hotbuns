@@ -61,11 +61,71 @@ import { secp256k1, schnorr } from "@noble/curves/secp256k1.js";
 
 // BIP-32 constants
 const HARDENED_OFFSET = 0x80000000;
+const BIP32_MAX_INDEX = 0xffffffff;
 
 // secp256k1 curve order (n)
 const CURVE_ORDER = BigInt(
   "0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141"
 );
+
+/**
+ * Recoverable error signalling that BIP-32 CKD landed on the spec-mandated
+ * skip case: parse256(IL) >= n  OR  k_i == 0. Both conditions are extremely
+ * rare (~2^-127) but the spec REQUIRES the caller to bump the child index
+ * by 1 and retry rather than emit the invalid key.
+ *
+ * BIP-32: "In case parse256(IL) >= n or k_i = 0, the resulting key is
+ *          invalid, and one should proceed with the next value for i."
+ *
+ * Also matches Bitcoin Core's CKey::Derive: libsecp256k1's seckey_tweak_add
+ * returns 0 in exactly these two cases, and Core propagates that as failure.
+ */
+export class Bip32InvalidChildError extends Error {
+  readonly index: number;
+  constructor(index: number, reason: "il-overflow" | "child-zero") {
+    super(
+      `BIP-32 invalid child at index ${index} (${reason}); caller must retry with index+1`
+    );
+    this.name = "Bip32InvalidChildError";
+    this.index = index;
+  }
+}
+
+/**
+ * Pure BIP-32 CKD-priv math given a precomputed HMAC-SHA512 output `I`
+ * (64 bytes). Throws `Bip32InvalidChildError` on the spec-mandated skip cases
+ * (parse256(IL) >= n  OR  k_i == 0). Exported for unit testing the retry
+ * detection without recomputing the HMAC.
+ */
+export function bip32CkdPrivFromI(
+  parentKey: Buffer,
+  I: Buffer,
+  index: number
+): { key: Buffer; chainCode: Buffer } {
+  if (I.length !== 64) {
+    throw new Error(`bip32CkdPrivFromI: I must be 64 bytes, got ${I.length}`);
+  }
+  const IL = I.subarray(0, 32);
+  const IR = I.subarray(32, 64);
+
+  const parentKeyBigInt = BigInt("0x" + parentKey.toString("hex"));
+  const ILBigInt = BigInt("0x" + IL.toString("hex"));
+
+  if (ILBigInt >= CURVE_ORDER) {
+    throw new Bip32InvalidChildError(index, "il-overflow");
+  }
+
+  const childKeyBigInt = (parentKeyBigInt + ILBigInt) % CURVE_ORDER;
+  if (childKeyBigInt === 0n) {
+    throw new Bip32InvalidChildError(index, "child-zero");
+  }
+
+  const childKeyHex = childKeyBigInt.toString(16).padStart(64, "0");
+  return {
+    key: Buffer.from(childKeyHex, "hex"),
+    chainCode: Buffer.from(IR),
+  };
+}
 
 // BIP-86 Taproot internal key tweak (hash of "TapTweak" tag for key-path spending)
 const TAPTWEAK_TAG = "TapTweak";
@@ -507,24 +567,7 @@ export class Wallet {
     }
 
     const I = Buffer.from(hmac(sha512, parentChainCode, data));
-    const IL = I.subarray(0, 32);
-    const IR = I.subarray(32, 64);
-
-    // Child key = IL + parent key (mod curve order)
-    const parentKeyBigInt = BigInt("0x" + parentKey.toString("hex"));
-    const ILBigInt = BigInt("0x" + IL.toString("hex"));
-
-    const childKeyBigInt = (parentKeyBigInt + ILBigInt) % CURVE_ORDER;
-
-    // Convert back to 32-byte buffer
-    let childKeyHex = childKeyBigInt.toString(16);
-    childKeyHex = childKeyHex.padStart(64, "0");
-    const childKey = Buffer.from(childKeyHex, "hex");
-
-    return {
-      key: childKey,
-      chainCode: IR,
-    };
+    return bip32CkdPrivFromI(parentKey, I, index);
   }
 
   /**
@@ -557,7 +600,32 @@ export class Wallet {
         index += HARDENED_OFFSET;
       }
 
-      const derived = this.deriveChild(currentKey, currentChainCode, index);
+      // BIP-32 spec: on parse256(IL) >= n or k_i == 0, skip to next index.
+      // Single retry suffices with overwhelming probability (~2^-127);
+      // bound the loop anyway so a pathological mocked-HMAC test cannot
+      // burn forever, and so we never cross the hardened/non-hardened
+      // boundary (the spec says "next value for i" — same flag).
+      const maxIndex = isHardened ? BIP32_MAX_INDEX : HARDENED_OFFSET - 1;
+      let derived: { key: Buffer; chainCode: Buffer } | undefined;
+      for (let attempt = 0; attempt < 256; attempt++) {
+        try {
+          derived = this.deriveChild(currentKey, currentChainCode, index);
+          break;
+        } catch (e) {
+          if (!(e instanceof Bip32InvalidChildError)) throw e;
+          if (index >= maxIndex) {
+            throw new Error(
+              `BIP-32 derivation exhausted index space at ${part} (no valid child)`
+            );
+          }
+          index += 1;
+        }
+      }
+      if (!derived) {
+        throw new Error(
+          `BIP-32 derivation failed after 256 retries at ${part}`
+        );
+      }
       currentKey = derived.key;
       currentChainCode = derived.chainCode;
     }

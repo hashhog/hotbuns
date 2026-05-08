@@ -69,10 +69,32 @@ import {
 /** BIP-32 hardened offset */
 const HARDENED_OFFSET = 0x80000000;
 
+/** Largest BIP-32 child index (32-bit) */
+const BIP32_MAX_INDEX = 0xffffffff;
+
 /** secp256k1 curve order */
 const CURVE_ORDER = BigInt(
   "0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141"
 );
+
+/**
+ * Recoverable BIP-32 CKD failure: parse256(IL) >= n  OR  k_i == 0  OR
+ * (for public-key derivation) child point is the point at infinity.
+ * Spec mandates the caller skip this child index and retry with i+1.
+ */
+export class Bip32InvalidChildError extends Error {
+  readonly index: number;
+  constructor(
+    index: number,
+    reason: "il-overflow" | "child-zero" | "child-infinity"
+  ) {
+    super(
+      `BIP-32 invalid child at index ${index} (${reason}); caller must retry with index+1`
+    );
+    this.name = "Bip32InvalidChildError";
+    this.index = index;
+  }
+}
 
 /** Taproot tweak tag */
 const TAPTWEAK_TAG = "TapTweak";
@@ -354,14 +376,37 @@ export class BIP32PubkeyProvider implements PubkeyProvider {
     let currentChainCode = this.extkey.chainCode;
     let isPrivate = this.extkey.isPrivate;
 
-    // Derive along the fixed path
-    for (const childIndex of this.path) {
-      const derived = this.deriveChild(
-        currentKey,
-        currentChainCode,
-        childIndex,
-        isPrivate
+    // Derive along the fixed path. BIP-32 spec: on parse256(IL) >= n or
+    // k_i == 0, skip to next index (preserving hardened/non-hardened flag).
+    const tryDerive = (
+      key: Buffer,
+      chainCode: Buffer,
+      startIndex: number
+    ): { key: Buffer; chainCode: Buffer; usedIndex: number } => {
+      const isHardened = startIndex >= HARDENED_OFFSET;
+      const maxIndex = isHardened ? BIP32_MAX_INDEX : HARDENED_OFFSET - 1;
+      let idx = startIndex;
+      for (let attempt = 0; attempt < 256; attempt++) {
+        try {
+          const d = this.deriveChild(key, chainCode, idx, isPrivate);
+          return { key: d.key, chainCode: d.chainCode, usedIndex: idx };
+        } catch (e) {
+          if (!(e instanceof Bip32InvalidChildError)) throw e;
+          if (idx >= maxIndex) {
+            throw new Error(
+              `BIP-32 derivation exhausted index space at ${idx} (no valid child)`
+            );
+          }
+          idx += 1;
+        }
+      }
+      throw new Error(
+        `BIP-32 derivation failed after 256 retries starting at ${startIndex}`
       );
+    };
+
+    for (const childIndex of this.path) {
+      const derived = tryDerive(currentKey, currentChainCode, childIndex);
       currentKey = derived.key;
       currentChainCode = derived.chainCode;
     }
@@ -372,12 +417,7 @@ export class BIP32PubkeyProvider implements PubkeyProvider {
         this.deriveType === DeriveType.HARDENED
           ? index + HARDENED_OFFSET
           : index;
-      const derived = this.deriveChild(
-        currentKey,
-        currentChainCode,
-        childIndex,
-        isPrivate
-      );
+      const derived = tryDerive(currentKey, currentChainCode, childIndex);
       currentKey = derived.key;
     }
 
@@ -422,22 +462,42 @@ export class BIP32PubkeyProvider implements PubkeyProvider {
     const IL = I.subarray(0, 32);
     const IR = I.subarray(32, 64);
 
+    const ILBigInt = BigInt("0x" + IL.toString("hex"));
+
+    // BIP-32: parse256(IL) >= n  →  invalid, retry next index.
+    if (ILBigInt >= CURVE_ORDER) {
+      throw new Bip32InvalidChildError(index, "il-overflow");
+    }
+
     let childKey: Buffer;
     if (isPrivate) {
       // Child private key = IL + parent key (mod curve order)
       const parentKeyBigInt = BigInt("0x" + parentKey.toString("hex"));
-      const ILBigInt = BigInt("0x" + IL.toString("hex"));
       const childKeyBigInt = (parentKeyBigInt + ILBigInt) % CURVE_ORDER;
+      // BIP-32: k_i == 0  →  invalid, retry next index.
+      if (childKeyBigInt === 0n) {
+        throw new Bip32InvalidChildError(index, "child-zero");
+      }
       let childKeyHex = childKeyBigInt.toString(16);
       childKeyHex = childKeyHex.padStart(64, "0");
       childKey = Buffer.from(childKeyHex, "hex");
     } else {
       // Child public key = IL * G + parent key
-      const ILBigInt = BigInt("0x" + IL.toString("hex"));
+      // (Equivalent failure case: child point is identity / infinity.)
       const parentPoint = secp256k1.Point.fromHex(parentKey.toString("hex"));
       const ILPoint = secp256k1.Point.BASE.multiply(ILBigInt);
       const childPoint = parentPoint.add(ILPoint);
-      childKey = Buffer.from(childPoint.toBytes(true));
+      if (typeof (childPoint as { is0?: () => boolean }).is0 === "function" &&
+          (childPoint as { is0: () => boolean }).is0()) {
+        throw new Bip32InvalidChildError(index, "child-infinity");
+      }
+      try {
+        childKey = Buffer.from(childPoint.toBytes(true));
+      } catch (e) {
+        // noble-curves throws "bad point: ZERO" for the infinity point on
+        // serialization. Translate to the BIP-32 retry signal.
+        throw new Bip32InvalidChildError(index, "child-infinity");
+      }
     }
 
     return {
