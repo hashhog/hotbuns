@@ -23,7 +23,7 @@ import {
   serializeMessage,
   ipv4ToBuffer,
 } from "./messages.js";
-import { REGTEST } from "../consensus/params.js";
+import { MAINNET, REGTEST } from "../consensus/params.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -732,6 +732,68 @@ describe("PeerManager service flags", () => {
     expect(BanScores.SLOW_RESPONSE).toBe(2);
     expect(BanScores.PROTOCOL_VIOLATION).toBe(10);
     expect(BanScores.UNREQUESTED_DATA).toBe(5);
+  });
+});
+
+describe("PeerManager BIP-159 NODE_NETWORK_LIMITED advertisement (W26)", () => {
+  // Regression coverage for the W26 wiring fix: hotbuns shipped a working
+  // PruneManager + GETDATA gate but never plumbed `pruneMode` from the
+  // CLI into the PeerManager constructor.  Before the fix, even when an
+  // operator passed `--prune=550`, hotbuns advertised 0x09n and lied to
+  // peers about its pruning state.  These tests pin the new contract:
+  //
+  //   - default (no --prune)  → services == 0x09n  (NETWORK | WITNESS)
+  //   - --prune=N>0           → services == 0x0409n (+ NETWORK_LIMITED)
+  //
+  // Implementation: cli.ts:1329 now passes `pruneMode: pruneManager !== undefined`,
+  // and the PeerManager constructor copy retains the field (it was previously
+  // dropped by the `this.config = {…}` whitelisting).  The OR-in itself was
+  // already wired at manager.ts:638-640 (outbound) and :1881-1883 (inbound).
+  const baseConfig = (overrides: Partial<PeerManagerConfig> = {}): PeerManagerConfig => ({
+    maxOutbound: 8,
+    maxInbound: 117,
+    params: MAINNET,
+    bestHeight: 0,
+    datadir: "/tmp/hotbuns-bip159-test-stub",
+    ...overrides,
+  });
+
+  test("default (pruneMode unset) advertises NETWORK | WITNESS = 0x09n", () => {
+    const manager = new PeerManager(baseConfig());
+    expect(manager.getAdvertisedServices()).toBe(0x09n);
+    expect(manager.getAdvertisedServices()).toBe(1n | 8n);
+  });
+
+  test("pruneMode: false advertises NETWORK | WITNESS = 0x09n (explicit off)", () => {
+    const manager = new PeerManager(baseConfig({ pruneMode: false }));
+    expect(manager.getAdvertisedServices()).toBe(0x09n);
+  });
+
+  test("pruneMode: true OR's in NODE_NETWORK_LIMITED → 0x0409n", () => {
+    const manager = new PeerManager(baseConfig({ pruneMode: true }));
+    // 1 (NETWORK) | 8 (WITNESS) | 1024 (NETWORK_LIMITED) = 0x0409 = 1033.
+    expect(manager.getAdvertisedServices()).toBe(0x0409n);
+    expect(manager.getAdvertisedServices()).toBe(1n | 8n | 1024n);
+  });
+
+  test("pruneMode: true sets the NETWORK_LIMITED bit on top of network defaults", () => {
+    const manager = new PeerManager(baseConfig({ pruneMode: true }));
+    const advertised = manager.getAdvertisedServices();
+    // The bit is OR'd, not assigned: existing flags must still be present.
+    expect(advertised & ServiceFlags.NODE_NETWORK).toBe(ServiceFlags.NODE_NETWORK);
+    expect(advertised & ServiceFlags.NODE_WITNESS).toBe(ServiceFlags.NODE_WITNESS);
+    expect(advertised & ServiceFlags.NODE_NETWORK_LIMITED).toBe(
+      ServiceFlags.NODE_NETWORK_LIMITED
+    );
+  });
+
+  test("regtest pruneMode: true also advertises NETWORK_LIMITED", () => {
+    // Sanity: gating is on `pruneMode`, not network — regtest with --prune
+    // must also OR-in the bit so cross-impl regtest harnesses see parity.
+    const manager = new PeerManager(baseConfig({ params: REGTEST, pruneMode: true }));
+    expect(manager.getAdvertisedServices() & ServiceFlags.NODE_NETWORK_LIMITED).toBe(
+      ServiceFlags.NODE_NETWORK_LIMITED
+    );
   });
 });
 

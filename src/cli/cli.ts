@@ -1326,6 +1326,11 @@ async function startNode(config: NodeConfig): Promise<void> {
   await headerSync.loadFromDB();
 
   // 6. Start peer manager (DNS seed resolution, connect to peers)
+  // BIP-159: when prune mode is on, PeerManager OR's NODE_NETWORK_LIMITED
+  // (1<<10 = 0x400) into the advertised services bitfield.  Mirrors Core's
+  // `init.cpp` (`nLocalServices |= NODE_NETWORK_LIMITED` when IsPruneMode).
+  // Without this wire-up the bit was never advertised even with --prune>0,
+  // causing peers to request blocks below the prune horizon and disconnect.
   const peerManager = new PeerManager({
     maxOutbound: mergedConfig.maxOutbound,
     maxInbound: 117,
@@ -1335,6 +1340,7 @@ async function startNode(config: NodeConfig): Promise<void> {
     connect: config.connect,
     listen: mergedConfig.listen,
     port: mergedConfig.port,
+    pruneMode: pruneManager !== undefined,
   });
 
   // Register header sync with peer manager
