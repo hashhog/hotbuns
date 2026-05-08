@@ -23,6 +23,7 @@ import {
   privateKeyToPublicKey,
   ecdsaSign,
   taggedHash,
+  tweakPrivateKey,
 } from "../crypto/primitives.js";
 import {
   AddressType,
@@ -40,9 +41,11 @@ import {
   type TxIn,
   type TxOut,
   type OutPoint,
+  type TaprootSigHashCache,
   serializeTx,
   getTxId,
   sigHashWitnessV0,
+  sigHashTaproot,
   SIGHASH_ALL,
   isCoinbase,
 } from "../validation/tx.js";
@@ -933,14 +936,23 @@ export class Wallet {
       lockTime: 0,
     };
 
-    // Sign all inputs
+    // Sign all inputs. Taproot signing requires the prevOut (scriptPubKey +
+    // amount) of EVERY input — not just the input being signed — so build the
+    // full prevOuts vector once and thread it through.
+    const prevOuts = selectedUtxos.map((u) => {
+      const decoded = decodeAddress(u.address);
+      return {
+        scriptPubKey: this.buildScriptPubKey(decoded.type, decoded.hash),
+        value: u.amount,
+      };
+    });
     for (let i = 0; i < txInputs.length; i++) {
       const utxo = selectedUtxos[i];
       const key = this.keys.get(utxo.address);
       if (!key) {
         throw new Error(`No key found for address: ${utxo.address}`);
       }
-      this.signInput(tx, i, key, utxo);
+      this.signInput(tx, i, key, utxo, prevOuts);
     }
 
     return tx;
@@ -981,12 +993,18 @@ export class Wallet {
 
   /**
    * Sign a transaction input based on address type.
+   *
+   * @param prevOuts - scriptPubKey + value for ALL inputs of `tx`. Required for
+   *   BIP-341 taproot key-path signing (sha_amounts + sha_scriptPubKeys commit
+   *   to every input). Optional for legacy/segwit-v0 paths, which only need
+   *   the active input's amount.
    */
   private signInput(
     tx: Transaction,
     inputIndex: number,
     key: WalletKey,
-    utxo: WalletUTXO
+    utxo: WalletUTXO,
+    prevOuts?: { scriptPubKey: Buffer; value: bigint }[]
   ): void {
     switch (key.addressType) {
       case AddressType.P2PKH:
@@ -998,9 +1016,32 @@ export class Wallet {
       case AddressType.P2WPKH:
         this.signP2WPKHInput(tx, inputIndex, key, utxo);
         break;
-      case AddressType.P2TR:
-        this.signP2TRInput(tx, inputIndex, key, utxo);
+      case AddressType.P2TR: {
+        // Build the prevOuts vector lazily if the caller didn't pre-compute it
+        // (e.g. callers that sign single-input txs). We can recover the
+        // scriptPubKey for the *active* input from `utxo.address`; the other
+        // inputs' addresses are unknown from here alone, so we require the
+        // caller to pass `prevOuts` for multi-input taproot txs. Throw a clear
+        // error rather than silently signing with zeros.
+        let resolved = prevOuts;
+        if (!resolved) {
+          if (tx.inputs.length !== 1) {
+            throw new Error(
+              "signInput(P2TR): multi-input transactions require prevOuts " +
+                "(scriptPubKey + value for every input) per BIP-341"
+            );
+          }
+          const decoded = decodeAddress(utxo.address);
+          resolved = [
+            {
+              scriptPubKey: this.buildScriptPubKey(decoded.type, decoded.hash),
+              value: utxo.amount,
+            },
+          ];
+        }
+        this.signP2TRInput(tx, inputIndex, key, utxo, resolved);
         break;
+      }
       default:
         throw new Error(`Unsupported address type for signing: ${key.addressType}`);
     }
@@ -1116,41 +1157,72 @@ export class Wallet {
   }
 
   /**
-   * Sign a P2TR input (taproot key-path).
+   * Sign a P2TR input (BIP-341 taproot key-path, BIP-86 derivation).
+   *
+   * Uses the canonical `sigHashTaproot` from validation/tx.ts (the same code
+   * path that validates incoming blocks) to produce the BIP-341 sighash, and
+   * `tweakPrivateKey` to apply BIP-341's even-y negation + key tweak.
+   *
+   * Defaults to SIGHASH_DEFAULT (0x00) which produces a 64-byte witness
+   * (no sighash byte appended), matching the canonical BIP-86 wallet output.
    */
   private signP2TRInput(
     tx: Transaction,
     inputIndex: number,
     key: WalletKey,
-    utxo: WalletUTXO
+    utxo: WalletUTXO,
+    prevOuts: { scriptPubKey: Buffer; value: bigint }[],
+    hashType: number = 0x00 // SIGHASH_DEFAULT
   ): void {
-    // BIP-341 taproot key-path spending
-    // We need to tweak the private key just like we tweaked the public key
-
-    // Get x-only public key
+    // Internal x-only pubkey P (32 bytes). key.publicKey is the 33-byte
+    // compressed form: [parity_byte || x].
     const xOnlyPubkey = key.publicKey.subarray(1, 33);
 
-    // Compute tweak
+    // BIP-86: tweak = TaggedHash("TapTweak", x(P)) — no merkle root for
+    // single-key BIP-86 derivation. (For BIP-341 script-path wallets, this
+    // would be TaggedHash("TapTweak", x(P) || merkle_root).)
     const tweak = taggedHash(TAPTWEAK_TAG, xOnlyPubkey);
 
-    // Tweak the private key: d' = d + t (mod n)
-    const privateKeyBigInt = BigInt("0x" + key.privateKey.toString("hex"));
-    const tweakBigInt = BigInt("0x" + tweak.toString("hex"));
-    const tweakedKeyBigInt = (privateKeyBigInt + tweakBigInt) % CURVE_ORDER;
+    // Tweak the private key with BIP-341 even-y negation. Without the
+    // negation step (which was missing pre-W20), ~50% of internal keys
+    // produce a tweaked secret that does NOT correspond to the on-chain
+    // x-only output key, and Schnorr verify fails.
+    const tweakedPrivateKey = tweakPrivateKey(key.privateKey, tweak);
 
-    let tweakedKeyHex = tweakedKeyBigInt.toString(16);
-    tweakedKeyHex = tweakedKeyHex.padStart(64, "0");
-    const tweakedPrivateKey = Buffer.from(tweakedKeyHex, "hex");
+    // Canonical BIP-341 sighash. Commits to ALL inputs' amounts and
+    // scriptPubKeys via sha_amounts / sha_scriptPubKeys.
+    const cache: TaprootSigHashCache = {};
+    const sighash = sigHashTaproot(
+      tx,
+      inputIndex,
+      prevOuts,
+      hashType,
+      0,         // ext_flag = 0 for key-path
+      undefined, // no annex
+      undefined, // no tap leaf hash (key-path)
+      undefined, // no key version (key-path)
+      0xffffffff, // codeSepPos unused for key-path
+      cache
+    );
 
-    // Compute BIP-341 sighash (simplified - uses SIGHASH_DEFAULT = 0x00)
-    const sighash = this.sigHashTaproot(tx, inputIndex, utxo.amount, 0x00);
+    // Schnorr-sign with the tweaked secret. Note that BIP-340's sign() will
+    // *not* re-negate the secret: by construction `tweakedPrivateKey * G == Q`
+    // where Q is the even-Y output key, so the inner has_even_y(P) check
+    // inside Noble's signer is already satisfied.
+    const signature = Buffer.from(schnorr.sign(sighash, tweakedPrivateKey));
 
-    // Sign with Schnorr (64-byte signature)
-    const signature = this.schnorrSign(sighash, tweakedPrivateKey);
+    // Witness encoding (BIP-341 §"Constructing and spending Taproot outputs"):
+    //   - SIGHASH_DEFAULT (0x00): 64-byte signature, no trailing hash-type byte
+    //   - any other hashType:    65 bytes — signature || [hashType]
+    let witnessSig: Buffer;
+    if (hashType === 0x00) {
+      witnessSig = signature;
+    } else {
+      witnessSig = Buffer.concat([signature, Buffer.from([hashType])]);
+    }
 
-    // For SIGHASH_DEFAULT, we use a 64-byte signature (no sighash byte appended)
     tx.inputs[inputIndex].scriptSig = Buffer.alloc(0);
-    tx.inputs[inputIndex].witness = [signature];
+    tx.inputs[inputIndex].witness = [witnessSig];
   }
 
   /**
@@ -1185,92 +1257,6 @@ export class Wallet {
 
     const { hash256 } = require("../crypto/primitives.js");
     return hash256(Buffer.concat([serialized, hashTypeBytes]));
-  }
-
-  /**
-   * BIP-341 Taproot sighash computation.
-   */
-  private sigHashTaproot(
-    tx: Transaction,
-    inputIndex: number,
-    amount: bigint,
-    hashType: number
-  ): Buffer {
-    // Simplified BIP-341 sighash for key-path spending
-    // This is a basic implementation; full BIP-341 is more complex
-
-    const writer = new BufferWriter();
-
-    // Epoch byte
-    writer.writeUInt8(0x00);
-
-    // Hash type
-    const effectiveHashType = hashType === 0x00 ? SIGHASH_ALL : hashType;
-    writer.writeUInt8(hashType);
-
-    // Version
-    writer.writeInt32LE(tx.version);
-
-    // Lock time
-    writer.writeUInt32LE(tx.lockTime);
-
-    // Hash of prevouts
-    const prevoutsWriter = new BufferWriter();
-    for (const input of tx.inputs) {
-      prevoutsWriter.writeBytes(input.prevOut.txid);
-      prevoutsWriter.writeUInt32LE(input.prevOut.vout);
-    }
-    const { sha256Hash } = require("../crypto/primitives.js");
-    writer.writeBytes(sha256Hash(prevoutsWriter.toBuffer()));
-
-    // Hash of amounts
-    const amountsWriter = new BufferWriter();
-    // For proper implementation, we'd need all input amounts
-    // For now, use a placeholder
-    amountsWriter.writeUInt64LE(amount);
-    for (let i = 1; i < tx.inputs.length; i++) {
-      amountsWriter.writeUInt64LE(0n); // Would need actual amounts
-    }
-    writer.writeBytes(sha256Hash(amountsWriter.toBuffer()));
-
-    // Hash of scriptPubKeys
-    const scriptsWriter = new BufferWriter();
-    // For key-path, this would be the witness program
-    const pubKeyHash = Buffer.alloc(32); // placeholder
-    scriptsWriter.writeVarBytes(pubKeyHash);
-    writer.writeBytes(sha256Hash(scriptsWriter.toBuffer()));
-
-    // Hash of sequences
-    const seqWriter = new BufferWriter();
-    for (const input of tx.inputs) {
-      seqWriter.writeUInt32LE(input.sequence);
-    }
-    writer.writeBytes(sha256Hash(seqWriter.toBuffer()));
-
-    // Hash of outputs
-    const outputsWriter = new BufferWriter();
-    for (const output of tx.outputs) {
-      outputsWriter.writeUInt64LE(output.value);
-      outputsWriter.writeVarBytes(output.scriptPubKey);
-    }
-    writer.writeBytes(sha256Hash(outputsWriter.toBuffer()));
-
-    // Spend type (key-path, no annex)
-    writer.writeUInt8(0x00);
-
-    // Input index
-    writer.writeUInt32LE(inputIndex);
-
-    return taggedHash("TapSighash", writer.toBuffer());
-  }
-
-  /**
-   * Schnorr signature for Taproot.
-   */
-  private schnorrSign(msgHash: Buffer, privateKey: Buffer): Buffer {
-    // Use schnorr signing from @noble/curves
-    const signature = schnorr.sign(msgHash, privateKey);
-    return Buffer.from(signature);
   }
 
   /**
