@@ -3153,6 +3153,296 @@ export function buildScriptPubKeyObj(script: Buffer): DecodedScriptPubKey {
   return result;
 }
 
+// =============================================================================
+// decodescript helpers (W56)
+// Reference: bitcoin-core/src/rpc/rawtransaction.cpp::decodescript
+//            bitcoin-core/src/script/script.cpp::HasValidOps
+//            bitcoin-core/src/script/script.h::IsUnspendable / MAX_OPCODE
+//            bitcoin-core/src/script/script.cpp::IsOpSuccess
+// =============================================================================
+
+const MAX_OPCODE = 0xb9; // OP_NOP10
+const MAX_SCRIPT_ELEMENT_SIZE = 520;
+const MAX_SCRIPT_SIZE = 10000;
+
+/**
+ * Check whether a script segment (starting at `offset`) consists only of
+ * data-push opcodes. Mirrors CScript::IsPushOnly.
+ */
+function isPushOnly(script: Buffer, offset: number): boolean {
+  let i = offset;
+  while (i < script.length) {
+    const op = script[i];
+    if (op > 0x60) return false; // > OP_16 is not a push opcode
+    if (op === 0x00) { i++; continue; } // OP_0
+    if (op >= 0x01 && op <= 0x4b) {
+      // OP_PUSHBYTES_N
+      if (i + 1 + op > script.length) return false;
+      i += 1 + op;
+    } else if (op === 0x4c) {
+      // OP_PUSHDATA1
+      if (i + 1 >= script.length) return false;
+      const len = script[i + 1];
+      if (i + 2 + len > script.length) return false;
+      i += 2 + len;
+    } else if (op === 0x4d) {
+      // OP_PUSHDATA2
+      if (i + 2 >= script.length) return false;
+      const len = script.readUInt16LE(i + 1);
+      if (i + 3 + len > script.length) return false;
+      i += 3 + len;
+    } else if (op === 0x4e) {
+      // OP_PUSHDATA4
+      if (i + 4 >= script.length) return false;
+      const len = script.readUInt32LE(i + 1);
+      if (i + 5 + len > script.length) return false;
+      i += 5 + len;
+    } else if (op >= 0x4f && op <= 0x60) {
+      // OP_1NEGATE (0x4f) and OP_1..OP_16 (0x51..0x60)
+      i++;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Core-accurate script type solver. Matches Bitcoin Core's Solver() in
+ * src/script/solver.cpp for the types relevant to decodescript.
+ *
+ * Unlike getScriptType(), this correctly classifies scripts with trailing
+ * junk after OP_RETURN as "nonstandard" (Core requires IsPushOnly after
+ * OP_RETURN for NULL_DATA).
+ *
+ * Returns { type, solutionsData } where solutionsData carries the extracted
+ * template fields (hash/pubkey) needed for segwit wrap construction.
+ */
+function solveScript(script: Buffer): { type: string; solutionsData: Buffer[] } {
+  // P2WPKH: OP_0 <20>
+  if (script.length === 22 && script[0] === 0x00 && script[1] === 0x14) {
+    return { type: "witness_v0_keyhash", solutionsData: [script.subarray(2, 22)] };
+  }
+  // P2WSH: OP_0 <32>
+  if (script.length === 34 && script[0] === 0x00 && script[1] === 0x20) {
+    return { type: "witness_v0_scripthash", solutionsData: [script.subarray(2, 34)] };
+  }
+  // P2TR: OP_1 <32>
+  if (script.length === 34 && script[0] === 0x51 && script[1] === 0x20) {
+    return { type: "witness_v1_taproot", solutionsData: [script.subarray(2, 34)] };
+  }
+  // P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+  if (
+    script.length === 25 &&
+    script[0] === 0x76 && script[1] === 0xa9 && script[2] === 0x14 &&
+    script[23] === 0x88 && script[24] === 0xac
+  ) {
+    return { type: "pubkeyhash", solutionsData: [script.subarray(3, 23)] };
+  }
+  // P2SH: OP_HASH160 <20> OP_EQUAL
+  if (
+    script.length === 23 &&
+    script[0] === 0xa9 && script[1] === 0x14 && script[22] === 0x87
+  ) {
+    return { type: "scripthash", solutionsData: [script.subarray(2, 22)] };
+  }
+  // P2PK: <33 or 65 bytes pubkey> OP_CHECKSIG
+  if (
+    (script.length === 35 && script[0] === 0x21 && script[34] === 0xac) ||
+    (script.length === 67 && script[0] === 0x41 && script[66] === 0xac)
+  ) {
+    return { type: "pubkey", solutionsData: [script.subarray(1, script.length - 1)] };
+  }
+  // NULL_DATA: OP_RETURN followed by push-only data (IsPushOnly check)
+  if (script.length >= 1 && script[0] === 0x6a && isPushOnly(script, 1)) {
+    return { type: "nulldata", solutionsData: [] };
+  }
+  // TODO: multisig (not needed for current corpus)
+  return { type: "nonstandard", solutionsData: [] };
+}
+
+/**
+ * Check whether a script has all valid opcodes.
+ * Mirrors CScript::HasValidOps in script.cpp.
+ */
+function hasValidOps(script: Buffer): boolean {
+  let i = 0;
+  while (i < script.length) {
+    const op = script[i];
+    if (op >= 0x01 && op <= 0x4b) {
+      // push N bytes
+      if (i + 1 + op > script.length) return false;
+      if (op > MAX_SCRIPT_ELEMENT_SIZE) return false;
+      i += 1 + op;
+    } else if (op === 0x4c) {
+      if (i + 1 >= script.length) return false;
+      const len = script[i + 1];
+      if (len > MAX_SCRIPT_ELEMENT_SIZE) return false;
+      if (i + 2 + len > script.length) return false;
+      i += 2 + len;
+    } else if (op === 0x4d) {
+      if (i + 2 >= script.length) return false;
+      const len = script.readUInt16LE(i + 1);
+      if (len > MAX_SCRIPT_ELEMENT_SIZE) return false;
+      if (i + 3 + len > script.length) return false;
+      i += 3 + len;
+    } else if (op === 0x4e) {
+      if (i + 4 >= script.length) return false;
+      const len = script.readUInt32LE(i + 1);
+      if (len > MAX_SCRIPT_ELEMENT_SIZE) return false;
+      if (i + 5 + len > script.length) return false;
+      i += 5 + len;
+    } else {
+      if (op > MAX_OPCODE) return false;
+      i++;
+    }
+  }
+  return true;
+}
+
+/**
+ * IsOpSuccess per bitcoin-core/src/script/script.cpp.
+ * These opcodes are reserved for future soft-forks in tapscript context.
+ */
+function isOpSuccess(op: number): boolean {
+  return op === 80 || op === 98 ||
+    (op >= 126 && op <= 129) ||
+    (op >= 131 && op <= 134) ||
+    (op >= 137 && op <= 138) ||
+    (op >= 141 && op <= 142) ||
+    (op >= 149 && op <= 153) ||
+    (op >= 187 && op <= 254);
+}
+
+/**
+ * Scan script for OP_CHECKSIGADD (0xba) or any OP_SUCCESS opcode.
+ * Mirrors the for-loop in decodescript's can_wrap lambda in Core.
+ */
+function hasChecksigAddOrOpSuccess(script: Buffer): boolean {
+  let i = 0;
+  while (i < script.length) {
+    const op = script[i];
+    if (op >= 0x01 && op <= 0x4b) {
+      i += 1 + op;
+    } else if (op === 0x4c) {
+      if (i + 1 >= script.length) break;
+      i += 2 + script[i + 1];
+    } else if (op === 0x4d) {
+      if (i + 2 >= script.length) break;
+      i += 3 + script.readUInt16LE(i + 1);
+    } else if (op === 0x4e) {
+      if (i + 4 >= script.length) break;
+      i += 5 + script.readUInt32LE(i + 1);
+    } else {
+      if (op === 0xba || isOpSuccess(op)) return true; // OP_CHECKSIGADD = 0xba
+      i++;
+    }
+  }
+  return false;
+}
+
+/**
+ * Compute the P2SH address for a script: base58check(0x05, hash160(script)).
+ * Mirrors EncodeDestination(ScriptHash(script)).
+ */
+function p2shAddress(script: Buffer): string {
+  return base58CheckEncode(0x05, hash160(script));
+}
+
+/**
+ * Decode a script for the `decodescript` RPC, producing Bitcoin Core-byte-
+ * compatible JSON output.
+ *
+ * Shape:
+ *   { asm, desc, type, address?, p2sh?, segwit? }
+ *
+ * CRITICAL: top-level has NO `hex` field (unlike buildScriptPubKeyObj).
+ * The inner `segwit` object DOES have `hex`.
+ *
+ * Reference: bitcoin-core/src/rpc/rawtransaction.cpp::decodescript
+ */
+export function decodeScriptRPC(script: Buffer): Record<string, unknown> {
+  const { type, solutionsData } = solveScript(script);
+
+  // Build base shape from the existing helper, then override type with the
+  // Core-accurate solver result and strip top-level hex.
+  const base = buildScriptPubKeyObj(script);
+  const result: Record<string, unknown> = {
+    asm: base.asm,
+    desc: base.desc,
+    type,
+  };
+  if (base.address !== undefined) {
+    result.address = base.address;
+  }
+
+  // can_wrap: types that may be wrapped in P2SH
+  // (MULTISIG / NONSTANDARD / PUBKEY / PUBKEYHASH / WITNESS_V0_KEYHASH / WITNESS_V0_SCRIPTHASH)
+  const canWrapTypes = new Set([
+    "multisig", "nonstandard", "pubkey", "pubkeyhash",
+    "witness_v0_keyhash", "witness_v0_scripthash",
+  ]);
+  const isUnspendable =
+    (script.length > 0 && script[0] === 0x6a) || script.length > MAX_SCRIPT_SIZE;
+  const canWrap =
+    canWrapTypes.has(type) &&
+    hasValidOps(script) &&
+    !isUnspendable &&
+    !hasChecksigAddOrOpSuccess(script);
+
+  if (canWrap) {
+    result.p2sh = p2shAddress(script);
+
+    // can_wrap_P2WSH: types eligible for P2WSH wrap
+    // (MULTISIG / PUBKEY [compressed only] / NONSTANDARD / PUBKEYHASH)
+    // WITNESS_V0_KEYHASH and WITNESS_V0_SCRIPTHASH are excluded (already segwit).
+    let canWrapP2WSH = false;
+    if (type === "pubkeyhash" || type === "nonstandard" || type === "multisig") {
+      canWrapP2WSH = true;
+    } else if (type === "pubkey") {
+      // Only compressed pubkeys allowed in segwit
+      const pubkey = solutionsData[0];
+      canWrapP2WSH = pubkey !== undefined && pubkey.length === 33;
+    }
+    // witness_v0_keyhash / witness_v0_scripthash: canWrapP2WSH = false
+
+    if (canWrapP2WSH) {
+      // Build the segwit wrapper script:
+      //   PUBKEY   → P2WPKH(hash160(pubkey)) = OP_0 <20>
+      //   PUBKEYHASH → P2WPKH(hash from script) = OP_0 <20>
+      //   others   → P2WSH(sha256(script)) = OP_0 <32>
+      let segwitScr: Buffer;
+      if (type === "pubkey") {
+        const pubkeyHash = hash160(solutionsData[0]);
+        segwitScr = Buffer.concat([Buffer.from([0x00, 0x14]), pubkeyHash]);
+      } else if (type === "pubkeyhash") {
+        // solutionsData[0] is the 20-byte hash directly
+        segwitScr = Buffer.concat([Buffer.from([0x00, 0x14]), solutionsData[0]]);
+      } else {
+        // MULTISIG / NONSTANDARD: P2WSH
+        const wsh = sha256Hash(script);
+        segwitScr = Buffer.concat([Buffer.from([0x00, 0x20]), wsh]);
+      }
+
+      // Build inner segwit object via buildScriptPubKeyObj (which includes hex)
+      const inner = buildScriptPubKeyObj(segwitScr);
+      const segwitObj: Record<string, unknown> = {
+        asm: inner.asm,
+        desc: inner.desc,
+        hex: segwitScr.toString("hex"),
+        type: inner.type,
+      };
+      if (inner.address !== undefined) {
+        segwitObj.address = inner.address;
+      }
+      segwitObj["p2sh-segwit"] = p2shAddress(segwitScr);
+      result.segwit = segwitObj;
+    }
+  }
+
+  return result;
+}
+
 /**
  * Format derivation path from indices.
  */

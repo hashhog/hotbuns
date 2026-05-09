@@ -71,6 +71,7 @@ import {
   formatBtcAmount,
   buildScriptPubKeyObj,
   disassembleScriptSigHashDecode,
+  decodeScriptRPC,
 } from "../wallet/psbt.js";
 import {
   ChainstateManager,
@@ -6170,15 +6171,13 @@ export class RPCServer {
   }
 
   private async decodeScript(params: unknown[]): Promise<Record<string, unknown>> {
-    if (!params[0] || typeof params[0] !== "string") {
+    if (params[0] === undefined || params[0] === null || typeof params[0] !== "string") {
       throw this.rpcError(-22, "Script decode failed");
     }
-    const script = Buffer.from(params[0] as string, "hex");
-    return {
-      asm: this.disassembleScript(script),
-      hex: script.toString("hex"),
-      type: this.getScriptType(script),
-    };
+    const hexStr = params[0] as string;
+    // Allow empty string (Core handles it as an empty script)
+    const script = Buffer.from(hexStr, "hex");
+    return decodeScriptRPC(script);
   }
 
   private async createRawTransaction(params: unknown[]): Promise<string> {
