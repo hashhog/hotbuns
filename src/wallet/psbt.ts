@@ -19,6 +19,9 @@ import {
   serializeTx,
   deserializeTx,
   getTxId,
+  getWTxId,
+  getTxWeight,
+  getTxVSize,
   sigHashWitnessV0,
   sigHashLegacy,
   SIGHASH_ALL,
@@ -26,11 +29,14 @@ import {
 } from "../validation/tx.js";
 import {
   hash160,
+  hash256,
   sha256Hash,
   ecdsaSign,
   ecdsaVerify,
   taggedHash,
 } from "../crypto/primitives.js";
+import { base58CheckEncode, bech32Encode } from "../address/encoding.js";
+import { addChecksum } from "./descriptor.js";
 
 // =============================================================================
 // PSBT Constants
@@ -2452,10 +2458,22 @@ export function convertToPSBT(tx: Transaction): PSBT {
 /**
  * Decoded PSBT representation for RPC output.
  */
+export interface DecodedScriptPubKey {
+  asm: string;
+  desc: string;
+  hex: string;
+  address?: string;
+  type: string;
+}
+
 export interface DecodedPSBT {
   tx: {
     txid: string;
+    hash: string;
     version: number;
+    size: number;
+    vsize: number;
+    weight: number;
     locktime: number;
     vin: Array<{
       txid: string;
@@ -2464,14 +2482,17 @@ export interface DecodedPSBT {
       sequence: number;
     }>;
     vout: Array<{
-      value: number;
+      value: unknown;
       n: number;
-      scriptPubKey: { asm: string; hex: string; type: string };
+      scriptPubKey: DecodedScriptPubKey;
     }>;
   };
+  global_xpubs: unknown[];
+  psbt_version: number;
+  proprietary: unknown[];
   unknown: Record<string, string>;
   inputs: Array<{
-    witness_utxo?: { amount: number; scriptPubKey: { asm: string; hex: string; type: string } };
+    witness_utxo?: { amount: unknown; scriptPubKey: DecodedScriptPubKey };
     non_witness_utxo?: { txid: string };
     partial_signatures?: Record<string, string>;
     sighash?: string;
@@ -2492,27 +2513,155 @@ export interface DecodedPSBT {
 }
 
 /**
- * Simple script disassembly (hex to asm).
+ * Opcode name lookup — mirrors bitcoin-core/src/script/script.cpp::GetOpName.
+ * Small numbers (OP_0, OP_1..OP_16) use Core's numeric string form ("0",
+ * "1".."16"). OP_1NEGATE → "-1". Unknown opcodes → "OP_UNKNOWN".
  */
-function disassembleScript(script: Buffer): string {
-  // Very basic disassembly - just return hex for now
-  // A full implementation would decode opcodes
-  return script.toString("hex");
+function getOpcodeName(op: number): string {
+  const names: Record<number, string> = {
+    0x4f: "-1",       // OP_1NEGATE
+    0x50: "OP_RESERVED",
+    0x51: "1",  0x52: "2",  0x53: "3",  0x54: "4",
+    0x55: "5",  0x56: "6",  0x57: "7",  0x58: "8",
+    0x59: "9",  0x5a: "10", 0x5b: "11", 0x5c: "12",
+    0x5d: "13", 0x5e: "14", 0x5f: "15", 0x60: "16",
+    0x61: "OP_NOP",
+    0x63: "OP_IF",    0x64: "OP_NOTIF",
+    0x67: "OP_ELSE",  0x68: "OP_ENDIF",
+    0x69: "OP_VERIFY",
+    0x6a: "OP_RETURN",
+    0x6b: "OP_TOALTSTACK", 0x6c: "OP_FROMALTSTACK",
+    0x6d: "OP_2DROP", 0x6e: "OP_2DUP",  0x6f: "OP_3DUP",
+    0x70: "OP_2OVER", 0x71: "OP_2ROT",  0x72: "OP_2SWAP",
+    0x73: "OP_IFDUP", 0x74: "OP_DEPTH", 0x75: "OP_DROP",
+    0x76: "OP_DUP",   0x77: "OP_NIP",   0x78: "OP_OVER",
+    0x87: "OP_EQUAL", 0x88: "OP_EQUALVERIFY",
+    0x8b: "OP_1ADD",  0x8c: "OP_1SUB",
+    0x91: "OP_NOT",   0x92: "OP_0NOTEQUAL",
+    0x93: "OP_ADD",   0x94: "OP_SUB",
+    0x9a: "OP_BOOLAND", 0x9b: "OP_BOOLOR",
+    0x9c: "OP_NUMEQUAL", 0x9d: "OP_NUMEQUALVERIFY",
+    0x9e: "OP_NUMNOTEQUAL",
+    0x9f: "OP_LESSTHAN", 0xa0: "OP_GREATERTHAN",
+    0xa1: "OP_LESSTHANOREQUAL", 0xa2: "OP_GREATERTHANOREQUAL",
+    0xa3: "OP_MIN",   0xa4: "OP_MAX",   0xa5: "OP_WITHIN",
+    0xa6: "OP_RIPEMD160", 0xa7: "OP_SHA1",
+    0xa8: "OP_SHA256", 0xa9: "OP_HASH160", 0xaa: "OP_HASH256",
+    0xab: "OP_CODESEPARATOR",
+    0xac: "OP_CHECKSIG", 0xad: "OP_CHECKSIGVERIFY",
+    0xae: "OP_CHECKMULTISIG", 0xaf: "OP_CHECKMULTISIGVERIFY",
+    0xb0: "OP_NOP1",
+    0xb1: "OP_CHECKLOCKTIMEVERIFY", 0xb2: "OP_CHECKSEQUENCEVERIFY",
+    0xb3: "OP_NOP4",  0xb4: "OP_NOP5",  0xb5: "OP_NOP6",
+    0xb6: "OP_NOP7",  0xb7: "OP_NOP8",  0xb8: "OP_NOP9",
+    0xb9: "OP_NOP10",
+    0xba: "OP_CHECKSIGADD",
+  };
+  return names[op] ?? "OP_UNKNOWN";
 }
 
 /**
- * Get script type from scriptPubKey.
+ * Decode a CScriptNum push (≤4 bytes) to its signed-integer string.
+ * Core's ScriptToAsmStr renders small pushes this way.
+ */
+function scriptNumToAsmStr(vch: Buffer): string {
+  if (vch.length === 0) return "0";
+  let result = 0;
+  for (let i = 0; i < vch.length; i++) {
+    result |= vch[i] << (8 * i);
+  }
+  // Sign bit is in MSB of last byte.
+  const last = vch[vch.length - 1];
+  if (last & 0x80) {
+    // Clear sign bit, negate.
+    const signBitMask = 1 << (8 * (vch.length - 1) + 7 - (8 * (vch.length - 1)));
+    result &= ~(0x80 << (8 * (vch.length - 1)));
+    result = -result;
+  }
+  return result.toString();
+}
+
+/**
+ * Core-compatible script ASM disassembly (ScriptToAsmStr, fAttemptSighashDecode=false).
+ * - OP_0 (0x00) → "0"
+ * - Small pushes (1–4 bytes) → CScriptNum integer text
+ * - Large pushes (>4 bytes) → hex
+ * - Non-push opcodes → GetOpName string
+ */
+function disassembleScript(script: Buffer): string {
+  if (script.length === 0) return "";
+
+  const parts: string[] = [];
+  let i = 0;
+
+  while (i < script.length) {
+    const op = script[i];
+
+    if (op === 0x00) {
+      // OP_0 → "0"
+      parts.push("0");
+      i++;
+    } else if (op >= 0x01 && op <= 0x4b) {
+      // OP_PUSHBYTES_N
+      const len = op;
+      if (i + 1 + len > script.length) { parts.push("[error]"); break; }
+      const data = script.subarray(i + 1, i + 1 + len);
+      if (len <= 4) {
+        parts.push(scriptNumToAsmStr(data));
+      } else {
+        parts.push(data.toString("hex"));
+      }
+      i += 1 + len;
+    } else if (op === 0x4c) {
+      // OP_PUSHDATA1
+      if (i + 1 >= script.length) { parts.push("[error]"); break; }
+      const len = script[i + 1];
+      if (i + 2 + len > script.length) { parts.push("[error]"); break; }
+      const data = script.subarray(i + 2, i + 2 + len);
+      parts.push(len <= 4 ? scriptNumToAsmStr(data) : data.toString("hex"));
+      i += 2 + len;
+    } else if (op === 0x4d) {
+      // OP_PUSHDATA2
+      if (i + 2 >= script.length) { parts.push("[error]"); break; }
+      const len = script.readUInt16LE(i + 1);
+      if (i + 3 + len > script.length) { parts.push("[error]"); break; }
+      const data = script.subarray(i + 3, i + 3 + len);
+      parts.push(len <= 4 ? scriptNumToAsmStr(data) : data.toString("hex"));
+      i += 3 + len;
+    } else if (op === 0x4e) {
+      // OP_PUSHDATA4
+      if (i + 4 >= script.length) { parts.push("[error]"); break; }
+      const len = script.readUInt32LE(i + 1);
+      if (i + 5 + len > script.length) { parts.push("[error]"); break; }
+      const data = script.subarray(i + 5, i + 5 + len);
+      parts.push(len <= 4 ? scriptNumToAsmStr(data) : data.toString("hex"));
+      i += 5 + len;
+    } else {
+      parts.push(getOpcodeName(op));
+      i++;
+    }
+  }
+
+  return parts.join(" ");
+}
+
+/**
+ * Get script type string matching Bitcoin Core's scriptPubKey type names.
  */
 function getScriptType(script: Buffer): string {
+  // P2WPKH: OP_0 <20 bytes>
   if (script.length === 22 && script[0] === 0x00 && script[1] === 0x14) {
     return "witness_v0_keyhash";
   }
+  // P2WSH: OP_0 <32 bytes>
   if (script.length === 34 && script[0] === 0x00 && script[1] === 0x20) {
     return "witness_v0_scripthash";
   }
+  // P2TR: OP_1 <32 bytes>
   if (script.length === 34 && script[0] === 0x51 && script[1] === 0x20) {
     return "witness_v1_taproot";
   }
+  // P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
   if (
     script.length === 25 &&
     script[0] === 0x76 &&
@@ -2523,6 +2672,7 @@ function getScriptType(script: Buffer): string {
   ) {
     return "pubkeyhash";
   }
+  // P2SH: OP_HASH160 <20 bytes> OP_EQUAL
   if (
     script.length === 23 &&
     script[0] === 0xa9 &&
@@ -2531,7 +2681,119 @@ function getScriptType(script: Buffer): string {
   ) {
     return "scripthash";
   }
+  // P2PK: <33 or 65 bytes pubkey> OP_CHECKSIG
+  if (
+    (script.length === 35 || script.length === 67) &&
+    script[script.length - 1] === 0xac
+  ) {
+    return "pubkey";
+  }
+  // OP_RETURN (nulldata)
+  if (script.length >= 1 && script[0] === 0x6a) {
+    return "nulldata";
+  }
   return "nonstandard";
+}
+
+/**
+ * Sentinel prefix used to tag BTC amount strings so the RPC JSON replacer
+ * (server.ts::bigIntJsonReplacer) can detect and un-quote them, turning
+ * the JSON string `"__BTC__:1.00000000"` into the raw JSON number
+ * `1.00000000` after a post-process pass.
+ *
+ * This is the canonical way to embed raw JSON numbers in JavaScript
+ * without a custom serializer: (1) tag in JSON replacer, (2) strip
+ * quotes in the final string pass.
+ */
+export const BTC_AMOUNT_SENTINEL = "__BTC__:";
+
+/**
+ * Format a satoshi amount as Bitcoin Core's ValueFromAmount:
+ * always 8 fractional digits, no scientific notation (e.g. "1.00000000").
+ *
+ * Returns an object whose toJSON() emits a sentinel-tagged string that the
+ * RPC serializer post-processes into a raw JSON number.  See BTC_AMOUNT_SENTINEL.
+ *
+ * Reference: bitcoin-core/src/core_io.cpp ValueFromAmount (%s%d.%08d).
+ */
+export function formatBtcAmount(sats: bigint): { toJSON(): string } {
+  const neg = sats < 0n;
+  const abs = neg ? -sats : sats;
+  const whole = abs / 100_000_000n;
+  const frac = abs % 100_000_000n;
+  const fracStr = frac.toString().padStart(8, "0");
+  const raw = (neg ? "-" : "") + whole.toString() + "." + fracStr;
+  return { toJSON() { return BTC_AMOUNT_SENTINEL + raw; } };
+}
+
+/**
+ * Extract the canonical Bitcoin address from a scriptPubKey, matching
+ * Core's ExtractDestination. Returns null for P2PK, multisig, nulldata,
+ * nonstandard. The network is always mainnet for the live PSBT fleet.
+ */
+function spkToAddress(script: Buffer): string | null {
+  const type = getScriptType(script);
+
+  if (type === "pubkeyhash" && script.length === 25) {
+    return base58CheckEncode(0x00, script.subarray(3, 23));
+  }
+  if (type === "scripthash" && script.length === 23) {
+    return base58CheckEncode(0x05, script.subarray(2, 22));
+  }
+  if (type === "witness_v0_keyhash" && script.length === 22) {
+    return bech32Encode("bc", 0, script.subarray(2, 22));
+  }
+  if (type === "witness_v0_scripthash" && script.length === 34) {
+    return bech32Encode("bc", 0, script.subarray(2, 34));
+  }
+  if (type === "witness_v1_taproot" && script.length === 34) {
+    return bech32Encode("bc", 1, script.subarray(2, 34));
+  }
+  return null;
+}
+
+/**
+ * Build a BIP-380 descriptor string for a scriptPubKey, mirroring Core's
+ * InferDescriptor in the no-provider context (decodepsbt):
+ *   addr(<address>)#<checksum>  — for standard address-encodable scripts
+ *   raw(<hex>)#<checksum>       — otherwise
+ */
+function inferDescriptor(script: Buffer): string {
+  const addr = spkToAddress(script);
+  let inner: string;
+  if (addr !== null) {
+    inner = `addr(${addr})`;
+  } else {
+    inner = `raw(${script.toString("hex")})`;
+  }
+  try {
+    return addChecksum(inner);
+  } catch {
+    return inner;
+  }
+}
+
+/**
+ * Build the Core-compatible scriptPubKey JSON object:
+ *   { asm, desc, hex, address?, type }
+ * The `address` field is suppressed for bare-pubkey scripts (type==="pubkey"),
+ * matching Core's ScriptToUniv behaviour.
+ */
+function buildScriptPubKeyObj(script: Buffer): DecodedScriptPubKey {
+  const type = getScriptType(script);
+  const result: DecodedScriptPubKey = {
+    asm: disassembleScript(script),
+    desc: inferDescriptor(script),
+    hex: script.toString("hex"),
+    type,
+  };
+  if (type !== "pubkey") {
+    const addr = spkToAddress(script);
+    if (addr !== null) {
+      result.address = addr;
+    }
+  }
+  return result;
 }
 
 /**
@@ -2548,12 +2810,29 @@ function formatDerivationPath(origin: KeyOriginInfo): string {
 }
 
 /**
- * Decode a PSBT for RPC output.
+ * Decode a PSBT for RPC output, producing Bitcoin Core-byte-compatible JSON.
+ *
+ * References:
+ *   bitcoin-core/src/rpc/rawtransaction.cpp::decodepsbt
+ *   bitcoin-core/src/core_io.cpp::TxToUniv, ScriptToUniv, ValueFromAmount
  */
 export function decodePSBT(psbt: PSBT): DecodedPSBT {
-  const txid = getTxId(psbt.tx).reverse().toString("hex");
+  const tx = psbt.tx;
 
-  const vin = psbt.tx.inputs.map((input) => ({
+  // tx.txid and tx.hash — for non-segwit PSBTs (unsigned global tx has no
+  // witness data) these are identical. Both are displayed as big-endian hex.
+  // NOTE: Buffer.reverse() mutates in place; clone before reversing so the
+  // cached _cachedTxId is not corrupted (getWTxId returns the same buffer
+  // reference for non-segwit txs).
+  const txid = Buffer.from(getTxId(tx)).reverse().toString("hex");
+  const hash = Buffer.from(getWTxId(tx)).reverse().toString("hex");
+
+  // tx size/vsize/weight (Core's TxToUniv fields)
+  const txSize = serializeTx(tx, hasWitness(tx)).length;
+  const txWeight = getTxWeight(tx);
+  const txVsize = getTxVSize(tx);
+
+  const vin = tx.inputs.map((input) => ({
     txid: Buffer.from(input.prevOut.txid).reverse().toString("hex"),
     vout: input.prevOut.vout,
     scriptSig: {
@@ -2563,14 +2842,10 @@ export function decodePSBT(psbt: PSBT): DecodedPSBT {
     sequence: input.sequence,
   }));
 
-  const vout = psbt.tx.outputs.map((output, n) => ({
-    value: Number(output.value) / 100_000_000,
+  const vout = tx.outputs.map((output, n) => ({
+    value: formatBtcAmount(output.value),
     n,
-    scriptPubKey: {
-      asm: disassembleScript(output.scriptPubKey),
-      hex: output.scriptPubKey.toString("hex"),
-      type: getScriptType(output.scriptPubKey),
-    },
+    scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey),
   }));
 
   const unknown: Record<string, string> = {};
@@ -2583,12 +2858,8 @@ export function decodePSBT(psbt: PSBT): DecodedPSBT {
 
     if (input.witnessUtxo) {
       result.witness_utxo = {
-        amount: Number(input.witnessUtxo.value) / 100_000_000,
-        scriptPubKey: {
-          asm: disassembleScript(input.witnessUtxo.scriptPubKey),
-          hex: input.witnessUtxo.scriptPubKey.toString("hex"),
-          type: getScriptType(input.witnessUtxo.scriptPubKey),
-        },
+        amount: formatBtcAmount(input.witnessUtxo.value),
+        scriptPubKey: buildScriptPubKeyObj(input.witnessUtxo.scriptPubKey),
       };
     }
 
@@ -2703,24 +2974,23 @@ export function decodePSBT(psbt: PSBT): DecodedPSBT {
     return result;
   });
 
-  // Calculate fee
-  let fee: number | undefined;
-  const analysis = analyzePSBT(psbt);
-  if (analysis.estimatedFee !== undefined) {
-    fee = Number(analysis.estimatedFee) / 100_000_000;
-  }
-
   return {
     tx: {
       txid,
-      version: psbt.tx.version,
-      locktime: psbt.tx.lockTime,
+      hash,
+      version: tx.version,
+      size: txSize,
+      vsize: txVsize,
+      weight: txWeight,
+      locktime: tx.lockTime,
       vin,
       vout,
     },
+    global_xpubs: [],
+    psbt_version: 0,
+    proprietary: [],
     unknown,
     inputs,
     outputs,
-    fee,
   };
 }

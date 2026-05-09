@@ -67,6 +67,7 @@ import {
   updateInputUTXO,
   isInputFinalized,
   analyzePSBTCore,
+  BTC_AMOUNT_SENTINEL,
 } from "../wallet/psbt.js";
 import {
   ChainstateManager,
@@ -222,6 +223,23 @@ export function bigIntJsonReplacer(_key: string, value: unknown): unknown {
     return value.toString();
   }
   return value;
+}
+
+/**
+ * Post-process a serialized JSON string to replace BTC-amount sentinel tokens
+ * with raw JSON numbers.
+ *
+ * `formatBtcAmount` (wallet/psbt.ts) uses `toJSON()` to embed
+ * `"__BTC__:1.00000000"` in the JSON string (quoted, because JSON.stringify
+ * always quotes strings returned by toJSON). This pass removes the quotes
+ * and the sentinel prefix, leaving the raw decimal number `1.00000000`
+ * in the JSON stream — byte-identical to Bitcoin Core's ValueFromAmount output.
+ *
+ * The regex anchors on the fixed 8-digit fractional part so it cannot match
+ * unrelated string fields.
+ */
+function unquoteBtcAmounts(json: string): string {
+  return json.replace(/"__BTC__:(-?\d+\.\d{8})"/g, "$1");
 }
 
 // ============================================================================
@@ -596,7 +614,7 @@ export class RPCServer {
       const responses = await Promise.all(
         body.map((request) => this.processRequest(request))
       );
-      return new Response(JSON.stringify(responses, bigIntJsonReplacer), {
+      return new Response(unquoteBtcAmounts(JSON.stringify(responses, bigIntJsonReplacer)), {
         status: 200,
         headers: { "Content-Type": "application/json", "Connection": "close" },
       });
@@ -621,7 +639,7 @@ export class RPCServer {
     // handlers that return a `bigint`-typed field; without it `JSON.stringify`
     // throws and the RPC client sees a connection drop / 500.
     const response = await this.processRequest(body);
-    return new Response(JSON.stringify(response, bigIntJsonReplacer), {
+    return new Response(unquoteBtcAmounts(JSON.stringify(response, bigIntJsonReplacer)), {
       status: 200,
       headers: { "Content-Type": "application/json", "Connection": "close" },
     });
