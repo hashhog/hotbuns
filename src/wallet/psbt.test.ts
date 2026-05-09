@@ -24,10 +24,12 @@ import {
 } from "../validation/tx";
 import {
   addPartialSignature,
+  analyzePSBTCore,
   createPSBT,
   finalizePSBTInput,
   getInputUTXO,
   isInputFinalized,
+  parseMultisigThreshold,
   signPSBTInput,
 } from "./psbt";
 
@@ -381,5 +383,198 @@ describe("PSBT finalize: legacy P2SH-multisig (W43)", () => {
     // Partial sigs must NOT be cleared on failure.
     expect(psbt.inputs[0].partialSigs.size).toBe(1);
     expect(psbt.inputs[0].redeemScript).toBeDefined();
+  });
+});
+
+// =============================================================================
+// W47: analyzepsbt per-input role classifier + PSBT-level next rollup.
+//
+// Mirrors the OCaml regression added in camlcoin commit `2a22a0e` (W41).
+// The W40-C harness (tools/psbt-multi-input-test.sh) reported camlcoin's
+// analyzepsbt returning next="signer" on a fixture whose two inputs each
+// have all required partial sigs; Bitcoin Core 31.99 reports next="finalizer".
+// We reproduce the bug-shape here so hotbuns can't regress.
+//
+// Reference: bitcoin-core/src/node/psbt.cpp `AnalyzePSBT`.
+// Reference: camlcoin lib/psbt.ml `psbt_next_role` (W41 / 2a22a0e).
+// =============================================================================
+
+describe("analyzepsbt: per-input role classifier + PSBT-level next (W47)", () => {
+  /** Build a 2-of-2 P2SH-multisig redeemScript for two distinct pubkeys. */
+  function build2of2Redeem(pubA: Buffer, pubB: Buffer): Buffer {
+    return Buffer.concat([
+      Buffer.from([0x52]), // OP_2
+      Buffer.from([0x21]), pubA,
+      Buffer.from([0x21]), pubB,
+      Buffer.from([0x52]), // OP_2
+      Buffer.from([0xae]), // OP_CHECKMULTISIG
+    ]);
+  }
+
+  /** P2SH scriptPubKey: OP_HASH160 <hash160(redeem)> OP_EQUAL. */
+  function p2shScript(redeem: Buffer): Buffer {
+    return Buffer.concat([
+      Buffer.from([0xa9, 0x14]),
+      hash160(redeem),
+      Buffer.from([0x87]),
+    ]);
+  }
+
+  /** Asymmetric fake-DER signature. NOT a valid ECDSA sig — we only
+   *  exercise the classifier, not signature verification. */
+  function makeFakeSig(seed: number): Buffer {
+    const sig = Buffer.alloc(70);
+    for (let i = 0; i < 70; i++) sig[i] = (i * 17 + seed) & 0xff;
+    sig[0] = 0x30;
+    sig[69] = 0x01; // SIGHASH_ALL
+    return sig;
+  }
+
+  test("parseMultisigThreshold extracts (2, 2) and the two pubkeys from a bare 2-of-2 CHECKMULTISIG", () => {
+    const kA = makeKey(401);
+    const kB = makeKey(402);
+    const redeem = build2of2Redeem(kA.pub, kB.pub);
+
+    const ms = parseMultisigThreshold(redeem);
+    expect(ms).toBeDefined();
+    expect(ms!.m).toBe(2);
+    expect(ms!.n).toBe(2);
+    expect(ms!.pubkeys).toHaveLength(2);
+    expect(ms!.pubkeys[0].equals(kA.pub)).toBe(true);
+    expect(ms!.pubkeys[1].equals(kB.pub)).toBe(true);
+  });
+
+  test("W40-C regression: 2-of-2 P2SH-multisig with both partial sigs → next='finalizer' (NOT 'signer')", () => {
+    // This mirrors camlcoin's W41 regression test exactly: a PSBT whose
+    // single input has every required signature must report
+    // next='finalizer', not 'signer', because the next role is the
+    // finalizer (not yet another signer).
+    const kA = makeKey(411);
+    const kB = makeKey(412);
+    const redeem = build2of2Redeem(kA.pub, kB.pub);
+    const spk = p2shScript(redeem);
+    const value = 271_828n;
+
+    const prevTx = makePrevTx(spk, value, 0xb1);
+    const spendTx = makeSpendTx(makeAsymTxid(0xb1), value);
+
+    const psbt = createPSBT(spendTx);
+    psbt.inputs[0].nonWitnessUtxo = prevTx;
+    psbt.inputs[0].redeemScript = redeem;
+    addPartialSignature(psbt, 0, kA.pub, makeFakeSig(0xa1));
+    addPartialSignature(psbt, 0, kB.pub, makeFakeSig(0xb2));
+
+    const a = analyzePSBTCore(psbt);
+    expect(a.inputs).toHaveLength(1);
+    expect(a.inputs[0].has_utxo).toBe(true);
+    expect(a.inputs[0].is_final).toBe(false);
+    expect(a.inputs[0].next).toBe("finalizer");
+    expect(a.inputs[0].missing).toBeUndefined();
+    expect(a.next).toBe("finalizer");
+  });
+
+  test("partially-signed 2-of-2 P2SH-multisig (1 of 2) → next='signer' + missing.signatures lists the absent pubkey", () => {
+    const kA = makeKey(421);
+    const kB = makeKey(422);
+    const redeem = build2of2Redeem(kA.pub, kB.pub);
+    const spk = p2shScript(redeem);
+    const value = 314_159n;
+
+    const prevTx = makePrevTx(spk, value, 0xb2);
+    const spendTx = makeSpendTx(makeAsymTxid(0xb2), value);
+
+    const psbt = createPSBT(spendTx);
+    psbt.inputs[0].nonWitnessUtxo = prevTx;
+    psbt.inputs[0].redeemScript = redeem;
+    // Only kA has signed.
+    addPartialSignature(psbt, 0, kA.pub, makeFakeSig(0xc3));
+
+    const a = analyzePSBTCore(psbt);
+    expect(a.inputs).toHaveLength(1);
+    expect(a.inputs[0].has_utxo).toBe(true);
+    expect(a.inputs[0].is_final).toBe(false);
+    expect(a.inputs[0].next).toBe("signer");
+    expect(a.inputs[0].missing).toBeDefined();
+    expect(a.inputs[0].missing!.signatures).toEqual([kB.pub.toString("hex")]);
+    expect(a.next).toBe("signer");
+  });
+
+  test("finalized PSBT (final_script_sig set) → next='extractor' at both per-input and PSBT level", () => {
+    const kA = makeKey(431);
+    const kB = makeKey(432);
+    const redeem = build2of2Redeem(kA.pub, kB.pub);
+    const spk = p2shScript(redeem);
+    const value = 161_803n;
+
+    const prevTx = makePrevTx(spk, value, 0xb3);
+    const spendTx = makeSpendTx(makeAsymTxid(0xb3), value);
+
+    const psbt = createPSBT(spendTx);
+    psbt.inputs[0].nonWitnessUtxo = prevTx;
+    // Stash a non-empty final_script_sig — its exact bytes don't matter
+    // for analyzepsbt (we only check is_final).
+    psbt.inputs[0].finalScriptSig = Buffer.from([0x00, 0x47, 0x30]);
+
+    const a = analyzePSBTCore(psbt);
+    expect(a.inputs).toHaveLength(1);
+    expect(a.inputs[0].is_final).toBe(true);
+    expect(a.inputs[0].next).toBe("extractor");
+    expect(a.next).toBe("extractor");
+  });
+
+  test("PSBT-level next is the MIN of per-input roles (mixed: one finalizer + one updater → 'updater')", () => {
+    // Two inputs: input 0 has utxo+sigs (finalizer); input 1 has no utxo
+    // (updater). PSBT-level next must be 'updater' (the rarer role wins
+    // because it's earlier in Core's role order).
+    const kA = makeKey(441);
+    const kB = makeKey(442);
+    const redeem = build2of2Redeem(kA.pub, kB.pub);
+    const spk = p2shScript(redeem);
+    const value = 999_999n;
+
+    const prevTx = makePrevTx(spk, value, 0xb4);
+    const spendTx: Transaction = {
+      version: 2,
+      inputs: [
+        {
+          prevOut: { txid: makeAsymTxid(0xb4), vout: 0 },
+          scriptSig: Buffer.alloc(0),
+          sequence: 0xffffffff,
+          witness: [],
+        },
+        {
+          prevOut: { txid: makeAsymTxid(0xb5), vout: 0 },
+          scriptSig: Buffer.alloc(0),
+          sequence: 0xffffffff,
+          witness: [],
+        },
+      ],
+      outputs: [
+        {
+          value: value - 2000n,
+          scriptPubKey: Buffer.concat([
+            Buffer.from([0x00, 0x14]),
+            // Distinct asymmetric dummy hash (W32-B).
+            Buffer.from(Array.from({ length: 20 }, (_, i) => (i * 13 + 0x73) & 0xff)),
+          ]),
+        },
+      ],
+      lockTime: 0,
+    };
+
+    const psbt = createPSBT(spendTx);
+    // Input 0 is fully signed (finalizer).
+    psbt.inputs[0].nonWitnessUtxo = prevTx;
+    psbt.inputs[0].redeemScript = redeem;
+    addPartialSignature(psbt, 0, kA.pub, makeFakeSig(0xa9));
+    addPartialSignature(psbt, 0, kB.pub, makeFakeSig(0xba));
+    // Input 1 has no UTXO at all.
+
+    const a = analyzePSBTCore(psbt);
+    expect(a.inputs).toHaveLength(2);
+    expect(a.inputs[0].next).toBe("finalizer");
+    expect(a.inputs[1].has_utxo).toBe(false);
+    expect(a.inputs[1].next).toBe("updater");
+    expect(a.next).toBe("updater");
   });
 });

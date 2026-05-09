@@ -66,6 +66,7 @@ import {
   convertToPSBT,
   updateInputUTXO,
   isInputFinalized,
+  analyzePSBTCore,
 } from "../wallet/psbt.js";
 import {
   ChainstateManager,
@@ -894,6 +895,7 @@ export class RPCServer {
     this.registerMethod("decodepsbt", (params) => this.decodePSBTRpc(params));
     this.registerMethod("combinepsbt", (params) => this.combinePSBTRpc(params));
     this.registerMethod("finalizepsbt", (params) => this.finalizePSBTRpc(params));
+    this.registerMethod("analyzepsbt", (params) => this.analyzePSBTRpc(params));
 
     // Utility methods
     this.registerMethod("help", (params) => this.help(params));
@@ -6839,6 +6841,56 @@ export class RPCServer {
       result.psbt = encodePSBTBase64(psbt);
     }
     return result;
+  }
+
+  /**
+   * analyzepsbt: analyse a PSBT and report next-role per input + globally.
+   *
+   * Output shape mirrors Bitcoin Core's `analyzepsbt`
+   * (`bitcoin-core/src/rpc/rawtransaction.cpp::analyzepsbt`,
+   * `bitcoin-core/src/node/psbt.cpp::AnalyzePSBT`):
+   *
+   *   {
+   *     "inputs": [
+   *       { "has_utxo": bool, "is_final": bool, "next": role,
+   *         "missing": { "signatures": ["pubkey-hex", ...] } (optional) },
+   *       ...
+   *     ],
+   *     "next": role
+   *   }
+   *
+   * The PSBT-level `next` is the minimum per-input role in Core's order
+   * (creator < updater < signer < finalizer < extractor). Multisig inputs
+   * are classified by parsing the redeem/witness CHECKMULTISIG layout to
+   * derive the M threshold; an input with M partial sigs is reported as
+   * `next=finalizer`, not `signer` (W47 / W44-1 finding; see also
+   * camlcoin commit `2a22a0e` for the OCaml reference implementation).
+   *
+   * Per-input `estimated_vsize` / `estimated_feerate` / `fee` are not
+   * emitted yet — the W40-C harness only checks the top-level `next`
+   * field. Adding them is a follow-up that requires a working
+   * dummy-signer analog of Core's `SignPSBTInput`.
+   *
+   * @param params [psbt]
+   */
+  private async analyzePSBTRpc(params: unknown[]): Promise<Record<string, unknown>> {
+    const [psbtParam] = params;
+    if (typeof psbtParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "psbt must be a string");
+    }
+    let psbt: PSBT;
+    try {
+      psbt = decodePSBTBase64(psbtParam);
+    } catch (e) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `TX decode failed ${(e as Error).message}`
+      );
+    }
+    const analysis = analyzePSBTCore(psbt);
+    // Cast through unknown — `AnalyzedPSBT` is a structurally-compatible
+    // JSON object (string-keyed, JSON-safe values).
+    return analysis as unknown as Record<string, unknown>;
   }
 
   /**
