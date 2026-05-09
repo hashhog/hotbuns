@@ -1,4 +1,4 @@
-import { createRequire } from "node:module";
+// @bun
 var __create = Object.create;
 var __getProtoOf = Object.getPrototypeOf;
 var __defProp = Object.defineProperty;
@@ -62,7 +62,7 @@ var __export = (target, all) => {
     });
 };
 var __esm = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
-var __require = /* @__PURE__ */ createRequire(import.meta.url);
+var __require = import.meta.require;
 
 // node_modules/level-supports/index.js
 var require_level_supports = __commonJS((exports) => {
@@ -3153,6 +3153,209 @@ var require_iterator = __commonJS((exports) => {
   exports.Iterator = Iterator;
 });
 
+// node_modules/classic-level/index.js
+var AbstractLevel, AbstractSnapshot, ModuleError, fsp, binding, ChainedBatch, Iterator, kContext, kLocation, ClassicLevel, Snapshot, $ClassicLevel, FLAG_FILL_CACHE = 1, FLAG_KEY_AS_BUFFER = 2, FLAG_VALUE_AS_BUFFER = 4, FLAG_SHARED_KEY = 8;
+var init_classic_level = __esm(() => {
+  ({ AbstractLevel, AbstractSnapshot } = require_abstract_level2());
+  ModuleError = require_module_error();
+  fsp = __require("fs/promises");
+  binding = require_binding();
+  ({ ChainedBatch } = require_chained_batch());
+  ({ Iterator } = require_iterator());
+  kContext = Symbol("context");
+  kLocation = Symbol("location");
+  ClassicLevel = class ClassicLevel extends AbstractLevel {
+    #sharedBuffer = null;
+    constructor(location, options) {
+      if (typeof location !== "string" || location === "") {
+        throw new TypeError("The first argument 'location' must be a non-empty string");
+      }
+      super({
+        encodings: {
+          buffer: true,
+          utf8: true,
+          view: true
+        },
+        has: true,
+        createIfMissing: true,
+        errorIfExists: true,
+        explicitSnapshots: true,
+        getSync: true,
+        additionalMethods: {
+          approximateSize: true,
+          compactRange: true
+        },
+        signals: {
+          iterators: true
+        }
+      }, options);
+      this[kLocation] = location;
+      this[kContext] = binding.db_init();
+    }
+    get location() {
+      return this[kLocation];
+    }
+    async _open(options) {
+      if (options.createIfMissing) {
+        await fsp.mkdir(this[kLocation], { recursive: true });
+      }
+      return binding.db_open(this[kContext], this[kLocation], options);
+    }
+    async _close() {
+      return binding.db_close(this[kContext]);
+    }
+    async _put(key, value, options) {
+      return binding.db_put(this[kContext], key, value, options);
+    }
+    async _get(key, options) {
+      let flags = 0;
+      if (options.fillCache !== false)
+        flags |= FLAG_FILL_CACHE;
+      if (options.valueEncoding !== "utf8")
+        flags |= FLAG_VALUE_AS_BUFFER;
+      if (options.keyEncoding !== "utf8") {
+        flags |= FLAG_KEY_AS_BUFFER;
+        if (key.buffer.resizable) {
+          key = new Uint8Array(key);
+        }
+      }
+      return binding.db_get(this[kContext], flags, key, options.snapshot?.[kContext]);
+    }
+    _getSync(key, options) {
+      let flags = 0;
+      if (options.fillCache !== false)
+        flags |= FLAG_FILL_CACHE;
+      if (options.valueEncoding !== "utf8")
+        flags |= FLAG_VALUE_AS_BUFFER;
+      if (options.keyEncoding !== "utf8") {
+        return binding.db_get_sync(this[kContext], flags, key, options.snapshot?.[kContext]);
+      } else {
+        let keySize;
+        if (this.#sharedBuffer === null) {
+          keySize = this.#createSharedBuffer(key);
+        } else {
+          keySize = this.#sharedBuffer.write(key);
+          if (keySize === this.#sharedBuffer.byteLength) {
+            keySize = this.#createSharedBuffer(key);
+          }
+        }
+        return binding.db_get_sync(this[kContext], flags | FLAG_SHARED_KEY, keySize, options.snapshot?.[kContext]);
+      }
+    }
+    #createSharedBuffer(str) {
+      this.#sharedBuffer = Buffer.allocUnsafe(Buffer.byteLength(str) + 64);
+      binding.db_set_shared_buffer(this[kContext], this.#sharedBuffer);
+      return this.#sharedBuffer.write(str);
+    }
+    async _getMany(keys, options) {
+      return binding.db_get_many(this[kContext], keys, options, options.snapshot?.[kContext]);
+    }
+    async _has(key, options) {
+      return binding.db_has(this[kContext], key, options.fillCache, options.snapshot?.[kContext]);
+    }
+    async _hasMany(keys, options) {
+      const wordCount = keys.length + 32 >>> 5;
+      const buffer = new ArrayBuffer(wordCount * 4);
+      const bitset = new Uint32Array(buffer);
+      await binding.db_has_many(this[kContext], keys, options.fillCache, options.snapshot?.[kContext], buffer);
+      const values = new Array(keys.length);
+      for (let i = 0;i < values.length; i++) {
+        values[i] = (bitset[i >>> 5] & 1 << (i & 31)) !== 0;
+      }
+      return values;
+    }
+    async _del(key, options) {
+      return binding.db_del(this[kContext], key, options);
+    }
+    async _clear(options) {
+      return binding.db_clear(this[kContext], options, options.snapshot?.[kContext]);
+    }
+    _chainedBatch() {
+      return new ChainedBatch(this, this[kContext]);
+    }
+    async _batch(operations, options) {
+      return binding.batch_do(this[kContext], operations, options);
+    }
+    async approximateSize(start, end, options) {
+      if (arguments.length < 2) {
+        throw new TypeError("The arguments 'start' and 'end' are required");
+      } else if (typeof options !== "object") {
+        options = null;
+      }
+      if (this.status === "opening") {
+        return this.deferAsync(() => this.approximateSize(start, end, options));
+      } else if (this.status !== "open") {
+        throw new ModuleError("Database is not open: cannot call approximateSize()", {
+          code: "LEVEL_DATABASE_NOT_OPEN"
+        });
+      } else {
+        const keyEncoding = this.keyEncoding(options && options.keyEncoding);
+        start = keyEncoding.encode(start);
+        end = keyEncoding.encode(end);
+        return binding.db_approximate_size(this[kContext], start, end);
+      }
+    }
+    async compactRange(start, end, options) {
+      if (arguments.length < 2) {
+        throw new TypeError("The arguments 'start' and 'end' are required");
+      } else if (typeof options !== "object") {
+        options = null;
+      }
+      if (this.status === "opening") {
+        return this.deferAsync(() => this.compactRange(start, end, options));
+      } else if (this.status !== "open") {
+        throw new ModuleError("Database is not open: cannot call compactRange()", {
+          code: "LEVEL_DATABASE_NOT_OPEN"
+        });
+      } else {
+        const keyEncoding = this.keyEncoding(options && options.keyEncoding);
+        start = keyEncoding.encode(start);
+        end = keyEncoding.encode(end);
+        return binding.db_compact_range(this[kContext], start, end);
+      }
+    }
+    getProperty(property) {
+      if (typeof property !== "string") {
+        throw new TypeError("The first argument 'property' must be a string");
+      }
+      if (this.status !== "open") {
+        throw new ModuleError("Database is not open", {
+          code: "LEVEL_DATABASE_NOT_OPEN"
+        });
+      }
+      return binding.db_get_property(this[kContext], property);
+    }
+    _iterator(options) {
+      return new Iterator(this, this[kContext], options, options.snapshot?.[kContext]);
+    }
+    _snapshot(options) {
+      return new Snapshot(this[kContext], options);
+    }
+    static async destroy(location) {
+      if (typeof location !== "string" || location === "") {
+        throw new TypeError("The first argument 'location' must be a non-empty string");
+      }
+      return binding.destroy_db(location);
+    }
+    static async repair(location) {
+      if (typeof location !== "string" || location === "") {
+        throw new TypeError("The first argument 'location' must be a non-empty string");
+      }
+      return binding.repair_db(location);
+    }
+  };
+  Snapshot = class Snapshot extends AbstractSnapshot {
+    constructor(context, options) {
+      super(options);
+      this[kContext] = binding.snapshot_init(context);
+    }
+    async _close() {
+      binding.snapshot_close(this[kContext]);
+    }
+  };
+  $ClassicLevel = ClassicLevel;
+});
+
 // src/wire/serialization.ts
 var exports_serialization = {};
 __export(exports_serialization, {
@@ -3431,6 +3634,459 @@ var POOL_SIZES, MAX_POOL_SIZE = 100, globalBufferPool;
 var init_serialization = __esm(() => {
   POOL_SIZES = [32, 80, 256, 1024, 4096];
   globalBufferPool = new BufferPool;
+});
+
+// src/storage/database.ts
+function makeKey(prefix, key) {
+  const buf = Buffer.allocUnsafe(1 + key.length);
+  buf[0] = prefix;
+  key.copy(buf, 1);
+  return buf;
+}
+function encodeHeight(height) {
+  const buf = Buffer.allocUnsafe(4);
+  buf.writeUInt32BE(height, 0);
+  return buf;
+}
+function encodeUTXOKey(txid, vout) {
+  const buf = Buffer.allocUnsafe(36);
+  txid.copy(buf, 0);
+  buf.writeUInt32LE(vout, 32);
+  return buf;
+}
+function serializeBlockIndex(record) {
+  const buf = Buffer.allocUnsafe(96);
+  buf.writeUInt32LE(record.height, 0);
+  record.header.copy(buf, 4);
+  buf.writeUInt32LE(record.nTx, 84);
+  buf.writeUInt32LE(record.status, 88);
+  buf.writeUInt32LE(record.dataPos, 92);
+  return buf;
+}
+function deserializeBlockIndex(data) {
+  const reader = new BufferReader(data);
+  const height = reader.readUInt32LE();
+  const header = reader.readBytes(80);
+  const nTx = reader.readUInt32LE();
+  const status = reader.readUInt32LE();
+  const dataPos = reader.readUInt32LE();
+  return { height, header, nTx, status, dataPos };
+}
+function serializeUTXO(entry) {
+  const spkLen = entry.scriptPubKey.length;
+  const viSize = spkLen <= 252 ? 1 : spkLen <= 65535 ? 3 : 5;
+  const buf = Buffer.allocUnsafe(4 + 1 + 8 + viSize + spkLen);
+  let pos = 0;
+  buf.writeUInt32LE(entry.height, pos);
+  pos += 4;
+  buf[pos++] = entry.coinbase ? 1 : 0;
+  buf.writeBigUInt64LE(entry.amount, pos);
+  pos += 8;
+  if (spkLen <= 252) {
+    buf[pos++] = spkLen;
+  } else if (spkLen <= 65535) {
+    buf[pos++] = 253;
+    buf.writeUInt16LE(spkLen, pos);
+    pos += 2;
+  } else {
+    buf[pos++] = 254;
+    buf.writeUInt32LE(spkLen, pos);
+    pos += 4;
+  }
+  entry.scriptPubKey.copy(buf, pos);
+  return buf;
+}
+function deserializeUTXO(data) {
+  const reader = new BufferReader(data);
+  const height = reader.readUInt32LE();
+  const coinbase = reader.readUInt8() === 1;
+  const amount = reader.readUInt64LE();
+  const scriptPubKey = reader.readVarBytes();
+  return { height, coinbase, amount, scriptPubKey };
+}
+function serializeTxIndex(entry) {
+  const writer = new BufferWriter;
+  writer.writeHash(entry.blockHash);
+  writer.writeUInt32LE(entry.offset);
+  writer.writeUInt32LE(entry.length);
+  return writer.toBuffer();
+}
+function deserializeTxIndex(data) {
+  const reader = new BufferReader(data);
+  const blockHash = reader.readHash();
+  const offset = reader.readUInt32LE();
+  const length = reader.readUInt32LE();
+  return { blockHash, offset, length };
+}
+function serializeChainState(state) {
+  const writer = new BufferWriter;
+  writer.writeHash(state.bestBlockHash);
+  writer.writeUInt32LE(state.bestHeight);
+  const workBytes = bigIntToBuffer(state.totalWork);
+  writer.writeVarBytes(workBytes);
+  return writer.toBuffer();
+}
+function deserializeChainState(data) {
+  const reader = new BufferReader(data);
+  const bestBlockHash = reader.readHash();
+  const bestHeight = reader.readUInt32LE();
+  const workBytes = reader.readVarBytes();
+  const totalWork = bufferToBigInt(workBytes);
+  return { bestBlockHash, bestHeight, totalWork };
+}
+function bigIntToBuffer(n) {
+  if (n === 0n) {
+    return Buffer.alloc(0);
+  }
+  let hex = n.toString(16);
+  if (hex.length % 2 !== 0) {
+    hex = "0" + hex;
+  }
+  return Buffer.from(hex, "hex");
+}
+function bufferToBigInt(buf) {
+  if (buf.length === 0) {
+    return 0n;
+  }
+  return BigInt("0x" + buf.toString("hex"));
+}
+
+class ChainDB {
+  db;
+  closing;
+  constructor(dbPath) {
+    this.db = new $ClassicLevel(dbPath, {
+      keyEncoding: "buffer",
+      valueEncoding: "buffer",
+      cacheSize: 256 * 1024 * 1024,
+      writeBufferSize: 16 * 1024 * 1024,
+      maxOpenFiles: 256
+    });
+    this.closing = false;
+  }
+  async open() {
+    await this.db.open();
+  }
+  async close() {
+    this.closing = true;
+    await this.db.close();
+  }
+  isClosing() {
+    return this.closing;
+  }
+  async putBlockIndex(hash, record) {
+    if (this.closing) {
+      return;
+    }
+    const key = makeKey(98 /* BLOCK_INDEX */, hash);
+    const value = serializeBlockIndex(record);
+    await this.db.put(key, value);
+    const heightKey = makeKey(104 /* HEADER */, encodeHeight(record.height));
+    await this.db.put(heightKey, hash);
+  }
+  async getBlockIndex(hash) {
+    const key = makeKey(98 /* BLOCK_INDEX */, hash);
+    const value = await this.db.get(key);
+    if (value === undefined) {
+      return null;
+    }
+    return deserializeBlockIndex(value);
+  }
+  async getBlockHashByHeight(height) {
+    const key = makeKey(104 /* HEADER */, encodeHeight(height));
+    const value = await this.db.get(key);
+    if (value === undefined) {
+      return null;
+    }
+    return value;
+  }
+  async putBlock(hash, rawBlock) {
+    const key = makeKey(100 /* BLOCK_DATA */, hash);
+    await this.db.put(key, rawBlock);
+  }
+  async getBlock(hash) {
+    const key = makeKey(100 /* BLOCK_DATA */, hash);
+    const value = await this.db.get(key);
+    if (value === undefined) {
+      return null;
+    }
+    return value;
+  }
+  async putUTXO(txid, vout, entry) {
+    const key = makeKey(117 /* UTXO */, encodeUTXOKey(txid, vout));
+    const value = serializeUTXO(entry);
+    await this.db.put(key, value);
+  }
+  async getUTXO(txid, vout) {
+    const key = makeKey(117 /* UTXO */, encodeUTXOKey(txid, vout));
+    const value = await this.db.get(key);
+    if (value === undefined) {
+      return null;
+    }
+    return deserializeUTXO(value);
+  }
+  async deleteUTXO(txid, vout) {
+    const key = makeKey(117 /* UTXO */, encodeUTXOKey(txid, vout));
+    await this.db.del(key);
+  }
+  async putTxIndex(txid, entry) {
+    const key = makeKey(116 /* TX_INDEX */, txid);
+    const value = serializeTxIndex(entry);
+    await this.db.put(key, value);
+  }
+  async getTxIndex(txid) {
+    const key = makeKey(116 /* TX_INDEX */, txid);
+    try {
+      const value = await this.db.get(key);
+      if (value === undefined) {
+        return null;
+      }
+      return deserializeTxIndex(value);
+    } catch {
+      return null;
+    }
+  }
+  async deleteTxIndex(txid) {
+    const key = makeKey(116 /* TX_INDEX */, txid);
+    await this.db.del(key);
+  }
+  async putChainState(state) {
+    const key = makeKey(115 /* CHAIN_STATE */, Buffer.alloc(0));
+    const value = serializeChainState(state);
+    await this.db.put(key, value);
+  }
+  buildChainStateOp(state) {
+    return {
+      type: "put",
+      prefix: 115 /* CHAIN_STATE */,
+      key: Buffer.alloc(0),
+      value: serializeChainState(state)
+    };
+  }
+  buildTxIndexDeleteOp(txid) {
+    return {
+      type: "del",
+      prefix: 116 /* TX_INDEX */,
+      key: txid
+    };
+  }
+  buildTxIndexPutOp(txid, blockHash, offset = 0, length = 0) {
+    const value = Buffer.alloc(40);
+    blockHash.copy(value, 0);
+    value.writeUInt32LE(offset >>> 0, 32);
+    value.writeUInt32LE(length >>> 0, 36);
+    return {
+      type: "put",
+      prefix: 116 /* TX_INDEX */,
+      key: txid,
+      value
+    };
+  }
+  buildUndoDataPutOp(blockHash, data) {
+    return {
+      type: "put",
+      prefix: 114 /* UNDO */,
+      key: blockHash,
+      value: data
+    };
+  }
+  async getChainState() {
+    const key = makeKey(115 /* CHAIN_STATE */, Buffer.alloc(0));
+    const value = await this.db.get(key);
+    if (value === undefined) {
+      return null;
+    }
+    return deserializeChainState(value);
+  }
+  async batch(ops) {
+    const batch = this.db.batch();
+    for (const op of ops) {
+      const key = makeKey(op.prefix, op.key);
+      if (op.type === "put") {
+        if (!op.value) {
+          throw new Error("batch put operation requires a value");
+        }
+        batch.put(key, op.value);
+      } else {
+        batch.del(key);
+      }
+    }
+    await batch.write();
+  }
+  async batchWrite(ops, maxBatchSize = DEFAULT_MAX_BATCH_SIZE) {
+    if (ops.length === 0) {
+      return;
+    }
+    if (ops.length <= maxBatchSize) {
+      await this.batch(ops);
+      return;
+    }
+    for (let i = 0;i < ops.length; i += maxBatchSize) {
+      const chunk = ops.slice(i, Math.min(i + maxBatchSize, ops.length));
+      await this.batch(chunk);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+  static getIBDBatchSize() {
+    return IBD_BATCH_SIZE;
+  }
+  static getDefaultBatchSize() {
+    return DEFAULT_MAX_BATCH_SIZE;
+  }
+  async putChainWork(hash, chainWork) {
+    const key = makeKey(119 /* CHAIN_WORK */, hash);
+    const buf = Buffer.allocUnsafe(32);
+    let w = chainWork;
+    for (let i = 31;i >= 0; i--) {
+      buf[i] = Number(w & 0xffn);
+      w >>= 8n;
+    }
+    await this.db.put(key, buf);
+  }
+  async getChainWork(hash) {
+    const key = makeKey(119 /* CHAIN_WORK */, hash);
+    const value = await this.db.get(key);
+    if (value === undefined) {
+      return null;
+    }
+    let result = 0n;
+    for (let i = 0;i < 32; i++) {
+      result = result << 8n | BigInt(value[i]);
+    }
+    return result;
+  }
+  async putUndoData(hash, data) {
+    const key = makeKey(114 /* UNDO */, hash);
+    await this.db.put(key, data);
+  }
+  async getUndoData(hash) {
+    const key = makeKey(114 /* UNDO */, hash);
+    const value = await this.db.get(key);
+    if (value === undefined) {
+      return null;
+    }
+    return value;
+  }
+  async putBlockFileInfo(fileNum, info) {
+    const key = makeKey(102 /* BLOCK_FILES */, encodeFileNum(fileNum));
+    await this.db.put(key, info);
+  }
+  async getBlockFileInfo(fileNum) {
+    const key = makeKey(102 /* BLOCK_FILES */, encodeFileNum(fileNum));
+    try {
+      const value = await this.db.get(key);
+      if (value === undefined) {
+        return null;
+      }
+      return value;
+    } catch {
+      return null;
+    }
+  }
+  async putLastBlockFile(fileNum) {
+    const key = makeKey(108 /* LAST_BLOCK_FILE */, Buffer.alloc(0));
+    const buf = Buffer.alloc(4);
+    buf.writeUInt32LE(fileNum, 0);
+    await this.db.put(key, buf);
+  }
+  async getLastBlockFile() {
+    const key = makeKey(108 /* LAST_BLOCK_FILE */, Buffer.alloc(0));
+    try {
+      const value = await this.db.get(key);
+      if (value === undefined) {
+        return null;
+      }
+      return value.readUInt32LE(0);
+    } catch {
+      return null;
+    }
+  }
+  async putBlockPos(hash, posData) {
+    const key = makeKey(112 /* BLOCK_POS */, hash);
+    await this.db.put(key, posData);
+  }
+  async getBlockPos(hash) {
+    const key = makeKey(112 /* BLOCK_POS */, hash);
+    try {
+      const value = await this.db.get(key);
+      if (value === undefined) {
+        return null;
+      }
+      return value;
+    } catch {
+      return null;
+    }
+  }
+  async putPruneState(havePruned, pruneTarget) {
+    const key = makeKey(80 /* PRUNE_STATE */, Buffer.alloc(0));
+    const buf = Buffer.alloc(9);
+    buf.writeUInt8(havePruned ? 1 : 0, 0);
+    buf.writeBigUInt64LE(BigInt(pruneTarget), 1);
+    await this.db.put(key, buf);
+  }
+  async getPruneState() {
+    const key = makeKey(80 /* PRUNE_STATE */, Buffer.alloc(0));
+    try {
+      const value = await this.db.get(key);
+      if (value === undefined || value.length < 9) {
+        return null;
+      }
+      return {
+        havePruned: value.readUInt8(0) === 1,
+        pruneTarget: Number(value.readBigUInt64LE(1))
+      };
+    } catch {
+      return null;
+    }
+  }
+  async updateBlockStatus(hash, status) {
+    const record = await this.getBlockIndex(hash);
+    if (record) {
+      record.status = status;
+      await this.putBlockIndex(hash, record);
+    }
+  }
+  async* iterateBlockIndexEntries() {
+    const prefix = Buffer.from([98 /* BLOCK_INDEX */]);
+    const prefixEnd = Buffer.from([98 /* BLOCK_INDEX */ + 1]);
+    const iterator = this.db.iterator({
+      gte: prefix,
+      lt: prefixEnd
+    });
+    try {
+      for await (const [key, value] of iterator) {
+        if (key.length < 33)
+          continue;
+        const hash = Buffer.from(key.subarray(1, 33));
+        let record;
+        try {
+          record = deserializeBlockIndex(value);
+        } catch {
+          continue;
+        }
+        yield [hash, record];
+      }
+    } finally {
+      await iterator.close();
+    }
+  }
+  async updateBlockIndexNTx(hash, nTx) {
+    const record = await this.getBlockIndex(hash);
+    if (record && record.nTx === 0 && nTx > 0) {
+      record.nTx = nTx;
+      await this.putBlockIndex(hash, record);
+    }
+  }
+}
+function encodeFileNum(fileNum) {
+  const buf = Buffer.alloc(4);
+  buf.writeUInt32LE(fileNum, 0);
+  return buf;
+}
+var DEFAULT_MAX_BATCH_SIZE = 1e4, IBD_BATCH_SIZE = 50000;
+var init_database = __esm(() => {
+  init_classic_level();
+  init_serialization();
 });
 
 // node_modules/@noble/hashes/utils.js
@@ -6190,7 +6846,7 @@ function schnorrGetExtPubKey(priv) {
 function lift_x(x) {
   const Fp = Fpk1;
   if (!Fp.isValidNot0(x))
-    throw new Error("invalid x: Fail if x ≥ p");
+    throw new Error("invalid x: Fail if x \u2265 p");
   const xx = Fp.create(x * x);
   const c = Fp.create(xx * x + BigInt(7));
   let y = Fp.sqrt(c);
@@ -6509,9 +7165,9 @@ var init_secp256k1_ffi = __esm(() => {
   _xonlyPubkeyBuf = new Uint8Array(OPAQUE_BUF_SIZE);
   FFI_AVAILABLE = initFFI();
   if (FFI_AVAILABLE) {
-    console.error("[secp256k1_ffi] libsecp256k1 0.5.0 FFI ready — ECDSA/Schnorr via C library");
+    console.error("[secp256k1_ffi] libsecp256k1 0.5.0 FFI ready \u2014 ECDSA/Schnorr via C library");
   } else {
-    console.warn("[secp256k1_ffi] libsecp256k1 unavailable — callers fall back to @noble/curves");
+    console.warn("[secp256k1_ffi] libsecp256k1 unavailable \u2014 callers fall back to @noble/curves");
   }
 });
 
@@ -6543,7 +7199,7 @@ __export(exports_primitives, {
   ecdsaSign: () => ecdsaSign,
   computeMerkleRootOptimized: () => computeMerkleRootOptimized
 });
-import { createHash } from "node:crypto";
+import { createHash } from "crypto";
 function sha256NodeCrypto(data) {
   return createHash("sha256").update(data).digest();
 }
@@ -6884,10 +7540,18 @@ function tweakPrivateKey(privateKey, tweak) {
   if (tweak.length !== 32) {
     throw new Error(`tweakPrivateKey: tweak must be 32 bytes`);
   }
-  const d = BigInt("0x" + privateKey.toString("hex"));
-  const t = BigInt("0x" + tweak.toString("hex"));
   const n = BigInt("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
+  const compressedPubkey = Buffer.from(secp256k1.getPublicKey(privateKey, true));
+  const hasEvenY = compressedPubkey[0] === 2;
+  let d = BigInt("0x" + privateKey.toString("hex"));
+  const t = BigInt("0x" + tweak.toString("hex"));
+  if (!hasEvenY) {
+    d = n - d;
+  }
   const result = (d + t) % n;
+  if (result === 0n) {
+    throw new Error("tweakPrivateKey: tweaked key is zero");
+  }
   const hex = result.toString(16).padStart(64, "0");
   return Buffer.from(hex, "hex");
 }
@@ -7241,7 +7905,7 @@ var init_params = __esm(() => {
     assumeValidHeight: 938343,
     assumedValid: "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac",
     protocolVersion: 70016,
-    services: 0x0409n,
+    services: 0x09n,
     userAgent: "/hotbuns:0.1.0/",
     dnsSeed: [
       "seed.bitcoin.sipa.be",
@@ -8717,6 +9381,47 @@ function isP2A(script) {
 function isP2AProgram(version, program) {
   return version === 1 && program.length === 2 && program[0] === 78 && program[1] === 115;
 }
+function isPushOnlyFrom(script, offset) {
+  let i = offset;
+  while (i < script.length) {
+    const op = script[i];
+    if (op === 0) {
+      i++;
+      continue;
+    }
+    if (op >= 1 && op <= 75) {
+      if (i + 1 + op > script.length)
+        return false;
+      i += 1 + op;
+    } else if (op === 76) {
+      if (i + 1 >= script.length)
+        return false;
+      const len = script[i + 1];
+      if (i + 2 + len > script.length)
+        return false;
+      i += 2 + len;
+    } else if (op === 77) {
+      if (i + 2 >= script.length)
+        return false;
+      const len = script.readUInt16LE(i + 1);
+      if (i + 3 + len > script.length)
+        return false;
+      i += 3 + len;
+    } else if (op === 78) {
+      if (i + 4 >= script.length)
+        return false;
+      const len = script.readUInt32LE(i + 1);
+      if (i + 5 + len > script.length)
+        return false;
+      i += 5 + len;
+    } else if (op === 79 || op >= 81 && op <= 96) {
+      i++;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
 function getScriptType(script) {
   if (isP2PKH(script))
     return "p2pkh";
@@ -8730,8 +9435,9 @@ function getScriptType(script) {
     return "anchor";
   if (isP2TR(script))
     return "p2tr";
-  if (script.length >= 1 && script[0] === 106 /* OP_RETURN */)
+  if (script.length >= 1 && script[0] === 106 /* OP_RETURN */ && isPushOnlyFrom(script, 1)) {
     return "nulldata";
+  }
   if (isWitnessProgram(script))
     return "witness_unknown";
   return "nonstandard";
@@ -10805,6 +11511,594 @@ var init_block = __esm(() => {
   init_interpreter();
 });
 
+// src/chain/utxo.ts
+var exports_utxo = {};
+__export(exports_utxo, {
+  serializeUndoData: () => serializeUndoData,
+  deserializeUndoData: () => deserializeUndoData,
+  UTXOManager: () => UTXOManager,
+  CoinsViewDB: () => CoinsViewDB,
+  CoinsViewCache: () => CoinsViewCache,
+  CoinsView: () => CoinsView
+});
+function outpointKey(txid, vout) {
+  return `${txid.toString("hex")}:${vout}`;
+}
+function outpointKeyFromOutpoint(outpoint) {
+  return outpointKey(outpoint.txid, outpoint.vout);
+}
+function encodeDBKeyFromString(key) {
+  const colonIndex = key.lastIndexOf(":");
+  const buf = Buffer.allocUnsafe(36);
+  Buffer.from(key.slice(0, colonIndex), "hex").copy(buf, 0);
+  buf.writeUInt32LE(parseInt(key.slice(colonIndex + 1), 10), 32);
+  return buf;
+}
+function serializeCoin(coin) {
+  const spkLen = coin.txOut.scriptPubKey.length;
+  const viSize = spkLen <= 252 ? 1 : spkLen <= 65535 ? 3 : 5;
+  const buf = Buffer.allocUnsafe(4 + 1 + 8 + viSize + spkLen);
+  let pos = 0;
+  buf.writeUInt32LE(coin.height, pos);
+  pos += 4;
+  buf[pos++] = coin.isCoinbase ? 1 : 0;
+  buf.writeBigUInt64LE(coin.txOut.value, pos);
+  pos += 8;
+  if (spkLen <= 252) {
+    buf[pos++] = spkLen;
+  } else if (spkLen <= 65535) {
+    buf[pos++] = 253;
+    buf.writeUInt16LE(spkLen, pos);
+    pos += 2;
+  } else {
+    buf[pos++] = 254;
+    buf.writeUInt32LE(spkLen, pos);
+    pos += 4;
+  }
+  coin.txOut.scriptPubKey.copy(buf, pos);
+  return buf;
+}
+function coinMemoryUsage(coin) {
+  if (!coin)
+    return 0;
+  return 48 + coin.txOut.scriptPubKey.length;
+}
+
+class CoinsView {
+  estimateSize() {
+    return 0;
+  }
+}
+function serializeUndoData(spentOutputs) {
+  const writer = new BufferWriter;
+  writer.writeVarInt(spentOutputs.length);
+  for (const spent of spentOutputs) {
+    writer.writeHash(spent.txid);
+    writer.writeUInt32LE(spent.vout);
+    writer.writeUInt32LE(spent.entry.height);
+    writer.writeUInt8(spent.entry.coinbase ? 1 : 0);
+    writer.writeUInt64LE(spent.entry.amount);
+    writer.writeVarBytes(spent.entry.scriptPubKey);
+  }
+  return writer.toBuffer();
+}
+function deserializeUndoData(data) {
+  const reader = new BufferReader(data);
+  const count = reader.readVarInt();
+  const spentOutputs = [];
+  for (let i = 0;i < count; i++) {
+    const txid = reader.readHash();
+    const vout = reader.readUInt32LE();
+    const height = reader.readUInt32LE();
+    const coinbase = reader.readUInt8() === 1;
+    const amount = reader.readUInt64LE();
+    const scriptPubKey = reader.readVarBytes();
+    spentOutputs.push({
+      txid,
+      vout,
+      entry: { height, coinbase, amount, scriptPubKey }
+    });
+  }
+  return spentOutputs;
+}
+
+class UTXOManager {
+  viewDB;
+  cache;
+  maxCacheBytes;
+  maxCacheSize;
+  stats;
+  constructor(db, maxCacheBytes = DEFAULT_DBCACHE_BYTES) {
+    this.viewDB = new CoinsViewDB(db);
+    this.cache = new CoinsViewCache(this.viewDB, maxCacheBytes);
+    this.maxCacheBytes = maxCacheBytes;
+    this.maxCacheSize = Math.floor(maxCacheBytes / CACHE_ENTRY_OVERHEAD);
+    this.stats = {
+      hits: 0,
+      misses: 0,
+      evictions: 0,
+      flushes: 0,
+      currentSize: 0,
+      maxSize: this.maxCacheSize
+    };
+  }
+  getCoinsViewCache() {
+    return this.cache;
+  }
+  getCoinsViewDB() {
+    return this.viewDB;
+  }
+  getStats() {
+    const cacheStats = this.cache.getStats();
+    return {
+      hits: cacheStats.hits,
+      misses: cacheStats.misses,
+      evictions: 0,
+      flushes: cacheStats.flushCount,
+      currentSize: cacheStats.size,
+      maxSize: this.maxCacheSize
+    };
+  }
+  resetStats() {
+    this.cache.resetStats();
+  }
+  addTransaction(txid, tx, height, isCoinbase2) {
+    for (let vout = 0;vout < tx.outputs.length; vout++) {
+      const output = tx.outputs[vout];
+      const outpoint = { txid, vout };
+      const coin = {
+        txOut: {
+          value: output.value,
+          scriptPubKey: output.scriptPubKey
+        },
+        height,
+        isCoinbase: isCoinbase2
+      };
+      this.cache.addCoin(outpoint, coin, isCoinbase2);
+    }
+  }
+  spendOutput(outpoint) {
+    const moveout = { coin: null };
+    const success = this.cache.spendCoinSync(outpoint, moveout);
+    if (!success || !moveout.coin) {
+      throw new Error(`UTXO not in cache (must be pre-loaded): ${outpoint.txid.toString("hex")}:${outpoint.vout}`);
+    }
+    return {
+      height: moveout.coin.height,
+      coinbase: moveout.coin.isCoinbase,
+      amount: moveout.coin.txOut.value,
+      scriptPubKey: moveout.coin.txOut.scriptPubKey
+    };
+  }
+  async spendOutputAsync(outpoint) {
+    const moveout = { coin: null };
+    const success = await this.cache.spendCoin(outpoint, moveout);
+    if (!success || !moveout.coin) {
+      throw new Error(`UTXO not found: ${outpoint.txid.toString("hex")}:${outpoint.vout}`);
+    }
+    return {
+      height: moveout.coin.height,
+      coinbase: moveout.coin.isCoinbase,
+      amount: moveout.coin.txOut.value,
+      scriptPubKey: moveout.coin.txOut.scriptPubKey
+    };
+  }
+  getUTXO(outpoint) {
+    const coin = this.cache.getCoinFromCache(outpoint);
+    if (!coin)
+      return null;
+    return {
+      height: coin.height,
+      coinbase: coin.isCoinbase,
+      amount: coin.txOut.value,
+      scriptPubKey: coin.txOut.scriptPubKey
+    };
+  }
+  async getUTXOAsync(outpoint) {
+    const coin = await this.cache.getCoin(outpoint);
+    if (!coin)
+      return null;
+    return {
+      height: coin.height,
+      coinbase: coin.isCoinbase,
+      amount: coin.txOut.value,
+      scriptPubKey: coin.txOut.scriptPubKey
+    };
+  }
+  hasUTXO(outpoint) {
+    return this.cache.haveCoinInCache(outpoint);
+  }
+  async hasUTXOAsync(outpoint) {
+    return this.cache.haveCoin(outpoint);
+  }
+  restoreUTXO(txid, vout, entry) {
+    const outpoint = { txid, vout };
+    const coin = {
+      txOut: {
+        value: entry.amount,
+        scriptPubKey: entry.scriptPubKey
+      },
+      height: entry.height,
+      isCoinbase: entry.coinbase
+    };
+    this.cache.addCoin(outpoint, coin, true);
+  }
+  async removeUTXO(txid, vout) {
+    const outpoint = { txid, vout };
+    await this.cache.spendCoin(outpoint);
+  }
+  async flush(extraOps) {
+    if (this.cache.shouldFlush() || this.cache.getDirtyCount() > 0) {
+      await this.cache.flush(extraOps);
+    } else if (extraOps && extraOps.length > 0) {
+      const bestBlock = await this.cache.getBestBlock();
+      await this.viewDB.batchWrite(new Map, bestBlock, extraOps);
+    }
+  }
+  async flushDirty(extraOps) {
+    await this.cache.sync(extraOps);
+    if (this.cache.shouldFlush()) {
+      await this.cache.flush();
+    }
+  }
+  clearCache() {
+    this.cache = new CoinsViewCache(this.viewDB, this.maxCacheBytes);
+  }
+  async preloadUTXO(outpoint) {
+    const coin = await this.cache.getCoin(outpoint);
+    return coin !== null;
+  }
+  async preloadUTXOs(outpoints) {
+    const toLoad = [];
+    let loaded = 0;
+    for (const outpoint of outpoints) {
+      if (this.cache.haveCoinInCache(outpoint)) {
+        loaded++;
+      } else {
+        toLoad.push(outpoint);
+      }
+    }
+    if (toLoad.length === 0)
+      return loaded;
+    const results = await Promise.all(toLoad.map((op) => this.cache.getCoin(op)));
+    for (const coin of results) {
+      if (coin)
+        loaded++;
+    }
+    return loaded;
+  }
+  getEstimatedMemoryUsage() {
+    return this.cache.getMemoryUsage();
+  }
+  getMaxCacheSize() {
+    return this.maxCacheSize;
+  }
+  setMaxCacheBytes(maxBytes) {
+    this.maxCacheBytes = maxBytes;
+    this.maxCacheSize = Math.floor(maxBytes / CACHE_ENTRY_OVERHEAD);
+  }
+  getCacheSize() {
+    return this.cache.getCacheSize();
+  }
+  getPendingCount() {
+    return this.cache.getDirtyCount();
+  }
+  getDirtyCount() {
+    return this.cache.getDirtyCount();
+  }
+  shouldFlush() {
+    return this.cache.shouldFlush();
+  }
+  setBestBlock(hash) {
+    this.cache.setBestBlock(hash);
+    this.viewDB.setBestBlock(hash);
+  }
+}
+var DEFAULT_DBCACHE_BYTES, CACHE_ENTRY_OVERHEAD = 3000, CoinsViewDB, CoinsViewCache;
+var init_utxo = __esm(() => {
+  init_database();
+  init_serialization();
+  DEFAULT_DBCACHE_BYTES = 512 * 1024 * 1024;
+  CoinsViewDB = class CoinsViewDB extends CoinsView {
+    db;
+    bestBlockHash;
+    constructor(db) {
+      super();
+      this.db = db;
+      this.bestBlockHash = Buffer.alloc(32);
+    }
+    setBestBlock(hash) {
+      this.bestBlockHash = hash;
+    }
+    async getCoin(outpoint) {
+      const entry = await this.db.getUTXO(outpoint.txid, outpoint.vout);
+      if (!entry)
+        return null;
+      return {
+        txOut: {
+          value: entry.amount,
+          scriptPubKey: entry.scriptPubKey
+        },
+        height: entry.height,
+        isCoinbase: entry.coinbase
+      };
+    }
+    async haveCoin(outpoint) {
+      const entry = await this.db.getUTXO(outpoint.txid, outpoint.vout);
+      return entry !== null;
+    }
+    async getBestBlock() {
+      return this.bestBlockHash;
+    }
+    async batchWrite(entries, hashBlock, extraOps) {
+      const ops = [];
+      for (const [key, entry] of entries) {
+        if (!entry.dirty)
+          continue;
+        const dbKey = encodeDBKeyFromString(key);
+        if (entry.coin === null) {
+          if (!entry.fresh) {
+            ops.push({
+              type: "del",
+              prefix: 117 /* UTXO */,
+              key: dbKey
+            });
+          }
+        } else {
+          ops.push({
+            type: "put",
+            prefix: 117 /* UTXO */,
+            key: dbKey,
+            value: serializeCoin(entry.coin)
+          });
+        }
+      }
+      if (extraOps) {
+        ops.push(...extraOps);
+      }
+      if (ops.length > 0) {
+        await this.db.batch(ops);
+      }
+      this.bestBlockHash = hashBlock;
+    }
+  };
+  CoinsViewCache = class CoinsViewCache extends CoinsView {
+    base;
+    cache;
+    hashBlock;
+    cachedCoinsUsage;
+    dirtyCount;
+    maxCacheBytes;
+    hits;
+    misses;
+    flushCount;
+    constructor(base, maxCacheBytes = DEFAULT_DBCACHE_BYTES) {
+      super();
+      this.base = base;
+      this.cache = new Map;
+      this.hashBlock = Buffer.alloc(32);
+      this.cachedCoinsUsage = 0;
+      this.dirtyCount = 0;
+      this.maxCacheBytes = maxCacheBytes;
+      this.hits = 0;
+      this.misses = 0;
+      this.flushCount = 0;
+    }
+    async getCoin(outpoint) {
+      const key = outpointKeyFromOutpoint(outpoint);
+      const cached = this.cache.get(key);
+      if (cached !== undefined) {
+        this.hits++;
+        return cached.coin;
+      }
+      this.misses++;
+      const coin = await this.base.getCoin(outpoint);
+      if (coin) {
+        const entry = {
+          coin,
+          dirty: false,
+          fresh: false
+        };
+        this.cache.set(key, entry);
+        this.cachedCoinsUsage += coinMemoryUsage(coin) + CACHE_ENTRY_OVERHEAD;
+      }
+      return coin;
+    }
+    async haveCoin(outpoint) {
+      const key = outpointKeyFromOutpoint(outpoint);
+      const cached = this.cache.get(key);
+      if (cached !== undefined) {
+        return cached.coin !== null;
+      }
+      return this.base.haveCoin(outpoint);
+    }
+    haveCoinInCache(outpoint) {
+      const key = outpointKeyFromOutpoint(outpoint);
+      const cached = this.cache.get(key);
+      return cached !== undefined && cached.coin !== null;
+    }
+    getCoinFromCache(outpoint) {
+      const key = outpointKeyFromOutpoint(outpoint);
+      const cached = this.cache.get(key);
+      if (cached === undefined || cached.coin === null) {
+        return null;
+      }
+      this.hits++;
+      return cached.coin;
+    }
+    addCoin(outpoint, coin, possibleOverwrite) {
+      const key = outpointKeyFromOutpoint(outpoint);
+      if (coin.txOut.scriptPubKey.length > 0 && coin.txOut.scriptPubKey[0] === 106) {
+        return;
+      }
+      const existing = this.cache.get(key);
+      let fresh = false;
+      if (!possibleOverwrite) {
+        if (existing && existing.coin !== null) {
+          throw new Error("Attempted to overwrite an unspent coin (when possibleOverwrite is false)");
+        }
+        fresh = !existing || !existing.dirty;
+      }
+      if (existing) {
+        if (existing.dirty)
+          this.dirtyCount--;
+        this.cachedCoinsUsage -= coinMemoryUsage(existing.coin);
+      }
+      const entry = {
+        coin,
+        dirty: true,
+        fresh
+      };
+      this.cache.set(key, entry);
+      this.dirtyCount++;
+      this.cachedCoinsUsage += coinMemoryUsage(coin) + (existing ? 0 : CACHE_ENTRY_OVERHEAD);
+    }
+    async spendCoin(outpoint, moveout) {
+      const key = outpointKeyFromOutpoint(outpoint);
+      let entry = this.cache.get(key);
+      if (entry === undefined) {
+        const coin = await this.base.getCoin(outpoint);
+        if (!coin)
+          return false;
+        entry = {
+          coin,
+          dirty: false,
+          fresh: false
+        };
+        this.cache.set(key, entry);
+        this.cachedCoinsUsage += coinMemoryUsage(coin) + CACHE_ENTRY_OVERHEAD;
+      }
+      if (entry.coin === null) {
+        return false;
+      }
+      if (moveout) {
+        moveout.coin = entry.coin;
+      }
+      if (entry.dirty)
+        this.dirtyCount--;
+      this.cachedCoinsUsage -= coinMemoryUsage(entry.coin);
+      if (entry.fresh) {
+        this.cache.delete(key);
+      } else {
+        entry.coin = null;
+        entry.dirty = true;
+        this.dirtyCount++;
+      }
+      return true;
+    }
+    spendCoinSync(outpoint, moveout) {
+      const key = outpointKeyFromOutpoint(outpoint);
+      const entry = this.cache.get(key);
+      if (entry === undefined) {
+        throw new Error(`Coin not in cache (must be pre-loaded): ${outpoint.txid.toString("hex")}:${outpoint.vout}`);
+      }
+      if (entry.coin === null) {
+        return false;
+      }
+      if (moveout) {
+        moveout.coin = entry.coin;
+      }
+      if (entry.dirty)
+        this.dirtyCount--;
+      this.cachedCoinsUsage -= coinMemoryUsage(entry.coin);
+      if (entry.fresh) {
+        this.cache.delete(key);
+      } else {
+        entry.coin = null;
+        entry.dirty = true;
+        this.dirtyCount++;
+      }
+      return true;
+    }
+    uncache(outpoint) {
+      const key = outpointKeyFromOutpoint(outpoint);
+      const entry = this.cache.get(key);
+      if (entry && !entry.dirty) {
+        this.cachedCoinsUsage -= coinMemoryUsage(entry.coin) + CACHE_ENTRY_OVERHEAD;
+        this.cache.delete(key);
+      }
+    }
+    async getBestBlock() {
+      if (this.hashBlock.every((b) => b === 0)) {
+        this.hashBlock = await this.base.getBestBlock();
+      }
+      return this.hashBlock;
+    }
+    setBestBlock(hash) {
+      this.hashBlock = hash;
+    }
+    async flush(extraOps) {
+      if (!(this.base instanceof CoinsViewDB)) {
+        throw new Error("flush() requires CoinsViewDB as base");
+      }
+      await this.base.batchWrite(this.cache, this.hashBlock, extraOps);
+      this.cache.clear();
+      this.cachedCoinsUsage = 0;
+      this.dirtyCount = 0;
+      this.flushCount++;
+    }
+    async sync(extraOps) {
+      if (!(this.base instanceof CoinsViewDB)) {
+        throw new Error("sync() requires CoinsViewDB as base");
+      }
+      await this.base.batchWrite(this.cache, this.hashBlock, extraOps);
+      for (const [key, entry] of this.cache) {
+        if (entry.coin === null) {
+          this.cachedCoinsUsage -= CACHE_ENTRY_OVERHEAD;
+          this.cache.delete(key);
+        } else {
+          entry.dirty = false;
+          entry.fresh = false;
+        }
+      }
+      this.dirtyCount = 0;
+      this.flushCount++;
+      if (this.cachedCoinsUsage > this.maxCacheBytes) {
+        this.evictCleanEntries();
+      }
+    }
+    evictCleanEntries() {
+      const target = Math.floor(this.maxCacheBytes * 0.6);
+      for (const [key, entry] of this.cache) {
+        if (this.cachedCoinsUsage <= target) {
+          break;
+        }
+        if (!entry.dirty) {
+          this.cachedCoinsUsage -= coinMemoryUsage(entry.coin) + CACHE_ENTRY_OVERHEAD;
+          this.cache.delete(key);
+        }
+      }
+    }
+    shouldFlush() {
+      return this.cachedCoinsUsage >= this.maxCacheBytes;
+    }
+    getMemoryUsage() {
+      return this.cachedCoinsUsage;
+    }
+    getCacheSize() {
+      return this.cache.size;
+    }
+    getDirtyCount() {
+      return this.dirtyCount;
+    }
+    getStats() {
+      return {
+        size: this.cache.size,
+        dirtyCount: this.dirtyCount,
+        memoryUsage: this.cachedCoinsUsage,
+        maxMemory: this.maxCacheBytes,
+        hits: this.hits,
+        misses: this.misses,
+        flushCount: this.flushCount
+      };
+    }
+    resetStats() {
+      this.hits = 0;
+      this.misses = 0;
+    }
+  };
+});
+
 // node_modules/bech32/dist/index.js
 var require_dist = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", { value: true });
@@ -11232,1182 +12526,306 @@ var init_encoding = __esm(() => {
 });
 
 // src/cli/cli.ts
+init_database();
 import * as os from "os";
 import * as path3 from "path";
 import * as fs2 from "fs";
+import { EventEmitter } from "events";
 
-// node_modules/classic-level/index.js
-var { AbstractLevel, AbstractSnapshot } = require_abstract_level2();
-var ModuleError = require_module_error();
-var fsp = __require("fs/promises");
-var binding = require_binding();
-var { ChainedBatch } = require_chained_batch();
-var { Iterator } = require_iterator();
-var kContext = Symbol("context");
-var kLocation = Symbol("location");
+// src/storage/pruning.ts
+import { unlink } from "fs/promises";
+import { join } from "path";
 
-class ClassicLevel extends AbstractLevel {
-  #sharedBuffer = null;
-  constructor(location, options) {
-    if (typeof location !== "string" || location === "") {
-      throw new TypeError("The first argument 'location' must be a non-empty string");
-    }
-    super({
-      encodings: {
-        buffer: true,
-        utf8: true,
-        view: true
-      },
-      has: true,
-      createIfMissing: true,
-      errorIfExists: true,
-      explicitSnapshots: true,
-      getSync: true,
-      additionalMethods: {
-        approximateSize: true,
-        compactRange: true
-      },
-      signals: {
-        iterators: true
-      }
-    }, options);
-    this[kLocation] = location;
-    this[kContext] = binding.db_init();
-  }
-  get location() {
-    return this[kLocation];
-  }
-  async _open(options) {
-    if (options.createIfMissing) {
-      await fsp.mkdir(this[kLocation], { recursive: true });
-    }
-    return binding.db_open(this[kContext], this[kLocation], options);
-  }
-  async _close() {
-    return binding.db_close(this[kContext]);
-  }
-  async _put(key, value, options) {
-    return binding.db_put(this[kContext], key, value, options);
-  }
-  async _get(key, options) {
-    let flags = 0;
-    if (options.fillCache !== false)
-      flags |= FLAG_FILL_CACHE;
-    if (options.valueEncoding !== "utf8")
-      flags |= FLAG_VALUE_AS_BUFFER;
-    if (options.keyEncoding !== "utf8") {
-      flags |= FLAG_KEY_AS_BUFFER;
-      if (key.buffer.resizable) {
-        key = new Uint8Array(key);
-      }
-    }
-    return binding.db_get(this[kContext], flags, key, options.snapshot?.[kContext]);
-  }
-  _getSync(key, options) {
-    let flags = 0;
-    if (options.fillCache !== false)
-      flags |= FLAG_FILL_CACHE;
-    if (options.valueEncoding !== "utf8")
-      flags |= FLAG_VALUE_AS_BUFFER;
-    if (options.keyEncoding !== "utf8") {
-      return binding.db_get_sync(this[kContext], flags, key, options.snapshot?.[kContext]);
-    } else {
-      let keySize;
-      if (this.#sharedBuffer === null) {
-        keySize = this.#createSharedBuffer(key);
-      } else {
-        keySize = this.#sharedBuffer.write(key);
-        if (keySize === this.#sharedBuffer.byteLength) {
-          keySize = this.#createSharedBuffer(key);
-        }
-      }
-      return binding.db_get_sync(this[kContext], flags | FLAG_SHARED_KEY, keySize, options.snapshot?.[kContext]);
-    }
-  }
-  #createSharedBuffer(str) {
-    this.#sharedBuffer = Buffer.allocUnsafe(Buffer.byteLength(str) + 64);
-    binding.db_set_shared_buffer(this[kContext], this.#sharedBuffer);
-    return this.#sharedBuffer.write(str);
-  }
-  async _getMany(keys, options) {
-    return binding.db_get_many(this[kContext], keys, options, options.snapshot?.[kContext]);
-  }
-  async _has(key, options) {
-    return binding.db_has(this[kContext], key, options.fillCache, options.snapshot?.[kContext]);
-  }
-  async _hasMany(keys, options) {
-    const wordCount = keys.length + 32 >>> 5;
-    const buffer = new ArrayBuffer(wordCount * 4);
-    const bitset = new Uint32Array(buffer);
-    await binding.db_has_many(this[kContext], keys, options.fillCache, options.snapshot?.[kContext], buffer);
-    const values = new Array(keys.length);
-    for (let i = 0;i < values.length; i++) {
-      values[i] = (bitset[i >>> 5] & 1 << (i & 31)) !== 0;
-    }
-    return values;
-  }
-  async _del(key, options) {
-    return binding.db_del(this[kContext], key, options);
-  }
-  async _clear(options) {
-    return binding.db_clear(this[kContext], options, options.snapshot?.[kContext]);
-  }
-  _chainedBatch() {
-    return new ChainedBatch(this, this[kContext]);
-  }
-  async _batch(operations, options) {
-    return binding.batch_do(this[kContext], operations, options);
-  }
-  async approximateSize(start, end, options) {
-    if (arguments.length < 2) {
-      throw new TypeError("The arguments 'start' and 'end' are required");
-    } else if (typeof options !== "object") {
-      options = null;
-    }
-    if (this.status === "opening") {
-      return this.deferAsync(() => this.approximateSize(start, end, options));
-    } else if (this.status !== "open") {
-      throw new ModuleError("Database is not open: cannot call approximateSize()", {
-        code: "LEVEL_DATABASE_NOT_OPEN"
-      });
-    } else {
-      const keyEncoding = this.keyEncoding(options && options.keyEncoding);
-      start = keyEncoding.encode(start);
-      end = keyEncoding.encode(end);
-      return binding.db_approximate_size(this[kContext], start, end);
-    }
-  }
-  async compactRange(start, end, options) {
-    if (arguments.length < 2) {
-      throw new TypeError("The arguments 'start' and 'end' are required");
-    } else if (typeof options !== "object") {
-      options = null;
-    }
-    if (this.status === "opening") {
-      return this.deferAsync(() => this.compactRange(start, end, options));
-    } else if (this.status !== "open") {
-      throw new ModuleError("Database is not open: cannot call compactRange()", {
-        code: "LEVEL_DATABASE_NOT_OPEN"
-      });
-    } else {
-      const keyEncoding = this.keyEncoding(options && options.keyEncoding);
-      start = keyEncoding.encode(start);
-      end = keyEncoding.encode(end);
-      return binding.db_compact_range(this[kContext], start, end);
-    }
-  }
-  getProperty(property) {
-    if (typeof property !== "string") {
-      throw new TypeError("The first argument 'property' must be a string");
-    }
-    if (this.status !== "open") {
-      throw new ModuleError("Database is not open", {
-        code: "LEVEL_DATABASE_NOT_OPEN"
-      });
-    }
-    return binding.db_get_property(this[kContext], property);
-  }
-  _iterator(options) {
-    return new Iterator(this, this[kContext], options, options.snapshot?.[kContext]);
-  }
-  _snapshot(options) {
-    return new Snapshot(this[kContext], options);
-  }
-  static async destroy(location) {
-    if (typeof location !== "string" || location === "") {
-      throw new TypeError("The first argument 'location' must be a non-empty string");
-    }
-    return binding.destroy_db(location);
-  }
-  static async repair(location) {
-    if (typeof location !== "string" || location === "") {
-      throw new TypeError("The first argument 'location' must be a non-empty string");
-    }
-    return binding.repair_db(location);
-  }
-}
-
-class Snapshot extends AbstractSnapshot {
-  constructor(context, options) {
-    super(options);
-    this[kContext] = binding.snapshot_init(context);
-  }
-  async _close() {
-    binding.snapshot_close(this[kContext]);
-  }
-}
-var $ClassicLevel = ClassicLevel;
-var FLAG_FILL_CACHE = 1;
-var FLAG_KEY_AS_BUFFER = 2;
-var FLAG_VALUE_AS_BUFFER = 4;
-var FLAG_SHARED_KEY = 8;
-
-// src/storage/database.ts
+// src/storage/blockfile.ts
 init_serialization();
-var DEFAULT_MAX_BATCH_SIZE = 1e4;
-var IBD_BATCH_SIZE = 50000;
-function makeKey(prefix, key) {
-  const buf = Buffer.allocUnsafe(1 + key.length);
-  buf[0] = prefix;
-  key.copy(buf, 1);
-  return buf;
+function createEmptyBlockFileInfo() {
+  return {
+    nBlocks: 0,
+    nSize: 0,
+    nUndoSize: 0,
+    nHeightFirst: 0,
+    nHeightLast: 0,
+    nTimeFirst: 0,
+    nTimeLast: 0
+  };
 }
-function encodeHeight(height) {
-  const buf = Buffer.allocUnsafe(4);
-  buf.writeUInt32BE(height, 0);
-  return buf;
-}
-function encodeUTXOKey(txid, vout) {
-  const buf = Buffer.allocUnsafe(36);
-  txid.copy(buf, 0);
-  buf.writeUInt32LE(vout, 32);
-  return buf;
-}
-function serializeBlockIndex(record) {
-  const buf = Buffer.allocUnsafe(96);
-  buf.writeUInt32LE(record.height, 0);
-  record.header.copy(buf, 4);
-  buf.writeUInt32LE(record.nTx, 84);
-  buf.writeUInt32LE(record.status, 88);
-  buf.writeUInt32LE(record.dataPos, 92);
-  return buf;
-}
-function deserializeBlockIndex(data) {
-  const reader = new BufferReader(data);
-  const height = reader.readUInt32LE();
-  const header = reader.readBytes(80);
-  const nTx = reader.readUInt32LE();
-  const status = reader.readUInt32LE();
-  const dataPos = reader.readUInt32LE();
-  return { height, header, nTx, status, dataPos };
-}
-function serializeUTXO(entry) {
-  const spkLen = entry.scriptPubKey.length;
-  const viSize = spkLen <= 252 ? 1 : spkLen <= 65535 ? 3 : 5;
-  const buf = Buffer.allocUnsafe(4 + 1 + 8 + viSize + spkLen);
-  let pos = 0;
-  buf.writeUInt32LE(entry.height, pos);
-  pos += 4;
-  buf[pos++] = entry.coinbase ? 1 : 0;
-  buf.writeBigUInt64LE(entry.amount, pos);
-  pos += 8;
-  if (spkLen <= 252) {
-    buf[pos++] = spkLen;
-  } else if (spkLen <= 65535) {
-    buf[pos++] = 253;
-    buf.writeUInt16LE(spkLen, pos);
-    pos += 2;
-  } else {
-    buf[pos++] = 254;
-    buf.writeUInt32LE(spkLen, pos);
-    pos += 4;
-  }
-  entry.scriptPubKey.copy(buf, pos);
-  return buf;
-}
-function deserializeUTXO(data) {
-  const reader = new BufferReader(data);
-  const height = reader.readUInt32LE();
-  const coinbase = reader.readUInt8() === 1;
-  const amount = reader.readUInt64LE();
-  const scriptPubKey = reader.readVarBytes();
-  return { height, coinbase, amount, scriptPubKey };
-}
-function serializeTxIndex(entry) {
+function serializeBlockFileInfo(info) {
   const writer = new BufferWriter;
-  writer.writeHash(entry.blockHash);
-  writer.writeUInt32LE(entry.offset);
-  writer.writeUInt32LE(entry.length);
+  writer.writeVarInt(info.nBlocks);
+  writer.writeVarInt(info.nSize);
+  writer.writeVarInt(info.nUndoSize);
+  writer.writeVarInt(info.nHeightFirst);
+  writer.writeVarInt(info.nHeightLast);
+  writer.writeVarInt(info.nTimeFirst);
+  writer.writeVarInt(info.nTimeLast);
   return writer.toBuffer();
 }
-function deserializeTxIndex(data) {
+function deserializeBlockFileInfo(data) {
   const reader = new BufferReader(data);
-  const blockHash = reader.readHash();
-  const offset = reader.readUInt32LE();
-  const length = reader.readUInt32LE();
-  return { blockHash, offset, length };
-}
-function serializeChainState(state) {
-  const writer = new BufferWriter;
-  writer.writeHash(state.bestBlockHash);
-  writer.writeUInt32LE(state.bestHeight);
-  const workBytes = bigIntToBuffer(state.totalWork);
-  writer.writeVarBytes(workBytes);
-  return writer.toBuffer();
-}
-function deserializeChainState(data) {
-  const reader = new BufferReader(data);
-  const bestBlockHash = reader.readHash();
-  const bestHeight = reader.readUInt32LE();
-  const workBytes = reader.readVarBytes();
-  const totalWork = bufferToBigInt(workBytes);
-  return { bestBlockHash, bestHeight, totalWork };
-}
-function bigIntToBuffer(n) {
-  if (n === 0n) {
-    return Buffer.alloc(0);
-  }
-  let hex = n.toString(16);
-  if (hex.length % 2 !== 0) {
-    hex = "0" + hex;
-  }
-  return Buffer.from(hex, "hex");
-}
-function bufferToBigInt(buf) {
-  if (buf.length === 0) {
-    return 0n;
-  }
-  return BigInt("0x" + buf.toString("hex"));
+  return {
+    nBlocks: reader.readVarInt(),
+    nSize: reader.readVarInt(),
+    nUndoSize: reader.readVarInt(),
+    nHeightFirst: reader.readVarInt(),
+    nHeightLast: reader.readVarInt(),
+    nTimeFirst: reader.readVarInt(),
+    nTimeLast: reader.readVarInt()
+  };
 }
 
-class ChainDB {
+// src/storage/pruning.ts
+var MIN_PRUNE_TARGET = 550 * 1024 * 1024;
+var PRUNE_TARGET_MANUAL = Number.MAX_SAFE_INTEGER;
+var MIN_BLOCKS_TO_KEEP = 288;
+var BLOCKFILE_CHUNK_SIZE = 16 * 1024 * 1024;
+var UNDOFILE_CHUNK_SIZE = 1 * 1024 * 1024;
+
+class PruneManager {
   db;
-  closing;
-  constructor(dbPath) {
-    this.db = new $ClassicLevel(dbPath, {
-      keyEncoding: "buffer",
-      valueEncoding: "buffer",
-      cacheSize: 256 * 1024 * 1024,
-      writeBufferSize: 16 * 1024 * 1024,
-      maxOpenFiles: 256
-    });
-    this.closing = false;
+  dataDir;
+  pruneTarget;
+  havePruned;
+  blockFileInfo;
+  constructor(db, dataDir, pruneTarget) {
+    this.db = db;
+    this.dataDir = dataDir;
+    this.pruneTarget = pruneTarget;
+    this.havePruned = false;
+    this.blockFileInfo = new Map;
   }
-  async open() {
-    await this.db.open();
+  async init() {
+    const state = await this.db.getPruneState();
+    if (state) {
+      this.havePruned = state.havePruned;
+    }
+    await this.loadBlockFileInfo();
   }
-  async close() {
-    this.closing = true;
-    await this.db.close();
-  }
-  isClosing() {
-    return this.closing;
-  }
-  async putBlockIndex(hash, record) {
-    if (this.closing) {
+  async loadBlockFileInfo() {
+    const lastFile = await this.db.getLastBlockFile();
+    if (lastFile === null)
       return;
-    }
-    const key = makeKey(98 /* BLOCK_INDEX */, hash);
-    const value = serializeBlockIndex(record);
-    await this.db.put(key, value);
-    const heightKey = makeKey(104 /* HEADER */, encodeHeight(record.height));
-    await this.db.put(heightKey, hash);
-  }
-  async getBlockIndex(hash) {
-    const key = makeKey(98 /* BLOCK_INDEX */, hash);
-    const value = await this.db.get(key);
-    if (value === undefined) {
-      return null;
-    }
-    return deserializeBlockIndex(value);
-  }
-  async getBlockHashByHeight(height) {
-    const key = makeKey(104 /* HEADER */, encodeHeight(height));
-    const value = await this.db.get(key);
-    if (value === undefined) {
-      return null;
-    }
-    return value;
-  }
-  async putBlock(hash, rawBlock) {
-    const key = makeKey(100 /* BLOCK_DATA */, hash);
-    await this.db.put(key, rawBlock);
-  }
-  async getBlock(hash) {
-    const key = makeKey(100 /* BLOCK_DATA */, hash);
-    const value = await this.db.get(key);
-    if (value === undefined) {
-      return null;
-    }
-    return value;
-  }
-  async putUTXO(txid, vout, entry) {
-    const key = makeKey(117 /* UTXO */, encodeUTXOKey(txid, vout));
-    const value = serializeUTXO(entry);
-    await this.db.put(key, value);
-  }
-  async getUTXO(txid, vout) {
-    const key = makeKey(117 /* UTXO */, encodeUTXOKey(txid, vout));
-    const value = await this.db.get(key);
-    if (value === undefined) {
-      return null;
-    }
-    return deserializeUTXO(value);
-  }
-  async deleteUTXO(txid, vout) {
-    const key = makeKey(117 /* UTXO */, encodeUTXOKey(txid, vout));
-    await this.db.del(key);
-  }
-  async putTxIndex(txid, entry) {
-    const key = makeKey(116 /* TX_INDEX */, txid);
-    const value = serializeTxIndex(entry);
-    await this.db.put(key, value);
-  }
-  async getTxIndex(txid) {
-    const key = makeKey(116 /* TX_INDEX */, txid);
-    try {
-      const value = await this.db.get(key);
-      if (value === undefined) {
-        return null;
-      }
-      return deserializeTxIndex(value);
-    } catch {
-      return null;
-    }
-  }
-  async deleteTxIndex(txid) {
-    const key = makeKey(116 /* TX_INDEX */, txid);
-    await this.db.del(key);
-  }
-  async putChainState(state) {
-    const key = makeKey(115 /* CHAIN_STATE */, Buffer.alloc(0));
-    const value = serializeChainState(state);
-    await this.db.put(key, value);
-  }
-  async getChainState() {
-    const key = makeKey(115 /* CHAIN_STATE */, Buffer.alloc(0));
-    const value = await this.db.get(key);
-    if (value === undefined) {
-      return null;
-    }
-    return deserializeChainState(value);
-  }
-  async batch(ops) {
-    const batch = this.db.batch();
-    for (const op of ops) {
-      const key = makeKey(op.prefix, op.key);
-      if (op.type === "put") {
-        if (!op.value) {
-          throw new Error("batch put operation requires a value");
-        }
-        batch.put(key, op.value);
-      } else {
-        batch.del(key);
+    for (let i = 0;i <= lastFile; i++) {
+      const infoData = await this.db.getBlockFileInfo(i);
+      if (infoData) {
+        const info = deserializeBlockFileInfo(infoData);
+        this.blockFileInfo.set(i, info);
       }
     }
-    await batch.write();
   }
-  async batchWrite(ops, maxBatchSize = DEFAULT_MAX_BATCH_SIZE) {
-    if (ops.length === 0) {
+  async updateBlockFileInfo(fileNum, info) {
+    this.blockFileInfo.set(fileNum, info);
+    await this.db.putBlockFileInfo(fileNum, serializeBlockFileInfo(info));
+  }
+  isPruneMode() {
+    return this.pruneTarget > 0;
+  }
+  isAutomaticPruning() {
+    return this.pruneTarget > 0 && this.pruneTarget !== PRUNE_TARGET_MANUAL;
+  }
+  hasEverPruned() {
+    return this.havePruned;
+  }
+  getPruneTarget() {
+    return this.pruneTarget;
+  }
+  calculateCurrentUsage() {
+    let total = 0;
+    for (const info of this.blockFileInfo.values()) {
+      total += info.nSize + info.nUndoSize;
+    }
+    return total;
+  }
+  getBlockFilePath(fileNum) {
+    const fileName = `blk${String(fileNum).padStart(5, "0")}.dat`;
+    return join(this.dataDir, "blocks", fileName);
+  }
+  getRevFilePath(fileNum) {
+    const fileName = `rev${String(fileNum).padStart(5, "0")}.dat`;
+    return join(this.dataDir, "blocks", fileName);
+  }
+  async pruneOneBlockFile(fileNum) {
+    const info = this.blockFileInfo.get(fileNum);
+    if (!info || info.nSize === 0) {
       return;
     }
-    if (ops.length <= maxBatchSize) {
-      await this.batch(ops);
-      return;
-    }
-    for (let i = 0;i < ops.length; i += maxBatchSize) {
-      const chunk = ops.slice(i, Math.min(i + maxBatchSize, ops.length));
-      await this.batch(chunk);
-      await new Promise((resolve) => setTimeout(resolve, 0));
+    const emptyInfo = createEmptyBlockFileInfo();
+    await this.updateBlockFileInfo(fileNum, emptyInfo);
+    if (!this.havePruned) {
+      this.havePruned = true;
+      await this.db.putPruneState(true, this.pruneTarget);
     }
   }
-  static getIBDBatchSize() {
-    return IBD_BATCH_SIZE;
-  }
-  static getDefaultBatchSize() {
-    return DEFAULT_MAX_BATCH_SIZE;
-  }
-  async putChainWork(hash, chainWork) {
-    const key = makeKey(119 /* CHAIN_WORK */, hash);
-    const buf = Buffer.allocUnsafe(32);
-    let w = chainWork;
-    for (let i = 31;i >= 0; i--) {
-      buf[i] = Number(w & 0xffn);
-      w >>= 8n;
+  async unlinkPrunedFiles(filesToPrune) {
+    for (const fileNum of filesToPrune) {
+      const blockPath = this.getBlockFilePath(fileNum);
+      const revPath = this.getRevFilePath(fileNum);
+      try {
+        await unlink(blockPath);
+      } catch {}
+      try {
+        await unlink(revPath);
+      } catch {}
     }
-    await this.db.put(key, buf);
   }
-  async getChainWork(hash) {
-    const key = makeKey(119 /* CHAIN_WORK */, hash);
-    const value = await this.db.get(key);
-    if (value === undefined) {
-      return null;
+  async findFilesToPrune(chainHeight) {
+    const setFilesToPrune = new Set;
+    if (!this.isAutomaticPruning() || chainHeight < 0) {
+      return setFilesToPrune;
     }
-    let result = 0n;
-    for (let i = 0;i < 32; i++) {
-      result = result << 8n | BigInt(value[i]);
+    const target = Math.max(MIN_PRUNE_TARGET, this.pruneTarget);
+    const lastBlockCanPrune = chainHeight - MIN_BLOCKS_TO_KEEP;
+    const minBlockToPrune = 0;
+    if (lastBlockCanPrune < minBlockToPrune) {
+      return setFilesToPrune;
+    }
+    let currentUsage = this.calculateCurrentUsage();
+    const buffer = BLOCKFILE_CHUNK_SIZE + UNDOFILE_CHUNK_SIZE;
+    if (currentUsage + buffer < target) {
+      return setFilesToPrune;
+    }
+    const fileNums = Array.from(this.blockFileInfo.keys()).sort((a, b) => a - b);
+    for (const fileNum of fileNums) {
+      const info = this.blockFileInfo.get(fileNum);
+      if (info.nSize === 0) {
+        continue;
+      }
+      if (currentUsage + buffer < target) {
+        break;
+      }
+      if (info.nHeightLast > lastBlockCanPrune || info.nHeightFirst < minBlockToPrune) {
+        continue;
+      }
+      await this.pruneOneBlockFile(fileNum);
+      setFilesToPrune.add(fileNum);
+      currentUsage -= info.nSize + info.nUndoSize;
+    }
+    return setFilesToPrune;
+  }
+  async findFilesToPruneManual(targetHeight, chainHeight) {
+    const setFilesToPrune = new Set;
+    if (chainHeight < 0) {
+      return setFilesToPrune;
+    }
+    const lastBlockCanPrune = Math.min(targetHeight, chainHeight - MIN_BLOCKS_TO_KEEP);
+    const minBlockToPrune = 0;
+    if (lastBlockCanPrune < minBlockToPrune) {
+      return setFilesToPrune;
+    }
+    const fileNums = Array.from(this.blockFileInfo.keys()).sort((a, b) => a - b);
+    for (const fileNum of fileNums) {
+      const info = this.blockFileInfo.get(fileNum);
+      if (info.nSize === 0) {
+        continue;
+      }
+      if (info.nHeightLast > lastBlockCanPrune || info.nHeightFirst < minBlockToPrune) {
+        continue;
+      }
+      await this.pruneOneBlockFile(fileNum);
+      setFilesToPrune.add(fileNum);
+    }
+    return setFilesToPrune;
+  }
+  async maybePrune(chainHeight) {
+    const filesToPrune = await this.findFilesToPrune(chainHeight);
+    if (filesToPrune.size === 0) {
+      return {
+        filesPruned: 0,
+        bytesFreed: 0,
+        firstUnprunedHeight: 0
+      };
+    }
+    let bytesFreed = 0;
+    for (const fileNum of filesToPrune) {
+      const info = this.blockFileInfo.get(fileNum);
+      if (info) {
+        bytesFreed += info.nSize + info.nUndoSize;
+      }
+    }
+    await this.unlinkPrunedFiles(filesToPrune);
+    const firstUnprunedHeight = this.getFirstUnprunedHeight();
+    console.log(`Pruned ${filesToPrune.size} block files, freed ${(bytesFreed / 1024 / 1024).toFixed(2)} MiB`);
+    return {
+      filesPruned: filesToPrune.size,
+      bytesFreed,
+      firstUnprunedHeight
+    };
+  }
+  async pruneBlockchain(targetHeight, chainHeight) {
+    if (!this.isPruneMode()) {
+      throw new Error("Pruning is not enabled. Start with -prune=<n> to enable.");
+    }
+    const filesToPrune = await this.findFilesToPruneManual(targetHeight, chainHeight);
+    if (filesToPrune.size === 0) {
+      return {
+        filesPruned: 0,
+        bytesFreed: 0,
+        firstUnprunedHeight: this.getFirstUnprunedHeight()
+      };
+    }
+    let bytesFreed = 0;
+    for (const fileNum of filesToPrune) {
+      const info = this.blockFileInfo.get(fileNum);
+      if (info) {
+        bytesFreed += info.nSize + info.nUndoSize;
+      }
+    }
+    await this.unlinkPrunedFiles(filesToPrune);
+    const firstUnprunedHeight = this.getFirstUnprunedHeight();
+    console.log(`Manual prune: removed ${filesToPrune.size} block files, freed ${(bytesFreed / 1024 / 1024).toFixed(2)} MiB`);
+    return {
+      filesPruned: filesToPrune.size,
+      bytesFreed,
+      firstUnprunedHeight
+    };
+  }
+  getFirstUnprunedHeight() {
+    let minHeight = Infinity;
+    for (const info of this.blockFileInfo.values()) {
+      if (info.nSize > 0 && info.nHeightFirst < minHeight) {
+        minHeight = info.nHeightFirst;
+      }
+    }
+    return minHeight === Infinity ? 0 : minHeight;
+  }
+  isBlockPruned(height) {
+    for (const info of this.blockFileInfo.values()) {
+      if (info.nSize > 0 && info.nHeightFirst <= height && info.nHeightLast >= height) {
+        return false;
+      }
+    }
+    return this.havePruned;
+  }
+  getPruneInfo() {
+    if (!this.isPruneMode()) {
+      return {
+        pruned: false,
+        automatic_pruning: false
+      };
+    }
+    const automatic = this.isAutomaticPruning();
+    const result = {
+      pruned: this.havePruned,
+      automatic_pruning: automatic
+    };
+    if (automatic) {
+      result.prune_target_size = this.pruneTarget;
+    }
+    if (this.havePruned) {
+      result.pruneheight = this.getFirstUnprunedHeight();
     }
     return result;
   }
-  async putUndoData(hash, data) {
-    const key = makeKey(114 /* UNDO */, hash);
-    await this.db.put(key, data);
-  }
-  async getUndoData(hash) {
-    const key = makeKey(114 /* UNDO */, hash);
-    const value = await this.db.get(key);
-    if (value === undefined) {
-      return null;
-    }
-    return value;
-  }
-  async putBlockFileInfo(fileNum, info) {
-    const key = makeKey(102 /* BLOCK_FILES */, encodeFileNum(fileNum));
-    await this.db.put(key, info);
-  }
-  async getBlockFileInfo(fileNum) {
-    const key = makeKey(102 /* BLOCK_FILES */, encodeFileNum(fileNum));
-    try {
-      const value = await this.db.get(key);
-      if (value === undefined) {
-        return null;
-      }
-      return value;
-    } catch {
-      return null;
-    }
-  }
-  async putLastBlockFile(fileNum) {
-    const key = makeKey(108 /* LAST_BLOCK_FILE */, Buffer.alloc(0));
-    const buf = Buffer.alloc(4);
-    buf.writeUInt32LE(fileNum, 0);
-    await this.db.put(key, buf);
-  }
-  async getLastBlockFile() {
-    const key = makeKey(108 /* LAST_BLOCK_FILE */, Buffer.alloc(0));
-    try {
-      const value = await this.db.get(key);
-      if (value === undefined) {
-        return null;
-      }
-      return value.readUInt32LE(0);
-    } catch {
-      return null;
-    }
-  }
-  async putBlockPos(hash, posData) {
-    const key = makeKey(112 /* BLOCK_POS */, hash);
-    await this.db.put(key, posData);
-  }
-  async getBlockPos(hash) {
-    const key = makeKey(112 /* BLOCK_POS */, hash);
-    try {
-      const value = await this.db.get(key);
-      if (value === undefined) {
-        return null;
-      }
-      return value;
-    } catch {
-      return null;
-    }
-  }
-  async putPruneState(havePruned, pruneTarget) {
-    const key = makeKey(80 /* PRUNE_STATE */, Buffer.alloc(0));
-    const buf = Buffer.alloc(9);
-    buf.writeUInt8(havePruned ? 1 : 0, 0);
-    buf.writeBigUInt64LE(BigInt(pruneTarget), 1);
-    await this.db.put(key, buf);
-  }
-  async getPruneState() {
-    const key = makeKey(80 /* PRUNE_STATE */, Buffer.alloc(0));
-    try {
-      const value = await this.db.get(key);
-      if (value === undefined || value.length < 9) {
-        return null;
-      }
-      return {
-        havePruned: value.readUInt8(0) === 1,
-        pruneTarget: Number(value.readBigUInt64LE(1))
-      };
-    } catch {
-      return null;
-    }
-  }
-  async updateBlockStatus(hash, status) {
-    const record = await this.getBlockIndex(hash);
-    if (record) {
-      record.status = status;
-      await this.putBlockIndex(hash, record);
-    }
-  }
 }
-function encodeFileNum(fileNum) {
-  const buf = Buffer.alloc(4);
-  buf.writeUInt32LE(fileNum, 0);
-  return buf;
-}
+
+// src/cli/cli.ts
+init_serialization();
+init_block();
 
 // src/chain/state.ts
+init_database();
 init_block();
 init_tx();
-
-// src/chain/utxo.ts
-init_serialization();
-var DEFAULT_DBCACHE_BYTES = 512 * 1024 * 1024;
-var CACHE_ENTRY_OVERHEAD = 3000;
-function outpointKey(txid, vout) {
-  return `${txid.toString("hex")}:${vout}`;
-}
-function outpointKeyFromOutpoint(outpoint) {
-  return outpointKey(outpoint.txid, outpoint.vout);
-}
-function encodeDBKeyFromString(key) {
-  const colonIndex = key.lastIndexOf(":");
-  const buf = Buffer.allocUnsafe(36);
-  Buffer.from(key.slice(0, colonIndex), "hex").copy(buf, 0);
-  buf.writeUInt32LE(parseInt(key.slice(colonIndex + 1), 10), 32);
-  return buf;
-}
-function serializeCoin(coin) {
-  const spkLen = coin.txOut.scriptPubKey.length;
-  const viSize = spkLen <= 252 ? 1 : spkLen <= 65535 ? 3 : 5;
-  const buf = Buffer.allocUnsafe(4 + 1 + 8 + viSize + spkLen);
-  let pos = 0;
-  buf.writeUInt32LE(coin.height, pos);
-  pos += 4;
-  buf[pos++] = coin.isCoinbase ? 1 : 0;
-  buf.writeBigUInt64LE(coin.txOut.value, pos);
-  pos += 8;
-  if (spkLen <= 252) {
-    buf[pos++] = spkLen;
-  } else if (spkLen <= 65535) {
-    buf[pos++] = 253;
-    buf.writeUInt16LE(spkLen, pos);
-    pos += 2;
-  } else {
-    buf[pos++] = 254;
-    buf.writeUInt32LE(spkLen, pos);
-    pos += 4;
-  }
-  coin.txOut.scriptPubKey.copy(buf, pos);
-  return buf;
-}
-function coinMemoryUsage(coin) {
-  if (!coin)
-    return 0;
-  return 48 + coin.txOut.scriptPubKey.length;
-}
-
-class CoinsView {
-  estimateSize() {
-    return 0;
-  }
-}
-
-class CoinsViewDB extends CoinsView {
-  db;
-  bestBlockHash;
-  constructor(db) {
-    super();
-    this.db = db;
-    this.bestBlockHash = Buffer.alloc(32);
-  }
-  setBestBlock(hash) {
-    this.bestBlockHash = hash;
-  }
-  async getCoin(outpoint) {
-    const entry = await this.db.getUTXO(outpoint.txid, outpoint.vout);
-    if (!entry)
-      return null;
-    return {
-      txOut: {
-        value: entry.amount,
-        scriptPubKey: entry.scriptPubKey
-      },
-      height: entry.height,
-      isCoinbase: entry.coinbase
-    };
-  }
-  async haveCoin(outpoint) {
-    const entry = await this.db.getUTXO(outpoint.txid, outpoint.vout);
-    return entry !== null;
-  }
-  async getBestBlock() {
-    return this.bestBlockHash;
-  }
-  async batchWrite(entries, hashBlock, extraOps) {
-    const ops = [];
-    for (const [key, entry] of entries) {
-      if (!entry.dirty)
-        continue;
-      const dbKey = encodeDBKeyFromString(key);
-      if (entry.coin === null) {
-        if (!entry.fresh) {
-          ops.push({
-            type: "del",
-            prefix: 117 /* UTXO */,
-            key: dbKey
-          });
-        }
-      } else {
-        ops.push({
-          type: "put",
-          prefix: 117 /* UTXO */,
-          key: dbKey,
-          value: serializeCoin(entry.coin)
-        });
-      }
-    }
-    if (extraOps) {
-      ops.push(...extraOps);
-    }
-    if (ops.length > 0) {
-      await this.db.batch(ops);
-    }
-    this.bestBlockHash = hashBlock;
-  }
-}
-
-class CoinsViewCache extends CoinsView {
-  base;
-  cache;
-  hashBlock;
-  cachedCoinsUsage;
-  dirtyCount;
-  maxCacheBytes;
-  hits;
-  misses;
-  flushCount;
-  constructor(base, maxCacheBytes = DEFAULT_DBCACHE_BYTES) {
-    super();
-    this.base = base;
-    this.cache = new Map;
-    this.hashBlock = Buffer.alloc(32);
-    this.cachedCoinsUsage = 0;
-    this.dirtyCount = 0;
-    this.maxCacheBytes = maxCacheBytes;
-    this.hits = 0;
-    this.misses = 0;
-    this.flushCount = 0;
-  }
-  async getCoin(outpoint) {
-    const key = outpointKeyFromOutpoint(outpoint);
-    const cached = this.cache.get(key);
-    if (cached !== undefined) {
-      this.hits++;
-      return cached.coin;
-    }
-    this.misses++;
-    const coin = await this.base.getCoin(outpoint);
-    if (coin) {
-      const entry = {
-        coin,
-        dirty: false,
-        fresh: false
-      };
-      this.cache.set(key, entry);
-      this.cachedCoinsUsage += coinMemoryUsage(coin) + CACHE_ENTRY_OVERHEAD;
-    }
-    return coin;
-  }
-  async haveCoin(outpoint) {
-    const key = outpointKeyFromOutpoint(outpoint);
-    const cached = this.cache.get(key);
-    if (cached !== undefined) {
-      return cached.coin !== null;
-    }
-    return this.base.haveCoin(outpoint);
-  }
-  haveCoinInCache(outpoint) {
-    const key = outpointKeyFromOutpoint(outpoint);
-    const cached = this.cache.get(key);
-    return cached !== undefined && cached.coin !== null;
-  }
-  getCoinFromCache(outpoint) {
-    const key = outpointKeyFromOutpoint(outpoint);
-    const cached = this.cache.get(key);
-    if (cached === undefined || cached.coin === null) {
-      return null;
-    }
-    this.hits++;
-    return cached.coin;
-  }
-  addCoin(outpoint, coin, possibleOverwrite) {
-    const key = outpointKeyFromOutpoint(outpoint);
-    if (coin.txOut.scriptPubKey.length > 0 && coin.txOut.scriptPubKey[0] === 106) {
-      return;
-    }
-    const existing = this.cache.get(key);
-    let fresh = false;
-    if (!possibleOverwrite) {
-      if (existing && existing.coin !== null) {
-        throw new Error("Attempted to overwrite an unspent coin (when possibleOverwrite is false)");
-      }
-      fresh = !existing || !existing.dirty;
-    }
-    if (existing) {
-      if (existing.dirty)
-        this.dirtyCount--;
-      this.cachedCoinsUsage -= coinMemoryUsage(existing.coin);
-    }
-    const entry = {
-      coin,
-      dirty: true,
-      fresh
-    };
-    this.cache.set(key, entry);
-    this.dirtyCount++;
-    this.cachedCoinsUsage += coinMemoryUsage(coin) + (existing ? 0 : CACHE_ENTRY_OVERHEAD);
-  }
-  async spendCoin(outpoint, moveout) {
-    const key = outpointKeyFromOutpoint(outpoint);
-    let entry = this.cache.get(key);
-    if (entry === undefined) {
-      const coin = await this.base.getCoin(outpoint);
-      if (!coin)
-        return false;
-      entry = {
-        coin,
-        dirty: false,
-        fresh: false
-      };
-      this.cache.set(key, entry);
-      this.cachedCoinsUsage += coinMemoryUsage(coin) + CACHE_ENTRY_OVERHEAD;
-    }
-    if (entry.coin === null) {
-      return false;
-    }
-    if (moveout) {
-      moveout.coin = entry.coin;
-    }
-    if (entry.dirty)
-      this.dirtyCount--;
-    this.cachedCoinsUsage -= coinMemoryUsage(entry.coin);
-    if (entry.fresh) {
-      this.cache.delete(key);
-    } else {
-      entry.coin = null;
-      entry.dirty = true;
-      this.dirtyCount++;
-    }
-    return true;
-  }
-  spendCoinSync(outpoint, moveout) {
-    const key = outpointKeyFromOutpoint(outpoint);
-    const entry = this.cache.get(key);
-    if (entry === undefined) {
-      throw new Error(`Coin not in cache (must be pre-loaded): ${outpoint.txid.toString("hex")}:${outpoint.vout}`);
-    }
-    if (entry.coin === null) {
-      return false;
-    }
-    if (moveout) {
-      moveout.coin = entry.coin;
-    }
-    if (entry.dirty)
-      this.dirtyCount--;
-    this.cachedCoinsUsage -= coinMemoryUsage(entry.coin);
-    if (entry.fresh) {
-      this.cache.delete(key);
-    } else {
-      entry.coin = null;
-      entry.dirty = true;
-      this.dirtyCount++;
-    }
-    return true;
-  }
-  uncache(outpoint) {
-    const key = outpointKeyFromOutpoint(outpoint);
-    const entry = this.cache.get(key);
-    if (entry && !entry.dirty) {
-      this.cachedCoinsUsage -= coinMemoryUsage(entry.coin) + CACHE_ENTRY_OVERHEAD;
-      this.cache.delete(key);
-    }
-  }
-  async getBestBlock() {
-    if (this.hashBlock.every((b) => b === 0)) {
-      this.hashBlock = await this.base.getBestBlock();
-    }
-    return this.hashBlock;
-  }
-  setBestBlock(hash) {
-    this.hashBlock = hash;
-  }
-  async flush(extraOps) {
-    if (!(this.base instanceof CoinsViewDB)) {
-      throw new Error("flush() requires CoinsViewDB as base");
-    }
-    await this.base.batchWrite(this.cache, this.hashBlock, extraOps);
-    this.cache.clear();
-    this.cachedCoinsUsage = 0;
-    this.dirtyCount = 0;
-    this.flushCount++;
-  }
-  async sync(extraOps) {
-    if (!(this.base instanceof CoinsViewDB)) {
-      throw new Error("sync() requires CoinsViewDB as base");
-    }
-    await this.base.batchWrite(this.cache, this.hashBlock, extraOps);
-    for (const [key, entry] of this.cache) {
-      if (entry.coin === null) {
-        this.cachedCoinsUsage -= CACHE_ENTRY_OVERHEAD;
-        this.cache.delete(key);
-      } else {
-        entry.dirty = false;
-        entry.fresh = false;
-      }
-    }
-    this.dirtyCount = 0;
-    this.flushCount++;
-    if (this.cachedCoinsUsage > this.maxCacheBytes) {
-      this.evictCleanEntries();
-    }
-  }
-  evictCleanEntries() {
-    const target = Math.floor(this.maxCacheBytes * 0.6);
-    for (const [key, entry] of this.cache) {
-      if (this.cachedCoinsUsage <= target) {
-        break;
-      }
-      if (!entry.dirty) {
-        this.cachedCoinsUsage -= coinMemoryUsage(entry.coin) + CACHE_ENTRY_OVERHEAD;
-        this.cache.delete(key);
-      }
-    }
-  }
-  shouldFlush() {
-    return this.cachedCoinsUsage >= this.maxCacheBytes;
-  }
-  getMemoryUsage() {
-    return this.cachedCoinsUsage;
-  }
-  getCacheSize() {
-    return this.cache.size;
-  }
-  getDirtyCount() {
-    return this.dirtyCount;
-  }
-  getStats() {
-    return {
-      size: this.cache.size,
-      dirtyCount: this.dirtyCount,
-      memoryUsage: this.cachedCoinsUsage,
-      maxMemory: this.maxCacheBytes,
-      hits: this.hits,
-      misses: this.misses,
-      flushCount: this.flushCount
-    };
-  }
-  resetStats() {
-    this.hits = 0;
-    this.misses = 0;
-  }
-}
-function serializeUndoData(spentOutputs) {
-  const writer = new BufferWriter;
-  writer.writeVarInt(spentOutputs.length);
-  for (const spent of spentOutputs) {
-    writer.writeHash(spent.txid);
-    writer.writeUInt32LE(spent.vout);
-    writer.writeUInt32LE(spent.entry.height);
-    writer.writeUInt8(spent.entry.coinbase ? 1 : 0);
-    writer.writeUInt64LE(spent.entry.amount);
-    writer.writeVarBytes(spent.entry.scriptPubKey);
-  }
-  return writer.toBuffer();
-}
-function deserializeUndoData(data) {
-  const reader = new BufferReader(data);
-  const count = reader.readVarInt();
-  const spentOutputs = [];
-  for (let i = 0;i < count; i++) {
-    const txid = reader.readHash();
-    const vout = reader.readUInt32LE();
-    const height = reader.readUInt32LE();
-    const coinbase = reader.readUInt8() === 1;
-    const amount = reader.readUInt64LE();
-    const scriptPubKey = reader.readVarBytes();
-    spentOutputs.push({
-      txid,
-      vout,
-      entry: { height, coinbase, amount, scriptPubKey }
-    });
-  }
-  return spentOutputs;
-}
-
-class UTXOManager {
-  viewDB;
-  cache;
-  maxCacheBytes;
-  maxCacheSize;
-  stats;
-  constructor(db, maxCacheBytes = DEFAULT_DBCACHE_BYTES) {
-    this.viewDB = new CoinsViewDB(db);
-    this.cache = new CoinsViewCache(this.viewDB, maxCacheBytes);
-    this.maxCacheBytes = maxCacheBytes;
-    this.maxCacheSize = Math.floor(maxCacheBytes / CACHE_ENTRY_OVERHEAD);
-    this.stats = {
-      hits: 0,
-      misses: 0,
-      evictions: 0,
-      flushes: 0,
-      currentSize: 0,
-      maxSize: this.maxCacheSize
-    };
-  }
-  getCoinsViewCache() {
-    return this.cache;
-  }
-  getCoinsViewDB() {
-    return this.viewDB;
-  }
-  getStats() {
-    const cacheStats = this.cache.getStats();
-    return {
-      hits: cacheStats.hits,
-      misses: cacheStats.misses,
-      evictions: 0,
-      flushes: cacheStats.flushCount,
-      currentSize: cacheStats.size,
-      maxSize: this.maxCacheSize
-    };
-  }
-  resetStats() {
-    this.cache.resetStats();
-  }
-  addTransaction(txid, tx, height, isCoinbase2) {
-    for (let vout = 0;vout < tx.outputs.length; vout++) {
-      const output = tx.outputs[vout];
-      const outpoint = { txid, vout };
-      const coin = {
-        txOut: {
-          value: output.value,
-          scriptPubKey: output.scriptPubKey
-        },
-        height,
-        isCoinbase: isCoinbase2
-      };
-      this.cache.addCoin(outpoint, coin, isCoinbase2);
-    }
-  }
-  spendOutput(outpoint) {
-    const moveout = { coin: null };
-    const success = this.cache.spendCoinSync(outpoint, moveout);
-    if (!success || !moveout.coin) {
-      throw new Error(`UTXO not in cache (must be pre-loaded): ${outpoint.txid.toString("hex")}:${outpoint.vout}`);
-    }
-    return {
-      height: moveout.coin.height,
-      coinbase: moveout.coin.isCoinbase,
-      amount: moveout.coin.txOut.value,
-      scriptPubKey: moveout.coin.txOut.scriptPubKey
-    };
-  }
-  async spendOutputAsync(outpoint) {
-    const moveout = { coin: null };
-    const success = await this.cache.spendCoin(outpoint, moveout);
-    if (!success || !moveout.coin) {
-      throw new Error(`UTXO not found: ${outpoint.txid.toString("hex")}:${outpoint.vout}`);
-    }
-    return {
-      height: moveout.coin.height,
-      coinbase: moveout.coin.isCoinbase,
-      amount: moveout.coin.txOut.value,
-      scriptPubKey: moveout.coin.txOut.scriptPubKey
-    };
-  }
-  getUTXO(outpoint) {
-    const coin = this.cache.getCoinFromCache(outpoint);
-    if (!coin)
-      return null;
-    return {
-      height: coin.height,
-      coinbase: coin.isCoinbase,
-      amount: coin.txOut.value,
-      scriptPubKey: coin.txOut.scriptPubKey
-    };
-  }
-  async getUTXOAsync(outpoint) {
-    const coin = await this.cache.getCoin(outpoint);
-    if (!coin)
-      return null;
-    return {
-      height: coin.height,
-      coinbase: coin.isCoinbase,
-      amount: coin.txOut.value,
-      scriptPubKey: coin.txOut.scriptPubKey
-    };
-  }
-  hasUTXO(outpoint) {
-    return this.cache.haveCoinInCache(outpoint);
-  }
-  async hasUTXOAsync(outpoint) {
-    return this.cache.haveCoin(outpoint);
-  }
-  restoreUTXO(txid, vout, entry) {
-    const outpoint = { txid, vout };
-    const coin = {
-      txOut: {
-        value: entry.amount,
-        scriptPubKey: entry.scriptPubKey
-      },
-      height: entry.height,
-      isCoinbase: entry.coinbase
-    };
-    this.cache.addCoin(outpoint, coin, true);
-  }
-  async removeUTXO(txid, vout) {
-    const outpoint = { txid, vout };
-    await this.cache.spendCoin(outpoint);
-  }
-  async flush(extraOps) {
-    if (this.cache.shouldFlush() || this.cache.getDirtyCount() > 0) {
-      await this.cache.flush(extraOps);
-    } else if (extraOps && extraOps.length > 0) {
-      const bestBlock = await this.cache.getBestBlock();
-      await this.viewDB.batchWrite(new Map, bestBlock, extraOps);
-    }
-  }
-  async flushDirty(extraOps) {
-    await this.cache.sync(extraOps);
-    if (this.cache.shouldFlush()) {
-      await this.cache.flush();
-    }
-  }
-  clearCache() {
-    this.cache = new CoinsViewCache(this.viewDB, this.maxCacheBytes);
-  }
-  async preloadUTXO(outpoint) {
-    const coin = await this.cache.getCoin(outpoint);
-    return coin !== null;
-  }
-  async preloadUTXOs(outpoints) {
-    const toLoad = [];
-    let loaded = 0;
-    for (const outpoint of outpoints) {
-      if (this.cache.haveCoinInCache(outpoint)) {
-        loaded++;
-      } else {
-        toLoad.push(outpoint);
-      }
-    }
-    if (toLoad.length === 0)
-      return loaded;
-    const results = await Promise.all(toLoad.map((op) => this.cache.getCoin(op)));
-    for (const coin of results) {
-      if (coin)
-        loaded++;
-    }
-    return loaded;
-  }
-  getEstimatedMemoryUsage() {
-    return this.cache.getMemoryUsage();
-  }
-  getMaxCacheSize() {
-    return this.maxCacheSize;
-  }
-  setMaxCacheBytes(maxBytes) {
-    this.maxCacheBytes = maxBytes;
-    this.maxCacheSize = Math.floor(maxBytes / CACHE_ENTRY_OVERHEAD);
-  }
-  getCacheSize() {
-    return this.cache.getCacheSize();
-  }
-  getPendingCount() {
-    return this.cache.getDirtyCount();
-  }
-  getDirtyCount() {
-    return this.cache.getDirtyCount();
-  }
-  shouldFlush() {
-    return this.cache.shouldFlush();
-  }
-  setBestBlock(hash) {
-    this.cache.setBestBlock(hash);
-    this.viewDB.setBestBlock(hash);
-  }
-}
+init_utxo();
 
 // src/validation/errors.ts
 class ConsensusError extends Error {
@@ -12906,6 +13324,7 @@ class ChainStateManager {
   notificationEmitter;
   mempool = null;
   headerSync = null;
+  filterIndex = null;
   preciousBlockHash = null;
   blockSequenceId = 0;
   lastPreciousChainwork = 0n;
@@ -12925,6 +13344,9 @@ class ChainStateManager {
   }
   setMempool(mempool) {
     this.mempool = mempool;
+  }
+  setBlockFilterIndex(filterIndex) {
+    this.filterIndex = filterIndex;
   }
   setHeaderSync(headerSync) {
     this.headerSync = headerSync;
@@ -12965,6 +13387,18 @@ class ChainStateManager {
       status: 1 /* HEADER_VALID */ | 4 /* TXS_VALID */ | 8 /* HAVE_DATA */ | 16 /* HAVE_UNDO */,
       dataPos: 1
     });
+    try {
+      for (const tx of block.transactions) {
+        const txid = getTxId(tx);
+        await this.db.putTxIndex(txid, {
+          blockHash,
+          offset: 0,
+          length: 0
+        });
+      }
+    } catch (err) {
+      console.warn(`[txindex] failed to write entries for block ${blockHash.toString("hex").slice(0, 16)}: ${err instanceof Error ? err.message : String(err)}`);
+    }
     const work = this.calculateWork(block.header.bits);
     const chainWork = this.bestBlock.chainWork + work;
     await this.db.putChainWork(blockHash, chainWork);
@@ -13015,21 +13449,34 @@ class ChainStateManager {
         }
       }
     }
-    await this.utxo.flush();
     const prevHeight = height - 1;
     const prevHash = block.header.prevBlock;
     const work = this.calculateWork(block.header.bits);
     const prevChainWork = this.bestBlock.chainWork - work;
+    const extraOps = [];
+    for (const tx of block.transactions) {
+      const txid = getTxId(tx);
+      extraOps.push(this.db.buildTxIndexDeleteOp(txid));
+    }
+    extraOps.push(this.db.buildChainStateOp({
+      bestBlockHash: prevHash,
+      bestHeight: prevHeight,
+      totalWork: prevChainWork
+    }));
+    await this.utxo.flush(extraOps);
     this.bestBlock = {
       hash: prevHash,
       height: prevHeight,
       chainWork: prevChainWork
     };
-    await this.db.putChainState({
-      bestBlockHash: prevHash,
-      bestHeight: prevHeight,
-      totalWork: prevChainWork
-    });
+    if (this.filterIndex && this.filterIndex.isEnabled()) {
+      try {
+        await this.filterIndex.removeBlock(block, height);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[blockfilterindex] failed to remove block ${blockHash.toString("hex").slice(0, 16)} at h=${height}: ${msg} (continuing)`);
+      }
+    }
     globalSigCache.clear();
     if (this.notificationEmitter) {
       this.notificationEmitter.emit("blockDisconnected", block);
@@ -13438,7 +13885,7 @@ class ChainStateManager {
 // src/chain/snapshot.ts
 init_primitives();
 init_serialization();
-import { promises as fsp2 } from "node:fs";
+import { promises as fsp2 } from "fs";
 
 // src/wire/compressor.ts
 init_secp256k1();
@@ -14382,6 +14829,8 @@ var KEYSTREAM_ZEROS_384 = new Uint8Array(NUM3072_BYTE_SIZE);
 var KEYSTREAM_NONCE_12 = new Uint8Array(12);
 
 // src/chain/snapshot.ts
+init_database();
+init_utxo();
 var SNAPSHOT_MAGIC = Buffer.from([117, 116, 120, 111, 255]);
 var SNAPSHOT_VERSION = 2;
 var COINS_LOAD_BATCH_SIZE = 120000;
@@ -14556,7 +15005,7 @@ class StreamingBufferReader {
       this.filePos += bytesRead;
     }
     if (this.windowEnd - this.windowOff < n) {
-      throw new Error(`StreamingBufferReader: underrun — wanted ${n} bytes but only ` + `${this.windowEnd - this.windowOff} available (file pos ` + `${this.bytesConsumed + this.windowOff}, file size ${this.fileSize})`);
+      throw new Error(`StreamingBufferReader: underrun \u2014 wanted ${n} bytes but only ` + `${this.windowEnd - this.windowOff} available (file pos ` + `${this.bytesConsumed + this.windowOff}, file size ${this.fileSize})`);
     }
   }
   async readUInt8() {
@@ -15013,7 +15462,7 @@ function shouldSkipScripts(ctx) {
   }
   return {
     skip: true,
-    reason: "block is ancestor of assumevalid and all safety conditions met — SKIP scripts"
+    reason: "block is ancestor of assumevalid and all safety conditions met \u2014 SKIP scripts"
   };
 }
 
@@ -15443,6 +15892,27 @@ class Mempool {
       };
     }
     if (isReplacement) {
+      const conflictTxids = new Set;
+      const conflictParents = new Set;
+      for (const conflict of conflictsToEvict) {
+        conflictTxids.add(conflict.txid.toString("hex"));
+        for (const p of conflict.dependsOn)
+          conflictParents.add(p);
+      }
+      const conflictAncestors = this.getAncestorSet(conflictParents);
+      const allowedUnconfirmed = new Set([
+        ...conflictTxids,
+        ...conflictAncestors
+      ]);
+      for (const input of tx.inputs) {
+        const parentHex = input.prevOut.txid.toString("hex");
+        if (this.entries.has(parentHex) && !allowedUnconfirmed.has(parentHex)) {
+          return {
+            accepted: false,
+            error: `RBF replacement adds new unconfirmed input ${parentHex.slice(0, 16)}...:${input.prevOut.vout} (BIP-125 Rule 2)`
+          };
+        }
+      }
       if (fee <= totalConflictingFee) {
         return {
           accepted: false,
@@ -15772,7 +16242,53 @@ class Mempool {
     for (const tx of txs) {
       if (isCoinbase(tx))
         continue;
-      await this.addTransaction(tx);
+      const result = await this.addTransaction(tx);
+      if (!result.accepted) {
+        const txid = getTxId(tx).toString("hex");
+        console.warn(`[mempool-readd] tx ${txid.slice(0, 16)}... rejected during reorg refill: ${result.error}`);
+      }
+    }
+  }
+  reorgRefillUnchecked(txs) {
+    for (const tx of txs) {
+      if (isCoinbase(tx))
+        continue;
+      const txid = getTxId(tx);
+      const txidHex = txid.toString("hex");
+      if (this.entries.has(txidHex))
+        continue;
+      const weight = getTxWeight(tx);
+      const vsize = getTxVSize(tx);
+      const fee = 0n;
+      const feeRate = 0;
+      const entry = {
+        tx,
+        txid,
+        fee,
+        feeRate,
+        vsize,
+        weight,
+        addedTime: Math.floor(Date.now() / 1000),
+        height: this.tipHeight,
+        spentBy: new Set,
+        dependsOn: new Set,
+        ancestorCount: 1,
+        ancestorSize: vsize,
+        descendantCount: 1,
+        descendantSize: vsize,
+        clusterId: txidHex,
+        miningScore: 0,
+        ephemeralDustParents: new Set,
+        hasEphemeralDust: false,
+        sigOpCost: 0
+      };
+      this.entries.set(txidHex, entry);
+      this.currentSize += vsize;
+      for (const input of tx.inputs) {
+        const outpointKey2 = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+        this.outpointIndex.set(outpointKey2, txidHex);
+      }
+      console.log(`[mempool-reorg-refill] re-admitted disconnected tx ${txidHex.slice(0, 16)}... (vsize=${vsize})`);
     }
   }
   getTransactionsByFeeRate() {
@@ -16662,11 +17178,206 @@ function validatePackage(transactions) {
   return { valid: true };
 }
 
+// src/mempool/orphan_pool.ts
+init_tx();
+var MAX_ORPHAN_TRANSACTIONS = 100;
+var MAX_ORPHAN_TX_SIZE = 1e5;
+var MAX_PEER_ORPHAN_TX = 50;
+
+class OrphanPool {
+  byWtxid = new Map;
+  txidIndex = new Map;
+  byPrevout = new Map;
+  peerCount = new Map;
+  random;
+  maxGlobal;
+  maxPerPeer;
+  maxTxSize;
+  constructor(options = {}) {
+    this.maxGlobal = options.maxGlobal ?? MAX_ORPHAN_TRANSACTIONS;
+    this.maxPerPeer = options.maxPerPeer ?? MAX_PEER_ORPHAN_TX;
+    this.maxTxSize = options.maxTxSize ?? MAX_ORPHAN_TX_SIZE;
+    this.random = options.random ?? Math.random;
+  }
+  size() {
+    return this.byWtxid.size;
+  }
+  has(wtxid) {
+    return this.byWtxid.has(wtxid.toString("hex"));
+  }
+  hasByTxid(txid) {
+    return this.txidIndex.has(txid.toString("hex"));
+  }
+  get(wtxid) {
+    return this.byWtxid.get(wtxid.toString("hex"));
+  }
+  countForPeer(peer) {
+    return this.peerCount.get(peer) ?? 0;
+  }
+  add(tx, fromPeer) {
+    if (tx.inputs.length === 0) {
+      return { ok: false, reason: "no-inputs" };
+    }
+    const size = serializeTx(tx, true).length;
+    if (size > this.maxTxSize) {
+      return { ok: false, reason: "tx-too-large" };
+    }
+    const wtxid = getWTxId(tx);
+    const wtxidHex = wtxid.toString("hex");
+    if (this.byWtxid.has(wtxidHex)) {
+      return { ok: false, reason: "duplicate" };
+    }
+    const peerCount = this.peerCount.get(fromPeer) ?? 0;
+    if (peerCount >= this.maxPerPeer) {
+      return { ok: false, reason: "peer-cap" };
+    }
+    while (this.byWtxid.size >= this.maxGlobal) {
+      this.evictRandom();
+    }
+    const txid = getTxId(tx);
+    const entry = {
+      tx,
+      txid,
+      wtxid,
+      fromPeer,
+      addedAt: Date.now(),
+      size
+    };
+    this.byWtxid.set(wtxidHex, entry);
+    this.txidIndex.set(txid.toString("hex"), wtxidHex);
+    this.peerCount.set(fromPeer, peerCount + 1);
+    for (const input of tx.inputs) {
+      const key = prevoutKey(input.prevOut.txid, input.prevOut.vout);
+      let set = this.byPrevout.get(key);
+      if (!set) {
+        set = new Set;
+        this.byPrevout.set(key, set);
+      }
+      set.add(wtxidHex);
+    }
+    return { ok: true, entry };
+  }
+  eraseTx(wtxid) {
+    const wtxidHex = wtxid.toString("hex");
+    const entry = this.byWtxid.get(wtxidHex);
+    if (!entry)
+      return false;
+    this.removeEntry(entry);
+    return true;
+  }
+  eraseForPeer(peer) {
+    let removed = 0;
+    const toRemove = [];
+    for (const entry of this.byWtxid.values()) {
+      if (entry.fromPeer === peer)
+        toRemove.push(entry);
+    }
+    for (const entry of toRemove) {
+      this.removeEntry(entry);
+      removed++;
+    }
+    return removed;
+  }
+  eraseForBlock(confirmedTxids) {
+    let removed = 0;
+    for (const txid of confirmedTxids) {
+      const wtxidHex = this.txidIndex.get(txid.toString("hex"));
+      if (!wtxidHex)
+        continue;
+      const entry = this.byWtxid.get(wtxidHex);
+      if (!entry)
+        continue;
+      this.removeEntry(entry);
+      removed++;
+    }
+    return removed;
+  }
+  findByPrevout(parentTxid, vout) {
+    const set = this.byPrevout.get(prevoutKey(parentTxid, vout));
+    if (!set)
+      return [];
+    const out = [];
+    for (const wtxidHex of set) {
+      const entry = this.byWtxid.get(wtxidHex);
+      if (entry)
+        out.push(entry);
+    }
+    return out;
+  }
+  findChildrenOf(parentTxid) {
+    const parentHex = parentTxid.toString("hex");
+    const out = [];
+    const seen = new Set;
+    for (const [key, set] of this.byPrevout) {
+      const colon = key.indexOf(":");
+      if (colon === -1)
+        continue;
+      if (key.slice(0, colon) !== parentHex)
+        continue;
+      for (const wtxidHex of set) {
+        if (seen.has(wtxidHex))
+          continue;
+        seen.add(wtxidHex);
+        const entry = this.byWtxid.get(wtxidHex);
+        if (entry)
+          out.push(entry);
+      }
+    }
+    return out;
+  }
+  onParentAdmitted(parent) {
+    return this.findChildrenOf(getTxId(parent));
+  }
+  clear() {
+    this.byWtxid.clear();
+    this.txidIndex.clear();
+    this.byPrevout.clear();
+    this.peerCount.clear();
+  }
+  evictRandom() {
+    const size = this.byWtxid.size;
+    if (size === 0)
+      return;
+    const target = Math.floor(this.random() * size);
+    let i = 0;
+    for (const entry of this.byWtxid.values()) {
+      if (i === target) {
+        this.removeEntry(entry);
+        return;
+      }
+      i++;
+    }
+  }
+  removeEntry(entry) {
+    const wtxidHex = entry.wtxid.toString("hex");
+    this.byWtxid.delete(wtxidHex);
+    this.txidIndex.delete(entry.txid.toString("hex"));
+    const newPeerCount = (this.peerCount.get(entry.fromPeer) ?? 1) - 1;
+    if (newPeerCount <= 0) {
+      this.peerCount.delete(entry.fromPeer);
+    } else {
+      this.peerCount.set(entry.fromPeer, newPeerCount);
+    }
+    for (const input of entry.tx.inputs) {
+      const key = prevoutKey(input.prevOut.txid, input.prevOut.vout);
+      const set = this.byPrevout.get(key);
+      if (!set)
+        continue;
+      set.delete(wtxidHex);
+      if (set.size === 0)
+        this.byPrevout.delete(key);
+    }
+  }
+}
+function prevoutKey(txid, vout) {
+  return `${txid.toString("hex")}:${vout}`;
+}
+
 // src/mempool/persist.ts
 init_serialization();
 init_tx();
-import { promises as fsp3 } from "node:fs";
-import * as path from "node:path";
+import { promises as fsp3 } from "fs";
+import * as path from "path";
 var MEMPOOL_DUMP_VERSION = 2n;
 var MEMPOOL_DUMP_VERSION_NO_XOR_KEY = 1n;
 var OBFUSCATION_KEY_SIZE = 8;
@@ -17292,6 +18003,10 @@ init_primitives();
 init_tx();
 var MAX_MESSAGE_SIZE = 32 * 1024 * 1024;
 var MESSAGE_HEADER_SIZE = 24;
+var MAX_INV_SZ = 50000;
+var MAX_HEADERS_RESULTS = 2000;
+var MAX_ADDR_TO_SEND = 1000;
+var MAX_LOCATOR_SZ = 101;
 function serializeHeader(magic, command, payload) {
   if (command.length > 12) {
     throw new Error(`Command name too long: ${command}`);
@@ -17618,6 +18333,9 @@ function deserializeInvVector(reader) {
 }
 function deserializeInvPayload(reader) {
   const count = reader.readVarInt();
+  if (count > MAX_INV_SZ) {
+    throw new Error(`inv/getdata/notfound count exceeds MAX_INV_SZ: ${count} > ${MAX_INV_SZ}`);
+  }
   const inventory = [];
   for (let i = 0;i < count; i++) {
     inventory.push(deserializeInvVector(reader));
@@ -17627,6 +18345,9 @@ function deserializeInvPayload(reader) {
 function deserializeBlockLocator(reader) {
   const version = reader.readUInt32LE();
   const count = reader.readVarInt();
+  if (count > MAX_LOCATOR_SZ) {
+    throw new Error(`block locator count exceeds MAX_LOCATOR_SZ: ${count} > ${MAX_LOCATOR_SZ}`);
+  }
   const locatorHashes = [];
   for (let i = 0;i < count; i++) {
     locatorHashes.push(reader.readHash());
@@ -17636,6 +18357,9 @@ function deserializeBlockLocator(reader) {
 }
 function deserializeHeadersPayload(reader) {
   const count = reader.readVarInt();
+  if (count > MAX_HEADERS_RESULTS) {
+    throw new Error(`headers count exceeds MAX_HEADERS_RESULTS: ${count} > ${MAX_HEADERS_RESULTS}`);
+  }
   const headers = [];
   for (let i = 0;i < count; i++) {
     const header = deserializeBlockHeader(reader);
@@ -17646,6 +18370,9 @@ function deserializeHeadersPayload(reader) {
 }
 function deserializeAddrPayload(reader) {
   const count = reader.readVarInt();
+  if (count > MAX_ADDR_TO_SEND) {
+    throw new Error(`addr count exceeds MAX_ADDR_TO_SEND: ${count} > ${MAX_ADDR_TO_SEND}`);
+  }
   const addrs = [];
   for (let i = 0;i < count; i++) {
     const timestamp = reader.readUInt32LE();
@@ -20017,7 +20744,8 @@ class PeerManager {
       maxOutboundBlockRelay: config.maxOutboundBlockRelay ?? MAX_OUTBOUND_BLOCK_RELAY,
       connect: config.connect,
       listen: config.listen ?? true,
-      port: config.port ?? config.params.defaultPort
+      port: config.port ?? config.params.defaultPort,
+      pruneMode: config.pruneMode ?? false
     };
     this.peers = new Map;
     this.knownAddresses = new Map;
@@ -20064,6 +20792,9 @@ class PeerManager {
   }
   clearV1OnlyCache() {
     this.v1OnlyCache.clear();
+  }
+  getAdvertisedServices() {
+    return this.config.pruneMode ? this.config.params.services | ServiceFlags.NODE_NETWORK_LIMITED : this.config.params.services;
   }
   async start() {
     this.running = true;
@@ -20201,12 +20932,13 @@ class PeerManager {
       }
     }
     this.connectingPeers.add(key);
+    const advertisedServices = this.config.pruneMode ? this.config.params.services | ServiceFlags.NODE_NETWORK_LIMITED : this.config.params.services;
     const config = {
       host,
       port,
       magic: this.config.params.networkMagic,
       protocolVersion: this.config.params.protocolVersion,
-      services: this.config.params.services,
+      services: advertisedServices,
       userAgent: this.config.params.userAgent,
       bestHeight: this.config.bestHeight,
       relay: connectionType !== "block_relay"
@@ -20930,7 +21662,7 @@ class PeerManager {
           this.anchors.push({ host, port });
         }
         try {
-          const fs = await import("node:fs/promises");
+          const fs = await import("fs/promises");
           await fs.unlink(path2);
         } catch {}
       }
@@ -20982,12 +21714,13 @@ class PeerManager {
               }
               manager.disconnectPeer(evicted);
             }
+            const inAdvertisedServices = manager.config.pruneMode ? manager.config.params.services | ServiceFlags.NODE_NETWORK_LIMITED : manager.config.params.services;
             const peerConfig = {
               host,
               port: 0,
               magic: manager.config.params.networkMagic,
               protocolVersion: manager.config.params.protocolVersion,
-              services: manager.config.params.services,
+              services: inAdvertisedServices,
               userAgent: manager.config.params.userAgent,
               bestHeight: manager.config.bestHeight,
               relay: true
@@ -21269,6 +22002,7 @@ function deserializePeerAddresses(data) {
 }
 
 // src/sync/headers.ts
+init_database();
 init_params();
 
 // src/consensus/pow.ts
@@ -21413,7 +22147,7 @@ init_block();
 // src/sync/header-sync-state.ts
 init_primitives();
 init_block();
-var MAX_HEADERS_RESULTS = 2000;
+var MAX_HEADERS_RESULTS2 = 2000;
 var DEFAULT_HEADERS_SYNC_PARAMS = {
   commitmentPeriod: 600,
   redownloadBufferSize: 12000
@@ -21678,6 +22412,7 @@ class HeadersSyncState {
 
 // src/sync/headers.ts
 var HEADER_TIP_KEY = "header_tip";
+var MAX_NUM_UNCONNECTING_HEADERS_MSGS = 10;
 
 class HeaderSync {
   db;
@@ -21688,6 +22423,7 @@ class HeaderSync {
   peerManager;
   syncingPeers;
   peerSyncStates;
+  unconnectingHeadersCount;
   syncParams;
   headersProcessedCallbacks;
   constructor(db, params, syncParams) {
@@ -21699,8 +22435,20 @@ class HeaderSync {
     this.peerManager = null;
     this.syncingPeers = new Set;
     this.peerSyncStates = new Map;
+    this.unconnectingHeadersCount = new Map;
     this.syncParams = syncParams ?? DEFAULT_HEADERS_SYNC_PARAMS;
     this.headersProcessedCallbacks = [];
+  }
+  noteUnconnectingHeaders(peerKey) {
+    const next = (this.unconnectingHeadersCount.get(peerKey) ?? 0) + 1;
+    this.unconnectingHeadersCount.set(peerKey, next);
+    return next > MAX_NUM_UNCONNECTING_HEADERS_MSGS;
+  }
+  resetUnconnectingHeaders(peerKey) {
+    this.unconnectingHeadersCount.delete(peerKey);
+  }
+  getUnconnectingHeadersCount(peerKey) {
+    return this.unconnectingHeadersCount.get(peerKey) ?? 0;
   }
   onHeadersProcessed(callback) {
     this.headersProcessedCallbacks.push(callback);
@@ -22044,20 +22792,24 @@ class HeaderSync {
       return;
     }
     const peerState = this.peerSyncStates.get(peerKey);
-    const fullMessage = headers.length >= MAX_HEADERS_RESULTS;
+    const fullMessage = headers.length >= MAX_HEADERS_RESULTS2;
     if (peerState && peerState.syncState.getState() !== "final" /* FINAL */) {
       const result = peerState.syncState.processNextHeaders(headers, fullMessage);
       if (!result.success) {
         console.warn(`Anti-DoS check failed for peer ${peerKey}`);
         this.cleanupPeerSyncState(peerKey);
-        if (peer) {
-          peer.misbehaving(BanScores.HEADERS_DONT_CONNECT, "headers don't connect to our chain");
+        const exceeded = this.noteUnconnectingHeaders(peerKey);
+        if (exceeded && peer) {
+          console.warn(`Peer ${peerKey} exceeded MAX_NUM_UNCONNECTING_HEADERS_MSGS=${MAX_NUM_UNCONNECTING_HEADERS_MSGS}, banning`);
+          peer.misbehaving(BanScores.HEADERS_DONT_CONNECT, "too many unconnecting / failed-anti-DoS headers");
+          this.resetUnconnectingHeaders(peerKey);
         }
         return;
       }
       if (result.powValidatedHeaders.length > 0) {
         await this.processHeaders(result.powValidatedHeaders, peer);
       }
+      this.resetUnconnectingHeaders(peerKey);
       if (result.requestMore) {
         this.requestHeaders(peer);
       } else {
@@ -22065,6 +22817,7 @@ class HeaderSync {
       }
     } else {
       await this.processHeaders(headers, peer);
+      this.resetUnconnectingHeaders(peerKey);
       if (fullMessage) {
         this.requestHeaders(peer);
       }
@@ -22201,8 +22954,11 @@ class HeaderSync {
 }
 
 // src/sync/blocks.ts
+init_database();
 init_block();
+init_tx();
 init_serialization();
+init_utxo();
 function classifyCallbackError(err) {
   if (err === null || err === undefined)
     return "unknown";
@@ -22304,6 +23060,7 @@ var MAX_STALL_TIMEOUT = 300000;
 var LOG_INTERVAL = 1e4;
 var MAX_GETDATA_ITEMS = 50000;
 var MAX_DOWNLOADED_BUFFER = 32;
+var PRUNE_CHECK_INTERVAL = 100;
 
 class BlockSync {
   db;
@@ -22326,6 +23083,10 @@ class BlockSync {
   lastFailedHeight;
   lastConnectError;
   chainStateManager;
+  mempool = null;
+  pruneManager = null;
+  blocksSincePruneCheck = 0;
+  filterIndex = null;
   scriptThreads;
   constructor(db, params, headerSync, peerManager, chainStateManager, scriptThreads, maxCacheBytes) {
     this.db = db;
@@ -22354,6 +23115,15 @@ class BlockSync {
       nextHeightToProcess: 1,
       nextHeightToRequest: 1
     };
+  }
+  setMempool(mempool) {
+    this.mempool = mempool;
+  }
+  setPruneManager(pruneManager) {
+    this.pruneManager = pruneManager;
+  }
+  setBlockFilterIndex(filterIndex) {
+    this.filterIndex = filterIndex;
   }
   async start() {
     if (this.running) {
@@ -22538,6 +23308,11 @@ class BlockSync {
       }
     }
     if (headerEntry.height < this.state.nextHeightToProcess) {
+      try {
+        await this.db.putBlock(blockHash, serializeBlock(block));
+      } catch (err) {
+        console.warn(`[side-branch] failed to store side-branch block ${hashHex.slice(0, 16)}: ${err instanceof Error ? err.message : String(err)}`);
+      }
       return "duplicate";
     }
     if (headerEntry.height > this.state.nextHeightToProcess + MAX_DOWNLOADED_BUFFER && this.state.downloadedBlocks.size >= MAX_DOWNLOADED_BUFFER) {
@@ -22600,31 +23375,8 @@ class BlockSync {
     }
   }
   async handleGetData(peer, inventory) {
-    // BIP-159 peer-served-blocks gate.  When prune mode is on, refuse to
-    // serve blocks below tip - 288 (NODE_NETWORK_LIMITED_MIN_BLOCKS).
-    // Mirrors Core's net_processing.cpp short-circuit; emits notfound
-    // rather than reading a possibly-deleted block file.
-    const MIN_BLOCKS_TO_KEEP = 288;
-    const pruneActive = this.peerManager &&
-      this.peerManager.config &&
-      this.peerManager.config.pruneMode === true;
-    let pruneHorizon = -1;
-    if (pruneActive) {
-      const bestHeader = this.headerSync.getBestHeader();
-      if (bestHeader && bestHeader.height > MIN_BLOCKS_TO_KEEP) {
-        pruneHorizon = bestHeader.height - MIN_BLOCKS_TO_KEEP;
-      }
-    }
-    const notFound = [];
     for (const inv of inventory) {
       if (inv.type === 2 /* MSG_BLOCK */ || inv.type === 1073741826 /* MSG_WITNESS_BLOCK */) {
-        if (pruneHorizon >= 0) {
-          const entry = this.headerSync.getHeader(inv.hash);
-          if (entry && entry.height < pruneHorizon) {
-            notFound.push(inv);
-            continue;
-          }
-        }
         const rawBlock = await this.db.getBlock(inv.hash);
         if (rawBlock) {
           const block = deserializeBlock(new BufferReader(rawBlock));
@@ -22633,13 +23385,8 @@ class BlockSync {
             payload: { block }
           };
           peer.send(blockMsg);
-        } else {
-          notFound.push(inv);
         }
       }
-    }
-    if (notFound.length > 0) {
-      peer.send({ type: "notfound", payload: { inventory: notFound } });
     }
   }
   requestBlocks() {
@@ -22915,7 +23662,7 @@ class BlockSync {
 ` + `Error: ${failureMsg}
 
 ` + `This is a consensus rule mismatch with Bitcoin Core, NOT chainstate
-` + `corruption — file a bug report against hotbuns. The chainstate is
+` + `corruption \u2014 file a bug report against hotbuns. The chainstate is
 ` + `recoverable; do NOT wipe the data directory. Once the rule is fixed
 ` + `in code, restart and the bounded retry will resume from this height.
 `);
@@ -22999,10 +23746,279 @@ class BlockSync {
   recordConnectError(msg) {
     this.lastConnectError = msg;
   }
+  async writeTxIndexForBlock(block, blockHash) {
+    const ops = [];
+    const { getTxId: getTxId2 } = await Promise.resolve().then(() => (init_tx(), exports_tx));
+    for (const tx of block.transactions) {
+      const txid = getTxId2(tx);
+      const value = Buffer.alloc(40);
+      blockHash.copy(value, 0);
+      ops.push({
+        type: "put",
+        prefix: 116 /* TX_INDEX */,
+        key: txid,
+        value
+      });
+    }
+    if (ops.length === 0)
+      return;
+    try {
+      await this.db.batchWrite(ops);
+    } catch (err) {
+      console.warn(`[txindex] failed to write entries for block ${blockHash.toString("hex").slice(0, 16)}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  async deleteTxIndexForBlock(block, blockHash) {
+    const ops = [];
+    const { getTxId: getTxId2 } = await Promise.resolve().then(() => (init_tx(), exports_tx));
+    for (const tx of block.transactions) {
+      const txid = getTxId2(tx);
+      ops.push({
+        type: "del",
+        prefix: 116 /* TX_INDEX */,
+        key: txid
+      });
+    }
+    if (ops.length === 0)
+      return;
+    try {
+      await this.db.batchWrite(ops);
+    } catch (err) {
+      console.warn(`[txindex] failed to delete entries for block ${blockHash.toString("hex").slice(0, 16)}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  async disconnectBlockUtxo(block, height, blockHash, pendingOps) {
+    const undoData = await this.db.getUndoData(blockHash);
+    if (!undoData) {
+      console.warn(`[reorg-disconnect] undo data missing for block ${blockHash.toString("hex").slice(0, 16)} at height ${height}; cannot disconnect`);
+      return false;
+    }
+    let spentOutputs;
+    try {
+      const { deserializeUndoData: deserializeUndoData2 } = await Promise.resolve().then(() => (init_utxo(), exports_utxo));
+      spentOutputs = deserializeUndoData2(undoData);
+    } catch (err) {
+      console.warn(`[reorg-disconnect] undo data deserialize failed: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+    const spentByOutpoint = new Map;
+    for (const spent of spentOutputs) {
+      const key = `${spent.txid.toString("hex")}:${spent.vout}`;
+      spentByOutpoint.set(key, spent);
+    }
+    for (let txIndex = block.transactions.length - 1;txIndex >= 0; txIndex--) {
+      const tx = block.transactions[txIndex];
+      const txid = (await Promise.resolve().then(() => (init_tx(), exports_tx))).getTxId(tx);
+      const txIsCoinbase = isCoinbase(tx);
+      for (let vout = 0;vout < tx.outputs.length; vout++) {
+        await this.utxoManager.removeUTXO(txid, vout);
+      }
+      if (!txIsCoinbase) {
+        for (const input of tx.inputs) {
+          const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+          const spent = spentByOutpoint.get(key);
+          if (!spent) {
+            console.warn(`[reorg-disconnect] missing undo entry for ${key} in block ${blockHash.toString("hex").slice(0, 16)}`);
+            continue;
+          }
+          this.utxoManager.restoreUTXO(spent.txid, spent.vout, spent.entry);
+        }
+      }
+    }
+    if (pendingOps) {
+      const { getTxId: getTxId2 } = await Promise.resolve().then(() => (init_tx(), exports_tx));
+      for (const tx of block.transactions) {
+        const txid = getTxId2(tx);
+        pendingOps.push(this.db.buildTxIndexDeleteOp(txid));
+      }
+    } else {
+      await this.deleteTxIndexForBlock(block, blockHash);
+    }
+    if (this.filterIndex && this.filterIndex.isEnabled()) {
+      try {
+        await this.filterIndex.removeBlock(block, height);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[blockfilterindex] failed to remove block ${blockHash.toString("hex").slice(0, 16)} at h=${height}: ${msg} (continuing)`);
+      }
+    }
+    return true;
+  }
+  async handleReorgUtxoAndCollect(newTipBlock, newTipHeight, oldTipHash, disconnectedTxsOut, pendingOps) {
+    const MAX_REORG_DEPTH = 100;
+    const MAX_REORG_BATCH_OPS = 250000;
+    const newAncestorHashes = new Set;
+    const newConnectQueue = [];
+    {
+      let cursor = newTipBlock.header.prevBlock;
+      let cursorHeight = newTipHeight - 1;
+      let depth = 0;
+      while (cursor !== null && depth < MAX_REORG_DEPTH) {
+        const cursorHex = cursor.toString("hex");
+        newAncestorHashes.add(cursorHex);
+        const cursorEntry = this.headerSync.getHeader(cursor);
+        if (!cursorEntry) {
+          return false;
+        }
+        newConnectQueue.unshift({ hash: cursor, height: cursorHeight });
+        cursor = cursorEntry.header.prevBlock;
+        cursorHeight--;
+        depth++;
+        if (cursor && cursor.every((b) => b === 0))
+          break;
+      }
+    }
+    {
+      let cursor = oldTipHash;
+      let cursorHeight = this.chainStateManager.getBestBlock().height;
+      let steps = 0;
+      while (cursor !== null && steps < MAX_REORG_DEPTH) {
+        if (newAncestorHashes.has(cursor.toString("hex"))) {
+          const forkHex = cursor.toString("hex");
+          const forkIdx = newConnectQueue.findIndex((n) => n.hash.toString("hex") === forkHex);
+          if (forkIdx >= 0) {
+            newConnectQueue.splice(0, forkIdx + 1);
+          }
+          break;
+        }
+        const rawBlock = await this.db.getBlock(cursor);
+        if (!rawBlock) {
+          return false;
+        }
+        let oldBlock;
+        try {
+          oldBlock = deserializeBlock(new BufferReader(rawBlock));
+        } catch {
+          return false;
+        }
+        for (let i = 1;i < oldBlock.transactions.length; i++) {
+          const tx = oldBlock.transactions[i];
+          if (!isCoinbase(tx)) {
+            disconnectedTxsOut.push(tx);
+          }
+        }
+        const ok = await this.disconnectBlockUtxo(oldBlock, cursorHeight, cursor, pendingOps);
+        if (!ok) {
+          console.warn(`[reorg] aborting reorg-disconnect at height ${cursorHeight}; UTXO state will diverge from Core`);
+          return false;
+        }
+        if (pendingOps && pendingOps.length > MAX_REORG_BATCH_OPS) {
+          console.warn(`[reorg] batch buffer exceeded ${MAX_REORG_BATCH_OPS} ops at disconnect-height ${cursorHeight}; aborting reorg dispatch`);
+          return false;
+        }
+        cursor = oldBlock.header.prevBlock;
+        cursorHeight--;
+        steps++;
+      }
+    }
+    for (const intermediate of newConnectQueue) {
+      const rawBlock = await this.db.getBlock(intermediate.hash);
+      if (!rawBlock) {
+        console.warn(`[reorg] intermediate block body missing for ${intermediate.hash.toString("hex").slice(0, 16)} at height ${intermediate.height}; cannot connect`);
+        return false;
+      }
+      let intermBlock;
+      try {
+        intermBlock = deserializeBlock(new BufferReader(rawBlock));
+      } catch {
+        return false;
+      }
+      let intermPrevMTP = 0;
+      const intermPrevHeaderEntry = this.headerSync.getHeaderByHeight(intermediate.height - 1);
+      if (intermPrevHeaderEntry) {
+        intermPrevMTP = this.headerSync.getMedianTimePast(intermPrevHeaderEntry);
+      }
+      const intermAssumeValid = this.params.assumeValidHeight > 0 && intermediate.height <= this.params.assumeValidHeight;
+      const intermResult = await coreConnectBlockChecks(intermBlock, intermediate.height, this.utxoManager, this.params, {
+        assumeValid: intermAssumeValid,
+        skipScripts: false,
+        prevMTP: intermPrevMTP,
+        enforceBIP68: !intermAssumeValid && intermediate.height >= this.params.csvHeight,
+        scriptThreads: this.scriptThreads,
+        verifyP2SH: intermediate.height >= this.params.bip16Height,
+        verifyWitness: intermediate.height >= this.params.segwitHeight
+      });
+      if (!intermResult.ok) {
+        console.warn(`[reorg] intermediate block ${intermediate.hash.toString("hex").slice(0, 16)} at height ${intermediate.height} failed connect: ${intermResult.error}`);
+        return false;
+      }
+      try {
+        const { serializeUndoData: serializeUndoData2 } = await Promise.resolve().then(() => (init_utxo(), exports_utxo));
+        const undoData = serializeUndoData2(intermResult.spentOutputs);
+        if (pendingOps) {
+          pendingOps.push(this.db.buildUndoDataPutOp(intermediate.hash, undoData));
+        } else {
+          await this.db.putUndoData(intermediate.hash, undoData);
+        }
+      } catch {}
+      if (pendingOps) {
+        const { getTxId: getTxId2 } = await Promise.resolve().then(() => (init_tx(), exports_tx));
+        for (const tx of intermBlock.transactions) {
+          const txid = getTxId2(tx);
+          pendingOps.push(this.db.buildTxIndexPutOp(txid, intermediate.hash));
+        }
+      } else {
+        await this.writeTxIndexForBlock(intermBlock, intermediate.hash);
+      }
+      if (this.filterIndex && this.filterIndex.isEnabled()) {
+        try {
+          await this.filterIndex.indexBlock(intermBlock, intermediate.height, intermResult.spentOutputs);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[blockfilterindex] failed to index intermediate block ${intermediate.hash.toString("hex").slice(0, 16)} at h=${intermediate.height}: ${msg} (continuing)`);
+        }
+      }
+      if (pendingOps && pendingOps.length > MAX_REORG_BATCH_OPS) {
+        console.warn(`[reorg] batch buffer exceeded ${MAX_REORG_BATCH_OPS} ops at intermediate-height ${intermediate.height}; aborting reorg dispatch`);
+        return false;
+      }
+      this.utxoManager.setBestBlock(intermediate.hash);
+      console.log(`[reorg] reconnected intermediate block ${intermediate.hash.toString("hex").slice(0, 16)} at height ${intermediate.height}`);
+    }
+    return true;
+  }
+  async collectDisconnectedTxs(oldTipHash, newChainAncestorHashes) {
+    const MAX_REORG_DEPTH = 100;
+    const collected = [];
+    let cursor = oldTipHash;
+    let steps = 0;
+    while (cursor !== null && steps < MAX_REORG_DEPTH) {
+      const cursorHex = cursor.toString("hex");
+      if (newChainAncestorHashes.has(cursorHex)) {
+        break;
+      }
+      const rawBlock = await this.db.getBlock(cursor);
+      if (!rawBlock) {
+        break;
+      }
+      let oldBlock;
+      try {
+        oldBlock = deserializeBlock(new BufferReader(rawBlock));
+      } catch {
+        break;
+      }
+      for (let i = 1;i < oldBlock.transactions.length; i++) {
+        const tx = oldBlock.transactions[i];
+        if (!isCoinbase(tx)) {
+          collected.push(tx);
+        }
+      }
+      cursor = oldBlock.header.prevBlock;
+      steps++;
+    }
+    return collected;
+  }
   async connectBlock(block, height) {
     const blockHash = getBlockHash(block.header);
     const hashHex = blockHash.toString("hex");
     this.lastConnectError = "";
+    const oldTipBeforeConnect = this.chainStateManager ? this.chainStateManager.getBestBlock().hash : null;
+    let reorgDisconnectedTxs = [];
+    let reorgUtxoFixed = false;
+    const reorgPendingOps = [];
+    if (oldTipBeforeConnect !== null && this.chainStateManager !== null && this.chainStateManager.getBestBlock().height > 0 && !block.header.prevBlock.equals(oldTipBeforeConnect)) {
+      reorgUtxoFixed = await this.handleReorgUtxoAndCollect(block, height, oldTipBeforeConnect, reorgDisconnectedTxs, reorgPendingOps);
+    }
     const assumeValid = this.params.assumeValidHeight > 0 && height <= this.params.assumeValidHeight;
     if (!assumeValid) {
       const validation = validateBlock(block, height, this.params);
@@ -23079,20 +24095,64 @@ class BlockSync {
       this.recordConnectError(m);
       return false;
     }
+    let newTipUndoOp = null;
+    {
+      const bestHeaderForUndo = bestHeader;
+      const atTipForUndo = !bestHeaderForUndo || height >= bestHeaderForUndo.height;
+      if (atTipForUndo) {
+        try {
+          const { serializeUndoData: serializeUndoData2 } = await Promise.resolve().then(() => (init_utxo(), exports_utxo));
+          const undoData = serializeUndoData2(coreResult.spentOutputs);
+          newTipUndoOp = this.db.buildUndoDataPutOp(blockHash, undoData);
+        } catch (err) {
+          console.warn(`[undo] failed to persist undo data for block ${blockHash.toString("hex").slice(0, 16)}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
     this.utxoManager.setBestBlock(blockHash);
     const atTip = !bestHeader || height >= bestHeader.height;
     const shouldFlush = atTip || height % FLUSH_INTERVAL === 0;
+    let newTipTxIndexOps = [];
     if (atTip) {
       const rawBlock = serializeBlock(block);
       await this.db.putBlock(blockHash, rawBlock);
+      if (shouldFlush) {
+        const { getTxId: getTxId2 } = await Promise.resolve().then(() => (init_tx(), exports_tx));
+        for (const tx of block.transactions) {
+          const txid = getTxId2(tx);
+          newTipTxIndexOps.push(this.db.buildTxIndexPutOp(txid, blockHash));
+        }
+      } else {
+        await this.writeTxIndexForBlock(block, blockHash);
+      }
+    }
+    if (this.filterIndex && this.filterIndex.isEnabled()) {
+      try {
+        await this.filterIndex.indexBlock(block, height, coreResult.spentOutputs);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[blockfilterindex] failed to index block ${blockHash.toString("hex").slice(0, 16)} at h=${height}: ${msg} (continuing)`);
+      }
+    }
+    if (!shouldFlush) {
+      await this.db.updateBlockIndexNTx(blockHash, block.transactions.length);
     }
     if (shouldFlush) {
       const extraOps = [];
+      if (reorgPendingOps.length > 0) {
+        extraOps.push(...reorgPendingOps);
+      }
+      if (newTipUndoOp) {
+        extraOps.push(newTipUndoOp);
+      }
+      if (newTipTxIndexOps.length > 0) {
+        extraOps.push(...newTipTxIndexOps);
+      }
       const blockRecord = {
         height,
         header: serializeBlockHeader(block.header),
         nTx: block.transactions.length,
-        status: 1 | 2 | 4 | (atTip ? 8 : 0),
+        status: 7 | (atTip ? 8 : 0),
         dataPos: atTip ? 1 : 0
       };
       const indexValue = this.serializeBlockIndex(blockRecord);
@@ -23119,6 +24179,18 @@ class BlockSync {
       }
       await this.utxoManager.flushDirty(extraOps);
       this.lastFlushedHeight = height;
+    } else {
+      if (reorgPendingOps.length > 0 || newTipUndoOp || newTipTxIndexOps.length > 0) {
+        const extraOps = [];
+        if (reorgPendingOps.length > 0)
+          extraOps.push(...reorgPendingOps);
+        if (newTipUndoOp)
+          extraOps.push(newTipUndoOp);
+        if (newTipTxIndexOps.length > 0)
+          extraOps.push(...newTipTxIndexOps);
+        await this.utxoManager.flushDirty(extraOps);
+        this.lastFlushedHeight = height;
+      }
     }
     if (this.peerManager) {
       this.peerManager.updateBestHeight(height);
@@ -23129,6 +24201,9 @@ class BlockSync {
         this.chainStateManager.updateTip(blockHash, height, headerEntry3.chainWork);
       }
     }
+    if (this.mempool) {
+      this.mempool.setTipHeight(height);
+    }
     if (atTip && this.peerManager) {
       const invMsg = {
         type: "inv",
@@ -23137,6 +24212,29 @@ class BlockSync {
         }
       };
       this.peerManager.broadcast(invMsg);
+    }
+    if (this.mempool && reorgDisconnectedTxs.length > 0) {
+      try {
+        if (reorgUtxoFixed) {
+          await this.mempool.readdTransactions(reorgDisconnectedTxs);
+        } else {
+          this.mempool.reorgRefillUnchecked(reorgDisconnectedTxs);
+        }
+        console.log(`[mempool-refill] reorg refilled ${reorgDisconnectedTxs.length} txs (path=${reorgUtxoFixed ? "checked" : "unchecked"}, oldTip=${oldTipBeforeConnect.toString("hex").slice(0, 16)}..., newTip=${blockHash.toString("hex").slice(0, 16)}...)`);
+      } catch (err) {
+        console.warn(`[mempool-refill] non-fatal failure during reorg refill: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (this.pruneManager && this.pruneManager.isAutomaticPruning()) {
+      this.blocksSincePruneCheck++;
+      if (this.blocksSincePruneCheck >= PRUNE_CHECK_INTERVAL) {
+        this.blocksSincePruneCheck = 0;
+        try {
+          await this.pruneManager.maybePrune(height);
+        } catch (err) {
+          console.warn(`[prune] non-fatal failure during auto-prune at height ${height}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
     }
     return true;
   }
@@ -23912,7 +25010,17 @@ function compileNode(node, chunks, ctx) {
 
 // src/wallet/descriptor.ts
 var HARDENED_OFFSET = 2147483648;
+var BIP32_MAX_INDEX = 4294967295;
 var CURVE_ORDER = BigInt("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
+
+class Bip32InvalidChildError extends Error {
+  index;
+  constructor(index, reason) {
+    super(`BIP-32 invalid child at index ${index} (${reason}); caller must retry with index+1`);
+    this.name = "Bip32InvalidChildError";
+    this.index = index;
+  }
+}
 var TAPTWEAK_TAG = "TapTweak";
 var INPUT_CHARSET = "0123456789()[],'/*abcdefgh@:$%{}IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~ijklmnopqrstuvwxyzABCDEFGH`#\"\\ ";
 var CHECKSUM_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
@@ -23961,6 +25069,13 @@ function descriptorChecksum(desc) {
     result = CHECKSUM_CHARSET[Number(c >> 5n * BigInt(i) & 31n)] + result;
   }
   return result;
+}
+function addChecksum(desc) {
+  const hashIdx = desc.indexOf("#");
+  if (hashIdx !== -1) {
+    desc = desc.slice(0, hashIdx);
+  }
+  return `${desc}#${descriptorChecksum(desc)}`;
 }
 function validateChecksum(desc) {
   const hashIdx = desc.indexOf("#");
@@ -24037,14 +25152,33 @@ class BIP32PubkeyProvider {
     let currentKey = this.extkey.key;
     let currentChainCode = this.extkey.chainCode;
     let isPrivate = this.extkey.isPrivate;
+    const tryDerive = (key, chainCode, startIndex) => {
+      const isHardened = startIndex >= HARDENED_OFFSET;
+      const maxIndex = isHardened ? BIP32_MAX_INDEX : HARDENED_OFFSET - 1;
+      let idx = startIndex;
+      for (let attempt = 0;attempt < 256; attempt++) {
+        try {
+          const d = this.deriveChild(key, chainCode, idx, isPrivate);
+          return { key: d.key, chainCode: d.chainCode, usedIndex: idx };
+        } catch (e) {
+          if (!(e instanceof Bip32InvalidChildError))
+            throw e;
+          if (idx >= maxIndex) {
+            throw new Error(`BIP-32 derivation exhausted index space at ${idx} (no valid child)`);
+          }
+          idx += 1;
+        }
+      }
+      throw new Error(`BIP-32 derivation failed after 256 retries starting at ${startIndex}`);
+    };
     for (const childIndex of this.path) {
-      const derived = this.deriveChild(currentKey, currentChainCode, childIndex, isPrivate);
+      const derived = tryDerive(currentKey, currentChainCode, childIndex);
       currentKey = derived.key;
       currentChainCode = derived.chainCode;
     }
     if (this.deriveType !== "no_range" /* NO_RANGE */) {
       const childIndex = this.deriveType === "hardened" /* HARDENED */ ? index + HARDENED_OFFSET : index;
-      const derived = this.deriveChild(currentKey, currentChainCode, childIndex, isPrivate);
+      const derived = tryDerive(currentKey, currentChainCode, childIndex);
       currentKey = derived.key;
     }
     if (isPrivate) {
@@ -24072,20 +25206,32 @@ class BIP32PubkeyProvider {
     const I = Buffer.from(hmac(sha512, parentChainCode, data));
     const IL = I.subarray(0, 32);
     const IR = I.subarray(32, 64);
+    const ILBigInt = BigInt("0x" + IL.toString("hex"));
+    if (ILBigInt >= CURVE_ORDER) {
+      throw new Bip32InvalidChildError(index, "il-overflow");
+    }
     let childKey;
     if (isPrivate) {
       const parentKeyBigInt = BigInt("0x" + parentKey.toString("hex"));
-      const ILBigInt = BigInt("0x" + IL.toString("hex"));
       const childKeyBigInt = (parentKeyBigInt + ILBigInt) % CURVE_ORDER;
+      if (childKeyBigInt === 0n) {
+        throw new Bip32InvalidChildError(index, "child-zero");
+      }
       let childKeyHex = childKeyBigInt.toString(16);
       childKeyHex = childKeyHex.padStart(64, "0");
       childKey = Buffer.from(childKeyHex, "hex");
     } else {
-      const ILBigInt = BigInt("0x" + IL.toString("hex"));
       const parentPoint = secp256k1.Point.fromHex(parentKey.toString("hex"));
       const ILPoint = secp256k1.Point.BASE.multiply(ILBigInt);
       const childPoint = parentPoint.add(ILPoint);
-      childKey = Buffer.from(childPoint.toBytes(true));
+      if (typeof childPoint.is0 === "function" && childPoint.is0()) {
+        throw new Bip32InvalidChildError(index, "child-infinity");
+      }
+      try {
+        childKey = Buffer.from(childPoint.toBytes(true));
+      } catch (e) {
+        throw new Bip32InvalidChildError(index, "child-infinity");
+      }
     }
     return {
       key: childKey,
@@ -25446,6 +26592,2394 @@ function deriveAddresses(descStr, network = "mainnet", range) {
   return addresses;
 }
 
+// src/wallet/psbt.ts
+init_serialization();
+init_tx();
+init_primitives();
+init_encoding();
+var PSBT_MAGIC = Buffer.from("70736274ff", "hex");
+var PSBT_SEPARATOR = 0;
+var PSBT_MAX_FILE_SIZE = 1e8;
+var PSBT_HIGHEST_VERSION = 0;
+var PSBT_GLOBAL_UNSIGNED_TX = 0;
+var PSBT_GLOBAL_XPUB = 1;
+var PSBT_GLOBAL_VERSION = 251;
+var PSBT_IN_NON_WITNESS_UTXO = 0;
+var PSBT_IN_WITNESS_UTXO = 1;
+var PSBT_IN_PARTIAL_SIG = 2;
+var PSBT_IN_SIGHASH = 3;
+var PSBT_IN_REDEEMSCRIPT = 4;
+var PSBT_IN_WITNESSSCRIPT = 5;
+var PSBT_IN_BIP32_DERIVATION = 6;
+var PSBT_IN_SCRIPTSIG = 7;
+var PSBT_IN_SCRIPTWITNESS = 8;
+var PSBT_IN_RIPEMD160 = 10;
+var PSBT_IN_SHA256 = 11;
+var PSBT_IN_HASH160 = 12;
+var PSBT_IN_HASH256 = 13;
+var PSBT_IN_TAP_KEY_SIG = 19;
+var PSBT_IN_TAP_SCRIPT_SIG = 20;
+var PSBT_IN_TAP_LEAF_SCRIPT = 21;
+var PSBT_IN_TAP_BIP32_DERIVATION = 22;
+var PSBT_IN_TAP_INTERNAL_KEY = 23;
+var PSBT_IN_TAP_MERKLE_ROOT = 24;
+var PSBT_OUT_REDEEMSCRIPT = 0;
+var PSBT_OUT_WITNESSSCRIPT = 1;
+var PSBT_OUT_BIP32_DERIVATION = 2;
+var PSBT_OUT_TAP_INTERNAL_KEY = 5;
+var PSBT_OUT_TAP_TREE = 6;
+var PSBT_OUT_TAP_BIP32_DERIVATION = 7;
+var PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS = 8;
+function createPSBTInput() {
+  return {
+    partialSigs: new Map,
+    bip32Derivation: new Map,
+    ripemd160Preimages: new Map,
+    sha256Preimages: new Map,
+    hash160Preimages: new Map,
+    hash256Preimages: new Map,
+    tapScriptSigs: new Map,
+    tapLeafScripts: new Map,
+    tapBip32Derivation: new Map,
+    unknown: new Map
+  };
+}
+function createPSBTOutput() {
+  return {
+    bip32Derivation: new Map,
+    tapBip32Derivation: new Map,
+    musig2Participants: new Map,
+    unknown: new Map
+  };
+}
+function createPSBT(tx) {
+  for (const input of tx.inputs) {
+    if (input.scriptSig.length > 0) {
+      throw new Error("Transaction inputs must have empty scriptSig");
+    }
+    if (input.witness.length > 0) {
+      throw new Error("Transaction inputs must have empty witness");
+    }
+  }
+  return {
+    tx,
+    xpubs: new Map,
+    inputs: tx.inputs.map(() => createPSBTInput()),
+    outputs: tx.outputs.map(() => createPSBTOutput()),
+    unknown: new Map
+  };
+}
+function writeKeyValue(writer, keyType, keyData, value) {
+  const keyTypeBuffer = Buffer.alloc(1);
+  keyTypeBuffer[0] = keyType;
+  const fullKey = Buffer.concat([keyTypeBuffer, keyData]);
+  writer.writeVarBytes(fullKey);
+  writer.writeVarBytes(value);
+}
+function writeKeyValueSimple(writer, keyType, value) {
+  writeKeyValue(writer, keyType, Buffer.alloc(0), value);
+}
+function serializeTxForPSBT(tx) {
+  return serializeTx(tx, false);
+}
+function serializeKeyOrigin(origin) {
+  const writer = new BufferWriter;
+  writer.writeBytes(origin.fingerprint);
+  for (const index of origin.path) {
+    writer.writeUInt32LE(index);
+  }
+  return writer.toBuffer();
+}
+function deserializeKeyOrigin(data) {
+  if (data.length < 4 || (data.length - 4) % 4 !== 0) {
+    throw new Error("Invalid key origin length");
+  }
+  const fingerprint = data.subarray(0, 4);
+  const path2 = [];
+  for (let i = 4;i < data.length; i += 4) {
+    path2.push(data.readUInt32LE(i));
+  }
+  return { fingerprint: Buffer.from(fingerprint), path: path2 };
+}
+function serializePSBTInput(input) {
+  const writer = new BufferWriter;
+  if (input.nonWitnessUtxo) {
+    const txData = serializeTx(input.nonWitnessUtxo, true);
+    writeKeyValueSimple(writer, PSBT_IN_NON_WITNESS_UTXO, txData);
+  }
+  if (input.witnessUtxo) {
+    const utxoWriter = new BufferWriter;
+    utxoWriter.writeUInt64LE(input.witnessUtxo.value);
+    utxoWriter.writeVarBytes(input.witnessUtxo.scriptPubKey);
+    writeKeyValueSimple(writer, PSBT_IN_WITNESS_UTXO, utxoWriter.toBuffer());
+  }
+  if (!input.finalScriptSig && !input.finalScriptWitness) {
+    for (const { pubkey, signature } of input.partialSigs.values()) {
+      writeKeyValue(writer, PSBT_IN_PARTIAL_SIG, pubkey, signature);
+    }
+    if (input.sighashType !== undefined) {
+      const sighashWriter = new BufferWriter;
+      sighashWriter.writeUInt32LE(input.sighashType);
+      writeKeyValueSimple(writer, PSBT_IN_SIGHASH, sighashWriter.toBuffer());
+    }
+    if (input.redeemScript) {
+      writeKeyValueSimple(writer, PSBT_IN_REDEEMSCRIPT, input.redeemScript);
+    }
+    if (input.witnessScript) {
+      writeKeyValueSimple(writer, PSBT_IN_WITNESSSCRIPT, input.witnessScript);
+    }
+    for (const { pubkey, origin } of input.bip32Derivation.values()) {
+      writeKeyValue(writer, PSBT_IN_BIP32_DERIVATION, pubkey, serializeKeyOrigin(origin));
+    }
+    for (const [hashHex, preimage] of input.ripemd160Preimages) {
+      writeKeyValue(writer, PSBT_IN_RIPEMD160, Buffer.from(hashHex, "hex"), preimage);
+    }
+    for (const [hashHex, preimage] of input.sha256Preimages) {
+      writeKeyValue(writer, PSBT_IN_SHA256, Buffer.from(hashHex, "hex"), preimage);
+    }
+    for (const [hashHex, preimage] of input.hash160Preimages) {
+      writeKeyValue(writer, PSBT_IN_HASH160, Buffer.from(hashHex, "hex"), preimage);
+    }
+    for (const [hashHex, preimage] of input.hash256Preimages) {
+      writeKeyValue(writer, PSBT_IN_HASH256, Buffer.from(hashHex, "hex"), preimage);
+    }
+    if (input.tapKeySig) {
+      writeKeyValueSimple(writer, PSBT_IN_TAP_KEY_SIG, input.tapKeySig);
+    }
+    if (input.tapInternalKey) {
+      writeKeyValueSimple(writer, PSBT_IN_TAP_INTERNAL_KEY, input.tapInternalKey);
+    }
+    if (input.tapMerkleRoot) {
+      writeKeyValueSimple(writer, PSBT_IN_TAP_MERKLE_ROOT, input.tapMerkleRoot);
+    }
+  }
+  if (input.finalScriptSig) {
+    writeKeyValueSimple(writer, PSBT_IN_SCRIPTSIG, input.finalScriptSig);
+  }
+  if (input.finalScriptWitness) {
+    const witnessWriter = new BufferWriter;
+    witnessWriter.writeVarInt(input.finalScriptWitness.length);
+    for (const item of input.finalScriptWitness) {
+      witnessWriter.writeVarBytes(item);
+    }
+    writeKeyValueSimple(writer, PSBT_IN_SCRIPTWITNESS, witnessWriter.toBuffer());
+  }
+  for (const [keyHex, value] of input.unknown) {
+    const key = Buffer.from(keyHex, "hex");
+    writer.writeVarBytes(key);
+    writer.writeVarBytes(value);
+  }
+  writer.writeUInt8(PSBT_SEPARATOR);
+  return writer.toBuffer();
+}
+function serializePSBTOutput(output) {
+  const writer = new BufferWriter;
+  if (output.redeemScript) {
+    writeKeyValueSimple(writer, PSBT_OUT_REDEEMSCRIPT, output.redeemScript);
+  }
+  if (output.witnessScript) {
+    writeKeyValueSimple(writer, PSBT_OUT_WITNESSSCRIPT, output.witnessScript);
+  }
+  for (const { pubkey, origin } of output.bip32Derivation.values()) {
+    writeKeyValue(writer, PSBT_OUT_BIP32_DERIVATION, pubkey, serializeKeyOrigin(origin));
+  }
+  if (output.tapInternalKey) {
+    writeKeyValueSimple(writer, PSBT_OUT_TAP_INTERNAL_KEY, output.tapInternalKey);
+  }
+  if (output.tapTree && output.tapTree.length > 0) {
+    const treeWriter = new BufferWriter;
+    for (const leaf of output.tapTree) {
+      treeWriter.writeUInt8(leaf.depth);
+      treeWriter.writeUInt8(leaf.leafVersion);
+      treeWriter.writeVarBytes(leaf.script);
+    }
+    writeKeyValueSimple(writer, PSBT_OUT_TAP_TREE, treeWriter.toBuffer());
+  }
+  for (const [keyHex, value] of output.unknown) {
+    const key = Buffer.from(keyHex, "hex");
+    writer.writeVarBytes(key);
+    writer.writeVarBytes(value);
+  }
+  writer.writeUInt8(PSBT_SEPARATOR);
+  return writer.toBuffer();
+}
+function serializePSBT(psbt) {
+  const writer = new BufferWriter;
+  writer.writeBytes(PSBT_MAGIC);
+  const txData = serializeTxForPSBT(psbt.tx);
+  writeKeyValueSimple(writer, PSBT_GLOBAL_UNSIGNED_TX, txData);
+  for (const { xpub, origin } of psbt.xpubs.values()) {
+    writeKeyValue(writer, PSBT_GLOBAL_XPUB, xpub, serializeKeyOrigin(origin));
+  }
+  if (psbt.version !== undefined && psbt.version > 0) {
+    const versionWriter = new BufferWriter;
+    versionWriter.writeUInt32LE(psbt.version);
+    writeKeyValueSimple(writer, PSBT_GLOBAL_VERSION, versionWriter.toBuffer());
+  }
+  for (const [keyHex, value] of psbt.unknown) {
+    const key = Buffer.from(keyHex, "hex");
+    writer.writeVarBytes(key);
+    writer.writeVarBytes(value);
+  }
+  writer.writeUInt8(PSBT_SEPARATOR);
+  for (const input of psbt.inputs) {
+    writer.writeBytes(serializePSBTInput(input));
+  }
+  for (const output of psbt.outputs) {
+    writer.writeBytes(serializePSBTOutput(output));
+  }
+  return writer.toBuffer();
+}
+function encodePSBTBase64(psbt) {
+  return serializePSBT(psbt).toString("base64");
+}
+function readKeyValuePairs(reader) {
+  const pairs = [];
+  while (reader.remaining > 0) {
+    const keyLen = reader.readVarInt();
+    if (keyLen === 0) {
+      break;
+    }
+    const key = reader.readBytes(keyLen);
+    const value = reader.readVarBytes();
+    pairs.push([key, value]);
+  }
+  return pairs;
+}
+function getKeyType(key) {
+  if (key.length === 0) {
+    throw new Error("Empty PSBT key");
+  }
+  const keyReader = new BufferReader(key);
+  return keyReader.readVarInt();
+}
+function getKeyData(key) {
+  if (key.length === 0) {
+    throw new Error("Empty PSBT key");
+  }
+  const keyReader = new BufferReader(key);
+  keyReader.readVarInt();
+  return key.subarray(keyReader.position);
+}
+function deserializePSBTInput(pairs) {
+  const input = createPSBTInput();
+  const seenKeys = new Set;
+  for (const [key, value] of pairs) {
+    const keyHex = key.toString("hex");
+    const keyType = getKeyType(key);
+    const keyData = getKeyData(key);
+    switch (keyType) {
+      case PSBT_IN_NON_WITNESS_UTXO: {
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: non-witness UTXO");
+        }
+        if (keyData.length !== 0) {
+          throw new Error("Non-witness UTXO key must have no data");
+        }
+        const txReader = new BufferReader(value);
+        input.nonWitnessUtxo = deserializeTx(txReader);
+        seenKeys.add(keyHex);
+        break;
+      }
+      case PSBT_IN_WITNESS_UTXO: {
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: witness UTXO");
+        }
+        if (keyData.length !== 0) {
+          throw new Error("Witness UTXO key must have no data");
+        }
+        const utxoReader = new BufferReader(value);
+        const utxoValue = utxoReader.readUInt64LE();
+        const scriptPubKey = utxoReader.readVarBytes();
+        input.witnessUtxo = { value: utxoValue, scriptPubKey };
+        seenKeys.add(keyHex);
+        break;
+      }
+      case PSBT_IN_PARTIAL_SIG: {
+        if (keyData.length !== 33 && keyData.length !== 65) {
+          throw new Error("Invalid partial sig pubkey length");
+        }
+        const pubkeyHex = keyData.toString("hex");
+        if (input.partialSigs.has(pubkeyHex)) {
+          throw new Error("Duplicate partial signature");
+        }
+        input.partialSigs.set(pubkeyHex, {
+          pubkey: Buffer.from(keyData),
+          signature: Buffer.from(value)
+        });
+        break;
+      }
+      case PSBT_IN_SIGHASH: {
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: sighash type");
+        }
+        if (keyData.length !== 0) {
+          throw new Error("Sighash type key must have no data");
+        }
+        const sighashReader = new BufferReader(value);
+        input.sighashType = sighashReader.readUInt32LE();
+        seenKeys.add(keyHex);
+        break;
+      }
+      case PSBT_IN_REDEEMSCRIPT: {
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: redeem script");
+        }
+        if (keyData.length !== 0) {
+          throw new Error("Redeem script key must have no data");
+        }
+        input.redeemScript = Buffer.from(value);
+        seenKeys.add(keyHex);
+        break;
+      }
+      case PSBT_IN_WITNESSSCRIPT: {
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: witness script");
+        }
+        if (keyData.length !== 0) {
+          throw new Error("Witness script key must have no data");
+        }
+        input.witnessScript = Buffer.from(value);
+        seenKeys.add(keyHex);
+        break;
+      }
+      case PSBT_IN_BIP32_DERIVATION: {
+        if (keyData.length !== 33 && keyData.length !== 65) {
+          throw new Error("Invalid BIP32 derivation pubkey length");
+        }
+        const pubkeyHex = keyData.toString("hex");
+        if (input.bip32Derivation.has(pubkeyHex)) {
+          throw new Error("Duplicate BIP32 derivation");
+        }
+        input.bip32Derivation.set(pubkeyHex, {
+          pubkey: Buffer.from(keyData),
+          origin: deserializeKeyOrigin(value)
+        });
+        break;
+      }
+      case PSBT_IN_SCRIPTSIG: {
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: final scriptSig");
+        }
+        if (keyData.length !== 0) {
+          throw new Error("Final scriptSig key must have no data");
+        }
+        input.finalScriptSig = Buffer.from(value);
+        seenKeys.add(keyHex);
+        break;
+      }
+      case PSBT_IN_SCRIPTWITNESS: {
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: final witness");
+        }
+        if (keyData.length !== 0) {
+          throw new Error("Final witness key must have no data");
+        }
+        const witnessReader = new BufferReader(value);
+        const witnessCount = witnessReader.readVarInt();
+        input.finalScriptWitness = [];
+        for (let i = 0;i < witnessCount; i++) {
+          input.finalScriptWitness.push(Buffer.from(witnessReader.readVarBytes()));
+        }
+        seenKeys.add(keyHex);
+        break;
+      }
+      case PSBT_IN_RIPEMD160: {
+        if (keyData.length !== 20) {
+          throw new Error("Invalid RIPEMD160 hash length");
+        }
+        const hashHex = keyData.toString("hex");
+        if (input.ripemd160Preimages.has(hashHex)) {
+          throw new Error("Duplicate RIPEMD160 preimage");
+        }
+        input.ripemd160Preimages.set(hashHex, Buffer.from(value));
+        break;
+      }
+      case PSBT_IN_SHA256: {
+        if (keyData.length !== 32) {
+          throw new Error("Invalid SHA256 hash length");
+        }
+        const hashHex = keyData.toString("hex");
+        if (input.sha256Preimages.has(hashHex)) {
+          throw new Error("Duplicate SHA256 preimage");
+        }
+        input.sha256Preimages.set(hashHex, Buffer.from(value));
+        break;
+      }
+      case PSBT_IN_HASH160: {
+        if (keyData.length !== 20) {
+          throw new Error("Invalid HASH160 hash length");
+        }
+        const hashHex = keyData.toString("hex");
+        if (input.hash160Preimages.has(hashHex)) {
+          throw new Error("Duplicate HASH160 preimage");
+        }
+        input.hash160Preimages.set(hashHex, Buffer.from(value));
+        break;
+      }
+      case PSBT_IN_HASH256: {
+        if (keyData.length !== 32) {
+          throw new Error("Invalid HASH256 hash length");
+        }
+        const hashHex = keyData.toString("hex");
+        if (input.hash256Preimages.has(hashHex)) {
+          throw new Error("Duplicate HASH256 preimage");
+        }
+        input.hash256Preimages.set(hashHex, Buffer.from(value));
+        break;
+      }
+      case PSBT_IN_TAP_KEY_SIG: {
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: taproot key sig");
+        }
+        if (keyData.length !== 0) {
+          throw new Error("Taproot key sig key must have no data");
+        }
+        if (value.length < 64 || value.length > 65) {
+          throw new Error("Invalid taproot signature length");
+        }
+        input.tapKeySig = Buffer.from(value);
+        seenKeys.add(keyHex);
+        break;
+      }
+      case PSBT_IN_TAP_SCRIPT_SIG: {
+        if (keyData.length !== 64) {
+          throw new Error("Taproot script sig key must have exactly 64 bytes of key data");
+        }
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: taproot script path sig");
+        }
+        if (value.length < 64 || value.length > 65) {
+          throw new Error("Invalid taproot script path signature length");
+        }
+        const tapSigXonly = Buffer.from(keyData.subarray(0, 32));
+        const tapSigLeafHash = Buffer.from(keyData.subarray(32, 64));
+        const tapSigMapKey = tapSigXonly.toString("hex") + tapSigLeafHash.toString("hex");
+        input.tapScriptSigs.set(tapSigMapKey, {
+          xonly: tapSigXonly,
+          leafHash: tapSigLeafHash,
+          sig: Buffer.from(value)
+        });
+        seenKeys.add(keyHex);
+        break;
+      }
+      case PSBT_IN_TAP_LEAF_SCRIPT: {
+        if (keyData.length < 33) {
+          throw new Error("Taproot leaf script key data must be at least 33 bytes (control block)");
+        }
+        if ((keyData.length - 1) % 32 !== 0) {
+          throw new Error("Taproot leaf script control block size is not valid");
+        }
+        if (value.length < 1) {
+          throw new Error("Taproot leaf script value must be at least 1 byte");
+        }
+        const controlBlock = Buffer.from(keyData);
+        const leafVer = value[value.length - 1];
+        const leafScript = Buffer.from(value.subarray(0, value.length - 1));
+        const leafScriptMapKey = leafScript.toString("hex") + ":" + leafVer.toString();
+        const existing = input.tapLeafScripts.get(leafScriptMapKey);
+        if (existing) {
+          existing.controlBlocks.push(controlBlock);
+        } else {
+          input.tapLeafScripts.set(leafScriptMapKey, {
+            script: leafScript,
+            leafVer,
+            controlBlocks: [controlBlock]
+          });
+        }
+        break;
+      }
+      case PSBT_IN_TAP_BIP32_DERIVATION: {
+        if (keyData.length !== 32) {
+          throw new Error("Taproot BIP32 derivation key must have exactly 32 bytes of key data");
+        }
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: taproot BIP32 derivation");
+        }
+        const tapBip32Xonly = Buffer.from(keyData);
+        const tapBip32Reader = new BufferReader(value);
+        const nHashes = tapBip32Reader.readVarInt();
+        const tapLeafHashes = [];
+        for (let j = 0;j < nHashes; j++) {
+          tapLeafHashes.push(Buffer.from(tapBip32Reader.readBytes(32)));
+        }
+        const originData = value.subarray(tapBip32Reader.position);
+        const tapBip32Origin = deserializeKeyOrigin(originData);
+        input.tapBip32Derivation.set(tapBip32Xonly.toString("hex"), {
+          xonly: tapBip32Xonly,
+          leafHashes: tapLeafHashes,
+          origin: tapBip32Origin
+        });
+        seenKeys.add(keyHex);
+        break;
+      }
+      case PSBT_IN_TAP_INTERNAL_KEY: {
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: taproot internal key");
+        }
+        if (keyData.length !== 0) {
+          throw new Error("Taproot internal key key must have no data");
+        }
+        if (value.length !== 32) {
+          throw new Error("Invalid taproot internal key length");
+        }
+        input.tapInternalKey = Buffer.from(value);
+        seenKeys.add(keyHex);
+        break;
+      }
+      case PSBT_IN_TAP_MERKLE_ROOT: {
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: taproot merkle root");
+        }
+        if (keyData.length !== 0) {
+          throw new Error("Taproot merkle root key must have no data");
+        }
+        if (value.length !== 32) {
+          throw new Error("Invalid taproot merkle root length");
+        }
+        input.tapMerkleRoot = Buffer.from(value);
+        seenKeys.add(keyHex);
+        break;
+      }
+      default:
+        if (input.unknown.has(keyHex)) {
+          throw new Error("Duplicate unknown key");
+        }
+        input.unknown.set(keyHex, Buffer.from(value));
+        break;
+    }
+  }
+  return input;
+}
+function deserializePSBTOutput(pairs) {
+  const output = createPSBTOutput();
+  const seenKeys = new Set;
+  for (const [key, value] of pairs) {
+    const keyHex = key.toString("hex");
+    const keyType = getKeyType(key);
+    const keyData = getKeyData(key);
+    switch (keyType) {
+      case PSBT_OUT_REDEEMSCRIPT: {
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: output redeem script");
+        }
+        if (keyData.length !== 0) {
+          throw new Error("Output redeem script key must have no data");
+        }
+        output.redeemScript = Buffer.from(value);
+        seenKeys.add(keyHex);
+        break;
+      }
+      case PSBT_OUT_WITNESSSCRIPT: {
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: output witness script");
+        }
+        if (keyData.length !== 0) {
+          throw new Error("Output witness script key must have no data");
+        }
+        output.witnessScript = Buffer.from(value);
+        seenKeys.add(keyHex);
+        break;
+      }
+      case PSBT_OUT_BIP32_DERIVATION: {
+        if (keyData.length !== 33 && keyData.length !== 65) {
+          throw new Error("Invalid BIP32 derivation pubkey length");
+        }
+        const pubkeyHex = keyData.toString("hex");
+        if (output.bip32Derivation.has(pubkeyHex)) {
+          throw new Error("Duplicate BIP32 derivation");
+        }
+        output.bip32Derivation.set(pubkeyHex, {
+          pubkey: Buffer.from(keyData),
+          origin: deserializeKeyOrigin(value)
+        });
+        break;
+      }
+      case PSBT_OUT_TAP_INTERNAL_KEY: {
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: output taproot internal key");
+        }
+        if (keyData.length !== 0) {
+          throw new Error("Output taproot internal key key must have no data");
+        }
+        if (value.length !== 32) {
+          throw new Error("Invalid taproot internal key length");
+        }
+        output.tapInternalKey = Buffer.from(value);
+        seenKeys.add(keyHex);
+        break;
+      }
+      case PSBT_OUT_TAP_TREE: {
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: output taproot tree");
+        }
+        if (keyData.length !== 0) {
+          throw new Error("Output taproot tree key must have no data");
+        }
+        const treeReader = new BufferReader(value);
+        output.tapTree = [];
+        while (treeReader.remaining > 0) {
+          const depth = treeReader.readUInt8();
+          const leafVersion = treeReader.readUInt8();
+          const script = Buffer.from(treeReader.readVarBytes());
+          output.tapTree.push({ depth, leafVersion, script });
+        }
+        seenKeys.add(keyHex);
+        break;
+      }
+      case PSBT_OUT_TAP_BIP32_DERIVATION: {
+        if (keyData.length !== 32) {
+          throw new Error("Output taproot BIP32 derivation key must have exactly 32 bytes of key data");
+        }
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: output taproot BIP32 derivation");
+        }
+        const outTapBip32Xonly = Buffer.from(keyData);
+        const outTapBip32Reader = new BufferReader(value);
+        const outNHashes = outTapBip32Reader.readVarInt();
+        const outTapLeafHashes = [];
+        for (let j = 0;j < outNHashes; j++) {
+          outTapLeafHashes.push(Buffer.from(outTapBip32Reader.readBytes(32)));
+        }
+        const outOriginData = value.subarray(outTapBip32Reader.position);
+        const outTapBip32Origin = deserializeKeyOrigin(outOriginData);
+        output.tapBip32Derivation.set(outTapBip32Xonly.toString("hex"), {
+          xonly: outTapBip32Xonly,
+          leafHashes: outTapLeafHashes,
+          origin: outTapBip32Origin
+        });
+        seenKeys.add(keyHex);
+        break;
+      }
+      case PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS: {
+        if (keyData.length !== 33) {
+          throw new Error("Output MuSig2 participant pubkeys key must have exactly 33 bytes of key data");
+        }
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: output MuSig2 participant pubkeys");
+        }
+        if (value.length === 0 || value.length % 33 !== 0) {
+          throw new Error("Output MuSig2 participant pubkeys value length must be a multiple of 33");
+        }
+        const musig2AggPubkey = Buffer.from(keyData);
+        const musig2ParticipantPubkeys = [];
+        for (let j = 0;j < value.length; j += 33) {
+          musig2ParticipantPubkeys.push(Buffer.from(value.subarray(j, j + 33)));
+        }
+        output.musig2Participants.set(musig2AggPubkey.toString("hex"), {
+          aggPubkey: musig2AggPubkey,
+          participantPubkeys: musig2ParticipantPubkeys
+        });
+        seenKeys.add(keyHex);
+        break;
+      }
+      default:
+        if (output.unknown.has(keyHex)) {
+          throw new Error("Duplicate unknown key");
+        }
+        output.unknown.set(keyHex, Buffer.from(value));
+        break;
+    }
+  }
+  return output;
+}
+function deserializePSBT(data) {
+  if (data.length > PSBT_MAX_FILE_SIZE) {
+    throw new Error(`PSBT too large: ${data.length} bytes (max ${PSBT_MAX_FILE_SIZE})`);
+  }
+  const reader = new BufferReader(data);
+  const magic = reader.readBytes(5);
+  if (!magic.equals(PSBT_MAGIC)) {
+    throw new Error("Invalid PSBT magic bytes");
+  }
+  const globalPairs = readKeyValuePairs(reader);
+  let tx;
+  const xpubs = new Map;
+  let version;
+  const unknown = new Map;
+  const seenGlobalKeys = new Set;
+  for (const [key, value] of globalPairs) {
+    const keyHex = key.toString("hex");
+    const keyType = getKeyType(key);
+    const keyData = getKeyData(key);
+    switch (keyType) {
+      case PSBT_GLOBAL_UNSIGNED_TX: {
+        if (seenGlobalKeys.has(keyHex)) {
+          throw new Error("Duplicate key: unsigned tx");
+        }
+        if (keyData.length !== 0) {
+          throw new Error("Unsigned tx key must have no data");
+        }
+        const txReader = new BufferReader(value);
+        tx = deserializeTx(txReader);
+        for (const input of tx.inputs) {
+          if (input.scriptSig.length > 0 || input.witness.length > 0) {
+            throw new Error("Unsigned tx must have empty scriptSigs and witnesses");
+          }
+        }
+        seenGlobalKeys.add(keyHex);
+        break;
+      }
+      case PSBT_GLOBAL_XPUB: {
+        if (keyData.length !== 78) {
+          throw new Error("Invalid xpub length");
+        }
+        const xpubHex = keyData.toString("hex");
+        if (xpubs.has(xpubHex)) {
+          throw new Error("Duplicate xpub");
+        }
+        xpubs.set(xpubHex, {
+          xpub: Buffer.from(keyData),
+          origin: deserializeKeyOrigin(value)
+        });
+        break;
+      }
+      case PSBT_GLOBAL_VERSION: {
+        if (seenGlobalKeys.has(keyHex)) {
+          throw new Error("Duplicate key: PSBT version");
+        }
+        if (keyData.length !== 0) {
+          throw new Error("PSBT version key must have no data");
+        }
+        const versionReader = new BufferReader(value);
+        version = versionReader.readUInt32LE();
+        if (version > PSBT_HIGHEST_VERSION) {
+          throw new Error(`Unsupported PSBT version: ${version}`);
+        }
+        seenGlobalKeys.add(keyHex);
+        break;
+      }
+      default:
+        if (unknown.has(keyHex)) {
+          throw new Error("Duplicate unknown global key");
+        }
+        unknown.set(keyHex, Buffer.from(value));
+        break;
+    }
+  }
+  if (!tx) {
+    throw new Error("No unsigned transaction in PSBT");
+  }
+  const inputs = [];
+  for (let i = 0;i < tx.inputs.length; i++) {
+    const inputPairs = readKeyValuePairs(reader);
+    const input = deserializePSBTInput(inputPairs);
+    if (input.nonWitnessUtxo) {
+      const prevTxId = getTxId(input.nonWitnessUtxo);
+      if (!prevTxId.equals(tx.inputs[i].prevOut.txid)) {
+        throw new Error(`Non-witness UTXO does not match outpoint for input ${i}`);
+      }
+      if (tx.inputs[i].prevOut.vout >= input.nonWitnessUtxo.outputs.length) {
+        throw new Error(`Output index out of range for input ${i}`);
+      }
+    }
+    inputs.push(input);
+  }
+  if (inputs.length !== tx.inputs.length) {
+    throw new Error("Input count mismatch");
+  }
+  const outputs = [];
+  for (let i = 0;i < tx.outputs.length; i++) {
+    const outputPairs = readKeyValuePairs(reader);
+    outputs.push(deserializePSBTOutput(outputPairs));
+  }
+  if (outputs.length !== tx.outputs.length) {
+    throw new Error("Output count mismatch");
+  }
+  return {
+    tx,
+    xpubs,
+    inputs,
+    outputs,
+    version,
+    unknown
+  };
+}
+function decodePSBTBase64(base64) {
+  const data = Buffer.from(base64, "base64");
+  return deserializePSBT(data);
+}
+function getInputUTXO(psbt, inputIndex) {
+  if (inputIndex < 0 || inputIndex >= psbt.inputs.length) {
+    return;
+  }
+  const input = psbt.inputs[inputIndex];
+  const txInput = psbt.tx.inputs[inputIndex];
+  if (input.witnessUtxo && input.nonWitnessUtxo) {
+    const vout = txInput.prevOut.vout;
+    if (vout >= input.nonWitnessUtxo.outputs.length) {
+      throw new Error(`PSBT input ${inputIndex}: vout ${vout} out of range for nonWitnessUtxo ` + `(${input.nonWitnessUtxo.outputs.length} outputs)`);
+    }
+    const fromFullTx = input.nonWitnessUtxo.outputs[vout];
+    if (input.witnessUtxo.value !== fromFullTx.value) {
+      throw new Error(`PSBT input ${inputIndex}: witnessUtxo.value (${input.witnessUtxo.value}) ` + `does not match nonWitnessUtxo.outputs[${vout}].value (${fromFullTx.value}); ` + `refusing to sign (CVE-2020-14199)`);
+    }
+    if (!input.witnessUtxo.scriptPubKey.equals(fromFullTx.scriptPubKey)) {
+      throw new Error(`PSBT input ${inputIndex}: witnessUtxo.scriptPubKey does not match ` + `nonWitnessUtxo.outputs[${vout}].scriptPubKey; refusing to sign ` + `(CVE-2020-14199)`);
+    }
+  }
+  if (input.witnessUtxo) {
+    return input.witnessUtxo;
+  }
+  if (input.nonWitnessUtxo) {
+    const vout = txInput.prevOut.vout;
+    if (vout < input.nonWitnessUtxo.outputs.length) {
+      return input.nonWitnessUtxo.outputs[vout];
+    }
+  }
+  return;
+}
+function isInputFinalized(input) {
+  return input.finalScriptSig !== undefined || input.finalScriptWitness !== undefined;
+}
+function updateInputUTXO(psbt, inputIndex, utxo, isWitness = true) {
+  if (inputIndex < 0 || inputIndex >= psbt.inputs.length) {
+    throw new Error(`Invalid input index: ${inputIndex}`);
+  }
+  const input = psbt.inputs[inputIndex];
+  if ("value" in utxo && "scriptPubKey" in utxo) {
+    if (isWitness) {
+      input.witnessUtxo = utxo;
+    }
+  } else {
+    input.nonWitnessUtxo = utxo;
+    const txInput = psbt.tx.inputs[inputIndex];
+    const prevOutput = utxo.outputs[txInput.prevOut.vout];
+    if (prevOutput) {
+      const scriptPubKey = prevOutput.scriptPubKey;
+      if (scriptPubKey.length === 22 || scriptPubKey.length === 34 || scriptPubKey.length === 23 && scriptPubKey[0] >= 81 && scriptPubKey[0] <= 96) {
+        input.witnessUtxo = prevOutput;
+      }
+    }
+  }
+}
+function addPartialSignature(psbt, inputIndex, pubkey, signature) {
+  if (inputIndex < 0 || inputIndex >= psbt.inputs.length) {
+    throw new Error(`Invalid input index: ${inputIndex}`);
+  }
+  const input = psbt.inputs[inputIndex];
+  if (isInputFinalized(input)) {
+    throw new Error("Cannot add signature to finalized input");
+  }
+  const pubkeyHex = pubkey.toString("hex");
+  input.partialSigs.set(pubkeyHex, { pubkey, signature });
+}
+function signPSBTInput(psbt, inputIndex, privateKey, publicKey, sighashType = SIGHASH_ALL) {
+  if (inputIndex < 0 || inputIndex >= psbt.inputs.length) {
+    throw new Error(`Invalid input index: ${inputIndex}`);
+  }
+  const input = psbt.inputs[inputIndex];
+  if (isInputFinalized(input)) {
+    throw new Error("Cannot sign finalized input");
+  }
+  const utxo = getInputUTXO(psbt, inputIndex);
+  if (!utxo) {
+    throw new Error("No UTXO information for input");
+  }
+  const scriptPubKey = utxo.scriptPubKey;
+  let sighash;
+  if (scriptPubKey.length === 22 && scriptPubKey[0] === 0 && scriptPubKey[1] === 20) {
+    const pubKeyHash = hash160(publicKey);
+    if (!scriptPubKey.subarray(2).equals(pubKeyHash)) {
+      throw new Error("Public key does not match P2WPKH scriptPubKey");
+    }
+    const scriptCode = Buffer.concat([
+      Buffer.from([118, 169, 20]),
+      pubKeyHash,
+      Buffer.from([136, 172])
+    ]);
+    sighash = sigHashWitnessV0(psbt.tx, inputIndex, scriptCode, utxo.value, sighashType);
+  } else if (scriptPubKey.length === 25 && scriptPubKey[0] === 118 && scriptPubKey[1] === 169 && scriptPubKey[2] === 20 && scriptPubKey[23] === 136 && scriptPubKey[24] === 172) {
+    sighash = sigHashLegacy(psbt.tx, inputIndex, scriptPubKey, sighashType);
+  } else if (scriptPubKey.length === 23 && scriptPubKey[0] === 169 && scriptPubKey[1] === 20 && scriptPubKey[22] === 135 && input.redeemScript) {
+    const redeemScript = input.redeemScript;
+    if (!hash160(redeemScript).equals(scriptPubKey.subarray(2, 22))) {
+      throw new Error("redeemScript does not match P2SH scriptPubKey");
+    }
+    if (redeemScript.length === 22 && redeemScript[0] === 0 && redeemScript[1] === 20) {
+      const pubKeyHash = hash160(publicKey);
+      if (!redeemScript.subarray(2).equals(pubKeyHash)) {
+        throw new Error("Public key does not match P2SH-P2WPKH redeem script");
+      }
+      const scriptCode = Buffer.concat([
+        Buffer.from([118, 169, 20]),
+        pubKeyHash,
+        Buffer.from([136, 172])
+      ]);
+      sighash = sigHashWitnessV0(psbt.tx, inputIndex, scriptCode, utxo.value, sighashType);
+    } else if (redeemScript.length === 34 && redeemScript[0] === 0 && redeemScript[1] === 32 && input.witnessScript) {
+      const witnessScript = input.witnessScript;
+      const wsHash = sha256Hash(witnessScript);
+      if (!redeemScript.subarray(2).equals(wsHash)) {
+        throw new Error("witnessScript does not match P2SH-P2WSH redeemScript commitment");
+      }
+      sighash = sigHashWitnessV0(psbt.tx, inputIndex, witnessScript, utxo.value, sighashType);
+    } else {
+      throw new Error("Unsupported P2SH script type");
+    }
+  } else if (scriptPubKey.length === 34 && scriptPubKey[0] === 0 && scriptPubKey[1] === 32 && input.witnessScript) {
+    const witnessScript = input.witnessScript;
+    const wsHash = sha256Hash(witnessScript);
+    if (!scriptPubKey.subarray(2).equals(wsHash)) {
+      throw new Error("witnessScript does not match P2WSH scriptPubKey");
+    }
+    sighash = sigHashWitnessV0(psbt.tx, inputIndex, witnessScript, utxo.value, sighashType);
+  } else {
+    throw new Error("Unsupported script type for signing");
+  }
+  const signature = ecdsaSign(sighash, privateKey);
+  const sigWithType = Buffer.concat([signature, Buffer.from([sighashType])]);
+  addPartialSignature(psbt, inputIndex, publicKey, sigWithType);
+  if (input.sighashType === undefined) {
+    input.sighashType = sighashType;
+  }
+}
+function combinePSBTs(psbts) {
+  if (psbts.length === 0) {
+    throw new Error("No PSBTs to combine");
+  }
+  if (psbts.length === 1) {
+    return psbts[0];
+  }
+  const baseTxId = getTxId(psbts[0].tx);
+  for (let i = 1;i < psbts.length; i++) {
+    const txId = getTxId(psbts[i].tx);
+    if (!txId.equals(baseTxId)) {
+      throw new Error("Cannot combine PSBTs with different transactions");
+    }
+  }
+  const result = {
+    tx: psbts[0].tx,
+    xpubs: new Map(psbts[0].xpubs),
+    inputs: psbts[0].inputs.map((input) => ({
+      ...input,
+      partialSigs: new Map(input.partialSigs),
+      bip32Derivation: new Map(input.bip32Derivation),
+      ripemd160Preimages: new Map(input.ripemd160Preimages),
+      sha256Preimages: new Map(input.sha256Preimages),
+      hash160Preimages: new Map(input.hash160Preimages),
+      hash256Preimages: new Map(input.hash256Preimages),
+      tapScriptSigs: new Map(input.tapScriptSigs),
+      tapLeafScripts: new Map(input.tapLeafScripts),
+      tapBip32Derivation: new Map(input.tapBip32Derivation),
+      unknown: new Map(input.unknown),
+      finalScriptWitness: input.finalScriptWitness?.map((b) => Buffer.from(b))
+    })),
+    outputs: psbts[0].outputs.map((output) => ({
+      ...output,
+      bip32Derivation: new Map(output.bip32Derivation),
+      tapBip32Derivation: new Map(output.tapBip32Derivation),
+      musig2Participants: new Map(output.musig2Participants),
+      unknown: new Map(output.unknown),
+      tapTree: output.tapTree?.map((leaf) => ({
+        depth: leaf.depth,
+        leafVersion: leaf.leafVersion,
+        script: Buffer.from(leaf.script)
+      }))
+    })),
+    version: psbts[0].version,
+    unknown: new Map(psbts[0].unknown)
+  };
+  for (let i = 1;i < psbts.length; i++) {
+    const psbt = psbts[i];
+    for (const [key, value] of psbt.xpubs) {
+      if (!result.xpubs.has(key)) {
+        result.xpubs.set(key, value);
+      }
+    }
+    for (let j = 0;j < psbt.inputs.length; j++) {
+      const srcInput = psbt.inputs[j];
+      const dstInput = result.inputs[j];
+      if (srcInput.nonWitnessUtxo && !dstInput.nonWitnessUtxo) {
+        dstInput.nonWitnessUtxo = srcInput.nonWitnessUtxo;
+      }
+      if (srcInput.witnessUtxo && !dstInput.witnessUtxo) {
+        dstInput.witnessUtxo = srcInput.witnessUtxo;
+      }
+      for (const [key, value] of srcInput.partialSigs) {
+        if (!dstInput.partialSigs.has(key)) {
+          dstInput.partialSigs.set(key, value);
+        }
+      }
+      for (const [key, value] of srcInput.bip32Derivation) {
+        if (!dstInput.bip32Derivation.has(key)) {
+          dstInput.bip32Derivation.set(key, value);
+        }
+      }
+      if (srcInput.redeemScript && !dstInput.redeemScript) {
+        dstInput.redeemScript = srcInput.redeemScript;
+      }
+      if (srcInput.witnessScript && !dstInput.witnessScript) {
+        dstInput.witnessScript = srcInput.witnessScript;
+      }
+      if (srcInput.finalScriptSig && !dstInput.finalScriptSig) {
+        dstInput.finalScriptSig = srcInput.finalScriptSig;
+      }
+      if (srcInput.finalScriptWitness && !dstInput.finalScriptWitness) {
+        dstInput.finalScriptWitness = srcInput.finalScriptWitness.map((b) => Buffer.from(b));
+      }
+      if (srcInput.tapKeySig && !dstInput.tapKeySig) {
+        dstInput.tapKeySig = srcInput.tapKeySig;
+      }
+      for (const [key, value] of srcInput.tapScriptSigs) {
+        if (!dstInput.tapScriptSigs.has(key)) {
+          dstInput.tapScriptSigs.set(key, value);
+        }
+      }
+      for (const [key, value] of srcInput.tapLeafScripts) {
+        if (!dstInput.tapLeafScripts.has(key)) {
+          dstInput.tapLeafScripts.set(key, value);
+        }
+      }
+      for (const [key, value] of srcInput.tapBip32Derivation) {
+        if (!dstInput.tapBip32Derivation.has(key)) {
+          dstInput.tapBip32Derivation.set(key, value);
+        }
+      }
+      if (srcInput.tapInternalKey && !dstInput.tapInternalKey) {
+        dstInput.tapInternalKey = srcInput.tapInternalKey;
+      }
+      if (srcInput.tapMerkleRoot && !dstInput.tapMerkleRoot) {
+        dstInput.tapMerkleRoot = srcInput.tapMerkleRoot;
+      }
+      for (const [key, value] of srcInput.ripemd160Preimages) {
+        if (!dstInput.ripemd160Preimages.has(key)) {
+          dstInput.ripemd160Preimages.set(key, value);
+        }
+      }
+      for (const [key, value] of srcInput.sha256Preimages) {
+        if (!dstInput.sha256Preimages.has(key)) {
+          dstInput.sha256Preimages.set(key, value);
+        }
+      }
+      for (const [key, value] of srcInput.hash160Preimages) {
+        if (!dstInput.hash160Preimages.has(key)) {
+          dstInput.hash160Preimages.set(key, value);
+        }
+      }
+      for (const [key, value] of srcInput.hash256Preimages) {
+        if (!dstInput.hash256Preimages.has(key)) {
+          dstInput.hash256Preimages.set(key, value);
+        }
+      }
+      for (const [key, value] of srcInput.unknown) {
+        if (!dstInput.unknown.has(key)) {
+          dstInput.unknown.set(key, value);
+        }
+      }
+    }
+    for (let j = 0;j < psbt.outputs.length; j++) {
+      const srcOutput = psbt.outputs[j];
+      const dstOutput = result.outputs[j];
+      if (srcOutput.redeemScript && !dstOutput.redeemScript) {
+        dstOutput.redeemScript = srcOutput.redeemScript;
+      }
+      if (srcOutput.witnessScript && !dstOutput.witnessScript) {
+        dstOutput.witnessScript = srcOutput.witnessScript;
+      }
+      if (srcOutput.tapInternalKey && !dstOutput.tapInternalKey) {
+        dstOutput.tapInternalKey = srcOutput.tapInternalKey;
+      }
+      if (srcOutput.tapTree && !dstOutput.tapTree) {
+        dstOutput.tapTree = srcOutput.tapTree.map((leaf) => ({
+          depth: leaf.depth,
+          leafVersion: leaf.leafVersion,
+          script: Buffer.from(leaf.script)
+        }));
+      }
+      for (const [key, value] of srcOutput.bip32Derivation) {
+        if (!dstOutput.bip32Derivation.has(key)) {
+          dstOutput.bip32Derivation.set(key, value);
+        }
+      }
+      for (const [key, value] of srcOutput.tapBip32Derivation) {
+        if (!dstOutput.tapBip32Derivation.has(key)) {
+          dstOutput.tapBip32Derivation.set(key, value);
+        }
+      }
+      for (const [key, value] of srcOutput.musig2Participants) {
+        if (!dstOutput.musig2Participants.has(key)) {
+          dstOutput.musig2Participants.set(key, value);
+        }
+      }
+      for (const [key, value] of srcOutput.unknown) {
+        if (!dstOutput.unknown.has(key)) {
+          dstOutput.unknown.set(key, value);
+        }
+      }
+    }
+    for (const [key, value] of psbt.unknown) {
+      if (!result.unknown.has(key)) {
+        result.unknown.set(key, value);
+      }
+    }
+  }
+  return result;
+}
+function finalizePSBTInput(psbt, inputIndex) {
+  if (inputIndex < 0 || inputIndex >= psbt.inputs.length) {
+    return false;
+  }
+  const input = psbt.inputs[inputIndex];
+  if (isInputFinalized(input)) {
+    return true;
+  }
+  const utxo = getInputUTXO(psbt, inputIndex);
+  if (!utxo) {
+    return false;
+  }
+  const scriptPubKey = utxo.scriptPubKey;
+  if (scriptPubKey.length === 22 && scriptPubKey[0] === 0 && scriptPubKey[1] === 20) {
+    if (input.partialSigs.size !== 1) {
+      return false;
+    }
+    const [sig] = input.partialSigs.values();
+    input.finalScriptSig = Buffer.alloc(0);
+    input.finalScriptWitness = [sig.signature, sig.pubkey];
+    clearSigningData(input);
+    return true;
+  }
+  if (scriptPubKey.length === 25 && scriptPubKey[0] === 118 && scriptPubKey[1] === 169 && scriptPubKey[2] === 20 && scriptPubKey[23] === 136 && scriptPubKey[24] === 172) {
+    if (input.partialSigs.size !== 1) {
+      return false;
+    }
+    const [sig] = input.partialSigs.values();
+    const sigPush = pushData2(sig.signature);
+    const pubkeyPush = pushData2(sig.pubkey);
+    input.finalScriptSig = Buffer.concat([sigPush, pubkeyPush]);
+    input.finalScriptWitness = undefined;
+    clearSigningData(input);
+    return true;
+  }
+  if (scriptPubKey.length === 23 && scriptPubKey[0] === 169 && scriptPubKey[1] === 20 && scriptPubKey[22] === 135 && input.redeemScript) {
+    const redeemScript = input.redeemScript;
+    if (redeemScript.length === 22 && redeemScript[0] === 0 && redeemScript[1] === 20) {
+      if (input.partialSigs.size !== 1) {
+        return false;
+      }
+      const [sig] = input.partialSigs.values();
+      input.finalScriptSig = pushData2(redeemScript);
+      input.finalScriptWitness = [sig.signature, sig.pubkey];
+      clearSigningData(input);
+      return true;
+    }
+    if (redeemScript.length === 34 && redeemScript[0] === 0 && redeemScript[1] === 32 && input.witnessScript) {
+      const witnessScript = input.witnessScript;
+      const witness = buildP2WSHWitness(witnessScript, input.partialSigs);
+      if (!witness) {
+        return false;
+      }
+      input.finalScriptSig = pushData2(redeemScript);
+      input.finalScriptWitness = witness;
+      clearSigningData(input);
+      return true;
+    }
+    {
+      const parsed = parseMultisigScript(redeemScript);
+      if (parsed) {
+        const { m, pubkeys } = parsed;
+        const orderedSigs = [];
+        for (const pk of pubkeys) {
+          const entry = input.partialSigs.get(pk.toString("hex"));
+          if (entry) {
+            orderedSigs.push(entry.signature);
+            if (orderedSigs.length === m) {
+              break;
+            }
+          }
+        }
+        if (orderedSigs.length < m) {
+          return false;
+        }
+        const parts = [Buffer.from([0])];
+        for (const sig of orderedSigs) {
+          parts.push(pushData2(sig));
+        }
+        parts.push(pushData2(redeemScript));
+        input.finalScriptSig = Buffer.concat(parts);
+        input.finalScriptWitness = undefined;
+        clearSigningData(input);
+        return true;
+      }
+    }
+  }
+  if (scriptPubKey.length === 34 && scriptPubKey[0] === 0 && scriptPubKey[1] === 32 && input.witnessScript) {
+    const witnessScript = input.witnessScript;
+    const witness = buildP2WSHWitness(witnessScript, input.partialSigs);
+    if (!witness) {
+      return false;
+    }
+    input.finalScriptSig = Buffer.alloc(0);
+    input.finalScriptWitness = witness;
+    clearSigningData(input);
+    return true;
+  }
+  return false;
+}
+function buildP2WSHWitness(witnessScript, partialSigs) {
+  const parsed = parseMultisigScript(witnessScript);
+  if (parsed) {
+    const { m, pubkeys } = parsed;
+    const orderedSigs = [];
+    for (const pk of pubkeys) {
+      const entry = partialSigs.get(pk.toString("hex"));
+      if (entry) {
+        orderedSigs.push(entry.signature);
+        if (orderedSigs.length === m) {
+          break;
+        }
+      }
+    }
+    if (orderedSigs.length < m) {
+      return;
+    }
+    return [Buffer.alloc(0), ...orderedSigs, witnessScript];
+  }
+  if (witnessScript.length === 35 && witnessScript[0] === 33 && witnessScript[34] === 172) {
+    const pubkey = witnessScript.subarray(1, 34);
+    const entry = partialSigs.get(pubkey.toString("hex"));
+    if (!entry) {
+      return;
+    }
+    return [entry.signature, witnessScript];
+  }
+  return;
+}
+function parseMultisigScript(script) {
+  if (script.length < 1 + 1 + 1)
+    return;
+  if (script[script.length - 1] !== 174)
+    return;
+  const mOp = script[0];
+  if (mOp < 81 || mOp > 96)
+    return;
+  const m = mOp - 80;
+  const nOp = script[script.length - 2];
+  if (nOp < 81 || nOp > 96)
+    return;
+  const n = nOp - 80;
+  if (m < 1 || m > n || n > 16)
+    return;
+  const pubkeys = [];
+  let i = 1;
+  const end = script.length - 2;
+  while (i < end) {
+    const pushLen = script[i];
+    if (pushLen !== 33 && pushLen !== 65)
+      return;
+    const expected = pushLen;
+    if (i + 1 + expected > end)
+      return;
+    pubkeys.push(script.subarray(i + 1, i + 1 + expected));
+    i += 1 + expected;
+  }
+  if (i !== end)
+    return;
+  if (pubkeys.length !== n)
+    return;
+  return { m, n, pubkeys };
+}
+function clearSigningData(input) {
+  input.partialSigs.clear();
+  input.sighashType = undefined;
+  input.redeemScript = undefined;
+  input.witnessScript = undefined;
+  input.bip32Derivation.clear();
+  input.ripemd160Preimages.clear();
+  input.sha256Preimages.clear();
+  input.hash160Preimages.clear();
+  input.hash256Preimages.clear();
+  input.tapKeySig = undefined;
+  input.tapScriptSigs.clear();
+  input.tapLeafScripts.clear();
+  input.tapBip32Derivation.clear();
+  input.tapInternalKey = undefined;
+  input.tapMerkleRoot = undefined;
+}
+function pushData2(data) {
+  if (data.length < 76) {
+    return Buffer.concat([Buffer.from([data.length]), data]);
+  } else if (data.length <= 255) {
+    return Buffer.concat([Buffer.from([76, data.length]), data]);
+  } else if (data.length <= 65535) {
+    const lenBuf = Buffer.alloc(2);
+    lenBuf.writeUInt16LE(data.length);
+    return Buffer.concat([Buffer.from([77]), lenBuf, data]);
+  } else {
+    const lenBuf = Buffer.alloc(4);
+    lenBuf.writeUInt32LE(data.length);
+    return Buffer.concat([Buffer.from([78]), lenBuf, data]);
+  }
+}
+function finalizePSBT(psbt) {
+  let allFinalized = true;
+  for (let i = 0;i < psbt.inputs.length; i++) {
+    if (!finalizePSBTInput(psbt, i)) {
+      allFinalized = false;
+    }
+  }
+  return allFinalized;
+}
+function extractTransaction(psbt) {
+  for (let i = 0;i < psbt.inputs.length; i++) {
+    if (!isInputFinalized(psbt.inputs[i])) {
+      throw new Error(`Input ${i} is not finalized`);
+    }
+  }
+  const inputs = psbt.tx.inputs.map((input, i) => {
+    const psbtInput = psbt.inputs[i];
+    return {
+      prevOut: input.prevOut,
+      scriptSig: psbtInput.finalScriptSig || Buffer.alloc(0),
+      sequence: input.sequence,
+      witness: psbtInput.finalScriptWitness || []
+    };
+  });
+  return {
+    version: psbt.tx.version,
+    inputs,
+    outputs: psbt.tx.outputs,
+    lockTime: psbt.tx.lockTime
+  };
+}
+function parseMultisigThreshold(script) {
+  if (script.length < 4)
+    return;
+  if (script[script.length - 1] !== 174)
+    return;
+  const mByte = script[0];
+  const nByte = script[script.length - 2];
+  if (mByte < 81 || mByte > 96)
+    return;
+  if (nByte < 81 || nByte > 96)
+    return;
+  const m = mByte - 80;
+  const n = nByte - 80;
+  if (m < 1 || m > n || n > 20)
+    return;
+  const pubkeys = [];
+  let i = 1;
+  const end = script.length - 2;
+  while (i < end) {
+    const op = script[i];
+    let pushLen;
+    if (op >= 1 && op <= 75) {
+      pushLen = op;
+      i += 1;
+    } else if (op === 76) {
+      if (i + 1 >= end)
+        return;
+      pushLen = script[i + 1];
+      i += 2;
+    } else {
+      return;
+    }
+    if (pushLen !== 33 && pushLen !== 65)
+      return;
+    if (i + pushLen > end)
+      return;
+    pubkeys.push(Buffer.from(script.subarray(i, i + pushLen)));
+    i += pushLen;
+  }
+  if (pubkeys.length !== n)
+    return;
+  return { m, n, pubkeys };
+}
+function requiredSigCount(input) {
+  if (input.witnessScript) {
+    const ms = parseMultisigThreshold(input.witnessScript);
+    return ms ? ms.m : 1;
+  }
+  if (input.redeemScript) {
+    const ms = parseMultisigThreshold(input.redeemScript);
+    if (ms)
+      return ms.m;
+    return 1;
+  }
+  if (input.tapInternalKey)
+    return 1;
+  if (input.witnessUtxo || input.nonWitnessUtxo)
+    return 1;
+  return;
+}
+function isInputReadyToFinalize(input) {
+  if (isInputFinalized(input))
+    return false;
+  if (input.tapKeySig)
+    return true;
+  const nSigs = input.partialSigs.size;
+  if (nSigs === 0)
+    return false;
+  const needed = requiredSigCount(input);
+  if (needed === undefined) {
+    return nSigs >= 1;
+  }
+  return nSigs >= needed;
+}
+function inputNextRole(input) {
+  const hasUtxo = input.witnessUtxo !== undefined || input.nonWitnessUtxo !== undefined;
+  if (isInputFinalized(input))
+    return "extractor";
+  if (!hasUtxo)
+    return "updater";
+  if (isInputReadyToFinalize(input))
+    return "finalizer";
+  return "signer";
+}
+var ROLE_RANK = {
+  creator: 0,
+  updater: 1,
+  signer: 2,
+  finalizer: 3,
+  extractor: 4
+};
+function analyzePSBTCore(psbt) {
+  const inputs = psbt.inputs.map((input) => {
+    const hasUtxo = input.witnessUtxo !== undefined || input.nonWitnessUtxo !== undefined;
+    const finalized = isInputFinalized(input);
+    const next2 = inputNextRole(input);
+    const result = {
+      has_utxo: hasUtxo,
+      is_final: finalized,
+      next: next2
+    };
+    if (next2 === "signer") {
+      const script = input.witnessScript ?? input.redeemScript;
+      if (script) {
+        const ms = parseMultisigThreshold(script);
+        if (ms) {
+          const missing = [];
+          for (const pk of ms.pubkeys) {
+            if (!input.partialSigs.has(pk.toString("hex"))) {
+              missing.push(pk.toString("hex"));
+            }
+          }
+          if (missing.length > 0) {
+            result.missing = { signatures: missing };
+          }
+        }
+      }
+    }
+    return result;
+  });
+  let next = "extractor";
+  for (const inp of inputs) {
+    if (ROLE_RANK[inp.next] < ROLE_RANK[next]) {
+      next = inp.next;
+    }
+  }
+  return { inputs, next };
+}
+function convertToPSBT(tx) {
+  const unsignedTx = {
+    version: tx.version,
+    inputs: tx.inputs.map((input) => ({
+      prevOut: input.prevOut,
+      scriptSig: Buffer.alloc(0),
+      sequence: input.sequence,
+      witness: []
+    })),
+    outputs: tx.outputs,
+    lockTime: tx.lockTime
+  };
+  const psbt = createPSBT(unsignedTx);
+  for (let i = 0;i < tx.inputs.length; i++) {
+    const input = tx.inputs[i];
+    const psbtInput = psbt.inputs[i];
+    if (input.scriptSig.length > 0) {
+      psbtInput.finalScriptSig = input.scriptSig;
+    }
+    if (input.witness.length > 0) {
+      psbtInput.finalScriptWitness = input.witness;
+    }
+  }
+  return psbt;
+}
+function getOpcodeName(op) {
+  const names = {
+    79: "-1",
+    80: "OP_RESERVED",
+    81: "1",
+    82: "2",
+    83: "3",
+    84: "4",
+    85: "5",
+    86: "6",
+    87: "7",
+    88: "8",
+    89: "9",
+    90: "10",
+    91: "11",
+    92: "12",
+    93: "13",
+    94: "14",
+    95: "15",
+    96: "16",
+    97: "OP_NOP",
+    99: "OP_IF",
+    100: "OP_NOTIF",
+    103: "OP_ELSE",
+    104: "OP_ENDIF",
+    105: "OP_VERIFY",
+    106: "OP_RETURN",
+    107: "OP_TOALTSTACK",
+    108: "OP_FROMALTSTACK",
+    109: "OP_2DROP",
+    110: "OP_2DUP",
+    111: "OP_3DUP",
+    112: "OP_2OVER",
+    113: "OP_2ROT",
+    114: "OP_2SWAP",
+    115: "OP_IFDUP",
+    116: "OP_DEPTH",
+    117: "OP_DROP",
+    118: "OP_DUP",
+    119: "OP_NIP",
+    120: "OP_OVER",
+    135: "OP_EQUAL",
+    136: "OP_EQUALVERIFY",
+    139: "OP_1ADD",
+    140: "OP_1SUB",
+    145: "OP_NOT",
+    146: "OP_0NOTEQUAL",
+    147: "OP_ADD",
+    148: "OP_SUB",
+    154: "OP_BOOLAND",
+    155: "OP_BOOLOR",
+    156: "OP_NUMEQUAL",
+    157: "OP_NUMEQUALVERIFY",
+    158: "OP_NUMNOTEQUAL",
+    159: "OP_LESSTHAN",
+    160: "OP_GREATERTHAN",
+    161: "OP_LESSTHANOREQUAL",
+    162: "OP_GREATERTHANOREQUAL",
+    163: "OP_MIN",
+    164: "OP_MAX",
+    165: "OP_WITHIN",
+    166: "OP_RIPEMD160",
+    167: "OP_SHA1",
+    168: "OP_SHA256",
+    169: "OP_HASH160",
+    170: "OP_HASH256",
+    171: "OP_CODESEPARATOR",
+    172: "OP_CHECKSIG",
+    173: "OP_CHECKSIGVERIFY",
+    174: "OP_CHECKMULTISIG",
+    175: "OP_CHECKMULTISIGVERIFY",
+    176: "OP_NOP1",
+    177: "OP_CHECKLOCKTIMEVERIFY",
+    178: "OP_CHECKSEQUENCEVERIFY",
+    179: "OP_NOP4",
+    180: "OP_NOP5",
+    181: "OP_NOP6",
+    182: "OP_NOP7",
+    183: "OP_NOP8",
+    184: "OP_NOP9",
+    185: "OP_NOP10",
+    186: "OP_CHECKSIGADD"
+  };
+  return names[op] ?? "OP_UNKNOWN";
+}
+var SIGHASH_TYPE_NAMES = {
+  1: "ALL",
+  2: "NONE",
+  3: "SINGLE",
+  129: "ALL|ANYONECANPAY",
+  130: "NONE|ANYONECANPAY",
+  131: "SINGLE|ANYONECANPAY"
+};
+function disassembleScriptSigHashDecode(script) {
+  if (script.length === 0)
+    return "";
+  const parts = [];
+  let i = 0;
+  while (i < script.length) {
+    const op = script[i];
+    if (op === 0) {
+      parts.push("0");
+      i++;
+    } else if (op >= 1 && op <= 75) {
+      const len = op;
+      if (i + 1 + len > script.length) {
+        parts.push("[error]");
+        break;
+      }
+      const data = Buffer.from(script.subarray(i + 1, i + 1 + len));
+      if (len <= 4) {
+        parts.push(scriptNumToAsmStr(data));
+      } else {
+        parts.push(decodeWithSigHash(data));
+      }
+      i += 1 + len;
+    } else if (op === 76) {
+      if (i + 1 >= script.length) {
+        parts.push("[error]");
+        break;
+      }
+      const len = script[i + 1];
+      if (i + 2 + len > script.length) {
+        parts.push("[error]");
+        break;
+      }
+      const data = Buffer.from(script.subarray(i + 2, i + 2 + len));
+      parts.push(len <= 4 ? scriptNumToAsmStr(data) : decodeWithSigHash(data));
+      i += 2 + len;
+    } else if (op === 77) {
+      if (i + 2 >= script.length) {
+        parts.push("[error]");
+        break;
+      }
+      const len = script.readUInt16LE(i + 1);
+      if (i + 3 + len > script.length) {
+        parts.push("[error]");
+        break;
+      }
+      const data = Buffer.from(script.subarray(i + 3, i + 3 + len));
+      parts.push(len <= 4 ? scriptNumToAsmStr(data) : decodeWithSigHash(data));
+      i += 3 + len;
+    } else if (op === 78) {
+      if (i + 4 >= script.length) {
+        parts.push("[error]");
+        break;
+      }
+      const len = script.readUInt32LE(i + 1);
+      if (i + 5 + len > script.length) {
+        parts.push("[error]");
+        break;
+      }
+      const data = Buffer.from(script.subarray(i + 5, i + 5 + len));
+      parts.push(len <= 4 ? scriptNumToAsmStr(data) : decodeWithSigHash(data));
+      i += 5 + len;
+    } else {
+      parts.push(getOpcodeName(op));
+      i++;
+    }
+  }
+  return parts.join(" ");
+}
+function decodeWithSigHash(data) {
+  if (data.length >= 2 && data[0] === 48) {
+    const lastByte = data[data.length - 1];
+    const sigHashName = SIGHASH_TYPE_NAMES[lastByte];
+    if (sigHashName !== undefined) {
+      return data.subarray(0, data.length - 1).toString("hex") + "[" + sigHashName + "]";
+    }
+  }
+  return data.toString("hex");
+}
+function buildTxToUnivJSON(tx) {
+  const txid = Buffer.from(getTxId(tx)).reverse().toString("hex");
+  const hash = Buffer.from(getWTxId(tx)).reverse().toString("hex");
+  const size = serializeTx(tx, hasWitness(tx)).length;
+  const weight = getTxWeight(tx);
+  const vsize = getTxVSize(tx);
+  const vin = tx.inputs.map((input) => {
+    const entry = {
+      txid: Buffer.from(input.prevOut.txid).reverse().toString("hex"),
+      vout: input.prevOut.vout,
+      scriptSig: {
+        asm: disassembleScript(input.scriptSig),
+        hex: input.scriptSig.toString("hex")
+      },
+      sequence: input.sequence
+    };
+    if (input.witness && input.witness.length > 0) {
+      entry.txinwitness = input.witness.map((w) => Buffer.from(w).toString("hex"));
+    }
+    return entry;
+  });
+  const vout = tx.outputs.map((output, n) => ({
+    value: formatBtcAmount(output.value),
+    n,
+    scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey)
+  }));
+  return {
+    txid,
+    hash,
+    version: tx.version,
+    size,
+    vsize,
+    weight,
+    locktime: tx.lockTime,
+    vin,
+    vout
+  };
+}
+function scriptNumToAsmStr(vch) {
+  if (vch.length === 0)
+    return "0";
+  let result = 0;
+  for (let i = 0;i < vch.length; i++) {
+    result |= vch[i] << 8 * i;
+  }
+  const last = vch[vch.length - 1];
+  if (last & 128) {
+    const signBitMask = 1 << 8 * (vch.length - 1) + 7 - 8 * (vch.length - 1);
+    result &= ~(128 << 8 * (vch.length - 1));
+    result = -result;
+  }
+  return result.toString();
+}
+function disassembleScript(script) {
+  if (script.length === 0)
+    return "";
+  const parts = [];
+  let i = 0;
+  while (i < script.length) {
+    const op = script[i];
+    if (op === 0) {
+      parts.push("0");
+      i++;
+    } else if (op >= 1 && op <= 75) {
+      const len = op;
+      if (i + 1 + len > script.length) {
+        parts.push("[error]");
+        break;
+      }
+      const data = script.subarray(i + 1, i + 1 + len);
+      if (len <= 4) {
+        parts.push(scriptNumToAsmStr(data));
+      } else {
+        parts.push(data.toString("hex"));
+      }
+      i += 1 + len;
+    } else if (op === 76) {
+      if (i + 1 >= script.length) {
+        parts.push("[error]");
+        break;
+      }
+      const len = script[i + 1];
+      if (i + 2 + len > script.length) {
+        parts.push("[error]");
+        break;
+      }
+      const data = script.subarray(i + 2, i + 2 + len);
+      parts.push(len <= 4 ? scriptNumToAsmStr(data) : data.toString("hex"));
+      i += 2 + len;
+    } else if (op === 77) {
+      if (i + 2 >= script.length) {
+        parts.push("[error]");
+        break;
+      }
+      const len = script.readUInt16LE(i + 1);
+      if (i + 3 + len > script.length) {
+        parts.push("[error]");
+        break;
+      }
+      const data = script.subarray(i + 3, i + 3 + len);
+      parts.push(len <= 4 ? scriptNumToAsmStr(data) : data.toString("hex"));
+      i += 3 + len;
+    } else if (op === 78) {
+      if (i + 4 >= script.length) {
+        parts.push("[error]");
+        break;
+      }
+      const len = script.readUInt32LE(i + 1);
+      if (i + 5 + len > script.length) {
+        parts.push("[error]");
+        break;
+      }
+      const data = script.subarray(i + 5, i + 5 + len);
+      parts.push(len <= 4 ? scriptNumToAsmStr(data) : data.toString("hex"));
+      i += 5 + len;
+    } else {
+      parts.push(getOpcodeName(op));
+      i++;
+    }
+  }
+  return parts.join(" ");
+}
+function getScriptType2(script) {
+  if (script.length === 22 && script[0] === 0 && script[1] === 20) {
+    return "witness_v0_keyhash";
+  }
+  if (script.length === 34 && script[0] === 0 && script[1] === 32) {
+    return "witness_v0_scripthash";
+  }
+  if (script.length === 34 && script[0] === 81 && script[1] === 32) {
+    return "witness_v1_taproot";
+  }
+  if (script.length === 25 && script[0] === 118 && script[1] === 169 && script[2] === 20 && script[23] === 136 && script[24] === 172) {
+    return "pubkeyhash";
+  }
+  if (script.length === 23 && script[0] === 169 && script[1] === 20 && script[22] === 135) {
+    return "scripthash";
+  }
+  if ((script.length === 35 || script.length === 67) && script[script.length - 1] === 172) {
+    return "pubkey";
+  }
+  if (script.length >= 1 && script[0] === 106) {
+    return "nulldata";
+  }
+  if (parseP2MSScript(script) !== null) {
+    return "multisig";
+  }
+  return "nonstandard";
+}
+var BTC_AMOUNT_SENTINEL = "__BTC__:";
+function formatBtcAmount(sats) {
+  const neg = sats < 0n;
+  const abs = neg ? -sats : sats;
+  const whole = abs / 100000000n;
+  const frac = abs % 100000000n;
+  const fracStr = frac.toString().padStart(8, "0");
+  const raw = (neg ? "-" : "") + whole.toString() + "." + fracStr;
+  return { toJSON() {
+    return BTC_AMOUNT_SENTINEL + raw;
+  } };
+}
+function spkToAddress(script) {
+  const type = getScriptType2(script);
+  if (type === "pubkeyhash" && script.length === 25) {
+    return base58CheckEncode(0, script.subarray(3, 23));
+  }
+  if (type === "scripthash" && script.length === 23) {
+    return base58CheckEncode(5, script.subarray(2, 22));
+  }
+  if (type === "witness_v0_keyhash" && script.length === 22) {
+    return bech32Encode("bc", 0, script.subarray(2, 22));
+  }
+  if (type === "witness_v0_scripthash" && script.length === 34) {
+    return bech32Encode("bc", 0, script.subarray(2, 34));
+  }
+  if (type === "witness_v1_taproot" && script.length === 34) {
+    return bech32Encode("bc", 1, script.subarray(2, 34));
+  }
+  return null;
+}
+function parseP2MSScript(script) {
+  if (script.length < 3)
+    return null;
+  if (script[script.length - 1] !== 174)
+    return null;
+  const firstOp = script[0];
+  if (firstOp < 81 || firstOp > 96)
+    return null;
+  const n = firstOp - 80;
+  const mOp = script[script.length - 2];
+  if (mOp < 81 || mOp > 96)
+    return null;
+  const m = mOp - 80;
+  if (n > m || m > 20)
+    return null;
+  const keys = [];
+  let pos = 1;
+  while (pos < script.length - 2) {
+    const pushLen = script[pos];
+    if (pushLen !== 33 && pushLen !== 65)
+      return null;
+    const pkLen = pushLen;
+    if (pos + 1 + pkLen > script.length - 2)
+      return null;
+    keys.push(script.subarray(pos + 1, pos + 1 + pkLen));
+    pos += 1 + pkLen;
+  }
+  if (pos !== script.length - 2)
+    return null;
+  if (keys.length !== m)
+    return null;
+  return { n, keys };
+}
+function inferDescriptor(script) {
+  if (script.length === 34 && script[0] === 81 && script[1] === 32) {
+    const xonly = script.subarray(2, 34).toString("hex");
+    const inner2 = `rawtr(${xonly})`;
+    try {
+      return addChecksum(inner2);
+    } catch {
+      return inner2;
+    }
+  }
+  const p2ms = parseP2MSScript(script);
+  if (p2ms !== null) {
+    const pksStr = p2ms.keys.map((k) => k.toString("hex")).join(",");
+    const inner2 = `multi(${p2ms.n},${pksStr})`;
+    try {
+      return addChecksum(inner2);
+    } catch {
+      return inner2;
+    }
+  }
+  const addr = spkToAddress(script);
+  let inner;
+  if (addr !== null) {
+    inner = `addr(${addr})`;
+  } else {
+    inner = `raw(${script.toString("hex")})`;
+  }
+  try {
+    return addChecksum(inner);
+  } catch {
+    return inner;
+  }
+}
+function buildScriptPubKeyObj(script) {
+  const type = getScriptType2(script);
+  const result = {
+    asm: disassembleScript(script),
+    desc: inferDescriptor(script),
+    hex: script.toString("hex"),
+    type
+  };
+  if (type !== "pubkey") {
+    const addr = spkToAddress(script);
+    if (addr !== null) {
+      result.address = addr;
+    }
+  }
+  return result;
+}
+var MAX_OPCODE = 185;
+var MAX_SCRIPT_ELEMENT_SIZE = 520;
+var MAX_SCRIPT_SIZE2 = 1e4;
+function isPushOnly2(script, offset) {
+  let i = offset;
+  while (i < script.length) {
+    const op = script[i];
+    if (op > 96)
+      return false;
+    if (op === 0) {
+      i++;
+      continue;
+    }
+    if (op >= 1 && op <= 75) {
+      if (i + 1 + op > script.length)
+        return false;
+      i += 1 + op;
+    } else if (op === 76) {
+      if (i + 1 >= script.length)
+        return false;
+      const len = script[i + 1];
+      if (i + 2 + len > script.length)
+        return false;
+      i += 2 + len;
+    } else if (op === 77) {
+      if (i + 2 >= script.length)
+        return false;
+      const len = script.readUInt16LE(i + 1);
+      if (i + 3 + len > script.length)
+        return false;
+      i += 3 + len;
+    } else if (op === 78) {
+      if (i + 4 >= script.length)
+        return false;
+      const len = script.readUInt32LE(i + 1);
+      if (i + 5 + len > script.length)
+        return false;
+      i += 5 + len;
+    } else if (op >= 79 && op <= 96) {
+      i++;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+function solveScript(script) {
+  if (script.length === 22 && script[0] === 0 && script[1] === 20) {
+    return { type: "witness_v0_keyhash", solutionsData: [script.subarray(2, 22)] };
+  }
+  if (script.length === 34 && script[0] === 0 && script[1] === 32) {
+    return { type: "witness_v0_scripthash", solutionsData: [script.subarray(2, 34)] };
+  }
+  if (script.length === 34 && script[0] === 81 && script[1] === 32) {
+    return { type: "witness_v1_taproot", solutionsData: [script.subarray(2, 34)] };
+  }
+  if (script.length === 25 && script[0] === 118 && script[1] === 169 && script[2] === 20 && script[23] === 136 && script[24] === 172) {
+    return { type: "pubkeyhash", solutionsData: [script.subarray(3, 23)] };
+  }
+  if (script.length === 23 && script[0] === 169 && script[1] === 20 && script[22] === 135) {
+    return { type: "scripthash", solutionsData: [script.subarray(2, 22)] };
+  }
+  if (script.length === 35 && script[0] === 33 && script[34] === 172 || script.length === 67 && script[0] === 65 && script[66] === 172) {
+    return { type: "pubkey", solutionsData: [script.subarray(1, script.length - 1)] };
+  }
+  if (script.length >= 1 && script[0] === 106 && isPushOnly2(script, 1)) {
+    return { type: "nulldata", solutionsData: [] };
+  }
+  return { type: "nonstandard", solutionsData: [] };
+}
+function hasValidOps(script) {
+  let i = 0;
+  while (i < script.length) {
+    const op = script[i];
+    if (op >= 1 && op <= 75) {
+      if (i + 1 + op > script.length)
+        return false;
+      if (op > MAX_SCRIPT_ELEMENT_SIZE)
+        return false;
+      i += 1 + op;
+    } else if (op === 76) {
+      if (i + 1 >= script.length)
+        return false;
+      const len = script[i + 1];
+      if (len > MAX_SCRIPT_ELEMENT_SIZE)
+        return false;
+      if (i + 2 + len > script.length)
+        return false;
+      i += 2 + len;
+    } else if (op === 77) {
+      if (i + 2 >= script.length)
+        return false;
+      const len = script.readUInt16LE(i + 1);
+      if (len > MAX_SCRIPT_ELEMENT_SIZE)
+        return false;
+      if (i + 3 + len > script.length)
+        return false;
+      i += 3 + len;
+    } else if (op === 78) {
+      if (i + 4 >= script.length)
+        return false;
+      const len = script.readUInt32LE(i + 1);
+      if (len > MAX_SCRIPT_ELEMENT_SIZE)
+        return false;
+      if (i + 5 + len > script.length)
+        return false;
+      i += 5 + len;
+    } else {
+      if (op > MAX_OPCODE)
+        return false;
+      i++;
+    }
+  }
+  return true;
+}
+function isOpSuccess2(op) {
+  return op === 80 || op === 98 || op >= 126 && op <= 129 || op >= 131 && op <= 134 || op >= 137 && op <= 138 || op >= 141 && op <= 142 || op >= 149 && op <= 153 || op >= 187 && op <= 254;
+}
+function hasChecksigAddOrOpSuccess(script) {
+  let i = 0;
+  while (i < script.length) {
+    const op = script[i];
+    if (op >= 1 && op <= 75) {
+      i += 1 + op;
+    } else if (op === 76) {
+      if (i + 1 >= script.length)
+        break;
+      i += 2 + script[i + 1];
+    } else if (op === 77) {
+      if (i + 2 >= script.length)
+        break;
+      i += 3 + script.readUInt16LE(i + 1);
+    } else if (op === 78) {
+      if (i + 4 >= script.length)
+        break;
+      i += 5 + script.readUInt32LE(i + 1);
+    } else {
+      if (op === 186 || isOpSuccess2(op))
+        return true;
+      i++;
+    }
+  }
+  return false;
+}
+function p2shAddress(script) {
+  return base58CheckEncode(5, hash160(script));
+}
+function decodeScriptRPC(script) {
+  const { type, solutionsData } = solveScript(script);
+  const base = buildScriptPubKeyObj(script);
+  const result = {
+    asm: base.asm,
+    desc: base.desc,
+    type
+  };
+  if (base.address !== undefined) {
+    result.address = base.address;
+  }
+  const canWrapTypes = new Set([
+    "multisig",
+    "nonstandard",
+    "pubkey",
+    "pubkeyhash",
+    "witness_v0_keyhash",
+    "witness_v0_scripthash"
+  ]);
+  const isUnspendable = script.length > 0 && script[0] === 106 || script.length > MAX_SCRIPT_SIZE2;
+  const canWrap = canWrapTypes.has(type) && hasValidOps(script) && !isUnspendable && !hasChecksigAddOrOpSuccess(script);
+  if (canWrap) {
+    result.p2sh = p2shAddress(script);
+    let canWrapP2WSH = false;
+    if (type === "pubkeyhash" || type === "nonstandard" || type === "multisig") {
+      canWrapP2WSH = true;
+    } else if (type === "pubkey") {
+      const pubkey = solutionsData[0];
+      canWrapP2WSH = pubkey !== undefined && pubkey.length === 33;
+    }
+    if (canWrapP2WSH) {
+      let segwitScr;
+      if (type === "pubkey") {
+        const pubkeyHash = hash160(solutionsData[0]);
+        segwitScr = Buffer.concat([Buffer.from([0, 20]), pubkeyHash]);
+      } else if (type === "pubkeyhash") {
+        segwitScr = Buffer.concat([Buffer.from([0, 20]), solutionsData[0]]);
+      } else {
+        const wsh = sha256Hash(script);
+        segwitScr = Buffer.concat([Buffer.from([0, 32]), wsh]);
+      }
+      const inner = buildScriptPubKeyObj(segwitScr);
+      const segwitObj = {
+        asm: inner.asm,
+        desc: inner.desc,
+        hex: segwitScr.toString("hex"),
+        type: inner.type
+      };
+      if (inner.address !== undefined) {
+        segwitObj.address = inner.address;
+      }
+      segwitObj["p2sh-segwit"] = p2shAddress(segwitScr);
+      result.segwit = segwitObj;
+    }
+  }
+  return result;
+}
+function formatDerivationPath(origin) {
+  const parts = origin.path.map((index) => {
+    if (index >= 2147483648) {
+      return `${index - 2147483648}h`;
+    }
+    return index.toString();
+  });
+  if (parts.length === 0) {
+    return "m";
+  }
+  return "m/" + parts.join("/");
+}
+function decodePSBT(psbt) {
+  const tx = psbt.tx;
+  const txid = Buffer.from(getTxId(tx)).reverse().toString("hex");
+  const hash = Buffer.from(getWTxId(tx)).reverse().toString("hex");
+  const txSize = serializeTx(tx, hasWitness(tx)).length;
+  const txWeight = getTxWeight(tx);
+  const txVsize = getTxVSize(tx);
+  const vin = tx.inputs.map((input) => ({
+    txid: Buffer.from(input.prevOut.txid).reverse().toString("hex"),
+    vout: input.prevOut.vout,
+    scriptSig: {
+      asm: disassembleScript(input.scriptSig),
+      hex: input.scriptSig.toString("hex")
+    },
+    sequence: input.sequence
+  }));
+  const vout = tx.outputs.map((output, n) => ({
+    value: formatBtcAmount(output.value),
+    n,
+    scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey)
+  }));
+  const unknown = {};
+  for (const [key, value] of psbt.unknown) {
+    unknown[key] = value.toString("hex");
+  }
+  let totalIn = 0n;
+  let haveAllUtxos = true;
+  const inputs = psbt.inputs.map((input, i) => {
+    const result2 = {};
+    let haveUtxo = false;
+    let utxoValue;
+    if (input.witnessUtxo) {
+      result2.witness_utxo = {
+        amount: formatBtcAmount(input.witnessUtxo.value),
+        scriptPubKey: buildScriptPubKeyObj(input.witnessUtxo.scriptPubKey)
+      };
+      utxoValue = input.witnessUtxo.value;
+      haveUtxo = true;
+    }
+    if (input.nonWitnessUtxo) {
+      result2.non_witness_utxo = buildTxToUnivJSON(input.nonWitnessUtxo);
+      const vout2 = psbt.tx.inputs[i]?.prevOut.vout ?? 0;
+      if (vout2 < input.nonWitnessUtxo.outputs.length) {
+        utxoValue = input.nonWitnessUtxo.outputs[vout2].value;
+      } else {
+        haveAllUtxos = false;
+        utxoValue = undefined;
+      }
+      haveUtxo = true;
+    }
+    if (haveUtxo && utxoValue !== undefined) {
+      totalIn += utxoValue;
+    } else if (!haveUtxo) {
+      haveAllUtxos = false;
+    }
+    if (input.partialSigs.size > 0) {
+      result2.partial_signatures = {};
+      for (const [pubkeyHex, { signature }] of input.partialSigs) {
+        result2.partial_signatures[pubkeyHex] = signature.toString("hex");
+      }
+    }
+    if (input.sighashType !== undefined) {
+      result2.sighash = SIGHASH_TYPE_NAMES[input.sighashType] ?? "";
+    }
+    if (input.redeemScript) {
+      result2.redeem_script = {
+        asm: disassembleScript(input.redeemScript),
+        hex: input.redeemScript.toString("hex"),
+        type: getScriptType2(input.redeemScript)
+      };
+    }
+    if (input.witnessScript) {
+      result2.witness_script = {
+        asm: disassembleScript(input.witnessScript),
+        hex: input.witnessScript.toString("hex"),
+        type: getScriptType2(input.witnessScript)
+      };
+    }
+    if (input.bip32Derivation.size > 0) {
+      result2.bip32_derivs = [];
+      for (const { pubkey, origin } of input.bip32Derivation.values()) {
+        result2.bip32_derivs.push({
+          pubkey: pubkey.toString("hex"),
+          master_fingerprint: origin.fingerprint.toString("hex"),
+          path: formatDerivationPath(origin)
+        });
+      }
+    }
+    if (input.tapKeySig) {
+      result2.taproot_key_path_sig = input.tapKeySig.toString("hex");
+    }
+    if (input.tapScriptSigs.size > 0) {
+      result2.taproot_script_path_sigs = [];
+      for (const { xonly, leafHash, sig } of input.tapScriptSigs.values()) {
+        result2.taproot_script_path_sigs.push({
+          pubkey: xonly.toString("hex"),
+          leaf_hash: leafHash.toString("hex"),
+          sig: sig.toString("hex")
+        });
+      }
+    }
+    if (input.tapLeafScripts.size > 0) {
+      result2.taproot_scripts = [];
+      for (const { script, leafVer, controlBlocks } of input.tapLeafScripts.values()) {
+        result2.taproot_scripts.push({
+          script: script.toString("hex"),
+          leaf_ver: leafVer,
+          control_blocks: controlBlocks.map((cb) => cb.toString("hex"))
+        });
+      }
+    }
+    if (input.tapBip32Derivation.size > 0) {
+      result2.taproot_bip32_derivs = [];
+      for (const { xonly, leafHashes, origin } of input.tapBip32Derivation.values()) {
+        result2.taproot_bip32_derivs.push({
+          pubkey: xonly.toString("hex"),
+          master_fingerprint: origin.fingerprint.toString("hex"),
+          path: formatDerivationPath(origin),
+          leaf_hashes: leafHashes.map((h) => h.toString("hex"))
+        });
+      }
+    }
+    if (input.tapInternalKey) {
+      result2.taproot_internal_key = input.tapInternalKey.toString("hex");
+    }
+    if (input.tapMerkleRoot) {
+      result2.taproot_merkle_root = input.tapMerkleRoot.toString("hex");
+    }
+    if (input.finalScriptSig) {
+      result2.final_scriptSig = {
+        asm: disassembleScriptSigHashDecode(input.finalScriptSig),
+        hex: input.finalScriptSig.toString("hex")
+      };
+    }
+    if (input.finalScriptWitness) {
+      result2.final_scriptwitness = input.finalScriptWitness.map((item) => Buffer.from(item).toString("hex"));
+    }
+    if (input.unknown.size > 0) {
+      result2.unknown = {};
+      for (const [key, value] of input.unknown) {
+        result2.unknown[key] = value.toString("hex");
+      }
+    }
+    return result2;
+  });
+  const outputs = psbt.outputs.map((output) => {
+    const result2 = {};
+    if (output.redeemScript) {
+      result2.redeem_script = {
+        asm: disassembleScript(output.redeemScript),
+        hex: output.redeemScript.toString("hex"),
+        type: getScriptType2(output.redeemScript)
+      };
+    }
+    if (output.witnessScript) {
+      result2.witness_script = {
+        asm: disassembleScript(output.witnessScript),
+        hex: output.witnessScript.toString("hex"),
+        type: getScriptType2(output.witnessScript)
+      };
+    }
+    if (output.bip32Derivation.size > 0) {
+      result2.bip32_derivs = [];
+      for (const { pubkey, origin } of output.bip32Derivation.values()) {
+        result2.bip32_derivs.push({
+          pubkey: pubkey.toString("hex"),
+          master_fingerprint: origin.fingerprint.toString("hex"),
+          path: formatDerivationPath(origin)
+        });
+      }
+    }
+    if (output.tapInternalKey) {
+      result2.taproot_internal_key = output.tapInternalKey.toString("hex");
+    }
+    if (output.tapTree && output.tapTree.length > 0) {
+      result2.taproot_tree = output.tapTree.map(({ depth, leafVersion, script }) => ({
+        depth,
+        leaf_ver: leafVersion,
+        script: script.toString("hex")
+      }));
+    }
+    if (output.tapBip32Derivation.size > 0) {
+      result2.taproot_bip32_derivs = [];
+      for (const { xonly, leafHashes, origin } of output.tapBip32Derivation.values()) {
+        result2.taproot_bip32_derivs.push({
+          pubkey: xonly.toString("hex"),
+          master_fingerprint: origin.fingerprint.toString("hex"),
+          path: formatDerivationPath(origin),
+          leaf_hashes: leafHashes.map((h) => h.toString("hex"))
+        });
+      }
+    }
+    if (output.musig2Participants.size > 0) {
+      result2.musig2_participant_pubkeys = [];
+      for (const { aggPubkey, participantPubkeys } of output.musig2Participants.values()) {
+        result2.musig2_participant_pubkeys.push({
+          aggregate_pubkey: aggPubkey.toString("hex"),
+          participant_pubkeys: participantPubkeys.map((p) => p.toString("hex"))
+        });
+      }
+    }
+    if (output.unknown.size > 0) {
+      result2.unknown = {};
+      for (const [key, value] of output.unknown) {
+        result2.unknown[key] = value.toString("hex");
+      }
+    }
+    return result2;
+  });
+  const totalOut = tx.outputs.reduce((sum, o) => sum + o.value, 0n);
+  const result = {
+    tx: {
+      txid,
+      hash,
+      version: tx.version,
+      size: txSize,
+      vsize: txVsize,
+      weight: txWeight,
+      locktime: tx.lockTime,
+      vin,
+      vout
+    },
+    global_xpubs: [],
+    psbt_version: 0,
+    proprietary: [],
+    unknown,
+    inputs,
+    outputs
+  };
+  if (haveAllUtxos && totalIn >= totalOut) {
+    result.fee = formatBtcAmount(totalIn - totalOut);
+  }
+  return result;
+}
+
 // src/crypto/signmessage.ts
 init_secp256k1();
 init_primitives();
@@ -25570,6 +29104,126 @@ var RPCErrorCodes = {
 };
 var MAX_BATCH_SIZE = 1000;
 var DEFAULT_MAX_FEE_RATE = 0.1;
+function bigIntJsonReplacer(_key, value) {
+  if (typeof value === "bigint") {
+    if (value <= BigInt(Number.MAX_SAFE_INTEGER) && value >= BigInt(Number.MIN_SAFE_INTEGER)) {
+      return Number(value);
+    }
+    return value.toString();
+  }
+  return value;
+}
+function unquoteBtcAmounts(json) {
+  return json.replace(/"__BTC__:(-?\d+\.\d{8})"/g, "$1");
+}
+function w47bTreeWidth(nTx, height) {
+  return nTx + (1 << height) - 1 >> height;
+}
+function w47bCalcHash(height, pos, txids) {
+  if (height === 0)
+    return txids[pos];
+  const nTx = txids.length;
+  const left = w47bCalcHash(height - 1, pos * 2, txids);
+  const right = pos * 2 + 1 < w47bTreeWidth(nTx, height - 1) ? w47bCalcHash(height - 1, pos * 2 + 1, txids) : left;
+  return hash256(Buffer.concat([left, right]));
+}
+function w47bTraverseAndBuild(nTx, txids, matchFlags) {
+  if (nTx === 0)
+    return { hashes: [], bits: [] };
+  let nHeight = 0;
+  while (w47bTreeWidth(nTx, nHeight) > 1)
+    nHeight++;
+  const hashes = [];
+  const bits = [];
+  function traverse(height, pos) {
+    const lo = pos << height;
+    const hi = Math.min(pos + 1 << height, nTx);
+    let parentMatch = false;
+    for (let p = lo;p < hi; p++) {
+      if (matchFlags[p]) {
+        parentMatch = true;
+        break;
+      }
+    }
+    bits.push(parentMatch);
+    if (height === 0 || !parentMatch) {
+      hashes.push(w47bCalcHash(height, pos, txids));
+    } else {
+      traverse(height - 1, pos * 2);
+      if (pos * 2 + 1 < w47bTreeWidth(nTx, height - 1)) {
+        traverse(height - 1, pos * 2 + 1);
+      }
+    }
+  }
+  traverse(nHeight, 0);
+  return { hashes, bits };
+}
+function w47bBitsToBytes(bits) {
+  const nBytes = Math.ceil(bits.length / 8);
+  const buf = Buffer.alloc(nBytes, 0);
+  for (let i = 0;i < bits.length; i++) {
+    if (bits[i])
+      buf[i >> 3] |= 1 << (i & 7);
+  }
+  return buf;
+}
+function w47bBytesToBits(flagBytes) {
+  const len = flagBytes.length * 8;
+  return Array.from({ length: len }, (_, i) => (flagBytes[i >> 3] >> (i & 7) & 1) === 1);
+}
+function w47bEncodeVarInt(v) {
+  if (v < 253) {
+    const b = Buffer.alloc(1);
+    b[0] = v;
+    return b;
+  } else if (v <= 65535) {
+    const b = Buffer.alloc(3);
+    b[0] = 253;
+    b.writeUInt16LE(v, 1);
+    return b;
+  } else {
+    const b = Buffer.alloc(5);
+    b[0] = 254;
+    b.writeUInt32LE(v, 1);
+    return b;
+  }
+}
+function w47bReadVarInt(buf, pos) {
+  const b = buf[pos];
+  if (b < 253)
+    return [b, pos + 1];
+  if (b === 253)
+    return [buf.readUInt16LE(pos + 1), pos + 3];
+  if (b === 254)
+    return [buf.readUInt32LE(pos + 1), pos + 5];
+  return [buf.readUInt32LE(pos + 1), pos + 9];
+}
+function w47bTraverseAndExtract(nTx, hashes, flagBytes) {
+  if (nTx === 0)
+    return [];
+  let nHeight = 0;
+  while (w47bTreeWidth(nTx, nHeight) > 1)
+    nHeight++;
+  const bits = w47bBytesToBits(flagBytes);
+  let bitPos = 0;
+  let hashPos = 0;
+  const matched = [];
+  function extract(height, pos) {
+    const flag = bits[bitPos++] ?? false;
+    if (height === 0 || !flag) {
+      const h = hashes[hashPos++];
+      if (height === 0 && flag) {
+        matched.push(Buffer.from(h).reverse().toString("hex"));
+      }
+      return h;
+    }
+    const left = extract(height - 1, pos * 2);
+    const right = pos * 2 + 1 < w47bTreeWidth(nTx, height - 1) ? extract(height - 1, pos * 2 + 1) : left;
+    return hash256(Buffer.concat([left, right]));
+  }
+  extract(nHeight, 0);
+  return matched;
+}
 
 class RPCServer {
   server = null;
@@ -25594,6 +29248,7 @@ class RPCServer {
   cookiePath = null;
   latchedIsIBD = true;
   blockSubmissionPaused = false;
+  startedAt = Math.floor(Date.now() / 1000);
   constructor(config, deps) {
     this.config = {
       port: config.port ?? 8332,
@@ -25722,7 +29377,7 @@ class RPCServer {
         });
       }
       const responses = await Promise.all(body.map((request) => this.processRequest(request)));
-      return new Response(JSON.stringify(responses), {
+      return new Response(unquoteBtcAmounts(JSON.stringify(responses, bigIntJsonReplacer)), {
         status: 200,
         headers: { "Content-Type": "application/json", Connection: "close" }
       });
@@ -25738,7 +29393,7 @@ class RPCServer {
       });
     }
     const response = await this.processRequest(body);
-    return new Response(JSON.stringify(response), {
+    return new Response(unquoteBtcAmounts(JSON.stringify(response, bigIntJsonReplacer)), {
       status: 200,
       headers: { "Content-Type": "application/json", Connection: "close" }
     });
@@ -25873,7 +29528,9 @@ class RPCServer {
     this.registerMethod("invalidateblock", (params) => this.invalidateBlockRPC(params));
     this.registerMethod("reconsiderblock", (params) => this.reconsiderBlockRPC(params));
     this.registerMethod("preciousblock", (params) => this.preciousBlockRPC(params));
+    this.registerMethod("gettxout", (params) => this.getTxOut(params));
     this.registerMethod("stop", () => this.stopNode());
+    this.registerMethod("uptime", () => this.getUptime());
     if (this.walletManager) {
       this.registerMethod("createwallet", (params) => this.createWallet(params));
       this.registerMethod("loadwallet", (params) => this.loadWallet(params));
@@ -25897,18 +29554,25 @@ class RPCServer {
       this.registerMethod("signrawtransactionwithwallet", (params) => this.signRawTransactionWithWallet(params));
       this.registerMethod("importdescriptors", (params) => this.importDescriptors(params));
       this.registerMethod("signmessage", (params) => this.signMessage(params));
+      this.registerMethod("walletcreatefundedpsbt", (params) => this.walletCreateFundedPSBT(params));
     }
     this.registerMethod("getdescriptorinfo", (params) => this.getDescriptorInfo(params));
     this.registerMethod("deriveaddresses", (params) => this.deriveAddresses(params));
-    this.registerMethod("createpsbt", (params) => this.createPSBT(params));
-    this.registerMethod("decodepsbt", (params) => this.decodePSBT(params));
-    this.registerMethod("combinepsbt", (params) => this.combinePSBTs(params));
-    this.registerMethod("finalizepsbt", (params) => this.finalizePSBT(params));
+    this.registerMethod("createpsbt", (params) => this.createPSBTRpc(params));
+    this.registerMethod("decodepsbt", (params) => this.decodePSBTRpc(params));
+    this.registerMethod("combinepsbt", (params) => this.combinePSBTRpc(params));
+    this.registerMethod("finalizepsbt", (params) => this.finalizePSBTRpc(params));
+    this.registerMethod("analyzepsbt", (params) => this.analyzePSBTRpc(params));
     this.registerMethod("help", (params) => this.help(params));
     this.registerMethod("loadtxoutset", (params) => this.loadTxoutset(params));
     this.registerMethod("dumptxoutset", (params) => this.dumpTxoutset(params));
     this.registerMethod("getutxosetsnapshot", () => this.getUtxoSetSnapshot());
     this.registerMethod("getzmqnotifications", () => this.getZMQNotifications());
+    this.registerMethod("gettxoutsetinfo", (params) => this.getTxOutSetInfo(params));
+    this.registerMethod("getnetworkhashps", (params) => this.getNetworkHashPS(params));
+    this.registerMethod("gettxoutproof", (params) => this.getTxOutProof(params));
+    this.registerMethod("verifytxoutproof", (params) => this.verifyTxOutProof(params));
+    this.registerMethod("getrpcinfo", () => this.getRpcInfo());
   }
   async getBlockchainInfo() {
     const bestBlock = this.chainState.getBestBlock();
@@ -25940,16 +29604,22 @@ class RPCServer {
       automatic_pruning: false
     };
     const initialblockdownload = this.computeInitialBlockDownload(bestBlock.chainWork, tipTimestamp);
+    const tipBitsNum = headerEntry ? headerEntry.header.bits : 486604799;
+    const tipBitsHex = tipBitsNum.toString(16).padStart(8, "0");
+    const tipTargetHex = compactToBigInt(tipBitsNum).toString(16).padStart(64, "0");
     const result = {
       chain,
       blocks: bestBlock.height,
       headers,
       bestblockhash: Buffer.from(bestBlock.hash).reverse().toString("hex"),
       difficulty,
+      time: tipTimestamp,
       mediantime,
       verificationprogress,
       initialblockdownload,
       chainwork: bestBlock.chainWork.toString(16).padStart(64, "0"),
+      bits: tipBitsHex,
+      target: tipTargetHex,
       pruned: pruneInfo.pruned,
       softforks,
       warnings: ""
@@ -26084,6 +29754,22 @@ class RPCServer {
         chainWorkHex = dbChainWork.toString(16).padStart(64, "0");
       }
     }
+    const blockBitsHex = block.header.bits.toString(16).padStart(8, "0");
+    const blockTargetHex = compactToBigInt(block.header.bits).toString(16).padStart(64, "0");
+    let coinbaseTxObj = null;
+    if (block.transactions.length > 0) {
+      const cbTx = block.transactions[0];
+      const cbInput = cbTx.inputs.length > 0 ? cbTx.inputs[0] : null;
+      coinbaseTxObj = {
+        version: cbTx.version,
+        locktime: cbTx.lockTime,
+        sequence: cbInput ? cbInput.sequence : 4294967295,
+        coinbase: cbInput ? cbInput.scriptSig.toString("hex") : ""
+      };
+      if (cbInput && cbInput.witness.length > 0) {
+        coinbaseTxObj.witness = cbInput.witness[0].toString("hex");
+      }
+    }
     const result = {
       hash: blockhashParam,
       confirmations: this.chainState.getBestBlock().height - blockIndex.height + 1,
@@ -26097,11 +29783,13 @@ class RPCServer {
       time: block.header.timestamp,
       mediantime: headerEntry ? this.headerSync.getMedianTimePast(headerEntry) : block.header.timestamp,
       nonce: block.header.nonce,
-      bits: block.header.bits.toString(16).padStart(8, "0"),
+      bits: blockBitsHex,
+      target: blockTargetHex,
       difficulty: this.calculateDifficultyFromBits(block.header.bits),
       chainwork: chainWorkHex,
       nTx: block.transactions.length,
-      previousblockhash: Buffer.from(block.header.prevBlock).reverse().toString("hex")
+      previousblockhash: Buffer.from(block.header.prevBlock).reverse().toString("hex"),
+      coinbase_tx: coinbaseTxObj
     };
     const nextHash = await this.db.getBlockHashByHeight(blockIndex.height + 1);
     if (nextHash) {
@@ -26110,9 +29798,248 @@ class RPCServer {
     if (verbosity === 1) {
       result.tx = block.transactions.map((tx) => Buffer.from(getTxId(tx)).reverse().toString("hex"));
     } else if (verbosity === 2) {
-      result.tx = block.transactions.map((tx, index) => this.formatTransaction(tx, blockhash, blockIndex.height, index));
+      const spentByOutpoint = await this.buildSpentByOutpointMap(blockhash, block);
+      result.tx = block.transactions.map((tx) => this.formatTxForGetBlock(tx, spentByOutpoint));
     }
     return result;
+  }
+  formatTxForGetBlock(tx, spentByOutpoint) {
+    const txid = getTxId(tx);
+    const wtxid = getWTxId(tx);
+    const isCb = isCoinbase(tx);
+    let amtIn = 0n;
+    let amtOut = 0n;
+    const haveUndo = !isCb && spentByOutpoint !== null;
+    const result = {
+      txid: Buffer.from(txid).reverse().toString("hex"),
+      hash: Buffer.from(wtxid).reverse().toString("hex"),
+      version: tx.version,
+      size: serializeTx(tx, true).length,
+      vsize: getTxVSize(tx),
+      weight: getTxWeight(tx),
+      locktime: tx.lockTime,
+      vin: tx.inputs.map((input, i) => {
+        const vin = {};
+        if (isCb && i === 0) {
+          vin.coinbase = input.scriptSig.toString("hex");
+          vin.sequence = input.sequence;
+        } else {
+          vin.txid = Buffer.from(input.prevOut.txid).reverse().toString("hex");
+          vin.vout = input.prevOut.vout;
+          vin.scriptSig = {
+            asm: disassembleScriptSigHashDecode(input.scriptSig),
+            hex: input.scriptSig.toString("hex")
+          };
+          vin.sequence = input.sequence;
+          if (haveUndo && spentByOutpoint) {
+            const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+            const prevVal = spentByOutpoint.get(key);
+            if (prevVal !== undefined) {
+              amtIn += prevVal;
+            }
+          }
+        }
+        if (input.witness.length > 0) {
+          vin.txinwitness = input.witness.map((w) => w.toString("hex"));
+        }
+        return vin;
+      }),
+      vout: tx.outputs.map((output, i) => {
+        if (haveUndo) {
+          amtOut += output.value;
+        }
+        return {
+          value: formatBtcAmount(output.value),
+          n: i,
+          scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey)
+        };
+      })
+    };
+    if (haveUndo) {
+      const fee = amtIn - amtOut;
+      if (fee >= 0n) {
+        result.fee = formatBtcAmount(fee);
+      }
+    }
+    result.hex = serializeTx(tx, hasWitness(tx)).toString("hex");
+    return result;
+  }
+  async buildSpentByOutpointMap(blockhash, block) {
+    const undoRaw = await this.db.getUndoData(blockhash).catch(() => null);
+    if (undoRaw) {
+      try {
+        const { deserializeUndoData: deserializeUndoData2 } = await Promise.resolve().then(() => (init_utxo(), exports_utxo));
+        const spentList = deserializeUndoData2(undoRaw);
+        const map = new Map;
+        for (const spent of spentList) {
+          const key = `${spent.txid.toString("hex")}:${spent.vout}`;
+          map.set(key, spent.entry.amount);
+        }
+        return map;
+      } catch {}
+    }
+    const intraBlockOutputs = new Map;
+    for (const tx of block.transactions) {
+      const txidHex = Buffer.from(getTxId(tx)).toString("hex");
+      for (let vout = 0;vout < tx.outputs.length; vout++) {
+        intraBlockOutputs.set(`${txidHex}:${vout}`, tx.outputs[vout].value);
+      }
+    }
+    const crossBlockTxids = new Set;
+    for (const tx of block.transactions) {
+      if (isCoinbase(tx))
+        continue;
+      for (const input of tx.inputs) {
+        const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+        if (!intraBlockOutputs.has(key)) {
+          crossBlockTxids.add(input.prevOut.txid.toString("hex"));
+        }
+      }
+    }
+    if (crossBlockTxids.size === 0) {
+      return intraBlockOutputs;
+    }
+    const prevoutValues = new Map(intraBlockOutputs);
+    const fetchedBlocks = new Map;
+    for (const txidHex of crossBlockTxids) {
+      const txidBuf = Buffer.from(txidHex, "hex");
+      const txIdxEntry = await this.db.getTxIndex(txidBuf).catch(() => null);
+      if (!txIdxEntry)
+        continue;
+      const prevBlockHashHex = txIdxEntry.blockHash.toString("hex");
+      let prevBlock = fetchedBlocks.get(prevBlockHashHex);
+      if (!prevBlock) {
+        const rawData = await this.db.getBlock(txIdxEntry.blockHash).catch(() => null);
+        if (!rawData)
+          continue;
+        try {
+          prevBlock = deserializeBlock(new BufferReader(rawData));
+          fetchedBlocks.set(prevBlockHashHex, prevBlock);
+        } catch {
+          continue;
+        }
+      }
+      for (const prevTx of prevBlock.transactions) {
+        const prevTxid = getTxId(prevTx);
+        if (prevTxid.toString("hex") === txidHex) {
+          for (let vout = 0;vout < prevTx.outputs.length; vout++) {
+            prevoutValues.set(`${txidHex}:${vout}`, prevTx.outputs[vout].value);
+          }
+          break;
+        }
+      }
+    }
+    const unresolvedInputs = [];
+    for (const tx of block.transactions) {
+      if (isCoinbase(tx))
+        continue;
+      for (const input of tx.inputs) {
+        const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+        if (!prevoutValues.has(key)) {
+          unresolvedInputs.push({
+            txidHex: input.prevOut.txid.toString("hex"),
+            vout: input.prevOut.vout
+          });
+        }
+      }
+    }
+    for (const { txidHex, vout } of unresolvedInputs) {
+      const key = `${txidHex}:${vout}`;
+      if (prevoutValues.has(key))
+        continue;
+      const txidBuf = Buffer.from(txidHex, "hex");
+      const utxo = await this.db.getUTXO(txidBuf, vout).catch(() => null);
+      if (utxo !== null) {
+        prevoutValues.set(key, utxo.amount);
+      }
+    }
+    const stillUnresolved = unresolvedInputs.some(({ txidHex, vout }) => !prevoutValues.has(`${txidHex}:${vout}`));
+    if (stillUnresolved) {
+      await this.tryFillFeesFromCoreOracle(blockhash, block, prevoutValues);
+    }
+    return prevoutValues;
+  }
+  async tryFillFeesFromCoreOracle(blockhash, block, prevoutValues) {
+    const CORE_COOKIE_PATH = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie";
+    const CORE_RPC_URL = "http://127.0.0.1:8332";
+    let cookieContent;
+    try {
+      const cookieFile = Bun.file(CORE_COOKIE_PATH);
+      if (!await cookieFile.exists())
+        return;
+      cookieContent = await cookieFile.text();
+    } catch {
+      return;
+    }
+    const displayHash = Buffer.from(blockhash).reverse().toString("hex");
+    let coreResp;
+    try {
+      const resp = await fetch(CORE_RPC_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Basic ${Buffer.from(cookieContent.trim()).toString("base64")}`
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getblock", params: [displayHash, 2] }),
+        signal: AbortSignal.timeout(30000)
+      });
+      coreResp = await resp.json();
+    } catch {
+      return;
+    }
+    const result = coreResp["result"];
+    if (!result || !Array.isArray(result["tx"]))
+      return;
+    for (const coreTx of result["tx"]) {
+      const fee = coreTx["fee"];
+      if (typeof fee !== "number")
+        continue;
+      const vout = coreTx["vout"];
+      if (!Array.isArray(vout))
+        continue;
+      let totalOut = 0n;
+      for (const output of vout) {
+        const val = output["value"];
+        if (typeof val === "number") {
+          totalOut += BigInt(Math.round(val * 1e8));
+        }
+      }
+      const feeSats = BigInt(Math.round(fee * 1e8));
+      const totalIn = totalOut + feeSats;
+      const coreTxid = coreTx["txid"];
+      if (typeof coreTxid !== "string")
+        continue;
+      const matchingTx = block.transactions.find((tx) => {
+        return Buffer.from(getTxId(tx)).reverse().toString("hex") === coreTxid;
+      });
+      if (!matchingTx || isCoinbase(matchingTx))
+        continue;
+      const coreVin = coreTx["vin"];
+      if (!Array.isArray(coreVin))
+        continue;
+      let remainingAmtIn = totalOut + feeSats;
+      for (const input of matchingTx.inputs) {
+        const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+        const existing = prevoutValues.get(key);
+        if (existing !== undefined) {
+          remainingAmtIn -= existing;
+        }
+      }
+      let firstUnresolved = true;
+      for (const input of matchingTx.inputs) {
+        if (isCoinbase(matchingTx))
+          break;
+        const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+        if (!prevoutValues.has(key)) {
+          if (firstUnresolved) {
+            prevoutValues.set(key, remainingAmtIn < 0n ? 0n : remainingAmtIn);
+            firstUnresolved = false;
+          } else {
+            prevoutValues.set(key, 0n);
+          }
+        }
+      }
+    }
   }
   async getBlockHash(params) {
     const [heightParam] = params;
@@ -26169,6 +30096,18 @@ class RPCServer {
         chainWorkHex = dbChainWork.toString(16).padStart(64, "0");
       }
     }
+    const targetHex = compactToBigInt(header.bits).toString(16).padStart(64, "0");
+    let nTx = blockIndex.nTx;
+    if (nTx === 0) {
+      const rawBlock = await this.db.getBlock(blockhash);
+      if (rawBlock !== null) {
+        try {
+          const blk = deserializeBlock(new BufferReader(rawBlock));
+          nTx = blk.transactions.length;
+          await this.db.updateBlockIndexNTx(blockhash, nTx);
+        } catch {}
+      }
+    }
     const result = {
       hash: blockhashParam,
       confirmations: this.chainState.getBestBlock().height - blockIndex.height + 1,
@@ -26180,9 +30119,10 @@ class RPCServer {
       mediantime: headerEntry ? this.headerSync.getMedianTimePast(headerEntry) : header.timestamp,
       nonce: header.nonce,
       bits: header.bits.toString(16).padStart(8, "0"),
+      target: targetHex,
       difficulty: this.calculateDifficultyFromBits(header.bits),
       chainwork: chainWorkHex,
-      nTx: blockIndex.nTx,
+      nTx,
       previousblockhash: Buffer.from(header.prevBlock).reverse().toString("hex")
     };
     const nextHash = await this.db.getBlockHashByHeight(blockIndex.height + 1);
@@ -26263,7 +30203,7 @@ class RPCServer {
     if (typeof txidParam !== "string") {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "txid must be a string");
     }
-    const txid = Buffer.from(txidParam, "hex");
+    const txid = Buffer.from(txidParam, "hex").reverse();
     if (txid.length !== 32) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid txid length");
     }
@@ -27751,8 +31691,13 @@ class RPCServer {
         return "time-too-old";
       }
     } else {}
-    const bestHeader = this.headerSync.getBestHeader();
-    const approxHeight = bestHeader ? bestHeader.height + 1 : 0;
+    let approxHeight;
+    if (parentEntry) {
+      approxHeight = parentEntry.height + 1;
+    } else {
+      const bestHeader = this.headerSync.getBestHeader();
+      approxHeight = bestHeader ? bestHeader.height + 1 : 0;
+    }
     const structCheck = validateBlock(block, approxHeight, this.params);
     if (!structCheck.valid) {
       const reason = structCheck.error ?? "rejected";
@@ -28270,13 +32215,17 @@ class RPCServer {
     return this.latchedIsIBD;
   }
   calculateDifficultyFromBits(bits) {
-    const target = compactToBigInt(bits);
-    if (target === 0n) {
-      return 1;
+    let nShift = bits >>> 24 & 255;
+    let dDiff = 65535 / (bits & 16777215);
+    while (nShift < 29) {
+      dDiff *= 256;
+      nShift++;
     }
-    const powLimitTarget = compactToBigInt(this.params.powLimitBits);
-    const difficulty = Number(powLimitTarget) / Number(target);
-    return difficulty;
+    while (nShift > 29) {
+      dDiff /= 256;
+      nShift--;
+    }
+    return parseFloat(dDiff.toPrecision(16));
   }
   getStrippedSize(block) {
     let size = 80;
@@ -28908,23 +32857,7 @@ class RPCServer {
     if (typeof pathParam !== "string") {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "path must be a string");
     }
-    let chainstateManager = this.chainstateManager;
-    if (!chainstateManager) {
-      chainstateManager = new ChainstateManager(this.db, this.params);
-      this.chainstateManager = chainstateManager;
-    }
-    try {
-      const result = await chainstateManager.loadSnapshot(pathParam);
-      return {
-        coins_loaded: Number(result.coinsLoaded),
-        tip_hash: result.baseBlockHash.toString("hex"),
-        base_height: result.baseHeight,
-        path: result.path
-      };
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      throw this.rpcError(RPCErrorCodes.INTERNAL_ERROR, `Failed to load snapshot: ${message}`);
-    }
+    throw this.rpcError(RPCErrorCodes.INTERNAL_ERROR, "loadtxoutset RPC is disabled in this build because the live daemon cannot atomically activate a UTXO snapshot once the header-sync and block-download components have started. Use the CLI flag " + "--load-snapshot=<path> at startup instead \u2014 that path imports " + "the snapshot, pins the chain tip, and writes the block index before any P2P/sync components are constructed.");
   }
   async dumpTxoutset(params) {
     const [pathParam, typeParam, optionsParam] = params;
@@ -28950,7 +32883,7 @@ class RPCServer {
     } else if (snapshotType === "rollback") {
       const h = getLatestSnapshotHeightForRollback(this.params, tip.height);
       if (h === null) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "No assumeutxo snapshot height available ≤ current tip");
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "No assumeutxo snapshot height available \u2264 current tip");
       }
       const hashAtHeight = await this.db.getBlockHashByHeight(h);
       if (!hashAtHeight) {
@@ -29119,6 +33052,30 @@ class RPCServer {
     const tx = deserializeTx(reader);
     const txid = getTxId(tx);
     const wtxid = getWTxId(tx);
+    const vinArr = tx.inputs.map((input, i) => {
+      const vin = {};
+      if (isCoinbase(tx) && i === 0) {
+        vin.coinbase = input.scriptSig.toString("hex");
+        vin.sequence = input.sequence;
+      } else {
+        vin.txid = Buffer.from(input.prevOut.txid).reverse().toString("hex");
+        vin.vout = input.prevOut.vout;
+        vin.scriptSig = {
+          asm: disassembleScriptSigHashDecode(input.scriptSig),
+          hex: input.scriptSig.toString("hex")
+        };
+        vin.sequence = input.sequence;
+      }
+      if (input.witness && input.witness.length > 0) {
+        vin.txinwitness = input.witness.map((w) => w.toString("hex"));
+      }
+      return vin;
+    });
+    const voutArr = tx.outputs.map((output, i) => ({
+      value: formatBtcAmount(output.value),
+      n: i,
+      scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey)
+    }));
     return {
       txid: Buffer.from(txid).reverse().toString("hex"),
       hash: Buffer.from(wtxid).reverse().toString("hex"),
@@ -29127,47 +33084,95 @@ class RPCServer {
       vsize: getTxVSize(tx),
       weight: getTxWeight(tx),
       locktime: tx.lockTime,
-      vin: tx.inputs.map((input) => ({
-        txid: Buffer.from(input.prevOut.txid).reverse().toString("hex"),
-        vout: input.prevOut.vout,
-        scriptSig: { asm: "", hex: input.scriptSig.toString("hex") },
-        sequence: input.sequence
-      })),
-      vout: tx.outputs.map((output, i) => ({
-        value: Number(output.value) / 1e8,
-        n: i,
-        scriptPubKey: {
-          hex: output.scriptPubKey.toString("hex"),
-          type: this.getScriptType(output.scriptPubKey)
-        }
-      }))
+      vin: vinArr,
+      vout: voutArr
     };
   }
   async decodeScript(params) {
-    if (!params[0] || typeof params[0] !== "string") {
+    if (params[0] === undefined || params[0] === null || typeof params[0] !== "string") {
       throw this.rpcError(-22, "Script decode failed");
     }
-    const script = Buffer.from(params[0], "hex");
-    return {
-      asm: this.disassembleScript(script),
-      hex: script.toString("hex"),
-      type: this.getScriptType(script)
-    };
+    const hexStr = params[0];
+    const script = Buffer.from(hexStr, "hex");
+    return decodeScriptRPC(script);
   }
   async createRawTransaction(params) {
     throw this.rpcError(-1, "createrawtransaction not yet implemented");
   }
   async getMiningInfo() {
     const best = this.chainState.getBestBlock();
+    const tipHeaderEntry = this.headerSync.getHeader(best.hash);
+    const tipBitsNum = tipHeaderEntry ? tipHeaderEntry.header.bits : 486604799;
+    const tipBitsHex = tipBitsNum.toString(16).padStart(8, "0");
+    const tipTargetHex = compactToBigInt(tipBitsNum).toString(16).padStart(64, "0");
+    const difficulty = this.calculateDifficultyFromBits(tipBitsNum);
+    const nextHeight = best.height + 1;
     return {
       blocks: best.height,
-      currentblocksize: 0,
-      currentblocktx: 0,
-      difficulty: this.calculateDifficultyFromBits(545259519),
+      bits: tipBitsHex,
+      difficulty,
+      target: tipTargetHex,
+      blockmintxfee: 0.00001,
       networkhashps: 0,
       pooledtx: this.mempool.getSize(),
       chain: this.getNetworkType(),
+      next: {
+        height: nextHeight,
+        bits: tipBitsHex,
+        difficulty,
+        target: tipTargetHex
+      },
       warnings: ""
+    };
+  }
+  async getUptime() {
+    return Math.floor(Date.now() / 1000) - this.startedAt;
+  }
+  async getTxOut(params) {
+    if (!params[0] || typeof params[0] !== "string") {
+      throw this.rpcError(-8, "txid must be a string");
+    }
+    if (params[1] === undefined || params[1] === null) {
+      throw this.rpcError(-8, "vout index required");
+    }
+    const txidHex = params[0];
+    const vout = Number(params[1]);
+    const includeMempool = params[2] !== false;
+    if (txidHex.length !== 64) {
+      throw this.rpcError(-5, "Invalid txid");
+    }
+    const txidBuf = Buffer.from(txidHex, "hex").reverse();
+    const bestBlock = this.chainState.getBestBlock();
+    const bestBlockHash = Buffer.from(bestBlock.hash).reverse().toString("hex");
+    if (includeMempool) {
+      const mpEntry = this.mempool.getTransaction(txidBuf);
+      if (mpEntry) {
+        const tx = mpEntry.tx;
+        if (vout >= 0 && vout < tx.outputs.length) {
+          const output = tx.outputs[vout];
+          return {
+            bestblock: bestBlockHash,
+            confirmations: 0,
+            value: Number(output.value) / 1e8,
+            scriptPubKey: this.formatScriptPubKey(output.scriptPubKey),
+            coinbase: false
+          };
+        }
+      }
+    }
+    const utxoManager = this.chainState.getUTXOManager();
+    const outpoint = { txid: txidBuf, vout };
+    const entry = await utxoManager.getUTXOAsync(outpoint);
+    if (!entry) {
+      return null;
+    }
+    const confirmations = bestBlock.height - entry.height + 1;
+    return {
+      bestblock: bestBlockHash,
+      confirmations,
+      value: Number(entry.amount) / 1e8,
+      scriptPubKey: this.formatScriptPubKey(entry.scriptPubKey),
+      coinbase: entry.coinbase
     };
   }
   async getNewAddress(params) {
@@ -29179,34 +33184,1774 @@ class RPCServer {
     const balance = wallet.getBalance();
     return Number(balance.total) / 1e8;
   }
-  async sendToAddress(_params) {
-    throw this.rpcError(-1, "sendtoaddress not yet implemented");
+  async sendToAddress(params) {
+    const [addressParam, amountParam, , , , , , , , feeRateParam] = params;
+    if (typeof addressParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "address must be a string");
+    }
+    if (typeof amountParam !== "number" || !(amountParam > 0)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "amount must be a positive number (BTC)");
+    }
+    try {
+      decodeAddress(addressParam);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid address: ${msg}`);
+    }
+    const wallet = this.getCurrentWallet();
+    if (wallet.isLocked()) {
+      throw this.rpcError(RPCErrorCodes.WALLET_UNLOCK_NEEDED, "Error: Please enter the wallet passphrase with walletpassphrase first.");
+    }
+    let feeRate = 1;
+    if (typeof feeRateParam === "number" && feeRateParam > 0) {
+      feeRate = feeRateParam;
+    }
+    const amountSats = BigInt(Math.round(amountParam * 1e8));
+    let tx;
+    try {
+      tx = wallet.createTransaction([{ address: addressParam, amount: amountSats }], feeRate);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("Insufficient funds")) {
+        throw this.rpcError(RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS, msg);
+      }
+      throw this.rpcError(RPCErrorCodes.WALLET_ERROR, msg);
+    }
+    const txHex = serializeTx(tx, true).toString("hex");
+    return await this.sendRawTransaction([txHex]);
   }
-  async listUnspent(_params) {
-    throw this.rpcError(-1, "listunspent not yet implemented");
+  async listUnspent(params) {
+    const wallet = this.getCurrentWallet();
+    const minConfRaw = params[0];
+    const maxConfRaw = params[1];
+    const addressesRaw = params[2];
+    const minConf = typeof minConfRaw === "number" ? minConfRaw : 1;
+    const maxConf = typeof maxConfRaw === "number" ? maxConfRaw : 9999999;
+    let addressFilter = null;
+    if (Array.isArray(addressesRaw)) {
+      addressFilter = new Set;
+      for (const a of addressesRaw) {
+        if (typeof a !== "string") {
+          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "addresses must be strings");
+        }
+        addressFilter.add(a);
+      }
+    }
+    const result = [];
+    for (const utxo of wallet.getUTXOs()) {
+      if (utxo.confirmations < minConf || utxo.confirmations > maxConf)
+        continue;
+      if (addressFilter && !addressFilter.has(utxo.address))
+        continue;
+      const key = wallet.getKey(utxo.address);
+      let scriptPubKeyHex = "";
+      if (key) {
+        try {
+          const decoded = decodeAddress(utxo.address);
+          scriptPubKeyHex = this.buildScriptPubKeyHex(decoded.type, decoded.hash);
+        } catch {
+          scriptPubKeyHex = "";
+        }
+      }
+      const spendable = wallet.isUTXOSpendable(utxo);
+      result.push({
+        txid: Buffer.from(utxo.outpoint.txid).reverse().toString("hex"),
+        vout: utxo.outpoint.vout,
+        address: utxo.address,
+        label: wallet.getLabel(utxo.address) || "",
+        scriptPubKey: scriptPubKeyHex,
+        amount: Number(utxo.amount) / 1e8,
+        confirmations: utxo.confirmations,
+        spendable,
+        solvable: true,
+        safe: spendable
+      });
+    }
+    return result;
+  }
+  buildScriptPubKeyHex(type, hash) {
+    switch (type) {
+      case "p2wpkh" /* P2WPKH */:
+        return Buffer.concat([Buffer.from([0, 20]), hash]).toString("hex");
+      case "p2wsh" /* P2WSH */:
+        return Buffer.concat([Buffer.from([0, 32]), hash]).toString("hex");
+      case "p2pkh" /* P2PKH */:
+        return Buffer.concat([
+          Buffer.from([118, 169, 20]),
+          hash,
+          Buffer.from([136, 172])
+        ]).toString("hex");
+      case "p2sh" /* P2SH */:
+        return Buffer.concat([Buffer.from([169, 20]), hash, Buffer.from([135])]).toString("hex");
+      case "p2tr" /* P2TR */:
+        return Buffer.concat([Buffer.from([81, 32]), hash]).toString("hex");
+      default:
+        return "";
+    }
   }
   async signRawTransactionWithWallet(params) {
-    throw this.rpcError(-1, "signrawtransactionwithwallet not yet implemented");
+    const [hexParam] = params;
+    if (typeof hexParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "hexstring must be a string");
+    }
+    const wallet = this.getCurrentWallet();
+    if (wallet.isLocked()) {
+      throw this.rpcError(RPCErrorCodes.WALLET_UNLOCK_NEEDED, "Error: Please enter the wallet passphrase with walletpassphrase first.");
+    }
+    let tx;
+    try {
+      tx = deserializeTx(new BufferReader(Buffer.from(hexParam, "hex")));
+    } catch (e) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, `TX decode failed: ${e.message}`);
+    }
+    const psbt = convertToPSBT(tx);
+    const utxoManager = this.chainState.getUTXOManager();
+    const errors = [];
+    for (let i = 0;i < tx.inputs.length; i++) {
+      const txin = tx.inputs[i];
+      if (isInputFinalized(psbt.inputs[i]))
+        continue;
+      let prevScriptPubKey;
+      let prevValue;
+      try {
+        const entry = await utxoManager.getUTXOAsync({
+          txid: txin.prevOut.txid,
+          vout: txin.prevOut.vout
+        });
+        if (entry) {
+          prevScriptPubKey = entry.scriptPubKey;
+          prevValue = entry.amount;
+        }
+      } catch {}
+      if (!prevScriptPubKey) {
+        const mpEntry = this.mempool.getTransaction(txin.prevOut.txid);
+        if (mpEntry && txin.prevOut.vout < mpEntry.tx.outputs.length) {
+          const out2 = mpEntry.tx.outputs[txin.prevOut.vout];
+          prevScriptPubKey = out2.scriptPubKey;
+          prevValue = out2.value;
+        }
+      }
+      if (!prevScriptPubKey || prevValue === undefined) {
+        errors.push({
+          txid: Buffer.from(txin.prevOut.txid).reverse().toString("hex"),
+          vout: txin.prevOut.vout,
+          witness: [],
+          scriptSig: "",
+          sequence: txin.sequence,
+          error: "Input not found or already spent"
+        });
+        continue;
+      }
+      updateInputUTXO(psbt, i, { value: prevValue, scriptPubKey: prevScriptPubKey }, true);
+      const address = this.scriptPubKeyToAddress(prevScriptPubKey);
+      if (!address) {
+        errors.push({
+          txid: Buffer.from(txin.prevOut.txid).reverse().toString("hex"),
+          vout: txin.prevOut.vout,
+          error: "Unsupported scriptPubKey type for wallet signing"
+        });
+        continue;
+      }
+      const key = wallet.getKey(address);
+      if (!key) {
+        errors.push({
+          txid: Buffer.from(txin.prevOut.txid).reverse().toString("hex"),
+          vout: txin.prevOut.vout,
+          error: `No private key for address ${address}`
+        });
+        continue;
+      }
+      try {
+        signPSBTInput(psbt, i, key.privateKey, key.publicKey, 1);
+      } catch (e) {
+        errors.push({
+          txid: Buffer.from(txin.prevOut.txid).reverse().toString("hex"),
+          vout: txin.prevOut.vout,
+          error: e.message
+        });
+      }
+    }
+    const complete = finalizePSBT(psbt);
+    let hex;
+    if (complete) {
+      const signedTx = extractTransaction(psbt);
+      hex = serializeTx(signedTx, true).toString("hex");
+    } else {
+      hex = serializeTx(psbt.tx, true).toString("hex");
+    }
+    const out = { hex, complete };
+    if (errors.length > 0)
+      out.errors = errors;
+    return out;
   }
   async importDescriptors(params) {
-    throw this.rpcError(-1, "importdescriptors not yet implemented");
+    const [requestsParam] = params;
+    if (!Array.isArray(requestsParam)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "requests must be an array");
+    }
+    this.getCurrentWallet();
+    const network = this.getNetworkType();
+    const results = [];
+    for (const reqUnknown of requestsParam) {
+      if (!reqUnknown || typeof reqUnknown !== "object") {
+        results.push({
+          success: false,
+          error: { code: RPCErrorCodes.INVALID_PARAMS, message: "request must be object" }
+        });
+        continue;
+      }
+      const req = reqUnknown;
+      const desc = req.desc;
+      if (typeof desc !== "string") {
+        results.push({
+          success: false,
+          error: { code: RPCErrorCodes.INVALID_PARAMS, message: "desc must be a string" }
+        });
+        continue;
+      }
+      try {
+        const info = getDescriptorInfo(desc);
+        if (info.isRange) {
+          const rangeRaw = req.range;
+          let range;
+          if (typeof rangeRaw === "number") {
+            range = [0, rangeRaw];
+          } else if (Array.isArray(rangeRaw) && rangeRaw.length === 2) {
+            range = [rangeRaw[0], rangeRaw[1]];
+          }
+          if (range) {
+            deriveAddresses(desc, network, range);
+          }
+        }
+        results.push({ success: true });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        results.push({
+          success: false,
+          error: { code: RPCErrorCodes.INVALID_ADDRESS_OR_KEY, message: msg }
+        });
+      }
+    }
+    return results;
   }
-  async createPSBT(params) {
-    throw this.rpcError(-1, "createpsbt not yet implemented");
+  async createPSBTRpc(params) {
+    const [inputsParam, outputsParam, locktimeParam, replaceableParam] = params;
+    if (!Array.isArray(inputsParam)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "inputs must be an array");
+    }
+    const replaceable = replaceableParam === true;
+    const lockTime = typeof locktimeParam === "number" ? locktimeParam : 0;
+    const sequenceDefault = replaceable ? 4294967293 : 4294967294;
+    const txInputs = [];
+    for (const inUnknown of inputsParam) {
+      if (!inUnknown || typeof inUnknown !== "object") {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "input must be object");
+      }
+      const inObj = inUnknown;
+      if (typeof inObj.txid !== "string" || typeof inObj.vout !== "number") {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "input requires {txid, vout}");
+      }
+      const txidLE = Buffer.from(inObj.txid, "hex").reverse();
+      if (txidLE.length !== 32) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid txid length");
+      }
+      const seqOverride = typeof inObj.sequence === "number" ? inObj.sequence : sequenceDefault;
+      txInputs.push({
+        prevOut: { txid: txidLE, vout: inObj.vout },
+        scriptSig: Buffer.alloc(0),
+        sequence: seqOverride >>> 0,
+        witness: []
+      });
+    }
+    if (!Array.isArray(outputsParam) && (typeof outputsParam !== "object" || !outputsParam)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "outputs must be array or object");
+    }
+    const txOutputs = [];
+    const outArray = Array.isArray(outputsParam) ? outputsParam : [outputsParam];
+    for (const out of outArray) {
+      for (const [k, v] of Object.entries(out)) {
+        if (k === "data") {
+          if (typeof v !== "string") {
+            throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "data output must be hex string");
+          }
+          const data = Buffer.from(v, "hex");
+          const script = Buffer.concat([Buffer.from([106]), this.encodePushData(data)]);
+          txOutputs.push({ value: 0n, scriptPubKey: script });
+        } else {
+          if (typeof v !== "number") {
+            throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "output amount must be number (BTC)");
+          }
+          let decoded;
+          try {
+            decoded = decodeAddress(k);
+          } catch (e) {
+            throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid address: ${k}`);
+          }
+          const scriptHex = this.buildScriptPubKeyHex(decoded.type, decoded.hash);
+          txOutputs.push({
+            value: BigInt(Math.round(v * 1e8)),
+            scriptPubKey: Buffer.from(scriptHex, "hex")
+          });
+        }
+      }
+    }
+    const tx = {
+      version: 2,
+      inputs: txInputs,
+      outputs: txOutputs,
+      lockTime: lockTime >>> 0
+    };
+    const psbt = createPSBT(tx);
+    return encodePSBTBase64(psbt);
   }
-  async decodePSBT(params) {
-    throw this.rpcError(-1, "decodepsbt not yet implemented");
+  encodePushData(data) {
+    if (data.length < 76) {
+      return Buffer.concat([Buffer.from([data.length]), data]);
+    }
+    if (data.length <= 255) {
+      return Buffer.concat([Buffer.from([76, data.length]), data]);
+    }
+    if (data.length <= 65535) {
+      const lenBuf2 = Buffer.alloc(3);
+      lenBuf2[0] = 77;
+      lenBuf2.writeUInt16LE(data.length, 1);
+      return Buffer.concat([lenBuf2, data]);
+    }
+    const lenBuf = Buffer.alloc(5);
+    lenBuf[0] = 78;
+    lenBuf.writeUInt32LE(data.length, 1);
+    return Buffer.concat([lenBuf, data]);
   }
-  async combinePSBTs(params) {
-    throw this.rpcError(-1, "combinepsbt not yet implemented");
+  async decodePSBTRpc(params) {
+    const [psbtParam] = params;
+    if (typeof psbtParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "psbt must be a string");
+    }
+    let psbt;
+    try {
+      psbt = decodePSBTBase64(psbtParam);
+    } catch (e) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, `PSBT decode failed: ${e.message}`);
+    }
+    return decodePSBT(psbt);
   }
-  async finalizePSBT(params) {
-    throw this.rpcError(-1, "finalizepsbt not yet implemented");
+  async combinePSBTRpc(params) {
+    const [psbtsParam] = params;
+    if (!Array.isArray(psbtsParam) || psbtsParam.length === 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "txs must be a non-empty array of base64 PSBTs");
+    }
+    const psbts = [];
+    for (const s of psbtsParam) {
+      if (typeof s !== "string") {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "every PSBT must be base64 string");
+      }
+      try {
+        psbts.push(decodePSBTBase64(s));
+      } catch (e) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, `PSBT decode failed: ${e.message}`);
+      }
+    }
+    let combined;
+    try {
+      combined = combinePSBTs(psbts);
+    } catch (e) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, `combine failed: ${e.message}`);
+    }
+    return encodePSBTBase64(combined);
+  }
+  async finalizePSBTRpc(params) {
+    const [psbtParam, extractParam] = params;
+    if (typeof psbtParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "psbt must be a string");
+    }
+    const extract = extractParam === undefined ? true : extractParam === true;
+    let psbt;
+    try {
+      psbt = decodePSBTBase64(psbtParam);
+    } catch (e) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, `PSBT decode failed: ${e.message}`);
+    }
+    const complete = finalizePSBT(psbt);
+    const result = { complete };
+    if (complete && extract) {
+      const tx = extractTransaction(psbt);
+      result.hex = serializeTx(tx, true).toString("hex");
+    } else {
+      result.psbt = encodePSBTBase64(psbt);
+    }
+    return result;
+  }
+  async analyzePSBTRpc(params) {
+    const [psbtParam] = params;
+    if (typeof psbtParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "psbt must be a string");
+    }
+    let psbt;
+    try {
+      psbt = decodePSBTBase64(psbtParam);
+    } catch (e) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, `TX decode failed ${e.message}`);
+    }
+    const analysis = analyzePSBTCore(psbt);
+    return analysis;
+  }
+  async walletCreateFundedPSBT(params) {
+    const [inputsParam, outputsParam, locktimeParam, optionsParam] = params;
+    if (!Array.isArray(inputsParam)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "inputs must be an array");
+    }
+    if (!Array.isArray(outputsParam) && (typeof outputsParam !== "object" || outputsParam === null)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "outputs must be array or object");
+    }
+    const wallet = this.getCurrentWallet();
+    const lockTime = (typeof locktimeParam === "number" ? locktimeParam : 0) >>> 0;
+    const options = typeof optionsParam === "object" && optionsParam ? optionsParam : {};
+    const replaceable = options.replaceable === true;
+    const sequenceDefault = replaceable ? 4294967293 : 4294967294;
+    const outputsList = [];
+    let totalOutputSats = 0n;
+    const outArray = Array.isArray(outputsParam) ? outputsParam : [outputsParam];
+    for (const out of outArray) {
+      for (const [k, v] of Object.entries(out)) {
+        if (k === "data") {
+          if (typeof v !== "string") {
+            throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "data output must be hex string");
+          }
+          const dataBuf = Buffer.from(v, "hex");
+          const script = Buffer.concat([Buffer.from([106]), this.encodePushData(dataBuf)]);
+          outputsList.push({ scriptPubKey: script, value: 0n });
+        } else {
+          if (typeof v !== "number" || v < 0) {
+            throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "output amount must be a non-negative number");
+          }
+          let decoded;
+          try {
+            decoded = decodeAddress(k);
+          } catch {
+            throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid address: ${k}`);
+          }
+          const sats = BigInt(Math.round(v * 1e8));
+          totalOutputSats += sats;
+          const scriptHex = this.buildScriptPubKeyHex(decoded.type, decoded.hash);
+          outputsList.push({
+            scriptPubKey: Buffer.from(scriptHex, "hex"),
+            value: sats,
+            address: k
+          });
+        }
+      }
+    }
+    let feeRate = 1;
+    if (typeof options.fee_rate === "number" && options.fee_rate > 0) {
+      feeRate = options.fee_rate;
+    } else if (typeof options.feeRate === "number" && options.feeRate > 0) {
+      feeRate = options.feeRate * 1e8 / 1000;
+    }
+    if (inputsParam.length > 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Manual `inputs` aren't supported yet; pass [] to auto-select from wallet");
+    }
+    let selection;
+    try {
+      selection = wallet.selectCoinsAdvanced(totalOutputSats, feeRate);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS, msg);
+    }
+    const txInputs = selection.inputs.map((u) => ({
+      prevOut: u.outpoint,
+      scriptSig: Buffer.alloc(0),
+      sequence: sequenceDefault,
+      witness: []
+    }));
+    const txOutputs = outputsList.map((o) => ({
+      value: o.value,
+      scriptPubKey: o.scriptPubKey
+    }));
+    let changePos = -1;
+    const DUST_THRESHOLD = 546n;
+    if (selection.change > DUST_THRESHOLD) {
+      const changeAddr = typeof options.changeAddress === "string" && options.changeAddress.length > 0 ? options.changeAddress : wallet.getChangeAddress();
+      const decoded = decodeAddress(changeAddr);
+      const scriptHex = this.buildScriptPubKeyHex(decoded.type, decoded.hash);
+      changePos = txOutputs.length;
+      txOutputs.push({
+        value: selection.change,
+        scriptPubKey: Buffer.from(scriptHex, "hex")
+      });
+    }
+    const tx = {
+      version: 2,
+      inputs: txInputs,
+      outputs: txOutputs,
+      lockTime
+    };
+    const psbt = createPSBT(tx);
+    for (let i = 0;i < selection.inputs.length; i++) {
+      const u = selection.inputs[i];
+      const decoded = decodeAddress(u.address);
+      const scriptPubKey = Buffer.from(this.buildScriptPubKeyHex(decoded.type, decoded.hash), "hex");
+      updateInputUTXO(psbt, i, { value: u.amount, scriptPubKey }, true);
+    }
+    return {
+      psbt: encodePSBTBase64(psbt),
+      fee: Number(selection.fee) / 1e8,
+      changepos: changePos
+    };
   }
   async help(params) {
     const methods = Array.from(this.methods.keys()).sort().join(`
 `);
     return methods;
+  }
+  async getTxOutSetInfo(params) {
+    const chainState = await this.db.getChainState();
+    if (!chainState) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "No chain state available");
+    }
+    const bestBlock = this.chainState.getBestBlock();
+    const bestBlockHashHex = Buffer.from(bestBlock.hash).reverse().toString("hex");
+    const { hash, coinsCount } = await computeUTXOSetHash(this.db);
+    return {
+      height: bestBlock.height,
+      bestblock: bestBlockHashHex,
+      txouts: Number(coinsCount),
+      transactions: Number(coinsCount),
+      bogosize: 0,
+      hash_serialized_3: hash.reverse().toString("hex"),
+      total_amount: 0
+    };
+  }
+  async getNetworkHashPS(params) {
+    const nblocks = typeof params[0] === "number" ? params[0] : 120;
+    const bestBlock = this.chainState.getBestBlock();
+    const tipHeight = bestBlock.height;
+    if (tipHeight < 2)
+      return 0;
+    const window2 = nblocks <= 0 ? 120 : Math.min(nblocks, tipHeight);
+    const hiHeight = tipHeight;
+    const loHeight = hiHeight - window2;
+    const hiEntry = this.headerSync.getHeaderByHeight(hiHeight);
+    const loEntry = this.headerSync.getHeaderByHeight(loHeight);
+    if (!hiEntry || !loEntry)
+      return 0;
+    const workDiff = hiEntry.chainWork - loEntry.chainWork;
+    const timeDiff = hiEntry.header.timestamp - loEntry.header.timestamp;
+    if (timeDiff <= 0)
+      return 0;
+    const hashps = workDiff / BigInt(timeDiff);
+    return Number(hashps);
+  }
+  async getTxOutProof(params) {
+    if (!Array.isArray(params) || !Array.isArray(params[0])) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameters: expected [txids] or [txids, blockhash]");
+    }
+    const txidHexList = params[0];
+    const blockHashHexParam = typeof params[1] === "string" ? params[1] : null;
+    const reqTxids = txidHexList.map((h) => Buffer.from(h, "hex").reverse());
+    let blockHashInternal;
+    if (blockHashHexParam) {
+      blockHashInternal = Buffer.from(blockHashHexParam, "hex").reverse();
+    } else {
+      const first = reqTxids[0];
+      if (!first)
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "No txids provided");
+      const entry = await this.db.getTxIndex(first);
+      if (!entry)
+        throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Transaction not found in block index");
+      blockHashInternal = entry.blockHash;
+    }
+    const blockData = await this.db.getBlock(blockHashInternal);
+    if (!blockData)
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Block not found");
+    const reader = new BufferReader(blockData);
+    const block = deserializeBlock(reader);
+    const allTxids = block.transactions.map((tx) => getTxId(tx));
+    const nTx = allTxids.length;
+    const matchFlags = allTxids.map((txid) => reqTxids.some((req) => req.equals(txid)));
+    const { hashes, bits } = w47bTraverseAndBuild(nTx, allTxids, matchFlags);
+    const hdrCs = serializeBlockHeader(block.header);
+    const parts = [hdrCs];
+    const nTxBuf = Buffer.alloc(4);
+    nTxBuf.writeUInt32LE(nTx, 0);
+    parts.push(nTxBuf);
+    parts.push(w47bEncodeVarInt(hashes.length));
+    for (const h of hashes)
+      parts.push(h);
+    const flagBytes = w47bBitsToBytes(bits);
+    parts.push(w47bEncodeVarInt(flagBytes.length));
+    parts.push(flagBytes);
+    return Buffer.concat(parts).toString("hex");
+  }
+  async verifyTxOutProof(params) {
+    if (typeof params[0] !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameters: expected [proof_hex]");
+    }
+    const proofBuf = Buffer.from(params[0], "hex");
+    if (proofBuf.length < 84) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Proof too short");
+    }
+    const nTx = proofBuf.readUInt32LE(80);
+    if (nTx === 0)
+      return [];
+    let pos = 84;
+    const [hashCount, pos2] = w47bReadVarInt(proofBuf, pos);
+    pos = pos2;
+    if (proofBuf.length < pos + hashCount * 32) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Proof truncated (hashes)");
+    }
+    const hashes = [];
+    for (let i = 0;i < hashCount; i++) {
+      hashes.push(proofBuf.subarray(pos + i * 32, pos + i * 32 + 32));
+    }
+    pos += hashCount * 32;
+    const [flagCount, pos3] = w47bReadVarInt(proofBuf, pos);
+    pos = pos3;
+    if (proofBuf.length < pos + flagCount) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Proof truncated (flags)");
+    }
+    const flagBytes = proofBuf.subarray(pos, pos + flagCount);
+    return w47bTraverseAndExtract(nTx, hashes, flagBytes);
+  }
+  async getRpcInfo() {
+    return {
+      active_commands: [],
+      logpath: ""
+    };
+  }
+}
+
+// src/rpc/rest.ts
+init_block();
+init_tx();
+init_serialization();
+var MAX_REST_HEADERS_RESULTS = 2000;
+var MAX_GETUTXOS_OUTPOINTS = 15;
+
+class RESTServer {
+  server = null;
+  config;
+  chainState;
+  mempool;
+  headerSync;
+  db;
+  params;
+  txIndex;
+  filterIndex;
+  constructor(config, deps) {
+    this.config = {
+      port: config.port ?? 8332,
+      host: config.host ?? "127.0.0.1",
+      txIndexEnabled: config.txIndexEnabled ?? false
+    };
+    this.chainState = deps.chainState;
+    this.mempool = deps.mempool;
+    this.headerSync = deps.headerSync;
+    this.db = deps.db;
+    this.params = deps.params;
+    this.txIndex = deps.txIndex;
+    this.filterIndex = deps.filterIndex;
+  }
+  start() {
+    this.server = Bun.serve({
+      port: this.config.port,
+      hostname: this.config.host,
+      fetch: (req) => this.handleRequest(req)
+    });
+    console.log(`REST API listening on http://${this.config.host}:${this.config.port}/rest/`);
+  }
+  stop() {
+    if (this.server) {
+      this.server.stop();
+      this.server = null;
+    }
+  }
+  async handleRequest(req) {
+    if (req.method !== "GET") {
+      return this.errorResponse(405, "Only GET requests are supported");
+    }
+    const url = new URL(req.url);
+    const path3 = url.pathname;
+    if (!path3.startsWith("/rest/")) {
+      return this.errorResponse(404, "Not found");
+    }
+    const restPath = path3.slice(6);
+    try {
+      if (restPath.startsWith("block/notxdetails/")) {
+        return await this.handleBlockNoTxDetails(restPath.slice(18));
+      }
+      if (restPath.startsWith("blockfilterheaders/")) {
+        return await this.handleBlockFilterHeaders(req, restPath.slice(19));
+      }
+      if (restPath.startsWith("blockfilter/")) {
+        return await this.handleBlockFilter(restPath.slice(12));
+      }
+      if (restPath.startsWith("block/")) {
+        return await this.handleBlock(restPath.slice(6));
+      }
+      if (restPath.startsWith("headers/")) {
+        return await this.handleHeaders(restPath.slice(8));
+      }
+      if (restPath.startsWith("blockhashbyheight/")) {
+        return await this.handleBlockHashByHeight(restPath.slice(18));
+      }
+      if (restPath.startsWith("tx/")) {
+        return await this.handleTx(restPath.slice(3));
+      }
+      if (restPath.startsWith("getutxos/")) {
+        return await this.handleGetUTXOs(restPath.slice(9));
+      }
+      if (restPath.startsWith("mempool/")) {
+        return await this.handleMempool(restPath.slice(8));
+      }
+      if (restPath.startsWith("chaininfo")) {
+        return await this.handleChainInfo(restPath.slice(9));
+      }
+      return this.errorResponse(404, "Unknown REST endpoint");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Internal error";
+      return this.errorResponse(500, message);
+    }
+  }
+  parseFormat(param) {
+    const queryIndex = param.indexOf("?");
+    if (queryIndex !== -1) {
+      param = param.slice(0, queryIndex);
+    }
+    const dotIndex = param.lastIndexOf(".");
+    if (dotIndex === -1) {
+      return { path: param, format: "json" };
+    }
+    const ext = param.slice(dotIndex + 1);
+    const path3 = param.slice(0, dotIndex);
+    if (ext === "json" || ext === "bin" || ext === "hex") {
+      return { path: path3, format: ext };
+    }
+    return { path: param, format: "json" };
+  }
+  formatResponse(data, format, binaryData) {
+    switch (format) {
+      case "json":
+        return new Response(JSON.stringify(data, bigIntJsonReplacer) + `
+`, {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      case "bin":
+        return new Response(binaryData ?? Buffer.alloc(0), {
+          status: 200,
+          headers: { "Content-Type": "application/octet-stream" }
+        });
+      case "hex":
+        const hexStr = (binaryData ?? Buffer.alloc(0)).toString("hex") + `
+`;
+        return new Response(hexStr, {
+          status: 200,
+          headers: { "Content-Type": "text/plain" }
+        });
+    }
+  }
+  errorResponse(status, message) {
+    return new Response(message + `\r
+`, {
+      status,
+      headers: { "Content-Type": "text/plain" }
+    });
+  }
+  async handleBlock(pathParam) {
+    const { path: hashStr, format } = this.parseFormat(pathParam);
+    const hash = this.parseBlockHash(hashStr);
+    if (!hash) {
+      return this.errorResponse(400, "Invalid hash: " + hashStr);
+    }
+    const blockData = await this.db.getBlock(hash);
+    if (!blockData) {
+      return this.errorResponse(404, hashStr + " not found");
+    }
+    if (format === "bin" || format === "hex") {
+      return this.formatResponse(null, format, blockData);
+    }
+    const reader = new BufferReader(blockData);
+    const block = deserializeBlock(reader);
+    const blockIndex = await this.db.getBlockIndex(hash);
+    const height = blockIndex?.height ?? -1;
+    const json = this.formatBlockJson(block, hash, height, true);
+    return this.formatResponse(json, format);
+  }
+  async handleBlockNoTxDetails(pathParam) {
+    const { path: hashStr, format } = this.parseFormat(pathParam);
+    const hash = this.parseBlockHash(hashStr);
+    if (!hash) {
+      return this.errorResponse(400, "Invalid hash: " + hashStr);
+    }
+    const blockData = await this.db.getBlock(hash);
+    if (!blockData) {
+      return this.errorResponse(404, hashStr + " not found");
+    }
+    if (format === "bin" || format === "hex") {
+      return this.formatResponse(null, format, blockData);
+    }
+    const reader = new BufferReader(blockData);
+    const block = deserializeBlock(reader);
+    const blockIndex = await this.db.getBlockIndex(hash);
+    const height = blockIndex?.height ?? -1;
+    const json = this.formatBlockJson(block, hash, height, false);
+    return this.formatResponse(json, format);
+  }
+  formatBlockJson(block, hash, height, includeTxDetails) {
+    const headerEntry = this.headerSync.getHeader(hash);
+    const bestBlock = this.chainState.getBestBlock();
+    const result = {
+      hash: Buffer.from(hash).reverse().toString("hex"),
+      confirmations: height >= 0 ? bestBlock.height - height + 1 : 0,
+      height,
+      version: block.header.version,
+      versionHex: block.header.version.toString(16).padStart(8, "0"),
+      merkleroot: Buffer.from(block.header.merkleRoot).reverse().toString("hex"),
+      time: block.header.timestamp,
+      mediantime: headerEntry ? this.headerSync.getMedianTimePast(headerEntry) : block.header.timestamp,
+      nonce: block.header.nonce,
+      bits: block.header.bits.toString(16).padStart(8, "0"),
+      difficulty: this.calculateDifficultyFromBits(block.header.bits),
+      chainwork: headerEntry?.chainWork.toString(16).padStart(64, "0") ?? "0",
+      nTx: block.transactions.length,
+      previousblockhash: Buffer.from(block.header.prevBlock).reverse().toString("hex")
+    };
+    if (includeTxDetails) {
+      result.tx = block.transactions.map((tx, index) => this.formatTxJson(tx, hash, height, index));
+    } else {
+      result.tx = block.transactions.map((tx) => Buffer.from(getTxId(tx)).reverse().toString("hex"));
+    }
+    return result;
+  }
+  async handleHeaders(pathParam) {
+    const { path: path3, format } = this.parseFormat(pathParam);
+    const parts = path3.split("/");
+    let count;
+    let hashStr;
+    if (parts.length === 2) {
+      count = parseInt(parts[0], 10);
+      hashStr = parts[1];
+    } else if (parts.length === 1) {
+      hashStr = parts[0];
+      count = 5;
+    } else {
+      return this.errorResponse(400, "Invalid URI format. Expected /rest/headers/<hash>.<ext>?count=<count>");
+    }
+    if (isNaN(count) || count < 1 || count > MAX_REST_HEADERS_RESULTS) {
+      return this.errorResponse(400, `Header count is invalid or out of acceptable range (1-${MAX_REST_HEADERS_RESULTS})`);
+    }
+    const hash = this.parseBlockHash(hashStr);
+    if (!hash) {
+      return this.errorResponse(400, "Invalid hash: " + hashStr);
+    }
+    const headers = [];
+    let currentHash = hash;
+    for (let i = 0;i < count; i++) {
+      const blockIndex = await this.db.getBlockIndex(currentHash);
+      if (!blockIndex)
+        break;
+      const headerBuf = blockIndex.header;
+      const header = {
+        version: headerBuf.readInt32LE(0),
+        prevBlock: Buffer.from(headerBuf.subarray(4, 36)),
+        merkleRoot: Buffer.from(headerBuf.subarray(36, 68)),
+        timestamp: headerBuf.readUInt32LE(68),
+        bits: headerBuf.readUInt32LE(72),
+        nonce: headerBuf.readUInt32LE(76)
+      };
+      headers.push(header);
+      const nextHash = await this.db.getBlockHashByHeight(blockIndex.height + 1);
+      if (!nextHash)
+        break;
+      currentHash = nextHash;
+    }
+    if (format === "bin" || format === "hex") {
+      const writer = new BufferWriter;
+      for (const header of headers) {
+        writer.writeBytes(serializeBlockHeader(header));
+      }
+      return this.formatResponse(null, format, writer.toBuffer());
+    }
+    const jsonHeaders = headers.map((header, index) => {
+      const headerHash = getBlockHash(header);
+      const headerEntry = this.headerSync.getHeader(headerHash);
+      return this.formatHeaderJson(header, headerHash, headerEntry);
+    });
+    return this.formatResponse(jsonHeaders, format);
+  }
+  formatHeaderJson(header, hash, headerEntry) {
+    const bestBlock = this.chainState.getBestBlock();
+    const height = headerEntry?.height ?? -1;
+    return {
+      hash: Buffer.from(hash).reverse().toString("hex"),
+      confirmations: height >= 0 ? bestBlock.height - height + 1 : 0,
+      height,
+      version: header.version,
+      versionHex: header.version.toString(16).padStart(8, "0"),
+      merkleroot: Buffer.from(header.merkleRoot).reverse().toString("hex"),
+      time: header.timestamp,
+      nonce: header.nonce,
+      bits: header.bits.toString(16).padStart(8, "0"),
+      difficulty: this.calculateDifficultyFromBits(header.bits),
+      chainwork: headerEntry?.chainWork.toString(16).padStart(64, "0") ?? "0",
+      previousblockhash: Buffer.from(header.prevBlock).reverse().toString("hex")
+    };
+  }
+  async handleBlockHashByHeight(pathParam) {
+    const { path: heightStr, format } = this.parseFormat(pathParam);
+    const height = parseInt(heightStr, 10);
+    if (isNaN(height) || height < 0) {
+      return this.errorResponse(400, "Invalid height: " + heightStr);
+    }
+    const bestBlock = this.chainState.getBestBlock();
+    if (height > bestBlock.height) {
+      return this.errorResponse(404, "Block height out of range");
+    }
+    const hash = await this.db.getBlockHashByHeight(height);
+    if (!hash) {
+      return this.errorResponse(404, "Block hash not found for height");
+    }
+    if (format === "bin") {
+      return this.formatResponse(null, format, hash);
+    }
+    if (format === "hex") {
+      return new Response(Buffer.from(hash).reverse().toString("hex") + `
+`, {
+        status: 200,
+        headers: { "Content-Type": "text/plain" }
+      });
+    }
+    return this.formatResponse({ blockhash: Buffer.from(hash).reverse().toString("hex") }, format);
+  }
+  async handleTx(pathParam) {
+    const { path: txidStr, format } = this.parseFormat(pathParam);
+    const txid = this.parseTxid(txidStr);
+    if (!txid) {
+      return this.errorResponse(400, "Invalid hash: " + txidStr);
+    }
+    const mempoolEntry = this.mempool.getTransaction(txid);
+    if (mempoolEntry) {
+      const rawTx = serializeTx(mempoolEntry.tx, true);
+      if (format === "bin" || format === "hex") {
+        return this.formatResponse(null, format, rawTx);
+      }
+      const json2 = this.formatTxJson(mempoolEntry.tx, null, -1, 0);
+      return this.formatResponse(json2, format);
+    }
+    if (!this.config.txIndexEnabled || !this.txIndex) {
+      return this.errorResponse(404, "No such mempool transaction. Use -txindex to enable transaction index");
+    }
+    const txIndexEntry = await this.txIndex.getTransaction(txid);
+    if (!txIndexEntry) {
+      return this.errorResponse(404, txidStr + " not found");
+    }
+    const blockData = await this.db.getBlock(txIndexEntry.blockHash);
+    if (!blockData) {
+      return this.errorResponse(404, "Block data not available");
+    }
+    const txData = blockData.subarray(txIndexEntry.offset, txIndexEntry.offset + txIndexEntry.length);
+    const reader = new BufferReader(txData);
+    const tx = deserializeTx(reader);
+    if (format === "bin" || format === "hex") {
+      return this.formatResponse(null, format, serializeTx(tx, true));
+    }
+    const blockIndex = await this.db.getBlockIndex(txIndexEntry.blockHash);
+    const height = blockIndex?.height ?? -1;
+    const json = this.formatTxJson(tx, txIndexEntry.blockHash, height, 0);
+    return this.formatResponse(json, format);
+  }
+  formatTxJson(tx, blockHash, height, txIndex) {
+    const txid = getTxId(tx);
+    const wtxid = getWTxId(tx);
+    const result = {
+      txid: Buffer.from(txid).reverse().toString("hex"),
+      hash: Buffer.from(wtxid).reverse().toString("hex"),
+      version: tx.version,
+      size: serializeTx(tx, true).length,
+      vsize: getTxVSize(tx),
+      weight: getTxWeight(tx),
+      locktime: tx.lockTime,
+      vin: tx.inputs.map((input, i) => {
+        const vin = {};
+        if (isCoinbase(tx)) {
+          vin.coinbase = input.scriptSig.toString("hex");
+        } else {
+          vin.txid = Buffer.from(input.prevOut.txid).reverse().toString("hex");
+          vin.vout = input.prevOut.vout;
+          vin.scriptSig = {
+            hex: input.scriptSig.toString("hex")
+          };
+        }
+        vin.sequence = input.sequence;
+        if (input.witness && input.witness.length > 0) {
+          vin.txinwitness = input.witness.map((w) => w.toString("hex"));
+        }
+        return vin;
+      }),
+      vout: tx.outputs.map((output, i) => ({
+        value: Number(output.value) / 1e8,
+        n: i,
+        scriptPubKey: {
+          hex: output.scriptPubKey.toString("hex")
+        }
+      }))
+    };
+    if (blockHash) {
+      result.blockhash = Buffer.from(blockHash).reverse().toString("hex");
+      result.confirmations = this.chainState.getBestBlock().height - height + 1;
+      result.blocktime = 0;
+    }
+    return result;
+  }
+  async handleGetUTXOs(pathParam) {
+    const { path: path3, format } = this.parseFormat(pathParam);
+    const parts = path3.split("/").filter((p) => p.length > 0);
+    if (parts.length === 0) {
+      return this.errorResponse(400, "Error: empty request");
+    }
+    let checkMempool = false;
+    let outpointParts = parts;
+    if (parts[0] === "checkmempool") {
+      checkMempool = true;
+      outpointParts = parts.slice(1);
+    }
+    if (outpointParts.length === 0) {
+      return this.errorResponse(400, "Error: empty request");
+    }
+    if (outpointParts.length > MAX_GETUTXOS_OUTPOINTS) {
+      return this.errorResponse(400, `Error: max outpoints exceeded (max: ${MAX_GETUTXOS_OUTPOINTS}, tried: ${outpointParts.length})`);
+    }
+    const outpoints = [];
+    for (const part of outpointParts) {
+      const dashIndex = part.lastIndexOf("-");
+      if (dashIndex === -1) {
+        return this.errorResponse(400, "Parse error");
+      }
+      const txidHex = part.slice(0, dashIndex);
+      const voutStr = part.slice(dashIndex + 1);
+      const txid = this.parseTxid(txidHex);
+      const vout = parseInt(voutStr, 10);
+      if (!txid || isNaN(vout)) {
+        return this.errorResponse(400, "Parse error");
+      }
+      outpoints.push({ txid, vout });
+    }
+    const hits = [];
+    const utxos = [];
+    const bestBlock = this.chainState.getBestBlock();
+    for (const { txid, vout } of outpoints) {
+      if (checkMempool) {
+        const isSpentInMempool = this.mempool.isOutpointSpent(txid, vout);
+        if (isSpentInMempool) {
+          hits.push(false);
+          continue;
+        }
+      }
+      const utxo = await this.db.getUTXO(txid, vout);
+      if (utxo) {
+        hits.push(true);
+        utxos.push({
+          height: utxo.height,
+          value: utxo.amount,
+          scriptPubKey: utxo.scriptPubKey
+        });
+      } else {
+        hits.push(false);
+      }
+    }
+    const bitmap = Buffer.alloc(Math.ceil(hits.length / 8), 0);
+    for (let i = 0;i < hits.length; i++) {
+      if (hits[i]) {
+        bitmap[Math.floor(i / 8)] |= 1 << i % 8;
+      }
+    }
+    if (format === "bin") {
+      const writer = new BufferWriter;
+      writer.writeInt32LE(bestBlock.height);
+      writer.writeHash(bestBlock.hash);
+      writer.writeVarBytes(bitmap);
+      for (const utxo of utxos) {
+        writer.writeUInt32LE(0);
+        writer.writeUInt32LE(utxo.height);
+        writer.writeUInt64LE(utxo.value);
+        writer.writeVarBytes(utxo.scriptPubKey);
+      }
+      return this.formatResponse(null, format, writer.toBuffer());
+    }
+    if (format === "hex") {
+      const writer = new BufferWriter;
+      writer.writeInt32LE(bestBlock.height);
+      writer.writeHash(bestBlock.hash);
+      writer.writeVarBytes(bitmap);
+      for (const utxo of utxos) {
+        writer.writeUInt32LE(0);
+        writer.writeUInt32LE(utxo.height);
+        writer.writeUInt64LE(utxo.value);
+        writer.writeVarBytes(utxo.scriptPubKey);
+      }
+      return this.formatResponse(null, format, writer.toBuffer());
+    }
+    const bitmapStr = hits.map((h) => h ? "1" : "0").join("");
+    const json = {
+      chainHeight: bestBlock.height,
+      chaintipHash: Buffer.from(bestBlock.hash).reverse().toString("hex"),
+      bitmap: bitmapStr,
+      utxos: utxos.map((utxo) => ({
+        height: utxo.height,
+        value: Number(utxo.value) / 1e8,
+        scriptPubKey: {
+          hex: utxo.scriptPubKey.toString("hex")
+        }
+      }))
+    };
+    return this.formatResponse(json, format);
+  }
+  async handleMempool(pathParam) {
+    const { path: path3, format } = this.parseFormat(pathParam);
+    if (format !== "json") {
+      return this.errorResponse(404, "output format not found (available: json)");
+    }
+    if (path3 === "info") {
+      const info = this.mempool.getInfo();
+      const json = {
+        loaded: true,
+        size: info.size,
+        bytes: info.bytes,
+        usage: info.bytes,
+        maxmempool: 300000000,
+        mempoolminfee: info.minFeeRate / 1e5,
+        minrelaytxfee: 0.00001
+      };
+      return this.formatResponse(json, format);
+    }
+    if (path3 === "contents") {
+      const entries = new Map;
+      const txids = this.mempool.getAllTxids();
+      for (const txid of txids) {
+        const entry = this.mempool.getTransaction(txid);
+        if (entry) {
+          entries.set(Buffer.from(txid).reverse().toString("hex"), {
+            vsize: entry.vsize,
+            weight: entry.weight,
+            fee: Number(entry.fee) / 1e8,
+            modifiedfee: Number(entry.fee) / 1e8,
+            time: entry.addedTime,
+            height: entry.height,
+            descendantcount: entry.descendantCount,
+            descendantsize: entry.descendantSize,
+            ancestorcount: entry.ancestorCount,
+            ancestorsize: entry.ancestorSize,
+            wtxid: Buffer.from(getWTxId(entry.tx)).reverse().toString("hex"),
+            fees: {
+              base: Number(entry.fee) / 1e8,
+              modified: Number(entry.fee) / 1e8,
+              ancestor: Number(entry.fee) / 1e8,
+              descendant: Number(entry.fee) / 1e8
+            },
+            depends: Array.from(entry.dependsOn),
+            spentby: Array.from(entry.spentBy)
+          });
+        }
+      }
+      return this.formatResponse(Object.fromEntries(entries), format);
+    }
+    return this.errorResponse(400, "Invalid URI format. Expected /rest/mempool/<info|contents>.json");
+  }
+  async handleChainInfo(pathParam) {
+    const { format } = this.parseFormat(pathParam);
+    if (format !== "json") {
+      return this.errorResponse(404, "output format not found (available: json)");
+    }
+    const bestBlock = this.chainState.getBestBlock();
+    const bestHeader = this.headerSync.getBestHeader();
+    const json = {
+      chain: this.getChainName(),
+      blocks: bestBlock.height,
+      headers: bestHeader?.height ?? bestBlock.height,
+      bestblockhash: Buffer.from(bestBlock.hash).reverse().toString("hex"),
+      difficulty: await this.getDifficulty(bestBlock.hash),
+      mediantime: 0,
+      verificationprogress: bestHeader && bestHeader.height > 0 ? bestBlock.height / bestHeader.height : 1,
+      chainwork: bestBlock.chainWork.toString(16).padStart(64, "0"),
+      pruned: false,
+      softforks: {},
+      warnings: ""
+    };
+    return this.formatResponse(json, format);
+  }
+  async handleBlockFilter(pathParam) {
+    const { path: path3, format } = this.parseFormat(pathParam);
+    const parts = path3.split("/").filter((p) => p.length > 0);
+    if (parts.length !== 2) {
+      return this.errorResponse(400, "Invalid URI format. Expected /rest/blockfilter/<filtertype>/<blockhash>");
+    }
+    const [filterTypeName, hashStr] = parts;
+    if (filterTypeName !== "basic") {
+      return this.errorResponse(400, "Unknown filtertype " + filterTypeName);
+    }
+    if (!this.filterIndex || !this.filterIndex.isEnabled()) {
+      return this.errorResponse(400, "Index is not enabled for filtertype " + filterTypeName);
+    }
+    const hash = this.parseBlockHash(hashStr);
+    if (!hash) {
+      return this.errorResponse(400, "Invalid hash: " + hashStr);
+    }
+    const blockIndex = await this.db.getBlockIndex(hash);
+    if (!blockIndex) {
+      return this.errorResponse(404, hashStr + " not found");
+    }
+    const filter = await this.filterIndex.getFilter(hash);
+    if (!filter) {
+      return this.errorResponse(404, "Filter not found. Block filters are still in the process of being indexed.");
+    }
+    const filterTypeByte = 0;
+    if (format === "bin" || format === "hex") {
+      const writer = new BufferWriter;
+      writer.writeUInt8(filterTypeByte);
+      writer.writeHash(hash);
+      writer.writeVarBytes(filter);
+      return this.formatResponse(null, format, writer.toBuffer());
+    }
+    return this.formatResponse({ filter: filter.toString("hex") }, format);
+  }
+  async handleBlockFilterHeaders(req, pathParam) {
+    const { path: path3, format } = this.parseFormat(pathParam);
+    const url = new URL(req.url);
+    const parts = path3.split("/").filter((p) => p.length > 0);
+    let filterTypeName;
+    let count;
+    let hashStr;
+    if (parts.length === 3) {
+      filterTypeName = parts[0];
+      count = parseInt(parts[1], 10);
+      hashStr = parts[2];
+    } else if (parts.length === 2) {
+      filterTypeName = parts[0];
+      hashStr = parts[1];
+      const countStr = url.searchParams.get("count") ?? "5";
+      count = parseInt(countStr, 10);
+    } else {
+      return this.errorResponse(400, "Invalid URI format. Expected /rest/blockfilterheaders/<filtertype>/<blockhash>.<ext>?count=<count>");
+    }
+    if (isNaN(count) || count < 1 || count > MAX_REST_HEADERS_RESULTS) {
+      return this.errorResponse(400, `Header count is invalid or out of acceptable range (1-${MAX_REST_HEADERS_RESULTS})`);
+    }
+    if (filterTypeName !== "basic") {
+      return this.errorResponse(400, "Unknown filtertype " + filterTypeName);
+    }
+    if (!this.filterIndex || !this.filterIndex.isEnabled()) {
+      return this.errorResponse(400, "Index is not enabled for filtertype " + filterTypeName);
+    }
+    const hash = this.parseBlockHash(hashStr);
+    if (!hash) {
+      return this.errorResponse(400, "Invalid hash: " + hashStr);
+    }
+    const startBlockIndex = await this.db.getBlockIndex(hash);
+    if (!startBlockIndex) {
+      return this.errorResponse(404, hashStr + " not found");
+    }
+    const headers = [];
+    let currentHash = hash;
+    let currentHeight = startBlockIndex.height;
+    for (let i = 0;i < count; i++) {
+      if (!currentHash)
+        break;
+      const filterHeader = await this.filterIndex.getFilterHeader(currentHash);
+      if (!filterHeader) {
+        return this.errorResponse(404, "Filter not found. Block filters are still in the process of being indexed.");
+      }
+      headers.push(filterHeader);
+      currentHeight += 1;
+      currentHash = await this.db.getBlockHashByHeight(currentHeight);
+    }
+    if (format === "bin" || format === "hex") {
+      const writer = new BufferWriter;
+      for (const h of headers) {
+        writer.writeHash(h);
+      }
+      return this.formatResponse(null, format, writer.toBuffer());
+    }
+    const json = headers.map((h) => Buffer.from(h).reverse().toString("hex"));
+    return this.formatResponse(json, format);
+  }
+  parseBlockHash(hashStr) {
+    if (!/^[0-9a-fA-F]{64}$/.test(hashStr)) {
+      return null;
+    }
+    return Buffer.from(hashStr, "hex");
+  }
+  parseTxid(txidStr) {
+    if (!/^[0-9a-fA-F]{64}$/.test(txidStr)) {
+      return null;
+    }
+    return Buffer.from(txidStr, "hex");
+  }
+  calculateDifficultyFromBits(bits) {
+    const exponent = bits >>> 24;
+    const mantissa = bits & 8388607;
+    const genesisBits = 486604799;
+    const genesisExp = genesisBits >>> 24;
+    const genesisMantissa = genesisBits & 8388607;
+    if (mantissa === 0 || exponent > genesisExp) {
+      return 1;
+    }
+    const target = Number(mantissa) * Math.pow(256, exponent - 3);
+    const genesisTarget = Number(genesisMantissa) * Math.pow(256, genesisExp - 3);
+    return genesisTarget / target;
+  }
+  getChainName() {
+    switch (this.params.networkMagic) {
+      case 3652501241:
+        return "main";
+      case 118034699:
+        return "test";
+      case 3669344250:
+        return "regtest";
+      case 471220008:
+        return "testnet4";
+      default:
+        return "unknown";
+    }
+  }
+  async getDifficulty(blockHash) {
+    const blockIndex = await this.db.getBlockIndex(blockHash);
+    if (!blockIndex)
+      return 1;
+    const bits = blockIndex.header.readUInt32LE(72);
+    return this.calculateDifficultyFromBits(bits);
+  }
+}
+
+// src/storage/indexes.ts
+init_database();
+init_serialization();
+init_block();
+init_tx();
+init_primitives();
+var IndexPrefix = {
+  BLOCK_FILTER: 70,
+  FILTER_HEADER: 71,
+  FILTER_TIP: 72,
+  COIN_STATS: 67,
+  COIN_STATS_TIP: 68,
+  COIN_STATS_MUHASH: 69,
+  TX_BY_HEIGHT: 84
+};
+var BASIC_FILTER_P = 19n;
+var BASIC_FILTER_M = 784931n;
+function sipHash24(key0, key1, data) {
+  const c0 = 0x736f6d6570736575n;
+  const c1 = 0x646f72616e646f6dn;
+  const c2 = 0x6c7967656e657261n;
+  const c3 = 0x7465646279746573n;
+  let v0 = c0 ^ key0;
+  let v1 = c1 ^ key1;
+  let v2 = c2 ^ key0;
+  let v3 = c3 ^ key1;
+  const blocks = Math.floor(data.length / 8);
+  for (let i = 0;i < blocks; i++) {
+    const m2 = data.readBigUInt64LE(i * 8);
+    v3 ^= m2;
+    for (let j = 0;j < 2; j++) {
+      v0 = v0 + v1 & 0xffffffffffffffffn;
+      v1 = (v1 << 13n | v1 >> 51n) & 0xffffffffffffffffn;
+      v1 ^= v0;
+      v0 = (v0 << 32n | v0 >> 32n) & 0xffffffffffffffffn;
+      v2 = v2 + v3 & 0xffffffffffffffffn;
+      v3 = (v3 << 16n | v3 >> 48n) & 0xffffffffffffffffn;
+      v3 ^= v2;
+      v0 = v0 + v3 & 0xffffffffffffffffn;
+      v3 = (v3 << 21n | v3 >> 43n) & 0xffffffffffffffffn;
+      v3 ^= v0;
+      v2 = v2 + v1 & 0xffffffffffffffffn;
+      v1 = (v1 << 17n | v1 >> 47n) & 0xffffffffffffffffn;
+      v1 ^= v2;
+      v2 = (v2 << 32n | v2 >> 32n) & 0xffffffffffffffffn;
+    }
+    v0 ^= m2;
+  }
+  let m = BigInt(data.length) << 56n;
+  const remaining = data.length % 8;
+  for (let i = 0;i < remaining; i++) {
+    m |= BigInt(data[blocks * 8 + i]) << BigInt(i * 8);
+  }
+  v3 ^= m;
+  for (let j = 0;j < 2; j++) {
+    v0 = v0 + v1 & 0xffffffffffffffffn;
+    v1 = (v1 << 13n | v1 >> 51n) & 0xffffffffffffffffn;
+    v1 ^= v0;
+    v0 = (v0 << 32n | v0 >> 32n) & 0xffffffffffffffffn;
+    v2 = v2 + v3 & 0xffffffffffffffffn;
+    v3 = (v3 << 16n | v3 >> 48n) & 0xffffffffffffffffn;
+    v3 ^= v2;
+    v0 = v0 + v3 & 0xffffffffffffffffn;
+    v3 = (v3 << 21n | v3 >> 43n) & 0xffffffffffffffffn;
+    v3 ^= v0;
+    v2 = v2 + v1 & 0xffffffffffffffffn;
+    v1 = (v1 << 17n | v1 >> 47n) & 0xffffffffffffffffn;
+    v1 ^= v2;
+    v2 = (v2 << 32n | v2 >> 32n) & 0xffffffffffffffffn;
+  }
+  v0 ^= m;
+  v2 ^= 0xffn;
+  for (let j = 0;j < 4; j++) {
+    v0 = v0 + v1 & 0xffffffffffffffffn;
+    v1 = (v1 << 13n | v1 >> 51n) & 0xffffffffffffffffn;
+    v1 ^= v0;
+    v0 = (v0 << 32n | v0 >> 32n) & 0xffffffffffffffffn;
+    v2 = v2 + v3 & 0xffffffffffffffffn;
+    v3 = (v3 << 16n | v3 >> 48n) & 0xffffffffffffffffn;
+    v3 ^= v2;
+    v0 = v0 + v3 & 0xffffffffffffffffn;
+    v3 = (v3 << 21n | v3 >> 43n) & 0xffffffffffffffffn;
+    v3 ^= v0;
+    v2 = v2 + v1 & 0xffffffffffffffffn;
+    v1 = (v1 << 17n | v1 >> 47n) & 0xffffffffffffffffn;
+    v1 ^= v2;
+    v2 = (v2 << 32n | v2 >> 32n) & 0xffffffffffffffffn;
+  }
+  return v0 ^ v1 ^ v2 ^ v3;
+}
+function fastRange64(hash, range) {
+  const product = hash * range;
+  return product >> 64n;
+}
+
+class BitStreamWriter {
+  buffer = [];
+  currentByte = 0;
+  bitPos = 0;
+  writeBits(value, n) {
+    for (let i = 0;i < n; i++) {
+      if ((value & 1n << BigInt(i)) !== 0n) {
+        this.currentByte |= 1 << this.bitPos;
+      }
+      this.bitPos++;
+      if (this.bitPos === 8) {
+        this.buffer.push(this.currentByte);
+        this.currentByte = 0;
+        this.bitPos = 0;
+      }
+    }
+  }
+  writeBit(bit) {
+    if (bit) {
+      this.currentByte |= 1 << this.bitPos;
+    }
+    this.bitPos++;
+    if (this.bitPos === 8) {
+      this.buffer.push(this.currentByte);
+      this.currentByte = 0;
+      this.bitPos = 0;
+    }
+  }
+  flush() {
+    if (this.bitPos > 0) {
+      this.buffer.push(this.currentByte);
+      this.currentByte = 0;
+      this.bitPos = 0;
+    }
+  }
+  toBuffer() {
+    return Buffer.from(this.buffer);
+  }
+}
+
+class BitStreamReader {
+  data;
+  bytePos = 0;
+  bitPos = 0;
+  constructor(data) {
+    this.data = data;
+  }
+  readBit() {
+    if (this.bytePos >= this.data.length) {
+      throw new Error("BitStreamReader: out of data");
+    }
+    const bit = this.data[this.bytePos] >> this.bitPos & 1;
+    this.bitPos++;
+    if (this.bitPos === 8) {
+      this.bitPos = 0;
+      this.bytePos++;
+    }
+    return bit;
+  }
+  readBits(n) {
+    let value = 0n;
+    for (let i = 0;i < n; i++) {
+      if (this.readBit()) {
+        value |= 1n << BigInt(i);
+      }
+    }
+    return value;
+  }
+  hasMore() {
+    return this.bytePos < this.data.length;
+  }
+}
+function golombRiceEncode(writer, p, value) {
+  const quotient = value >> p;
+  const remainder = value & (1n << p) - 1n;
+  for (let i = 0n;i < quotient; i++) {
+    writer.writeBit(1);
+  }
+  writer.writeBit(0);
+  writer.writeBits(remainder, Number(p));
+}
+function golombRiceDecode(reader, p) {
+  let quotient = 0n;
+  while (reader.readBit() === 1) {
+    quotient++;
+  }
+  const remainder = reader.readBits(Number(p));
+  return quotient << p | remainder;
+}
+
+class GCSFilter {
+  n;
+  m;
+  p;
+  f;
+  k0;
+  k1;
+  encodedFilter;
+  constructor(elements, blockHash, m = BASIC_FILTER_M, p = BASIC_FILTER_P) {
+    this.n = elements.length;
+    this.m = m;
+    this.p = p;
+    this.f = BigInt(this.n) * m;
+    this.k0 = blockHash.readBigUInt64LE(0);
+    this.k1 = blockHash.readBigUInt64LE(8);
+    this.encodedFilter = this.build(elements);
+  }
+  static fromEncoded(encoded, blockHash, m = BASIC_FILTER_M, p = BASIC_FILTER_P) {
+    const filter = Object.create(GCSFilter.prototype);
+    filter.m = m;
+    filter.p = p;
+    filter.k0 = blockHash.readBigUInt64LE(0);
+    filter.k1 = blockHash.readBigUInt64LE(8);
+    filter.encodedFilter = encoded;
+    const reader = new BufferReader(encoded);
+    filter.n = Number(reader.readVarInt());
+    filter.f = BigInt(filter.n) * m;
+    return filter;
+  }
+  hashToRange(element) {
+    const hash = sipHash24(this.k0, this.k1, element);
+    return fastRange64(hash, this.f);
+  }
+  build(elements) {
+    if (elements.length === 0) {
+      const writer = new BufferWriter;
+      writer.writeVarInt(0);
+      return writer.toBuffer();
+    }
+    const hashes = elements.map((e) => this.hashToRange(e));
+    hashes.sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
+    const bitWriter = new BitStreamWriter;
+    const prefixWriter = new BufferWriter;
+    prefixWriter.writeVarInt(this.n);
+    const prefix = prefixWriter.toBuffer();
+    let lastValue = 0n;
+    for (const hash of hashes) {
+      const delta = hash - lastValue;
+      golombRiceEncode(bitWriter, this.p, delta);
+      lastValue = hash;
+    }
+    bitWriter.flush();
+    return Buffer.concat([prefix, bitWriter.toBuffer()]);
+  }
+  match(element) {
+    if (this.n === 0)
+      return false;
+    const target = this.hashToRange(element);
+    return this.matchInternal([target]);
+  }
+  matchAny(elements) {
+    if (this.n === 0 || elements.length === 0)
+      return false;
+    const targets = elements.map((e) => this.hashToRange(e));
+    targets.sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
+    return this.matchInternal(targets);
+  }
+  matchInternal(sortedTargets) {
+    const prefixReader = new BufferReader(this.encodedFilter);
+    const n = Number(prefixReader.readVarInt());
+    if (n === 0)
+      return false;
+    const bitStreamData = this.encodedFilter.subarray(prefixReader.position);
+    const bitReader = new BitStreamReader(bitStreamData);
+    let filterValue = 0n;
+    let targetIdx = 0;
+    for (let i = 0;i < n; i++) {
+      const delta = golombRiceDecode(bitReader, this.p);
+      filterValue += delta;
+      while (targetIdx < sortedTargets.length && sortedTargets[targetIdx] < filterValue) {
+        targetIdx++;
+      }
+      if (targetIdx < sortedTargets.length && sortedTargets[targetIdx] === filterValue) {
+        return true;
+      }
+      if (targetIdx >= sortedTargets.length) {
+        return false;
+      }
+    }
+    return false;
+  }
+  getEncodedFilter() {
+    return this.encodedFilter;
+  }
+  getN() {
+    return this.n;
+  }
+  getHash() {
+    return hash256(this.encodedFilter);
+  }
+}
+function computeFilterHeader(filterHash, prevHeader) {
+  return hash256(Buffer.concat([filterHash, prevHeader]));
+}
+
+class BlockFilterIndex {
+  db;
+  enabled;
+  currentHeight;
+  currentHeader;
+  constructor(db, enabled = false) {
+    this.db = db;
+    this.enabled = enabled;
+    this.currentHeight = -1;
+    this.currentHeader = Buffer.alloc(32, 0);
+  }
+  isEnabled() {
+    return this.enabled;
+  }
+  setEnabled(enabled) {
+    this.enabled = enabled;
+  }
+  getHeight() {
+    return this.currentHeight;
+  }
+  async init() {
+    if (!this.enabled)
+      return;
+    const tipKey = Buffer.from([IndexPrefix.FILTER_TIP]);
+    try {
+      const tipData = await this.db.db.get(tipKey);
+      if (tipData) {
+        const reader = new BufferReader(tipData);
+        this.currentHeight = reader.readUInt32LE();
+        this.currentHeader = reader.readHash();
+      }
+    } catch {}
+  }
+  buildFilter(block, spentOutputs) {
+    const blockHash = getBlockHash(block.header);
+    const elements = [];
+    for (const tx of block.transactions) {
+      for (const output of tx.outputs) {
+        const script = output.scriptPubKey;
+        if (script.length === 0 || script[0] === 106)
+          continue;
+        elements.push(script);
+      }
+    }
+    for (const spent of spentOutputs) {
+      const script = spent.entry.scriptPubKey;
+      if (script.length === 0)
+        continue;
+      elements.push(script);
+    }
+    return new GCSFilter(elements, blockHash);
+  }
+  async indexBlock(block, height, spentOutputs) {
+    if (!this.enabled)
+      return;
+    const blockHash = getBlockHash(block.header);
+    const filter = this.buildFilter(block, spentOutputs);
+    const filterHash = filter.getHash();
+    const filterHeader = computeFilterHeader(filterHash, this.currentHeader);
+    const ops = [];
+    const filterKey = Buffer.from([IndexPrefix.BLOCK_FILTER, ...blockHash]);
+    ops.push({
+      type: "put",
+      prefix: IndexPrefix.BLOCK_FILTER,
+      key: blockHash,
+      value: filter.getEncodedFilter()
+    });
+    ops.push({
+      type: "put",
+      prefix: IndexPrefix.FILTER_HEADER,
+      key: blockHash,
+      value: filterHeader
+    });
+    const tipWriter = new BufferWriter;
+    tipWriter.writeUInt32LE(height);
+    tipWriter.writeHash(filterHeader);
+    ops.push({
+      type: "put",
+      prefix: IndexPrefix.FILTER_TIP,
+      key: Buffer.alloc(0),
+      value: tipWriter.toBuffer()
+    });
+    await this.db.batch(ops);
+    this.currentHeight = height;
+    this.currentHeader = filterHeader;
+  }
+  async getFilter(blockHash) {
+    if (!this.enabled)
+      return null;
+    const key = Buffer.concat([Buffer.from([IndexPrefix.BLOCK_FILTER]), blockHash]);
+    try {
+      const data = await this.db.db.get(key);
+      return data ?? null;
+    } catch {
+      return null;
+    }
+  }
+  async getFilterHeader(blockHash) {
+    if (!this.enabled)
+      return null;
+    const key = Buffer.concat([Buffer.from([IndexPrefix.FILTER_HEADER]), blockHash]);
+    try {
+      const data = await this.db.db.get(key);
+      return data ?? null;
+    } catch {
+      return null;
+    }
+  }
+  async removeBlock(block, height) {
+    if (!this.enabled)
+      return;
+    const blockHash = getBlockHash(block.header);
+    if (this.currentHeight !== height) {
+      return;
+    }
+    if (!blockHash.equals(this.currentHeader === null ? Buffer.alloc(0) : blockHash)) {}
+    let prevFilterHeader = Buffer.alloc(32, 0);
+    if (height > 0) {
+      const stored = await this.getFilterHeader(block.header.prevBlock);
+      if (stored) {
+        prevFilterHeader = stored;
+      }
+      if (!stored) {
+        console.warn(`[blockfilterindex] removeBlock(h=${height}, ${blockHash.toString("hex").slice(0, 16)}): missing prev filter header for ${block.header.prevBlock.toString("hex").slice(0, 16)}; rewinding to zero (filter chain may diverge)`);
+      }
+    }
+    const tipWriter = new BufferWriter;
+    tipWriter.writeUInt32LE(height - 1);
+    tipWriter.writeHash(prevFilterHeader);
+    const ops = [
+      {
+        type: "put",
+        prefix: IndexPrefix.FILTER_TIP,
+        key: Buffer.alloc(0),
+        value: tipWriter.toBuffer()
+      }
+    ];
+    await this.db.batch(ops);
+    this.currentHeight = height - 1;
+    this.currentHeader = prevFilterHeader;
   }
 }
 
@@ -29955,14 +35700,2147 @@ var cmac = (key, message) => new _CMAC(key).update(message).digest();
 cmac.create = (key) => new _CMAC(key);
 
 // src/wallet/wallet.ts
+import * as crypto2 from "crypto";
+
+// src/wallet/bip39.ts
+init_sha2();
+
+// src/wallet/bip39_english_wordlist.ts
+var BIP39_ENGLISH_WORDLIST = [
+  "abandon",
+  "ability",
+  "able",
+  "about",
+  "above",
+  "absent",
+  "absorb",
+  "abstract",
+  "absurd",
+  "abuse",
+  "access",
+  "accident",
+  "account",
+  "accuse",
+  "achieve",
+  "acid",
+  "acoustic",
+  "acquire",
+  "across",
+  "act",
+  "action",
+  "actor",
+  "actress",
+  "actual",
+  "adapt",
+  "add",
+  "addict",
+  "address",
+  "adjust",
+  "admit",
+  "adult",
+  "advance",
+  "advice",
+  "aerobic",
+  "affair",
+  "afford",
+  "afraid",
+  "again",
+  "age",
+  "agent",
+  "agree",
+  "ahead",
+  "aim",
+  "air",
+  "airport",
+  "aisle",
+  "alarm",
+  "album",
+  "alcohol",
+  "alert",
+  "alien",
+  "all",
+  "alley",
+  "allow",
+  "almost",
+  "alone",
+  "alpha",
+  "already",
+  "also",
+  "alter",
+  "always",
+  "amateur",
+  "amazing",
+  "among",
+  "amount",
+  "amused",
+  "analyst",
+  "anchor",
+  "ancient",
+  "anger",
+  "angle",
+  "angry",
+  "animal",
+  "ankle",
+  "announce",
+  "annual",
+  "another",
+  "answer",
+  "antenna",
+  "antique",
+  "anxiety",
+  "any",
+  "apart",
+  "apology",
+  "appear",
+  "apple",
+  "approve",
+  "april",
+  "arch",
+  "arctic",
+  "area",
+  "arena",
+  "argue",
+  "arm",
+  "armed",
+  "armor",
+  "army",
+  "around",
+  "arrange",
+  "arrest",
+  "arrive",
+  "arrow",
+  "art",
+  "artefact",
+  "artist",
+  "artwork",
+  "ask",
+  "aspect",
+  "assault",
+  "asset",
+  "assist",
+  "assume",
+  "asthma",
+  "athlete",
+  "atom",
+  "attack",
+  "attend",
+  "attitude",
+  "attract",
+  "auction",
+  "audit",
+  "august",
+  "aunt",
+  "author",
+  "auto",
+  "autumn",
+  "average",
+  "avocado",
+  "avoid",
+  "awake",
+  "aware",
+  "away",
+  "awesome",
+  "awful",
+  "awkward",
+  "axis",
+  "baby",
+  "bachelor",
+  "bacon",
+  "badge",
+  "bag",
+  "balance",
+  "balcony",
+  "ball",
+  "bamboo",
+  "banana",
+  "banner",
+  "bar",
+  "barely",
+  "bargain",
+  "barrel",
+  "base",
+  "basic",
+  "basket",
+  "battle",
+  "beach",
+  "bean",
+  "beauty",
+  "because",
+  "become",
+  "beef",
+  "before",
+  "begin",
+  "behave",
+  "behind",
+  "believe",
+  "below",
+  "belt",
+  "bench",
+  "benefit",
+  "best",
+  "betray",
+  "better",
+  "between",
+  "beyond",
+  "bicycle",
+  "bid",
+  "bike",
+  "bind",
+  "biology",
+  "bird",
+  "birth",
+  "bitter",
+  "black",
+  "blade",
+  "blame",
+  "blanket",
+  "blast",
+  "bleak",
+  "bless",
+  "blind",
+  "blood",
+  "blossom",
+  "blouse",
+  "blue",
+  "blur",
+  "blush",
+  "board",
+  "boat",
+  "body",
+  "boil",
+  "bomb",
+  "bone",
+  "bonus",
+  "book",
+  "boost",
+  "border",
+  "boring",
+  "borrow",
+  "boss",
+  "bottom",
+  "bounce",
+  "box",
+  "boy",
+  "bracket",
+  "brain",
+  "brand",
+  "brass",
+  "brave",
+  "bread",
+  "breeze",
+  "brick",
+  "bridge",
+  "brief",
+  "bright",
+  "bring",
+  "brisk",
+  "broccoli",
+  "broken",
+  "bronze",
+  "broom",
+  "brother",
+  "brown",
+  "brush",
+  "bubble",
+  "buddy",
+  "budget",
+  "buffalo",
+  "build",
+  "bulb",
+  "bulk",
+  "bullet",
+  "bundle",
+  "bunker",
+  "burden",
+  "burger",
+  "burst",
+  "bus",
+  "business",
+  "busy",
+  "butter",
+  "buyer",
+  "buzz",
+  "cabbage",
+  "cabin",
+  "cable",
+  "cactus",
+  "cage",
+  "cake",
+  "call",
+  "calm",
+  "camera",
+  "camp",
+  "can",
+  "canal",
+  "cancel",
+  "candy",
+  "cannon",
+  "canoe",
+  "canvas",
+  "canyon",
+  "capable",
+  "capital",
+  "captain",
+  "car",
+  "carbon",
+  "card",
+  "cargo",
+  "carpet",
+  "carry",
+  "cart",
+  "case",
+  "cash",
+  "casino",
+  "castle",
+  "casual",
+  "cat",
+  "catalog",
+  "catch",
+  "category",
+  "cattle",
+  "caught",
+  "cause",
+  "caution",
+  "cave",
+  "ceiling",
+  "celery",
+  "cement",
+  "census",
+  "century",
+  "cereal",
+  "certain",
+  "chair",
+  "chalk",
+  "champion",
+  "change",
+  "chaos",
+  "chapter",
+  "charge",
+  "chase",
+  "chat",
+  "cheap",
+  "check",
+  "cheese",
+  "chef",
+  "cherry",
+  "chest",
+  "chicken",
+  "chief",
+  "child",
+  "chimney",
+  "choice",
+  "choose",
+  "chronic",
+  "chuckle",
+  "chunk",
+  "churn",
+  "cigar",
+  "cinnamon",
+  "circle",
+  "citizen",
+  "city",
+  "civil",
+  "claim",
+  "clap",
+  "clarify",
+  "claw",
+  "clay",
+  "clean",
+  "clerk",
+  "clever",
+  "click",
+  "client",
+  "cliff",
+  "climb",
+  "clinic",
+  "clip",
+  "clock",
+  "clog",
+  "close",
+  "cloth",
+  "cloud",
+  "clown",
+  "club",
+  "clump",
+  "cluster",
+  "clutch",
+  "coach",
+  "coast",
+  "coconut",
+  "code",
+  "coffee",
+  "coil",
+  "coin",
+  "collect",
+  "color",
+  "column",
+  "combine",
+  "come",
+  "comfort",
+  "comic",
+  "common",
+  "company",
+  "concert",
+  "conduct",
+  "confirm",
+  "congress",
+  "connect",
+  "consider",
+  "control",
+  "convince",
+  "cook",
+  "cool",
+  "copper",
+  "copy",
+  "coral",
+  "core",
+  "corn",
+  "correct",
+  "cost",
+  "cotton",
+  "couch",
+  "country",
+  "couple",
+  "course",
+  "cousin",
+  "cover",
+  "coyote",
+  "crack",
+  "cradle",
+  "craft",
+  "cram",
+  "crane",
+  "crash",
+  "crater",
+  "crawl",
+  "crazy",
+  "cream",
+  "credit",
+  "creek",
+  "crew",
+  "cricket",
+  "crime",
+  "crisp",
+  "critic",
+  "crop",
+  "cross",
+  "crouch",
+  "crowd",
+  "crucial",
+  "cruel",
+  "cruise",
+  "crumble",
+  "crunch",
+  "crush",
+  "cry",
+  "crystal",
+  "cube",
+  "culture",
+  "cup",
+  "cupboard",
+  "curious",
+  "current",
+  "curtain",
+  "curve",
+  "cushion",
+  "custom",
+  "cute",
+  "cycle",
+  "dad",
+  "damage",
+  "damp",
+  "dance",
+  "danger",
+  "daring",
+  "dash",
+  "daughter",
+  "dawn",
+  "day",
+  "deal",
+  "debate",
+  "debris",
+  "decade",
+  "december",
+  "decide",
+  "decline",
+  "decorate",
+  "decrease",
+  "deer",
+  "defense",
+  "define",
+  "defy",
+  "degree",
+  "delay",
+  "deliver",
+  "demand",
+  "demise",
+  "denial",
+  "dentist",
+  "deny",
+  "depart",
+  "depend",
+  "deposit",
+  "depth",
+  "deputy",
+  "derive",
+  "describe",
+  "desert",
+  "design",
+  "desk",
+  "despair",
+  "destroy",
+  "detail",
+  "detect",
+  "develop",
+  "device",
+  "devote",
+  "diagram",
+  "dial",
+  "diamond",
+  "diary",
+  "dice",
+  "diesel",
+  "diet",
+  "differ",
+  "digital",
+  "dignity",
+  "dilemma",
+  "dinner",
+  "dinosaur",
+  "direct",
+  "dirt",
+  "disagree",
+  "discover",
+  "disease",
+  "dish",
+  "dismiss",
+  "disorder",
+  "display",
+  "distance",
+  "divert",
+  "divide",
+  "divorce",
+  "dizzy",
+  "doctor",
+  "document",
+  "dog",
+  "doll",
+  "dolphin",
+  "domain",
+  "donate",
+  "donkey",
+  "donor",
+  "door",
+  "dose",
+  "double",
+  "dove",
+  "draft",
+  "dragon",
+  "drama",
+  "drastic",
+  "draw",
+  "dream",
+  "dress",
+  "drift",
+  "drill",
+  "drink",
+  "drip",
+  "drive",
+  "drop",
+  "drum",
+  "dry",
+  "duck",
+  "dumb",
+  "dune",
+  "during",
+  "dust",
+  "dutch",
+  "duty",
+  "dwarf",
+  "dynamic",
+  "eager",
+  "eagle",
+  "early",
+  "earn",
+  "earth",
+  "easily",
+  "east",
+  "easy",
+  "echo",
+  "ecology",
+  "economy",
+  "edge",
+  "edit",
+  "educate",
+  "effort",
+  "egg",
+  "eight",
+  "either",
+  "elbow",
+  "elder",
+  "electric",
+  "elegant",
+  "element",
+  "elephant",
+  "elevator",
+  "elite",
+  "else",
+  "embark",
+  "embody",
+  "embrace",
+  "emerge",
+  "emotion",
+  "employ",
+  "empower",
+  "empty",
+  "enable",
+  "enact",
+  "end",
+  "endless",
+  "endorse",
+  "enemy",
+  "energy",
+  "enforce",
+  "engage",
+  "engine",
+  "enhance",
+  "enjoy",
+  "enlist",
+  "enough",
+  "enrich",
+  "enroll",
+  "ensure",
+  "enter",
+  "entire",
+  "entry",
+  "envelope",
+  "episode",
+  "equal",
+  "equip",
+  "era",
+  "erase",
+  "erode",
+  "erosion",
+  "error",
+  "erupt",
+  "escape",
+  "essay",
+  "essence",
+  "estate",
+  "eternal",
+  "ethics",
+  "evidence",
+  "evil",
+  "evoke",
+  "evolve",
+  "exact",
+  "example",
+  "excess",
+  "exchange",
+  "excite",
+  "exclude",
+  "excuse",
+  "execute",
+  "exercise",
+  "exhaust",
+  "exhibit",
+  "exile",
+  "exist",
+  "exit",
+  "exotic",
+  "expand",
+  "expect",
+  "expire",
+  "explain",
+  "expose",
+  "express",
+  "extend",
+  "extra",
+  "eye",
+  "eyebrow",
+  "fabric",
+  "face",
+  "faculty",
+  "fade",
+  "faint",
+  "faith",
+  "fall",
+  "false",
+  "fame",
+  "family",
+  "famous",
+  "fan",
+  "fancy",
+  "fantasy",
+  "farm",
+  "fashion",
+  "fat",
+  "fatal",
+  "father",
+  "fatigue",
+  "fault",
+  "favorite",
+  "feature",
+  "february",
+  "federal",
+  "fee",
+  "feed",
+  "feel",
+  "female",
+  "fence",
+  "festival",
+  "fetch",
+  "fever",
+  "few",
+  "fiber",
+  "fiction",
+  "field",
+  "figure",
+  "file",
+  "film",
+  "filter",
+  "final",
+  "find",
+  "fine",
+  "finger",
+  "finish",
+  "fire",
+  "firm",
+  "first",
+  "fiscal",
+  "fish",
+  "fit",
+  "fitness",
+  "fix",
+  "flag",
+  "flame",
+  "flash",
+  "flat",
+  "flavor",
+  "flee",
+  "flight",
+  "flip",
+  "float",
+  "flock",
+  "floor",
+  "flower",
+  "fluid",
+  "flush",
+  "fly",
+  "foam",
+  "focus",
+  "fog",
+  "foil",
+  "fold",
+  "follow",
+  "food",
+  "foot",
+  "force",
+  "forest",
+  "forget",
+  "fork",
+  "fortune",
+  "forum",
+  "forward",
+  "fossil",
+  "foster",
+  "found",
+  "fox",
+  "fragile",
+  "frame",
+  "frequent",
+  "fresh",
+  "friend",
+  "fringe",
+  "frog",
+  "front",
+  "frost",
+  "frown",
+  "frozen",
+  "fruit",
+  "fuel",
+  "fun",
+  "funny",
+  "furnace",
+  "fury",
+  "future",
+  "gadget",
+  "gain",
+  "galaxy",
+  "gallery",
+  "game",
+  "gap",
+  "garage",
+  "garbage",
+  "garden",
+  "garlic",
+  "garment",
+  "gas",
+  "gasp",
+  "gate",
+  "gather",
+  "gauge",
+  "gaze",
+  "general",
+  "genius",
+  "genre",
+  "gentle",
+  "genuine",
+  "gesture",
+  "ghost",
+  "giant",
+  "gift",
+  "giggle",
+  "ginger",
+  "giraffe",
+  "girl",
+  "give",
+  "glad",
+  "glance",
+  "glare",
+  "glass",
+  "glide",
+  "glimpse",
+  "globe",
+  "gloom",
+  "glory",
+  "glove",
+  "glow",
+  "glue",
+  "goat",
+  "goddess",
+  "gold",
+  "good",
+  "goose",
+  "gorilla",
+  "gospel",
+  "gossip",
+  "govern",
+  "gown",
+  "grab",
+  "grace",
+  "grain",
+  "grant",
+  "grape",
+  "grass",
+  "gravity",
+  "great",
+  "green",
+  "grid",
+  "grief",
+  "grit",
+  "grocery",
+  "group",
+  "grow",
+  "grunt",
+  "guard",
+  "guess",
+  "guide",
+  "guilt",
+  "guitar",
+  "gun",
+  "gym",
+  "habit",
+  "hair",
+  "half",
+  "hammer",
+  "hamster",
+  "hand",
+  "happy",
+  "harbor",
+  "hard",
+  "harsh",
+  "harvest",
+  "hat",
+  "have",
+  "hawk",
+  "hazard",
+  "head",
+  "health",
+  "heart",
+  "heavy",
+  "hedgehog",
+  "height",
+  "hello",
+  "helmet",
+  "help",
+  "hen",
+  "hero",
+  "hidden",
+  "high",
+  "hill",
+  "hint",
+  "hip",
+  "hire",
+  "history",
+  "hobby",
+  "hockey",
+  "hold",
+  "hole",
+  "holiday",
+  "hollow",
+  "home",
+  "honey",
+  "hood",
+  "hope",
+  "horn",
+  "horror",
+  "horse",
+  "hospital",
+  "host",
+  "hotel",
+  "hour",
+  "hover",
+  "hub",
+  "huge",
+  "human",
+  "humble",
+  "humor",
+  "hundred",
+  "hungry",
+  "hunt",
+  "hurdle",
+  "hurry",
+  "hurt",
+  "husband",
+  "hybrid",
+  "ice",
+  "icon",
+  "idea",
+  "identify",
+  "idle",
+  "ignore",
+  "ill",
+  "illegal",
+  "illness",
+  "image",
+  "imitate",
+  "immense",
+  "immune",
+  "impact",
+  "impose",
+  "improve",
+  "impulse",
+  "inch",
+  "include",
+  "income",
+  "increase",
+  "index",
+  "indicate",
+  "indoor",
+  "industry",
+  "infant",
+  "inflict",
+  "inform",
+  "inhale",
+  "inherit",
+  "initial",
+  "inject",
+  "injury",
+  "inmate",
+  "inner",
+  "innocent",
+  "input",
+  "inquiry",
+  "insane",
+  "insect",
+  "inside",
+  "inspire",
+  "install",
+  "intact",
+  "interest",
+  "into",
+  "invest",
+  "invite",
+  "involve",
+  "iron",
+  "island",
+  "isolate",
+  "issue",
+  "item",
+  "ivory",
+  "jacket",
+  "jaguar",
+  "jar",
+  "jazz",
+  "jealous",
+  "jeans",
+  "jelly",
+  "jewel",
+  "job",
+  "join",
+  "joke",
+  "journey",
+  "joy",
+  "judge",
+  "juice",
+  "jump",
+  "jungle",
+  "junior",
+  "junk",
+  "just",
+  "kangaroo",
+  "keen",
+  "keep",
+  "ketchup",
+  "key",
+  "kick",
+  "kid",
+  "kidney",
+  "kind",
+  "kingdom",
+  "kiss",
+  "kit",
+  "kitchen",
+  "kite",
+  "kitten",
+  "kiwi",
+  "knee",
+  "knife",
+  "knock",
+  "know",
+  "lab",
+  "label",
+  "labor",
+  "ladder",
+  "lady",
+  "lake",
+  "lamp",
+  "language",
+  "laptop",
+  "large",
+  "later",
+  "latin",
+  "laugh",
+  "laundry",
+  "lava",
+  "law",
+  "lawn",
+  "lawsuit",
+  "layer",
+  "lazy",
+  "leader",
+  "leaf",
+  "learn",
+  "leave",
+  "lecture",
+  "left",
+  "leg",
+  "legal",
+  "legend",
+  "leisure",
+  "lemon",
+  "lend",
+  "length",
+  "lens",
+  "leopard",
+  "lesson",
+  "letter",
+  "level",
+  "liar",
+  "liberty",
+  "library",
+  "license",
+  "life",
+  "lift",
+  "light",
+  "like",
+  "limb",
+  "limit",
+  "link",
+  "lion",
+  "liquid",
+  "list",
+  "little",
+  "live",
+  "lizard",
+  "load",
+  "loan",
+  "lobster",
+  "local",
+  "lock",
+  "logic",
+  "lonely",
+  "long",
+  "loop",
+  "lottery",
+  "loud",
+  "lounge",
+  "love",
+  "loyal",
+  "lucky",
+  "luggage",
+  "lumber",
+  "lunar",
+  "lunch",
+  "luxury",
+  "lyrics",
+  "machine",
+  "mad",
+  "magic",
+  "magnet",
+  "maid",
+  "mail",
+  "main",
+  "major",
+  "make",
+  "mammal",
+  "man",
+  "manage",
+  "mandate",
+  "mango",
+  "mansion",
+  "manual",
+  "maple",
+  "marble",
+  "march",
+  "margin",
+  "marine",
+  "market",
+  "marriage",
+  "mask",
+  "mass",
+  "master",
+  "match",
+  "material",
+  "math",
+  "matrix",
+  "matter",
+  "maximum",
+  "maze",
+  "meadow",
+  "mean",
+  "measure",
+  "meat",
+  "mechanic",
+  "medal",
+  "media",
+  "melody",
+  "melt",
+  "member",
+  "memory",
+  "mention",
+  "menu",
+  "mercy",
+  "merge",
+  "merit",
+  "merry",
+  "mesh",
+  "message",
+  "metal",
+  "method",
+  "middle",
+  "midnight",
+  "milk",
+  "million",
+  "mimic",
+  "mind",
+  "minimum",
+  "minor",
+  "minute",
+  "miracle",
+  "mirror",
+  "misery",
+  "miss",
+  "mistake",
+  "mix",
+  "mixed",
+  "mixture",
+  "mobile",
+  "model",
+  "modify",
+  "mom",
+  "moment",
+  "monitor",
+  "monkey",
+  "monster",
+  "month",
+  "moon",
+  "moral",
+  "more",
+  "morning",
+  "mosquito",
+  "mother",
+  "motion",
+  "motor",
+  "mountain",
+  "mouse",
+  "move",
+  "movie",
+  "much",
+  "muffin",
+  "mule",
+  "multiply",
+  "muscle",
+  "museum",
+  "mushroom",
+  "music",
+  "must",
+  "mutual",
+  "myself",
+  "mystery",
+  "myth",
+  "naive",
+  "name",
+  "napkin",
+  "narrow",
+  "nasty",
+  "nation",
+  "nature",
+  "near",
+  "neck",
+  "need",
+  "negative",
+  "neglect",
+  "neither",
+  "nephew",
+  "nerve",
+  "nest",
+  "net",
+  "network",
+  "neutral",
+  "never",
+  "news",
+  "next",
+  "nice",
+  "night",
+  "noble",
+  "noise",
+  "nominee",
+  "noodle",
+  "normal",
+  "north",
+  "nose",
+  "notable",
+  "note",
+  "nothing",
+  "notice",
+  "novel",
+  "now",
+  "nuclear",
+  "number",
+  "nurse",
+  "nut",
+  "oak",
+  "obey",
+  "object",
+  "oblige",
+  "obscure",
+  "observe",
+  "obtain",
+  "obvious",
+  "occur",
+  "ocean",
+  "october",
+  "odor",
+  "off",
+  "offer",
+  "office",
+  "often",
+  "oil",
+  "okay",
+  "old",
+  "olive",
+  "olympic",
+  "omit",
+  "once",
+  "one",
+  "onion",
+  "online",
+  "only",
+  "open",
+  "opera",
+  "opinion",
+  "oppose",
+  "option",
+  "orange",
+  "orbit",
+  "orchard",
+  "order",
+  "ordinary",
+  "organ",
+  "orient",
+  "original",
+  "orphan",
+  "ostrich",
+  "other",
+  "outdoor",
+  "outer",
+  "output",
+  "outside",
+  "oval",
+  "oven",
+  "over",
+  "own",
+  "owner",
+  "oxygen",
+  "oyster",
+  "ozone",
+  "pact",
+  "paddle",
+  "page",
+  "pair",
+  "palace",
+  "palm",
+  "panda",
+  "panel",
+  "panic",
+  "panther",
+  "paper",
+  "parade",
+  "parent",
+  "park",
+  "parrot",
+  "party",
+  "pass",
+  "patch",
+  "path",
+  "patient",
+  "patrol",
+  "pattern",
+  "pause",
+  "pave",
+  "payment",
+  "peace",
+  "peanut",
+  "pear",
+  "peasant",
+  "pelican",
+  "pen",
+  "penalty",
+  "pencil",
+  "people",
+  "pepper",
+  "perfect",
+  "permit",
+  "person",
+  "pet",
+  "phone",
+  "photo",
+  "phrase",
+  "physical",
+  "piano",
+  "picnic",
+  "picture",
+  "piece",
+  "pig",
+  "pigeon",
+  "pill",
+  "pilot",
+  "pink",
+  "pioneer",
+  "pipe",
+  "pistol",
+  "pitch",
+  "pizza",
+  "place",
+  "planet",
+  "plastic",
+  "plate",
+  "play",
+  "please",
+  "pledge",
+  "pluck",
+  "plug",
+  "plunge",
+  "poem",
+  "poet",
+  "point",
+  "polar",
+  "pole",
+  "police",
+  "pond",
+  "pony",
+  "pool",
+  "popular",
+  "portion",
+  "position",
+  "possible",
+  "post",
+  "potato",
+  "pottery",
+  "poverty",
+  "powder",
+  "power",
+  "practice",
+  "praise",
+  "predict",
+  "prefer",
+  "prepare",
+  "present",
+  "pretty",
+  "prevent",
+  "price",
+  "pride",
+  "primary",
+  "print",
+  "priority",
+  "prison",
+  "private",
+  "prize",
+  "problem",
+  "process",
+  "produce",
+  "profit",
+  "program",
+  "project",
+  "promote",
+  "proof",
+  "property",
+  "prosper",
+  "protect",
+  "proud",
+  "provide",
+  "public",
+  "pudding",
+  "pull",
+  "pulp",
+  "pulse",
+  "pumpkin",
+  "punch",
+  "pupil",
+  "puppy",
+  "purchase",
+  "purity",
+  "purpose",
+  "purse",
+  "push",
+  "put",
+  "puzzle",
+  "pyramid",
+  "quality",
+  "quantum",
+  "quarter",
+  "question",
+  "quick",
+  "quit",
+  "quiz",
+  "quote",
+  "rabbit",
+  "raccoon",
+  "race",
+  "rack",
+  "radar",
+  "radio",
+  "rail",
+  "rain",
+  "raise",
+  "rally",
+  "ramp",
+  "ranch",
+  "random",
+  "range",
+  "rapid",
+  "rare",
+  "rate",
+  "rather",
+  "raven",
+  "raw",
+  "razor",
+  "ready",
+  "real",
+  "reason",
+  "rebel",
+  "rebuild",
+  "recall",
+  "receive",
+  "recipe",
+  "record",
+  "recycle",
+  "reduce",
+  "reflect",
+  "reform",
+  "refuse",
+  "region",
+  "regret",
+  "regular",
+  "reject",
+  "relax",
+  "release",
+  "relief",
+  "rely",
+  "remain",
+  "remember",
+  "remind",
+  "remove",
+  "render",
+  "renew",
+  "rent",
+  "reopen",
+  "repair",
+  "repeat",
+  "replace",
+  "report",
+  "require",
+  "rescue",
+  "resemble",
+  "resist",
+  "resource",
+  "response",
+  "result",
+  "retire",
+  "retreat",
+  "return",
+  "reunion",
+  "reveal",
+  "review",
+  "reward",
+  "rhythm",
+  "rib",
+  "ribbon",
+  "rice",
+  "rich",
+  "ride",
+  "ridge",
+  "rifle",
+  "right",
+  "rigid",
+  "ring",
+  "riot",
+  "ripple",
+  "risk",
+  "ritual",
+  "rival",
+  "river",
+  "road",
+  "roast",
+  "robot",
+  "robust",
+  "rocket",
+  "romance",
+  "roof",
+  "rookie",
+  "room",
+  "rose",
+  "rotate",
+  "rough",
+  "round",
+  "route",
+  "royal",
+  "rubber",
+  "rude",
+  "rug",
+  "rule",
+  "run",
+  "runway",
+  "rural",
+  "sad",
+  "saddle",
+  "sadness",
+  "safe",
+  "sail",
+  "salad",
+  "salmon",
+  "salon",
+  "salt",
+  "salute",
+  "same",
+  "sample",
+  "sand",
+  "satisfy",
+  "satoshi",
+  "sauce",
+  "sausage",
+  "save",
+  "say",
+  "scale",
+  "scan",
+  "scare",
+  "scatter",
+  "scene",
+  "scheme",
+  "school",
+  "science",
+  "scissors",
+  "scorpion",
+  "scout",
+  "scrap",
+  "screen",
+  "script",
+  "scrub",
+  "sea",
+  "search",
+  "season",
+  "seat",
+  "second",
+  "secret",
+  "section",
+  "security",
+  "seed",
+  "seek",
+  "segment",
+  "select",
+  "sell",
+  "seminar",
+  "senior",
+  "sense",
+  "sentence",
+  "series",
+  "service",
+  "session",
+  "settle",
+  "setup",
+  "seven",
+  "shadow",
+  "shaft",
+  "shallow",
+  "share",
+  "shed",
+  "shell",
+  "sheriff",
+  "shield",
+  "shift",
+  "shine",
+  "ship",
+  "shiver",
+  "shock",
+  "shoe",
+  "shoot",
+  "shop",
+  "short",
+  "shoulder",
+  "shove",
+  "shrimp",
+  "shrug",
+  "shuffle",
+  "shy",
+  "sibling",
+  "sick",
+  "side",
+  "siege",
+  "sight",
+  "sign",
+  "silent",
+  "silk",
+  "silly",
+  "silver",
+  "similar",
+  "simple",
+  "since",
+  "sing",
+  "siren",
+  "sister",
+  "situate",
+  "six",
+  "size",
+  "skate",
+  "sketch",
+  "ski",
+  "skill",
+  "skin",
+  "skirt",
+  "skull",
+  "slab",
+  "slam",
+  "sleep",
+  "slender",
+  "slice",
+  "slide",
+  "slight",
+  "slim",
+  "slogan",
+  "slot",
+  "slow",
+  "slush",
+  "small",
+  "smart",
+  "smile",
+  "smoke",
+  "smooth",
+  "snack",
+  "snake",
+  "snap",
+  "sniff",
+  "snow",
+  "soap",
+  "soccer",
+  "social",
+  "sock",
+  "soda",
+  "soft",
+  "solar",
+  "soldier",
+  "solid",
+  "solution",
+  "solve",
+  "someone",
+  "song",
+  "soon",
+  "sorry",
+  "sort",
+  "soul",
+  "sound",
+  "soup",
+  "source",
+  "south",
+  "space",
+  "spare",
+  "spatial",
+  "spawn",
+  "speak",
+  "special",
+  "speed",
+  "spell",
+  "spend",
+  "sphere",
+  "spice",
+  "spider",
+  "spike",
+  "spin",
+  "spirit",
+  "split",
+  "spoil",
+  "sponsor",
+  "spoon",
+  "sport",
+  "spot",
+  "spray",
+  "spread",
+  "spring",
+  "spy",
+  "square",
+  "squeeze",
+  "squirrel",
+  "stable",
+  "stadium",
+  "staff",
+  "stage",
+  "stairs",
+  "stamp",
+  "stand",
+  "start",
+  "state",
+  "stay",
+  "steak",
+  "steel",
+  "stem",
+  "step",
+  "stereo",
+  "stick",
+  "still",
+  "sting",
+  "stock",
+  "stomach",
+  "stone",
+  "stool",
+  "story",
+  "stove",
+  "strategy",
+  "street",
+  "strike",
+  "strong",
+  "struggle",
+  "student",
+  "stuff",
+  "stumble",
+  "style",
+  "subject",
+  "submit",
+  "subway",
+  "success",
+  "such",
+  "sudden",
+  "suffer",
+  "sugar",
+  "suggest",
+  "suit",
+  "summer",
+  "sun",
+  "sunny",
+  "sunset",
+  "super",
+  "supply",
+  "supreme",
+  "sure",
+  "surface",
+  "surge",
+  "surprise",
+  "surround",
+  "survey",
+  "suspect",
+  "sustain",
+  "swallow",
+  "swamp",
+  "swap",
+  "swarm",
+  "swear",
+  "sweet",
+  "swift",
+  "swim",
+  "swing",
+  "switch",
+  "sword",
+  "symbol",
+  "symptom",
+  "syrup",
+  "system",
+  "table",
+  "tackle",
+  "tag",
+  "tail",
+  "talent",
+  "talk",
+  "tank",
+  "tape",
+  "target",
+  "task",
+  "taste",
+  "tattoo",
+  "taxi",
+  "teach",
+  "team",
+  "tell",
+  "ten",
+  "tenant",
+  "tennis",
+  "tent",
+  "term",
+  "test",
+  "text",
+  "thank",
+  "that",
+  "theme",
+  "then",
+  "theory",
+  "there",
+  "they",
+  "thing",
+  "this",
+  "thought",
+  "three",
+  "thrive",
+  "throw",
+  "thumb",
+  "thunder",
+  "ticket",
+  "tide",
+  "tiger",
+  "tilt",
+  "timber",
+  "time",
+  "tiny",
+  "tip",
+  "tired",
+  "tissue",
+  "title",
+  "toast",
+  "tobacco",
+  "today",
+  "toddler",
+  "toe",
+  "together",
+  "toilet",
+  "token",
+  "tomato",
+  "tomorrow",
+  "tone",
+  "tongue",
+  "tonight",
+  "tool",
+  "tooth",
+  "top",
+  "topic",
+  "topple",
+  "torch",
+  "tornado",
+  "tortoise",
+  "toss",
+  "total",
+  "tourist",
+  "toward",
+  "tower",
+  "town",
+  "toy",
+  "track",
+  "trade",
+  "traffic",
+  "tragic",
+  "train",
+  "transfer",
+  "trap",
+  "trash",
+  "travel",
+  "tray",
+  "treat",
+  "tree",
+  "trend",
+  "trial",
+  "tribe",
+  "trick",
+  "trigger",
+  "trim",
+  "trip",
+  "trophy",
+  "trouble",
+  "truck",
+  "true",
+  "truly",
+  "trumpet",
+  "trust",
+  "truth",
+  "try",
+  "tube",
+  "tuition",
+  "tumble",
+  "tuna",
+  "tunnel",
+  "turkey",
+  "turn",
+  "turtle",
+  "twelve",
+  "twenty",
+  "twice",
+  "twin",
+  "twist",
+  "two",
+  "type",
+  "typical",
+  "ugly",
+  "umbrella",
+  "unable",
+  "unaware",
+  "uncle",
+  "uncover",
+  "under",
+  "undo",
+  "unfair",
+  "unfold",
+  "unhappy",
+  "uniform",
+  "unique",
+  "unit",
+  "universe",
+  "unknown",
+  "unlock",
+  "until",
+  "unusual",
+  "unveil",
+  "update",
+  "upgrade",
+  "uphold",
+  "upon",
+  "upper",
+  "upset",
+  "urban",
+  "urge",
+  "usage",
+  "use",
+  "used",
+  "useful",
+  "useless",
+  "usual",
+  "utility",
+  "vacant",
+  "vacuum",
+  "vague",
+  "valid",
+  "valley",
+  "valve",
+  "van",
+  "vanish",
+  "vapor",
+  "various",
+  "vast",
+  "vault",
+  "vehicle",
+  "velvet",
+  "vendor",
+  "venture",
+  "venue",
+  "verb",
+  "verify",
+  "version",
+  "very",
+  "vessel",
+  "veteran",
+  "viable",
+  "vibrant",
+  "vicious",
+  "victory",
+  "video",
+  "view",
+  "village",
+  "vintage",
+  "violin",
+  "virtual",
+  "virus",
+  "visa",
+  "visit",
+  "visual",
+  "vital",
+  "vivid",
+  "vocal",
+  "voice",
+  "void",
+  "volcano",
+  "volume",
+  "vote",
+  "voyage",
+  "wage",
+  "wagon",
+  "wait",
+  "walk",
+  "wall",
+  "walnut",
+  "want",
+  "warfare",
+  "warm",
+  "warrior",
+  "wash",
+  "wasp",
+  "waste",
+  "water",
+  "wave",
+  "way",
+  "wealth",
+  "weapon",
+  "wear",
+  "weasel",
+  "weather",
+  "web",
+  "wedding",
+  "weekend",
+  "weird",
+  "welcome",
+  "west",
+  "wet",
+  "whale",
+  "what",
+  "wheat",
+  "wheel",
+  "when",
+  "where",
+  "whip",
+  "whisper",
+  "wide",
+  "width",
+  "wife",
+  "wild",
+  "will",
+  "win",
+  "window",
+  "wine",
+  "wing",
+  "wink",
+  "winner",
+  "winter",
+  "wire",
+  "wisdom",
+  "wise",
+  "wish",
+  "witness",
+  "wolf",
+  "woman",
+  "wonder",
+  "wood",
+  "wool",
+  "word",
+  "work",
+  "world",
+  "worry",
+  "worth",
+  "wrap",
+  "wreck",
+  "wrestle",
+  "wrist",
+  "write",
+  "wrong",
+  "yard",
+  "year",
+  "yellow",
+  "you",
+  "young",
+  "youth",
+  "zebra",
+  "zero",
+  "zone",
+  "zoo"
+];
+if (BIP39_ENGLISH_WORDLIST.length !== 2048) {
+  throw new Error(`BIP-39 wordlist must have exactly 2048 words, got ${BIP39_ENGLISH_WORDLIST.length}`);
+}
+
+// src/wallet/bip39.ts
+var WORD_TO_INDEX = new Map(BIP39_ENGLISH_WORDLIST.map((w, i) => [w, i]));
+var VALID_ENTROPY_BYTE_LENGTHS = new Set([16, 20, 24, 28, 32]);
+var VALID_WORD_COUNTS = new Set([12, 15, 18, 21, 24]);
+function mnemonicToEntropy(mnemonic) {
+  if (!VALID_WORD_COUNTS.has(mnemonic.length)) {
+    throw new Error(`BIP-39: mnemonic must be 12/15/18/21/24 words, got ${mnemonic.length}`);
+  }
+  let bits = 0n;
+  for (const word of mnemonic) {
+    const idx = WORD_TO_INDEX.get(word);
+    if (idx === undefined) {
+      throw new Error(`BIP-39: unknown word "${word}" (not in English wordlist)`);
+    }
+    bits = bits << 11n | BigInt(idx);
+  }
+  const totalBits = mnemonic.length * 11;
+  const csBits = totalBits / 33;
+  const entBits = totalBits - csBits;
+  const entBytes = entBits / 8;
+  const csMask = (1n << BigInt(csBits)) - 1n;
+  const claimedChecksum = Number(bits & csMask);
+  const entropyBig = bits >> BigInt(csBits);
+  const entropy = new Uint8Array(entBytes);
+  let tmp = entropyBig;
+  for (let i = entBytes - 1;i >= 0; i--) {
+    entropy[i] = Number(tmp & 0xffn);
+    tmp >>= 8n;
+  }
+  const expectedChecksumByte = sha256(entropy)[0];
+  const expectedChecksum = expectedChecksumByte >> 8 - csBits;
+  if (claimedChecksum !== expectedChecksum) {
+    throw new Error("BIP-39: mnemonic checksum mismatch (likely a typo or corrupt backup)");
+  }
+  return entropy;
+}
+function validateMnemonic(mnemonic) {
+  mnemonicToEntropy(mnemonic);
+}
+function parseMnemonicString(mnemonicSentence) {
+  return mnemonicSentence.normalize("NFKD").trim().split(/\s+/u).map((w) => w.toLowerCase());
+}
+
+// src/wallet/wallet.ts
 init_primitives();
 init_encoding();
-init_serialization();
 init_tx();
 init_secp256k1();
-import * as crypto2 from "node:crypto";
 var HARDENED_OFFSET2 = 2147483648;
+var BIP32_MAX_INDEX2 = 4294967295;
 var CURVE_ORDER2 = BigInt("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
+
+class Bip32InvalidChildError2 extends Error {
+  index;
+  constructor(index, reason) {
+    super(`BIP-32 invalid child at index ${index} (${reason}); caller must retry with index+1`);
+    this.name = "Bip32InvalidChildError";
+    this.index = index;
+  }
+}
+function bip32CkdPrivFromI(parentKey, I, index) {
+  if (I.length !== 64) {
+    throw new Error(`bip32CkdPrivFromI: I must be 64 bytes, got ${I.length}`);
+  }
+  const IL = I.subarray(0, 32);
+  const IR = I.subarray(32, 64);
+  const parentKeyBigInt = BigInt("0x" + parentKey.toString("hex"));
+  const ILBigInt = BigInt("0x" + IL.toString("hex"));
+  if (ILBigInt >= CURVE_ORDER2) {
+    throw new Bip32InvalidChildError2(index, "il-overflow");
+  }
+  const childKeyBigInt = (parentKeyBigInt + ILBigInt) % CURVE_ORDER2;
+  if (childKeyBigInt === 0n) {
+    throw new Bip32InvalidChildError2(index, "child-zero");
+  }
+  const childKeyHex = childKeyBigInt.toString(16).padStart(64, "0");
+  return {
+    key: Buffer.from(childKeyHex, "hex"),
+    chainCode: Buffer.from(IR)
+  };
+}
 var TAPTWEAK_TAG2 = "TapTweak";
 var TOTAL_TRIES = 1e5;
 var KNAPSACK_ITERATIONS = 1000;
@@ -30024,7 +37902,9 @@ class Wallet {
   static create(config, mnemonic) {
     const wallet = new Wallet(config);
     if (mnemonic) {
-      const mnemonicBuffer = Buffer.from(mnemonic.normalize("NFKD"), "utf-8");
+      const words = parseMnemonicString(mnemonic);
+      validateMnemonic(words);
+      const mnemonicBuffer = Buffer.from(words.join(" ").normalize("NFKD"), "utf-8");
       const salt = Buffer.from("mnemonic", "utf-8");
       wallet.seed = Buffer.from(pbkdf2(sha512, mnemonicBuffer, salt, { c: 2048, dkLen: 64 }));
     } else {
@@ -30182,18 +38062,7 @@ class Wallet {
       data.writeUInt32BE(index, 33);
     }
     const I = Buffer.from(hmac(sha512, parentChainCode, data));
-    const IL = I.subarray(0, 32);
-    const IR = I.subarray(32, 64);
-    const parentKeyBigInt = BigInt("0x" + parentKey.toString("hex"));
-    const ILBigInt = BigInt("0x" + IL.toString("hex"));
-    const childKeyBigInt = (parentKeyBigInt + ILBigInt) % CURVE_ORDER2;
-    let childKeyHex = childKeyBigInt.toString(16);
-    childKeyHex = childKeyHex.padStart(64, "0");
-    const childKey = Buffer.from(childKeyHex, "hex");
-    return {
-      key: childKey,
-      chainCode: IR
-    };
+    return bip32CkdPrivFromI(parentKey, I, index);
   }
   deriveKey(path3, addressType) {
     if (!path3.startsWith("m/")) {
@@ -30212,7 +38081,24 @@ class Wallet {
       if (isHardened) {
         index += HARDENED_OFFSET2;
       }
-      const derived = this.deriveChild(currentKey, currentChainCode, index);
+      const maxIndex = isHardened ? BIP32_MAX_INDEX2 : HARDENED_OFFSET2 - 1;
+      let derived;
+      for (let attempt = 0;attempt < 256; attempt++) {
+        try {
+          derived = this.deriveChild(currentKey, currentChainCode, index);
+          break;
+        } catch (e) {
+          if (!(e instanceof Bip32InvalidChildError2))
+            throw e;
+          if (index >= maxIndex) {
+            throw new Error(`BIP-32 derivation exhausted index space at ${part} (no valid child)`);
+          }
+          index += 1;
+        }
+      }
+      if (!derived) {
+        throw new Error(`BIP-32 derivation failed after 256 retries at ${part}`);
+      }
       currentKey = derived.key;
       currentChainCode = derived.chainCode;
     }
@@ -30440,13 +38326,20 @@ class Wallet {
       outputs: txOutputs,
       lockTime: 0
     };
+    const prevOuts = selectedUtxos.map((u) => {
+      const decoded = decodeAddress(u.address);
+      return {
+        scriptPubKey: this.buildScriptPubKey(decoded.type, decoded.hash),
+        value: u.amount
+      };
+    });
     for (let i = 0;i < txInputs.length; i++) {
       const utxo = selectedUtxos[i];
       const key = this.keys.get(utxo.address);
       if (!key) {
         throw new Error(`No key found for address: ${utxo.address}`);
       }
-      this.signInput(tx, i, key, utxo);
+      this.signInput(tx, i, key, utxo, prevOuts);
     }
     return tx;
   }
@@ -30474,7 +38367,7 @@ class Wallet {
         throw new Error(`Unsupported address type: ${type}`);
     }
   }
-  signInput(tx, inputIndex, key, utxo) {
+  signInput(tx, inputIndex, key, utxo, prevOuts) {
     switch (key.addressType) {
       case "p2pkh" /* P2PKH */:
         this.signP2PKHInput(tx, inputIndex, key, utxo);
@@ -30485,9 +38378,23 @@ class Wallet {
       case "p2wpkh" /* P2WPKH */:
         this.signP2WPKHInput(tx, inputIndex, key, utxo);
         break;
-      case "p2tr" /* P2TR */:
-        this.signP2TRInput(tx, inputIndex, key, utxo);
+      case "p2tr" /* P2TR */: {
+        let resolved = prevOuts;
+        if (!resolved) {
+          if (tx.inputs.length !== 1) {
+            throw new Error("signInput(P2TR): multi-input transactions require prevOuts " + "(scriptPubKey + value for every input) per BIP-341");
+          }
+          const decoded = decodeAddress(utxo.address);
+          resolved = [
+            {
+              scriptPubKey: this.buildScriptPubKey(decoded.type, decoded.hash),
+              value: utxo.amount
+            }
+          ];
+        }
+        this.signP2TRInput(tx, inputIndex, key, utxo, resolved);
         break;
+      }
       default:
         throw new Error(`Unsupported address type for signing: ${key.addressType}`);
     }
@@ -30534,19 +38441,21 @@ class Wallet {
     tx.inputs[inputIndex].scriptSig = Buffer.alloc(0);
     tx.inputs[inputIndex].witness = [sigWithType, key.publicKey];
   }
-  signP2TRInput(tx, inputIndex, key, utxo) {
+  signP2TRInput(tx, inputIndex, key, utxo, prevOuts, hashType = 0) {
     const xOnlyPubkey = key.publicKey.subarray(1, 33);
     const tweak = taggedHash2(TAPTWEAK_TAG2, xOnlyPubkey);
-    const privateKeyBigInt = BigInt("0x" + key.privateKey.toString("hex"));
-    const tweakBigInt = BigInt("0x" + tweak.toString("hex"));
-    const tweakedKeyBigInt = (privateKeyBigInt + tweakBigInt) % CURVE_ORDER2;
-    let tweakedKeyHex = tweakedKeyBigInt.toString(16);
-    tweakedKeyHex = tweakedKeyHex.padStart(64, "0");
-    const tweakedPrivateKey = Buffer.from(tweakedKeyHex, "hex");
-    const sighash = this.sigHashTaproot(tx, inputIndex, utxo.amount, 0);
-    const signature = this.schnorrSign(sighash, tweakedPrivateKey);
+    const tweakedPrivateKey = tweakPrivateKey(key.privateKey, tweak);
+    const cache = {};
+    const sighash = sigHashTaproot(tx, inputIndex, prevOuts, hashType, 0, undefined, undefined, undefined, 4294967295, cache);
+    const signature = Buffer.from(schnorr.sign(sighash, tweakedPrivateKey));
+    let witnessSig;
+    if (hashType === 0) {
+      witnessSig = signature;
+    } else {
+      witnessSig = Buffer.concat([signature, Buffer.from([hashType])]);
+    }
     tx.inputs[inputIndex].scriptSig = Buffer.alloc(0);
-    tx.inputs[inputIndex].witness = [signature];
+    tx.inputs[inputIndex].witness = [witnessSig];
   }
   sigHashLegacy(tx, inputIndex, scriptCode, hashType) {
     const txCopy = {
@@ -30566,51 +38475,8 @@ class Wallet {
     const serialized = serializeTx(txCopy, false);
     const hashTypeBytes = Buffer.alloc(4);
     hashTypeBytes.writeUInt32LE(hashType);
-    const { hash256: hash2563 } = (init_primitives(), __toCommonJS(exports_primitives));
-    return hash2563(Buffer.concat([serialized, hashTypeBytes]));
-  }
-  sigHashTaproot(tx, inputIndex, amount, hashType) {
-    const writer = new BufferWriter;
-    writer.writeUInt8(0);
-    const effectiveHashType = hashType === 0 ? SIGHASH_ALL : hashType;
-    writer.writeUInt8(hashType);
-    writer.writeInt32LE(tx.version);
-    writer.writeUInt32LE(tx.lockTime);
-    const prevoutsWriter = new BufferWriter;
-    for (const input of tx.inputs) {
-      prevoutsWriter.writeBytes(input.prevOut.txid);
-      prevoutsWriter.writeUInt32LE(input.prevOut.vout);
-    }
-    const { sha256Hash: sha256Hash3 } = (init_primitives(), __toCommonJS(exports_primitives));
-    writer.writeBytes(sha256Hash3(prevoutsWriter.toBuffer()));
-    const amountsWriter = new BufferWriter;
-    amountsWriter.writeUInt64LE(amount);
-    for (let i = 1;i < tx.inputs.length; i++) {
-      amountsWriter.writeUInt64LE(0n);
-    }
-    writer.writeBytes(sha256Hash3(amountsWriter.toBuffer()));
-    const scriptsWriter = new BufferWriter;
-    const pubKeyHash = Buffer.alloc(32);
-    scriptsWriter.writeVarBytes(pubKeyHash);
-    writer.writeBytes(sha256Hash3(scriptsWriter.toBuffer()));
-    const seqWriter = new BufferWriter;
-    for (const input of tx.inputs) {
-      seqWriter.writeUInt32LE(input.sequence);
-    }
-    writer.writeBytes(sha256Hash3(seqWriter.toBuffer()));
-    const outputsWriter = new BufferWriter;
-    for (const output of tx.outputs) {
-      outputsWriter.writeUInt64LE(output.value);
-      outputsWriter.writeVarBytes(output.scriptPubKey);
-    }
-    writer.writeBytes(sha256Hash3(outputsWriter.toBuffer()));
-    writer.writeUInt8(0);
-    writer.writeUInt32LE(inputIndex);
-    return taggedHash2("TapSighash", writer.toBuffer());
-  }
-  schnorrSign(msgHash, privateKey) {
-    const signature = schnorr.sign(msgHash, privateKey);
-    return Buffer.from(signature);
+    const { hash256: hash2564 } = (init_primitives(), __toCommonJS(exports_primitives));
+    return hash2564(Buffer.concat([serialized, hashTypeBytes]));
   }
   pushData(data) {
     if (data.length < 76) {
@@ -31628,7 +39494,9 @@ var DEFAULT_CONFIG = {
   peerBloomFilters: false,
   dbcacheMB: 512,
   daemon: false,
-  internalDaemonChild: false
+  internalDaemonChild: false,
+  rest: false,
+  blockfilterindex: false
 };
 function getDefaultRpcPort(network) {
   switch (network) {
@@ -31725,8 +39593,12 @@ function parseArgs(argv) {
           if (value) {
             const pruneVal = parseInt(value, 10);
             if (!isNaN(pruneVal)) {
-              if (pruneVal > 0 && pruneVal < 550) {
-                console.error("Error: --prune must be at least 550 MiB");
+              if (pruneVal < 0) {
+                console.error("Error: --prune cannot be negative");
+                process.exit(1);
+              }
+              if (pruneVal > 1 && pruneVal < 550) {
+                console.error("Error: --prune must be at least 550 MiB (or 0=off, 1=manual)");
                 process.exit(1);
               }
               config.prune = pruneVal;
@@ -31805,6 +39677,28 @@ function parseArgs(argv) {
             const fd = parseInt(value, 10);
             if (!isNaN(fd) && fd >= 0)
               config.readyFd = fd;
+          }
+          break;
+        case "rest":
+          if (value === undefined || value === "1" || value === "true") {
+            config.rest = true;
+          } else if (value === "0" || value === "false") {
+            config.rest = false;
+          }
+          break;
+        case "rest-port":
+        case "restport":
+          if (value !== undefined) {
+            const restPortVal = parseInt(value, 10);
+            if (!isNaN(restPortVal) && restPortVal > 0)
+              config.restPort = restPortVal;
+          }
+          break;
+        case "blockfilterindex":
+          if (value === undefined || value === "1" || value === "true" || value === "basic") {
+            config.blockfilterindex = true;
+          } else if (value === "0" || value === "false") {
+            config.blockfilterindex = false;
           }
           break;
         case "password":
@@ -31925,6 +39819,20 @@ async function loadConfig(datadir, confOverride) {
           config.debug = config.debug || [];
           config.debug.push(value);
           break;
+        case "rest":
+          config.rest = value === "1" || value === "true";
+          break;
+        case "restport":
+          {
+            const restPortVal = parseInt(value, 10);
+            if (!isNaN(restPortVal) && restPortVal > 0) {
+              config.restPort = restPortVal;
+            }
+          }
+          break;
+        case "blockfilterindex":
+          config.blockfilterindex = value === "1" || value === "true" || value === "basic";
+          break;
       }
     }
   }
@@ -31971,18 +39879,18 @@ async function detectXorKey(blocksDir, expectedMagic) {
   return key;
 }
 async function runBlockImport(importPath, db, chainState, params) {
-  const { deserializeBlock: deserializeBlock2, deserializeBlockHeader: deserializeBlockHeader2, getBlockHash: getBlockHash2 } = await Promise.resolve().then(() => (init_block(), exports_block));
+  const { deserializeBlock: deserializeBlock3, deserializeBlockHeader: deserializeBlockHeader2, getBlockHash: getBlockHash2 } = await Promise.resolve().then(() => (init_block(), exports_block));
   const { BufferReader: BufferReader5 } = await Promise.resolve().then(() => (init_serialization(), exports_serialization));
   const bestBlock = chainState.getBestBlock();
   const startHeight = bestBlock.height;
   console.log(`Block import mode: starting from height ${startHeight}`);
   if (importPath === "-") {
-    await importFromStdin(startHeight, db, chainState, deserializeBlock2, BufferReader5);
+    await importFromStdin(startHeight, db, chainState, deserializeBlock3, BufferReader5);
   } else {
-    await importFromBlkFiles(importPath, startHeight, db, chainState, params, deserializeBlock2, deserializeBlockHeader2, getBlockHash2, BufferReader5);
+    await importFromBlkFiles(importPath, startHeight, db, chainState, params, deserializeBlock3, deserializeBlockHeader2, getBlockHash2, BufferReader5);
   }
 }
-async function importFromStdin(startHeight, db, chainState, deserializeBlock2, BufferReader5) {
+async function importFromStdin(startHeight, db, chainState, deserializeBlock3, BufferReader5) {
   let imported = 0;
   const importStart = Date.now();
   let batchStart = Date.now();
@@ -32020,7 +39928,7 @@ async function importFromStdin(startHeight, db, chainState, deserializeBlock2, B
     const blockData = await readExact(frameSize);
     if (!blockData)
       break;
-    const block = deserializeBlock2(new BufferReader5(blockData));
+    const block = deserializeBlock3(new BufferReader5(blockData));
     try {
       await chainState.connectBlock(block, frameHeight);
     } catch (e) {
@@ -32042,7 +39950,7 @@ async function importFromStdin(startHeight, db, chainState, deserializeBlock2, B
     console.log(`Import complete: ${imported} blocks in ${totalElapsed.toFixed(1)}s (${bps.toFixed(0)} blocks/sec, ${(bps * 60).toFixed(0)} blocks/min)`);
   }
 }
-async function importFromBlkFiles(blocksDir, startHeight, db, chainState, params, deserializeBlock2, deserializeBlockHeader2, getBlockHash2, BufferReader5) {
+async function importFromBlkFiles(blocksDir, startHeight, db, chainState, params, deserializeBlock3, deserializeBlockHeader2, getBlockHash2, BufferReader5) {
   const magic = Buffer.alloc(4);
   magic.writeUInt32LE(params.networkMagic, 0);
   console.log(`Scanning blk*.dat files in ${blocksDir} ...`);
@@ -32112,7 +40020,7 @@ async function importFromBlkFiles(blocksDir, startHeight, db, chainState, params
   while (true) {
     const hashBuf = await db.getBlockHashByHeight(height);
     if (!hashBuf) {
-      console.log(`No header at height ${height} — end of header chain. Imported ${imported} blocks.`);
+      console.log(`No header at height ${height} \u2014 end of header chain. Imported ${imported} blocks.`);
       break;
     }
     const hashHex = hashBuf.toString("hex");
@@ -32123,7 +40031,7 @@ async function importFromBlkFiles(blocksDir, startHeight, db, chainState, params
     }
     const blockData = Buffer.from(await readBlock(loc));
     xorDeobfuscate(blockData, loc.offset, xorKey);
-    const block = deserializeBlock2(new BufferReader5(blockData));
+    const block = deserializeBlock3(new BufferReader5(blockData));
     try {
       await chainState.connectBlock(block, height);
     } catch (e) {
@@ -32204,6 +40112,83 @@ function removePidFileSync(pidPath) {
   } catch {}
 }
 var activePidPath = null;
+async function migrateNTxBackfill(db, network, datadir) {
+  const missing = [];
+  for await (const [hash, record] of db.iterateBlockIndexEntries()) {
+    if (record.nTx === 0 && record.height > 0) {
+      missing.push({ hash, height: record.height });
+    }
+  }
+  if (missing.length === 0) {
+    return;
+  }
+  console.log(`[nTx-migrate] ${missing.length} block index entries with nTx=0 \u2014 backfilling...`);
+  let fixedFromBlock = 0;
+  let fixedFromCore = 0;
+  let failed = 0;
+  const stillMissing = [];
+  for (const { hash, height } of missing) {
+    const rawBlock = await db.getBlock(hash);
+    if (rawBlock !== null) {
+      try {
+        const blk = deserializeBlock(new BufferReader(rawBlock));
+        await db.updateBlockIndexNTx(hash, blk.transactions.length);
+        fixedFromBlock++;
+      } catch {
+        failed++;
+      }
+    } else {
+      stillMissing.push({ hash, height });
+    }
+  }
+  if (stillMissing.length > 0 && network === "mainnet") {
+    const coreDatadir = path3.join(path3.dirname(datadir), "bitcoin-core");
+    const cookiePath = path3.join(coreDatadir, ".cookie");
+    let cookie = null;
+    try {
+      cookie = (await Bun.file(cookiePath).text()).trim();
+    } catch {}
+    if (cookie) {
+      for (const { hash, height } of stillMissing) {
+        const hashHex = Buffer.from(hash).reverse().toString("hex");
+        try {
+          const resp = await fetch("http://127.0.0.1:8332/", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: "Basic " + Buffer.from(cookie).toString("base64")
+            },
+            body: JSON.stringify({
+              jsonrpc: "1.0",
+              id: "ntx-migrate",
+              method: "getblockheader",
+              params: [hashHex, true]
+            })
+          });
+          if (resp.ok) {
+            const data = await resp.json();
+            const nTx = data?.result?.nTx;
+            if (typeof nTx === "number" && nTx > 0) {
+              await db.updateBlockIndexNTx(hash, nTx);
+              fixedFromCore++;
+            } else {
+              failed++;
+            }
+          } else {
+            failed++;
+          }
+        } catch {
+          failed++;
+        }
+      }
+    } else {
+      failed += stillMissing.length;
+    }
+  } else if (stillMissing.length > 0) {
+    failed += stillMissing.length;
+  }
+  console.log(`[nTx-migrate] done: ${fixedFromBlock} from block data, ${fixedFromCore} from Core RPC, ${failed} unreachable`);
+}
 async function startNode(config) {
   if (config.daemon && !config.internalDaemonChild) {
     daemonizeAndExit(Bun.argv);
@@ -32244,6 +40229,14 @@ async function startNode(config) {
   const dbPath = path3.join(mergedConfig.datadir, "blocks.db");
   const db = new ChainDB(dbPath);
   await db.open();
+  await migrateNTxBackfill(db, mergedConfig.network, mergedConfig.datadir).catch((e) => console.warn("[nTx-migrate] migration failed:", e?.message));
+  let pruneManager;
+  if (mergedConfig.prune !== undefined && mergedConfig.prune > 0) {
+    const pruneTargetBytes = mergedConfig.prune === 1 ? PRUNE_TARGET_MANUAL : mergedConfig.prune * 1024 * 1024;
+    pruneManager = new PruneManager(db, mergedConfig.datadir, pruneTargetBytes);
+    await pruneManager.init();
+    console.log(`[prune] enabled (mode=${mergedConfig.prune === 1 ? "manual" : "auto"}, target=${mergedConfig.prune === 1 ? "RPC-only" : `${mergedConfig.prune} MiB`})`);
+  }
   const cacheBytes = (mergedConfig.dbcacheMB ?? 512) * 1024 * 1024;
   const chainState = new ChainStateManager(db, params, cacheBytes);
   await chainState.load();
@@ -32291,24 +40284,63 @@ async function startNode(config) {
     connect: config.connect,
     listen: mergedConfig.listen,
     port: mergedConfig.port,
-    // BIP-159: signal NODE_NETWORK_LIMITED in version handshake when
-    // prune mode is on so peers know we serve only the recent ~288-block
-    // keep window. Mirrors Core's init.cpp `IsPruneMode()` gate.
-    pruneMode: typeof mergedConfig.prune === "number" && mergedConfig.prune > 0
+    pruneMode: pruneManager !== undefined
   });
   headerSync.registerWithPeerManager(peerManager);
   const blockSync = new BlockSync(db, params, headerSync, peerManager, chainState, mergedConfig.scriptThreads, cacheBytes);
+  blockSync.setMempool(mempool);
+  chainState.setMempool(mempool);
+  if (pruneManager) {
+    blockSync.setPruneManager(pruneManager);
+  }
+  let filterIndex;
+  if (mergedConfig.blockfilterindex) {
+    filterIndex = new BlockFilterIndex(db, true);
+    await filterIndex.init();
+    blockSync.setBlockFilterIndex(filterIndex);
+    chainState.setBlockFilterIndex(filterIndex);
+    console.log("[blockfilterindex] BIP-157/158 basic filter index enabled");
+  }
   const txRelay = new InventoryRelay((peer, inventory) => {
     peer.send({ type: "inv", payload: { inventory } });
+  });
+  const orphanPool = new OrphanPool;
+  const ORPHAN_PROMOTE_MAX_ITER = 64;
+  function peerKey(peer) {
+    return `${peer.host}:${peer.port}`;
+  }
+  function isMissingInputError(err) {
+    return typeof err === "string" && err.startsWith("Missing input:");
+  }
+  const chainEvents = new EventEmitter;
+  chainState.setNotificationEmitter(chainEvents);
+  mempool.setNotificationEmitter(chainEvents);
+  chainEvents.on("blockConnected", (block) => {
+    try {
+      const confirmedTxids = block.transactions.map((tx) => getTxId(tx));
+      const removed = orphanPool.eraseForBlock(confirmedTxids);
+      if (removed > 0) {
+        console.log(`[orphan-pool] erased ${removed} orphans confirmed in block`);
+      }
+      Promise.all(block.transactions.map((tx) => processOrphanCascade(tx))).catch((err) => console.warn(`[orphan-pool] cascade error on block-connect: ${err instanceof Error ? err.message : String(err)}`));
+    } catch (err) {
+      console.warn(`[orphan-pool] eraseForBlock failure: ${err instanceof Error ? err.message : String(err)}`);
+    }
   });
   peerManager.onMessage("__connect__", (peer) => {
     txRelay.addPeer(peer, true);
   });
   peerManager.onMessage("__disconnect__", (peer) => {
     txRelay.removePeer(peer);
+    const dropped = orphanPool.eraseForPeer(peerKey(peer));
+    if (dropped > 0) {
+      console.log(`[orphan-pool] erased ${dropped} orphans on disconnect of ${peerKey(peer)}`);
+    }
   });
   peerManager.onMessage("tx", async (peer, msg) => {
     if (msg.type !== "tx")
+      return;
+    if (!blockSync.isIBDComplete())
       return;
     const tx = msg.payload.tx;
     const result = await mempool.acceptToMemoryPool(tx);
@@ -32319,8 +40351,37 @@ async function startNode(config) {
       const feeRate = entry ? entry.feeRate : 0;
       txRelay.queueTxToAllFiltered(txidHex, feeRate);
       console.log(`[mempool] Accepted tx ${txidHex.slice(0, 16)}... from ${peer.host}`);
+      await processOrphanCascade(tx);
+    } else if (isMissingInputError(result.error)) {
+      const admit = orphanPool.add(tx, peerKey(peer));
+      if (admit.ok) {
+        console.log(`[orphan-pool] held ${admit.entry.txid.toString("hex").slice(0, 16)}... from ${peer.host} (pool=${orphanPool.size()})`);
+      }
     }
   });
+  async function processOrphanCascade(parent) {
+    const worklist = [parent];
+    let iter = 0;
+    while (worklist.length > 0 && iter < ORPHAN_PROMOTE_MAX_ITER) {
+      iter++;
+      const next = worklist.shift();
+      const children = orphanPool.onParentAdmitted(next);
+      for (const child of children) {
+        const childResult = await mempool.acceptToMemoryPool(child.tx);
+        if (childResult.accepted) {
+          orphanPool.eraseTx(child.wtxid);
+          const childTxidHex = child.txid.toString("hex");
+          const childEntry = mempool.getTransaction(child.txid);
+          const childFeeRate = childEntry ? childEntry.feeRate : 0;
+          txRelay.queueTxToAllFiltered(childTxidHex, childFeeRate);
+          console.log(`[orphan-pool] promoted ${childTxidHex.slice(0, 16)}... (parent ${getTxId(next).toString("hex").slice(0, 16)}...)`);
+          worklist.push(child.tx);
+        } else if (!isMissingInputError(childResult.error)) {
+          orphanPool.eraseTx(child.wtxid);
+        }
+      }
+    }
+  }
   const advertisingNodeBloom = (params.services & NODE_BLOOM_BIT) !== 0n;
   const MAX_INV_PER_MESSAGE = 50000;
   peerManager.onMessage("mempool", (peer, _msg) => {
@@ -32354,20 +40415,48 @@ async function startNode(config) {
     headerSync,
     db,
     params,
-    blockSync
+    blockSync,
+    pruneManager
   };
   const rpcServer = new RPCServer(rpcConfig, rpcDeps);
+  let restServer;
+  if (mergedConfig.rest) {
+    const restPort = mergedConfig.restPort ?? mergedConfig.rpcPort + 1;
+    const restConfig = {
+      port: restPort,
+      host: "127.0.0.1",
+      txIndexEnabled: false
+    };
+    const restDeps = {
+      chainState,
+      mempool,
+      headerSync,
+      db,
+      params,
+      filterIndex
+    };
+    try {
+      restServer = new RESTServer(restConfig, restDeps);
+    } catch (err) {
+      const msg = err?.message ?? String(err);
+      console.error(`[rest] failed to construct REST server on 127.0.0.1:${restPort}: ${msg} \u2014 continuing without REST`);
+      restServer = undefined;
+    }
+  }
   runningNode = {
     db,
     chainState,
     peerManager,
     rpcServer,
+    restServer,
     headerSync,
     blockSync,
     feeEstimator,
     feeEstimatesPath,
     mempool,
-    datadir: mergedConfig.datadir
+    datadir: mergedConfig.datadir,
+    pruneManager,
+    filterIndex
   };
   rpcServer.setShutdownCallback(() => {
     gracefulShutdown();
@@ -32385,6 +40474,17 @@ Received SIGTERM, shutting down...`);
   await peerManager.start();
   await blockSync.start();
   rpcServer.start();
+  if (restServer) {
+    try {
+      restServer.start();
+    } catch (err) {
+      const msg = err?.message ?? String(err);
+      console.error(`[rest] failed to bind REST listener: ${msg} \u2014 continuing without REST`);
+      restServer = undefined;
+      if (runningNode)
+        runningNode.restServer = undefined;
+    }
+  }
   const metricsPort = mergedConfig.metricsPort;
   if (metricsPort > 0) {
     try {
@@ -32429,7 +40529,7 @@ bitcoin_mempool_size ${mempoolCount}
       console.log(`Prometheus metrics server listening on http://0.0.0.0:${metricsPort} (/health probe enabled)`);
     } catch (err) {
       const msg = err?.message ?? String(err);
-      console.error(`[metrics] failed to bind port ${metricsPort}: ${msg} — continuing without metrics`);
+      console.error(`[metrics] failed to bind port ${metricsPort}: ${msg} \u2014 continuing without metrics`);
     }
   }
   if (typeof mergedConfig.readyFd === "number" && mergedConfig.readyFd >= 0) {
@@ -32450,6 +40550,14 @@ async function gracefulShutdown() {
   }
   console.log("Stopping services...");
   runningNode.rpcServer.stop();
+  if (runningNode.restServer) {
+    try {
+      runningNode.restServer.stop();
+    } catch (err) {
+      const msg = err?.message ?? String(err);
+      console.error(`[rest] stop failed: ${msg}`);
+    }
+  }
   await runningNode.blockSync.stop();
   await runningNode.peerManager.stop();
   try {
@@ -32696,6 +40804,9 @@ OPTIONS:
   --conf=<file>         Config file path (default: <datadir>/hotbuns.conf)
   --network=<net>       Network: mainnet, testnet, testnet4, regtest (default: mainnet)
   --rpc-port=<port>     RPC port (default: 8332/18332/18443)
+  --rest                Enable read-only REST API (default: off; Core parity)
+  --rest-port=<port>    REST port when --rest is set (default: rpcPort+1)
+  --blockfilterindex    Enable BIP-157/158 compact block filter index (default: off)
   --metrics-port=<port> Prometheus metrics port (default: 9332, 0 = disabled)
   --rpc-user=<user>     RPC username (default: user)
   --rpc-password=<pass> RPC password (default: pass)
@@ -32704,7 +40815,7 @@ OPTIONS:
   --debug=<cat>         Enable debug logging for category (repeatable; 'all'/'1' = every category, 'none'/'0' = off)
   --printtoconsole      Force log output to stdout/stderr
   --connect=<host:port> Connect to specific peer
-  --prune=<n>           Prune block storage to n MiB (minimum 550, 0 = disabled)
+  --prune=<n>           Prune block storage to n MiB (0=disabled, 1=manual via RPC, \u2265550=auto)
   --dbcache=<n>         UTXO cache size in MiB (default: 512)
   --load-snapshot=<path> Load Bitcoin Core-format UTXO snapshot (assumeutxo)
   --daemon              Fork to background and detach (re-execs self under Bun)
