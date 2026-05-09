@@ -68,6 +68,9 @@ import {
   isInputFinalized,
   analyzePSBTCore,
   BTC_AMOUNT_SENTINEL,
+  formatBtcAmount,
+  buildScriptPubKeyObj,
+  disassembleScriptSigHashDecode,
 } from "../wallet/psbt.js";
 import {
   ChainstateManager,
@@ -6120,6 +6123,39 @@ export class RPCServer {
     const tx = deserializeTx(reader);
     const txid = getTxId(tx);
     const wtxid = getWTxId(tx);
+
+    // Build vin array matching Core's TxToUniv:
+    //   - coinbase input: { coinbase, sequence[, txinwitness] }
+    //   - regular input:  { txid, vout, scriptSig:{asm,hex}, sequence[, txinwitness] }
+    // scriptSig.asm uses fAttemptSighashDecode=true (ScriptToAsmStr in Core).
+    const vinArr = tx.inputs.map((input, i) => {
+      const vin: Record<string, unknown> = {};
+      if (isCoinbase(tx) && i === 0) {
+        vin.coinbase = input.scriptSig.toString("hex");
+        vin.sequence = input.sequence;
+      } else {
+        vin.txid = Buffer.from(input.prevOut.txid).reverse().toString("hex");
+        vin.vout = input.prevOut.vout;
+        vin.scriptSig = {
+          asm: disassembleScriptSigHashDecode(input.scriptSig),
+          hex: input.scriptSig.toString("hex"),
+        };
+        vin.sequence = input.sequence;
+      }
+      if (input.witness && input.witness.length > 0) {
+        vin.txinwitness = input.witness.map((w) => w.toString("hex"));
+      }
+      return vin;
+    });
+
+    // Build vout array: value via BTC sentinel (0.00000000 format), full
+    // scriptPubKey shape {asm, desc, hex, address?, type} via W53 helper.
+    const voutArr = tx.outputs.map((output, i) => ({
+      value: formatBtcAmount(output.value),
+      n: i,
+      scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey),
+    }));
+
     return {
       txid: Buffer.from(txid).reverse().toString("hex"),
       hash: Buffer.from(wtxid).reverse().toString("hex"),
@@ -6128,20 +6164,8 @@ export class RPCServer {
       vsize: getTxVSize(tx),
       weight: getTxWeight(tx),
       locktime: tx.lockTime,
-      vin: tx.inputs.map((input) => ({
-        txid: Buffer.from(input.prevOut.txid).reverse().toString("hex"),
-        vout: input.prevOut.vout,
-        scriptSig: { asm: "", hex: input.scriptSig.toString("hex") },
-        sequence: input.sequence,
-      })),
-      vout: tx.outputs.map((output, i) => ({
-        value: Number(output.value) / 100_000_000,
-        n: i,
-        scriptPubKey: {
-          hex: output.scriptPubKey.toString("hex"),
-          type: this.getScriptType(output.scriptPubKey),
-        },
-      })),
+      vin: vinArr,
+      vout: voutArr,
     };
   }
 

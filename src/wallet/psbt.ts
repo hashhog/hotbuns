@@ -2776,7 +2776,7 @@ const SIGHASH_TYPE_NAMES: Record<number, string> = {
  *
  * Used for final_scriptSig only.
  */
-function disassembleScriptSigHashDecode(script: Buffer): string {
+export function disassembleScriptSigHashDecode(script: Buffer): string {
   if (script.length === 0) return "";
 
   const parts: string[] = [];
@@ -3136,7 +3136,7 @@ function inferDescriptor(script: Buffer): string {
  * The `address` field is suppressed for bare-pubkey scripts (type==="pubkey"),
  * matching Core's ScriptToUniv behaviour.
  */
-function buildScriptPubKeyObj(script: Buffer): DecodedScriptPubKey {
+export function buildScriptPubKeyObj(script: Buffer): DecodedScriptPubKey {
   const type = getScriptType(script);
   const result: DecodedScriptPubKey = {
     asm: disassembleScript(script),
