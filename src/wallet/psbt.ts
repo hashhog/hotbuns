@@ -89,6 +89,7 @@ export const PSBT_OUT_BIP32_DERIVATION = 0x02;
 export const PSBT_OUT_TAP_INTERNAL_KEY = 0x05;
 export const PSBT_OUT_TAP_TREE = 0x06;
 export const PSBT_OUT_TAP_BIP32_DERIVATION = 0x07;
+export const PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS = 0x08;
 export const PSBT_OUT_PROPRIETARY = 0xfc;
 
 // =============================================================================
@@ -137,6 +138,12 @@ export interface PSBTInput {
   hash256Preimages: Map<string, Buffer>;
   /** Taproot key-path signature */
   tapKeySig?: Buffer;
+  /** Taproot script path signatures: map of (xonly_hex + leaf_hash_hex) -> {xonly, leafHash, sig} */
+  tapScriptSigs: Map<string, { xonly: Buffer; leafHash: Buffer; sig: Buffer }>;
+  /** Taproot leaf scripts: map of (script_hex + leaf_ver) -> {script, leafVer, controlBlocks[]} */
+  tapLeafScripts: Map<string, { script: Buffer; leafVer: number; controlBlocks: Buffer[] }>;
+  /** Taproot BIP32 derivation: xonly_hex -> {xonly, leafHashes[], origin} */
+  tapBip32Derivation: Map<string, { xonly: Buffer; leafHashes: Buffer[]; origin: KeyOriginInfo }>;
   /** Taproot internal key (x-only, 32 bytes) */
   tapInternalKey?: Buffer;
   /** Taproot merkle root */
@@ -159,6 +166,10 @@ export interface PSBTOutput {
   tapInternalKey?: Buffer;
   /** Taproot script tree */
   tapTree?: Array<{ depth: number; leafVersion: number; script: Buffer }>;
+  /** Taproot BIP32 derivation: xonly_hex -> {xonly, leafHashes[], origin} */
+  tapBip32Derivation: Map<string, { xonly: Buffer; leafHashes: Buffer[]; origin: KeyOriginInfo }>;
+  /** MuSig2 participant pubkeys: agg_pubkey_hex -> {aggPubkey, participantPubkeys[]} */
+  musig2Participants: Map<string, { aggPubkey: Buffer; participantPubkeys: Buffer[] }>;
   /** Unknown key-value pairs */
   unknown: Map<string, Buffer>;
 }
@@ -237,6 +248,9 @@ export function createPSBTInput(): PSBTInput {
     sha256Preimages: new Map(),
     hash160Preimages: new Map(),
     hash256Preimages: new Map(),
+    tapScriptSigs: new Map(),
+    tapLeafScripts: new Map(),
+    tapBip32Derivation: new Map(),
     unknown: new Map(),
   };
 }
@@ -247,6 +261,8 @@ export function createPSBTInput(): PSBTInput {
 export function createPSBTOutput(): PSBTOutput {
   return {
     bip32Derivation: new Map(),
+    tapBip32Derivation: new Map(),
+    musig2Participants: new Map(),
     unknown: new Map(),
   };
 }
@@ -860,6 +876,85 @@ function deserializePSBTInput(pairs: Array<[Buffer, Buffer]>): PSBTInput {
         break;
       }
 
+      case PSBT_IN_TAP_SCRIPT_SIG: {
+        // Key: type(1) + xonly_pubkey(32) + leaf_hash(32) = 65 bytes total
+        if (keyData.length !== 64) {
+          throw new Error("Taproot script sig key must have exactly 64 bytes of key data");
+        }
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: taproot script path sig");
+        }
+        if (value.length < 64 || value.length > 65) {
+          throw new Error("Invalid taproot script path signature length");
+        }
+        const tapSigXonly = Buffer.from(keyData.subarray(0, 32));
+        const tapSigLeafHash = Buffer.from(keyData.subarray(32, 64));
+        const tapSigMapKey = tapSigXonly.toString("hex") + tapSigLeafHash.toString("hex");
+        input.tapScriptSigs.set(tapSigMapKey, {
+          xonly: tapSigXonly,
+          leafHash: tapSigLeafHash,
+          sig: Buffer.from(value),
+        });
+        seenKeys.add(keyHex);
+        break;
+      }
+
+      case PSBT_IN_TAP_LEAF_SCRIPT: {
+        // Key: type(1) + control_block(>=33 bytes); Value: script + leaf_ver(1)
+        if (keyData.length < 33) {
+          throw new Error("Taproot leaf script key data must be at least 33 bytes (control block)");
+        }
+        if ((keyData.length - 1) % 32 !== 0) {
+          throw new Error("Taproot leaf script control block size is not valid");
+        }
+        if (value.length < 1) {
+          throw new Error("Taproot leaf script value must be at least 1 byte");
+        }
+        const controlBlock = Buffer.from(keyData);
+        const leafVer = value[value.length - 1];
+        const leafScript = Buffer.from(value.subarray(0, value.length - 1));
+        const leafScriptMapKey = leafScript.toString("hex") + ":" + leafVer.toString();
+        const existing = input.tapLeafScripts.get(leafScriptMapKey);
+        if (existing) {
+          existing.controlBlocks.push(controlBlock);
+        } else {
+          input.tapLeafScripts.set(leafScriptMapKey, {
+            script: leafScript,
+            leafVer,
+            controlBlocks: [controlBlock],
+          });
+        }
+        // Note: multiple control_blocks for same leaf script are valid — don't add to seenKeys
+        break;
+      }
+
+      case PSBT_IN_TAP_BIP32_DERIVATION: {
+        // Key: type(1) + xonly_pubkey(32) = 33 bytes total
+        if (keyData.length !== 32) {
+          throw new Error("Taproot BIP32 derivation key must have exactly 32 bytes of key data");
+        }
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: taproot BIP32 derivation");
+        }
+        const tapBip32Xonly = Buffer.from(keyData);
+        // Value: compact_size(N_hashes) + N_hashes*32 + fingerprint(4) + path(N*4)
+        const tapBip32Reader = new BufferReader(value);
+        const nHashes = tapBip32Reader.readVarInt();
+        const tapLeafHashes: Buffer[] = [];
+        for (let j = 0; j < nHashes; j++) {
+          tapLeafHashes.push(Buffer.from(tapBip32Reader.readBytes(32)));
+        }
+        const originData = value.subarray(tapBip32Reader.position);
+        const tapBip32Origin = deserializeKeyOrigin(originData);
+        input.tapBip32Derivation.set(tapBip32Xonly.toString("hex"), {
+          xonly: tapBip32Xonly,
+          leafHashes: tapLeafHashes,
+          origin: tapBip32Origin,
+        });
+        seenKeys.add(keyHex);
+        break;
+      }
+
       case PSBT_IN_TAP_INTERNAL_KEY: {
         if (seenKeys.has(keyHex)) {
           throw new Error("Duplicate key: taproot internal key");
@@ -989,6 +1084,58 @@ function deserializePSBTOutput(pairs: Array<[Buffer, Buffer]>): PSBTOutput {
           const script = Buffer.from(treeReader.readVarBytes());
           output.tapTree.push({ depth, leafVersion, script });
         }
+        seenKeys.add(keyHex);
+        break;
+      }
+
+      case PSBT_OUT_TAP_BIP32_DERIVATION: {
+        // Key: type(1) + xonly_pubkey(32) = 33 bytes total
+        if (keyData.length !== 32) {
+          throw new Error("Output taproot BIP32 derivation key must have exactly 32 bytes of key data");
+        }
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: output taproot BIP32 derivation");
+        }
+        const outTapBip32Xonly = Buffer.from(keyData);
+        // Value: compact_size(N_hashes) + N_hashes*32 + fingerprint(4) + path(N*4)
+        const outTapBip32Reader = new BufferReader(value);
+        const outNHashes = outTapBip32Reader.readVarInt();
+        const outTapLeafHashes: Buffer[] = [];
+        for (let j = 0; j < outNHashes; j++) {
+          outTapLeafHashes.push(Buffer.from(outTapBip32Reader.readBytes(32)));
+        }
+        const outOriginData = value.subarray(outTapBip32Reader.position);
+        const outTapBip32Origin = deserializeKeyOrigin(outOriginData);
+        output.tapBip32Derivation.set(outTapBip32Xonly.toString("hex"), {
+          xonly: outTapBip32Xonly,
+          leafHashes: outTapLeafHashes,
+          origin: outTapBip32Origin,
+        });
+        seenKeys.add(keyHex);
+        break;
+      }
+
+      case PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS: {
+        // Key: type(varint 0x08) + agg_pubkey(33 bytes)
+        // Value: N concatenated 33-byte compressed participant pubkeys
+        if (keyData.length !== 33) {
+          throw new Error("Output MuSig2 participant pubkeys key must have exactly 33 bytes of key data");
+        }
+        if (seenKeys.has(keyHex)) {
+          throw new Error("Duplicate key: output MuSig2 participant pubkeys");
+        }
+        if (value.length === 0 || value.length % 33 !== 0) {
+          throw new Error("Output MuSig2 participant pubkeys value length must be a multiple of 33");
+        }
+        const musig2AggPubkey = Buffer.from(keyData);
+        const musig2ParticipantPubkeys: Buffer[] = [];
+        for (let j = 0; j < value.length; j += 33) {
+          musig2ParticipantPubkeys.push(Buffer.from(value.subarray(j, j + 33)));
+        }
+        output.musig2Participants.set(musig2AggPubkey.toString("hex"), {
+          aggPubkey: musig2AggPubkey,
+          participantPubkeys: musig2ParticipantPubkeys,
+        });
         seenKeys.add(keyHex);
         break;
       }
@@ -1534,12 +1681,17 @@ export function combinePSBTs(psbts: PSBT[]): PSBT {
       sha256Preimages: new Map(input.sha256Preimages),
       hash160Preimages: new Map(input.hash160Preimages),
       hash256Preimages: new Map(input.hash256Preimages),
+      tapScriptSigs: new Map(input.tapScriptSigs),
+      tapLeafScripts: new Map(input.tapLeafScripts),
+      tapBip32Derivation: new Map(input.tapBip32Derivation),
       unknown: new Map(input.unknown),
       finalScriptWitness: input.finalScriptWitness?.map((b) => Buffer.from(b)),
     })),
     outputs: psbts[0].outputs.map((output) => ({
       ...output,
       bip32Derivation: new Map(output.bip32Derivation),
+      tapBip32Derivation: new Map(output.tapBip32Derivation),
+      musig2Participants: new Map(output.musig2Participants),
       unknown: new Map(output.unknown),
       tapTree: output.tapTree?.map((leaf) => ({
         depth: leaf.depth,
@@ -1615,6 +1767,21 @@ export function combinePSBTs(psbts: PSBT[]): PSBT {
       if (srcInput.tapKeySig && !dstInput.tapKeySig) {
         dstInput.tapKeySig = srcInput.tapKeySig;
       }
+      for (const [key, value] of srcInput.tapScriptSigs) {
+        if (!dstInput.tapScriptSigs.has(key)) {
+          dstInput.tapScriptSigs.set(key, value);
+        }
+      }
+      for (const [key, value] of srcInput.tapLeafScripts) {
+        if (!dstInput.tapLeafScripts.has(key)) {
+          dstInput.tapLeafScripts.set(key, value);
+        }
+      }
+      for (const [key, value] of srcInput.tapBip32Derivation) {
+        if (!dstInput.tapBip32Derivation.has(key)) {
+          dstInput.tapBip32Derivation.set(key, value);
+        }
+      }
       if (srcInput.tapInternalKey && !dstInput.tapInternalKey) {
         dstInput.tapInternalKey = srcInput.tapInternalKey;
       }
@@ -1680,6 +1847,16 @@ export function combinePSBTs(psbts: PSBT[]): PSBT {
       for (const [key, value] of srcOutput.bip32Derivation) {
         if (!dstOutput.bip32Derivation.has(key)) {
           dstOutput.bip32Derivation.set(key, value);
+        }
+      }
+      for (const [key, value] of srcOutput.tapBip32Derivation) {
+        if (!dstOutput.tapBip32Derivation.has(key)) {
+          dstOutput.tapBip32Derivation.set(key, value);
+        }
+      }
+      for (const [key, value] of srcOutput.musig2Participants) {
+        if (!dstOutput.musig2Participants.has(key)) {
+          dstOutput.musig2Participants.set(key, value);
         }
       }
 
@@ -2018,6 +2195,9 @@ function clearSigningData(input: PSBTInput): void {
   input.hash160Preimages.clear();
   input.hash256Preimages.clear();
   input.tapKeySig = undefined;
+  input.tapScriptSigs.clear();
+  input.tapLeafScripts.clear();
+  input.tapBip32Derivation.clear();
   input.tapInternalKey = undefined;
   input.tapMerkleRoot = undefined;
 }
@@ -2501,12 +2681,24 @@ export interface DecodedPSBT {
     bip32_derivs?: Array<{ pubkey: string; master_fingerprint: string; path: string }>;
     final_scriptSig?: { asm: string; hex: string };
     final_scriptwitness?: string[];
+    // BIP-371 taproot input fields
+    taproot_key_path_sig?: string;
+    taproot_script_path_sigs?: unknown[];
+    taproot_scripts?: unknown[];
+    taproot_bip32_derivs?: unknown[];
+    taproot_internal_key?: string;
+    taproot_merkle_root?: string;
     unknown?: Record<string, string>;
   }>;
   outputs: Array<{
     redeem_script?: { asm: string; hex: string; type: string };
     witness_script?: { asm: string; hex: string; type: string };
     bip32_derivs?: Array<{ pubkey: string; master_fingerprint: string; path: string }>;
+    // BIP-371 taproot output fields
+    taproot_internal_key?: string;
+    taproot_tree?: unknown[];
+    taproot_bip32_derivs?: unknown[];
+    musig2_participant_pubkeys?: unknown[];
     unknown?: Record<string, string>;
   }>;
   fee?: unknown;
@@ -2906,10 +3098,24 @@ function spkToAddress(script: Buffer): string | null {
 /**
  * Build a BIP-380 descriptor string for a scriptPubKey, mirroring Core's
  * InferDescriptor in the no-provider context (decodepsbt):
- *   addr(<address>)#<checksum>  — for standard address-encodable scripts
- *   raw(<hex>)#<checksum>       — otherwise
+ *   rawtr(<x-only-hex>)#<checksum>   — for OP_1 <32bytes> (witness_v1_taproot)
+ *   addr(<address>)#<checksum>       — for other standard address-encodable scripts
+ *   raw(<hex>)#<checksum>            — otherwise
+ *
+ * CRITICAL: taproot outputs use rawtr() NOT addr(), matching Core's InferDescriptor
+ * which returns a RawTRDescriptor when no signing provider is available.
  */
 function inferDescriptor(script: Buffer): string {
+  // witness_v1_taproot: OP_1 (0x51) + OP_DATA_32 (0x20) + 32 bytes = 34 bytes
+  if (script.length === 34 && script[0] === 0x51 && script[1] === 0x20) {
+    const xonly = script.subarray(2, 34).toString("hex");
+    const inner = `rawtr(${xonly})`;
+    try {
+      return addChecksum(inner);
+    } catch {
+      return inner;
+    }
+  }
   const addr = spkToAddress(script);
   let inner: string;
   if (addr !== null) {
@@ -2953,10 +3159,14 @@ function buildScriptPubKeyObj(script: Buffer): DecodedScriptPubKey {
 function formatDerivationPath(origin: KeyOriginInfo): string {
   const parts = origin.path.map((index) => {
     if (index >= 0x80000000) {
-      return `${index - 0x80000000}'`;
+      // Core's WriteHDKeypath uses 'h' suffix (not apostrophe) for hardened paths
+      return `${index - 0x80000000}h`;
     }
     return index.toString();
   });
+  if (parts.length === 0) {
+    return "m";
+  }
   return "m/" + parts.join("/");
 }
 
@@ -3088,6 +3298,60 @@ export function decodePSBT(psbt: PSBT): DecodedPSBT {
       }
     }
 
+    // BIP-371 Taproot fields (all conditional — omit when empty)
+
+    // taproot_key_path_sig (PSBT_IN_TAP_KEY_SIG 0x13)
+    if (input.tapKeySig) {
+      result.taproot_key_path_sig = input.tapKeySig.toString("hex");
+    }
+
+    // taproot_script_path_sigs (PSBT_IN_TAP_SCRIPT_SIG 0x14)
+    if (input.tapScriptSigs.size > 0) {
+      result.taproot_script_path_sigs = [];
+      for (const { xonly, leafHash, sig } of input.tapScriptSigs.values()) {
+        (result.taproot_script_path_sigs as unknown[]).push({
+          pubkey: xonly.toString("hex"),
+          leaf_hash: leafHash.toString("hex"),
+          sig: sig.toString("hex"),
+        });
+      }
+    }
+
+    // taproot_scripts (PSBT_IN_TAP_LEAF_SCRIPT 0x15)
+    if (input.tapLeafScripts.size > 0) {
+      result.taproot_scripts = [];
+      for (const { script, leafVer, controlBlocks } of input.tapLeafScripts.values()) {
+        (result.taproot_scripts as unknown[]).push({
+          script: script.toString("hex"),
+          leaf_ver: leafVer,
+          control_blocks: controlBlocks.map((cb) => cb.toString("hex")),
+        });
+      }
+    }
+
+    // taproot_bip32_derivs (PSBT_IN_TAP_BIP32_DERIVATION 0x16)
+    if (input.tapBip32Derivation.size > 0) {
+      result.taproot_bip32_derivs = [];
+      for (const { xonly, leafHashes, origin } of input.tapBip32Derivation.values()) {
+        (result.taproot_bip32_derivs as unknown[]).push({
+          pubkey: xonly.toString("hex"),
+          master_fingerprint: origin.fingerprint.toString("hex"),
+          path: formatDerivationPath(origin),
+          leaf_hashes: leafHashes.map((h) => h.toString("hex")),
+        });
+      }
+    }
+
+    // taproot_internal_key (PSBT_IN_TAP_INTERNAL_KEY 0x17)
+    if (input.tapInternalKey) {
+      result.taproot_internal_key = input.tapInternalKey.toString("hex");
+    }
+
+    // taproot_merkle_root (PSBT_IN_TAP_MERKLE_ROOT 0x18)
+    if (input.tapMerkleRoot) {
+      result.taproot_merkle_root = input.tapMerkleRoot.toString("hex");
+    }
+
     // final_scriptSig — ScriptToAsmStr with fAttemptSighashDecode=true
     if (input.finalScriptSig) {
       result.final_scriptSig = {
@@ -3138,6 +3402,44 @@ export function decodePSBT(psbt: PSBT): DecodedPSBT {
           pubkey: pubkey.toString("hex"),
           master_fingerprint: origin.fingerprint.toString("hex"),
           path: formatDerivationPath(origin),
+        });
+      }
+    }
+
+    // Taproot internal key (PSBT_OUT_TAP_INTERNAL_KEY 0x05)
+    if (output.tapInternalKey) {
+      result.taproot_internal_key = output.tapInternalKey.toString("hex");
+    }
+
+    // Taproot tree (PSBT_OUT_TAP_TREE 0x06) — emit as taproot_tree
+    if (output.tapTree && output.tapTree.length > 0) {
+      result.taproot_tree = output.tapTree.map(({ depth, leafVersion, script }) => ({
+        depth,
+        leaf_ver: leafVersion,
+        script: script.toString("hex"),
+      }));
+    }
+
+    // Taproot BIP32 derivs (PSBT_OUT_TAP_BIP32_DERIVATION 0x07)
+    if (output.tapBip32Derivation.size > 0) {
+      result.taproot_bip32_derivs = [];
+      for (const { xonly, leafHashes, origin } of output.tapBip32Derivation.values()) {
+        (result.taproot_bip32_derivs as unknown[]).push({
+          pubkey: xonly.toString("hex"),
+          master_fingerprint: origin.fingerprint.toString("hex"),
+          path: formatDerivationPath(origin),
+          leaf_hashes: leafHashes.map((h) => h.toString("hex")),
+        });
+      }
+    }
+
+    // MuSig2 participant pubkeys (PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS 0x08)
+    if (output.musig2Participants.size > 0) {
+      result.musig2_participant_pubkeys = [];
+      for (const { aggPubkey, participantPubkeys } of output.musig2Participants.values()) {
+        (result.musig2_participant_pubkeys as unknown[]).push({
+          aggregate_pubkey: aggPubkey.toString("hex"),
+          participant_pubkeys: participantPubkeys.map((p) => p.toString("hex")),
         });
       }
     }
