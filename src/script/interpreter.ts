@@ -1863,8 +1863,61 @@ export type TxoutType =
   | "nonstandard";
 
 /**
+ * Check whether all bytes in `script` starting at `offset` are push-only
+ * opcodes (OP_0, OP_PUSHBYTES_1..75, OP_PUSHDATA1/2/4, OP_1NEGATE, OP_1..OP_16).
+ *
+ * Mirrors Bitcoin Core's CScript::IsPushOnly(const_iterator pc) in
+ * script/script.h. Used by getScriptType to classify NULL_DATA scripts: Core's
+ * Solver() only returns NULL_DATA when OP_RETURN is followed by push-only data.
+ * A script like `6a 09 deadbeef` (OP_RETURN + push-9 with only 4 bytes of data)
+ * fails this check because the push is truncated, so it is classified nonstandard.
+ */
+function isPushOnlyFrom(script: Buffer, offset: number): boolean {
+  let i = offset;
+  while (i < script.length) {
+    const op = script[i];
+    if (op === 0x00) { i++; continue; } // OP_0
+    if (op >= 0x01 && op <= 0x4b) {
+      // OP_PUSHBYTES_N: expects N more bytes
+      if (i + 1 + op > script.length) return false;
+      i += 1 + op;
+    } else if (op === 0x4c) {
+      // OP_PUSHDATA1
+      if (i + 1 >= script.length) return false;
+      const len = script[i + 1];
+      if (i + 2 + len > script.length) return false;
+      i += 2 + len;
+    } else if (op === 0x4d) {
+      // OP_PUSHDATA2
+      if (i + 2 >= script.length) return false;
+      const len = script.readUInt16LE(i + 1);
+      if (i + 3 + len > script.length) return false;
+      i += 3 + len;
+    } else if (op === 0x4e) {
+      // OP_PUSHDATA4
+      if (i + 4 >= script.length) return false;
+      const len = script.readUInt32LE(i + 1);
+      if (i + 5 + len > script.length) return false;
+      i += 5 + len;
+    } else if (op === 0x4f || (op >= 0x51 && op <= 0x60)) {
+      // OP_1NEGATE (0x4f) and OP_1..OP_16 (0x51..0x60)
+      i++;
+    } else {
+      // Any other opcode (including non-push ops and > OP_16) is not push-only
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Detect script type.
  * Returns both AddressType-compatible values and extended TxoutType values.
+ *
+ * NULL_DATA classification mirrors Bitcoin Core's Solver() (src/script/solver.cpp):
+ * the script must start with OP_RETURN and all remaining bytes must be push-only.
+ * A script like `6a 09 deadbeef` (OP_RETURN + push-9 opcode with only 4 payload
+ * bytes) has a truncated push and is classified "nonstandard", not "nulldata".
  */
 export function getScriptType(script: Buffer): TxoutType {
   if (isP2PKH(script)) return "p2pkh";
@@ -1874,8 +1927,12 @@ export function getScriptType(script: Buffer): TxoutType {
   // Check P2A before P2TR since P2A is a specific witness v1 program
   if (isP2A(script)) return "anchor";
   if (isP2TR(script)) return "p2tr";
-  // Check for OP_RETURN (nulldata)
-  if (script.length >= 1 && script[0] === Opcode.OP_RETURN) return "nulldata";
+  // Check for OP_RETURN (nulldata): post-OP_RETURN data must be push-only.
+  // Core's Solver() requires IsPushOnly after OP_RETURN; a truncated push
+  // (e.g. 6a09deadbeef) must be classified "nonstandard".
+  if (script.length >= 1 && script[0] === Opcode.OP_RETURN && isPushOnlyFrom(script, 1)) {
+    return "nulldata";
+  }
   // Check for unknown witness versions (witness v2-v16)
   if (isWitnessProgram(script)) return "witness_unknown";
   return "nonstandard";

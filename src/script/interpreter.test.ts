@@ -946,6 +946,42 @@ describe("script type detection", () => {
     expect(isP2TR(nonstandard)).toBe(false);
     expect(getScriptType(nonstandard)).toBe("nonstandard");
   });
+
+  // W58-3 regression: getScriptType IsPushOnly gate for NULL_DATA
+  // Bitcoin Core's Solver() only returns NULL_DATA when OP_RETURN is followed
+  // by push-only data. A truncated push must classify as "nonstandard".
+  // Reference: bitcoin-core/src/script/solver.cpp, IsStandardTx() in policy.cpp
+  describe("getScriptType nulldata / nonstandard OP_RETURN (W58-3)", () => {
+    test("bare OP_RETURN (empty) is nulldata", () => {
+      const bare = Buffer.from([0x6a]);
+      expect(getScriptType(bare)).toBe("nulldata");
+    });
+
+    test("OP_RETURN with well-formed push is nulldata", () => {
+      // 6a 04 deadbeef — OP_RETURN + push-4 with exactly 4 bytes
+      const valid = Buffer.from("6a04deadbeef", "hex");
+      expect(getScriptType(valid)).toBe("nulldata");
+    });
+
+    test("OP_RETURN with truncated push is nonstandard (W58-3 corpus vector)", () => {
+      // 6a 09 deadbeef — OP_RETURN + push-9 opcode but only 4 payload bytes.
+      // Core's Solver() IsPushOnly check fails → classified nonstandard.
+      const truncated = Buffer.from("6a09deadbeef", "hex");
+      expect(getScriptType(truncated)).toBe("nonstandard");
+    });
+
+    test("OP_RETURN followed by non-push opcode is nonstandard", () => {
+      // 6a 51 — OP_RETURN OP_1 is push-only (OP_1 = 0x51 is a push opcode)
+      // but 6a 93 — OP_RETURN OP_ADD is not push-only
+      const withAdd = Buffer.from([0x6a, 0x93]); // OP_RETURN OP_ADD
+      expect(getScriptType(withAdd)).toBe("nonstandard");
+    });
+
+    test("OP_RETURN OP_1 is nulldata (OP_1 is a push opcode)", () => {
+      const withOP1 = Buffer.from([0x6a, 0x51]); // OP_RETURN OP_1
+      expect(getScriptType(withOP1)).toBe("nulldata");
+    });
+  });
 });
 
 describe("verifyScript - P2PKH", () => {
