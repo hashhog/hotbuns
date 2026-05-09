@@ -1378,6 +1378,28 @@ export class RPCServer {
       }
     }
 
+    // Derive target from compact nBits — 64-char lowercase hex, zero-padded.
+    // Matches Core's "target" field added in Bitcoin Core 27+.
+    const targetHex = compactToBigInt(header.bits).toString(16).padStart(64, "0");
+
+    // Resolve nTx: prefer the stored index value; fall back to counting from
+    // raw block data when the stored value is 0 (happens for pre-migration
+    // blocks that were indexed before nTx storage was wired into connectBlock).
+    let nTx = blockIndex.nTx;
+    if (nTx === 0) {
+      const rawBlock = await this.db.getBlock(blockhash);
+      if (rawBlock !== null) {
+        try {
+          const blk = deserializeBlock(new BufferReader(rawBlock));
+          nTx = blk.transactions.length;
+          // Persist the corrected value so subsequent calls are fast.
+          await this.db.updateBlockIndexNTx(blockhash, nTx);
+        } catch {
+          // Leave nTx as 0 if the block is unreadable.
+        }
+      }
+    }
+
     const result: Record<string, unknown> = {
       hash: blockhashParam,
       confirmations: this.chainState.getBestBlock().height - blockIndex.height + 1,
@@ -1391,9 +1413,10 @@ export class RPCServer {
         : header.timestamp,
       nonce: header.nonce,
       bits: header.bits.toString(16).padStart(8, "0"),
+      target: targetHex,
       difficulty: this.calculateDifficultyFromBits(header.bits),
       chainwork: chainWorkHex,
-      nTx: blockIndex.nTx,
+      nTx,
       previousblockhash: Buffer.from(header.prevBlock).reverse().toString("hex"),
     };
 
@@ -4810,19 +4833,26 @@ export class RPCServer {
   }
 
   /**
-   * Calculate difficulty from compact target (nBits).
-   * difficulty = powLimit / currentTarget
+   * Calculate difficulty from compact nBits.
+   *
+   * Mirrors Bitcoin Core GetDifficulty() (rpc/blockchain.cpp) exactly:
+   *   nShift = (nBits >> 24) & 0xff
+   *   dDiff  = 0x0000ffff / (nBits & 0x00ffffff)
+   *   shift to nShift==29 by ×256 or ÷256
+   *
+   * Serialized with 16 significant digits (Core uses std::setprecision(16)
+   * via UniValue::setFloat → std::ostringstream).
    */
   private calculateDifficultyFromBits(bits: number): number {
-    const target = compactToBigInt(bits);
-    if (target === 0n) {
-      return 1;
-    }
+    let nShift = (bits >>> 24) & 0xff;
+    let dDiff = 0x0000ffff / (bits & 0x00ffffff);
+    while (nShift < 29) { dDiff *= 256.0; nShift++; }
+    while (nShift > 29) { dDiff /= 256.0; nShift--; }
 
-    const powLimitTarget = compactToBigInt(this.params.powLimitBits);
-    const difficulty = Number(powLimitTarget) / Number(target);
-
-    return difficulty;
+    // Round-trip through 16-sig-digit string to match Core's serialisation
+    // (std::ostringstream << std::setprecision(16) << dDiff).
+    // parseFloat strips trailing zeros and preserves the same IEEE 754 value.
+    return parseFloat(dDiff.toPrecision(16));
   }
 
   /**
