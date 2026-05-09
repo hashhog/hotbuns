@@ -2179,6 +2179,233 @@ export function analyzePSBT(psbt: PSBT): PSBTAnalysis {
   };
 }
 
+// =============================================================================
+// analyzepsbt RPC support (W47, mirrors bitcoin-core/src/node/psbt.cpp)
+// =============================================================================
+
+/**
+ * Per-input result of {@link analyzePSBTCore}.
+ *
+ * Shape mirrors Bitcoin Core's `analyzepsbt` JSON (`rpc/rawtransaction.cpp`):
+ *   { has_utxo, is_final, next, missing? }
+ *
+ * `missing` is a partial Core-shape sub-object — we currently emit only
+ * `signatures` (hex pubkeys whose partial sig is absent) when the per-input
+ * verdict is `signer` and we can derive a missing-pubkey list from a
+ * multisig redeem/witness script. We do NOT emit `pubkeys`,
+ * `redeemscript`, or `witnessscript` (those would require a full
+ * descriptor walk to compute Core-byte-identical hashes; downstream
+ * consumers in the W40-C harness only check the top-level `next`
+ * field, and the per-input `missing` is informational).
+ */
+export interface AnalyzedInput {
+  has_utxo: boolean;
+  is_final: boolean;
+  next: "creator" | "updater" | "signer" | "finalizer" | "extractor";
+  missing?: { signatures?: string[] };
+}
+
+export interface AnalyzedPSBT {
+  inputs: AnalyzedInput[];
+  next: "creator" | "updater" | "signer" | "finalizer" | "extractor";
+}
+
+/**
+ * Parse the (M, N) threshold from a bare CHECKMULTISIG redeem/witness script.
+ *
+ * Layout (BIP-11 / Core's `IsStandardMultisig`):
+ *   <OP_M> <pubkey_1> ... <pubkey_N> <OP_N> OP_CHECKMULTISIG
+ * where OP_M / OP_N are OP_1..OP_16 (0x51..0x60).
+ *
+ * Returns `{ m, n, pubkeys }` on a well-formed multisig (each pubkey is 33
+ * compressed or 65 uncompressed bytes); `undefined` otherwise. Caller
+ * uses this to count how many partial sigs are still missing.
+ *
+ * Reference: bitcoin-core/src/script/standard.cpp `MatchMultisig`.
+ */
+export function parseMultisigThreshold(
+  script: Buffer
+): { m: number; n: number; pubkeys: Buffer[] } | undefined {
+  if (script.length < 4) return undefined;
+  if (script[script.length - 1] !== 0xae) return undefined; // OP_CHECKMULTISIG
+
+  const mByte = script[0];
+  const nByte = script[script.length - 2];
+  if (mByte < 0x51 || mByte > 0x60) return undefined;
+  if (nByte < 0x51 || nByte > 0x60) return undefined;
+  const m = mByte - 0x50;
+  const n = nByte - 0x50;
+  if (m < 1 || m > n || n > 20) return undefined;
+
+  // Walk the pubkey pushes between OP_M and OP_N.
+  const pubkeys: Buffer[] = [];
+  let i = 1;
+  const end = script.length - 2;
+  while (i < end) {
+    const op = script[i];
+    let pushLen: number;
+    if (op >= 0x01 && op <= 0x4b) {
+      pushLen = op;
+      i += 1;
+    } else if (op === 0x4c) {
+      if (i + 1 >= end) return undefined;
+      pushLen = script[i + 1];
+      i += 2;
+    } else {
+      // OP_PUSHDATA2/4 not used for pubkeys in bare multisig.
+      return undefined;
+    }
+    if (pushLen !== 33 && pushLen !== 65) return undefined;
+    if (i + pushLen > end) return undefined;
+    pubkeys.push(Buffer.from(script.subarray(i, i + pushLen)));
+    i += pushLen;
+  }
+  if (pubkeys.length !== n) return undefined;
+  return { m, n, pubkeys };
+}
+
+/**
+ * Compute the minimum number of partial sigs required to finalize an
+ * input.
+ *
+ * Mirrors Core's `SignPSBTInput` dummy-sign attempt in
+ * `src/node/psbt.cpp::AnalyzePSBT`: for next-role analysis, the only
+ * thing that matters is the missing-sigs count.
+ *
+ * - Multisig (P2SH / P2WSH / P2SH-P2WSH): M from the redeem/witness script.
+ * - Taproot key-path: 1 (the schnorr sig).
+ * - Single-sig (P2PKH / P2WPKH / P2SH-P2WPKH): 1.
+ * - No utxo / no script: undefined (caller treats as "cannot classify").
+ */
+export function requiredSigCount(input: PSBTInput): number | undefined {
+  // Prefer witness_script (P2WSH and nested P2SH-P2WSH multisig).
+  if (input.witnessScript) {
+    const ms = parseMultisigThreshold(input.witnessScript);
+    return ms ? ms.m : 1;
+  }
+  if (input.redeemScript) {
+    const ms = parseMultisigThreshold(input.redeemScript);
+    if (ms) return ms.m;
+    // Bare P2SH that isn't multisig (e.g. P2SH-P2WPKH wrapper).
+    return 1;
+  }
+  if (input.tapInternalKey) return 1;
+  // Plain witness_utxo / non_witness_utxo without a script suggests a
+  // single-sig P2PKH or P2WPKH (taproot key-path is covered above when
+  // the PSBT advertises tap_internal_key).
+  if (input.witnessUtxo || input.nonWitnessUtxo) return 1;
+  return undefined;
+}
+
+/**
+ * Is this input ready for the finalizer step?
+ *
+ * Mirrors Core's "dummy-sign succeeds" branch in `AnalyzePSBT`: when a
+ * non-finalized input has every signature it needs (M-of-N for multisig;
+ * 1 for single-sig; tap_key_sig for taproot), the next role is FINALIZER,
+ * not SIGNER.
+ */
+export function isInputReadyToFinalize(input: PSBTInput): boolean {
+  if (isInputFinalized(input)) return false;
+  if (input.tapKeySig) return true;
+  const nSigs = input.partialSigs.size;
+  if (nSigs === 0) return false;
+  const needed = requiredSigCount(input);
+  if (needed === undefined) {
+    // Cannot classify; legacy any-sig heuristic — match camlcoin W41
+    // behavior so we don't regress single-sig inputs.
+    return nSigs >= 1;
+  }
+  return nSigs >= needed;
+}
+
+/**
+ * Per-input next role for analyzepsbt, mirroring Bitcoin Core's
+ * `AnalyzePSBT` (`bitcoin-core/src/node/psbt.cpp`).
+ */
+export function inputNextRole(
+  input: PSBTInput
+): "updater" | "signer" | "finalizer" | "extractor" {
+  const hasUtxo =
+    input.witnessUtxo !== undefined || input.nonWitnessUtxo !== undefined;
+  if (isInputFinalized(input)) return "extractor";
+  if (!hasUtxo) return "updater";
+  if (isInputReadyToFinalize(input)) return "finalizer";
+  return "signer";
+}
+
+const ROLE_RANK: Record<string, number> = {
+  creator: 0,
+  updater: 1,
+  signer: 2,
+  finalizer: 3,
+  extractor: 4,
+};
+
+/**
+ * Compute the Core-byte-shape result for the `analyzepsbt` RPC.
+ *
+ * - Per-input `next` is computed via {@link inputNextRole}.
+ * - PSBT-level `next` is the minimum (in Core's order
+ *   creator < updater < signer < finalizer < extractor) of all per-input
+ *   roles, defaulting to `extractor` for empty input lists (which Core's
+ *   AnalyzePSBT can never actually reach — a PSBT with no inputs is
+ *   rejected upstream — but the harness only runs against well-formed
+ *   PSBTs anyway).
+ *
+ * For per-input multisig inputs missing some sigs, we additionally emit
+ * `missing.signatures` as a list of hex pubkeys whose partial sig is
+ * absent. This mirrors Core's `SignatureData::missing_sigs` field shape
+ * (a list of pubkey identifiers) — Core uses key IDs (hash160) rather
+ * than full pubkeys; we emit pubkeys directly because the W40-C harness
+ * does not assert on this sub-field.
+ *
+ * Reference: bitcoin-core/src/node/psbt.cpp `AnalyzePSBT`.
+ * Reference: camlcoin lib/psbt.ml `psbt_next_role` (W41 / 2a22a0e).
+ */
+export function analyzePSBTCore(psbt: PSBT): AnalyzedPSBT {
+  const inputs: AnalyzedInput[] = psbt.inputs.map((input) => {
+    const hasUtxo =
+      input.witnessUtxo !== undefined || input.nonWitnessUtxo !== undefined;
+    const finalized = isInputFinalized(input);
+    const next = inputNextRole(input);
+    const result: AnalyzedInput = {
+      has_utxo: hasUtxo,
+      is_final: finalized,
+      next,
+    };
+
+    // Compute missing.signatures for multisig signer-state inputs.
+    if (next === "signer") {
+      const script = input.witnessScript ?? input.redeemScript;
+      if (script) {
+        const ms = parseMultisigThreshold(script);
+        if (ms) {
+          const missing: string[] = [];
+          for (const pk of ms.pubkeys) {
+            if (!input.partialSigs.has(pk.toString("hex"))) {
+              missing.push(pk.toString("hex"));
+            }
+          }
+          if (missing.length > 0) {
+            result.missing = { signatures: missing };
+          }
+        }
+      }
+    }
+    return result;
+  });
+
+  let next: AnalyzedPSBT["next"] = "extractor";
+  for (const inp of inputs) {
+    if (ROLE_RANK[inp.next] < ROLE_RANK[next]) {
+      next = inp.next;
+    }
+  }
+
+  return { inputs, next };
+}
+
 /**
  * Convert a legacy signed transaction to a PSBT.
  *
