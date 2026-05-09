@@ -3035,6 +3035,10 @@ function getScriptType(script: Buffer): string {
   if (script.length >= 1 && script[0] === 0x6a) {
     return "nulldata";
   }
+  // Bare multisig (P2MS)
+  if (parseP2MSScript(script) !== null) {
+    return "multisig";
+  }
   return "nonstandard";
 }
 
@@ -3105,6 +3109,46 @@ function spkToAddress(script: Buffer): string | null {
  * CRITICAL: taproot outputs use rawtr() NOT addr(), matching Core's InferDescriptor
  * which returns a RawTRDescriptor when no signing provider is available.
  */
+/**
+ * Try to parse a bare-multisig scriptPubKey (P2MS):
+ *   OP_N <pk1> <pk2> ... <pkM> OP_M OP_CHECKMULTISIG
+ * Returns { n, keys } on success, null on failure.
+ * Mirrors Core's InferDescriptor recognition of TxoutType::MULTISIG.
+ */
+function parseP2MSScript(script: Buffer): { n: number; keys: Buffer[] } | null {
+  if (script.length < 3) return null;
+  if (script[script.length - 1] !== 0xae) return null; // must end with OP_CHECKMULTISIG
+
+  // First byte: OP_1..OP_16 (0x51..0x60) = minimum sigs N
+  const firstOp = script[0];
+  if (firstOp < 0x51 || firstOp > 0x60) return null;
+  const n = firstOp - 0x50; // OP_1=0x51 → 1, etc.
+
+  // Second-to-last byte: OP_1..OP_16 = total keys M
+  const mOp = script[script.length - 2];
+  if (mOp < 0x51 || mOp > 0x60) return null;
+  const m = mOp - 0x50;
+
+  if (n > m || m > 20) return null; // BIP-11 limits
+
+  // Parse pubkey pushes between first byte and last two bytes.
+  const keys: Buffer[] = [];
+  let pos = 1;
+  while (pos < script.length - 2) {
+    const pushLen = script[pos];
+    if (pushLen !== 0x21 && pushLen !== 0x41) return null; // 33 or 65 bytes only
+    const pkLen = pushLen; // OP_PUSHBYTES_33 = 0x21 = 33, OP_PUSHBYTES_65 = 0x41 = 65
+    if (pos + 1 + pkLen > script.length - 2) return null;
+    keys.push(script.subarray(pos + 1, pos + 1 + pkLen));
+    pos += 1 + pkLen;
+  }
+
+  if (pos !== script.length - 2) return null; // didn't consume exactly up to last 2 bytes
+  if (keys.length !== m) return null;
+
+  return { n, keys };
+}
+
 function inferDescriptor(script: Buffer): string {
   // witness_v1_taproot: OP_1 (0x51) + OP_DATA_32 (0x20) + 32 bytes = 34 bytes
   if (script.length === 34 && script[0] === 0x51 && script[1] === 0x20) {
@@ -3116,6 +3160,20 @@ function inferDescriptor(script: Buffer): string {
       return inner;
     }
   }
+
+  // Bare multisig (P2MS): multi(N,pk1,...,pkM)
+  // Mirrors Core's InferDescriptor TxoutType::MULTISIG branch.
+  const p2ms = parseP2MSScript(script);
+  if (p2ms !== null) {
+    const pksStr = p2ms.keys.map((k) => k.toString("hex")).join(",");
+    const inner = `multi(${p2ms.n},${pksStr})`;
+    try {
+      return addChecksum(inner);
+    } catch {
+      return inner;
+    }
+  }
+
   const addr = spkToAddress(script);
   let inner: string;
   if (addr !== null) {
