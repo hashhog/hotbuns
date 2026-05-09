@@ -748,6 +748,48 @@ export class ChainDB {
       await this.putBlockIndex(hash, record);
     }
   }
+
+  /**
+   * Iterate all block index entries in the DB.
+   * Yields [hash (32B internal-byte-order), BlockIndexRecord] pairs.
+   * Used by the startup nTx migration.
+   */
+  async *iterateBlockIndexEntries(): AsyncGenerator<[Buffer, BlockIndexRecord]> {
+    const prefix = Buffer.from([DBPrefix.BLOCK_INDEX]);
+    const prefixEnd = Buffer.from([DBPrefix.BLOCK_INDEX + 1]);
+    const iterator = this.db.iterator({
+      gte: prefix,
+      lt: prefixEnd,
+    });
+    try {
+      for await (const [key, value] of iterator) {
+        // key = prefix(1) + hash(32)
+        if (key.length < 33) continue;
+        const hash = Buffer.from(key.subarray(1, 33));
+        let record: BlockIndexRecord;
+        try {
+          record = deserializeBlockIndex(value);
+        } catch {
+          continue;
+        }
+        yield [hash, record];
+      }
+    } finally {
+      await iterator.close();
+    }
+  }
+
+  /**
+   * Update only the nTx field of a block index record.
+   * No-op if the record does not exist.
+   */
+  async updateBlockIndexNTx(hash: Buffer, nTx: number): Promise<void> {
+    const record = await this.getBlockIndex(hash);
+    if (record && record.nTx === 0 && nTx > 0) {
+      record.nTx = nTx;
+      await this.putBlockIndex(hash, record);
+    }
+  }
 }
 
 /**

@@ -2487,6 +2487,15 @@ export class BlockSync {
       }
     }
 
+    // Always persist nTx for this block so getblockheader can return it
+    // without re-reading the block body.  This is a tiny write (4 bytes)
+    // and is idempotent — updateBlockIndexNTx no-ops if nTx is already set.
+    // The full block index (including status + dataPos) is written in the
+    // shouldFlush batch below; this covers the non-flush IBD path.
+    if (!shouldFlush) {
+      await this.db.updateBlockIndexNTx(blockHash, block.transactions.length);
+    }
+
     if (shouldFlush) {
       // On flush, write chain state atomically with UTXO changes.
       // Also write block index + height mapping so we can resume from here.

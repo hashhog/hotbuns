@@ -11,7 +11,8 @@ import { EventEmitter } from "events";
 
 import { ChainDB, BlockStatus, DBPrefix } from "../storage/database.js";
 import { PruneManager, PRUNE_TARGET_MANUAL } from "../storage/pruning.js";
-import { BufferWriter } from "../wire/serialization.js";
+import { BufferReader, BufferWriter } from "../wire/serialization.js";
+import { deserializeBlock } from "../validation/block.js";
 import { ChainStateManager } from "../chain/state.js";
 import { ChainstateManager } from "../chain/snapshot.js";
 import { UTXOManager } from "../chain/utxo.js";
@@ -1154,6 +1155,119 @@ function removePidFileSync(pidPath: string | null): void {
 let activePidPath: string | null = null;
 
 /**
+ * One-time startup migration: back-fill nTx for block index entries that have
+ * nTx=0 (written before nTx storage was added to connectBlock).
+ *
+ * Strategy (in order):
+ *  1. For each entry with nTx=0, try db.getBlock() → count txs in-process.
+ *  2. For entries where block data is unavailable (historical pruned blocks),
+ *     query a local Bitcoin Core instance via JSON-RPC (mainnet only, port
+ *     8332, no-auth needed from localhost with cookie in dataRoot).
+ *
+ * The migration is best-effort — failures are logged but never fatal.
+ * Writes are idempotent (updateBlockIndexNTx only updates if stored nTx=0).
+ *
+ * Expected runtime on mainnet: a few seconds (only iterates the small
+ * BLOCK_INDEX prefix, does one Core RPC per missing block).
+ */
+async function migrateNTxBackfill(
+  db: ChainDB,
+  network: string,
+  datadir: string,
+): Promise<void> {
+  // Collect all block hashes with nTx=0 and their heights.
+  const missing: Array<{ hash: Buffer; height: number }> = [];
+  for await (const [hash, record] of db.iterateBlockIndexEntries()) {
+    if (record.nTx === 0 && record.height > 0) {
+      missing.push({ hash, height: record.height });
+    }
+  }
+
+  if (missing.length === 0) {
+    return;
+  }
+
+  console.log(`[nTx-migrate] ${missing.length} block index entries with nTx=0 — backfilling...`);
+
+  let fixedFromBlock = 0;
+  let fixedFromCore = 0;
+  let failed = 0;
+
+  // Pass 1: try block data in our own DB.
+  const stillMissing: Array<{ hash: Buffer; height: number }> = [];
+  for (const { hash, height } of missing) {
+    const rawBlock = await db.getBlock(hash);
+    if (rawBlock !== null) {
+      try {
+        const blk = deserializeBlock(new BufferReader(rawBlock));
+        await db.updateBlockIndexNTx(hash, blk.transactions.length);
+        fixedFromBlock++;
+      } catch {
+        failed++;
+      }
+    } else {
+      stillMissing.push({ hash, height });
+    }
+  }
+
+  // Pass 2: query Bitcoin Core for blocks we couldn't read locally.
+  // Only attempt on mainnet where Core is expected at port 8332.
+  if (stillMissing.length > 0 && network === "mainnet") {
+    const coreDatadir = path.join(path.dirname(datadir), "bitcoin-core");
+    const cookiePath = path.join(coreDatadir, ".cookie");
+    let cookie: string | null = null;
+    try {
+      cookie = (await Bun.file(cookiePath).text()).trim();
+    } catch {
+      // Cookie not available — skip Core pass.
+    }
+
+    if (cookie) {
+      for (const { hash, height } of stillMissing) {
+        const hashHex = Buffer.from(hash).reverse().toString("hex");
+        try {
+          const resp = await fetch("http://127.0.0.1:8332/", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": "Basic " + Buffer.from(cookie).toString("base64"),
+            },
+            body: JSON.stringify({
+              jsonrpc: "1.0",
+              id: "ntx-migrate",
+              method: "getblockheader",
+              params: [hashHex, true],
+            }),
+          });
+          if (resp.ok) {
+            const data = await resp.json() as { result?: { nTx?: number }; error?: unknown };
+            const nTx = data?.result?.nTx;
+            if (typeof nTx === "number" && nTx > 0) {
+              await db.updateBlockIndexNTx(hash, nTx);
+              fixedFromCore++;
+            } else {
+              failed++;
+            }
+          } else {
+            failed++;
+          }
+        } catch {
+          failed++;
+        }
+      }
+    } else {
+      failed += stillMissing.length;
+    }
+  } else if (stillMissing.length > 0) {
+    failed += stillMissing.length;
+  }
+
+  console.log(
+    `[nTx-migrate] done: ${fixedFromBlock} from block data, ${fixedFromCore} from Core RPC, ${failed} unreachable`
+  );
+}
+
+/**
  * Start the hotbuns node.
  */
 async function startNode(config: NodeConfig): Promise<void> {
@@ -1226,6 +1340,12 @@ async function startNode(config: NodeConfig): Promise<void> {
   const dbPath = path.join(mergedConfig.datadir, "blocks.db");
   const db = new ChainDB(dbPath);
   await db.open();
+
+  // 2-mig. Back-fill nTx for historical blocks that were indexed before
+  // nTx storage was wired into connectBlock.  Best-effort; never fatal.
+  await migrateNTxBackfill(db, mergedConfig.network, mergedConfig.datadir).catch(
+    (e: unknown) => console.warn("[nTx-migrate] migration failed:", (e as Error)?.message)
+  );
 
   // 2a. Construct PruneManager when `-prune=<n>` is set.
   //
