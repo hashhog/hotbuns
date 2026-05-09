@@ -2493,23 +2493,23 @@ export interface DecodedPSBT {
   unknown: Record<string, string>;
   inputs: Array<{
     witness_utxo?: { amount: unknown; scriptPubKey: DecodedScriptPubKey };
-    non_witness_utxo?: { txid: string };
+    non_witness_utxo?: Record<string, unknown>;
     partial_signatures?: Record<string, string>;
     sighash?: string;
-    redeem_script?: { asm: string; hex: string };
-    witness_script?: { asm: string; hex: string };
+    redeem_script?: { asm: string; hex: string; type: string };
+    witness_script?: { asm: string; hex: string; type: string };
     bip32_derivs?: Array<{ pubkey: string; master_fingerprint: string; path: string }>;
     final_scriptSig?: { asm: string; hex: string };
     final_scriptwitness?: string[];
     unknown?: Record<string, string>;
   }>;
   outputs: Array<{
-    redeem_script?: { asm: string; hex: string };
-    witness_script?: { asm: string; hex: string };
+    redeem_script?: { asm: string; hex: string; type: string };
+    witness_script?: { asm: string; hex: string; type: string };
     bip32_derivs?: Array<{ pubkey: string; master_fingerprint: string; path: string }>;
     unknown?: Record<string, string>;
   }>;
-  fee?: number;
+  fee?: unknown;
 }
 
 /**
@@ -2558,6 +2558,157 @@ function getOpcodeName(op: number): string {
     0xba: "OP_CHECKSIGADD",
   };
   return names[op] ?? "OP_UNKNOWN";
+}
+
+/**
+ * Sighash type name table mirroring bitcoin-core/src/core_io.cpp mapSigHashTypes.
+ * Unknown types are not in this map (SighashToStr returns "" for unknowns).
+ */
+const SIGHASH_TYPE_NAMES: Record<number, string> = {
+  0x01: "ALL",
+  0x02: "NONE",
+  0x03: "SINGLE",
+  0x81: "ALL|ANYONECANPAY",
+  0x82: "NONE|ANYONECANPAY",
+  0x83: "SINGLE|ANYONECANPAY",
+};
+
+/**
+ * Script ASM disassembly with sighash decode (ScriptToAsmStr fAttemptSighashDecode=true).
+ *
+ * For push data >4 bytes: if the pushed bytes look like a DER-encoded signature
+ * (first byte 0x30) and the last byte is a recognised sighash type, strip the
+ * last byte and append "[SIGHASH_NAME]" (e.g. "[ALL]"). Otherwise fall through
+ * to plain hex rendering. This mirrors Bitcoin Core's ScriptToAsmStr logic at
+ * bitcoin-core/src/core_io.cpp:376-393.
+ *
+ * Used for final_scriptSig only.
+ */
+function disassembleScriptSigHashDecode(script: Buffer): string {
+  if (script.length === 0) return "";
+
+  const parts: string[] = [];
+  let i = 0;
+
+  while (i < script.length) {
+    const op = script[i];
+
+    if (op === 0x00) {
+      parts.push("0");
+      i++;
+    } else if (op >= 0x01 && op <= 0x4b) {
+      const len = op;
+      if (i + 1 + len > script.length) { parts.push("[error]"); break; }
+      const data = Buffer.from(script.subarray(i + 1, i + 1 + len));
+      if (len <= 4) {
+        parts.push(scriptNumToAsmStr(data));
+      } else {
+        parts.push(decodeWithSigHash(data));
+      }
+      i += 1 + len;
+    } else if (op === 0x4c) {
+      if (i + 1 >= script.length) { parts.push("[error]"); break; }
+      const len = script[i + 1];
+      if (i + 2 + len > script.length) { parts.push("[error]"); break; }
+      const data = Buffer.from(script.subarray(i + 2, i + 2 + len));
+      parts.push(len <= 4 ? scriptNumToAsmStr(data) : decodeWithSigHash(data));
+      i += 2 + len;
+    } else if (op === 0x4d) {
+      if (i + 2 >= script.length) { parts.push("[error]"); break; }
+      const len = script.readUInt16LE(i + 1);
+      if (i + 3 + len > script.length) { parts.push("[error]"); break; }
+      const data = Buffer.from(script.subarray(i + 3, i + 3 + len));
+      parts.push(len <= 4 ? scriptNumToAsmStr(data) : decodeWithSigHash(data));
+      i += 3 + len;
+    } else if (op === 0x4e) {
+      if (i + 4 >= script.length) { parts.push("[error]"); break; }
+      const len = script.readUInt32LE(i + 1);
+      if (i + 5 + len > script.length) { parts.push("[error]"); break; }
+      const data = Buffer.from(script.subarray(i + 5, i + 5 + len));
+      parts.push(len <= 4 ? scriptNumToAsmStr(data) : decodeWithSigHash(data));
+      i += 5 + len;
+    } else {
+      parts.push(getOpcodeName(op));
+      i++;
+    }
+  }
+
+  return parts.join(" ");
+}
+
+/**
+ * Attempt sighash decode on a pushed data element >4 bytes.
+ *
+ * If data looks like a DER signature (byte[0] == 0x30) and the last byte is
+ * a recognised sighash type, emit hex(data[0..n-2]) + "[SIGHASH_NAME]".
+ * Otherwise emit plain hex.
+ *
+ * Mirrors Core's CheckSignatureEncoding + mapSigHashTypes check at
+ * bitcoin-core/src/core_io.cpp:382-390.
+ */
+function decodeWithSigHash(data: Buffer): string {
+  if (data.length >= 2 && data[0] === 0x30) {
+    const lastByte = data[data.length - 1];
+    const sigHashName = SIGHASH_TYPE_NAMES[lastByte];
+    if (sigHashName !== undefined) {
+      return data.subarray(0, data.length - 1).toString("hex") + "[" + sigHashName + "]";
+    }
+  }
+  return data.toString("hex");
+}
+
+/**
+ * Build a full TxToUniv-shaped JSON object for non_witness_utxo.
+ *
+ * Mirrors bitcoin-core/src/core_io.cpp::TxToUniv called with include_hex=false.
+ * Shape: {txid, hash, version, size, vsize, weight, locktime, vin[], vout[]}
+ * No "hex" field (Core omits it for PSBT's non_witness_utxo).
+ *
+ * vin[i].scriptSig uses plain disassembleScript (fAttemptSighashDecode=false
+ * for the prevtx, not the spending tx).
+ * vin[i] includes txinwitness when the input has witness data.
+ * vout[i] uses formatBtcAmount + buildScriptPubKeyObj.
+ */
+function buildTxToUnivJSON(tx: Transaction): Record<string, unknown> {
+  const txid = Buffer.from(getTxId(tx)).reverse().toString("hex");
+  const hash = Buffer.from(getWTxId(tx)).reverse().toString("hex");
+  const size = serializeTx(tx, hasWitness(tx)).length;
+  const weight = getTxWeight(tx);
+  const vsize = getTxVSize(tx);
+
+  const vin = tx.inputs.map((input) => {
+    const entry: Record<string, unknown> = {
+      txid: Buffer.from(input.prevOut.txid).reverse().toString("hex"),
+      vout: input.prevOut.vout,
+      scriptSig: {
+        asm: disassembleScript(input.scriptSig),
+        hex: input.scriptSig.toString("hex"),
+      },
+      sequence: input.sequence,
+    };
+    if (input.witness && input.witness.length > 0) {
+      entry.txinwitness = input.witness.map((w) => Buffer.from(w).toString("hex"));
+    }
+    return entry;
+  });
+
+  const vout = tx.outputs.map((output, n) => ({
+    value: formatBtcAmount(output.value),
+    n,
+    scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey),
+  }));
+
+  return {
+    txid,
+    hash,
+    version: tx.version,
+    size,
+    vsize,
+    weight,
+    locktime: tx.lockTime,
+    vin,
+    vout,
+  };
 }
 
 /**
@@ -2853,22 +3004,50 @@ export function decodePSBT(psbt: PSBT): DecodedPSBT {
     unknown[key] = value.toString("hex");
   }
 
-  const inputs = psbt.inputs.map((input) => {
+  // Track total input value for fee calculation.
+  // Core computes: fee = total_in - total_out, emitted only when all UTXOs present.
+  let totalIn = 0n;
+  let haveAllUtxos = true;
+
+  const inputs = psbt.inputs.map((input, i) => {
     const result: DecodedPSBT["inputs"][0] = {};
+
+    // UTXOs — mirrors rawtransaction.cpp:1122-1156.
+    // Core tracks txout as the *last-assigned* value (non_witness_utxo wins if
+    // both are present) and adds it once to total_in.
+    let haveUtxo = false;
+    let utxoValue: bigint | undefined;
 
     if (input.witnessUtxo) {
       result.witness_utxo = {
         amount: formatBtcAmount(input.witnessUtxo.value),
         scriptPubKey: buildScriptPubKeyObj(input.witnessUtxo.scriptPubKey),
       };
+      utxoValue = input.witnessUtxo.value;
+      haveUtxo = true;
     }
 
     if (input.nonWitnessUtxo) {
-      result.non_witness_utxo = {
-        txid: getTxId(input.nonWitnessUtxo).reverse().toString("hex"),
-      };
+      result.non_witness_utxo = buildTxToUnivJSON(input.nonWitnessUtxo);
+      // non_witness_utxo overwrites txout (Core semantics): use the specific
+      // output being spent.
+      const vout = psbt.tx.inputs[i]?.prevOut.vout ?? 0;
+      if (vout < input.nonWitnessUtxo.outputs.length) {
+        utxoValue = input.nonWitnessUtxo.outputs[vout].value;
+      } else {
+        haveAllUtxos = false;
+        utxoValue = undefined;
+      }
+      haveUtxo = true;
     }
 
+    if (haveUtxo && utxoValue !== undefined) {
+      totalIn += utxoValue;
+    } else if (!haveUtxo) {
+      haveAllUtxos = false;
+    }
+
+    // Partial signatures
     if (input.partialSigs.size > 0) {
       result.partial_signatures = {};
       for (const [pubkeyHex, { signature }] of input.partialSigs) {
@@ -2876,22 +3055,17 @@ export function decodePSBT(psbt: PSBT): DecodedPSBT {
       }
     }
 
+    // Sighash type — emit string name, "" for unknown (matches SighashToStr)
     if (input.sighashType !== undefined) {
-      const sighashNames: Record<number, string> = {
-        1: "ALL",
-        2: "NONE",
-        3: "SINGLE",
-        0x81: "ALL|ANYONECANPAY",
-        0x82: "NONE|ANYONECANPAY",
-        0x83: "SINGLE|ANYONECANPAY",
-      };
-      result.sighash = sighashNames[input.sighashType] ?? `UNKNOWN(${input.sighashType})`;
+      result.sighash = SIGHASH_TYPE_NAMES[input.sighashType] ?? "";
     }
 
+    // Redeem script / witness script — ScriptToUniv default shape: {asm, hex, type}
     if (input.redeemScript) {
       result.redeem_script = {
         asm: disassembleScript(input.redeemScript),
         hex: input.redeemScript.toString("hex"),
+        type: getScriptType(input.redeemScript),
       };
     }
 
@@ -2899,6 +3073,7 @@ export function decodePSBT(psbt: PSBT): DecodedPSBT {
       result.witness_script = {
         asm: disassembleScript(input.witnessScript),
         hex: input.witnessScript.toString("hex"),
+        type: getScriptType(input.witnessScript),
       };
     }
 
@@ -2913,16 +3088,17 @@ export function decodePSBT(psbt: PSBT): DecodedPSBT {
       }
     }
 
+    // final_scriptSig — ScriptToAsmStr with fAttemptSighashDecode=true
     if (input.finalScriptSig) {
       result.final_scriptSig = {
-        asm: disassembleScript(input.finalScriptSig),
+        asm: disassembleScriptSigHashDecode(input.finalScriptSig),
         hex: input.finalScriptSig.toString("hex"),
       };
     }
 
     if (input.finalScriptWitness) {
       result.final_scriptwitness = input.finalScriptWitness.map((item) =>
-        item.toString("hex")
+        Buffer.from(item).toString("hex")
       );
     }
 
@@ -2943,6 +3119,7 @@ export function decodePSBT(psbt: PSBT): DecodedPSBT {
       result.redeem_script = {
         asm: disassembleScript(output.redeemScript),
         hex: output.redeemScript.toString("hex"),
+        type: getScriptType(output.redeemScript),
       };
     }
 
@@ -2950,6 +3127,7 @@ export function decodePSBT(psbt: PSBT): DecodedPSBT {
       result.witness_script = {
         asm: disassembleScript(output.witnessScript),
         hex: output.witnessScript.toString("hex"),
+        type: getScriptType(output.witnessScript),
       };
     }
 
@@ -2974,7 +3152,10 @@ export function decodePSBT(psbt: PSBT): DecodedPSBT {
     return result;
   });
 
-  return {
+  // Fee calculation: mirrors rawtransaction.cpp:1254-1258.
+  // Emit "fee" only when all inputs have UTXOs and fee is non-negative.
+  const totalOut = tx.outputs.reduce((sum, o) => sum + o.value, 0n);
+  const result: DecodedPSBT = {
     tx: {
       txid,
       hash,
@@ -2993,4 +3174,10 @@ export function decodePSBT(psbt: PSBT): DecodedPSBT {
     inputs,
     outputs,
   };
+
+  if (haveAllUtxos && totalIn >= totalOut) {
+    result.fee = formatBtcAmount(totalIn - totalOut);
+  }
+
+  return result;
 }
