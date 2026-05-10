@@ -41,7 +41,8 @@ describe("mempool persistence", () => {
         },
       ],
       outputs: [
-        { value: 9000n, scriptPubKey: Buffer.from([0x51]) }, // OP_TRUE
+        { value: 9000n, scriptPubKey: Buffer.from([0x51, 0x02, 0x4e, 0x73]) }, // P2A
+        { value: 0n, scriptPubKey: Buffer.from([0x6a]) }, // OP_RETURN padding (≥65 bytes)
       ],
       lockTime: 0,
     };
@@ -52,7 +53,7 @@ describe("mempool persistence", () => {
       height: 1,
       coinbase: false,
       amount,
-      scriptPubKey: Buffer.from([0x51]),
+      scriptPubKey: Buffer.from([0x51, 0x02, 0x4e, 0x73]), // P2A matches createTestTx
     };
     await db.putUTXO(txid, vout, entry);
   }
@@ -282,7 +283,7 @@ describe("mempool persistence", () => {
             witness: [],
           },
         ],
-        outputs: [{ value: 9000n, scriptPubKey: Buffer.from([0x51]) }],
+        outputs: [{ value: 9000n, scriptPubKey: Buffer.from([0x51, 0x02, 0x4e, 0x73]) }, { value: 0n, scriptPubKey: Buffer.from([0x6a]) }],
         lockTime: 0,
       };
       const txB: Transaction = {
@@ -295,7 +296,7 @@ describe("mempool persistence", () => {
             witness: [],
           },
         ],
-        outputs: [{ value: 9000n, scriptPubKey: Buffer.from([0x51]) }],
+        outputs: [{ value: 9000n, scriptPubKey: Buffer.from([0x51, 0x02, 0x4e, 0x73]) }, { value: 0n, scriptPubKey: Buffer.from([0x6a]) }],
         lockTime: 0,
       };
       const ra = await mempool.addTransaction(txA);
@@ -337,7 +338,7 @@ describe("mempool persistence", () => {
             witness: [],
           },
         ],
-        outputs: [{ value: 9000n, scriptPubKey: Buffer.from([0x51]) }],
+        outputs: [{ value: 9000n, scriptPubKey: Buffer.from([0x51, 0x02, 0x4e, 0x73]) }, { value: 0n, scriptPubKey: Buffer.from([0x6a]) }],
         lockTime: 0,
       };
       // Encode with a deliberately ancient timestamp.

@@ -34,6 +34,9 @@ import {
   getConsensusFlags,
   getStandardFlags,
   isP2A,
+  isPushOnly,
+  getScriptType,
+  getBareMultisigParams,
   type ScriptFlags,
 } from "../script/interpreter.js";
 import { sigHashLegacy, sigHashWitnessV0 } from "../validation/tx.js";
@@ -59,6 +62,42 @@ const DUST_RELAY_FEE = 3000;
  * Per ephemeral anchor policy, only one dust output is allowed.
  */
 export const MAX_DUST_OUTPUTS_PER_TX = 1;
+
+// ============================================================================
+// IsStandardTx policy constants (mirrors bitcoin-core/src/policy/policy.h)
+// ============================================================================
+
+/**
+ * Minimum standard transaction version (policy.h TX_MIN_STANDARD_VERSION = 1).
+ * Version 0 is non-standard.
+ */
+export const TX_MIN_STANDARD_VERSION = 1;
+
+/**
+ * Maximum standard transaction version (policy.h TX_MAX_STANDARD_VERSION = 3).
+ * Version > 3 is non-standard. TRUC uses version 3 (BIP-431).
+ */
+export const TX_MAX_STANDARD_VERSION = 3;
+
+/**
+ * Minimum non-witness serialized size for a standard transaction (65 bytes).
+ * Mitigates CVE-2017-12842 (64-byte transaction / merkle-branch confusion).
+ * Bitcoin Core: validation.cpp MIN_STANDARD_TX_NONWITNESS_SIZE = 65.
+ */
+export const MIN_STANDARD_TX_NONWITNESS_SIZE = 65;
+
+/**
+ * Maximum scriptSig size in bytes per input (policy.h MAX_STANDARD_SCRIPTSIG_SIZE = 1650).
+ * Biggest standard scriptSig is 15-of-15 P2SH multisig (1627 bytes rounded to 1650).
+ */
+export const MAX_STANDARD_SCRIPTSIG_SIZE = 1650;
+
+/**
+ * Maximum cumulative OP_RETURN (nulldata) payload bytes per transaction.
+ * policy.h MAX_OP_RETURN_RELAY = MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR
+ * = 400_000 / 4 = 100_000 bytes.
+ */
+export const MAX_OP_RETURN_RELAY = 100_000;
 
 /**
  * Legacy ancestor/descendant limits per BIP-125.
@@ -833,6 +872,128 @@ export class Mempool {
       return { accepted: false, error: "Transaction already in mempool" };
     }
 
+    // 2a. IsStandardTx: version range [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION]
+    //     Mirrors Bitcoin Core IsStandardTx (policy/policy.cpp:102-105,
+    //     policy.h TX_MIN_STANDARD_VERSION=1, TX_MAX_STANDARD_VERSION=3).
+    //     Rejects version 0 and any version > 3 as non-standard.
+    if (tx.version < TX_MIN_STANDARD_VERSION || tx.version > TX_MAX_STANDARD_VERSION) {
+      return {
+        accepted: false,
+        error: `version: tx version ${tx.version} out of standard range [${TX_MIN_STANDARD_VERSION},${TX_MAX_STANDARD_VERSION}]`,
+      };
+    }
+
+    // 2b. IsStandardTx: weight gate (MAX_STANDARD_TX_WEIGHT = 400_000 WU).
+    //     Mirrors Bitcoin Core IsStandardTx (policy/policy.cpp:111-115).
+    //     Checked before the input/output loops — matches Core's order and ensures
+    //     we reject the tx-size reason before scriptpubkey/datacarrier reasons.
+    {
+      const earlyWeight = getTxWeight(tx);
+      if (BigInt(earlyWeight) > MAX_STANDARD_TX_WEIGHT) {
+        return {
+          accepted: false,
+          error: `tx-size: weight ${earlyWeight} exceeds standard limit ${MAX_STANDARD_TX_WEIGHT}`,
+        };
+      }
+      // Consensus block-weight ceiling (4 MWU). Defence-in-depth.
+      if (earlyWeight > this.params.maxBlockWeight) {
+        return {
+          accepted: false,
+          error: `Transaction weight ${earlyWeight} exceeds max ${this.params.maxBlockWeight}`,
+        };
+      }
+    }
+
+    // 2b2. IsStandardTx: minimum non-witness size (65 bytes).
+    //      Mitigates CVE-2017-12842 (64-byte transaction / merkle-branch confusion).
+    //      Mirrors Bitcoin Core MIN_STANDARD_TX_NONWITNESS_SIZE = 65 (validation.cpp:813).
+    {
+      const nonWitnessSize = serializeTx(tx, false).length;
+      if (nonWitnessSize < MIN_STANDARD_TX_NONWITNESS_SIZE) {
+        return {
+          accepted: false,
+          error: `tx-size-small: non-witness size ${nonWitnessSize} < ${MIN_STANDARD_TX_NONWITNESS_SIZE} bytes`,
+        };
+      }
+    }
+
+    // 2c. IsStandardTx: per-input scriptSig checks
+    //     (policy/policy.cpp:117-135, MAX_STANDARD_SCRIPTSIG_SIZE = 1650).
+    //     1. scriptSig must not exceed 1650 bytes.
+    //     2. scriptSig must be push-only (IsPushOnly).
+    //     Both mitigate CPU-exhaustion DoS from oversized / non-push scriptSigs.
+    for (let i = 0; i < tx.inputs.length; i++) {
+      const scriptSig = tx.inputs[i].scriptSig;
+      if (scriptSig.length > MAX_STANDARD_SCRIPTSIG_SIZE) {
+        return {
+          accepted: false,
+          error: `scriptsig-size: input ${i} scriptSig ${scriptSig.length} > ${MAX_STANDARD_SCRIPTSIG_SIZE} bytes`,
+        };
+      }
+      if (scriptSig.length > 0 && !isPushOnly(scriptSig)) {
+        return {
+          accepted: false,
+          error: `scriptsig-not-pushonly: input ${i} scriptSig contains non-push opcodes`,
+        };
+      }
+    }
+
+    // 2d. IsStandardTx: per-output scriptPubKey standardness + datacarrier budget.
+    //     (policy/policy.cpp:139-156).
+    //     - Each output must be a known standard type: p2pkh, p2sh, p2wpkh, p2wsh,
+    //       p2tr, anchor, nulldata, p2pk, or multisig (x-of-3 max, n ≤ 3).
+    //       "nonstandard" and "witness_unknown" outputs are rejected.
+    //     - Cumulative nulldata (OP_RETURN) payload capped at MAX_OP_RETURN_RELAY
+    //       (100_000 bytes) per transaction.
+    //     - Core default permit_bare_multisig = true, so bare multisig up to
+    //       x-of-3 is accepted. n > 3 → reject (IsStandard multisig check,
+    //       policy.cpp:91-94).
+    {
+      let datacarrierBytesUsed = 0;
+      for (let i = 0; i < tx.outputs.length; i++) {
+        const spk = tx.outputs[i].scriptPubKey;
+        const scriptType = getScriptType(spk);
+
+        if (scriptType === "nonstandard") {
+          return {
+            accepted: false,
+            error: `scriptpubkey: output ${i} uses non-standard script type`,
+          };
+        }
+
+        if (scriptType === "witness_unknown") {
+          return {
+            accepted: false,
+            error: `scriptpubkey: output ${i} uses undefined witness program version`,
+          };
+        }
+
+        if (scriptType === "multisig") {
+          // IsStandard() additional check: bare multisig n must be ≤ 3.
+          // Core policy.cpp:88-94: n ∈ [1,3], m ∈ [1,n].
+          const params = getBareMultisigParams(spk);
+          if (params === null || params.n > 3 || params.n < 1 || params.m < 1 || params.m > params.n) {
+            return {
+              accepted: false,
+              error: `scriptpubkey: output ${i} bare multisig exceeds x-of-3 standard limit`,
+            };
+          }
+        }
+
+        if (scriptType === "nulldata") {
+          // Track cumulative OP_RETURN script bytes for MAX_OP_RETURN_RELAY budget.
+          // Core policy.cpp:147: size = txout.scriptPubKey.size() (the whole script).
+          datacarrierBytesUsed += spk.length;
+          if (datacarrierBytesUsed > MAX_OP_RETURN_RELAY) {
+            return {
+              accepted: false,
+              error: `datacarrier: cumulative OP_RETURN data ${datacarrierBytesUsed} > ${MAX_OP_RETURN_RELAY} bytes`,
+            };
+          }
+        }
+      }
+    }
+
     // 3. Check for double-spend conflicts - with RBF support
     const conflicts = this.checkConflicts(tx);
     let isReplacement = false;
@@ -950,31 +1111,10 @@ export class Mempool {
 
     const fee = totalInput - totalOutput;
 
-    // Calculate weight and vsize
+    // Calculate weight and vsize (weight/size gates already enforced at 2b above,
+    // before the input/output lookups; here we just recompute for fee-rate math).
     const weight = getTxWeight(tx);
     const vsize = getTxVSize(tx);
-
-    // 8a. Standard-tx relay-policy weight gate (IsStandardTx in
-    //     bitcoin-core/src/policy/policy.cpp).  Mempool txs above
-    //     MAX_STANDARD_TX_WEIGHT (400_000 WU = 100 kvB) are non-standard
-    //     and rejected at the relay layer even though they would be
-    //     consensus-valid as block contents.
-    if (BigInt(weight) > MAX_STANDARD_TX_WEIGHT) {
-      return {
-        accepted: false,
-        error: `tx-size: weight ${weight} exceeds standard limit ${MAX_STANDARD_TX_WEIGHT}`,
-      };
-    }
-
-    // 8b. Consensus block-weight ceiling (4 MWU). Defence-in-depth: a
-    //     well-formed standard tx will always pass 8a first, so this
-    //     branch only fires if the standard limit is ever raised.
-    if (weight > this.params.maxBlockWeight) {
-      return {
-        accepted: false,
-        error: `Transaction weight ${weight} exceeds max ${this.params.maxBlockWeight}`,
-      };
-    }
 
     // 8c. BIP-113 IsFinalTx: nLockTime must be satisfied at the next block.
     //     Reference: Bitcoin Core CheckFinalTxAtTip() (validation.cpp).

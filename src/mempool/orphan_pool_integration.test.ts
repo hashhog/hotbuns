@@ -37,10 +37,14 @@ function createTestTx(
       sequence: 0xffffffff,
       witness: [],
     })),
-    outputs: outputs.map((out) => ({
-      value: out.value,
-      scriptPubKey: out.scriptPubKey ?? Buffer.from([0x51]), // OP_TRUE
-    })),
+    outputs: [
+      ...outputs.map((out) => ({
+        value: out.value,
+        // P2A: standard "anchor" type, spendable with empty scriptSig + witness.
+        scriptPubKey: out.scriptPubKey ?? Buffer.from([0x51, 0x02, 0x4e, 0x73]),
+      })),
+      { value: 0n, scriptPubKey: Buffer.from([0x6a]) }, // OP_RETURN padding (≥65 bytes)
+    ],
     lockTime: 0,
   };
 }
@@ -57,7 +61,7 @@ async function setupUTXO(
     height,
     coinbase,
     amount,
-    scriptPubKey: Buffer.from([0x51]),
+    scriptPubKey: Buffer.from([0x51, 0x02, 0x4e, 0x73]),
   };
   await db.putUTXO(txid, vout, entry);
 }

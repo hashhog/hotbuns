@@ -1805,6 +1805,64 @@ export function isP2TR(script: Buffer): boolean {
 }
 
 /**
+ * Check if script is P2PK (Pay-to-Public-Key): <pubkey> OP_CHECKSIG
+ *
+ * Valid pubkey sizes: 33 bytes (compressed) or 65 bytes (uncompressed).
+ * Script layout: <1-byte push opcode = pubkey_len> <pubkey> OP_CHECKSIG
+ * Mirrors Bitcoin Core Solver() TxoutType::PUBKEY path (src/script/solver.cpp).
+ */
+export function isP2PK(script: Buffer): boolean {
+  // Compressed: 35 bytes (1 + 33 + 1), uncompressed: 67 bytes (1 + 65 + 1)
+  if (script.length === 35 || script.length === 67) {
+    const keyLen = script.length - 2;
+    return script[0] === keyLen && script[script.length - 1] === Opcode.OP_CHECKSIG;
+  }
+  return false;
+}
+
+/**
+ * Parse a bare multisig script and return { m, n } if valid, null otherwise.
+ *
+ * Bare multisig layout: OP_m <pub1> ... <pubN> OP_n OP_CHECKMULTISIG
+ * where m ∈ [1,n] and n ∈ [1,20] (Core MAX_PUBKEYS_PER_MULTISIG).
+ * Pubkeys must be 33-byte (compressed) or 65-byte (uncompressed).
+ *
+ * Mirrors Bitcoin Core Solver() TxoutType::MULTISIG path.
+ * Policy IsStandard() imposes an additional cap: n ≤ 3.
+ */
+export function getBareMultisigParams(script: Buffer): { m: number; n: number } | null {
+  if (script.length < 3) return null;
+  // Last byte must be OP_CHECKMULTISIG (0xae)
+  if (script[script.length - 1] !== Opcode.OP_CHECKMULTISIG) return null;
+
+  // OP_n for n-of-N: second-to-last byte encodes n (OP_1=0x51..OP_16=0x60)
+  const nOpcode = script[script.length - 2];
+  if (nOpcode < 0x51 || nOpcode > 0x60) return null;
+  const n = nOpcode - 0x50;
+
+  // First byte encodes m (OP_1=0x51..OP_16=0x60)
+  const mOpcode = script[0];
+  if (mOpcode < 0x51 || mOpcode > 0x60) return null;
+  const m = mOpcode - 0x50;
+  if (m < 1 || m > n) return null;
+
+  // Walk through n pubkeys between the m/n opcodes
+  let pos = 1;
+  for (let i = 0; i < n; i++) {
+    if (pos >= script.length - 2) return null; // ran out of script
+    const pushLen = script[pos];
+    // Valid pubkey push: 33 (compressed) or 65 (uncompressed)
+    if (pushLen !== 33 && pushLen !== 65) return null;
+    pos += 1 + pushLen;
+  }
+
+  // After all pubkeys, we should be at the OP_n byte (second-to-last)
+  if (pos !== script.length - 2) return null;
+
+  return { m, n };
+}
+
+/**
  * Pay-to-Anchor (P2A) script constant.
  * This is a witness v1 program with a 2-byte program (0x4e73, "Ns" in ASCII).
  * P2A outputs are anyone-can-spend and used for fee bumping via CPFP.
@@ -1860,6 +1918,8 @@ export type TxoutType =
   | "anchor"
   | "nulldata"
   | "witness_unknown"
+  | "p2pk"
+  | "multisig"
   | "nonstandard";
 
 /**
@@ -1927,6 +1987,10 @@ export function getScriptType(script: Buffer): TxoutType {
   // Check P2A before P2TR since P2A is a specific witness v1 program
   if (isP2A(script)) return "anchor";
   if (isP2TR(script)) return "p2tr";
+  // P2PK: <pubkey> OP_CHECKSIG (mirrors Core Solver TxoutType::PUBKEY)
+  if (isP2PK(script)) return "p2pk";
+  // Bare multisig: m <keys> n OP_CHECKMULTISIG (mirrors Core TxoutType::MULTISIG)
+  if (getBareMultisigParams(script) !== null) return "multisig";
   // Check for OP_RETURN (nulldata): post-OP_RETURN data must be push-only.
   // Core's Solver() requires IsPushOnly after OP_RETURN; a truncated push
   // (e.g. 6a09deadbeef) must be classified "nonstandard".

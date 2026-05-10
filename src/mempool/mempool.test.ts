@@ -34,10 +34,19 @@ describe("Mempool", () => {
         sequence: 0xffffffff,
         witness: witness?.[i] ?? [],
       })),
-      outputs: outputs.map((out) => ({
-        value: out.value,
-        scriptPubKey: out.scriptPubKey ?? Buffer.from([0x51]), // OP_TRUE for simplicity
-      })),
+      outputs: [
+        ...outputs.map((out) => ({
+          value: out.value,
+          // P2A (OP_1 <2-byte-program 0x4e73>): standard "anchor" type, spendable
+          // with empty scriptSig + empty witness — allows test chains without real sigs.
+          scriptPubKey: out.scriptPubKey ?? Buffer.from([0x51, 0x02, 0x4e, 0x73]),
+        })),
+        // Bare OP_RETURN padding output: ensures non-witness tx size ≥ 65 bytes
+        // (MIN_STANDARD_TX_NONWITNESS_SIZE, CVE-2017-12842 gate). Value=0, not dust
+        // (OP_RETURN dust threshold = 0). Appended after user outputs so vout indices
+        // of user-specified outputs are unaffected.
+        { value: 0n, scriptPubKey: Buffer.from([0x6a]) },
+      ],
       lockTime: 0,
     };
   }
@@ -54,7 +63,7 @@ describe("Mempool", () => {
           witness: [],
         },
       ],
-      outputs: [{ value, scriptPubKey: Buffer.from([0x51]) }],
+      outputs: [{ value, scriptPubKey: Buffer.from([0x51, 0x02, 0x4e, 0x73]) }],
       lockTime: 0,
     };
   }
@@ -71,7 +80,8 @@ describe("Mempool", () => {
       height,
       coinbase,
       amount,
-      scriptPubKey: Buffer.from([0x51]), // OP_TRUE - always succeeds
+      // P2A script matches the default output scriptPubKey used in createTestTx.
+      scriptPubKey: Buffer.from([0x51, 0x02, 0x4e, 0x73]),
     };
     await db.putUTXO(txid, vout, entry);
   }
@@ -764,10 +774,13 @@ describe("Mempool ancestor/descendant limits", () => {
         sequence: 0xffffffff,
         witness: [],
       })),
-      outputs: outputs.map((out) => ({
-        value: out.value,
-        scriptPubKey: Buffer.from([0x51]), // OP_TRUE
-      })),
+      outputs: [
+        ...outputs.map((out) => ({
+          value: out.value,
+          scriptPubKey: Buffer.from([0x51, 0x02, 0x4e, 0x73]),
+        })),
+        { value: 0n, scriptPubKey: Buffer.from([0x6a]) }, // OP_RETURN padding (≥65 bytes)
+      ],
       lockTime: 0,
     };
   }
@@ -777,7 +790,7 @@ describe("Mempool ancestor/descendant limits", () => {
       height: 1,
       coinbase: false,
       amount,
-      scriptPubKey: Buffer.from([0x51]),
+      scriptPubKey: Buffer.from([0x51, 0x02, 0x4e, 0x73]),
     };
     await db.putUTXO(txid, vout, entry);
   }
