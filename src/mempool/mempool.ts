@@ -155,6 +155,25 @@ const ANNEX_TAG = 0x50;
 const TAPROOT_LEAF_MASK = 0xfe;
 
 /**
+ * Maximum weighted sigop cost for a standard transaction (policy.h).
+ * Equals MAX_BLOCK_SIGOPS_COST / 5 = 80_000 / 5 = 16_000.
+ * Reference: bitcoin-core/src/policy/policy.h:44
+ *   static constexpr unsigned int MAX_STANDARD_TX_SIGOPS_COST{MAX_BLOCK_SIGOPS_COST/5};
+ * Enforced in Bitcoin Core validation.cpp:941 before mempool admission.
+ */
+export const MAX_STANDARD_TX_SIGOPS_COST = 16_000;
+
+/**
+ * Default bytes-per-sigop for sigop-adjusted vsize calculation (policy.h).
+ * Reference: bitcoin-core/src/policy/policy.h:50
+ *   static constexpr unsigned int DEFAULT_BYTES_PER_SIGOP{20};
+ * Used by GetVirtualTransactionSize() to compute sigop-adjusted vsize:
+ *   adjWeight = max(weight, sigOpCost * bytes_per_sigop)
+ *   vsize = ceil(adjWeight / WITNESS_SCALE_FACTOR)
+ */
+export const DEFAULT_BYTES_PER_SIGOP = 20;
+
+/**
  * Taproot leaf version for tapscript (0xc0, BIP-342).
  * When (controlBlock[0] & TAPROOT_LEAF_MASK) === TAPROOT_LEAF_TAPSCRIPT,
  * the per-item stack size limit applies.
@@ -1366,10 +1385,40 @@ export class Mempool {
 
     const fee = totalInput - totalOutput;
 
-    // Calculate weight and vsize (weight/size gates already enforced at 2b above,
-    // before the input/output lookups; here we just recompute for fee-rate math).
+    // Calculate weight and sigop cost; derive sigop-adjusted vsize.
+    //
+    // Bitcoin Core computes GetTransactionSigOpCost() immediately after all
+    // inputs are fetched (validation.cpp:908), then:
+    //  1. Enforces MAX_STANDARD_TX_SIGOPS_COST = 16_000 (policy.h:44, validation.cpp:941).
+    //  2. Uses sigop-adjusted vsize for fee-rate math (mempool_entry.h:110-112):
+    //       adjWeight = max(weight, sigOpCost * DEFAULT_BYTES_PER_SIGOP)
+    //       vsize = ceil(adjWeight / WITNESS_SCALE_FACTOR)
     const weight = getTxWeight(tx);
-    const vsize = getTxVSize(tx);
+    const prevOutputsForSigOps: Buffer[] = tx.inputs.map((inp) => {
+      const utxoEntry = inputUtxos.find((u) => u.input === inp);
+      return utxoEntry ? Buffer.from(utxoEntry.utxo.scriptPubKey) : Buffer.alloc(0);
+    });
+    const sigOpCost = getTransactionSigOpCost(
+      tx,
+      prevOutputsForSigOps,
+      /* verifyP2SH */ true,
+      /* verifyWitness */ true
+    );
+
+    // Policy gate: reject txs with excessive sigops (validation.cpp:941).
+    // MAX_STANDARD_TX_SIGOPS_COST = MAX_BLOCK_SIGOPS_COST / 5 = 80_000 / 5 = 16_000.
+    if (sigOpCost > MAX_STANDARD_TX_SIGOPS_COST) {
+      return {
+        accepted: false,
+        error: `bad-txns-too-many-sigops: sigop cost ${sigOpCost} exceeds maximum ${MAX_STANDARD_TX_SIGOPS_COST}`,
+      };
+    }
+
+    // Sigop-adjusted vsize: mirrors GetVirtualTransactionSize(weight, sigOpCost, bytes_per_sigop)
+    // in bitcoin-core/src/policy/policy.cpp:395-397.
+    // If sigops are expensive (sigOpCost * 20 > weight), vsize inflates to reflect that cost.
+    const adjWeight = Math.max(weight, sigOpCost * DEFAULT_BYTES_PER_SIGOP);
+    const vsize = Math.ceil(adjWeight / WITNESS_SCALE_FACTOR);
 
     // 8c. BIP-113 IsFinalTx: nLockTime must be satisfied at the next block.
     //     Reference: Bitcoin Core CheckFinalTxAtTip() (validation.cpp).
@@ -1698,24 +1747,8 @@ export class Mempool {
     // Check if this tx has ephemeral dust outputs
     const txHasEphemeralDust = hasEphemeralDust(tx);
 
-    // Compute weighted sigop cost for this tx.
-    // prevOutputs must be in input order; fall back to empty Buffer for
-    // any input whose prevout is not in inputUtxos (defence-in-depth).
-    // Reference: Bitcoin Core GetTransactionSigOpCost() in consensus/tx_verify.cpp
-    const prevOutputsForSigOps: Buffer[] = tx.inputs.map((inp) => {
-      const utxoEntry = inputUtxos.find(
-        (u) => u.input === inp
-      );
-      return utxoEntry ? Buffer.from(utxoEntry.utxo.scriptPubKey) : Buffer.alloc(0);
-    });
-    const sigOpCost = getTransactionSigOpCost(
-      tx,
-      prevOutputsForSigOps,
-      /* verifyP2SH */ true,
-      /* verifyWitness */ true
-    );
-
     // Create the mempool entry
+    // (sigOpCost and vsize are computed early above, after inputs are gathered)
     const entry: MempoolEntry = {
       tx,
       txid,

@@ -688,11 +688,12 @@ function getLastPushData(scriptSig: Buffer): Buffer | null {
       pos += len;
     } else if (opcode === Opcode.OP_PUSHDATA4) {
       if (pos + 3 >= scriptSig.length) return null;
+      // Use >>> 0 to treat as unsigned 32-bit (same fix as countScriptSigOps above).
       const len =
-        scriptSig[pos] |
+        (scriptSig[pos] |
         (scriptSig[pos + 1] << 8) |
         (scriptSig[pos + 2] << 16) |
-        (scriptSig[pos + 3] << 24);
+        (scriptSig[pos + 3] << 24)) >>> 0;
       pos += 4;
       if (pos + len > scriptSig.length) return null;
       lastData = scriptSig.subarray(pos, pos + len);
@@ -735,7 +736,7 @@ export function getP2SHSigOpCount(
 
   for (let i = 0; i < tx.inputs.length; i++) {
     const input = tx.inputs[i];
-    const prevScript = prevOutputs[i];
+    const prevScript = prevOutputs[i] ?? Buffer.alloc(0);
 
     // Check if previous output is P2SH
     if (!isP2SH(prevScript)) {
@@ -912,7 +913,7 @@ export function getTransactionSigOpCost(
   // Witness sigops (not scaled - already at weight 1)
   if (verifyWitness) {
     for (let i = 0; i < tx.inputs.length; i++) {
-      cost += countInputWitnessSigOps(tx.inputs[i], prevOutputs[i]);
+      cost += countInputWitnessSigOps(tx.inputs[i], prevOutputs[i] ?? Buffer.alloc(0));
     }
   }
 
