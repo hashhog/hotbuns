@@ -578,6 +578,7 @@ export enum DescriptorType {
   SH = "sh",
   WSH = "wsh",
   TR = "tr",
+  RAWTR = "rawtr",
   MULTI = "multi",
   SORTEDMULTI = "sortedmulti",
   ADDR = "addr",
@@ -1032,6 +1033,68 @@ export class TRDescriptor implements Descriptor {
       return `tr(${this.internalKey.toPrivateString()},${treeToPrivateString(this.scriptTree)})`;
     }
     return `tr(${this.internalKey.toPrivateString()})`;
+  }
+}
+
+/**
+ * rawtr(KEY) - Raw taproot output key (x-only pubkey used directly as output key, no tweak)
+ * Reference: bitcoin-core/src/script/descriptor.cpp RawTRDescriptor
+ * issolvable: true (we know the output key); hasprivatekeys: false for pubkey-only.
+ */
+export class RawtrDescriptor implements Descriptor {
+  private pubkeyProvider: PubkeyProvider;
+
+  constructor(pubkeyProvider: PubkeyProvider) {
+    this.pubkeyProvider = pubkeyProvider;
+  }
+
+  getType(): DescriptorType {
+    return DescriptorType.RAWTR;
+  }
+
+  isRange(): boolean {
+    return this.pubkeyProvider.isRange();
+  }
+
+  isSingleType(): boolean {
+    return true;
+  }
+
+  getOutputType(): OutputType {
+    return OutputType.BECH32M;
+  }
+
+  expand(index: number, network: NetworkType): ExpandedOutput[] {
+    const pubkey = this.pubkeyProvider.getPubKey(index);
+    // x-only is 32 bytes; if 33-byte compressed, strip prefix
+    const xOnly = pubkey.length === 33 ? pubkey.subarray(1, 33) : pubkey;
+    const script = buildP2TRScript(xOnly);
+    const hrp = getHrp(network);
+    const address = bech32Encode(hrp, 1, xOnly);
+
+    const origins = new Map<string, KeyOriginInfo>();
+    const origin = this.pubkeyProvider.getOrigin();
+    if (origin) {
+      origins.set(pubkey.toString("hex"), origin);
+    }
+
+    return [
+      {
+        scriptPubKey: script,
+        address,
+        outputType: OutputType.BECH32M,
+        pubkeys: [pubkey],
+        origins,
+      },
+    ];
+  }
+
+  toString(): string {
+    return `rawtr(${this.pubkeyProvider.toString()})`;
+  }
+
+  toPrivateString(): string {
+    return `rawtr(${this.pubkeyProvider.toPrivateString()})`;
   }
 }
 
@@ -1834,6 +1897,7 @@ function parseDescriptorInner(
     "wpkh(",
     "sh(",
     "wsh(",
+    "rawtr(",
     "tr(",
     "multi(",
     "sortedmulti(",
@@ -1881,6 +1945,8 @@ function parseFunction(
       return parseSH(desc, pos, context, network);
     case "wsh":
       return parseWSH(desc, pos, context, network);
+    case "rawtr":
+      return parseRawtr(desc, pos, context, network);
     case "tr":
       return parseTR(desc, pos, context, network);
     case "multi":
@@ -2084,6 +2150,29 @@ function parseTaprootTree(
       pos: inner.pos,
     };
   }
+}
+
+function parseRawtr(
+  desc: string,
+  pos: number,
+  context: ParseContext,
+  network: NetworkType
+): ParseResult {
+  if (context !== ParseContext.TOP) {
+    throw new Error("rawtr() can only be used at top level");
+  }
+
+  const keyResult = parseKey(desc, pos, network);
+  pos = keyResult.pos;
+
+  if (desc[pos] !== ")") {
+    throw new Error(`Expected ')' at position ${pos}`);
+  }
+
+  return {
+    descriptor: new RawtrDescriptor(keyResult.provider),
+    pos: pos + 1,
+  };
 }
 
 function parseMulti(
