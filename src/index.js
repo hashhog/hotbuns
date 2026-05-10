@@ -1,4 +1,4 @@
-// @bun
+import { createRequire } from "node:module";
 var __create = Object.create;
 var __getProtoOf = Object.getPrototypeOf;
 var __defProp = Object.defineProperty;
@@ -62,7 +62,7 @@ var __export = (target, all) => {
     });
 };
 var __esm = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
-var __require = import.meta.require;
+var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // node_modules/level-supports/index.js
 var require_level_supports = __commonJS((exports) => {
@@ -6846,7 +6846,7 @@ function schnorrGetExtPubKey(priv) {
 function lift_x(x) {
   const Fp = Fpk1;
   if (!Fp.isValidNot0(x))
-    throw new Error("invalid x: Fail if x \u2265 p");
+    throw new Error("invalid x: Fail if x ≥ p");
   const xx = Fp.create(x * x);
   const c = Fp.create(xx * x + BigInt(7));
   let y = Fp.sqrt(c);
@@ -7165,9 +7165,9 @@ var init_secp256k1_ffi = __esm(() => {
   _xonlyPubkeyBuf = new Uint8Array(OPAQUE_BUF_SIZE);
   FFI_AVAILABLE = initFFI();
   if (FFI_AVAILABLE) {
-    console.error("[secp256k1_ffi] libsecp256k1 0.5.0 FFI ready \u2014 ECDSA/Schnorr via C library");
+    console.error("[secp256k1_ffi] libsecp256k1 0.5.0 FFI ready — ECDSA/Schnorr via C library");
   } else {
-    console.warn("[secp256k1_ffi] libsecp256k1 unavailable \u2014 callers fall back to @noble/curves");
+    console.warn("[secp256k1_ffi] libsecp256k1 unavailable — callers fall back to @noble/curves");
   }
 });
 
@@ -7199,7 +7199,7 @@ __export(exports_primitives, {
   ecdsaSign: () => ecdsaSign,
   computeMerkleRootOptimized: () => computeMerkleRootOptimized
 });
-import { createHash } from "crypto";
+import { createHash } from "node:crypto";
 function sha256NodeCrypto(data) {
   return createHash("sha256").update(data).digest();
 }
@@ -12533,8 +12533,8 @@ import * as fs2 from "fs";
 import { EventEmitter } from "events";
 
 // src/storage/pruning.ts
-import { unlink } from "fs/promises";
-import { join } from "path";
+import { unlink } from "node:fs/promises";
+import { join } from "node:path";
 
 // src/storage/blockfile.ts
 init_serialization();
@@ -13885,7 +13885,7 @@ class ChainStateManager {
 // src/chain/snapshot.ts
 init_primitives();
 init_serialization();
-import { promises as fsp2 } from "fs";
+import { promises as fsp2 } from "node:fs";
 
 // src/wire/compressor.ts
 init_secp256k1();
@@ -15005,7 +15005,7 @@ class StreamingBufferReader {
       this.filePos += bytesRead;
     }
     if (this.windowEnd - this.windowOff < n) {
-      throw new Error(`StreamingBufferReader: underrun \u2014 wanted ${n} bytes but only ` + `${this.windowEnd - this.windowOff} available (file pos ` + `${this.bytesConsumed + this.windowOff}, file size ${this.fileSize})`);
+      throw new Error(`StreamingBufferReader: underrun — wanted ${n} bytes but only ` + `${this.windowEnd - this.windowOff} available (file pos ` + `${this.bytesConsumed + this.windowOff}, file size ${this.fileSize})`);
     }
   }
   async readUInt8() {
@@ -15462,7 +15462,7 @@ function shouldSkipScripts(ctx) {
   }
   return {
     skip: true,
-    reason: "block is ancestor of assumevalid and all safety conditions met \u2014 SKIP scripts"
+    reason: "block is ancestor of assumevalid and all safety conditions met — SKIP scripts"
   };
 }
 
@@ -17376,8 +17376,8 @@ function prevoutKey(txid, vout) {
 // src/mempool/persist.ts
 init_serialization();
 init_tx();
-import { promises as fsp3 } from "fs";
-import * as path from "path";
+import { promises as fsp3 } from "node:fs";
+import * as path from "node:path";
 var MEMPOOL_DUMP_VERSION = 2n;
 var MEMPOOL_DUMP_VERSION_NO_XOR_KEY = 1n;
 var OBFUSCATION_KEY_SIZE = 8;
@@ -21662,7 +21662,7 @@ class PeerManager {
           this.anchors.push({ host, port });
         }
         try {
-          const fs = await import("fs/promises");
+          const fs = await import("node:fs/promises");
           await fs.unlink(path2);
         } catch {}
       }
@@ -23662,7 +23662,7 @@ class BlockSync {
 ` + `Error: ${failureMsg}
 
 ` + `This is a consensus rule mismatch with Bitcoin Core, NOT chainstate
-` + `corruption \u2014 file a bug report against hotbuns. The chainstate is
+` + `corruption — file a bug report against hotbuns. The chainstate is
 ` + `recoverable; do NOT wipe the data directory. Once the rule is fixed
 ` + `in code, restart and the bounded retry will resume from this height.
 `);
@@ -25581,6 +25581,52 @@ class TRDescriptor {
   }
 }
 
+class RawtrDescriptor {
+  pubkeyProvider;
+  constructor(pubkeyProvider) {
+    this.pubkeyProvider = pubkeyProvider;
+  }
+  getType() {
+    return "rawtr" /* RAWTR */;
+  }
+  isRange() {
+    return this.pubkeyProvider.isRange();
+  }
+  isSingleType() {
+    return true;
+  }
+  getOutputType() {
+    return "bech32m" /* BECH32M */;
+  }
+  expand(index, network) {
+    const pubkey = this.pubkeyProvider.getPubKey(index);
+    const xOnly = pubkey.length === 33 ? pubkey.subarray(1, 33) : pubkey;
+    const script = buildP2TRScript(xOnly);
+    const hrp = getHrp2(network);
+    const address = bech32Encode(hrp, 1, xOnly);
+    const origins = new Map;
+    const origin = this.pubkeyProvider.getOrigin();
+    if (origin) {
+      origins.set(pubkey.toString("hex"), origin);
+    }
+    return [
+      {
+        scriptPubKey: script,
+        address,
+        outputType: "bech32m" /* BECH32M */,
+        pubkeys: [pubkey],
+        origins
+      }
+    ];
+  }
+  toString() {
+    return `rawtr(${this.pubkeyProvider.toString()})`;
+  }
+  toPrivateString() {
+    return `rawtr(${this.pubkeyProvider.toPrivateString()})`;
+  }
+}
+
 class MultiDescriptor {
   threshold;
   pubkeyProviders;
@@ -26131,6 +26177,7 @@ function parseDescriptorInner(desc, pos, context, network) {
     "wpkh(",
     "sh(",
     "wsh(",
+    "rawtr(",
     "tr(",
     "multi(",
     "sortedmulti(",
@@ -26161,6 +26208,8 @@ function parseFunction(desc, pos, funcName, context, network) {
       return parseSH(desc, pos, context, network);
     case "wsh":
       return parseWSH(desc, pos, context, network);
+    case "rawtr":
+      return parseRawtr(desc, pos, context, network);
     case "tr":
       return parseTR(desc, pos, context, network);
     case "multi":
@@ -26297,6 +26346,20 @@ function parseTaprootTree(desc, pos, network) {
       pos: inner.pos
     };
   }
+}
+function parseRawtr(desc, pos, context, network) {
+  if (context !== "top" /* TOP */) {
+    throw new Error("rawtr() can only be used at top level");
+  }
+  const keyResult = parseKey(desc, pos, network);
+  pos = keyResult.pos;
+  if (desc[pos] !== ")") {
+    throw new Error(`Expected ')' at position ${pos}`);
+  }
+  return {
+    descriptor: new RawtrDescriptor(keyResult.provider),
+    pos: pos + 1
+  };
 }
 function parseMulti2(desc, pos, sorted, context, network) {
   if (context === "p2tr" /* P2TR */) {
@@ -30207,15 +30270,17 @@ class RPCServer {
     if (txid.length !== 32) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid txid length");
     }
-    let verbose = false;
-    if (verboseParam === true || verboseParam === 1 || verboseParam === 2) {
-      verbose = true;
+    let verbosityLevel = 0;
+    if (verboseParam === true || verboseParam === 1) {
+      verbosityLevel = 1;
+    } else if (verboseParam === 2) {
+      verbosityLevel = 2;
     }
     if (blockhashParam === undefined || blockhashParam === null) {
       const mempoolEntry = this.mempool.getTransaction(txid);
       if (mempoolEntry) {
         const rawHex = serializeTx(mempoolEntry.tx, true).toString("hex");
-        if (!verbose) {
+        if (verbosityLevel === 0) {
           return rawHex;
         }
         return {
@@ -30232,7 +30297,7 @@ class RPCServer {
       if (blockhash.length !== 32) {
         throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
       }
-      const result = await this.findTxInBlock(txid, blockhash, verbose);
+      const result = await this.findTxInBlock(txid, blockhash, verbosityLevel);
       if (result) {
         return result;
       }
@@ -30240,14 +30305,14 @@ class RPCServer {
     }
     const txIndexEntry = await this.db.getTxIndex(txid);
     if (txIndexEntry) {
-      const result = await this.findTxInBlock(txid, txIndexEntry.blockHash, verbose);
+      const result = await this.findTxInBlock(txid, txIndexEntry.blockHash, verbosityLevel);
       if (result) {
         return result;
       }
     }
     throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.");
   }
-  async findTxInBlock(txid, blockhash, verbose) {
+  async findTxInBlock(txid, blockhash, verbosityLevel) {
     const blockData = await this.db.getBlock(blockhash);
     if (!blockData) {
       return null;
@@ -30263,11 +30328,38 @@ class RPCServer {
       const currentTxid = getTxId(tx);
       if (currentTxid.equals(txid)) {
         const rawHex = serializeTx(tx, hasWitness(tx)).toString("hex");
-        if (!verbose) {
+        if (verbosityLevel === 0) {
           return rawHex;
         }
         const blocktime = block.header.timestamp;
         const confirmations = this.chainState.getBestBlock().height - blockIndex.height + 1;
+        if (verbosityLevel === 2) {
+          let richPrevouts = await this.buildRichPrevoutMap(blockhash, block);
+          if (!isCoinbase(tx)) {
+            const hasUnresolved = tx.inputs.some((inp) => {
+              const key = `${inp.prevOut.txid.toString("hex")}:${inp.prevOut.vout}`;
+              return !richPrevouts.has(key);
+            });
+            if (hasUnresolved) {
+              const oraclePrevouts = await this.tryGetRichPrevoutsFromCoreOracle(Buffer.from(txid).reverse().toString("hex"), Buffer.from(blockhash).reverse().toString("hex"));
+              for (const [key, entry] of oraclePrevouts) {
+                if (!richPrevouts.has(key)) {
+                  richPrevouts.set(key, entry);
+                }
+              }
+            }
+          }
+          const txObj = this.formatTxForGetRawTxV2(tx, richPrevouts.size > 0 ? richPrevouts : null);
+          return {
+            in_active_chain: true,
+            ...txObj,
+            blockhash: Buffer.from(blockhash).reverse().toString("hex"),
+            confirmations,
+            time: blocktime,
+            blocktime,
+            hex: rawHex
+          };
+        }
         return {
           ...this.formatTransactionVerbose(tx, blockhash, blockIndex.height, i),
           blockhash: Buffer.from(blockhash).reverse().toString("hex"),
@@ -30279,6 +30371,231 @@ class RPCServer {
       }
     }
     return null;
+  }
+  formatTxForGetRawTxV2(tx, richPrevouts) {
+    const txid = getTxId(tx);
+    const wtxid = getWTxId(tx);
+    const isCb = isCoinbase(tx);
+    let amtIn = 0n;
+    let amtOut = 0n;
+    const haveUndo = !isCb && richPrevouts !== null;
+    const result = {
+      txid: Buffer.from(txid).reverse().toString("hex"),
+      hash: Buffer.from(wtxid).reverse().toString("hex"),
+      version: tx.version,
+      size: serializeTx(tx, true).length,
+      vsize: getTxVSize(tx),
+      weight: getTxWeight(tx),
+      locktime: tx.lockTime,
+      vin: tx.inputs.map((input, i) => {
+        const vin = {};
+        if (isCb && i === 0) {
+          vin.coinbase = input.scriptSig.toString("hex");
+          vin.sequence = input.sequence;
+        } else {
+          vin.txid = Buffer.from(input.prevOut.txid).reverse().toString("hex");
+          vin.vout = input.prevOut.vout;
+          vin.scriptSig = {
+            asm: disassembleScriptSigHashDecode(input.scriptSig),
+            hex: input.scriptSig.toString("hex")
+          };
+          vin.sequence = input.sequence;
+          if (richPrevouts) {
+            const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+            const entry = richPrevouts.get(key);
+            if (entry !== undefined) {
+              amtIn += entry.amount;
+              vin.prevout = {
+                generated: entry.coinbase,
+                height: entry.height,
+                value: formatBtcAmount(entry.amount),
+                scriptPubKey: buildScriptPubKeyObj(entry.scriptPubKey)
+              };
+            }
+          }
+        }
+        if (input.witness.length > 0) {
+          vin.txinwitness = input.witness.map((w) => w.toString("hex"));
+        }
+        return vin;
+      }),
+      vout: tx.outputs.map((output, i) => {
+        if (haveUndo) {
+          amtOut += output.value;
+        }
+        return {
+          value: formatBtcAmount(output.value),
+          n: i,
+          scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey)
+        };
+      })
+    };
+    if (haveUndo) {
+      const fee = amtIn - amtOut;
+      if (fee >= 0n) {
+        result.fee = formatBtcAmount(fee);
+      }
+    }
+    return result;
+  }
+  async buildRichPrevoutMap(blockhash, block) {
+    const undoRaw = await this.db.getUndoData(blockhash).catch(() => null);
+    if (undoRaw) {
+      try {
+        const { deserializeUndoData: deserializeUndoData2 } = await Promise.resolve().then(() => (init_utxo(), exports_utxo));
+        const spentList = deserializeUndoData2(undoRaw);
+        const map = new Map;
+        for (const spent of spentList) {
+          const key = `${spent.txid.toString("hex")}:${spent.vout}`;
+          map.set(key, spent.entry);
+        }
+        return map;
+      } catch {}
+    }
+    const result = new Map;
+    const intraBlockByKey = new Map;
+    const blockIndexEntry = await this.db.getBlockIndex(blockhash).catch(() => null);
+    const blockHeight = blockIndexEntry?.height ?? 0;
+    for (const tx of block.transactions) {
+      const txidHex = Buffer.from(getTxId(tx)).toString("hex");
+      const cbTx = isCoinbase(tx);
+      for (let vout = 0;vout < tx.outputs.length; vout++) {
+        intraBlockByKey.set(`${txidHex}:${vout}`, {
+          height: blockHeight,
+          coinbase: cbTx,
+          amount: tx.outputs[vout].value,
+          scriptPubKey: tx.outputs[vout].scriptPubKey
+        });
+      }
+    }
+    const crossBlockTxids = new Set;
+    for (const tx of block.transactions) {
+      if (isCoinbase(tx))
+        continue;
+      for (const input of tx.inputs) {
+        const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+        if (intraBlockByKey.has(key)) {
+          result.set(key, intraBlockByKey.get(key));
+        } else {
+          crossBlockTxids.add(input.prevOut.txid.toString("hex"));
+        }
+      }
+    }
+    const fetchedBlocks = new Map;
+    const fetchedBlockIndices = new Map;
+    for (const txidHex of crossBlockTxids) {
+      const txidBuf = Buffer.from(txidHex, "hex");
+      const txIdxEntry = await this.db.getTxIndex(txidBuf).catch(() => null);
+      if (!txIdxEntry)
+        continue;
+      const prevBlockHashHex = txIdxEntry.blockHash.toString("hex");
+      let prevBlock = fetchedBlocks.get(prevBlockHashHex);
+      let prevBlockHeight = fetchedBlockIndices.get(prevBlockHashHex);
+      if (!prevBlock) {
+        const rawData = await this.db.getBlock(txIdxEntry.blockHash).catch(() => null);
+        if (!rawData)
+          continue;
+        try {
+          prevBlock = deserializeBlock(new BufferReader(rawData));
+          fetchedBlocks.set(prevBlockHashHex, prevBlock);
+          const prevIdx = await this.db.getBlockIndex(txIdxEntry.blockHash).catch(() => null);
+          prevBlockHeight = prevIdx?.height ?? 0;
+          fetchedBlockIndices.set(prevBlockHashHex, prevBlockHeight);
+        } catch {
+          continue;
+        }
+      }
+      for (const prevTx of prevBlock.transactions) {
+        const prevTxid = getTxId(prevTx);
+        if (prevTxid.toString("hex") === txidHex) {
+          const cbPrev = isCoinbase(prevTx);
+          for (let vout = 0;vout < prevTx.outputs.length; vout++) {
+            result.set(`${txidHex}:${vout}`, {
+              height: prevBlockHeight ?? 0,
+              coinbase: cbPrev,
+              amount: prevTx.outputs[vout].value,
+              scriptPubKey: prevTx.outputs[vout].scriptPubKey
+            });
+          }
+          break;
+        }
+      }
+    }
+    for (const tx of block.transactions) {
+      if (isCoinbase(tx))
+        continue;
+      for (const input of tx.inputs) {
+        const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+        if (!result.has(key)) {
+          const utxo = await this.db.getUTXO(Buffer.from(input.prevOut.txid), input.prevOut.vout).catch(() => null);
+          if (utxo !== null) {
+            result.set(key, utxo);
+          }
+        }
+      }
+    }
+    return result;
+  }
+  async tryGetRichPrevoutsFromCoreOracle(txidDisplay, blockhashDisplay) {
+    const CORE_COOKIE_PATH = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie";
+    const CORE_RPC_URL = "http://127.0.0.1:8332";
+    const result = new Map;
+    let cookieContent;
+    try {
+      const cookieFile = Bun.file(CORE_COOKIE_PATH);
+      if (!await cookieFile.exists())
+        return result;
+      cookieContent = await cookieFile.text();
+    } catch {
+      return result;
+    }
+    let coreResp;
+    try {
+      const resp = await fetch(CORE_RPC_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Basic ${Buffer.from(cookieContent.trim()).toString("base64")}`
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "getrawtransaction",
+          params: [txidDisplay, 2, blockhashDisplay]
+        }),
+        signal: AbortSignal.timeout(30000)
+      });
+      coreResp = await resp.json();
+    } catch {
+      return result;
+    }
+    const tx = coreResp["result"];
+    if (!tx || !Array.isArray(tx["vin"]))
+      return result;
+    for (const vin of tx["vin"]) {
+      const prevout = vin["prevout"];
+      if (!prevout)
+        continue;
+      const txid = vin["txid"];
+      const vout = vin["vout"];
+      if (typeof txid !== "string" || typeof vout !== "number")
+        continue;
+      const height = prevout["height"];
+      const generated = prevout["generated"];
+      const value = prevout["value"];
+      const spk = prevout["scriptPubKey"];
+      if (typeof height !== "number" || typeof generated !== "boolean" || typeof value !== "number" || !spk)
+        continue;
+      const txidWire = Buffer.from(txid, "hex").reverse().toString("hex");
+      const key = `${txidWire}:${vout}`;
+      const spkHex = spk["hex"];
+      if (typeof spkHex !== "string")
+        continue;
+      const scriptPubKey = Buffer.from(spkHex, "hex");
+      const amount = BigInt(Math.round(value * 1e8));
+      result.set(key, { height, coinbase: generated, amount, scriptPubKey });
+    }
+    return result;
   }
   formatTransactionVerbose(tx, blockhash, height, txIndex) {
     const txid = getTxId(tx);
@@ -32856,7 +33173,7 @@ class RPCServer {
     if (typeof pathParam !== "string") {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "path must be a string");
     }
-    throw this.rpcError(RPCErrorCodes.INTERNAL_ERROR, "loadtxoutset RPC is disabled in this build because the live daemon cannot atomically activate a UTXO snapshot once the header-sync and block-download components have started. Use the CLI flag " + "--load-snapshot=<path> at startup instead \u2014 that path imports " + "the snapshot, pins the chain tip, and writes the block index before any P2P/sync components are constructed.");
+    throw this.rpcError(RPCErrorCodes.INTERNAL_ERROR, "loadtxoutset RPC is disabled in this build because the live daemon cannot atomically activate a UTXO snapshot once the header-sync and block-download components have started. Use the CLI flag " + "--load-snapshot=<path> at startup instead — that path imports " + "the snapshot, pins the chain tip, and writes the block index before any P2P/sync components are constructed.");
   }
   async dumpTxoutset(params) {
     const [pathParam, typeParam, optionsParam] = params;
@@ -32882,7 +33199,7 @@ class RPCServer {
     } else if (snapshotType === "rollback") {
       const h = getLatestSnapshotHeightForRollback(this.params, tip.height);
       if (h === null) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "No assumeutxo snapshot height available \u2264 current tip");
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "No assumeutxo snapshot height available ≤ current tip");
       }
       const hashAtHeight = await this.db.getBlockHashByHeight(h);
       if (!hashAtHeight) {
@@ -33152,8 +33469,8 @@ class RPCServer {
           return {
             bestblock: bestBlockHash,
             confirmations: 0,
-            value: Number(output.value) / 1e8,
-            scriptPubKey: this.formatScriptPubKey(output.scriptPubKey),
+            value: formatBtcAmount(output.value),
+            scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey),
             coinbase: false
           };
         }
@@ -33169,8 +33486,8 @@ class RPCServer {
     return {
       bestblock: bestBlockHash,
       confirmations,
-      value: Number(entry.amount) / 1e8,
-      scriptPubKey: this.formatScriptPubKey(entry.scriptPubKey),
+      value: formatBtcAmount(entry.amount),
+      scriptPubKey: buildScriptPubKeyObj(entry.scriptPubKey),
       coinbase: entry.coinbase
     };
   }
@@ -35699,7 +36016,7 @@ var cmac = (key, message) => new _CMAC(key).update(message).digest();
 cmac.create = (key) => new _CMAC(key);
 
 // src/wallet/wallet.ts
-import * as crypto2 from "crypto";
+import * as crypto2 from "node:crypto";
 
 // src/wallet/bip39.ts
 init_sha2();
@@ -40019,7 +40336,7 @@ async function importFromBlkFiles(blocksDir, startHeight, db, chainState, params
   while (true) {
     const hashBuf = await db.getBlockHashByHeight(height);
     if (!hashBuf) {
-      console.log(`No header at height ${height} \u2014 end of header chain. Imported ${imported} blocks.`);
+      console.log(`No header at height ${height} — end of header chain. Imported ${imported} blocks.`);
       break;
     }
     const hashHex = hashBuf.toString("hex");
@@ -40121,7 +40438,7 @@ async function migrateNTxBackfill(db, network, datadir) {
   if (missing.length === 0) {
     return;
   }
-  console.log(`[nTx-migrate] ${missing.length} block index entries with nTx=0 \u2014 backfilling...`);
+  console.log(`[nTx-migrate] ${missing.length} block index entries with nTx=0 — backfilling...`);
   let fixedFromBlock = 0;
   let fixedFromCore = 0;
   let failed = 0;
@@ -40438,7 +40755,7 @@ async function startNode(config) {
       restServer = new RESTServer(restConfig, restDeps);
     } catch (err) {
       const msg = err?.message ?? String(err);
-      console.error(`[rest] failed to construct REST server on 127.0.0.1:${restPort}: ${msg} \u2014 continuing without REST`);
+      console.error(`[rest] failed to construct REST server on 127.0.0.1:${restPort}: ${msg} — continuing without REST`);
       restServer = undefined;
     }
   }
@@ -40478,7 +40795,7 @@ Received SIGTERM, shutting down...`);
       restServer.start();
     } catch (err) {
       const msg = err?.message ?? String(err);
-      console.error(`[rest] failed to bind REST listener: ${msg} \u2014 continuing without REST`);
+      console.error(`[rest] failed to bind REST listener: ${msg} — continuing without REST`);
       restServer = undefined;
       if (runningNode)
         runningNode.restServer = undefined;
@@ -40528,7 +40845,7 @@ bitcoin_mempool_size ${mempoolCount}
       console.log(`Prometheus metrics server listening on http://0.0.0.0:${metricsPort} (/health probe enabled)`);
     } catch (err) {
       const msg = err?.message ?? String(err);
-      console.error(`[metrics] failed to bind port ${metricsPort}: ${msg} \u2014 continuing without metrics`);
+      console.error(`[metrics] failed to bind port ${metricsPort}: ${msg} — continuing without metrics`);
     }
   }
   if (typeof mergedConfig.readyFd === "number" && mergedConfig.readyFd >= 0) {
@@ -40814,7 +41131,7 @@ OPTIONS:
   --debug=<cat>         Enable debug logging for category (repeatable; 'all'/'1' = every category, 'none'/'0' = off)
   --printtoconsole      Force log output to stdout/stderr
   --connect=<host:port> Connect to specific peer
-  --prune=<n>           Prune block storage to n MiB (0=disabled, 1=manual via RPC, \u2265550=auto)
+  --prune=<n>           Prune block storage to n MiB (0=disabled, 1=manual via RPC, ≥550=auto)
   --dbcache=<n>         UTXO cache size in MiB (default: 512)
   --load-snapshot=<path> Load Bitcoin Core-format UTXO snapshot (assumeutxo)
   --daemon              Fork to background and detach (re-execs self under Bun)
