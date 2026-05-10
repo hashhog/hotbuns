@@ -4361,9 +4361,9 @@ export class RPCServer {
 
     if (!decoded.valid) {
       result.isvalid = false;
-      if (decoded.error) {
-        result.error = decoded.error;
-      }
+      // Bitcoin Core 27+ always returns this exact error string and an empty error_locations array
+      result.error = "Invalid or unsupported Segwit (Bech32) or Base58 encoding.";
+      result.error_locations = [];
       return result;
     }
 
@@ -4489,7 +4489,8 @@ export class RPCServer {
     return {
       valid: true,
       scriptPubKey,
-      isScript: witnessVersion === 0 && witnessProgram.length === 32, // P2WSH
+      // isScript: true when witness program > 20 bytes (P2WSH v0 32-byte, P2TR v1 32-byte, future versions ≥2-byte)
+      isScript: witnessProgram.length > 20,
       isWitness: true,
       witnessVersion,
       witnessProgram,
