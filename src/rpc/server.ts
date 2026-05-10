@@ -7020,8 +7020,8 @@ export class RPCServer {
           return {
             bestblock: bestBlockHash,
             confirmations: 0,
-            value: Number(output.value) / 1e8,
-            scriptPubKey: this.formatScriptPubKey(output.scriptPubKey),
+            value: formatBtcAmount(output.value),
+            scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey),
             coinbase: false,
           };
         }
@@ -7040,8 +7040,8 @@ export class RPCServer {
     return {
       bestblock: bestBlockHash,
       confirmations,
-      value: Number(entry.amount) / 1e8,
-      scriptPubKey: this.formatScriptPubKey(entry.scriptPubKey),
+      value: formatBtcAmount(entry.amount),
+      scriptPubKey: buildScriptPubKeyObj(entry.scriptPubKey),
       coinbase: entry.coinbase,
     };
   }
