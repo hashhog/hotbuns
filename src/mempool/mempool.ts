@@ -34,6 +34,10 @@ import {
   getConsensusFlags,
   getStandardFlags,
   isP2A,
+  isP2SH,
+  isP2WSH,
+  isP2TR,
+  isWitnessProgram,
   isPushOnly,
   getScriptType,
   getBareMultisigParams,
@@ -98,6 +102,253 @@ export const MAX_STANDARD_SCRIPTSIG_SIZE = 1650;
  * = 400_000 / 4 = 100_000 bytes.
  */
 export const MAX_OP_RETURN_RELAY = 100_000;
+
+// ============================================================================
+// IsWitnessStandard policy constants (mirrors bitcoin-core/src/policy/policy.h)
+// Reference: bitcoin-core/src/policy/policy.cpp:265-352 (IsWitnessStandard)
+// ============================================================================
+
+/**
+ * Maximum witness script (redeemScript) size for P2WSH inputs (3600 bytes).
+ * policy.h MAX_STANDARD_P2WSH_SCRIPT_SIZE = 3600.
+ */
+export const MAX_STANDARD_P2WSH_SCRIPT_SIZE = 3_600;
+
+/**
+ * Maximum number of witness stack items (excluding witnessScript) for P2WSH (100).
+ * policy.h MAX_STANDARD_P2WSH_STACK_ITEMS = 100.
+ */
+export const MAX_STANDARD_P2WSH_STACK_ITEMS = 100;
+
+/**
+ * Maximum size of each individual witness stack item for P2WSH inputs (80 bytes).
+ * policy.h MAX_STANDARD_P2WSH_STACK_ITEM_SIZE = 80.
+ */
+export const MAX_STANDARD_P2WSH_STACK_ITEM_SIZE = 80;
+
+/**
+ * Maximum size of each individual tapscript witness stack item (80 bytes).
+ * policy.h MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE = 80.
+ */
+export const MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE = 80;
+
+/**
+ * Taproot annex tag byte (0x50). Inputs with an annex are non-standard.
+ * BIP-341: if the last witness stack item starts with 0x50, it is an annex.
+ * policy.cpp ANNEX_TAG = 0x50.
+ */
+const ANNEX_TAG = 0x50;
+
+/**
+ * Taproot leaf version mask (0xfe). Masks the parity bit from the control block's
+ * first byte to isolate the leaf version.
+ * policy.cpp TAPROOT_LEAF_MASK = 0xfe.
+ */
+const TAPROOT_LEAF_MASK = 0xfe;
+
+/**
+ * Taproot leaf version for tapscript (0xc0, BIP-342).
+ * When (controlBlock[0] & TAPROOT_LEAF_MASK) === TAPROOT_LEAF_TAPSCRIPT,
+ * the per-item stack size limit applies.
+ * policy.cpp TAPROOT_LEAF_TAPSCRIPT = 0xc0.
+ */
+const TAPROOT_LEAF_TAPSCRIPT = 0xc0;
+
+/**
+ * Evaluate a push-only scriptSig into a stack of buffer items.
+ *
+ * Used by isWitnessStandard() to extract the redeemScript from a P2SH input's
+ * scriptSig without running full script validation. Mirrors what Bitcoin Core
+ * does with EvalScript(..., SCRIPT_VERIFY_NONE, ...) in IsWitnessStandard:
+ * it only needs the resulting stack, and the scriptSig has already been
+ * validated as push-only by the IsStandardTx gate.
+ *
+ * Returns null if the scriptSig contains any opcode that is not a pure push
+ * (which should not happen after the push-only gate, but we guard anyway).
+ */
+function evalPushOnlyScriptSig(scriptSig: Buffer): Buffer[] | null {
+  const stack: Buffer[] = [];
+  let i = 0;
+  while (i < scriptSig.length) {
+    const op = scriptSig[i];
+    if (op === 0x00) {
+      // OP_0 → push empty buffer
+      stack.push(Buffer.alloc(0));
+      i++;
+    } else if (op >= 0x01 && op <= 0x4b) {
+      // OP_PUSHBYTES_N
+      const len = op;
+      if (i + 1 + len > scriptSig.length) return null;
+      stack.push(Buffer.from(scriptSig.subarray(i + 1, i + 1 + len)));
+      i += 1 + len;
+    } else if (op === 0x4c) {
+      // OP_PUSHDATA1
+      if (i + 1 >= scriptSig.length) return null;
+      const len = scriptSig[i + 1];
+      if (i + 2 + len > scriptSig.length) return null;
+      stack.push(Buffer.from(scriptSig.subarray(i + 2, i + 2 + len)));
+      i += 2 + len;
+    } else if (op === 0x4d) {
+      // OP_PUSHDATA2
+      if (i + 2 >= scriptSig.length) return null;
+      const len = scriptSig.readUInt16LE(i + 1);
+      if (i + 3 + len > scriptSig.length) return null;
+      stack.push(Buffer.from(scriptSig.subarray(i + 3, i + 3 + len)));
+      i += 3 + len;
+    } else if (op === 0x4e) {
+      // OP_PUSHDATA4
+      if (i + 4 >= scriptSig.length) return null;
+      const len = scriptSig.readUInt32LE(i + 1);
+      if (i + 5 + len > scriptSig.length) return null;
+      stack.push(Buffer.from(scriptSig.subarray(i + 5, i + 5 + len)));
+      i += 5 + len;
+    } else if (op === 0x4f) {
+      // OP_1NEGATE → push -1
+      stack.push(Buffer.from([0x81]));
+      i++;
+    } else if (op >= 0x51 && op <= 0x60) {
+      // OP_1 .. OP_16
+      stack.push(Buffer.from([op - 0x50]));
+      i++;
+    } else {
+      // Non-push opcode — should not happen after the push-only gate
+      return null;
+    }
+  }
+  return stack;
+}
+
+/**
+ * IsWitnessStandard policy check.
+ *
+ * Mirrors Bitcoin Core's IsWitnessStandard() (policy/policy.cpp:265-352).
+ * Called after the input UTXOs are resolved so that we have the prevout
+ * scriptPubKey for each input.
+ *
+ * 6 gates (matching Core's order):
+ *  1. P2A prevScript + any witness → reject "bad-witness-nonstandard"
+ *  2. P2SH-wrapped: eval scriptSig → fail/empty reject; top item = redeemScript
+ *  3. Non-witness prevScript + non-empty witness → reject "bad-witness-nonstandard"
+ *  4. P2WSH v0 32B: witnessScript ≤ 3600B; ≤ 100 stack items; each item ≤ 80B
+ *  5. P2TR v1 32B (not P2SH-wrapped): annex 0x50 → reject; tapscript leaf 0xc0
+ *     → each item ≤ 80B; empty stack → reject
+ *  6. Coinbase (handled by caller — coinbase txs skip the IsWitnessStandard check)
+ *
+ * @param tx  The transaction being evaluated.
+ * @param inputUtxos  Resolved UTXOs for each input (same order as tx.inputs).
+ * @returns  { ok: true } or { ok: false, reason: string }
+ */
+function isWitnessStandard(
+  tx: Transaction,
+  inputUtxos: Array<{ utxo: { scriptPubKey: Buffer }; input: (typeof tx.inputs)[0] }>
+): { ok: true } | { ok: false; reason: string } {
+  for (let i = 0; i < tx.inputs.length; i++) {
+    const witness = tx.inputs[i].witness;
+
+    // Skip inputs with no witness — they cannot be bloated.
+    // Core skips vin[i] when scriptWitness.IsNull() (policy.cpp:274-275).
+    if (witness.length === 0) continue;
+
+    let prevScript = inputUtxos[i].utxo.scriptPubKey;
+
+    // Gate 1: P2A prevScript + any witness → reject.
+    // Core policy.cpp:283-285: if (prevScript.IsPayToAnchor()) return false;
+    if (isP2A(prevScript)) {
+      return { ok: false, reason: "bad-witness-nonstandard: P2A input must not carry witness data" };
+    }
+
+    // Gate 2: P2SH-wrapped witness programs.
+    // Core policy.cpp:287-298: EvalScript(scriptSig → stack, redeemScript = stack.back()).
+    let p2sh = false;
+    if (isP2SH(prevScript)) {
+      const scriptSig = tx.inputs[i].scriptSig;
+      const stack = evalPushOnlyScriptSig(scriptSig);
+      if (stack === null || stack.length === 0) {
+        return { ok: false, reason: "bad-witness-nonstandard: P2SH scriptSig eval failed or produced empty stack" };
+      }
+      prevScript = stack[stack.length - 1];
+      p2sh = true;
+    }
+
+    // Gate 3: non-witness prevScript + non-empty witness → reject.
+    // Core policy.cpp:301-306: if (!prevScript.IsWitnessProgram(...)) return false;
+    // Note: at this point prevScript is the redeemScript for P2SH, so we check if
+    // it is a witness program. If it is not (and we already know witness is non-empty),
+    // reject as non-standard witness stuffing.
+    if (!isWitnessProgram(prevScript)) {
+      return { ok: false, reason: "bad-witness-nonstandard: witness present for non-witness-program input" };
+    }
+
+    // Parse witness version and program from the (possibly unwrapped) prevScript.
+    // isWitnessProgram guarantees: byte[0] = version opcode, byte[1] = pushLen, then program bytes.
+    const witnessVersion = prevScript[0] === 0x00 ? 0 : prevScript[0] - 0x50;
+    // prevScript[1] is the push-length byte (already validated by isWitnessProgram)
+    const programLen = prevScript[1];
+
+    // Gate 4: P2WSH (v0, 32-byte program) standard limits.
+    // Core policy.cpp:309-318.
+    if (witnessVersion === 0 && programLen === 32) {
+      // witness[-1] is the witnessScript; its size must be ≤ 3600.
+      const witnessScript = witness[witness.length - 1];
+      if (witnessScript.length > MAX_STANDARD_P2WSH_SCRIPT_SIZE) {
+        return { ok: false, reason: `bad-witness-nonstandard: P2WSH witnessScript too large (${witnessScript.length} > ${MAX_STANDARD_P2WSH_SCRIPT_SIZE})` };
+      }
+      // Remaining stack items (excluding witnessScript) must be ≤ 100.
+      const sizeWitnessStack = witness.length - 1;
+      if (sizeWitnessStack > MAX_STANDARD_P2WSH_STACK_ITEMS) {
+        return { ok: false, reason: `bad-witness-nonstandard: P2WSH witness stack too deep (${sizeWitnessStack} > ${MAX_STANDARD_P2WSH_STACK_ITEMS})` };
+      }
+      // Each of those stack items must be ≤ 80 bytes.
+      for (let j = 0; j < sizeWitnessStack; j++) {
+        if (witness[j].length > MAX_STANDARD_P2WSH_STACK_ITEM_SIZE) {
+          return { ok: false, reason: `bad-witness-nonstandard: P2WSH witness stack item ${j} too large (${witness[j].length} > ${MAX_STANDARD_P2WSH_STACK_ITEM_SIZE})` };
+        }
+      }
+    }
+
+    // Gate 5: P2TR (v1, 32-byte program, not P2SH-wrapped) Taproot limits.
+    // Core policy.cpp:324-348.
+    if (witnessVersion === 1 && programLen === 32 && !p2sh) {
+      // Work with a mutable view of the stack (we may pop the annex).
+      // In Core this is std::span, here we track an end index.
+      let stackEnd = witness.length; // exclusive end index into witness[]
+
+      // Check for annex: if ≥2 stack items and the last one starts with ANNEX_TAG.
+      // Core policy.cpp:327-330.
+      if (stackEnd >= 2 && witness[stackEnd - 1].length > 0 && witness[stackEnd - 1][0] === ANNEX_TAG) {
+        return { ok: false, reason: "bad-witness-nonstandard: Taproot annex present" };
+      }
+
+      if (stackEnd >= 2) {
+        // Script-path spend: 2+ items after optional annex removal.
+        // Core policy.cpp:331-341: control_block = SpanPopBack(stack); SpanPopBack(script).
+        const controlBlock = witness[stackEnd - 1];
+        // stackEnd - 1 is the control block; stackEnd - 2 is the script; remaining are args.
+        const numArgs = stackEnd - 2; // items before script and control block
+
+        if (controlBlock.length === 0) {
+          return { ok: false, reason: "bad-witness-nonstandard: Taproot control block is empty" };
+        }
+        if ((controlBlock[0] & TAPROOT_LEAF_MASK) === TAPROOT_LEAF_TAPSCRIPT) {
+          // Leaf version 0xc0 (Tapscript, BIP-342): enforce per-item size limit.
+          for (let j = 0; j < numArgs; j++) {
+            if (witness[j].length > MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE) {
+              return { ok: false, reason: `bad-witness-nonstandard: tapscript witness item ${j} too large (${witness[j].length} > ${MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE})` };
+            }
+          }
+        }
+        // Non-tapscript leaf versions: no additional policy limits applied.
+      } else if (stackEnd === 1) {
+        // Key-path spend: single stack item (signature). No policy limits.
+      } else {
+        // 0 stack elements: already invalid by consensus (Core policy.cpp:345-348).
+        return { ok: false, reason: "bad-witness-nonstandard: Taproot witness stack is empty" };
+      }
+    }
+  }
+
+  return { ok: true };
+}
 
 /**
  * Legacy ancestor/descendant limits per BIP-125.
@@ -1286,6 +1537,24 @@ export class Mempool {
     const ancestorResult = this.checkAncestorLimits(parentTxids, vsize);
     if (!ancestorResult.valid) {
       return { accepted: false, error: ancestorResult.error };
+    }
+
+    // 2e. IsWitnessStandard: per-input witness policy checks.
+    //     Mirrors Bitcoin Core's IsWitnessStandard() (policy/policy.cpp:265-352).
+    //     Called here (after inputUtxos is fully resolved) because we need the
+    //     prevout scriptPubKey for each input to classify the witness spend type.
+    //     6 gates (Core order):
+    //       1. P2A prevScript + any witness → reject
+    //       2. P2SH-wrapped: eval scriptSig → get redeemScript; fail/empty → reject
+    //       3. Non-witness prevScript + non-empty witness → reject
+    //       4. P2WSH v0 32B: witnessScript ≤ 3600; ≤ 100 stack items; each ≤ 80B
+    //       5. P2TR v1 32B (!p2sh): annex 0x50 → reject; tapscript leaf 0xc0 → items ≤ 80B; empty stack → reject
+    //       6. Coinbase: exempt (checked before addTransaction is called)
+    {
+      const witnessResult = isWitnessStandard(tx, inputUtxos);
+      if (!witnessResult.ok) {
+        return { accepted: false, error: witnessResult.reason };
+      }
     }
 
     // 7. Script validation
