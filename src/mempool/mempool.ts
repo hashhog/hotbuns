@@ -48,6 +48,14 @@ import {
   shouldSkipScripts,
   type AssumeValidBlockEntry,
 } from "../consensus/assumevalid.js";
+import {
+  signalsOptInRBF,
+  isRBFOptIn,
+  entriesAndTxidsDisjoint,
+  RBFTransactionState,
+  MAX_BIP125_RBF_SEQUENCE,
+  MAX_REPLACEMENT_CANDIDATES,
+} from "./rbf.js";
 
 /**
  * Maximum cluster size (replaces ancestor/descendant limits).
@@ -412,11 +420,7 @@ const DEFAULT_MIN_FEE_RATE = 1;
  */
 const DEFAULT_INCREMENTAL_RELAY_FEE = 1;
 
-/**
- * Maximum number of transactions that can be evicted by a single RBF replacement.
- * This includes the directly conflicting transactions and all their descendants.
- */
-const MAX_REPLACEMENT_CANDIDATES = 100;
+// MAX_REPLACEMENT_CANDIDATES (100) is imported from ./rbf.js.
 
 /**
  * Package validation result types.
@@ -1436,6 +1440,7 @@ export class Mempool {
       // plus all mempool ancestors of the conflicts. Then walk the
       // replacement's inputs; any input whose prev-out points at a mempool
       // tx outside this set is a new unconfirmed input.
+      // Build the direct-conflicts set (by txid-hex) and the ancestor sets.
       const conflictTxids = new Set<string>();
       const conflictParents = new Set<string>();
       for (const conflict of conflictsToEvict) {
@@ -1443,6 +1448,12 @@ export class Mempool {
         for (const p of conflict.dependsOn) conflictParents.add(p);
       }
       const conflictAncestors = this.getAncestorSet(conflictParents);
+
+      // Rule #2 / HasNoNewUnconfirmed
+      // (bitcoin-core/src/policy/rbf.cpp, pre-removal HasNoNewUnconfirmed):
+      // The replacement may only spend an unconfirmed input if that input was
+      // already known — either an in-mempool ancestor of one of the conflicts
+      // being replaced, or one of the conflicts themselves.
       // The "already-known" set is conflicts ∪ ancestors-of-conflicts.
       const allowedUnconfirmed = new Set<string>([
         ...conflictTxids,
@@ -1460,34 +1471,49 @@ export class Mempool {
         }
       }
 
-      // Rule #3: Replacement must pay a higher absolute fee
-      if (fee <= totalConflictingFee) {
+      // Gate #5 / EntriesAndTxidsDisjoint
+      // (bitcoin-core/src/policy/rbf.cpp:EntriesAndTxidsDisjoint)
+      // Verify that no ancestor of the *replacement* transaction appears in
+      // the direct-conflicts set. If an ancestor is being evicted, the
+      // replacement would spend an output of a transaction that no longer
+      // exists, which is topologically impossible.
+      const replacementAncestors = this.getAncestorSet(parentTxids);
+      const disjointErr = entriesAndTxidsDisjoint(
+        replacementAncestors,
+        conflictTxids,
+        txid.toString("hex")
+      );
+      if (disjointErr !== null) {
+        return { accepted: false, error: disjointErr };
+      }
+
+      // Rule #3: Replacement fees must be >= original fees.
+      // (bitcoin-core/src/policy/rbf.cpp:PaysForRBF, line 109: `replacement_fees < original_fees`)
+      // Core accepts equal fees here; Rule #4 rejects zero-increment cases.
+      if (fee < totalConflictingFee) {
         return {
           accepted: false,
-          error: `RBF replacement fee ${fee} must be greater than conflicting fee ${totalConflictingFee}`,
+          error: `RBF replacement fee ${fee} must be >= conflicting fees ${totalConflictingFee} (BIP-125 Rule 3)`,
         };
       }
 
-      // Rule #4: Additional fee must cover the replacement's own bandwidth
+      // Rule #4: Additional fee must cover the replacement's own bandwidth.
       // newFee - sumOldFees >= incrementalRelayFee * newVsize
+      // (bitcoin-core/src/policy/rbf.cpp:PaysForRBF, line 118)
       const additionalFee = fee - totalConflictingFee;
-      const requiredIncrementalFee = BigInt(this.incrementalRelayFee * vsize);
+      const requiredIncrementalFee = BigInt(Math.ceil(this.incrementalRelayFee * vsize));
       if (additionalFee < requiredIncrementalFee) {
         return {
           accepted: false,
-          error: `RBF incremental fee ${additionalFee} < required ${requiredIncrementalFee} (${this.incrementalRelayFee} sat/vB * ${vsize} vB)`,
+          error: `RBF incremental fee ${additionalFee} < required ${requiredIncrementalFee} (${this.incrementalRelayFee} sat/vB * ${vsize} vB) (BIP-125 Rule 4)`,
         };
       }
 
-      // Additional check: new tx's fee rate must be higher than all directly conflicting txs
-      for (const conflict of conflicts) {
-        if (feeRate <= conflict.feeRate) {
-          return {
-            accepted: false,
-            error: `RBF replacement fee rate ${feeRate.toFixed(2)} must be higher than conflicting tx ${conflict.txid.toString("hex").slice(0, 16)}... fee rate ${conflict.feeRate.toFixed(2)}`,
-          };
-        }
-      }
+      // NOTE: No per-conflict fee-rate comparison. Bitcoin Core (policy/rbf.cpp)
+      // does NOT require the replacement's fee rate to exceed every individual
+      // conflicting tx's fee rate — only the absolute and incremental fee gates
+      // above apply. The ImprovesFeerateDiagram check (Core 27+) handles the
+      // feerate diagram comparison and is deferred (Gate #8).
     }
 
     // 9a. Check TRUC (v3) policy rules
@@ -2554,12 +2580,71 @@ export class Mempool {
   }
 
   /**
-   * Check if a transaction is replaceable (always true for full RBF).
-   * In full RBF mode, all unconfirmed transactions are replaceable.
+   * Return the BIP-125 RBF opt-in state for a mempool transaction.
+   *
+   * Reports "yes" if the transaction itself or any of its mempool ancestors
+   * signals opt-in RBF via nSequence <= MAX_BIP125_RBF_SEQUENCE (0xfffffffd).
+   * Reports "no" if neither the tx nor any ancestor signals.
+   * Reports "unknown" if the txid is not in the mempool.
+   *
+   * Used for the "bip125-replaceable" field in getmempoolentry / getrawmempool.
+   * Mirrors bitcoin-core/src/policy/rbf.cpp:IsRBFOptIn.
+   *
+   * Note: hotbuns runs full-RBF (all mempool transactions are practically
+   * replaceable regardless of this signal), but we report the BIP-125 signal
+   * status faithfully for RPC compatibility with Bitcoin Core.
    */
-  isReplaceable(_txid: Buffer): boolean {
-    // Full RBF: all mempool transactions are replaceable
-    return true;
+  getRBFOptInState(txid: Buffer): RBFTransactionState {
+    const txidHex = txid.toString("hex");
+    const entry = this.entries.get(txidHex);
+    if (!entry) {
+      return RBFTransactionState.UNKNOWN;
+    }
+
+    // Build the ancestor Transaction iterable (lazy: just walk dependsOn).
+    const self = this;
+    function* ancestorTxs(): Iterable<import("../validation/tx.js").Transaction> {
+      const visited = new Set<string>();
+      const queue = Array.from(entry!.dependsOn);
+      while (queue.length > 0) {
+        const parentHex = queue.shift()!;
+        if (visited.has(parentHex)) continue;
+        visited.add(parentHex);
+        const parentEntry = self.entries.get(parentHex);
+        if (parentEntry) {
+          yield parentEntry.tx;
+          for (const grandparentHex of parentEntry.dependsOn) {
+            if (!visited.has(grandparentHex)) queue.push(grandparentHex);
+          }
+        }
+      }
+    }
+
+    return isRBFOptIn(entry.tx, true, ancestorTxs());
+  }
+
+  /**
+   * Check if a transaction is replaceable.
+   *
+   * In full-RBF mode (hotbuns default) every mempool transaction is
+   * replaceable regardless of BIP-125 sequence signaling.  Returns true for
+   * any known txid, false for unknown (not in mempool).
+   *
+   * For the BIP-125 signal status (used in "bip125-replaceable" RPC field),
+   * use getRBFOptInState() instead.
+   */
+  isReplaceable(txid: Buffer): boolean {
+    // Full RBF: every known mempool transaction is replaceable.
+    return this.entries.has(txid.toString("hex"));
+  }
+
+  /**
+   * Check whether a transaction signals opt-in RBF via BIP-125.
+   * Mirrors bitcoin-core/src/util/rbf.cpp:SignalsOptInRBF.
+   * Does NOT walk ancestors — use getRBFOptInState() for the full check.
+   */
+  static signalsOptInRBF(tx: import("../validation/tx.js").Transaction): boolean {
+    return signalsOptInRBF(tx);
   }
 
   /**

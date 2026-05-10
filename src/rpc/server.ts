@@ -11,6 +11,7 @@ import type { ChainDB } from "../storage/database.js";
 import type { Mempool, MempoolEntry } from "../mempool/mempool.js";
 import { PackageValidationResult, MAX_PACKAGE_COUNT } from "../mempool/mempool.js";
 import { dumpMempool, loadMempool, mempoolDumpExists } from "../mempool/persist.js";
+import { RBFTransactionState } from "../mempool/rbf.js";
 import type { PeerManager } from "../p2p/manager.js";
 import type { FeeEstimator } from "../fees/estimator.js";
 import type { HeaderSync, HeaderChainEntry } from "../sync/headers.js";
@@ -3312,7 +3313,7 @@ export class RPCServer {
         },
         depends: Array.from(entry.dependsOn),
         spentby: Array.from(entry.spentBy),
-        "bip125-replaceable": this.mempool.isReplaceable(txid),
+        "bip125-replaceable": this.mempool.getRBFOptInState(txid) === RBFTransactionState.REPLACEABLE_BIP125,
         unbroadcast: false,
       };
     }
@@ -3634,7 +3635,7 @@ export class RPCServer {
           ancestorfees: Number(ancestorEntry.fee),
           depends: Array.from(ancestorEntry.dependsOn),
           spentby: Array.from(ancestorEntry.spentBy),
-          "bip125-replaceable": this.mempool.isReplaceable(ancestorTxid),
+          "bip125-replaceable": this.mempool.getRBFOptInState(ancestorTxid) === RBFTransactionState.REPLACEABLE_BIP125,
         };
       }
     }
@@ -3713,7 +3714,7 @@ export class RPCServer {
           ancestorfees: Number(descendantEntry.fee),
           depends: Array.from(descendantEntry.dependsOn),
           spentby: Array.from(descendantEntry.spentBy),
-          "bip125-replaceable": this.mempool.isReplaceable(descendantTxid),
+          "bip125-replaceable": this.mempool.getRBFOptInState(descendantTxid) === RBFTransactionState.REPLACEABLE_BIP125,
         };
       }
     }
