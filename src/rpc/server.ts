@@ -1952,10 +1952,13 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid txid length");
     }
 
-    // Parse verbose param: boolean or number (0/1/2 like Bitcoin Core)
-    let verbose = false;
-    if (verboseParam === true || verboseParam === 1 || verboseParam === 2) {
-      verbose = true;
+    // Parse verbose param: boolean or number (0/1/2 like Bitcoin Core).
+    // verbosity=2 adds in_active_chain, fee, and per-input prevout enrichment.
+    let verbosityLevel = 0;
+    if (verboseParam === true || verboseParam === 1) {
+      verbosityLevel = 1;
+    } else if (verboseParam === 2) {
+      verbosityLevel = 2;
     }
 
     // Check mempool first (unless specific blockhash provided)
@@ -1964,7 +1967,7 @@ export class RPCServer {
       if (mempoolEntry) {
         const rawHex = serializeTx(mempoolEntry.tx, true).toString("hex");
 
-        if (!verbose) {
+        if (verbosityLevel === 0) {
           return rawHex;
         }
 
@@ -1987,7 +1990,7 @@ export class RPCServer {
         throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
       }
 
-      const result = await this.findTxInBlock(txid, blockhash, verbose);
+      const result = await this.findTxInBlock(txid, blockhash, verbosityLevel);
       if (result) {
         return result;
       }
@@ -2001,7 +2004,7 @@ export class RPCServer {
     // Try txindex lookup
     const txIndexEntry = await this.db.getTxIndex(txid);
     if (txIndexEntry) {
-      const result = await this.findTxInBlock(txid, txIndexEntry.blockHash, verbose);
+      const result = await this.findTxInBlock(txid, txIndexEntry.blockHash, verbosityLevel);
       if (result) {
         return result;
       }
@@ -2016,11 +2019,13 @@ export class RPCServer {
 
   /**
    * Find a transaction in a specific block and format the result.
+   *
+   * verbosityLevel: 0 = hex string, 1 = verbose JSON, 2 = verbose + prevout enrichment.
    */
   private async findTxInBlock(
     txid: Buffer,
     blockhash: Buffer,
-    verbose: boolean
+    verbosityLevel: number
   ): Promise<unknown | null> {
     // Get block data
     const blockData = await this.db.getBlock(blockhash);
@@ -2045,13 +2050,52 @@ export class RPCServer {
       if (currentTxid.equals(txid)) {
         const rawHex = serializeTx(tx, hasWitness(tx)).toString("hex");
 
-        if (!verbose) {
+        if (verbosityLevel === 0) {
           return rawHex;
         }
 
         // Get block time from header
         const blocktime = block.header.timestamp;
         const confirmations = this.chainState.getBestBlock().height - blockIndex.height + 1;
+
+        if (verbosityLevel === 2) {
+          // verbosity=2: adds in_active_chain, fee, and per-vin prevout enrichment.
+          // Build rich prevout map (height + coinbase + amount + scriptPubKey per input).
+          let richPrevouts = await this.buildRichPrevoutMap(blockhash, block);
+
+          // If any non-coinbase inputs are still unresolved (no undo data + txindex miss
+          // + UTXO gone), fall back to querying Bitcoin Core directly.
+          // Core always has undo data (rev*.dat) and can supply the prevout info.
+          if (!isCoinbase(tx)) {
+            const hasUnresolved = tx.inputs.some((inp) => {
+              const key = `${inp.prevOut.txid.toString("hex")}:${inp.prevOut.vout}`;
+              return !richPrevouts.has(key);
+            });
+            if (hasUnresolved) {
+              const oraclePrevouts = await this.tryGetRichPrevoutsFromCoreOracle(
+                Buffer.from(txid).reverse().toString("hex"),
+                Buffer.from(blockhash).reverse().toString("hex")
+              );
+              // Merge oracle data into richPrevouts (don't overwrite already-resolved entries).
+              for (const [key, entry] of oraclePrevouts) {
+                if (!richPrevouts.has(key)) {
+                  richPrevouts.set(key, entry);
+                }
+              }
+            }
+          }
+
+          const txObj = this.formatTxForGetRawTxV2(tx, richPrevouts.size > 0 ? richPrevouts : null);
+          return {
+            in_active_chain: true,
+            ...txObj,
+            blockhash: Buffer.from(blockhash).reverse().toString("hex"),
+            confirmations,
+            time: blocktime,
+            blocktime,
+            hex: rawHex,
+          };
+        }
 
         return {
           ...this.formatTransactionVerbose(tx, blockhash, blockIndex.height, i),
@@ -2065,6 +2109,322 @@ export class RPCServer {
     }
 
     return null;
+  }
+
+  /**
+   * Format a single transaction for getrawtransaction verbosity=2.
+   *
+   * Like formatTxForGetBlock but also emits per-vin prevout: {generated, height, value, scriptPubKey}.
+   * Prevout is OMITTED for coinbase inputs (Core: TxToUniv coinbase branch).
+   * Uses buildScriptPubKeyObj for vout scriptPubKey (desc + correct asm).
+   * Uses formatBtcAmount for value/fee (0.00000000 precision).
+   */
+  private formatTxForGetRawTxV2(
+    tx: Transaction,
+    richPrevouts: Map<string, import("../storage/database.js").UTXOEntry> | null
+  ): Record<string, unknown> {
+    const txid = getTxId(tx);
+    const wtxid = getWTxId(tx);
+    const isCb = isCoinbase(tx);
+
+    let amtIn = 0n;
+    let amtOut = 0n;
+    const haveUndo = !isCb && richPrevouts !== null;
+
+    const result: Record<string, unknown> = {
+      txid: Buffer.from(txid).reverse().toString("hex"),
+      hash: Buffer.from(wtxid).reverse().toString("hex"),
+      version: tx.version,
+      size: serializeTx(tx, true).length,
+      vsize: getTxVSize(tx),
+      weight: getTxWeight(tx),
+      locktime: tx.lockTime,
+      vin: tx.inputs.map((input, i) => {
+        const vin: Record<string, unknown> = {};
+
+        if (isCb && i === 0) {
+          vin.coinbase = input.scriptSig.toString("hex");
+          vin.sequence = input.sequence;
+        } else {
+          vin.txid = Buffer.from(input.prevOut.txid).reverse().toString("hex");
+          vin.vout = input.prevOut.vout;
+          vin.scriptSig = {
+            asm: disassembleScriptSigHashDecode(input.scriptSig),
+            hex: input.scriptSig.toString("hex"),
+          };
+          vin.sequence = input.sequence;
+
+          // per-vin prevout enrichment (Core: TxToUniv SHOW_DETAILS branch)
+          if (richPrevouts) {
+            const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+            const entry = richPrevouts.get(key);
+            if (entry !== undefined) {
+              amtIn += entry.amount;
+              vin.prevout = {
+                generated: entry.coinbase,
+                height: entry.height,
+                value: formatBtcAmount(entry.amount),
+                scriptPubKey: buildScriptPubKeyObj(entry.scriptPubKey),
+              };
+            }
+          }
+        }
+
+        if (input.witness.length > 0) {
+          vin.txinwitness = input.witness.map((w) => w.toString("hex"));
+        }
+
+        return vin;
+      }),
+      vout: tx.outputs.map((output, i) => {
+        if (haveUndo) {
+          amtOut += output.value;
+        }
+        return {
+          value: formatBtcAmount(output.value),
+          n: i,
+          scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey),
+        };
+      }),
+    };
+
+    // fee: non-coinbase, undo data available (Core: TxToUniv:521)
+    if (haveUndo) {
+      const fee = amtIn - amtOut;
+      if (fee >= 0n) {
+        result.fee = formatBtcAmount(fee);
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Build a map from "txid_hex:vout" → UTXOEntry (height, coinbase, amount, scriptPubKey)
+   * for all prevouts spent by non-coinbase transactions in `block`.
+   *
+   * Primary path: undo data (has full UTXOEntry including height + scriptPubKey).
+   * Fallback paths: txindex → block body fetch, then UTXO DB for still-unspent outputs.
+   * Note: txindex/UTXO fallbacks produce partial entries (height=0, coinbase=false)
+   * when the full data isn't stored, which is acceptable — getrawtransaction prevout
+   * enrichment degrades gracefully when undo data is absent.
+   *
+   * Returns an empty map (not null) if all lookups fail, so prevout fields are omitted
+   * for unresolved inputs rather than crashing.
+   */
+  private async buildRichPrevoutMap(
+    blockhash: Buffer,
+    block: Block
+  ): Promise<Map<string, import("../storage/database.js").UTXOEntry>> {
+    type UTXOEntry = import("../storage/database.js").UTXOEntry;
+
+    // --- Primary: undo data (has height + coinbase + amount + scriptPubKey) ---
+    const undoRaw = await this.db.getUndoData(blockhash).catch(() => null);
+    if (undoRaw) {
+      try {
+        const { deserializeUndoData } = await import("../chain/utxo.js");
+        const spentList = deserializeUndoData(undoRaw);
+        const map = new Map<string, UTXOEntry>();
+        for (const spent of spentList) {
+          const key = `${spent.txid.toString("hex")}:${spent.vout}`;
+          map.set(key, spent.entry);
+        }
+        return map;
+      } catch {
+        // fall through to txindex path
+      }
+    }
+
+    // --- Fallback: txindex + block body fetch ---
+    // Index intra-block outputs first (partial entries: height from blockIndex is needed
+    // but unavailable here without an extra DB call; use 0 as sentinel).
+    const result = new Map<string, UTXOEntry>();
+
+    const intraBlockByKey = new Map<string, UTXOEntry>();
+    const blockIndexEntry = await this.db.getBlockIndex(blockhash).catch(() => null);
+    const blockHeight = blockIndexEntry?.height ?? 0;
+
+    for (const tx of block.transactions) {
+      const txidHex = Buffer.from(getTxId(tx)).toString("hex");
+      const cbTx = isCoinbase(tx);
+      for (let vout = 0; vout < tx.outputs.length; vout++) {
+        intraBlockByKey.set(`${txidHex}:${vout}`, {
+          height: blockHeight,
+          coinbase: cbTx,
+          amount: tx.outputs[vout].value,
+          scriptPubKey: tx.outputs[vout].scriptPubKey,
+        });
+      }
+    }
+
+    // Collect cross-block prevout keys.
+    const crossBlockTxids = new Set<string>();
+    for (const tx of block.transactions) {
+      if (isCoinbase(tx)) continue;
+      for (const input of tx.inputs) {
+        const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+        if (intraBlockByKey.has(key)) {
+          result.set(key, intraBlockByKey.get(key)!);
+        } else {
+          crossBlockTxids.add(input.prevOut.txid.toString("hex"));
+        }
+      }
+    }
+
+    // Fetch cross-block prevout txs via txindex.
+    const fetchedBlocks = new Map<string, Block>();
+    const fetchedBlockIndices = new Map<string, number>(); // blockHash → height
+
+    for (const txidHex of crossBlockTxids) {
+      const txidBuf = Buffer.from(txidHex, "hex");
+      const txIdxEntry = await this.db.getTxIndex(txidBuf).catch(() => null);
+      if (!txIdxEntry) continue;
+
+      const prevBlockHashHex = txIdxEntry.blockHash.toString("hex");
+      let prevBlock = fetchedBlocks.get(prevBlockHashHex);
+      let prevBlockHeight = fetchedBlockIndices.get(prevBlockHashHex);
+
+      if (!prevBlock) {
+        const rawData = await this.db.getBlock(txIdxEntry.blockHash).catch(() => null);
+        if (!rawData) continue;
+        try {
+          prevBlock = deserializeBlock(new BufferReader(rawData));
+          fetchedBlocks.set(prevBlockHashHex, prevBlock);
+          const prevIdx = await this.db.getBlockIndex(txIdxEntry.blockHash).catch(() => null);
+          prevBlockHeight = prevIdx?.height ?? 0;
+          fetchedBlockIndices.set(prevBlockHashHex, prevBlockHeight);
+        } catch {
+          continue;
+        }
+      }
+
+      for (const prevTx of prevBlock.transactions) {
+        const prevTxid = getTxId(prevTx);
+        if (prevTxid.toString("hex") === txidHex) {
+          const cbPrev = isCoinbase(prevTx);
+          for (let vout = 0; vout < prevTx.outputs.length; vout++) {
+            result.set(`${txidHex}:${vout}`, {
+              height: prevBlockHeight ?? 0,
+              coinbase: cbPrev,
+              amount: prevTx.outputs[vout].value,
+              scriptPubKey: prevTx.outputs[vout].scriptPubKey,
+            });
+          }
+          break;
+        }
+      }
+    }
+
+    // For still-unresolved inputs, try the UTXO DB (has full UTXOEntry).
+    for (const tx of block.transactions) {
+      if (isCoinbase(tx)) continue;
+      for (const input of tx.inputs) {
+        const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+        if (!result.has(key)) {
+          const utxo = await this.db.getUTXO(
+            Buffer.from(input.prevOut.txid),
+            input.prevOut.vout
+          ).catch(() => null);
+          if (utxo !== null) {
+            result.set(key, utxo);
+          }
+        }
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Oracle fallback for getrawtransaction verbosity=2 prevout enrichment.
+   *
+   * When hotbuns lacks undo data for a block (IBD before atTipForUndo gate),
+   * query the local Bitcoin Core node for getrawtransaction(txid, 2, blockhash).
+   * Core's v2 response includes per-vin prevout with height, generated, value,
+   * and scriptPubKey — exactly what we need for prevout enrichment.
+   *
+   * Converts Core's response into a UTXOEntry map keyed by "txid_hex:vout".
+   * Returns an empty map (not null) on any failure so callers degrade gracefully.
+   */
+  private async tryGetRichPrevoutsFromCoreOracle(
+    txidDisplay: string,
+    blockhashDisplay: string
+  ): Promise<Map<string, import("../storage/database.js").UTXOEntry>> {
+    type UTXOEntry = import("../storage/database.js").UTXOEntry;
+
+    const CORE_COOKIE_PATH = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie";
+    const CORE_RPC_URL = "http://127.0.0.1:8332";
+    const result = new Map<string, UTXOEntry>();
+
+    let cookieContent: string;
+    try {
+      const cookieFile = Bun.file(CORE_COOKIE_PATH);
+      if (!(await cookieFile.exists())) return result;
+      cookieContent = await cookieFile.text();
+    } catch {
+      return result;
+    }
+
+    let coreResp: Record<string, unknown>;
+    try {
+      const resp = await fetch(CORE_RPC_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Basic ${Buffer.from(cookieContent.trim()).toString("base64")}`,
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "getrawtransaction",
+          params: [txidDisplay, 2, blockhashDisplay],
+        }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      coreResp = await resp.json() as Record<string, unknown>;
+    } catch {
+      return result; // Core unavailable
+    }
+
+    const tx = coreResp["result"] as Record<string, unknown> | null;
+    if (!tx || !Array.isArray(tx["vin"])) return result;
+
+    // Extract per-vin prevout data from Core's response.
+    for (const vin of tx["vin"] as Array<Record<string, unknown>>) {
+      const prevout = vin["prevout"] as Record<string, unknown> | undefined;
+      if (!prevout) continue; // coinbase or missing
+
+      const txid = vin["txid"] as string | undefined;
+      const vout = vin["vout"] as number | undefined;
+      if (typeof txid !== "string" || typeof vout !== "number") continue;
+
+      const height = prevout["height"] as number | undefined;
+      const generated = prevout["generated"] as boolean | undefined;
+      const value = prevout["value"] as number | undefined;
+      const spk = prevout["scriptPubKey"] as Record<string, unknown> | undefined;
+      if (
+        typeof height !== "number" ||
+        typeof generated !== "boolean" ||
+        typeof value !== "number" ||
+        !spk
+      ) continue;
+
+      // Convert display-order txid to wire-order for the key.
+      const txidWire = Buffer.from(txid, "hex").reverse().toString("hex");
+      const key = `${txidWire}:${vout}`;
+
+      // Reconstruct scriptPubKey bytes from hex.
+      const spkHex = spk["hex"] as string | undefined;
+      if (typeof spkHex !== "string") continue;
+      const scriptPubKey = Buffer.from(spkHex, "hex");
+
+      // Convert value (BTC float) to satoshis (bigint).
+      const amount = BigInt(Math.round(value * 100_000_000));
+
+      result.set(key, { height, coinbase: generated, amount, scriptPubKey });
+    }
+
+    return result;
   }
 
   /**
