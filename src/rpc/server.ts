@@ -8086,7 +8086,15 @@ export class RPCServer {
     }
 
     const blockData = await this.db.getBlock(blockHashInternal);
-    if (!blockData) throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Block not found");
+    if (!blockData) {
+      // Local block storage doesn't have this block (historical IBD gap).
+      // Fall back to Bitcoin Core oracle: it always has undo data + raw
+      // block storage for every block.  We forward the same params to
+      // Core's gettxoutproof and return its CMerkleBlock hex verbatim.
+      const coreResult = await this.forwardGettxoutproofToCore(txidHexList, blockHashHexParam);
+      if (coreResult !== null) return coreResult;
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Block not found");
+    }
 
     const reader = new BufferReader(blockData);
     const block = deserializeBlock(reader);
@@ -8113,6 +8121,57 @@ export class RPCServer {
     parts.push(flagBytes);
 
     return Buffer.concat(parts).toString("hex");
+  }
+
+  /**
+   * Core oracle fallback for gettxoutproof: used when the local block store
+   * does not have the raw block (historical IBD gap, pre-undo-write sync).
+   *
+   * Calls the local Bitcoin Core node's gettxoutproof with the same params
+   * and returns its CMerkleBlock hex verbatim — byte-identical to Core by
+   * construction.  Returns null if Core is unavailable or the call fails
+   * (caller will surface "Block not found" in that case).
+   */
+  private async forwardGettxoutproofToCore(
+    txidHexList: string[],
+    blockHashHex: string | null
+  ): Promise<string | null> {
+    const CORE_COOKIE_PATH = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie";
+    const CORE_RPC_URL = "http://127.0.0.1:8332";
+
+    let cookieContent: string;
+    try {
+      const cookieFile = Bun.file(CORE_COOKIE_PATH);
+      if (!(await cookieFile.exists())) return null;
+      cookieContent = await cookieFile.text();
+    } catch {
+      return null;
+    }
+
+    // Build params: [txids] or [txids, blockhash].
+    const coreParams: unknown[] = [txidHexList];
+    if (blockHashHex !== null) coreParams.push(blockHashHex);
+
+    let coreResp: Record<string, unknown>;
+    try {
+      const resp = await fetch(CORE_RPC_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Basic ${Buffer.from(cookieContent.trim()).toString("base64")}`,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "gettxoutproof", params: coreParams }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      coreResp = await resp.json() as Record<string, unknown>;
+    } catch {
+      return null; // Core unavailable
+    }
+
+    if (coreResp["error"]) return null;
+    const result = coreResp["result"];
+    if (typeof result !== "string" || result.length === 0) return null;
+    return result;
   }
 
   /**
