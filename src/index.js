@@ -31522,9 +31522,8 @@ class RPCServer {
     const decoded = this.decodeAddress(address);
     if (!decoded.valid) {
       result.isvalid = false;
-      if (decoded.error) {
-        result.error = decoded.error;
-      }
+      result.error = "Invalid or unsupported Segwit (Bech32) or Base58 encoding.";
+      result.error_locations = [];
       return result;
     }
     result.isvalid = true;
@@ -31599,7 +31598,7 @@ class RPCServer {
     return {
       valid: true,
       scriptPubKey,
-      isScript: witnessVersion === 0 && witnessProgram.length === 32,
+      isScript: witnessProgram.length > 20,
       isWitness: true,
       witnessVersion,
       witnessProgram
