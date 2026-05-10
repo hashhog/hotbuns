@@ -51,6 +51,10 @@ import {
   getDescriptorInfo,
   deriveAddresses,
   addChecksum,
+  MultiDescriptor,
+  SHDescriptor,
+  WSHDescriptor,
+  ConstPubkeyProvider,
   type NetworkType,
 } from "../wallet/descriptor.js";
 import {
@@ -911,6 +915,7 @@ export class RPCServer {
     // Descriptor methods (work without wallet)
     this.registerMethod("getdescriptorinfo", (params) => this.getDescriptorInfo(params));
     this.registerMethod("deriveaddresses", (params) => this.deriveAddresses(params));
+    this.registerMethod("createmultisig", (params) => this.createMultisig(params));
 
     // PSBT methods (BIP-174) — wallet-independent (creator/decoder/combiner/finalizer roles)
     this.registerMethod("createpsbt", (params) => this.createPSBTRpc(params));
@@ -6427,6 +6432,142 @@ export class RPCServer {
     try {
       const addresses = deriveAddresses(descriptorParam, network, range);
       return addresses;
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, message);
+    }
+  }
+
+  /**
+   * createmultisig: Create a P2SH/P2WSH/P2SH-P2WSH multisig address.
+   *
+   * Params: [nrequired, ["pk1","pk2",...], address_type?]
+   * address_type: "legacy" (default) | "bech32" | "p2sh-segwit"
+   *
+   * Returns: { address, redeemScript, descriptor }
+   */
+  private async createMultisig(params: unknown[]): Promise<Record<string, unknown>> {
+    const [nrequiredParam, pubkeysParam, addressTypeParam] = params;
+
+    // Validate nrequired
+    if (typeof nrequiredParam !== "number" || !Number.isInteger(nrequiredParam)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "nrequired must be an integer");
+    }
+    const nRequired = nrequiredParam;
+
+    // Validate pubkeys array
+    if (!Array.isArray(pubkeysParam)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "keys must be an array");
+    }
+    const pubkeyHexes = pubkeysParam as unknown[];
+    if (pubkeyHexes.length === 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "keys array must not be empty");
+    }
+    if (nRequired < 1 || nRequired > pubkeyHexes.length) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `nrequired (${nRequired}) must be between 1 and ${pubkeyHexes.length}`
+      );
+    }
+    if (pubkeyHexes.length > 20) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Number of keys exceeds 20");
+    }
+
+    // Parse + validate each pubkey (must be compressed, 33-byte)
+    const pubkeyBuffers: Buffer[] = [];
+    for (let i = 0; i < pubkeyHexes.length; i++) {
+      const hex = pubkeyHexes[i];
+      if (typeof hex !== "string") {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, `Key ${i} must be a hex string`);
+      }
+      if (!/^[0-9a-fA-F]+$/.test(hex) || hex.length % 2 !== 0) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, `Key ${i} is not valid hex`);
+      }
+      const buf = Buffer.from(hex, "hex");
+      if (buf.length !== 33) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          `Key ${i} must be a compressed public key (33 bytes)`
+        );
+      }
+      const prefix = buf[0];
+      if (prefix !== 0x02 && prefix !== 0x03) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          `Key ${i} is not a compressed public key`
+        );
+      }
+      pubkeyBuffers.push(buf);
+    }
+
+    // Parse address_type (default: "legacy")
+    const addressType = addressTypeParam === undefined ? "legacy" : addressTypeParam;
+    if (
+      addressType !== "legacy" &&
+      addressType !== "bech32" &&
+      addressType !== "p2sh-segwit"
+    ) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `Invalid address_type: ${addressType}. Must be legacy, bech32, or p2sh-segwit`
+      );
+    }
+
+    const network = this.getNetworkType();
+
+    try {
+      // Build multi() provider list (ConstPubkeyProvider for each key)
+      const providers = pubkeyBuffers.map((pk) => new ConstPubkeyProvider(pk));
+
+      // multi(M, pk1, pk2, ...) descriptor (inner, without wrapper)
+      const multiDesc = new MultiDescriptor(nRequired, providers, false);
+
+      // Expand to get the raw multisig redeemScript
+      const multiOutputs = multiDesc.expand(0, network);
+      if (multiOutputs.length === 0) {
+        throw new Error("Failed to expand multi descriptor");
+      }
+      const redeemScript = multiOutputs[0].scriptPubKey;
+      const redeemScriptHex = redeemScript.toString("hex");
+
+      let address: string;
+      let descriptor: string;
+
+      if (addressType === "legacy") {
+        // sh(multi(M,...)) — P2SH
+        const shDesc = new SHDescriptor(multiDesc);
+        const shOutputs = shDesc.expand(0, network);
+        if (!shOutputs[0].address) {
+          throw new Error("Failed to derive P2SH address");
+        }
+        address = shOutputs[0].address;
+        descriptor = addChecksum(`sh(${multiDesc.toString()})`);
+      } else if (addressType === "bech32") {
+        // wsh(multi(M,...)) — P2WSH
+        const wshDesc = new WSHDescriptor(multiDesc);
+        const wshOutputs = wshDesc.expand(0, network);
+        if (!wshOutputs[0].address) {
+          throw new Error("Failed to derive P2WSH address");
+        }
+        address = wshOutputs[0].address;
+        descriptor = addChecksum(`wsh(${multiDesc.toString()})`);
+      } else {
+        // p2sh-segwit: sh(wsh(multi(M,...))) — P2SH-P2WSH
+        const wshDesc = new WSHDescriptor(multiDesc);
+        const shWshDesc = new SHDescriptor(wshDesc);
+        const shWshOutputs = shWshDesc.expand(0, network);
+        if (!shWshOutputs[0].address) {
+          throw new Error("Failed to derive P2SH-P2WSH address");
+        }
+        address = shWshOutputs[0].address;
+        descriptor = addChecksum(`sh(wsh(${multiDesc.toString()}))`);
+      }
+
+      return {
+        address,
+        redeemScript: redeemScriptHex,
+        descriptor,
+      };
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, message);
