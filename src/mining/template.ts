@@ -98,11 +98,39 @@ export interface BlockTemplate {
 }
 
 /**
- * Reserve weight for coinbase transaction.
- * A typical coinbase with witness commitment is ~200 bytes base, ~1000 weight units.
- * We reserve 4000 to be safe and allow for larger coinbase scripts.
+ * Reserved weight for block header, var_int tx count and coinbase transaction.
+ * Core default: DEFAULT_BLOCK_RESERVED_WEIGHT = 8000 (policy/policy.h:27).
+ * This is the value passed to resetBlock() as nBlockWeight and must match Core.
  */
-const COINBASE_WEIGHT_RESERVE = 4000;
+const BLOCK_RESERVED_WEIGHT = 8000;
+
+/**
+ * Minimum sigops budget reserved for coinbase transaction outputs.
+ * Core default: DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS = 400 (policy/policy.h:29).
+ * Applied in resetBlock() analog: nBlockSigOpsCost starts at this value.
+ */
+const COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS = 400;
+
+/**
+ * Maximum consecutive failed chunk additions before early exit when block is nearly full.
+ * Core: MAX_CONSECUTIVE_FAILURES = 1000 (node/miner.cpp:284).
+ */
+const MAX_CONSECUTIVE_FAILURES = 1000;
+
+/**
+ * Weight delta used with MAX_CONSECUTIVE_FAILURES: if block weight is within
+ * BLOCK_FULL_ENOUGH_WEIGHT_DELTA of the maximum AND we've hit MAX_CONSECUTIVE_FAILURES,
+ * give up early. Core: BLOCK_FULL_ENOUGH_WEIGHT_DELTA = 4000 (node/miner.cpp:285).
+ */
+const BLOCK_FULL_ENOUGH_WEIGHT_DELTA = 4000;
+
+/**
+ * Coinbase input sequence value. Core uses MAX_SEQUENCE_NONFINAL (= SEQUENCE_FINAL - 1 =
+ * 0xFFFFFFFE) so that the coinbase's nLockTime = nHeight-1 is actually enforced.
+ * Using SEQUENCE_FINAL (0xFFFFFFFF) would make IsFinalTx ignore nLockTime entirely.
+ * Reference: node/miner.cpp:171 "Make sure timelock is enforced."
+ */
+const MAX_SEQUENCE_NONFINAL = 0xfffffffe;
 
 /**
  * Witness commitment header: OP_RETURN (0x6a) + push 36 bytes (0x24) + commitment marker (0xaa21a9ed)
@@ -162,7 +190,9 @@ export class BlockTemplateBuilder {
     const height = bestBlock.height + 1;
 
     // Select transactions from mempool
-    const { txs: selectedEntries, totalFees, totalWeight: txWeight, totalSigOps: selectedSigOps } = this.selectTransactions();
+    // totalWeight from selectTransactions() is nBlockWeight (starts at BLOCK_RESERVED_WEIGHT,
+    // grows with each selected tx). This matches Core's m_last_block_weight semantics.
+    const { txs: selectedEntries, totalFees, totalWeight, totalSigOps } = this.selectTransactions();
 
     // Get the selected transactions
     const transactions = selectedEntries.map(entry => entry.tx);
@@ -200,10 +230,13 @@ export class BlockTemplateBuilder {
     const txids = allTxs.map(tx => getTxId(tx));
     const merkleRoot = computeMerkleRoot(txids);
 
-    // Calculate block timestamp (max of current time and MTP + 1)
-    // For simplicity, we use current time since we don't have easy access to MTP here
-    // In production, this should be max(now, MTP + 1)
-    const timestamp = Math.floor(Date.now() / 1000);
+    // Bug fix 7: block timestamp must be >= MTP+1 (GetMinimumTime in Core miner.cpp:36-47).
+    // Core's UpdateTime() does max(GetMinimumTime(pindexPrev,...), now).
+    // GetMinimumTime returns max(MTP+1, ...). So: timestamp = max(now, MTP+1).
+    // Reference: node/miner.cpp:52-53.
+    const nowSecs = Math.floor(Date.now() / 1000);
+    const minTime = this.medianTimePast + 1;
+    const timestamp = Math.max(nowSecs, minTime);
 
     // Build block header
     const header: BlockHeader = {
@@ -215,13 +248,11 @@ export class BlockTemplateBuilder {
       nonce: 0, // Miner will increment this
     };
 
-    // Calculate total block weight
-    const coinbaseWeight = getTxWeight(coinbaseTx);
-    const headerWeight = 80 * 4; // 80 bytes * 4 = 320 weight units
-    const totalWeight = headerWeight + coinbaseWeight + txWeight;
-
-    // Sigops total accumulated by selectTransactions() via per-entry sigOpCost.
-    const totalSigOps = selectedSigOps;
+    // Bug fix 2: totalWeight is already fully accumulated by selectTransactions()
+    // (it starts at BLOCK_RESERVED_WEIGHT which covers header+coinbase overhead).
+    // Do NOT add headerWeight (320) or coinbaseWeight separately here — that was
+    // the old double-counting bug that made blocks appear heavier than maxBlockWeight.
+    // The coinbase weight is already accounted for by the BLOCK_RESERVED_WEIGHT reservation.
 
     return {
       header,
@@ -239,13 +270,28 @@ export class BlockTemplateBuilder {
    * Select transactions from the mempool greedily by fee rate.
    *
    * Respects:
-   * - Maximum block weight (minus coinbase reserve)
-   * - Maximum sigops cost
+   * - Maximum block weight (nBlockMaxWeight = maxBlockWeight; initial nBlockWeight = BLOCK_RESERVED_WEIGHT)
+   * - Maximum sigops cost (initial nBlockSigOpsCost = COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS)
    * - Parent-child dependencies (parent must be included before child)
    * - Transaction locktime (must be final at the target block height/time)
+   * - MAX_CONSECUTIVE_FAILURES early-exit when block is nearly full
+   *
+   * Mirrors Core BlockAssembler::addChunks() + TestChunkBlockLimits() in node/miner.cpp.
    */
   private selectTransactions(): { txs: MempoolEntry[]; totalFees: bigint; totalWeight: number; totalSigOps: number } {
-    const maxWeight = this.params.maxBlockWeight - COINBASE_WEIGHT_RESERVE - 80 * 4; // Subtract header weight too
+    // Bug fix 1+2: weight budget starts at BLOCK_RESERVED_WEIGHT (which already
+    // accounts for header + coinbase overhead), not zero. The block header weight
+    // (320 WU) is NOT separately subtracted here; it is already baked into
+    // BLOCK_RESERVED_WEIGHT. Subtracting it again caused the txWeight budget to
+    // be too small AND made totalWeight report more than the actual block weight.
+    // Core: resetBlock() sets nBlockWeight = *block_reserved_weight (8000).
+    // createTemplate's totalWeight below will be nBlockWeight (which starts at
+    // BLOCK_RESERVED_WEIGHT and grows with each selected tx), matching Core exactly.
+    const maxBlockWeight = this.params.maxBlockWeight;
+
+    // Bug fix 8: sigops budget starts at COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS (400),
+    // reserving room for the coinbase's own outputs. Core: resetBlock() sets
+    // nBlockSigOpsCost = coinbase_output_max_additional_sigops.
     const maxSigOps = this.params.maxBlockSigOpsCost;
 
     // Get target block height for locktime validation
@@ -258,14 +304,19 @@ export class BlockTemplateBuilder {
     const selected: MempoolEntry[] = [];
     const selectedTxids = new Set<string>();
     let totalFees = 0n;
-    let totalWeight = 0;
-    let totalSigOps = 0;
+    // Bug fix 1: start at BLOCK_RESERVED_WEIGHT, not 0. This tracks nBlockWeight.
+    let totalWeight = BLOCK_RESERVED_WEIGHT;
+    // Bug fix 8: start at reserved coinbase sigops budget.
+    let totalSigOps = COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS;
 
     // Track which entries we've processed to avoid re-checking
     const processed = new Set<string>();
 
     // Track entries that are not final (for skipping)
     const notFinal = new Set<string>();
+
+    // Bug fix 4: track consecutive failures for MAX_CONSECUTIVE_FAILURES early-exit.
+    let nConsecutiveFailed = 0;
 
     // Helper to add an entry and its ancestors
     const addWithAncestors = (entry: MempoolEntry): boolean => {
@@ -301,15 +352,18 @@ export class BlockTemplateBuilder {
         }
       }
 
-      // Check weight constraint
-      if (totalWeight + entry.weight > maxWeight) {
+      // Bug fix 3: use >= (not >) to match Core's TestChunkBlockLimits gate:
+      //   if (nBlockWeight + chunk_feerate.size >= m_options.nBlockMaxWeight) return false;
+      // Reference: node/miner.cpp:241.
+      if (totalWeight + entry.weight >= maxBlockWeight) {
         return false;
       }
 
-      // Enforce sigops budget: drop tx if it would push block past MAX_BLOCK_SIGOPS_COST.
-      // Reference: Bitcoin Core BlockAssembler::TestChunkBlockLimits in node/miner.cpp
+      // Bug fix 9: use >= for sigops gate, matching Core's TestChunkBlockLimits:
+      //   if (nBlockSigOpsCost + chunk_sigops_cost >= MAX_BLOCK_SIGOPS_COST) return false;
+      // Reference: node/miner.cpp:244.
       const txSigOpCost = entry.sigOpCost ?? 0;
-      if (totalSigOps + txSigOpCost > maxSigOps) {
+      if (totalSigOps + txSigOpCost >= maxSigOps) {
         return false;
       }
 
@@ -333,11 +387,22 @@ export class BlockTemplateBuilder {
       processed.add(txidHex);
 
       // Try to add this entry (with its ancestors if needed)
-      addWithAncestors(entry);
+      const added = addWithAncestors(entry);
 
-      // Early exit if we've filled the block
-      if (totalWeight >= maxWeight - 1000) {
-        break; // Leave some margin
+      if (!added) {
+        // Bug fix 4: MAX_CONSECUTIVE_FAILURES early-exit when block is nearly full.
+        // Core: addChunks() gives up if nConsecutiveFailed > 1000 AND
+        //   nBlockWeight + BLOCK_FULL_ENOUGH_WEIGHT_DELTA > nBlockMaxWeight.
+        // Reference: node/miner.cpp:314-317.
+        nConsecutiveFailed++;
+        if (
+          nConsecutiveFailed > MAX_CONSECUTIVE_FAILURES &&
+          totalWeight + BLOCK_FULL_ENOUGH_WEIGHT_DELTA > maxBlockWeight
+        ) {
+          break;
+        }
+      } else {
+        nConsecutiveFailed = 0;
       }
     }
 
@@ -348,10 +413,17 @@ export class BlockTemplateBuilder {
    * Build the coinbase transaction.
    *
    * Structure:
-   * - Input: prevOut = {txid: 32 zero bytes, vout: 0xFFFFFFFF}, scriptSig = [BIP34 height] + extraNonce + optional data
+   * - Input: prevOut = {txid: 32 zero bytes, vout: 0xFFFFFFFF},
+   *          scriptSig = [BIP34 height] + extraNonce,
+   *          sequence = MAX_SEQUENCE_NONFINAL (0xFFFFFFFE) — timelock enforced
    * - Output 0: value = subsidy + fees, scriptPubKey = coinbaseScript
    * - Output 1 (if segwit): OP_RETURN witness commitment
    * - Witness (if segwit): 32 zero bytes (witness nonce)
+   * - lockTime = height - 1 (BIP34 requirement; enforced because sequence != SEQUENCE_FINAL)
+   *
+   * Reference: Bitcoin Core node/miner.cpp CreateNewBlock():
+   *   coinbaseTx.vin[0].nSequence = CTxIn::MAX_SEQUENCE_NONFINAL  (line 171)
+   *   coinbaseTx.nLockTime = static_cast<uint32_t>(nHeight - 1)   (line 196)
    */
   private buildCoinbase(
     height: number,
@@ -378,7 +450,11 @@ export class BlockTemplateBuilder {
           vout: 0xffffffff,
         },
         scriptSig,
-        sequence: 0xffffffff,
+        // Bug fix 6: use MAX_SEQUENCE_NONFINAL (0xFFFFFFFE), not SEQUENCE_FINAL
+        // (0xFFFFFFFF). With SEQUENCE_FINAL, IsFinalTx ignores nLockTime entirely
+        // and the coinbase's height-minus-one timelock has no effect.
+        // Core comment: "Make sure timelock is enforced." (node/miner.cpp:171)
+        sequence: MAX_SEQUENCE_NONFINAL,
         witness: witnessCommitment.length > 0 ? [Buffer.alloc(32, 0)] : [], // Witness nonce if segwit
       },
     ];
@@ -407,7 +483,11 @@ export class BlockTemplateBuilder {
       version: 2,
       inputs,
       outputs,
-      lockTime: 0,
+      // Bug fix 5: coinbase lockTime must be nHeight - 1, not 0.
+      // This is the "height timelock" that ensures the coinbase can't be replayed
+      // at a lower height. Enforced because sequence = MAX_SEQUENCE_NONFINAL.
+      // Reference: node/miner.cpp:196 "coinbaseTx.nLockTime = static_cast<uint32_t>(nHeight - 1)"
+      lockTime: height > 0 ? height - 1 : 0,
     };
   }
 
