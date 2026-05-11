@@ -2432,11 +2432,14 @@ export class Mempool {
       };
     }
 
-    // If there's a mempool parent, ensure it doesn't also have an ancestor
+    // If there's a mempool parent, ensure it doesn't also have an ancestor.
+    // Mirrors Bitcoin Core SingleTRUCChecks: GetAncestorCount(parent) + 1 > TRUC_ANCESTOR_LIMIT.
+    // ancestorCount includes the parent itself, so ancestorCount >= 2 means parent has an ancestor.
     if (mempoolParents.length === 1) {
       const parent = mempoolParents[0];
-      // Check if parent has any mempool ancestors
-      if (parent.dependsOn.size > 0) {
+      // ancestorCount includes the parent itself; > 1 means parent itself has an unconfirmed ancestor.
+      // Equivalent to Core's GetAncestorCount(mempool_parents[0]) + 1 > TRUC_ANCESTOR_LIMIT (= 2).
+      if (parent.ancestorCount > 1) {
         return {
           valid: false,
           error: `version=3 tx would have too many ancestors`,
@@ -2451,33 +2454,49 @@ export class Mempool {
         };
       }
 
-      // Rule 2: Check descendant limit for the parent
-      // The parent can have at most 1 descendant (this new tx)
-      // But if an existing child will be replaced (conflict or sibling eviction), it's ok
+      // Rule 2: Check descendant limit for the parent.
+      // Mirrors Bitcoin Core SingleTRUCChecks:
+      //   if (pool.GetDescendantCount(parent_entry) + 1 > TRUC_DESCENDANT_LIMIT && !child_will_be_replaced)
+      // GetDescendantCount includes the entry itself, so GetDescendantCount = 1 means no children.
+      // We use parent.descendantCount (cached, transitive) as the primary count, and scan spentBy
+      // only to identify the sibling candidate for eviction.
       const parentTxidHex = parent.txid.toString("hex");
 
-      // Count current descendants of the parent (not including pending conflicts)
+      // Collect conflict txids so we can credit replacements.
       const conflictTxids = new Set(conflicts.map((c) => c.txid.toString("hex")));
-      let currentDescendants = 0;
-      let existingChild: MempoolEntry | undefined;
 
+      // Count conflicts that are direct children of the parent (will be removed).
+      let conflictedChildCount = 0;
+      let existingChild: MempoolEntry | undefined;
       for (const childTxidHex of parent.spentBy) {
-        if (!conflictTxids.has(childTxidHex)) {
-          currentDescendants++;
-          const child = this.entries.get(childTxidHex);
-          if (child && child.tx.version === TRUC_VERSION) {
-            existingChild = child;
-          }
+        const child = this.entries.get(childTxidHex);
+        if (conflictTxids.has(childTxidHex)) {
+          conflictedChildCount++;
+        } else if (child) {
+          // Track the non-conflict child as a sibling candidate.
+          existingChild = child;
         }
       }
 
+      // parent.descendantCount includes the parent itself. Subtract 1 (self) to get
+      // number of existing descendants. Subtract conflicted children that will be evicted.
+      // If after accounting for replacements the count is >= 1, we already have a child.
+      const currentDescendants = (parent.descendantCount - 1) - conflictedChildCount;
+
       // If parent already has a descendant that isn't being replaced
       if (currentDescendants >= 1) {
-        // Sibling eviction: if there's exactly one existing v3 child, we can evict it
+        // Sibling eviction: if there's exactly one existing v3 child, we can evict it.
+        // Mirrors Bitcoin Core SingleTRUCChecks (policy/truc_policy.cpp):
+        //   consider_sibling_eviction = (GetDescendantCount(parent) == 2)
+        //                            && (GetAncestorCount(sibling) == 2)
+        // The ancestor count guard (ancestorCount === 2) rejects sibling eviction
+        // when the sibling itself has extra ancestors (e.g. after a reorg), which
+        // Core also refuses in that case.
         if (
           currentDescendants === 1 &&
           existingChild &&
-          existingChild.descendantCount === 1 // Child has no grandchildren
+          existingChild.descendantCount === 1 && // sibling has no grandchildren
+          existingChild.ancestorCount === 2       // sibling has exactly 1 mempool ancestor (the shared parent)
         ) {
           // Allow sibling eviction - return the sibling to be evicted
           return {
