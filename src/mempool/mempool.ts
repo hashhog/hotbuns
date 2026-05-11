@@ -1743,7 +1743,9 @@ export class Mempool {
           utxo.scriptPubKey,
           input.witness,
           flags,
-          sigHasher
+          sigHasher,
+          undefined, // taprootCtx — mempool uses P2SH/segwit-v0 paths
+          { txVersion: tx.version, txLockTime: tx.lockTime, txSequence: input.sequence }
         );
 
         if (!valid) {

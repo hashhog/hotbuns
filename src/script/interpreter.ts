@@ -1113,41 +1113,61 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
       }
 
       case Opcode.OP_CHECKSEQUENCEVERIFY: {
+        // BIP-112: OP_CHECKSEQUENCEVERIFY
+        // Reference: bitcoin-core/src/script/interpreter.cpp:561-593,
+        //            GenericTransactionSignatureChecker::CheckSequence():1782-1826
         if (!flags.verifyCheckSequenceVerify) {
           if (flags.verifyDiscourageUpgradableNops) {
             throw new ScriptError("DISCOURAGE_UPGRADABLE_NOPS");
           }
-          break; // Treated as NOP
+          break; // Treated as NOP3
         }
-        if (stack.length < 1) return false;
+        if (stack.length < 1) throw new ScriptError("INVALID_STACK_OPERATION");
+        // nSequence is a 32-bit unsigned field; allow 5-byte encoding (Core: CScriptNum(_, _, 5))
         const sequence = scriptNumDecode(stack[stack.length - 1], 5);
         if (sequence < 0) throw new ScriptError("NEGATIVE_LOCKTIME");
 
-        // If the disable flag (bit 31) is set, CSV is a no-op
-        if (sequence & (1 << 31)) break;
+        // If the disable flag (bit 31) is set, CSV behaves as NOP (BIP-112 §3)
+        // Use >>> 0 to treat sequence as unsigned 32-bit before masking
+        if ((sequence >>> 0) & 0x80000000) break;
 
-        // CSV requires tx version >= 2
-        if (ctx.txVersion !== undefined && ctx.txVersion < 2) {
+        // CSV requires spending tx version >= 2 (BIP-68 activation)
+        // Core: if (txTo->version < 2) return false;  — unconditional
+        if (ctx.txVersion === undefined || ctx.txVersion < 2) {
           throw new ScriptError("UNSATISFIED_LOCKTIME");
         }
 
-        // Compare against input sequence (if context available)
-        if (ctx.txSequence !== undefined) {
-          const txSeq = ctx.txSequence;
-          // If input sequence has disable flag set, fail
-          if (txSeq & (1 << 31)) {
-            throw new ScriptError("UNSATISFIED_LOCKTIME");
-          }
-          // Both must be in the same type (time vs height)
-          const TYPE_FLAG = 1 << 22;
-          if ((sequence & TYPE_FLAG) !== (txSeq & TYPE_FLAG)) {
-            throw new ScriptError("UNSATISFIED_LOCKTIME");
-          }
-          // Compare masked values
-          const MASK = 0x0000ffff;
-          if ((sequence & MASK) > (txSeq & MASK)) {
-            throw new ScriptError("UNSATISFIED_LOCKTIME");
-          }
+        // Core: unconditional — if txToSequence disable flag set, fail
+        if (ctx.txSequence === undefined) {
+          throw new ScriptError("UNSATISFIED_LOCKTIME");
+        }
+        const txSeq = ctx.txSequence;
+        // If input's sequence has the disable flag set (bit 31), CSV fails
+        // (BIP-112: the spending input's sequence must not have the disable bit)
+        if ((txSeq >>> 0) & 0x80000000) {
+          throw new ScriptError("UNSATISFIED_LOCKTIME");
+        }
+
+        // Mask both operands to TYPE_FLAG | MASK before comparing (Core: nLockTimeMask)
+        // This ensures we compare apples-to-apples: both height-based or both time-based.
+        const nLockTimeMask = 0x00400000 | 0x0000ffff; // SEQUENCE_LOCKTIME_TYPE_FLAG | MASK
+        const txSeqMasked = (txSeq >>> 0) & nLockTimeMask;
+        const seqMasked = (sequence >>> 0) & nLockTimeMask;
+
+        // Both must be in the same type (height-based or time-based)
+        // height-based: masked value < TYPE_FLAG (bit 22 clear)
+        // time-based:   masked value >= TYPE_FLAG (bit 22 set)
+        const TYPE_FLAG = 0x00400000; // 1 << 22
+        if (!(
+          (txSeqMasked < TYPE_FLAG && seqMasked < TYPE_FLAG) ||
+          (txSeqMasked >= TYPE_FLAG && seqMasked >= TYPE_FLAG)
+        )) {
+          throw new ScriptError("UNSATISFIED_LOCKTIME");
+        }
+
+        // The script operand must be <= the input's sequence (both masked)
+        if (seqMasked > txSeqMasked) {
+          throw new ScriptError("UNSATISFIED_LOCKTIME");
         }
         break;
       }
