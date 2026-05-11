@@ -18,6 +18,14 @@ import type { HeaderSync, HeaderChainEntry } from "../sync/headers.js";
 import type { BlockSync } from "../sync/blocks.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import { compactToBigInt, bigIntToCompact, getBlockSubsidy } from "../consensus/params.js";
+import {
+  VersionBitsCache,
+  buildBlockIndex,
+  MAINNET_DEPLOYMENTS,
+  TESTNET4_DEPLOYMENTS,
+  REGTEST_DEPLOYMENTS,
+  type DeploymentParams,
+} from "../consensus/versionbits.js";
 import type { Block, BlockHeader } from "../validation/block.js";
 import {
   deserializeBlock,
@@ -419,6 +427,13 @@ export class RPCServer {
   private blockSubmissionPaused: boolean = false;
   /** Unix timestamp (seconds) when this server was constructed; used by `uptime`. */
   private readonly startedAt: number = Math.floor(Date.now() / 1000);
+  /**
+   * BIP9 version bits cache and deployment map for computeBlockVersion.
+   * Reused across getblocktemplate / generateToAddress calls to avoid redundant
+   * re-computation over the full header chain.
+   */
+  private readonly versionBitsCache: VersionBitsCache = new VersionBitsCache();
+  private versionBitsDeployments: Map<string, DeploymentParams> | null = null;
 
   constructor(config: RPCServerConfig, deps: RPCServerDeps) {
     this.config = {
@@ -452,6 +467,74 @@ export class RPCServer {
    */
   setShutdownCallback(callback: () => void): void {
     this.shutdownCallback = callback;
+  }
+
+  /**
+   * Return the BIP9 deployment map for the current network, or null when no
+   * active BIP9 deployments exist (e.g. regtest/testnet4 where everything is
+   * ALWAYS_ACTIVE, which computeBlockVersion handles correctly anyway).
+   */
+  private getVersionBitsDeployments(): Map<string, DeploymentParams> {
+    if (this.versionBitsDeployments) return this.versionBitsDeployments;
+    // Select the right deployment map by network magic.
+    // All known deployments (ALWAYS_ACTIVE, NEVER_ACTIVE, or real BIP9) go through
+    // the state machine — computeBlockVersion handles ALWAYS_ACTIVE as ACTIVE (no
+    // bit set) and NEVER_ACTIVE as FAILED (no bit set), so the fallback is safe.
+    const magic = this.params.networkMagic;
+    if (magic === 0xdab5bffa /* regtest */ || magic === 0xfabfb5da /* regtest alt */) {
+      this.versionBitsDeployments = REGTEST_DEPLOYMENTS;
+    } else if (magic === 0x283f161c /* testnet4 */) {
+      this.versionBitsDeployments = TESTNET4_DEPLOYMENTS;
+    } else {
+      // mainnet (and unknown networks): use mainnet deployments
+      this.versionBitsDeployments = MAINNET_DEPLOYMENTS;
+    }
+    return this.versionBitsDeployments;
+  }
+
+  /**
+   * Compute the nVersion for the next block (the one being assembled on top of
+   * pindexPrev).  Mirrors Bitcoin Core's VersionBitsCache::ComputeBlockVersion
+   * (versionbits.cpp:281-285).
+   *
+   * Bug fix: previously all three call sites (getblocktemplate, generateToAddress,
+   * BlockTemplateBuilder.createTemplate) hardcoded 0x20000000, which never signalled
+   * for any BIP9 deployment in STARTED or LOCKED_IN state.
+   *
+   * @param parentHeight - Height of the parent block (the block being built on)
+   * @returns nVersion for the new block
+   */
+  private computeNextBlockVersion(parentHeight: number): number {
+    const deployments = this.getVersionBitsDeployments();
+    // Guard: getHeaderByHeight may be absent on minimal mocks (test environments).
+    // In that case fall back to bare VERSIONBITS_TOP_BITS (0x20000000).
+    if (typeof this.headerSync.getHeaderByHeight !== "function") {
+      return 0x20000000;
+    }
+    const parentEntry = this.headerSync.getHeaderByHeight(parentHeight);
+    if (!parentEntry) {
+      // No header data available (very early chain / genesis) — return bare top bits.
+      return 0x20000000;
+    }
+    const pindexPrev = buildBlockIndex(
+      {
+        hash: parentEntry.hash,
+        height: parentEntry.height,
+        version: parentEntry.header.version,
+        medianTimePast: this.headerSync.getMedianTimePast(parentEntry),
+      },
+      (h: number) => {
+        const e = this.headerSync.getHeaderByHeight!(h);
+        if (!e) return undefined;
+        return {
+          hash: e.hash,
+          height: e.height,
+          version: e.header.version,
+          medianTimePast: this.headerSync.getMedianTimePast(e),
+        };
+      }
+    );
+    return this.versionBitsCache.computeBlockVersion(pindexPrev, deployments);
   }
 
   /**
@@ -4828,10 +4911,16 @@ export class RPCServer {
       ? this.headerSync.getMedianTimePast(parentEntry) + 1
       : curtime;
 
+    // Compute block version via BIP9 state machine.
+    // Bug fix: previously hardcoded 0x20000000 — now calls computeNextBlockVersion
+    // which sets signal bits for any deployment in STARTED or LOCKED_IN state.
+    // Core: versionbits.cpp:265-279 ComputeBlockVersion.
+    const blockVersion = this.computeNextBlockVersion(bestBlock.height);
+
     // Build the result
     const result: Record<string, unknown> = {
       capabilities: ["proposal"],
-      version: 0x20000000, // BIP9 version bits
+      version: blockVersion,
       rules: ["csv", "!segwit"],
       vbavailable: {},
       vbrequired: 0,
@@ -5181,8 +5270,12 @@ export class RPCServer {
     const target = this.params.powLimit;
     const bits = bigIntToCompact(target);
 
+    // Compute block version via BIP9 state machine (same fix as getblocktemplate).
+    // Bug fix: previously hardcoded 0x20000000.
+    const genToAddrVersion = this.computeNextBlockVersion(bestBlock.height);
+
     let header: BlockHeader = {
-      version: 0x20000000,
+      version: genToAddrVersion,
       prevBlock: bestBlock.hash,
       merkleRoot: computeMerkleRoot(txids),
       timestamp: Math.floor(Date.now() / 1000),
