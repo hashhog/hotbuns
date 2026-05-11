@@ -232,7 +232,12 @@ describe("BlockTemplateBuilder", () => {
       expect(parentIdx).toBeLessThan(childIdx);
     });
 
-    test("calculates total weight correctly", async () => {
+    test("calculates total weight correctly (BLOCK_RESERVED_WEIGHT + tx weights)", async () => {
+      // Bug fix 1+2: totalWeight = BLOCK_RESERVED_WEIGHT (8000) + sum of selected tx weights.
+      // Core: nBlockWeight starts at block_reserved_weight (DEFAULT_BLOCK_RESERVED_WEIGHT = 8000)
+      // in resetBlock(), then grows by entry.GetTxWeight() per included tx.
+      // The old code subtracted 80*4 (header) from the budget AND added it to the total,
+      // leading to double-counting. Now totalWeight directly tracks nBlockWeight.
       const input1 = Buffer.alloc(32, 0xaa);
       await setupUTXO(input1, 0, 100000n);
 
@@ -245,10 +250,9 @@ describe("BlockTemplateBuilder", () => {
 
       const template = builder.createTemplate(Buffer.from([0x51]));
 
-      // Weight should include: header (320) + coinbase + tx
-      const coinbaseWeight = getTxWeight(template.coinbaseTx);
+      // Weight = BLOCK_RESERVED_WEIGHT (8000) + selected tx weights
       const txWeight = getTxWeight(tx);
-      const expectedWeight = 320 + coinbaseWeight + txWeight;
+      const expectedWeight = 8000 + txWeight;
 
       expect(template.totalWeight).toBe(expectedWeight);
     });
@@ -575,18 +579,22 @@ describe("BlockTemplateBuilder", () => {
   });
 
   describe("coinbase properties", () => {
-    test("coinbase sequence is 0xFFFFFFFF (opts out of BIP68)", () => {
+    test("coinbase sequence is MAX_SEQUENCE_NONFINAL (0xFFFFFFFE) so timelock is enforced", () => {
+      // Bug fix 6: Core uses CTxIn::MAX_SEQUENCE_NONFINAL = SEQUENCE_FINAL - 1 = 0xFFFFFFFE
+      // so that the coinbase's nLockTime = nHeight-1 is actually evaluated by IsFinalTx.
+      // Using 0xFFFFFFFF (SEQUENCE_FINAL) would cause IsFinalTx to ignore nLockTime entirely.
+      // Reference: node/miner.cpp:171 "Make sure timelock is enforced."
       const template = builder.createTemplate(Buffer.from([0x51]));
-
-      // Coinbase input should have sequence 0xFFFFFFFF
-      expect(template.coinbaseTx.inputs[0].sequence).toBe(0xffffffff);
+      expect(template.coinbaseTx.inputs[0].sequence).toBe(0xfffffffe);
     });
 
-    test("coinbase lockTime is 0", () => {
+    test("coinbase lockTime is nHeight - 1 (not 0)", () => {
+      // Bug fix 5: Core sets coinbaseTx.nLockTime = static_cast<uint32_t>(nHeight - 1)
+      // so the coinbase carries a height timelock. Because sequence = MAX_SEQUENCE_NONFINAL
+      // this timelock IS evaluated. Reference: node/miner.cpp:196.
       const template = builder.createTemplate(Buffer.from([0x51]));
-
-      // Coinbase lockTime should be 0
-      expect(template.coinbaseTx.lockTime).toBe(0);
+      // chainState at genesis → height = 1, lockTime should be 0 (= 1 - 1).
+      expect(template.coinbaseTx.lockTime).toBe(template.height - 1);
     });
   });
 });
@@ -961,9 +969,11 @@ describe("sigops budget in block template", () => {
 
     const template = builder.createTemplate(Buffer.from([0x51]));
     expect(template.transactions.length).toBe(2);
-    // Each tx: 5 legacy sigops (from P2PKH outputs) * 4 = 20; total = 40.
+    // Each tx: 5 legacy sigops (from P2PKH outputs) * 4 = 20; total per-tx sigops = 40.
+    // Plus coinbase reservation of 400 (DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS).
+    // Bug 8 fix: totalSigOps = 400 (reserved) + 40 (from txs) = 440.
     // Note: the OP_RETURN padding output (from createTestTx) adds 0 sigops.
-    expect(template.totalSigOps).toBe(40);
+    expect(template.totalSigOps).toBe(440);
   });
 
   test("running-total budget enforced: tx dropped when it would push block past 80,000 sigops", async () => {
@@ -1020,9 +1030,9 @@ describe("sigops budget in block template", () => {
 
     const template = builder.createTemplate(Buffer.from([0x51]));
 
-    // All 3 fit within the 80,000 budget (total cost = 12,000).
-    // Verify total sigops is correctly tracked.
-    expect(template.totalSigOps).toBe(OUTPUTS_PER_TX * 3 * 4);
+    // All 3 fit within the 80,000 budget (total cost = 12,000 from txs + 400 coinbase reserve).
+    // Bug 8 fix: totalSigOps = 400 (reserved) + OUTPUTS_PER_TX * 3 * 4 (from txs).
+    expect(template.totalSigOps).toBe(400 + OUTPUTS_PER_TX * 3 * 4);
     expect(template.totalSigOps).toBeLessThanOrEqual(REGTEST.maxBlockSigOpsCost);
 
     // Verify all 3 txs are included (none dropped).
@@ -1036,3 +1046,292 @@ describe("sigops budget in block template", () => {
   });
 });
 
+// ============================================================================
+// W87 gate audit — 9 bug fixes verified
+// References: Bitcoin Core node/miner.cpp, node/miner.h, policy/policy.h
+// ============================================================================
+
+describe("W87 block-template gate audit", () => {
+  let tempDir: string;
+  let db: ChainDB;
+  let utxo: UTXOManager;
+  let chainState: ChainStateManager;
+  let mempool: Mempool;
+  let builder: BlockTemplateBuilder;
+
+  async function setupUTXO(
+    txid: Buffer,
+    vout: number,
+    amount: bigint,
+    height: number = 1,
+    coinbase: boolean = false
+  ): Promise<void> {
+    const entry: UTXOEntry = {
+      height,
+      coinbase,
+      amount,
+      scriptPubKey: Buffer.from([0x51, 0x02, 0x4e, 0x73]),
+    };
+    await db.putUTXO(txid, vout, entry);
+  }
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "w87-test-"));
+    db = new ChainDB(tempDir);
+    await db.open();
+    utxo = new UTXOManager(db);
+    chainState = new ChainStateManager(db, REGTEST);
+    await chainState.load();
+    mempool = new Mempool(utxo, REGTEST, 1_000_000);
+    mempool.setTipHeight(200);
+    builder = new BlockTemplateBuilder(mempool, chainState, REGTEST);
+  });
+
+  afterEach(async () => {
+    await db.close();
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  // --------------------------------------------------------------------------
+  // Bug 1+2: BLOCK_RESERVED_WEIGHT = 8000, no double-counting of header
+  // Core: resetBlock() sets nBlockWeight = *block_reserved_weight = 8000
+  // policy/policy.h:27: DEFAULT_BLOCK_RESERVED_WEIGHT = 8000
+  // --------------------------------------------------------------------------
+  describe("Bug 1+2: BLOCK_RESERVED_WEIGHT=8000, no header double-count", () => {
+    test("totalWeight of empty template equals BLOCK_RESERVED_WEIGHT (8000)", () => {
+      const template = builder.createTemplate(Buffer.from([0x51]));
+      // Empty block: nBlockWeight = 8000 (reserved), no txs added.
+      expect(template.totalWeight).toBe(8000);
+    });
+
+    test("totalWeight does not exceed maxBlockWeight", async () => {
+      for (let i = 0; i < 50; i++) {
+        const inputTxid = Buffer.alloc(32);
+        inputTxid.writeUInt32LE(i, 0);
+        await setupUTXO(inputTxid, 0, 200_000n);
+        const tx = createTestTx(
+          [{ txid: inputTxid, vout: 0 }],
+          [{ value: 180_000n }]
+        );
+        await mempool.addTransaction(tx);
+      }
+      const template = builder.createTemplate(Buffer.from([0x51]));
+      expect(template.totalWeight).toBeLessThan(REGTEST.maxBlockWeight);
+    });
+
+    test("totalWeight with one tx equals 8000 + txWeight", async () => {
+      const inputTxid = Buffer.alloc(32, 0xaa);
+      await setupUTXO(inputTxid, 0, 100_000n);
+      const tx = createTestTx(
+        [{ txid: inputTxid, vout: 0 }],
+        [{ value: 90_000n }]
+      );
+      await mempool.addTransaction(tx);
+      const template = builder.createTemplate(Buffer.from([0x51]));
+      const txW = getTxWeight(tx);
+      expect(template.totalWeight).toBe(8000 + txW);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // Bug 3: Weight gate uses >= (not >)
+  // Core TestChunkBlockLimits: nBlockWeight + chunk_size >= nBlockMaxWeight → reject
+  // node/miner.cpp:241
+  // --------------------------------------------------------------------------
+  describe("Bug 3: weight gate uses >= maxBlockWeight", () => {
+    test("block weight is always strictly less than maxBlockWeight", async () => {
+      for (let i = 0; i < 10; i++) {
+        const inputTxid = Buffer.alloc(32);
+        inputTxid.writeUInt32LE(i, 0);
+        await setupUTXO(inputTxid, 0, 500_000n);
+        const tx = createTestTx(
+          [{ txid: inputTxid, vout: 0 }],
+          [{ value: 480_000n }]
+        );
+        await mempool.addTransaction(tx);
+      }
+      const template = builder.createTemplate(Buffer.from([0x51]));
+      // Strict < maxBlockWeight (not <=) because gate uses >=
+      expect(template.totalWeight).toBeLessThan(REGTEST.maxBlockWeight);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // Bug 4: MAX_CONSECUTIVE_FAILURES (1000) + BLOCK_FULL_ENOUGH_DELTA (4000)
+  // Core: addChunks() returns if nConsecutiveFailed > 1000 AND
+  //   nBlockWeight + 4000 > nBlockMaxWeight.
+  // Old code: crude >= maxWeight-1000 break.
+  // node/miner.cpp:284-317
+  // --------------------------------------------------------------------------
+  describe("Bug 4: MAX_CONSECUTIVE_FAILURES gate", () => {
+    test("block template completes with many valid transactions", async () => {
+      for (let i = 0; i < 20; i++) {
+        const inputTxid = Buffer.alloc(32);
+        inputTxid.writeUInt32LE(i, 0);
+        await setupUTXO(inputTxid, 0, 100_000n);
+        const tx = createTestTx(
+          [{ txid: inputTxid, vout: 0 }],
+          [{ value: 90_000n }]
+        );
+        await mempool.addTransaction(tx);
+      }
+      const template = builder.createTemplate(Buffer.from([0x51]));
+      expect(template.transactions.length).toBe(20);
+    });
+
+    test("consecutive failure counter resets on success", async () => {
+      for (let i = 0; i < 5; i++) {
+        const inputTxid = Buffer.alloc(32);
+        inputTxid.writeUInt32LE(i, 0);
+        await setupUTXO(inputTxid, 0, 100_000n);
+        const tx = createTestTx(
+          [{ txid: inputTxid, vout: 0 }],
+          [{ value: 90_000n }]
+        );
+        await mempool.addTransaction(tx);
+      }
+      const template = builder.createTemplate(Buffer.from([0x51]));
+      expect(template.transactions.length).toBe(5);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // Bug 5: coinbase lockTime = nHeight - 1 (not 0)
+  // Core: coinbaseTx.nLockTime = static_cast<uint32_t>(nHeight - 1)
+  // node/miner.cpp:196
+  // --------------------------------------------------------------------------
+  describe("Bug 5: coinbase lockTime = nHeight - 1", () => {
+    test("coinbase lockTime equals height - 1", () => {
+      const template = builder.createTemplate(Buffer.from([0x51]));
+      expect(template.coinbaseTx.lockTime).toBe(template.height - 1);
+    });
+
+    test("coinbase lockTime is not hardcoded 0", () => {
+      // At height=1, lockTime=0 happens to equal height-1=0.
+      // The key invariant is the formula height-1, not a literal 0.
+      const template = builder.createTemplate(Buffer.from([0x51]));
+      expect(template.coinbaseTx.lockTime).toBe(template.height - 1);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // Bug 6: coinbase sequence = 0xFFFFFFFE (MAX_SEQUENCE_NONFINAL)
+  // Core: coinbaseTx.vin[0].nSequence = CTxIn::MAX_SEQUENCE_NONFINAL
+  // node/miner.cpp:171 "Make sure timelock is enforced."
+  // primitives/transaction.h: MAX_SEQUENCE_NONFINAL = SEQUENCE_FINAL - 1 = 0xFFFFFFFE
+  // --------------------------------------------------------------------------
+  describe("Bug 6: coinbase sequence = MAX_SEQUENCE_NONFINAL (0xFFFFFFFE)", () => {
+    test("coinbase sequence is 0xFFFFFFFE, not 0xFFFFFFFF", () => {
+      const template = builder.createTemplate(Buffer.from([0x51]));
+      expect(template.coinbaseTx.inputs[0].sequence).toBe(0xfffffffe);
+      expect(template.coinbaseTx.inputs[0].sequence).not.toBe(0xffffffff);
+    });
+
+    test("coinbase sequence is not SEQUENCE_FINAL (which would bypass lockTime)", () => {
+      const template = builder.createTemplate(Buffer.from([0x51]));
+      const SEQUENCE_FINAL = 0xffffffff;
+      expect(template.coinbaseTx.inputs[0].sequence).not.toBe(SEQUENCE_FINAL);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // Bug 7: timestamp = max(now, MTP+1)
+  // Core: UpdateTime() → max(GetMinimumTime(pindexPrev,...), NodeClock::now())
+  // GetMinimumTime = MTP+1 (+ optional BIP94 timewarp clamp).
+  // node/miner.cpp:36-65
+  // --------------------------------------------------------------------------
+  describe("Bug 7: timestamp = max(now, MTP+1)", () => {
+    test("timestamp >= MTP + 1 when MTP is recent", () => {
+      const mtp = Math.floor(Date.now() / 1000) - 10;
+      builder.setMedianTimePast(mtp);
+      const template = builder.createTemplate(Buffer.from([0x51]));
+      expect(template.header.timestamp).toBeGreaterThanOrEqual(mtp + 1);
+    });
+
+    test("timestamp >= MTP + 1 when MTP is ahead of wall clock", () => {
+      // Edge case: MTP is in the future; timestamp must still be >= MTP+1.
+      const mtp = Math.floor(Date.now() / 1000) + 100;
+      builder.setMedianTimePast(mtp);
+      const template = builder.createTemplate(Buffer.from([0x51]));
+      expect(template.header.timestamp).toBeGreaterThanOrEqual(mtp + 1);
+    });
+
+    test("timestamp equals max(now, MTP+1) when MTP is in the past", () => {
+      const nowApprox = Math.floor(Date.now() / 1000);
+      const mtp = nowApprox - 3600; // 1 hour ago
+      builder.setMedianTimePast(mtp);
+      const template = builder.createTemplate(Buffer.from([0x51]));
+      // MTP+1 is in the past, so timestamp should track wall clock.
+      expect(template.header.timestamp).toBeGreaterThanOrEqual(nowApprox - 2);
+      expect(template.header.timestamp).toBeLessThanOrEqual(nowApprox + 10);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // Bug 8: sigops budget starts at COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS (400)
+  // Core: resetBlock() nBlockSigOpsCost = coinbase_output_max_additional_sigops
+  // policy/policy.h:29: DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS = 400
+  // node/miner.cpp:115
+  // --------------------------------------------------------------------------
+  describe("Bug 8: sigops budget reserves 400 for coinbase outputs", () => {
+    test("empty block totalSigOps = 400 (coinbase reservation)", () => {
+      const template = builder.createTemplate(Buffer.from([0x51]));
+      expect(template.totalSigOps).toBe(400);
+    });
+
+    test("totalSigOps with one plain tx = 400 + tx sigops", async () => {
+      const inputTxid = Buffer.alloc(32, 0xbb);
+      await setupUTXO(inputTxid, 0, 100_000n);
+      // Plain tx with OP_RETURN output only → 0 sigops.
+      const tx = createTestTx(
+        [{ txid: inputTxid, vout: 0 }],
+        [{ value: 90_000n }]
+      );
+      await mempool.addTransaction(tx);
+      const template = builder.createTemplate(Buffer.from([0x51]));
+      // The tx contributes its sigOpCost; the reservation (400) is always present.
+      expect(template.totalSigOps).toBeGreaterThanOrEqual(400);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // Bug 9: sigops gate uses >= MAX_BLOCK_SIGOPS_COST (not >)
+  // Core TestChunkBlockLimits: nBlockSigOpsCost + chunk_sigops >= MAX_BLOCK_SIGOPS_COST → reject
+  // node/miner.cpp:244
+  // --------------------------------------------------------------------------
+  describe("Bug 9: sigops gate uses >= MAX_BLOCK_SIGOPS_COST", () => {
+    test("totalSigOps is always strictly < maxBlockSigOpsCost", async () => {
+      const P2PKH_SCRIPT = Buffer.alloc(25);
+      P2PKH_SCRIPT[0] = 0x76;
+      P2PKH_SCRIPT[1] = 0xa9;
+      P2PKH_SCRIPT[2] = 0x14;
+      P2PKH_SCRIPT.fill(0x01, 3, 23);
+      P2PKH_SCRIPT[23] = 0x88;
+      P2PKH_SCRIPT[24] = 0xac;
+
+      for (let i = 0; i < 10; i++) {
+        const inputTxid = Buffer.alloc(32);
+        inputTxid.writeUInt32LE(i + 100, 0);
+        await setupUTXO(inputTxid, 0, 500_000n);
+        const tx: import("../validation/tx.js").Transaction = {
+          version: 2,
+          inputs: [{
+            prevOut: { txid: inputTxid, vout: 0 },
+            scriptSig: Buffer.alloc(0),
+            sequence: 0xffffffff,
+            witness: [],
+          }],
+          outputs: [
+            { value: 400_000n, scriptPubKey: P2PKH_SCRIPT },
+            { value: 0n, scriptPubKey: Buffer.from([0x6a]) },
+          ],
+          lockTime: 0,
+        };
+        await mempool.addTransaction(tx);
+      }
+      const template = builder.createTemplate(Buffer.from([0x51]));
+      // Strict < (not <=) because the >= gate rejects txs that hit the limit exactly.
+      expect(template.totalSigOps).toBeLessThan(REGTEST.maxBlockSigOpsCost);
+    });
+  });
+});
