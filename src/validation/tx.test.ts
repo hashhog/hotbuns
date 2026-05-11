@@ -503,6 +503,14 @@ describe("sigHashWitnessV0", () => {
   });
 });
 
+/**
+ * W84 validateTxBasic tests — CheckTransaction gate coverage.
+ *
+ * All 9 gates from Bitcoin Core consensus/tx_check.cpp are verified here
+ * with canonical error strings that match Core's reject-reason tokens.
+ *
+ * Reference: bitcoin-core/src/consensus/tx_check.cpp:11-59
+ */
 describe("validateTxBasic", () => {
   test("valid transaction passes", () => {
     const tx = createLegacyTx();
@@ -511,47 +519,55 @@ describe("validateTxBasic", () => {
     expect(result.error).toBeUndefined();
   });
 
-  test("no inputs fails", () => {
+  // Gate 1: bad-txns-vin-empty (Core tx_check.cpp:14-15)
+  test("gate 1: no inputs → bad-txns-vin-empty", () => {
     const tx = createLegacyTx();
     tx.inputs = [];
     const result = validateTxBasic(tx);
     expect(result.valid).toBe(false);
-    expect(result.error).toContain("no inputs");
+    expect(result.error).toBe("bad-txns-vin-empty");
   });
 
-  test("no outputs fails", () => {
+  // Gate 2: bad-txns-vout-empty (Core tx_check.cpp:16-17)
+  test("gate 2: no outputs → bad-txns-vout-empty", () => {
     const tx = createLegacyTx();
     tx.outputs = [];
     const result = validateTxBasic(tx);
     expect(result.valid).toBe(false);
-    expect(result.error).toContain("no outputs");
+    expect(result.error).toBe("bad-txns-vout-empty");
   });
 
-  test("duplicate inputs fails", () => {
+  // Gate 3: bad-txns-oversize checked before output value checks (Core tx_check.cpp:18-21)
+  test("gate 3: oversize tx → bad-txns-oversize", () => {
     const tx = createLegacyTx();
-    tx.inputs.push(tx.inputs[0]); // Duplicate
+    // stripped_size * 4 > 4_000_000 → stripped_size > 1_000_000
+    tx.inputs[0].scriptSig = Buffer.alloc(1_000_001);
     const result = validateTxBasic(tx);
     expect(result.valid).toBe(false);
-    expect(result.error).toContain("Duplicate");
+    expect(result.error).toBe("bad-txns-oversize");
   });
 
-  test("negative output value fails", () => {
+  // Gate 4: bad-txns-vout-negative (CVE-2010-5139, Core tx_check.cpp:27-29)
+  test("gate 4: negative output value → bad-txns-vout-negative", () => {
     const tx = createLegacyTx();
-    tx.outputs[0].value = -1n;
+    // Simulate wire-negative: 0xffffffffffffffff is -1 as signed int64
+    tx.outputs[0] = { ...tx.outputs[0], value: 0xffffffffffffffffn };
     const result = validateTxBasic(tx);
     expect(result.valid).toBe(false);
-    expect(result.error).toContain("Negative");
+    expect(result.error).toBe("bad-txns-vout-negative");
   });
 
-  test("output exceeding max coins fails", () => {
+  // Gate 5: bad-txns-vout-toolarge (CVE-2010-5139, Core tx_check.cpp:30-32)
+  test("gate 5: single output > MAX_MONEY → bad-txns-vout-toolarge", () => {
     const tx = createLegacyTx();
-    tx.outputs[0].value = 2_100_000_000_000_001n;
+    tx.outputs[0] = { ...tx.outputs[0], value: 2_100_000_000_000_001n };
     const result = validateTxBasic(tx);
     expect(result.valid).toBe(false);
-    expect(result.error).toContain("exceeds maximum");
+    expect(result.error).toBe("bad-txns-vout-toolarge");
   });
 
-  test("total output exceeding max coins fails", () => {
+  // Gate 6: bad-txns-txouttotal-toolarge (CVE-2010-5139, Core tx_check.cpp:32-34)
+  test("gate 6: total outputs > MAX_MONEY → bad-txns-txouttotal-toolarge", () => {
     const tx = createLegacyTx();
     tx.outputs = [
       { value: 1_500_000_000_000_000n, scriptPubKey: Buffer.from([0x00]) },
@@ -559,7 +575,121 @@ describe("validateTxBasic", () => {
     ];
     const result = validateTxBasic(tx);
     expect(result.valid).toBe(false);
-    expect(result.error).toContain("Total output");
+    expect(result.error).toBe("bad-txns-txouttotal-toolarge");
+  });
+
+  // Gate 7: bad-txns-inputs-duplicate (CVE-2018-17144, Core tx_check.cpp:36-45)
+  test("gate 7: duplicate inputs → bad-txns-inputs-duplicate", () => {
+    const tx = createLegacyTx();
+    tx.inputs.push({ ...tx.inputs[0] }); // exact duplicate outpoint
+    const result = validateTxBasic(tx);
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe("bad-txns-inputs-duplicate");
+  });
+
+  test("gate 7: two distinct inputs are allowed", () => {
+    const tx = createLegacyTx();
+    tx.inputs.push({
+      prevOut: {
+        txid: Buffer.from(
+          "0000000000000000000000000000000000000000000000000000000000000002",
+          "hex"
+        ),
+        vout: 0,
+      },
+      scriptSig: Buffer.from([0x00]),
+      sequence: 0xffffffff,
+      witness: [],
+    });
+    const result = validateTxBasic(tx);
+    expect(result.valid).toBe(true);
+  });
+
+  // Gate 8: bad-cb-length — coinbase scriptSig must be 2..100 bytes (Core tx_check.cpp:48-51)
+  test("gate 8: coinbase scriptSig too short → bad-cb-length", () => {
+    const tx = createCoinbaseTx();
+    tx.inputs[0] = { ...tx.inputs[0], scriptSig: Buffer.from([0x00]) }; // 1 byte
+    const result = validateTxBasic(tx);
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe("bad-cb-length");
+  });
+
+  test("gate 8: coinbase scriptSig too long → bad-cb-length", () => {
+    const tx = createCoinbaseTx();
+    tx.inputs[0] = { ...tx.inputs[0], scriptSig: Buffer.alloc(101, 0x00) }; // 101 bytes
+    const result = validateTxBasic(tx);
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe("bad-cb-length");
+  });
+
+  test("gate 8: coinbase scriptSig exactly 2 bytes → valid", () => {
+    const tx = createCoinbaseTx();
+    tx.inputs[0] = { ...tx.inputs[0], scriptSig: Buffer.from([0x00, 0x00]) };
+    const result = validateTxBasic(tx);
+    expect(result.valid).toBe(true);
+  });
+
+  test("gate 8: coinbase scriptSig exactly 100 bytes → valid", () => {
+    const tx = createCoinbaseTx();
+    tx.inputs[0] = { ...tx.inputs[0], scriptSig: Buffer.alloc(100, 0x00) };
+    const result = validateTxBasic(tx);
+    expect(result.valid).toBe(true);
+  });
+
+  // Gate 9: bad-txns-prevout-null — non-coinbase inputs must not have null outpoints
+  // Core tx_check.cpp:53-56: if (txin.prevout.IsNull()) → "bad-txns-prevout-null"
+  //
+  // A tx is coinbase iff it has exactly ONE input with a null prevout.
+  // To test gate 9 we need isCoinbase() = false — achieved by having 2 inputs,
+  // where the second is the null prevout.
+  test("gate 9: non-coinbase tx with null prevout → bad-txns-prevout-null", () => {
+    const tx = createLegacyTx();
+    // Add a second input that is a null prevout (making the whole tx non-coinbase
+    // because isCoinbase requires exactly 1 input)
+    tx.inputs = [
+      tx.inputs[0], // normal non-null input
+      {
+        prevOut: {
+          txid: Buffer.alloc(32, 0), // all-zero txid
+          vout: 0xffffffff,          // 0xffffffff index = null marker
+        },
+        scriptSig: Buffer.from([0x00]),
+        sequence: 0xffffffff,
+        witness: [],
+      },
+    ];
+    const result = validateTxBasic(tx);
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe("bad-txns-prevout-null");
+  });
+
+  test("gate 9: null txid with non-0xffffffff vout is allowed in non-coinbase", () => {
+    const tx = createLegacyTx();
+    tx.inputs[0] = {
+      ...tx.inputs[0],
+      prevOut: {
+        txid: Buffer.alloc(32, 0), // all-zero txid
+        vout: 0,                   // but NOT 0xffffffff → not a null prevout
+      },
+    };
+    const result = validateTxBasic(tx);
+    expect(result.valid).toBe(true);
+  });
+
+  test("gate 9: coinbase with null prevout is allowed", () => {
+    const tx = createCoinbaseTx();
+    const result = validateTxBasic(tx);
+    expect(result.valid).toBe(true);
+  });
+
+  // Output value check ordering: oversize checked before output values
+  test("gate order: oversize checked before output values", () => {
+    const tx = createLegacyTx();
+    tx.inputs[0].scriptSig = Buffer.alloc(1_000_001);
+    tx.outputs[0] = { ...tx.outputs[0], value: 0xffffffffffffffffn }; // also negative
+    const result = validateTxBasic(tx);
+    // oversize should fire before negative-output
+    expect(result.error).toBe("bad-txns-oversize");
   });
 });
 

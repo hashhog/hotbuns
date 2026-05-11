@@ -37,6 +37,8 @@ export enum ConsensusErrorCode {
   BAD_TXNS_VIN_EMPTY = "BAD_TXNS_VIN_EMPTY",
   BAD_TXNS_PREVOUT_NULL = "BAD_TXNS_PREVOUT_NULL",
   INPUTS_NOT_EQUAL_OUTPUTS = "INPUTS_NOT_EQUAL_OUTPUTS",
+  BAD_TXNS_INPUTVALUES_OUTOFRANGE = "BAD_TXNS_INPUTVALUES_OUTOFRANGE",
+  BAD_TXNS_ACCUMULATED_FEE_OUTOFRANGE = "BAD_TXNS_ACCUMULATED_FEE_OUTOFRANGE",
 
   // Script errors
   SCRIPT_VERIFY_FLAG_FAILED = "SCRIPT_VERIFY_FLAG_FAILED",
@@ -86,6 +88,8 @@ const REJECT_CODES: Record<ConsensusErrorCode, number> = {
   [ConsensusErrorCode.BAD_TXNS_VIN_EMPTY]: 0x10,
   [ConsensusErrorCode.BAD_TXNS_PREVOUT_NULL]: 0x10,
   [ConsensusErrorCode.INPUTS_NOT_EQUAL_OUTPUTS]: 0x10,
+  [ConsensusErrorCode.BAD_TXNS_INPUTVALUES_OUTOFRANGE]: 0x10,
+  [ConsensusErrorCode.BAD_TXNS_ACCUMULATED_FEE_OUTOFRANGE]: 0x10,
   [ConsensusErrorCode.SCRIPT_VERIFY_FLAG_FAILED]: 0x10,
   [ConsensusErrorCode.CHECKSIG_FAILED]: 0x10,
   [ConsensusErrorCode.CHECKMULTISIG_FAILED]: 0x10,
@@ -175,6 +179,16 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
 
   if (s === "bad-cb-height") return "bad-cb-height"; // already canonical
   if (s === "bad-cb-length") return "bad-cb-length"; // already canonical
+  if (s === "bad-txns-vin-empty") return "bad-txns-vin-empty";
+  if (s === "bad-txns-vout-empty") return "bad-txns-vout-empty";
+  if (s === "bad-txns-vout-negative") return "bad-txns-vout-negative";
+  if (s === "bad-txns-vout-toolarge") return "bad-txns-vout-toolarge";
+  if (s === "bad-txns-txouttotal-toolarge") return "bad-txns-txouttotal-toolarge";
+  if (s === "bad-txns-inputs-duplicate") return "bad-txns-inputs-duplicate";
+  if (s === "bad-txns-prevout-null") return "bad-txns-prevout-null";
+  if (s === "bad-txns-inputvalues-outofrange") return "bad-txns-inputvalues-outofrange";
+  if (s.startsWith("bad-txns-inputvalues-outofrange")) return "bad-txns-inputvalues-outofrange";
+  if (s === "bad-txns-accumulated-fee-outofrange") return "bad-txns-accumulated-fee-outofrange";
   if (s === "inconclusive") return "inconclusive";
   if (s === "duplicate") return "duplicate";
   if (s === "duplicate-invalid") return "duplicate-invalid";

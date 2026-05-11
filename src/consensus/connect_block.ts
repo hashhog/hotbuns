@@ -471,9 +471,29 @@ export async function coreConnectBlockChecks(
       }
 
       // ── Spend inputs; collect undo data.
+      // Also enforce per-coin and accumulated input MoneyRange checks.
+      // Core consensus/tx_verify.cpp::CheckTxInputs:184-188:
+      //   nValueIn += coin.out.nValue;
+      //   if (!MoneyRange(coin.out.nValue) || !MoneyRange(nValueIn))
+      //     → "bad-txns-inputvalues-outofrange"
+      const MAX_MONEY_INPUT = 2_100_000_000_000_000n; // 21_000_000 * COIN
       for (const input of tx.inputs) {
         const spentEntry = utxoManager.spendOutput(input.prevOut);
+        // Gate: individual coin value must be in MoneyRange.
+        if (spentEntry.amount < 0n || spentEntry.amount > MAX_MONEY_INPUT) {
+          return {
+            ok: false,
+            error: `bad-txns-inputvalues-outofrange in tx ${txidHex.slice(0, 16)}`,
+          };
+        }
         totalInputValue += spentEntry.amount;
+        // Gate: accumulated input value must stay in MoneyRange.
+        if (totalInputValue > MAX_MONEY_INPUT) {
+          return {
+            ok: false,
+            error: `bad-txns-inputvalues-outofrange (accumulated) in tx ${txidHex.slice(0, 16)}`,
+          };
+        }
         spentOutputs.push({
           txid: input.prevOut.txid,
           vout: input.prevOut.vout,
@@ -531,6 +551,21 @@ export async function coreConnectBlockChecks(
     return {
       ok: false,
       error: `Transaction outputs exceed inputs: non-coinbase output sum exceeds input sum (bad-txns-in-belowout)`,
+    };
+  }
+
+  // ── 6b. Accumulated fee must be in MoneyRange.
+  // Core validation.cpp:2543-2547:
+  //   nFees += txfee;
+  //   if (!MoneyRange(nFees)) → "bad-txns-accumulated-fee-outofrange"
+  // Unreachable in practice (since nValueIn ≤ MAX_MONEY and nValueOut ≥ 0) but
+  // mirrors Core's defensive check exactly so the error code is correct if it
+  // ever fires due to an implementation bug.
+  const MAX_MONEY_CB = 2_100_000_000_000_000n; // 21_000_000 * COIN
+  if (fees > MAX_MONEY_CB) {
+    return {
+      ok: false,
+      error: `bad-txns-accumulated-fee-outofrange`,
     };
   }
 
