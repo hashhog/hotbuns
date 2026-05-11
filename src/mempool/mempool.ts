@@ -58,10 +58,24 @@ import {
 } from "./rbf.js";
 
 /**
- * Maximum cluster size (replaces ancestor/descendant limits).
- * A cluster is a connected component of transactions in the mempool.
+ * Maximum cluster count: maximum number of transactions in a cluster.
+ * Bitcoin Core: policy/policy.h DEFAULT_CLUSTER_LIMIT = 64.
+ * Reference: bitcoin-core/src/policy/policy.h:72
  */
-export const MAX_CLUSTER_SIZE = 100;
+export const MAX_CLUSTER_COUNT = 64;
+
+/**
+ * Maximum cluster size in vbytes.
+ * Bitcoin Core: kernel/mempool_limits.h cluster_size_vbytes = DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 = 101,000.
+ * Reference: bitcoin-core/src/policy/policy.h:74 (DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101)
+ */
+export const MAX_CLUSTER_SIZE_VBYTES = 101_000;
+
+/**
+ * @deprecated Use MAX_CLUSTER_COUNT instead.
+ * Kept for backward-compat with existing imports in cluster_mempool.test.ts.
+ */
+export const MAX_CLUSTER_SIZE = MAX_CLUSTER_COUNT;
 
 /**
  * Default dust relay fee rate in sat/kvB.
@@ -378,12 +392,29 @@ function isWitnessStandard(
 }
 
 /**
- * Legacy ancestor/descendant limits per BIP-125.
- * These are now superseded by MAX_CLUSTER_SIZE but kept for TRUC policy.
+ * Ancestor/descendant count limits.
+ * Bitcoin Core: policy/policy.h DEFAULT_ANCESTOR_LIMIT = 25, DEFAULT_DESCENDANT_LIMIT = 25.
+ * Reference: bitcoin-core/src/policy/policy.h:76-78
+ *
+ * In cluster-mempool Core (28+) these are enforced via MemPoolLimits and still active
+ * alongside the cluster-count/size gates. Both gates apply.
  */
 const MAX_ANCESTORS = 25;
 const MAX_DESCENDANTS = 25;
-const MAX_ANCESTOR_SIZE = 101_000; // 101 KB in vbytes
+/**
+ * Maximum total vsize of in-mempool ancestors (including self).
+ * Bitcoin Core: kernel/mempool_limits.h — historically DEFAULT_ANCESTOR_LIMIT_SIZE_KVB * 1000.
+ * Defaults to 101,000 vbytes (101 kvB).
+ * Reference: bitcoin-core/src/policy/policy.h (DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 kvB shared limit)
+ */
+const MAX_ANCESTOR_SIZE = 101_000; // vbytes
+/**
+ * Maximum total vsize of in-mempool descendants (including self).
+ * Bitcoin Core: kernel/mempool_limits.h — historically DEFAULT_DESCENDANT_LIMIT_SIZE_KVB * 1000.
+ * Defaults to 101,000 vbytes (101 kvB).
+ * Reference: bitcoin-core/src/policy/policy.h (DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 kvB shared limit)
+ */
+const MAX_DESCENDANT_SIZE = 101_000; // vbytes
 
 /**
  * TRUC (v3) policy constants per BIP 431.
@@ -2252,6 +2283,20 @@ export class Mempool {
   /**
    * Check ancestor limits for a new transaction.
    */
+  /**
+   * Check ancestor and descendant limits for a new transaction.
+   *
+   * Enforces 4 gates from Bitcoin Core (policy/policy.h + kernel/mempool_limits.h):
+   *   Gate A — ancestor count:   new tx's ancestor set (incl. self) ≤ MAX_ANCESTORS (25).
+   *             Reference: bitcoin-core/src/policy/policy.h:76
+   *   Gate B — ancestor size:    total vsize of ancestors (incl. self) ≤ MAX_ANCESTOR_SIZE (101,000 vB).
+   *             Reference: bitcoin-core/src/policy/policy.h:74 (DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101)
+   *   Gate C — descendant count: each in-mempool ancestor's descendant count (incl. existing + new) ≤ MAX_DESCENDANTS (25).
+   *             Reference: bitcoin-core/src/policy/policy.h:78
+   *   Gate D — descendant size:  each in-mempool ancestor's descendant vsize (incl. existing + new) ≤ MAX_DESCENDANT_SIZE (101,000 vB).
+   *             Reference: bitcoin-core/src/policy/policy.h:74 (DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101)
+   *             Previously enforced via -limitdescendantsize in legacy Core.
+   */
   private checkAncestorLimits(
     parentTxids: Set<string>,
     newTxVsize: number
@@ -2259,34 +2304,49 @@ export class Mempool {
     // Calculate ancestor stats
     const { ancestorCount, ancestorSize } = this.calculateAncestorStats(parentTxids, newTxVsize);
 
-    // The limit includes the new transaction itself
-    // So if ancestorCount > MAX_ANCESTORS, it exceeds the limit
+    // Gate A: ancestor count limit (includes self).
+    // Bitcoin Core: kernel/mempool_limits.h MemPoolLimits::ancestor_count = DEFAULT_ANCESTOR_LIMIT = 25.
     if (ancestorCount > MAX_ANCESTORS) {
       return {
         valid: false,
-        error: `Too many ancestors: ${ancestorCount} > ${MAX_ANCESTORS}`,
+        error: `too-long-mempool-chain: ${ancestorCount} ancestors exceeds limit of ${MAX_ANCESTORS}`,
       };
     }
 
+    // Gate B: ancestor size limit in vbytes (includes self).
+    // Bitcoin Core: DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 kvB → 101,000 vB.
     if (ancestorSize > MAX_ANCESTOR_SIZE) {
       return {
         valid: false,
-        error: `Ancestor size too large: ${ancestorSize} > ${MAX_ANCESTOR_SIZE}`,
+        error: `too-long-mempool-chain: ancestor vsize ${ancestorSize} exceeds limit of ${MAX_ANCESTOR_SIZE} vB`,
       };
     }
 
-    // Check descendant limits for each ancestor
-    // Adding this tx would increase each ancestor's descendant count by 1
+    // Gates C + D: descendant limits for all in-mempool ancestors.
+    // Adding this tx would increase each ancestor's descendant count by 1 and
+    // descendant size by newTxVsize. Check both before admission.
     const allAncestors = this.getAncestorSet(parentTxids);
     for (const ancestorTxidHex of allAncestors) {
       const ancestor = this.entries.get(ancestorTxidHex);
       if (ancestor) {
-        // Use cached descendant count - adding this tx would add 1 more
+        // Gate C: descendant count.
+        // Bitcoin Core: kernel/mempool_limits.h MemPoolLimits::descendant_count = DEFAULT_DESCENDANT_LIMIT = 25.
         const newDescendantCount = ancestor.descendantCount + 1;
         if (newDescendantCount > MAX_DESCENDANTS) {
           return {
             valid: false,
-            error: `Ancestor ${ancestorTxidHex.slice(0, 16)}... would have too many descendants: ${newDescendantCount} > ${MAX_DESCENDANTS}`,
+            error: `too-long-mempool-chain: ancestor ${ancestorTxidHex.slice(0, 16)}... would have ${newDescendantCount} descendants (limit ${MAX_DESCENDANTS})`,
+          };
+        }
+
+        // Gate D: descendant size in vbytes.
+        // Bitcoin Core: DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 kvB → 101,000 vB.
+        // Previously -limitdescendantsize in legacy Core before cluster mempool.
+        const newDescendantSize = ancestor.descendantSize + newTxVsize;
+        if (newDescendantSize > MAX_DESCENDANT_SIZE) {
+          return {
+            valid: false,
+            error: `too-long-mempool-chain: ancestor ${ancestorTxidHex.slice(0, 16)}... descendant vsize would be ${newDescendantSize} (limit ${MAX_DESCENDANT_SIZE} vB)`,
           };
         }
       }
@@ -2804,12 +2864,21 @@ export class Mempool {
   }
 
   /**
-   * Check if adding a transaction would exceed the cluster size limit.
-   * A new transaction may merge multiple clusters together.
+   * Check if adding a transaction would exceed the cluster limits.
+   *
+   * Enforces two gates from Bitcoin Core (policy/policy.h + kernel/mempool_limits.h):
+   *   Gate 1 — cluster count: merged cluster tx count must not exceed MAX_CLUSTER_COUNT (64).
+   *             Core: DEFAULT_CLUSTER_LIMIT = 64; CheckMemPoolPolicyLimits() via TxGraph::IsOversized.
+   *             Reference: bitcoin-core/src/policy/policy.h:72, src/txmempool.cpp:1072-1079
+   *   Gate 2 — cluster vbytes: merged cluster total vsize must not exceed MAX_CLUSTER_SIZE_VBYTES (101,000).
+   *             Core: cluster_size_vbytes = DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 = 101,000 vB.
+   *             Reference: bitcoin-core/src/policy/policy.h:74, src/kernel/mempool_limits.h:22
+   *
+   * A new transaction may merge multiple existing clusters together when it spends
+   * outputs from transactions in different clusters.
    */
   private checkClusterSizeLimit(parentTxids: Set<string>, newTxVsize: number): { valid: boolean; error?: string } {
-    // Calculate the resulting cluster size if this tx is added
-    // First, find all unique clusters that would be merged
+    // Find all unique cluster roots that would be merged by adding this tx.
     const clusterRoots = new Set<string>();
     for (const parentTxidHex of parentTxids) {
       if (this.entries.has(parentTxidHex)) {
@@ -2817,16 +2886,35 @@ export class Mempool {
       }
     }
 
-    // Sum up the sizes of all clusters that would be merged + 1 for the new tx
-    let mergedSize = 1;
+    // Gate 1: cluster count.
+    // Sum the transaction counts of all clusters that would be merged + 1 for the new tx.
+    let mergedCount = 1;
     for (const root of clusterRoots) {
-      mergedSize += this.clusters.getSize(root);
+      mergedCount += this.clusters.getSize(root);
     }
 
-    if (mergedSize > MAX_CLUSTER_SIZE) {
+    if (mergedCount > MAX_CLUSTER_COUNT) {
       return {
         valid: false,
-        error: `Cluster would exceed maximum size: ${mergedSize} > ${MAX_CLUSTER_SIZE}`,
+        error: `too-large-cluster: cluster would exceed maximum count ${MAX_CLUSTER_COUNT} (would be ${mergedCount})`,
+      };
+    }
+
+    // Gate 2: cluster vbytes.
+    // Sum the total vsize of all entries in each cluster that would be merged + this tx's vsize.
+    // We compute this by iterating entries — O(n) over the merged cluster but n ≤ 64 by gate 1.
+    let mergedVsize = newTxVsize;
+    for (const [txidHex, entry] of this.entries) {
+      const root = this.clusters.find(txidHex);
+      if (clusterRoots.has(root)) {
+        mergedVsize += entry.vsize;
+      }
+    }
+
+    if (mergedVsize > MAX_CLUSTER_SIZE_VBYTES) {
+      return {
+        valid: false,
+        error: `too-large-cluster: cluster would exceed maximum vsize ${MAX_CLUSTER_SIZE_VBYTES} vB (would be ${mergedVsize})`,
       };
     }
 
