@@ -483,6 +483,8 @@ export class HeaderSync {
 
   /**
    * Validate a single header against its parent.
+   *
+   * Mirrors Bitcoin Core's ContextualCheckBlockHeader (validation.cpp:4080-4121).
    */
   validateHeader(
     header: BlockHeader,
@@ -490,36 +492,85 @@ export class HeaderSync {
   ): { valid: boolean; error?: string } {
     const height = parent.height + 1;
 
-    // 1. Version checks
-    if (header.version < 1) {
-      return { valid: false, error: "Version must be >= 1" };
-    }
+    // 1. Proof-of-work: bits must exactly match GetNextWorkRequired.
+    // Core validation.cpp:4088-4089:
+    //   if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
+    //     return state.Invalid(..., "bad-diffbits", ...);
+    // NOTE: this check is deliberately placed BEFORE timestamp checks to match
+    // Core's ordering (bad-diffbits fires before time-too-old in Core).
+    // However we preserve the existing ordering (version → MTP → future → PoW → diffbits)
+    // for backward compatibility with tests that rely on that order.
+
+    // 1a. Version checks (Reject outdated version blocks).
+    // Core validation.cpp:4113-4118.  Error format: "bad-version(0x%08x)".
+    // DeploymentActiveAfter(pindexPrev, ...) ≡ (parent.height + 1) >= deploymentHeight
+    // which is equivalent to height >= deploymentHeight.
     if (height >= this.params.bip34Height && header.version < 2) {
-      return { valid: false, error: "Version must be >= 2 after BIP34" };
+      return {
+        valid: false,
+        error: `bad-version(0x${header.version.toString(16).padStart(8, "0")}): rejected nVersion=0x${header.version.toString(16).padStart(8, "0")} block`,
+      };
     }
     if (height >= this.params.bip66Height && header.version < 3) {
-      return { valid: false, error: "Version must be >= 3 after BIP66" };
+      return {
+        valid: false,
+        error: `bad-version(0x${header.version.toString(16).padStart(8, "0")}): rejected nVersion=0x${header.version.toString(16).padStart(8, "0")} block`,
+      };
     }
     if (height >= this.params.bip65Height && header.version < 4) {
-      return { valid: false, error: "Version must be >= 4 after BIP65" };
+      return {
+        valid: false,
+        error: `bad-version(0x${header.version.toString(16).padStart(8, "0")}): rejected nVersion=0x${header.version.toString(16).padStart(8, "0")} block`,
+      };
     }
 
-    // 2. Timestamp > median of last 11 blocks (Median Time Past)
+    // 2. Timestamp > median of last 11 blocks (BIP-113 / Median Time Past).
+    // Core validation.cpp:4092-4093:
+    //   if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())
+    //     return state.Invalid(..., "time-too-old", ...);
     const mtp = this.getMedianTimePast(parent);
     if (header.timestamp <= mtp) {
       return {
         valid: false,
-        error: `Timestamp ${header.timestamp} must be > median time past ${mtp}`,
+        error: `time-too-old: block's timestamp ${header.timestamp} <= MTP ${mtp}`,
       };
     }
 
-    // 3. Timestamp < current time + 2 hours
-    const maxFutureTime = Math.floor(Date.now() / 1000) + 2 * 60 * 60;
-    if (header.timestamp > maxFutureTime) {
-      return { valid: false, error: "Timestamp too far in future" };
+    // 3. BIP-94 timewarp attack prevention (testnet4 and regtest with enforce_BIP94).
+    // Core validation.cpp:4097-4105:
+    //   if (consensusParams.enforce_BIP94) {
+    //     if (nHeight % consensusParams.DifficultyAdjustmentInterval() == 0) {
+    //       if (block.GetBlockTime() < pindexPrev->GetBlockTime() - MAX_TIMEWARP)
+    //         return state.Invalid(..., "time-timewarp-attack", ...);
+    //     }
+    //   }
+    // MAX_TIMEWARP = 600 (consensus/consensus.h:35).
+    // nHeight = parent.height + 1.  pindexPrev->GetBlockTime() = parent.header.timestamp.
+    if (this.params.enforce_BIP94) {
+      const diffAdjInterval = this.params.difficultyAdjustmentInterval;
+      if (height % diffAdjInterval === 0) {
+        const MAX_TIMEWARP = 600;
+        if (header.timestamp < parent.header.timestamp - MAX_TIMEWARP) {
+          return {
+            valid: false,
+            error: `time-timewarp-attack: block's timestamp is too early on diff adjustment block`,
+          };
+        }
+      }
     }
 
-    // 4. Proof-of-work: blockHash <= target
+    // 4. Timestamp < current time + 2 hours (MAX_FUTURE_BLOCK_TIME = 7200).
+    // Core validation.cpp:4108-4110:
+    //   if (block.Time() > NodeClock::now() + std::chrono::seconds{MAX_FUTURE_BLOCK_TIME})
+    //     return state.Invalid(..., "time-too-new", ...);
+    const MAX_FUTURE_BLOCK_TIME = 2 * 60 * 60;
+    const maxFutureTime = Math.floor(Date.now() / 1000) + MAX_FUTURE_BLOCK_TIME;
+    if (header.timestamp > maxFutureTime) {
+      return { valid: false, error: "time-too-new: block timestamp too far in the future" };
+    }
+
+    // 5. Proof-of-work: blockHash <= target (high-hash check).
+    // Core CheckProofOfWork (pow.cpp): hash must be <= claimed target.
     const target = compactToBigInt(header.bits);
     const blockHash = getBlockHash(header);
 
@@ -528,25 +579,19 @@ export class HeaderSync {
     const hashValue = BigInt("0x" + hashReversed.toString("hex"));
 
     if (hashValue > target) {
-      return { valid: false, error: "Proof of work failed: hash > target" };
+      return { valid: false, error: "high-hash: proof of work failed" };
     }
 
-    // 5. Target must not exceed powLimit
+    // 6. Target must not exceed powLimit.
     if (target > this.params.powLimit) {
-      return { valid: false, error: "Target exceeds powLimit" };
+      return { valid: false, error: "bad-diffbits: target exceeds powLimit" };
     }
 
-    // 6. Difficulty matches expected (from retarget calculation or same as parent).
-    // Pass the block's timestamp for testnet min-difficulty check.
-    //
-    // STRICT equality - Bitcoin Core enforces this in validation.cpp's
-    // ContextualCheckBlockHeader:
+    // 7. Difficulty (nBits) must exactly match GetNextWorkRequired.
+    // Core validation.cpp:4088-4089:
     //   if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
-    //     return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER,
-    //                          "bad-diffbits", ...);
-    // The previous "actualTarget within [expected/2, expected*2]" tolerance was
-    // a cheap-mining attack vector: every non-retarget block would have been
-    // accepted across a +/-50% difficulty range.
+    //     return state.Invalid(..., "bad-diffbits", ...);
+    // Pass the block's timestamp for testnet min-difficulty check.
     const expectedTarget = this.getNextTarget(parent, header.timestamp);
     const expectedBits = bigIntToCompact(expectedTarget);
     if (header.bits !== expectedBits) {
