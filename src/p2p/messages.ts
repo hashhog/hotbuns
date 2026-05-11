@@ -922,19 +922,42 @@ function deserializeFeeFilterPayload(reader: BufferReader): FeeFilterPayload {
   return { feeRate };
 }
 
+/**
+ * Maximum total tx count in a cmpctblock message.
+ *
+ * Core: blockencodings.h serializer gate:
+ *   BlockTxCount() > std::numeric_limits<uint16_t>::max() → throw
+ * Combined shortIds + prefilledTxns must be ≤ 65535 (uint16_t max).
+ * We also enforce the weight-based ceiling:
+ *   MAX_BLOCK_WEIGHT (4_000_000) / MIN_SERIALIZABLE_TRANSACTION_WEIGHT (40) = 100_000
+ * The tighter uint16_t bound (65535) dominates.
+ */
+const MAX_CMPCT_TOTAL_TX = 0xffff;
+
 function deserializeCmpctBlockPayload(reader: BufferReader): CmpctBlockPayload {
   const header = deserializeBlockHeader(reader);
   const nonce = reader.readUInt64LE();
 
-  // Short IDs
+  // Short IDs — DoS cap before allocation.
+  // Core: blockencodings.h:125-128 (uint16_t overflow gate on BlockTxCount).
   const shortIdCount = reader.readVarInt();
+  if (shortIdCount > MAX_CMPCT_TOTAL_TX) {
+    throw new Error(`cmpctblock shortId count exceeds limit: ${shortIdCount} > ${MAX_CMPCT_TOTAL_TX}`);
+  }
   const shortIds: Buffer[] = [];
   for (let i = 0; i < shortIdCount; i++) {
     shortIds.push(reader.readBytes(6));
   }
 
-  // Prefilled transactions (differentially encoded)
+  // Prefilled transactions (differentially encoded) — cap before allocation.
   const prefilledCount = reader.readVarInt();
+  if (prefilledCount > MAX_CMPCT_TOTAL_TX) {
+    throw new Error(`cmpctblock prefilled count exceeds limit: ${prefilledCount} > ${MAX_CMPCT_TOTAL_TX}`);
+  }
+  // Combined count must also fit.
+  if (shortIdCount + prefilledCount > MAX_CMPCT_TOTAL_TX) {
+    throw new Error(`cmpctblock total tx count exceeds limit: ${shortIdCount + prefilledCount} > ${MAX_CMPCT_TOTAL_TX}`);
+  }
   const prefilledTxns: PrefilledTx[] = [];
   let lastIndex = -1;
   for (let i = 0; i < prefilledCount; i++) {
@@ -1396,134 +1419,5 @@ export function deserializeMessage(header: MessageHeader, payload: Buffer): Netw
   }
 }
 
-// ============================================================================
-// BIP-152 Compact Block Helper Functions
-// ============================================================================
-
 import { sha256Hash } from "../crypto/primitives.js";
-
-/**
- * Compute short transaction ID for compact blocks (BIP 152).
- *
- * shortid = SipHash-2-4(k0, k1, txid)[0:6]
- * where k0, k1 are derived from SHA256(header || nonce)
- *
- * For simplicity, we use SHA256 truncated (not SipHash) as an approximation.
- * Full BIP-152 implementation would use SipHash.
- */
-export function computeShortTxId(
-  headerHash: Buffer,
-  nonce: bigint,
-  txid: Buffer
-): Buffer {
-  // Compute key = SHA256(header || nonce)
-  const nonceBuffer = Buffer.alloc(8);
-  nonceBuffer.writeBigUInt64LE(nonce, 0);
-  const keyData = Buffer.concat([headerHash, nonceBuffer]);
-  const key = sha256Hash(keyData);
-
-  // Compute short ID = SHA256(key || txid)[0:6]
-  const shortIdData = Buffer.concat([key, txid]);
-  const fullHash = sha256Hash(shortIdData);
-
-  return fullHash.subarray(0, 6);
-}
-
-/**
- * Create a compact block from a full block.
- *
- * @param block - Full block to compact
- * @param nonce - Random nonce for short ID calculation
- * @param mempoolTxIds - Set of txids known to be in peer's mempool
- */
-export function createCompactBlock(
-  block: Block,
-  nonce: bigint,
-  mempoolTxIds: Set<string> = new Set()
-): CmpctBlockPayload {
-  const headerHash = hash256(serializeBlockHeader(block.header));
-  const shortIds: Buffer[] = [];
-  const prefilledTxns: PrefilledTx[] = [];
-
-  for (let i = 0; i < block.transactions.length; i++) {
-    const tx = block.transactions[i];
-    const txid = getTxId(tx);
-
-    // Always include coinbase in prefilled
-    if (i === 0) {
-      prefilledTxns.push({ index: i, tx });
-      continue;
-    }
-
-    // If not in mempool, include in prefilled
-    const txidHex = txid.toString("hex");
-    if (!mempoolTxIds.has(txidHex)) {
-      prefilledTxns.push({ index: i, tx });
-    } else {
-      // Add short ID
-      shortIds.push(computeShortTxId(headerHash, nonce, txid));
-    }
-  }
-
-  return {
-    header: block.header,
-    nonce,
-    shortIds,
-    prefilledTxns,
-  };
-}
-
-/**
- * Reconstruct a full block from a compact block and mempool transactions.
- *
- * @param compact - Compact block
- * @param txLookup - Map from short ID (hex) to full transaction
- * @returns Reconstructed block or null if transactions are missing
- */
-export function reconstructBlockFromCompact(
-  compact: CmpctBlockPayload,
-  txLookup: Map<string, Transaction>
-): Block | null {
-  // Total transaction count = shortIds + prefilledTxns
-  const txCount = compact.shortIds.length + compact.prefilledTxns.length;
-  const transactions: (Transaction | undefined)[] = new Array(txCount);
-
-  // Place prefilled transactions
-  for (const prefilled of compact.prefilledTxns) {
-    if (prefilled.index >= txCount) {
-      return null; // Invalid index
-    }
-    transactions[prefilled.index] = prefilled.tx;
-  }
-
-  // Fill remaining from lookup
-  let shortIdIndex = 0;
-  for (let i = 0; i < txCount; i++) {
-    if (transactions[i] === undefined) {
-      if (shortIdIndex >= compact.shortIds.length) {
-        return null; // Not enough short IDs
-      }
-      const shortIdHex = compact.shortIds[shortIdIndex].toString("hex");
-      const tx = txLookup.get(shortIdHex);
-      if (!tx) {
-        return null; // Transaction not found
-      }
-      transactions[i] = tx;
-      shortIdIndex++;
-    }
-  }
-
-  // Verify all slots are filled
-  for (const tx of transactions) {
-    if (tx === undefined) {
-      return null;
-    }
-  }
-
-  return {
-    header: compact.header,
-    transactions: transactions as Transaction[],
-  };
-}
-
 import { getTxId } from "../validation/tx.js";
