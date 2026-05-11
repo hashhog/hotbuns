@@ -10,6 +10,13 @@ import type { ConsensusParams } from "../consensus/params.js";
 import { getBlockSubsidy, compactToBigInt, bigIntToCompact } from "../consensus/params.js";
 import type { ChainStateManager } from "../chain/state.js";
 import type { Mempool, MempoolEntry } from "../mempool/mempool.js";
+import {
+  VersionBitsCache,
+  buildBlockIndex,
+  VERSIONBITS_TOP_BITS,
+  type DeploymentParams,
+  type HeaderInfo,
+} from "../consensus/versionbits.js";
 import type {
   Transaction,
   TxIn,
@@ -148,6 +155,12 @@ export class BlockTemplateBuilder {
   private mempool: Mempool;
   private chainState: ChainStateManager;
   private params: ConsensusParams;
+  /** Optional header lookup for BIP9 computeBlockVersion. */
+  private getHeaderByHeight?: (height: number) => HeaderInfo | undefined;
+  /** Optional per-deployment params for BIP9 version bits signalling. */
+  private deployments?: Map<string, DeploymentParams>;
+  /** Per-deployment state cache (reused across template builds). */
+  private versionBitsCache: VersionBitsCache = new VersionBitsCache();
 
   /**
    * Median time past for locktime validation.
@@ -155,10 +168,25 @@ export class BlockTemplateBuilder {
    */
   private medianTimePast: number = 0;
 
-  constructor(mempool: Mempool, chainState: ChainStateManager, params: ConsensusParams) {
+  constructor(
+    mempool: Mempool,
+    chainState: ChainStateManager,
+    params: ConsensusParams,
+    opts?: {
+      /**
+       * Header lookup by height for BIP9 computeBlockVersion.
+       * Without this, block version defaults to VERSIONBITS_TOP_BITS (0x20000000).
+       */
+      getHeaderByHeight?: (height: number) => HeaderInfo | undefined;
+      /** Active deployments to signal in block version. */
+      deployments?: Map<string, DeploymentParams>;
+    }
+  ) {
     this.mempool = mempool;
     this.chainState = chainState;
     this.params = params;
+    this.getHeaderByHeight = opts?.getHeaderByHeight;
+    this.deployments = opts?.deployments;
   }
 
   /**
@@ -238,9 +266,23 @@ export class BlockTemplateBuilder {
     const minTime = this.medianTimePast + 1;
     const timestamp = Math.max(nowSecs, minTime);
 
+    // Compute block version using BIP9 state machine when header data is available.
+    // Without header data, fall back to VERSIONBITS_TOP_BITS (0x20000000).
+    // Bug fix: previously always hardcoded 0x20000000, never signalled for any deployment
+    // in STARTED or LOCKED_IN states.
+    // Core: versionbits.cpp ComputeBlockVersion (line 265-279).
+    let blockVersion = VERSIONBITS_TOP_BITS;
+    if (this.getHeaderByHeight && this.deployments && this.deployments.size > 0) {
+      const parentEntry = this.getHeaderByHeight(height - 1);
+      if (parentEntry) {
+        const pindexPrev = buildBlockIndex(parentEntry, this.getHeaderByHeight);
+        blockVersion = this.versionBitsCache.computeBlockVersion(pindexPrev, this.deployments);
+      }
+    }
+
     // Build block header
     const header: BlockHeader = {
-      version: 0x20000000, // BIP9 version bits
+      version: blockVersion,
       prevBlock: bestBlock.hash,
       merkleRoot,
       timestamp,

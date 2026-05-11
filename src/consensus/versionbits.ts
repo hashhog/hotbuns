@@ -40,7 +40,15 @@ export const VERSIONBITS_LAST_OLD_BLOCK_VERSION = 4;
  */
 export const ALWAYS_ACTIVE = -1n;
 export const NEVER_ACTIVE = -2n;
-export const NO_TIMEOUT = BigInt(Number.MAX_SAFE_INTEGER);
+/**
+ * NO_TIMEOUT mirrors Bitcoin Core's BIP9Deployment::NO_TIMEOUT = std::numeric_limits<int64_t>::max()
+ * = 9223372036854775807 (2^63 - 1).
+ *
+ * Bug fix: previously used BigInt(Number.MAX_SAFE_INTEGER) = 2^53 - 1, which is 9007199254740991.
+ * Any deployment whose medianTimePast crossed that value would incorrectly transition to FAILED.
+ * Core: src/consensus/params.h:70 "static constexpr int64_t NO_TIMEOUT = std::numeric_limits<int64_t>::max();"
+ */
+export const NO_TIMEOUT = 9223372036854775807n; // int64_t max (2^63 - 1)
 
 /**
  * Parameters for a single BIP9 deployment.
@@ -496,8 +504,18 @@ export function getStateSinceHeight(
 
 /**
  * Default mainnet deployment thresholds.
+ *
+ * Bug fix: MAINNET_THRESHOLD_DEFAULT matches Bitcoin Core's BIP9Deployment::threshold default
+ * of 1916 (95%).  The old default of 1815 was wrong; taproot's explicit threshold=1815 was
+ * correct, but any deployment relying on the default would get 1815 instead of 1916.
+ * Core: src/consensus/params.h:67 "uint32_t threshold{1916};"
+ *
+ * MAINNET_THRESHOLD (1815 / 90%) is used only for deployments like taproot that explicitly
+ * set their threshold; MAINNET_THRESHOLD_DEFAULT (1916 / 95%) is the createDeployment() default.
+ * TESTNET_THRESHOLD (1512 / 75%) is used by test-chain deployments.
  */
-export const MAINNET_THRESHOLD = 1815; // 90% of 2016
+export const MAINNET_THRESHOLD = 1815; // 90% of 2016 — taproot-specific, NOT the BIP9 default
+export const MAINNET_THRESHOLD_DEFAULT = 1916; // 95% of 2016 — Core default for BIP9Deployment
 export const TESTNET_THRESHOLD = 1512; // 75% of 2016
 
 /**
@@ -517,7 +535,9 @@ export function createDeployment(params: {
     timeout: params.timeout,
     minActivationHeight: params.minActivationHeight ?? 0,
     period: params.period ?? 2016,
-    threshold: params.threshold ?? MAINNET_THRESHOLD,
+    // Default threshold is 1916 (95%), matching Core's BIP9Deployment::threshold default.
+    // Deployments like taproot that use 1815 must pass threshold explicitly.
+    threshold: params.threshold ?? MAINNET_THRESHOLD_DEFAULT,
   };
 }
 
@@ -565,3 +585,54 @@ export const REGTEST_DEPLOYMENTS: Map<string, DeploymentParams> = new Map([
     }),
   ],
 ]);
+
+/**
+ * Minimal header info needed to build a BlockIndex for computeBlockVersion.
+ * Matches what HeaderSync.getHeaderByHeight() returns.
+ */
+export interface HeaderInfo {
+  hash: Buffer;
+  height: number;
+  version: number;
+  medianTimePast: number;
+}
+
+/**
+ * Build a BlockIndex chain node from a HeaderInfo, linked to its parent via a lazy getter.
+ *
+ * This is used to feed real chain state into computeBlockVersion / getStateFor without
+ * importing HeaderSync (which would create a circular dep).  The parent chain is built
+ * lazily using getHeader(height) so only the ancestry path actually accessed is allocated.
+ *
+ * @param info - Header data for this block
+ * @param getHeader - Function to look up a header by height (from HeaderSync.getHeaderByHeight)
+ * @returns BlockIndex suitable for passing to getStateFor / computeBlockVersion
+ */
+export function buildBlockIndex(
+  info: HeaderInfo,
+  getHeader: (height: number) => HeaderInfo | undefined
+): BlockIndex {
+  // Use a cache so repeated ancestor lookups don't rebuild nodes.
+  const cache = new Map<number, BlockIndex>();
+
+  function make(h: HeaderInfo): BlockIndex {
+    if (cache.has(h.height)) return cache.get(h.height)!;
+
+    const node: BlockIndex = {
+      hash: h.hash.toString("hex"),
+      height: h.height,
+      version: h.version,
+      medianTimePast: BigInt(h.medianTimePast),
+      get prev(): BlockIndex | null {
+        if (h.height === 0) return null;
+        const parent = getHeader(h.height - 1);
+        if (!parent) return null;
+        return make(parent);
+      },
+    };
+    cache.set(h.height, node);
+    return node;
+  }
+
+  return make(info);
+}
