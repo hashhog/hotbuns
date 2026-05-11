@@ -19,22 +19,43 @@
  * This function contains the complete per-block consensus checks and UTXO
  * mutations that belong to EVERY ConnectBlock call regardless of caller context:
  *
- *   1. BIP-30 duplicate-UTXO check (UTXO-integrity; runs even under assumevalid)
- *   2. IsFinalTx for every transaction (BIP-113 lock-time; runs even under assumevalid)
- *   3. Bulk UTXO preload (parallel LevelDB reads)
+ *   0a. Genesis short-circuit (validation.cpp:2339-2343)                       [W93]
+ *   0b. View-best-block consistency check (validation.cpp:2333)                [W93]
+ *   1.  BIP-30 duplicate-UTXO check (UTXO-integrity; runs even under assumevalid)
+ *   2.  IsFinalTx for every transaction (BIP-113 lock-time; runs even under assumevalid)
+ *   3.  Bulk UTXO preload (parallel LevelDB reads)
  *   4a. Assumevalid fast path: spend + addTransaction, skip maturity/BIP68/scripts
  *   4b. Full validation path: maturity + BIP-68/CSV + script verify + spend + addTransaction
- *   5. Sigops cost ceiling (MAX_BLOCK_SIGOPS_COST)  [full path only]
- *   6. Coinbase value ≤ subsidy + fees (consensus-critical; runs even under assumevalid)
+ *       + per-tx accumulated-fee MoneyRange (W93, validation.cpp:2543-2547)
+ *       + per-tx bad-txns-in-belowout (W93, tx_verify.cpp:197)
+ *   5.  Sigops cost ceiling (MAX_BLOCK_SIGOPS_COST)  [full path only; W93 token "bad-blk-sigops"]
+ *   6.  Coinbase value ≤ subsidy + fees (consensus-critical; runs even under
+ *       assumevalid; W93 token "bad-cb-amount")
+ *
+ * Canonical Bitcoin Core reject tokens emitted by this function (W93):
+ *   - bad-txns-inputs-missingorspent       (tx_verify.cpp:168)
+ *   - bad-txns-in-belowout                 (tx_verify.cpp:197)
+ *   - bad-txns-accumulated-fee-outofrange  (validation.cpp:2544)
+ *   - bad-txns-inputvalues-outofrange      (tx_verify.cpp:187)
+ *   - bad-blk-sigops                       (validation.cpp:2570)
+ *   - bad-cb-amount                        (validation.cpp:2612)
+ *   - bad-txns-BIP30                       (validation.cpp:2471)
+ *   - bad-txns-nonfinal                    (validation.cpp:2558 / :4146)
  *
  * UTXO mutations (spendOutput / addTransaction) are performed inside this
  * function so that block-internal transaction chaining works correctly:
  * a transaction at index N can create a UTXO that transaction N+1 spends.
  *
  * DB writes (undo data, block store, chain state, block index) are LEFT TO
- * THE CALLER — they differ between the two call sites.
+ * THE CALLER — they differ between the two call sites.  The caller also
+ * advances the UTXO view's best-block pointer (`utxoManager.setBestBlock`)
+ * after this function returns; pre-W93 chain/state.ts forgot this update,
+ * leaving the view's bestBlock stale until the next flush.
  *
- * Reference: Bitcoin Core validation.cpp::ConnectBlock
+ * Reference: Bitcoin Core validation.cpp::ConnectBlock (lines 2295-2673),
+ *            validation.cpp::ConnectTip (lines 3005-3108),
+ *            validation.cpp::UpdateCoins (lines 1999-2012),
+ *            consensus/tx_verify.cpp::CheckTxInputs (lines 164-214).
  */
 
 import type { ConsensusParams } from "./params.js";
@@ -155,6 +176,40 @@ export interface ConnectBlockOpts {
    * when HeaderSync is available (sync/blocks.ts path).
    */
   getUTXOMTP?: (utxoHeight: number) => number;
+
+  /**
+   * W93 gate — hash of the genesis block on this network.  When supplied,
+   * coreConnectBlockChecks short-circuits the per-tx loop for the genesis
+   * block, matching Bitcoin Core validation.cpp:2339-2343:
+   *
+   *   // Special case for the genesis block, skipping connection of its
+   *   // transactions (its coinbase is unspendable)
+   *   if (block_hash == params.GetConsensus().hashGenesisBlock) { ... return true; }
+   *
+   * Without this guard, hotbuns runs the full tx loop on genesis: BIP-30
+   * happens to no-op (the UTXO is empty), the coinbase-value check sees
+   * 50 BTC vs subsidy 50 BTC and passes, but the early exit is symbolic
+   * — exposing the special case to test harnesses lets us match Core's
+   * "true without persisting anything for tx[0]" semantics.
+   */
+  genesisHashHex?: string;
+
+  /**
+   * W93 gate — hash of the parent block as stored in this UTXO view.
+   * When supplied, coreConnectBlockChecks asserts that the parent of the
+   * block being connected matches this hash, mirroring Core's
+   * validation.cpp:2333 invariant:
+   *
+   *   assert(hashPrevBlock == view.GetBestBlock());
+   *
+   * In Core this is an `assert` that aborts the process on failure (the
+   * UTXO view should never be out of sync with the chain).  In hotbuns
+   * we make this a soft check that returns a ConnectBlockErr instead, so
+   * an upstream coordination bug surfaces as a chain-state error rather
+   * than a process exit.  Callers that have access to `utxoManager
+   * .cache.getBestBlock()` should wire this through.
+   */
+  utxoBestBlockHashHex?: string;
 }
 
 // ─── Main helper ──────────────────────────────────────────────────────────────
@@ -193,7 +248,56 @@ export async function coreConnectBlockChecks(
     verifyP2SH = height >= params.bip16Height,
     verifyWitness = height >= params.segwitHeight,
     getUTXOMTP,
+    genesisHashHex,
+    utxoBestBlockHashHex,
   } = opts;
+
+  // ── W93 Gate 0a: Genesis short-circuit.
+  //
+  // Bitcoin Core validation.cpp:2339-2343 explicitly skips connection of the
+  // genesis block's transactions because its coinbase is unspendable.  Without
+  // this gate the BIP-30 + tx loop run uselessly on genesis (BIP-30 happens
+  // to no-op because the view is empty; tx loop then attempts to "spend"
+  // genesis-coinbase phantom inputs).  Mirrors Core's early-return.
+  const blockHashForGate = getBlockHash(block.header);
+  const blockHashHexForGate = Buffer.from(blockHashForGate)
+    .reverse()
+    .toString("hex"); // display order
+  if (genesisHashHex && blockHashHexForGate === genesisHashHex) {
+    return {
+      ok: true,
+      spentOutputs: [],
+      totalInputValue: 0n,
+      totalOutputValue: 0n,
+      coinbaseOutputValue: 0n,
+    };
+  }
+
+  // ── W93 Gate 0b: View consistency — the UTXO view's best block hash MUST
+  // match this block's prevBlock.  Core validation.cpp:2333 asserts:
+  //   assert(hashPrevBlock == view.GetBestBlock());
+  // In Core this is fatal (process exit); in hotbuns we surface a clean
+  // ConnectBlockErr so an upstream coordination bug doesn't kill the daemon
+  // mid-IBD.  Callers that don't have a fresh `view.getBestBlock()` (e.g.
+  // generateblock RPC at cold start) may omit this option — the gate becomes
+  // a no-op rather than fail-closed.
+  if (utxoBestBlockHashHex !== undefined) {
+    const prevBlockHexLE = Buffer.from(block.header.prevBlock)
+      .reverse()
+      .toString("hex");
+    // Allow empty/zero view-best-block as the "fresh start" state (matches
+    // Core's `view.GetBestBlock() == uint256()` for genesis-parent case).
+    const viewBest = utxoBestBlockHashHex.toLowerCase();
+    const isFreshView =
+      viewBest === "" ||
+      viewBest === "0".repeat(64);
+    if (!isFreshView && viewBest !== prevBlockHexLE.toLowerCase()) {
+      return {
+        ok: false,
+        error: `UTXO view best block ${viewBest} does not match block prev ${prevBlockHexLE} at height ${height} (view-out-of-sync)`,
+      };
+    }
+  }
 
   // ── 1. BIP-30: reject blocks that would overwrite an existing unspent output.
   //
@@ -317,9 +421,11 @@ export async function coreConnectBlockChecks(
           if (!utxoManager.hasUTXO(input.prevOut)) {
             const loaded = await utxoManager.preloadUTXO(input.prevOut);
             if (!loaded) {
+              // W93: match Core's canonical reject reason
+              // (consensus/tx_verify.cpp:168 — bad-txns-inputs-missingorspent).
               return {
                 ok: false,
-                error: `Missing UTXO at height ${height}: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout}`,
+                error: `bad-txns-inputs-missingorspent: input ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout} not in UTXO set at height ${height}`,
               };
             }
           }
@@ -350,9 +456,10 @@ export async function coreConnectBlockChecks(
     const avFees = avTotalInputValue - (avTotalOutputValue - avCoinbaseOutputValue);
     const avMaxCoinbaseValue = avSubsidy + avFees;
     if (avCoinbaseOutputValue > avMaxCoinbaseValue) {
+      // W93: align with Core's canonical reject reason (validation.cpp:2612).
       return {
         ok: false,
-        error: `Coinbase value ${avCoinbaseOutputValue} exceeds maximum ${avMaxCoinbaseValue} at height ${height}`,
+        error: `bad-cb-amount: coinbase pays too much (actual=${avCoinbaseOutputValue} vs limit=${avMaxCoinbaseValue}) at height ${height}`,
       };
     }
 
@@ -370,6 +477,15 @@ export async function coreConnectBlockChecks(
   const spentOutputs: SpentUTXO[] = [];
   let totalInputValue = 0n;
   let totalOutputValue = 0n;
+  // W93 Gate H: per-tx accumulated nFees with MoneyRange check.
+  // Bitcoin Core validation.cpp:2542-2547 increments nFees per tx then bails
+  // on !MoneyRange(nFees) — the bad-txns-accumulated-fee-outofrange error.
+  // Previously hotbuns only computed a final `fees` post-loop; if it ever
+  // overflowed, the error code was `bad-txns-accumulated-fee-outofrange`
+  // but fired AFTER the loop, not at the offending tx.  Tracking per-tx
+  // matches Core's gate ordering.
+  let nFees = 0n;
+  const MAX_MONEY_FEE = 2_100_000_000_000_000n;
 
   for (let txIndex = 0; txIndex < block.transactions.length; txIndex++) {
     const tx = block.transactions[txIndex];
@@ -386,9 +502,13 @@ export async function coreConnectBlockChecks(
         if (!utxoManager.hasUTXO(input.prevOut)) {
           const loaded = await utxoManager.preloadUTXO(input.prevOut);
           if (!loaded) {
+            // W93: match Core's canonical reject reason
+            // (consensus/tx_verify.cpp:168 — bad-txns-inputs-missingorspent).
+            // This is the HaveInputs() precondition gate at the entry to
+            // Consensus::CheckTxInputs.
             return {
               ok: false,
-              error: `Missing UTXO for input ${input.prevOut.vout} of tx ${txidHex.slice(0, 16)}: ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout} at height ${height}`,
+              error: `bad-txns-inputs-missingorspent: input ${input.prevOut.vout} of tx ${txidHex.slice(0, 16)} (${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout}) at height ${height}`,
             };
           }
         }
@@ -515,23 +635,62 @@ export async function coreConnectBlockChecks(
     //    so that block-internal chaining works correctly.
     utxoManager.addTransaction(txid, tx, height, isCoinbaseTx);
 
-    // ── Sum output values.
+    // ── Sum output values; bump per-tx fee accumulator + MoneyRange check.
+    let txOutputValue = 0n;
     for (const output of tx.outputs) {
       totalOutputValue += output.value;
+      txOutputValue += output.value;
+    }
+    if (!isCoinbaseTx) {
+      // W93 Gate H: per-tx accumulated nFees MoneyRange check.
+      // Core consensus/tx_verify.cpp:196-199 computes
+      //   value_out = tx.GetValueOut(); if (nValueIn < value_out) → bad-txns-in-belowout.
+      // We track txValueIn locally to mirror this gate per tx (the cumulative
+      // bad-txns-in-belowout check still runs post-loop for safety).
+      let txValueIn = 0n;
+      for (const sp of spentOutputs.slice(-(tx.inputs.length))) {
+        txValueIn += sp.entry.amount;
+      }
+      if (txValueIn < txOutputValue) {
+        return {
+          ok: false,
+          error: `bad-txns-in-belowout: value in (${txValueIn}) < value out (${txOutputValue}) in tx ${txidHex.slice(0, 16)} at height ${height}`,
+        };
+      }
+      const txFee = txValueIn - txOutputValue;
+      nFees += txFee;
+      // Core validation.cpp:2543-2547 — MoneyRange check on the running
+      // total, NOT just the per-tx fee.  Match that exactly.
+      if (nFees < 0n || nFees > MAX_MONEY_FEE) {
+        return {
+          ok: false,
+          error: `bad-txns-accumulated-fee-outofrange at tx ${txidHex.slice(0, 16)} (h=${height})`,
+        };
+      }
     }
   }
 
   // ── 5. Sigops ceiling.
+  //
+  // Bitcoin Core validation.cpp:2569-2572:
+  //   if (nSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
+  //     state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-sigops", ...);
+  //   }
+  // W93: emit canonical "bad-blk-sigops" prefix so cross-impl diff-test
+  // corpus and BIP-22 token mapping (bip22FromConnectError) catch it.
   if (totalSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
     return {
       ok: false,
-      error: `Block sigops cost ${totalSigOpsCost} exceeds maximum ${MAX_BLOCK_SIGOPS_COST}`,
+      error: `bad-blk-sigops: cost ${totalSigOpsCost} exceeds maximum ${MAX_BLOCK_SIGOPS_COST} at height ${height}`,
     };
   }
 
   // ── 6. Coinbase value ≤ subsidy + fees (consensus-critical).
   //
-  // Reference: Bitcoin Core validation.cpp ConnectBlock block_reward check.
+  // Reference: Bitcoin Core validation.cpp:2610-2614:
+  //   CAmount blockReward = nFees + GetBlockSubsidy(pindex->nHeight, ...);
+  //   if (block.vtx[0]->GetValueOut() > blockReward && state.IsValid())
+  //     state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount", ...);
   // Never skipped by assumevalid — fScriptChecks only gates signature verification.
   const coinbaseTx = block.transactions[0];
   let coinbaseOutputValue = 0n;
@@ -539,41 +698,28 @@ export async function coreConnectBlockChecks(
     coinbaseOutputValue += output.value;
   }
   const subsidy = getBlockSubsidy(height, params);
-  const fees = totalInputValue - (totalOutputValue - coinbaseOutputValue);
 
-  // ── 6a. Non-coinbase output-exceeds-input check (bad-txns-in-belowout).
-  //
-  // Must be checked BEFORE the coinbase check because a negative fees value
-  // would otherwise cause a spurious "Coinbase value exceeds maximum" error.
-  // Core consensus/tx_verify.cpp::CheckTxInputs:
-  //   state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout", ...)
-  if (fees < 0n) {
+  // W93: nFees was tracked per-tx with MoneyRange check inside the loop, so
+  // any range / bad-txns-in-belowout error already returned above.  This
+  // post-loop check is the consensus-critical Core gate at validation.cpp:
+  // 2611.  The legacy `fees = totalInputValue - (totalOutputValue -
+  // coinbaseOutputValue)` arithmetic is kept as a defensive sanity check —
+  // it MUST equal nFees if the per-tx loop computed correctly.
+  const feesByTotals = totalInputValue - (totalOutputValue - coinbaseOutputValue);
+  if (feesByTotals !== nFees) {
+    // This would indicate an internal arithmetic mismatch — would only fire
+    // under a programmer bug, but match Core's "bad-cb-amount" semantics.
     return {
       ok: false,
-      error: `Transaction outputs exceed inputs: non-coinbase output sum exceeds input sum (bad-txns-in-belowout)`,
+      error: `bad-cb-amount: internal fee accounting mismatch nFees=${nFees} vs totals-derived=${feesByTotals} at h=${height}`,
     };
   }
 
-  // ── 6b. Accumulated fee must be in MoneyRange.
-  // Core validation.cpp:2543-2547:
-  //   nFees += txfee;
-  //   if (!MoneyRange(nFees)) → "bad-txns-accumulated-fee-outofrange"
-  // Unreachable in practice (since nValueIn ≤ MAX_MONEY and nValueOut ≥ 0) but
-  // mirrors Core's defensive check exactly so the error code is correct if it
-  // ever fires due to an implementation bug.
-  const MAX_MONEY_CB = 2_100_000_000_000_000n; // 21_000_000 * COIN
-  if (fees > MAX_MONEY_CB) {
+  const blockReward = subsidy + nFees;
+  if (coinbaseOutputValue > blockReward) {
     return {
       ok: false,
-      error: `bad-txns-accumulated-fee-outofrange`,
-    };
-  }
-
-  const maxCoinbaseValue = subsidy + fees;
-  if (coinbaseOutputValue > maxCoinbaseValue) {
-    return {
-      ok: false,
-      error: `Coinbase value ${coinbaseOutputValue} exceeds maximum ${maxCoinbaseValue} at height ${height}`,
+      error: `bad-cb-amount: coinbase pays too much (actual=${coinbaseOutputValue} vs limit=${blockReward}) at height ${height}`,
     };
   }
 

@@ -255,8 +255,11 @@ describe("ChainStateManager", () => {
       const coinbase = createCoinbaseTx(1, 100_00000000n); // 100 BTC instead of 50
       const block = createBlock(REGTEST.genesisBlockHash, [coinbase]);
 
+      // W93: canonical reject reason is now "bad-cb-amount" (matches Core
+      // validation.cpp:2612).  Legacy "exceeds maximum" prose kept in the
+      // regex for backward-compat with any downstream consumer.
       await expect(chainState.connectBlock(block, 1)).rejects.toThrow(
-        /exceeds maximum|exceeds subsidy/
+        /bad-cb-amount|exceeds maximum|exceeds subsidy/
       );
     });
   });
