@@ -749,9 +749,13 @@ describe("locktime filtering in block template", () => {
     const inputTxid = Buffer.alloc(32, 0xaa);
     await setupUTXO(inputTxid, 0, 100000n);
 
-    // Create a tx with lockTime set to a future height (200 + some margin)
-    // Chain tip is at height 0 (genesis), so next block will be height 1
-    // But we set mempool tip to 200, so next block template is for height ~1
+    // Create a tx with lockTime set to a future height (9999) when tip is 200.
+    // nextHeight = 201, and 9999 > 201 with non-SEQUENCE_FINAL input → non-final.
+    // Core behavior (BIP-113 / CheckFinalTxAtTip): the mempool REJECTS non-final
+    // transactions at entry time, so the tx never reaches the block template.
+    // This test was updated (W81) to reflect the W80 IsFinalTx enforcement at
+    // mempool entry — previously the test assumed non-final txs could be in the
+    // mempool and that the template builder would filter them out.
     const tx: Transaction = {
       version: 2,
       inputs: [
@@ -766,15 +770,16 @@ describe("locktime filtering in block template", () => {
         { value: 90000n, scriptPubKey: Buffer.from([0x51, 0x02, 0x4e, 0x73]) }, // P2A
         { value: 0n, scriptPubKey: Buffer.from([0x6a]) }, // OP_RETURN padding (≥65 bytes)
       ],
-      lockTime: 9999, // Far future height
+      lockTime: 9999, // Far future height (9999 > nextHeight=201)
     };
 
-    await mempool.addTransaction(tx);
-    expect(mempool.getSize()).toBe(1);
+    // W80 IsFinalTx enforcement: mempool REJECTS the non-final tx at entry.
+    const result = await mempool.addTransaction(tx);
+    expect(result.accepted).toBe(false);
+    expect(mempool.getSize()).toBe(0);
 
+    // Block template has nothing to include (tx was never admitted)
     const template = builder.createTemplate(Buffer.from([0x51]));
-
-    // The tx should NOT be included because lockTime is not satisfied
     expect(template.transactions.length).toBe(0);
   });
 

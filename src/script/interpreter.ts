@@ -1079,35 +1079,60 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
         return false;
 
       case Opcode.OP_CHECKLOCKTIMEVERIFY: {
+        // BIP-65: OP_CHECKLOCKTIMEVERIFY
+        // Reference: bitcoin-core/src/script/interpreter.cpp:522-558 (OP_CLTV case)
+        //            bitcoin-core/src/script/interpreter.cpp:1745-1779 (CheckLockTime)
         if (!flags.verifyCheckLockTimeVerify) {
           if (flags.verifyDiscourageUpgradableNops) {
             throw new ScriptError("DISCOURAGE_UPGRADABLE_NOPS");
           }
-          break; // Treated as NOP
+          break; // Treated as NOP2
         }
-        if (stack.length < 1) return false;
-        // Value is checked but not popped
+        // Gate 1: empty stack → invalid stack operation
+        if (stack.length < 1) throw new ScriptError("INVALID_STACK_OPERATION");
+        // Gate 2: 5-byte script num (year-2038-safe, per BIP-65 §Motivation)
+        // Value is checked but NOT popped
         const locktime = scriptNumDecode(stack[stack.length - 1], 5);
+        // Gate 3: negative operand → reject
         if (locktime < 0) throw new ScriptError("NEGATIVE_LOCKTIME");
 
-        // Compare against tx locktime (if context available)
-        if (ctx.txLockTime !== undefined) {
-          const txLockTime = ctx.txLockTime;
-          // Both must be in the same domain (block height vs time)
-          const LOCKTIME_THRESHOLD = 500000000;
-          if (
-            (locktime < LOCKTIME_THRESHOLD && txLockTime >= LOCKTIME_THRESHOLD) ||
-            (locktime >= LOCKTIME_THRESHOLD && txLockTime < LOCKTIME_THRESHOLD)
-          ) {
-            throw new ScriptError("UNSATISFIED_LOCKTIME");
-          }
-          if (locktime > txLockTime) {
-            throw new ScriptError("UNSATISFIED_LOCKTIME");
-          }
-          // Sequence must not be final (0xFFFFFFFF disables locktime check)
-          if (ctx.txSequence !== undefined && ctx.txSequence === 0xFFFFFFFF) {
-            throw new ScriptError("UNSATISFIED_LOCKTIME");
-          }
+        // Gates 4-6: require txLockTime / txSequence from spending context.
+        // Missing context is treated as UNSATISFIED (fail-safe, not fail-open).
+        // Pre-fix bug: `if (ctx.txLockTime !== undefined)` wrapped all checks,
+        // letting scripts with CLTV pass silently when no txContext was supplied
+        // (e.g. in verifyWitnessV0 / executeTapscript, which didn't thread it).
+        // Core ref: CheckLockTime() is always called unconditionally — there is
+        // no "no context" code path in the C++ checker.
+        if (ctx.txLockTime === undefined) {
+          throw new ScriptError("UNSATISFIED_LOCKTIME");
+        }
+        const txLockTime = ctx.txLockTime;
+
+        // Gate 4: both must be in the same domain (block-height vs. block-time).
+        // LOCKTIME_THRESHOLD = 500_000_000 (script/script.h:47)
+        const LOCKTIME_THRESHOLD = 500_000_000;
+        if (
+          (locktime < LOCKTIME_THRESHOLD && txLockTime >= LOCKTIME_THRESHOLD) ||
+          (locktime >= LOCKTIME_THRESHOLD && txLockTime < LOCKTIME_THRESHOLD)
+        ) {
+          throw new ScriptError("UNSATISFIED_LOCKTIME");
+        }
+
+        // Gate 5: operand must be <= tx nLockTime (Core: if nLockTime > txTo->nLockTime return false)
+        if (locktime > txLockTime) {
+          throw new ScriptError("UNSATISFIED_LOCKTIME");
+        }
+
+        // Gate 6: spending input's nSequence must not be SEQUENCE_FINAL (0xffffffff).
+        // When all inputs are final, nLockTime is ignored by IsFinalTx, which
+        // would make CLTV bypassable.  Core: if SEQUENCE_FINAL == txTo->vin[nIn].nSequence return false.
+        // Pre-fix bug: `if (ctx.txSequence !== undefined && ...)` — double-optional
+        // guard skipped the check when txSequence was absent.
+        if (ctx.txSequence === undefined) {
+          throw new ScriptError("UNSATISFIED_LOCKTIME");
+        }
+        if (ctx.txSequence === 0xFFFFFFFF) {
+          throw new ScriptError("UNSATISFIED_LOCKTIME");
         }
         break;
       }
@@ -2189,10 +2214,10 @@ export function verifyScript(
     // Check for P2SH-wrapped witness
     if (flags.verifyWitness) {
       if (isP2WPKH(redeemScript)) {
-        return verifyWitnessV0(redeemScript, witness, flags, witnessSigHasher ?? sigHasher);
+        return verifyWitnessV0(redeemScript, witness, flags, witnessSigHasher ?? sigHasher, txContext);
       }
       if (isP2WSH(redeemScript)) {
-        return verifyWitnessV0(redeemScript, witness, flags, witnessSigHasher ?? sigHasher);
+        return verifyWitnessV0(redeemScript, witness, flags, witnessSigHasher ?? sigHasher, txContext);
       }
       if (isWitnessProgram(redeemScript)) {
         // P2SH-wrapped witness: check v0 program length
@@ -2227,7 +2252,7 @@ export function verifyScript(
       if (scriptSig.length !== 0) {
         return false;
       }
-      return verifyWitnessV0(scriptPubKey, witness, flags, witnessSigHasher ?? sigHasher);
+      return verifyWitnessV0(scriptPubKey, witness, flags, witnessSigHasher ?? sigHasher, txContext);
     }
 
     if (flags.verifyTaproot && isP2TR(scriptPubKey)) {
@@ -2235,7 +2260,7 @@ export function verifyScript(
         return false;
       }
       // Full taproot verification
-      return verifyTaproot(scriptPubKey, witness, flags, taprootCtx);
+      return verifyTaproot(scriptPubKey, witness, flags, taprootCtx, txContext);
     }
 
     // P2A (Pay-to-Anchor): anyone-can-spend with empty witness
@@ -2300,7 +2325,8 @@ export function verifyTaproot(
   scriptPubKey: Buffer,
   witness: Buffer[],
   flags: ScriptFlags,
-  taprootCtx?: TaprootContext
+  taprootCtx?: TaprootContext,
+  txContext?: { txVersion: number; txLockTime: number; txSequence: number }
 ): boolean {
   // P2TR: OP_1 <32 bytes>
   // Output key Q is the 32-byte x-only pubkey in scriptPubKey
@@ -2331,7 +2357,7 @@ export function verifyTaproot(
     // BIP-342 validation-weight budget seed — Core's
     // ::GetSerializeSize(witness.stack) at interpreter.cpp:1981
     // counts annex + control + script + args.
-    return verifyTaprootScriptPath(outputKeyBytes, witnessStack, witness, annexHash, flags, taprootCtx);
+    return verifyTaprootScriptPath(outputKeyBytes, witnessStack, witness, annexHash, flags, taprootCtx, txContext);
   }
 }
 
@@ -2414,7 +2440,8 @@ function verifyTaprootScriptPath(
   fullWitness: Buffer[],
   annexHash: Buffer | undefined,
   flags: ScriptFlags,
-  taprootCtx?: TaprootContext
+  taprootCtx?: TaprootContext,
+  txContext?: { txVersion: number; txLockTime: number; txSequence: number }
 ): boolean {
   if (witnessStack.length < 2) {
     return false;
@@ -2489,7 +2516,7 @@ function verifyTaprootScriptPath(
 
   // If leaf version is 0xC0 (tapscript), execute the script with BIP-342 rules
   if (leafVersion === TAPROOT_LEAF_TAPSCRIPT) {
-    return executeTapscript(tapscript, stack, leafHash, annexHash, flags, taprootCtx, fullWitness);
+    return executeTapscript(tapscript, stack, leafHash, annexHash, flags, taprootCtx, fullWitness, txContext);
   }
 
   // Unknown leaf version: succeed (future extensibility)
@@ -2605,6 +2632,7 @@ function executeTapscript(
   flags: ScriptFlags,
   taprootCtx?: TaprootContext,
   fullWitness?: Buffer[],
+  txContext?: { txVersion: number; txLockTime: number; txSequence: number }
 ): boolean {
   if (!taprootCtx) {
     throw new ScriptError("TAPROOT_CONTEXT_MISSING");
@@ -2647,6 +2675,9 @@ function executeTapscript(
   };
 
   // Execute with tapscript rules
+  // W81 fix: thread txContext so CLTV/CSV in tapscript can access nLockTime
+  // and nSequence.  Pre-fix: ctx had no txVersion/txLockTime/txSequence,
+  // so every OP_CLTV / OP_CSV in a tapscript silently passed (fail-open).
   const ctx: ExecutionContext = {
     stack: [...stack],
     altStack: [],
@@ -2655,6 +2686,9 @@ function executeTapscript(
     sigVersion: SigVersion.TAPSCRIPT,
     taprootSigHasher,
     sigopsBudget,
+    txVersion: txContext?.txVersion,
+    txLockTime: txContext?.txLockTime,
+    txSequence: txContext?.txSequence,
   };
 
   if (!executeScript(parsedScript, ctx)) {
@@ -2679,7 +2713,8 @@ function verifyWitnessV0(
   witnessProgram: Buffer,
   witness: Buffer[],
   flags: ScriptFlags,
-  sigHasher: (subscript: Buffer, hashType: number) => Buffer
+  sigHasher: (subscript: Buffer, hashType: number) => Buffer,
+  txContext?: { txVersion: number; txLockTime: number; txSequence: number }
 ): boolean {
   const programHash = witnessProgram.subarray(2);
 
@@ -2706,12 +2741,18 @@ function verifyWitnessV0(
     // Per BIP 141, MINIMALIF is enforced unconditionally in witness v0 (P2WSH)
     const witnessFlags: ScriptFlags = { ...flags, verifyMinimalIf: true };
 
+    // W81 fix: thread txContext so CLTV/CSV in P2WPKH redeem scripts can
+    // access nLockTime and nSequence.  Pre-fix: ctx had no txVersion/txLockTime/
+    // txSequence fields, so every CLTV in a witness-v0 script silently passed.
     const ctx: ExecutionContext = {
       stack: witnessStack,
       altStack: [],
       flags: witnessFlags,
       sigHasher,
       sigVersion: SigVersion.WITNESS_V0,
+      txVersion: txContext?.txVersion,
+      txLockTime: txContext?.txLockTime,
+      txSequence: txContext?.txSequence,
     };
 
     if (!executeScript(parsedScript, ctx)) {
@@ -2763,12 +2804,18 @@ function verifyWitnessV0(
     // Per BIP 141, MINIMALIF is enforced unconditionally in witness v0 (P2WSH)
     const witnessFlags: ScriptFlags = { ...flags, verifyMinimalIf: true };
 
+    // W81 fix: thread txContext so CLTV/CSV in P2WSH redeem scripts can
+    // access nLockTime and nSequence.  Pre-fix: ctx had no txVersion/txLockTime/
+    // txSequence fields, so every CLTV in a P2WSH script silently passed.
     const ctx: ExecutionContext = {
       stack: witnessStack,
       altStack: [],
       flags: witnessFlags,
       sigHasher,
       sigVersion: SigVersion.WITNESS_V0,
+      txVersion: txContext?.txVersion,
+      txLockTime: txContext?.txLockTime,
+      txSequence: txContext?.txSequence,
     };
 
     if (!executeScript(parsedScript, ctx)) {
