@@ -658,14 +658,19 @@ describe("ChainStateManager", () => {
       }
     });
 
-    test("connectBlock with MAINNET-like params allows h=91842 (exempt)", async () => {
+    test("connectBlock at h=91842 with wrong hash enforces BIP-30 (exemption requires height AND hash)", async () => {
+      // W79 fix: IsBIP30Repeat checks BOTH height AND block hash.
+      // A synthetic block at h=91842 with a different hash from the canonical
+      // mainnet block (00000000000a4d0a...) must NOT be exempt — it's an
+      // alternative-chain block and must still enforce BIP-30.
+      // Reference: Bitcoin Core validation.cpp:6189-6192 IsBIP30Repeat().
       const { MAINNET } = await import("../consensus/params.js");
       const customParams = {
         ...MAINNET,
         bip34Height: 200_000, // BIP34 not active at h=91842
       };
 
-      const testDir = await mkdtemp(join(tmpdir(), "bip30-exempt-test-"));
+      const testDir = await mkdtemp(join(tmpdir(), "bip30-hash-check-test-"));
       const testDb = new ChainDB(testDir);
       await testDb.open();
       const testChainState = new ChainStateManager(testDb, customParams);
@@ -677,9 +682,9 @@ describe("ChainStateManager", () => {
         const block1 = createBlock(customParams.genesisBlockHash, [coinbase1]);
         await testChainState.connectBlock(block1, 1);
 
-        // Duplicate coinbase at h=91842 (exempt height) must NOT throw BIP30.
-        // It may fail for other reasons (e.g., coinbase maturity, subsidy), but
-        // not specifically "bad-txns-BIP30".
+        // Duplicate coinbase at h=91842 — the synthetic blockDup will NOT have
+        // the canonical hash "00000000000a4d0a..." so the exemption does NOT apply.
+        // BIP-30 must fire because coinbase1's txid is already in the UTXO set.
         const coinbaseDup = { ...coinbase1 };
         const prevHash1 = getBlockHash(block1.header);
         const blockDup = createBlock(prevHash1, [coinbaseDup]);
@@ -691,9 +696,9 @@ describe("ChainStateManager", () => {
           if (e instanceof Error && e.message.includes("bad-txns-BIP30")) {
             threwBip30 = true;
           }
-          // Other errors (coinbase value, etc.) are fine — BIP30 is exempt
         }
-        expect(threwBip30).toBe(false);
+        // The synthetic block does NOT have the canonical hash, so BIP-30 fires.
+        expect(threwBip30).toBe(true);
       } finally {
         await testDb.close();
         await rm(testDir, { recursive: true, force: true });
