@@ -759,13 +759,20 @@ export class HeaderSync {
         return;
       }
 
+      // Compute the chain start's Median Time Past so HeadersSyncState can
+      // correctly bound maxCommitments to elapsed time since chain start
+      // (not since Unix epoch 0). Reference: headerssync.cpp:41-43.
+      const chainStartMTP = this.getMedianTimePast(chainStart);
+
       const syncState = new HeadersSyncState(
         this.params,
         this.syncParams,
         chainStart.hash,
         chainStart.height,
         chainStart.header.bits,
-        chainStart.chainWork
+        chainStart.chainWork,
+        undefined, // use params.nMinimumChainWork
+        chainStartMTP
       );
 
       this.peerSyncStates.set(peerKey, {
