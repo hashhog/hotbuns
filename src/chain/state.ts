@@ -32,6 +32,7 @@ import {
   SpentUTXO,
   serializeUndoData,
   deserializeUndoData,
+  DisconnectResult,
 } from "./utxo.js";
 import { ConsensusError, ConsensusErrorCode } from "../validation/errors.js";
 import { BufferReader } from "../wire/serialization.js";
@@ -422,37 +423,176 @@ export class ChainStateManager {
 
     const spentOutputs = deserializeUndoData(undoData);
 
-    // Create a map for quick lookup of spent outputs by outpoint
-    const spentByOutpoint = new Map<string, UTXOEntry>();
-    for (const spent of spentOutputs) {
-      const key = `${spent.txid.toString("hex")}:${spent.vout}`;
-      spentByOutpoint.set(key, spent.entry);
+    // ── W92 Core gate: blockUndo / block size consistency ──
+    //
+    // Mirrors bitcoin-core/src/validation.cpp:2190-2193 — Core checks
+    // `blockUndo.vtxundo.size() + 1 != block.vtx.size()` and aborts the
+    // disconnect on mismatch.  The +1 accounts for the coinbase (which
+    // has no input-undo records).
+    //
+    // Without this gate a truncated/corrupted undo file would only
+    // manifest as a "Missing undo entry for X" error mid-way through
+    // the reverse walk, leaving the UTXO set half-restored on disk.
+    // With the gate the disconnect aborts cleanly *before* any UTXO
+    // mutation.
+    //
+    // Note: hotbuns stores undo data as a flat list of per-input
+    // SpentUTXO records rather than Core's nested per-tx vtxundo, so
+    // the equivalent invariant is:
+    //   spentOutputs.length === sum(tx.inputs.length for non-coinbase tx)
+    let expectedUndoEntries = 0;
+    for (let i = 1; i < block.transactions.length; i++) {
+      expectedUndoEntries += block.transactions[i].inputs.length;
+    }
+    if (spentOutputs.length !== expectedUndoEntries) {
+      throw new Error(
+        `DisconnectBlock(): block and undo data inconsistent ` +
+          `(undo has ${spentOutputs.length} entries, expected ${expectedUndoEntries})`
+      );
     }
 
-    // Process transactions in reverse order
+    // Create a map for quick lookup of spent outputs by outpoint.  We keep
+    // a separate per-tx queue too so we can validate the per-tx undo size
+    // gate below (Core validation.cpp:2229).
+    const spentByOutpoint = new Map<string, SpentUTXO>();
+    for (const spent of spentOutputs) {
+      const key = `${spent.txid.toString("hex")}:${spent.vout}`;
+      spentByOutpoint.set(key, spent);
+    }
+
+    // ── W92 Core gate: disconnect-side BIP-30 exception ──
+    //
+    // Mirrors bitcoin-core/src/validation.cpp:2201-2202.  When
+    // disconnecting one of the two mainnet blocks immediately preceding
+    // a duplicate-coinbase (h=91722 or h=91812), the post-disconnect
+    // UTXO set is intentionally inconsistent with the block's outputs
+    // (because the LATER duplicate-coinbase block at h=91842 / h=91880
+    // re-added the same outpoint).  Core suppresses the output-mismatch
+    // fClean flag at these exact (height, hash) tuples.
+    const blockHashHex = Buffer.from(blockHash).reverse().toString("hex");
+    const fEnforceBIP30 = !this.params.bip30DisconnectExceptionBlocks.some(
+      (ex) => ex.height === height && ex.blockHashHex === blockHashHex
+    );
+
+    // Tracks whether the disconnect ran clean.  Core also returns
+    // DISCONNECT_UNCLEAN here; we surface it as a structured log line
+    // because we don't propagate the tristate further up (DisconnectTip
+    // does not abort on UNCLEAN in Core either — it just notes the
+    // inconsistency and keeps going).
+    let fClean = true;
+
+    // Process transactions in reverse order — Core validation.cpp:2205.
     for (let txIndex = block.transactions.length - 1; txIndex >= 0; txIndex--) {
       const tx = block.transactions[txIndex];
       const txid = getTxId(tx);
       const txIsCoinbase = isCoinbase(tx);
+      const isBIP30ExceptionTx = txIsCoinbase && !fEnforceBIP30;
 
-      // Remove outputs (they were created by this block)
-      for (let vout = 0; vout < tx.outputs.length; vout++) {
-        await this.utxo.removeUTXO(txid, vout);
+      // ── W92 Core gate: per-output match check ──
+      //
+      // Core validation.cpp:2213-2224 walks every output of the tx and
+      // verifies:
+      //   - the output exists in the view (`is_spent` after SpendCoin)
+      //   - `tx.vout[o] == coin.out`              (value + scriptPubKey)
+      //   - `pindex->nHeight == coin.nHeight`     (creation height)
+      //   - `is_coinbase == coin.fCoinBase`       (coinbase flag)
+      // Unspendable outputs are skipped (they were never in the UTXO set).
+      // Any mismatch flips fClean to false UNLESS this is a BIP-30
+      // exception coinbase tx.
+      for (let o = 0; o < tx.outputs.length; o++) {
+        const outScript = tx.outputs[o].scriptPubKey;
+        // Mirrors `if (!tx.vout[o].scriptPubKey.IsUnspendable())` — Core
+        // skips unspendable outputs from the match check because they
+        // were never AddCoin'd.  Hotbuns's CoinsViewCache.addCoin gate
+        // (W92) matches: OP_RETURN-prefixed or > MAX_SCRIPT_SIZE.
+        const unspendable =
+          (outScript.length > 0 && outScript[0] === 0x6a) ||
+          outScript.length > 10000;
+        if (unspendable) continue;
+
+        const spentCoin = await this.utxo.removeUTXO(txid, o);
+        const isSpent = spentCoin !== null;
+        const valueMatches = spentCoin && spentCoin.txOut.value === tx.outputs[o].value;
+        const scriptMatches =
+          spentCoin && spentCoin.txOut.scriptPubKey.equals(tx.outputs[o].scriptPubKey);
+        const heightMatches = spentCoin && spentCoin.height === height;
+        const coinbaseMatches = spentCoin && spentCoin.isCoinbase === txIsCoinbase;
+        if (
+          !isSpent ||
+          !valueMatches ||
+          !scriptMatches ||
+          !heightMatches ||
+          !coinbaseMatches
+        ) {
+          if (!isBIP30ExceptionTx) {
+            fClean = false; // transaction output mismatch
+          }
+        }
       }
 
-      // Restore spent inputs (for non-coinbase)
+      // Restore spent inputs (for non-coinbase).  Core
+      // validation.cpp:2227-2241.
       if (!txIsCoinbase) {
+        // ── W92 Core gate: per-tx undo size check ──
+        // Core line 2229: txundo.vprevout.size() != tx.vin.size().
+        const expectedInputs = tx.inputs.length;
+        let foundInputs = 0;
         for (const input of tx.inputs) {
           const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
-          const entry = spentByOutpoint.get(key);
-          if (!entry) {
+          if (spentByOutpoint.has(key)) foundInputs++;
+        }
+        if (foundInputs !== expectedInputs) {
+          throw new Error(
+            `DisconnectBlock(): transaction and undo data inconsistent ` +
+              `(tx ${txid.toString("hex").slice(0, 16)} has ${expectedInputs} inputs, ` +
+              `found ${foundInputs} undo entries)`
+          );
+        }
+
+        // ── W92 Core gate: reverse-iterate inputs ──
+        // Core validation.cpp:2233 walks `for (j = tx.vin.size(); j > 0;)
+        // { --j; ... }` — reverse order on inputs as well as txs.
+        // Defensive: matters when undo entries are positional and
+        // intra-block input dependencies exist.
+        for (let j = tx.inputs.length - 1; j >= 0; j--) {
+          const input = tx.inputs[j];
+          const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+          const spent = spentByOutpoint.get(key);
+          if (!spent) {
+            // Already caught by the size check above, but be explicit.
             throw new Error(
               `Missing undo entry for ${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`
             );
           }
-          this.utxo.restoreUTXO(input.prevOut.txid, input.prevOut.vout, entry);
+          // ── W92 Core gate: ApplyTxInUndo tristate ──
+          // Replaces direct `restoreUTXO` with the Core-faithful helper
+          // that runs HaveCoin → fClean=false, AccessByTxid metadata
+          // recovery, and sets the AddCoin overwrite flag correctly.
+          // Reference: validation.cpp:2149-2175.
+          const res = await this.utxo.applyInputUndo(spent, input.prevOut);
+          if (res === DisconnectResult.DISCONNECT_FAILED) {
+            throw new Error(
+              `DisconnectBlock(): ApplyTxInUndo failed for ${input.prevOut.txid
+                .toString("hex")
+                .slice(0, 16)}:${input.prevOut.vout} ` +
+                `(missing metadata, no sibling output)`
+            );
+          }
+          if (res === DisconnectResult.DISCONNECT_UNCLEAN) {
+            fClean = false;
+          }
         }
       }
+    }
+
+    // Surface UNCLEAN as a single log line per disconnected block, in
+    // line with Core's `LogError` for UNCLEAN cases (Core flows it up to
+    // DisconnectTip which logs via `BENCH`/`PRUNE` macros).
+    if (!fClean) {
+      console.warn(
+        `[disconnect] block ${blockHash.toString("hex").slice(0, 16)} at h=${height} ` +
+          `disconnected with UTXO inconsistencies (DISCONNECT_UNCLEAN)`
+      );
     }
 
     // ── Pattern D: single-batch atomicity for disconnectBlock ──
@@ -477,6 +617,17 @@ export class ChainStateManager {
     const prevHash = block.header.prevBlock;
     const work = this.calculateWork(block.header.bits);
     const prevChainWork = this.bestBlock.chainWork - work;
+
+    // ── W92 Core gate: move UTXO view's best-block pointer to pprev ──
+    //
+    // Mirrors bitcoin-core/src/validation.cpp:2245 —
+    //   view.SetBestBlock(pindex->pprev->GetBlockHash());
+    // Done BEFORE the flush so the persisted chainstate's hashBlock
+    // field matches the new tip atomically with the UTXO mutations
+    // and chain-state row.  Without this the CoinsViewCache's
+    // hashBlock can lag the on-disk chainstate by one block, and a
+    // subsequent connect would assert against the wrong best-block.
+    this.utxo.setBestBlock(prevHash);
 
     const extraOps: BatchOperation[] = [];
 
@@ -554,8 +705,30 @@ export class ChainStateManager {
     newTip: HeaderChainEntry,
     getBlock: (hash: Buffer) => Promise<Block | null>
   ): Promise<void> {
+    // ── W92 Core gate: bound reorg depth ──
+    //
+    // Mirrors bitcoin-core/src/validation.cpp's reorg dispatcher which
+    // caps any single reorg at 100 blocks via nMaxReorgDepth.  The
+    // BlockSync path (sync/blocks.ts::handleReorgUtxoAndCollect) already
+    // applies this cap; the chain/state.ts reorganize() path (generateblock,
+    // dumptxoutset rollback, invalidateblock RPC) previously walked
+    // unbounded, allowing a buggy caller or malicious sub-chain to OOM
+    // by passing a deep newTip.
+    //
+    // Use the same value as handleReorgUtxoAndCollect for fleet-wide
+    // consistency.  100 blocks is conservative; testnet reorgs of this
+    // depth have never been observed on mainnet outside testing.
+    const MAX_REORG_DEPTH = 100;
+
     // Find the fork point
     const { oldBlocks, newBlocks } = await this.findForkPoint(newTip, getBlock);
+
+    if (oldBlocks.length > MAX_REORG_DEPTH || newBlocks.length > MAX_REORG_DEPTH) {
+      throw new Error(
+        `reorganize(): reorg depth exceeds MAX_REORG_DEPTH=${MAX_REORG_DEPTH} ` +
+          `(old=${oldBlocks.length}, new=${newBlocks.length})`
+      );
+    }
 
     // Disconnect old blocks (in reverse order, from tip to fork)
     for (const { block, height } of oldBlocks.reverse()) {

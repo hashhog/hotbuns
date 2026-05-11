@@ -55,6 +55,35 @@ export interface ConsensusParams {
    */
   readonly bip30ExceptionBlocks: ReadonlyArray<{ height: number; blockHashHex: string }>;
   /**
+   * BIP-30 exception blocks for the DISCONNECT walk.
+   *
+   * Mirrors bitcoin-core/src/validation.cpp:2201-2202 — these are the
+   * heights/hashes of the blocks that were *overwritten by* the BIP-30
+   * duplicate-coinbase blocks (91842 and 91880), not the duplicates
+   * themselves.  DisconnectBlock unwinds in reverse, so the inconsistency
+   * surfaces when the EARLIER block is being disconnected (its outputs
+   * have already been re-written by the later duplicate).
+   *
+   * On mainnet the two heights are:
+   *   h=91722, hash=00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e
+   *   h=91812, hash=00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f
+   *
+   * When disconnecting one of these blocks, the post-disconnect UTXO set
+   * is intentionally inconsistent with the block's own outputs (because
+   * the LATER block at 91842/91880 created the SAME tx-output that this
+   * earlier block already created — i.e. when this earlier block is
+   * disconnected, its outputs are still in the UTXO set because the
+   * duplicate-coinbase block also added them).  Core marks the disconnect
+   * UNCLEAN-but-allowed at these heights — we mirror by silencing the
+   * output-mismatch fClean flag for these exact (height, hash) tuples.
+   *
+   * See https://github.com/bitcoin/bitcoin/issues/22596 for full history.
+   */
+  readonly bip30DisconnectExceptionBlocks: ReadonlyArray<{
+    height: number;
+    blockHashHex: string;
+  }>;
+  /**
    * @deprecated Use bip30ExceptionBlocks instead (height-only check is incorrect).
    * Kept for backward compatibility with existing tests; will be removed.
    */
@@ -394,6 +423,18 @@ export const MAINNET: ConsensusParams = {
       blockHashHex: "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721",
     },
   ],
+  // Disconnect-side BIP-30 exceptions — different blocks (one height
+  // before each duplicate above).  Mirrors validation.cpp:2201-2202.
+  bip30DisconnectExceptionBlocks: [
+    {
+      height: 91722,
+      blockHashHex: "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e",
+    },
+    {
+      height: 91812,
+      blockHashHex: "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f",
+    },
+  ],
   // Kept for backward compat; bip30ExceptionBlocks is the authoritative field.
   bip30ExceptionHeights: [91842, 91880],
   // BIP34Hash: block hash at h=227931 on mainnet canonical chain (display byte order).
@@ -692,6 +733,7 @@ export const TESTNET: ConsensusParams = {
   segwitHeight: 834624,
   taprootHeight: 0,
   bip30ExceptionBlocks: [], // No BIP-30 exceptions on testnet3
+  bip30DisconnectExceptionBlocks: [], // No BIP-30 disconnect-side exceptions on testnet3
   bip30ExceptionHeights: [], // No BIP-30 exceptions on testnet3
   // BIP34Hash: block hash at h=21111 on testnet3 canonical chain (display byte order, reversed to LE).
   // Reference: Bitcoin Core kernel/chainparams.cpp:213.
@@ -811,6 +853,7 @@ export const TESTNET4: ConsensusParams = {
   segwitHeight: 1,
   taprootHeight: 1,
   bip30ExceptionBlocks: [], // No BIP-30 exceptions on testnet4
+  bip30DisconnectExceptionBlocks: [], // No BIP-30 disconnect-side exceptions on testnet4
   bip30ExceptionHeights: [], // No BIP-30 exceptions on testnet4
   // BIP34 active from height 1 on testnet4; no canonical BIP34Hash needed.
   bip34Hash: null,
@@ -921,6 +964,7 @@ export const SIGNET: ConsensusParams = {
   segwitHeight: 1,
   taprootHeight: 1,
   bip30ExceptionBlocks: [], // No BIP-30 exceptions on signet
+  bip30DisconnectExceptionBlocks: [], // No BIP-30 disconnect-side exceptions on signet
   bip30ExceptionHeights: [], // No BIP-30 exceptions on signet
   // BIP34 active from height 1 on signet; no canonical BIP34Hash needed.
   bip34Hash: null,
@@ -969,6 +1013,7 @@ export const REGTEST: ConsensusParams = {
   segwitHeight: 0,
   taprootHeight: 0,
   bip30ExceptionBlocks: [], // No BIP-30 exceptions on regtest
+  bip30DisconnectExceptionBlocks: [], // No BIP-30 disconnect-side exceptions on regtest
   bip30ExceptionHeights: [], // No BIP-30 exceptions on regtest
   // BIP34 active from height 1 on regtest; no canonical BIP34Hash needed.
   bip34Hash: null,

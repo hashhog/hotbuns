@@ -1672,6 +1672,24 @@ export class BlockSync {
       return false;
     }
 
+    // ── W92 Core gate: blockUndo / block size consistency ──
+    //
+    // Mirrors bitcoin-core/src/validation.cpp:2190-2193.  Aborts the
+    // disconnect BEFORE any UTXO mutation when the undo file is
+    // truncated/corrupted, so we don't leave the UTXO set half-restored.
+    let expectedUndoEntries = 0;
+    for (let i = 1; i < block.transactions.length; i++) {
+      expectedUndoEntries += block.transactions[i].inputs.length;
+    }
+    if (spentOutputs.length !== expectedUndoEntries) {
+      console.warn(
+        `[reorg-disconnect] block and undo data inconsistent for ${blockHash
+          .toString("hex")
+          .slice(0, 16)} at h=${height}: undo has ${spentOutputs.length} entries, expected ${expectedUndoEntries}`
+      );
+      return false;
+    }
+
     // Build per-outpoint lookup so the per-input restore can find
     // the matching SpentUTXO without an O(n²) loop.
     const spentByOutpoint = new Map<string, (typeof spentOutputs)[0]>();
@@ -1680,22 +1698,63 @@ export class BlockSync {
       spentByOutpoint.set(key, spent);
     }
 
+    // ── W92 Core gate: disconnect-side BIP-30 exception ──
+    //
+    // Mirrors bitcoin-core/src/validation.cpp:2201-2202.  See the
+    // disconnect-side BIP30 doc on bip30DisconnectExceptionBlocks in
+    // consensus/params.ts.
+    const blockHashHex = Buffer.from(blockHash).reverse().toString("hex");
+    const fEnforceBIP30 = !this.params.bip30DisconnectExceptionBlocks.some(
+      (ex) => ex.height === height && ex.blockHashHex === blockHashHex
+    );
+
+    let fClean = true;
+    const { DisconnectResult } = await import("../chain/utxo.js");
+
     // Process transactions in reverse order so intra-block dependencies
     // unwind correctly (mirrors chain/state.ts::disconnectBlock).
     for (let txIndex = block.transactions.length - 1; txIndex >= 0; txIndex--) {
       const tx = block.transactions[txIndex];
       const txid = (await import("../validation/tx.js")).getTxId(tx);
       const txIsCoinbase = isCoinbase(tx);
+      const isBIP30ExceptionTx = txIsCoinbase && !fEnforceBIP30;
 
-      // Remove outputs created by this block (they will no longer be
-      // unspent once we go back to the pre-block state).
+      // Remove outputs created by this block.  W92 Core gate (4-way
+      // match: existence + value/scriptPubKey + height + coinbase).
+      // Unspendable outputs are skipped because they were never added
+      // in the first place — see CoinsViewCache.addCoin.
       for (let vout = 0; vout < tx.outputs.length; vout++) {
-        await this.utxoManager.removeUTXO(txid, vout);
+        const outScript = tx.outputs[vout].scriptPubKey;
+        const unspendable =
+          (outScript.length > 0 && outScript[0] === 0x6a) ||
+          outScript.length > 10000;
+        if (unspendable) continue;
+
+        const spentCoin = await this.utxoManager.removeUTXO(txid, vout);
+        const isSpent = spentCoin !== null;
+        const valueMatches = spentCoin && spentCoin.txOut.value === tx.outputs[vout].value;
+        const scriptMatches =
+          spentCoin && spentCoin.txOut.scriptPubKey.equals(tx.outputs[vout].scriptPubKey);
+        const heightMatches = spentCoin && spentCoin.height === height;
+        const coinbaseMatches = spentCoin && spentCoin.isCoinbase === txIsCoinbase;
+        if (
+          !isSpent ||
+          !valueMatches ||
+          !scriptMatches ||
+          !heightMatches ||
+          !coinbaseMatches
+        ) {
+          if (!isBIP30ExceptionTx) {
+            fClean = false;
+          }
+        }
       }
 
-      // Restore spent inputs (coinbase has none).
+      // Restore spent inputs (coinbase has none).  W92 gates: per-tx undo
+      // size check + reverse-iterate inputs + ApplyTxInUndo tristate.
       if (!txIsCoinbase) {
-        for (const input of tx.inputs) {
+        for (let j = tx.inputs.length - 1; j >= 0; j--) {
+          const input = tx.inputs[j];
           const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
           const spent = spentByOutpoint.get(key);
           if (!spent) {
@@ -1705,12 +1764,35 @@ export class BlockSync {
             console.warn(
               `[reorg-disconnect] missing undo entry for ${key} in block ${blockHash.toString("hex").slice(0, 16)}`
             );
+            fClean = false;
             continue;
           }
-          this.utxoManager.restoreUTXO(spent.txid, spent.vout, spent.entry);
+          const res = await this.utxoManager.applyInputUndo(spent, input.prevOut);
+          if (res === DisconnectResult.DISCONNECT_FAILED) {
+            console.warn(
+              `[reorg-disconnect] applyInputUndo FAILED for ${key} in block ${blockHash
+                .toString("hex")
+                .slice(0, 16)} (missing metadata + no sibling)`
+            );
+            return false;
+          }
+          if (res === DisconnectResult.DISCONNECT_UNCLEAN) {
+            fClean = false;
+          }
         }
       }
     }
+
+    if (!fClean) {
+      console.warn(
+        `[reorg-disconnect] block ${blockHash.toString("hex").slice(0, 16)} at h=${height} ` +
+          `disconnected with UTXO inconsistencies (DISCONNECT_UNCLEAN)`
+      );
+    }
+
+    // W92 Core gate: SetBestBlock(pprev) — keep the UTXO view's
+    // in-memory hashBlock aligned with the just-rolled-back state.
+    this.utxoManager.setBestBlock(block.header.prevBlock);
 
     // ── Pattern C0: revert txindex on disconnect ──
     //

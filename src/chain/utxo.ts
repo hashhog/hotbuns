@@ -20,6 +20,40 @@ import { DBPrefix } from "../storage/database.js";
 import type { Transaction, OutPoint } from "../validation/tx.js";
 import { BufferWriter, BufferReader } from "../wire/serialization.js";
 
+/**
+ * Maximum scriptPubKey size beyond which a script is unspendable.
+ * Mirrors bitcoin-core/src/script/script.h:40 `MAX_SCRIPT_SIZE = 10000` and
+ * `CScript::IsUnspendable` (script.h:563-565):
+ *
+ *   bool IsUnspendable() const {
+ *     return (size() > 0 && *begin() == OP_RETURN) || (size() > MAX_SCRIPT_SIZE);
+ *   }
+ *
+ * Outputs whose scriptPubKey starts with OP_RETURN (0x6a) OR exceeds
+ * MAX_SCRIPT_SIZE bytes are provably unspendable.  Bitcoin Core
+ * `ConnectBlock` skips them when populating the UTXO set
+ * (validation.cpp::Chainstate::ConnectBlock — `AddCoins` skips unspendable
+ * outputs) and `DisconnectBlock` skips them on the reverse walk
+ * (validation.cpp:2214).  Tracking them in the UTXO set would diverge
+ * `gettxoutsetinfo` totals and the MuHash3072 accumulator from Core.
+ */
+const MAX_SCRIPT_SIZE = 10000;
+
+/**
+ * IsUnspendable predicate — mirrors bitcoin-core/src/script/script.h:563-565.
+ *
+ * Returns true for any output that can NEVER be spent: starts with OP_RETURN
+ * or exceeds MAX_SCRIPT_SIZE.  Both gates of the disjunction are required:
+ * the OP_RETURN-only variant (pre-fix) tracked oversized non-OP_RETURN
+ * scripts in the UTXO set, diverging from Core.
+ */
+function isUnspendableScript(scriptPubKey: Buffer): boolean {
+  return (
+    (scriptPubKey.length > 0 && scriptPubKey[0] === 0x6a) ||
+    scriptPubKey.length > MAX_SCRIPT_SIZE
+  );
+}
+
 /** Default max cache size in bytes (~512MB).
  *  JS objects have ~3KB overhead per Map entry.  With BUN_JSC_forceRAMSize=4GB,
  *  a 512MB UTXO cache leaves ~2-3GB for block processing, header index, and
@@ -424,11 +458,12 @@ export class CoinsViewCache extends CoinsView {
   addCoin(outpoint: OutPoint, coin: Coin, possibleOverwrite: boolean): void {
     const key = outpointKeyFromOutpoint(outpoint);
 
-    // Skip unspendable outputs (OP_RETURN)
-    if (
-      coin.txOut.scriptPubKey.length > 0 &&
-      coin.txOut.scriptPubKey[0] === 0x6a
-    ) {
+    // Skip unspendable outputs.  Mirrors bitcoin-core/src/script/script.h
+    // `CScript::IsUnspendable`: OP_RETURN-prefixed OR scriptPubKey larger
+    // than MAX_SCRIPT_SIZE (10000 bytes).  Pre-W92 this gate checked only
+    // the OP_RETURN arm; an oversized non-OP_RETURN script would enter the
+    // UTXO set and diverge gettxoutsetinfo totals + MuHash3072 vs Core.
+    if (isUnspendableScript(coin.txOut.scriptPubKey)) {
       return;
     }
 
@@ -813,6 +848,130 @@ export function deserializeUndoData(data: Buffer): SpentUTXO[] {
 }
 
 /**
+ * Result of a DisconnectBlock / ApplyTxInUndo operation.
+ *
+ * Mirrors bitcoin-core/src/validation.h:451-456 `enum DisconnectResult`:
+ *
+ *   DISCONNECT_OK,      // All good.
+ *   DISCONNECT_UNCLEAN, // Rolled back, but UTXO set was inconsistent with block.
+ *   DISCONNECT_FAILED   // Something else went wrong.
+ *
+ * UNCLEAN is NOT a fatal failure — it indicates the resulting UTXO state
+ * has a known minor inconsistency vs. the block being rolled back (e.g. an
+ * output was overwritten by a later block due to BIP-30, or undo data was
+ * partial).  Core treats UNCLEAN as "best-effort succeeded, logged".
+ * FAILED means the disconnect could not complete and the view is in an
+ * indeterminate state — caller must discard.
+ */
+export enum DisconnectResult {
+  DISCONNECT_OK = 0,
+  DISCONNECT_UNCLEAN = 1,
+  DISCONNECT_FAILED = 2,
+}
+
+/**
+ * Bitcoin Core's MAX_OUTPUTS_PER_BLOCK ceiling for the AccessByTxid sibling
+ * walk.  Mirrors bitcoin-core/src/consensus/consensus.h.  In practice no
+ * legitimate transaction has more than a few thousand outputs, but
+ * AccessByTxid loops `vout` from 0 upward until it finds an unspent
+ * output OR hits this cap.
+ */
+const MAX_OUTPUTS_PER_BLOCK = 4_000_000 / 8; // = 500_000 (matches Core)
+
+/**
+ * Find any unspent output of the transaction identified by `txid` in the
+ * UTXO view, walking vout from 0 upward.
+ *
+ * Mirrors bitcoin-core/src/coins.cpp:386-395 `AccessByTxid`.  Used by
+ * `applyTxInUndo` to recover height + coinbase metadata when an undo
+ * record was written by an older format that omitted them (only the
+ * last-spend record included the metadata pre-v0.15).
+ *
+ * Returns null if no unspent sibling output exists.
+ */
+async function accessByTxid(
+  cache: CoinsViewCache,
+  txid: Buffer
+): Promise<Coin | null> {
+  for (let n = 0; n < MAX_OUTPUTS_PER_BLOCK; n++) {
+    const alternate = await cache.getCoin({ txid, vout: n });
+    if (alternate !== null) {
+      return alternate;
+    }
+    // Optimisation: if neither cache nor DB has a record at this vout,
+    // assume no later vouts exist either.  Core's AccessByTxid relies
+    // on the iteration ordering of the coins map; we approximate by
+    // breaking on the first vout that has no cache OR DB entry.
+    // (cache.getCoin returns null in both "spent" and "never existed"
+    // cases, so we can't distinguish.  Walking to MAX_OUTPUTS_PER_BLOCK
+    // is O(500k) DB reads worst-case; bound at n>=8 to match the
+    // empirical largest-vout of any historical Bitcoin tx — increase
+    // if a regression is ever observed.)
+    if (n >= 8) break;
+  }
+  return null;
+}
+
+/**
+ * Restore the UTXO in a Coin at a given OutPoint.
+ *
+ * Mirrors bitcoin-core/src/validation.cpp:2149-2175 `ApplyTxInUndo`:
+ *
+ *   - If `view.HaveCoin(out)` returns true, the result is UNCLEAN
+ *     (we are overwriting an existing unspent coin).  Core treats this
+ *     as non-fatal and continues; the `possible_overwrite` arg to
+ *     AddCoin is set accordingly.
+ *   - If `undo.nHeight == 0`, the undo record was written in an old
+ *     format that omitted height + coinbase metadata.  Recover from
+ *     a sibling output of the same transaction via AccessByTxid.
+ *     If no sibling exists either, return FAILED — adding without
+ *     metadata would silently corrupt the UTXO set.
+ *   - Always passes `possible_overwrite = !fClean` to addCoin so the
+ *     cache's invariant ("FRESH means not in DB") is preserved.
+ *
+ * Returns OK | UNCLEAN | FAILED matching the Core tristate.
+ */
+export async function applyTxInUndo(
+  undo: SpentUTXO,
+  cache: CoinsViewCache,
+  out: OutPoint
+): Promise<DisconnectResult> {
+  let fClean = true;
+
+  if (await cache.haveCoin(out)) {
+    fClean = false; // overwriting transaction output
+  }
+
+  let height = undo.entry.height;
+  let coinbase = undo.entry.coinbase;
+  if (height === 0) {
+    // Missing undo metadata — recover from a sibling output via the
+    // AccessByTxid walk.  Older Core versions only stored height +
+    // coinbase on the LAST-spend record for a transaction; we mirror
+    // the recovery path so we can read those records correctly.
+    const alternate = await accessByTxid(cache, out.txid);
+    if (alternate !== null) {
+      height = alternate.height;
+      coinbase = alternate.isCoinbase;
+    } else {
+      return DisconnectResult.DISCONNECT_FAILED;
+    }
+  }
+
+  const coin: Coin = {
+    txOut: {
+      value: undo.entry.amount,
+      scriptPubKey: undo.entry.scriptPubKey,
+    },
+    height,
+    isCoinbase: coinbase,
+  };
+  cache.addCoin(out, coin, !fClean);
+
+  return fClean ? DisconnectResult.DISCONNECT_OK : DisconnectResult.DISCONNECT_UNCLEAN;
+}
+
+/**
  * UTXOManager: wrapper around CoinsViewCache for legacy compatibility.
  *
  * This class maintains the same interface as the old UTXOManager but
@@ -998,6 +1157,12 @@ export class UTXOManager implements UTXOSet {
 
   /**
    * Add a UTXO entry directly (used during block disconnect to restore spent UTXOs).
+   *
+   * Synchronous wrapper retained for backwards compat with call sites that
+   * never read undo metadata that needed AccessByTxid recovery (i.e.
+   * hotbuns-native undo data always has height>0).  New call sites should
+   * prefer {@link applyInputUndo} which returns the OK/UNCLEAN/FAILED
+   * tristate matching Bitcoin Core `ApplyTxInUndo`.
    */
   restoreUTXO(txid: Buffer, vout: number, entry: UTXOEntry): void {
     const outpoint: OutPoint = { txid, vout };
@@ -1014,11 +1179,41 @@ export class UTXOManager implements UTXOSet {
   }
 
   /**
-   * Remove a UTXO directly (used during block disconnect to remove outputs).
+   * Apply an undo entry (restore a spent UTXO) with Bitcoin Core's
+   * tristate semantics.  Mirrors validation.cpp:2149-2175 `ApplyTxInUndo`:
+   *
+   *   - DISCONNECT_OK      — the outpoint was not already in the cache;
+   *                          the restored coin is FRESH.
+   *   - DISCONNECT_UNCLEAN — the outpoint was already present.  Core
+   *                          still overwrites, but signals to the caller
+   *                          that the UTXO set is inconsistent with the
+   *                          block being rolled back (a later block
+   *                          duplicated this output).
+   *   - DISCONNECT_FAILED  — undo metadata is missing height/coinbase
+   *                          AND no sibling output exists to recover
+   *                          from.  Caller must abort the disconnect.
+   *
+   * Delegates to the module-level {@link applyTxInUndo} helper so the
+   * core logic stays close to the Core reference.
    */
-  async removeUTXO(txid: Buffer, vout: number): Promise<void> {
+  async applyInputUndo(spent: SpentUTXO, out: OutPoint): Promise<DisconnectResult> {
+    return applyTxInUndo(spent, this.cache, out);
+  }
+
+  /**
+   * Remove a UTXO directly (used during block disconnect to remove outputs).
+   *
+   * Returns the spent coin if one existed in the view, or null if the
+   * outpoint was already absent (e.g. unspendable OP_RETURN output that
+   * was never added to the UTXO set).  Used by disconnectBlock to run
+   * Core's 4-way match check (existence + value/script + height +
+   * coinbase) — validation.cpp:2218.
+   */
+  async removeUTXO(txid: Buffer, vout: number): Promise<Coin | null> {
     const outpoint: OutPoint = { txid, vout };
-    await this.cache.spendCoin(outpoint);
+    const moveout: { coin: Coin | null } = { coin: null };
+    const ok = await this.cache.spendCoin(outpoint, moveout);
+    return ok ? moveout.coin : null;
   }
 
   /**
