@@ -94,8 +94,13 @@ export function sipHash24(key0: bigint, key1: bigint, data: Buffer): bigint {
     v0 ^= m;
   }
 
-  // Process remaining bytes with length encoding
-  let m = BigInt(data.length) << 56n;
+  // Process remaining bytes with length encoding.
+  // The SipHash spec (and Core's CSipHasher) encodes only the low 8 bits of
+  // the total byte count in the top byte of the final message block.  In Core
+  // m_count is uint8_t so it truncates automatically; here we must mask
+  // explicitly to avoid BigInt overflow beyond 64 bits for inputs >= 256 bytes
+  // (e.g. long tapscripts).  Core ref: siphash.cpp:Finalize "m_tmp | (uint64_t(m_count) << 56)".
+  let m = (BigInt(data.length) & 0xffn) << 56n;
   const remaining = data.length % 8;
   for (let i = 0; i < remaining; i++) {
     m |= BigInt(data[blocks * 8 + i]) << BigInt(i * 8);
@@ -156,52 +161,69 @@ export function fastRange64(hash: bigint, range: bigint): bigint {
 
 /**
  * BitStream writer for Golomb-Rice encoding.
+ *
+ * Bit order: MSB-first within each byte, matching Bitcoin Core's
+ * BitStreamWriter<OStream> in streams.h.  Core writes the nbits least
+ * significant bits of a value into the stream MSB-first:
+ *   m_buffer |= (data << (64 - nbits)) >> (64 - 8 + m_offset)
+ * which places the most significant queued bit at the highest available
+ * position in the current output byte.
+ *
+ * Previous implementation was LSB-first which produced filters byte-
+ * incompatible with Bitcoin Core and the BIP-158 test vectors.
  */
 export class BitStreamWriter {
   private buffer: number[] = [];
   private currentByte = 0;
-  private bitPos = 0;
+  // m_offset: number of high-order bits in currentByte already written
+  private m_offset = 0;
 
   /**
-   * Write n bits from value (LSB first).
+   * Write the n least-significant bits of value, MSB first (Core-compatible).
    */
   writeBits(value: bigint, n: number): void {
-    for (let i = 0; i < n; i++) {
-      if ((value & (1n << BigInt(i))) !== 0n) {
-        this.currentByte |= 1 << this.bitPos;
-      }
-      this.bitPos++;
-      if (this.bitPos === 8) {
+    let nbits = n;
+    while (nbits > 0) {
+      const bits = Math.min(8 - this.m_offset, nbits);
+      // Extract bits from the MSB side of the remaining value
+      // Core: m_buffer |= (data << (64 - nbits)) >> (64 - 8 + m_offset)
+      // Equivalent: shift value so the top `bits` of the remaining `nbits` bits
+      // land in the low bits, then place them at position (8 - m_offset - bits).
+      const shifted = Number((value >> BigInt(nbits - bits)) & BigInt((1 << bits) - 1));
+      this.currentByte |= shifted << (8 - this.m_offset - bits);
+      this.m_offset += bits;
+      nbits -= bits;
+      if (this.m_offset === 8) {
         this.buffer.push(this.currentByte);
         this.currentByte = 0;
-        this.bitPos = 0;
+        this.m_offset = 0;
       }
     }
   }
 
   /**
-   * Write a single bit.
+   * Write a single bit (1 or 0), MSB first.
    */
   writeBit(bit: number): void {
     if (bit) {
-      this.currentByte |= 1 << this.bitPos;
+      this.currentByte |= 1 << (7 - this.m_offset);
     }
-    this.bitPos++;
-    if (this.bitPos === 8) {
+    this.m_offset++;
+    if (this.m_offset === 8) {
       this.buffer.push(this.currentByte);
       this.currentByte = 0;
-      this.bitPos = 0;
+      this.m_offset = 0;
     }
   }
 
   /**
-   * Flush any remaining bits.
+   * Flush any remaining bits (zero-padded to a full byte on the LSB side).
    */
   flush(): void {
-    if (this.bitPos > 0) {
+    if (this.m_offset > 0) {
       this.buffer.push(this.currentByte);
       this.currentByte = 0;
-      this.bitPos = 0;
+      this.m_offset = 0;
     }
   }
 
@@ -215,41 +237,62 @@ export class BitStreamWriter {
 
 /**
  * BitStream reader for Golomb-Rice decoding.
+ *
+ * Bit order: MSB-first within each byte, matching Bitcoin Core's
+ * BitStreamReader<IStream> in streams.h.  Core reads from the high-order
+ * bit of each byte:
+ *   data |= (uint8_t)(m_buffer << m_offset) >> (8 - bits)
+ * which extracts bits starting from the most significant position.
  */
 export class BitStreamReader {
   private data: Buffer;
   private bytePos = 0;
-  private bitPos = 0;
+  // m_offset: number of high-order bits in the current byte already consumed
+  private m_offset = 8; // starts at 8 so we read a new byte on first access
 
   constructor(data: Buffer) {
     this.data = data;
   }
 
   /**
-   * Read a single bit.
+   * Read a single bit, MSB first (Core-compatible).
    */
   readBit(): number {
-    if (this.bytePos >= this.data.length) {
-      throw new Error("BitStreamReader: out of data");
-    }
-    const bit = (this.data[this.bytePos] >> this.bitPos) & 1;
-    this.bitPos++;
-    if (this.bitPos === 8) {
-      this.bitPos = 0;
+    if (this.m_offset === 8) {
+      if (this.bytePos >= this.data.length) {
+        throw new Error("BitStreamReader: out of data");
+      }
+      this.m_offset = 0;
       this.bytePos++;
     }
+    // Current byte is data[bytePos - 1] (already advanced above)
+    const byte = this.data[this.bytePos - 1];
+    const bit = (byte >> (7 - this.m_offset)) & 1;
+    this.m_offset++;
     return bit;
   }
 
   /**
-   * Read n bits as a value (LSB first).
+   * Read n bits as a value, MSB first, returned in the n LSBs of a bigint.
    */
   readBits(n: number): bigint {
     let value = 0n;
-    for (let i = 0; i < n; i++) {
-      if (this.readBit()) {
-        value |= 1n << BigInt(i);
+    let nbits = n;
+    while (nbits > 0) {
+      if (this.m_offset === 8) {
+        if (this.bytePos >= this.data.length) {
+          throw new Error("BitStreamReader: out of data");
+        }
+        this.m_offset = 0;
+        this.bytePos++;
       }
+      const byte = this.data[this.bytePos - 1];
+      const bits = Math.min(8 - this.m_offset, nbits);
+      // Extract `bits` bits from position m_offset (MSB side)
+      const chunk = (byte >> (8 - this.m_offset - bits)) & ((1 << bits) - 1);
+      value = (value << BigInt(bits)) | BigInt(chunk);
+      this.m_offset += bits;
+      nbits -= bits;
     }
     return value;
   }
@@ -258,7 +301,7 @@ export class BitStreamReader {
    * Check if there's more data.
    */
   hasMore(): boolean {
-    return this.bytePos < this.data.length;
+    return this.bytePos < this.data.length || this.m_offset < 8;
   }
 }
 
@@ -310,6 +353,14 @@ export class GCSFilter {
 
   /**
    * Create a GCS filter from elements.
+   *
+   * Duplicates are removed before encoding, matching Bitcoin Core's use of
+   * an unordered_set<Element> in BasicFilterElements() (blockfilter.cpp:188)
+   * and GCSFilter::GCSFilter(params, elements) (blockfilter.cpp:74).  Without
+   * deduplication, duplicate scripts (e.g. the same P2PKH address appears in
+   * both an input being spent and an output being created in the same block)
+   * would cause the encoded N to diverge from the actual number of unique
+   * hashed values, making the filter undecodable by Core-compatible clients.
    */
   constructor(
     elements: Buffer[],
@@ -317,17 +368,30 @@ export class GCSFilter {
     m: bigint = BASIC_FILTER_M,
     p: bigint = BASIC_FILTER_P
   ) {
-    this.n = elements.length;
     this.m = m;
     this.p = p;
-    this.f = BigInt(this.n) * m;
 
     // Extract SipHash keys from block hash (first 16 bytes, LE)
     this.k0 = blockHash.readBigUInt64LE(0);
     this.k1 = blockHash.readBigUInt64LE(8);
 
+    // Deduplicate elements (Core uses unordered_set, so duplicates are
+    // discarded automatically).  We compare by hex-string key.
+    const seen = new Set<string>();
+    const unique: Buffer[] = [];
+    for (const elem of elements) {
+      const key = elem.toString("hex");
+      if (!seen.has(key)) {
+        seen.add(key);
+        unique.push(elem);
+      }
+    }
+
+    this.n = unique.length;
+    this.f = BigInt(this.n) * m;
+
     // Build the filter
-    this.encodedFilter = this.build(elements);
+    this.encodedFilter = this.build(unique);
   }
 
   /**
