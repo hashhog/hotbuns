@@ -392,14 +392,18 @@ describe("SCRIPT_VERIFY_WITNESS_PUBKEYTYPE - getConsensusFlags", () => {
     expect(flags.verifyWitnessPubkeyType).toBe(false);
   });
 
-  test("WITNESS_PUBKEYTYPE enabled at segwit activation (height 481824)", () => {
+  test("WITNESS_PUBKEYTYPE absent from consensus flags at segwit activation (height 481824)", () => {
+    // WITNESS_PUBKEYTYPE is policy-only (STANDARD_SCRIPT_VERIFY_FLAGS, not MANDATORY).
+    // Reference: Bitcoin Core policy/policy.h:128 — present in STANDARD but not MANDATORY flags.
+    // Must NOT appear in getConsensusFlags() (block validation). Use getStandardFlags() for mempool.
     const flags = getConsensusFlags(481824);
-    expect(flags.verifyWitnessPubkeyType).toBe(true);
+    expect(flags.verifyWitnessPubkeyType).toBe(false);
   });
 
-  test("WITNESS_PUBKEYTYPE enabled after segwit activation (height 500000)", () => {
+  test("WITNESS_PUBKEYTYPE absent from consensus flags after segwit (height 500000)", () => {
+    // Policy-only: never set in consensus flags regardless of height.
     const flags = getConsensusFlags(500000);
-    expect(flags.verifyWitnessPubkeyType).toBe(true);
+    expect(flags.verifyWitnessPubkeyType).toBe(false);
   });
 
   test("WITNESS_PUBKEYTYPE disabled at genesis (height 0)", () => {

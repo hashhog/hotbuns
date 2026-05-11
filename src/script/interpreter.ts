@@ -493,11 +493,15 @@ function isValidSignatureEncoding(sig: Buffer): boolean {
 
 /**
  * Check if a signature has a valid defined hashtype (STRICTENC).
+ * Reference: Bitcoin Core interpreter.cpp:190-199 IsDefinedHashtypeSignature.
+ * Core returns false for empty sig (not true). checkSignatureEncoding guards
+ * the empty case before calling this function, but the function must also
+ * be correct per Core spec when called directly.
  */
 function isDefinedHashtypeSignature(sig: Buffer): boolean {
-  if (sig.length === 0) return true;
-  const hashType = sig[sig.length - 1] & ~0x80; // Strip ANYONECANPAY
-  if (hashType < 1 || hashType > 3) return false; // Must be ALL, NONE, or SINGLE
+  if (sig.length === 0) return false; // Core: returns false for empty sig
+  const hashType = sig[sig.length - 1] & ~0x80; // Strip ANYONECANPAY (0x80)
+  if (hashType < 1 || hashType > 3) return false; // Must be ALL(1), NONE(2), or SINGLE(3)
   return true;
 }
 
@@ -525,23 +529,42 @@ function isLowDERSignature(sig: Buffer): boolean {
 /**
  * Validate a signature against the active flags. Returns true if valid (or check not required).
  * Throws ScriptError with the appropriate code if invalid.
+ *
+ * Reference: Bitcoin Core interpreter.cpp:201-216 CheckSignatureEncoding.
+ *
+ * Gate ordering mirrors Core exactly:
+ *   1. DER format check — fires when DERSIG | LOW_S | STRICTENC (any one) is set.
+ *      Core line 207: `(flags & (DERSIG|LOW_S|STRICTENC)) != 0 && !IsValidSignatureEncoding`
+ *      Bug fix: hotbuns previously omitted LOW_S from this gate, causing a wrong
+ *      SIG_HIGH_S error code (instead of SIG_DER) when only verifyLowS was active
+ *      and the DER format was malformed.
+ *   2. LOW_S check — fires only when DERSIG check above already passed.
+ *   3. STRICTENC hashtype check — fires after DER check.
+ *
+ * Note: the DER check is performed on the stripped sig (sig without hashtype byte),
+ * so the bounds are 8 (min) / 72 (max) rather than Core's 9/73 (full sig). The
+ * arithmetic is equivalent: stripped_len = full_len - 1.
  */
 function checkSignatureEncoding(sig: Buffer, flags: ScriptFlags): boolean {
   if (sig.length === 0) return true;
 
-  // DERSIG: signature must be strict DER
-  if ((flags.verifyDERSignatures || flags.verifyStrictEncoding) && !isValidSignatureEncoding(sig.subarray(0, sig.length - 1))) {
+  // Gate 1: DER format check.
+  // Fires when ANY of DERSIG, LOW_S, or STRICTENC is active (Core line 207).
+  // Critical: LOW_S must be included here — if only LOW_S is set and the DER is
+  // malformed, Core returns SIG_DER (not SIG_HIGH_S).
+  if ((flags.verifyDERSignatures || flags.verifyLowS || flags.verifyStrictEncoding) && !isValidSignatureEncoding(sig.subarray(0, sig.length - 1))) {
     throw new ScriptError("SIG_DER");
   }
 
-  // STRICTENC: hash type must be defined
-  if (flags.verifyStrictEncoding && !isDefinedHashtypeSignature(sig)) {
-    throw new ScriptError("SIG_HASHTYPE");
-  }
-
-  // LOW_S: S value must be low
+  // Gate 2: LOW_S check — only reached when DER format above was valid.
+  // isLowDERSignature internally re-validates DER (harmless), then checks S ≤ N/2.
   if (flags.verifyLowS && !isLowDERSignature(sig.subarray(0, sig.length - 1))) {
     throw new ScriptError("SIG_HIGH_S");
+  }
+
+  // Gate 3: STRICTENC hashtype check.
+  if (flags.verifyStrictEncoding && !isDefinedHashtypeSignature(sig)) {
+    throw new ScriptError("SIG_HASHTYPE");
   }
 
   return true;
