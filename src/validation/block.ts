@@ -22,6 +22,41 @@ import {
 import { isP2SH, isP2WPKH, isP2WSH, isPushOnly, Opcode } from "../script/interpreter.js";
 
 // =============================================================================
+// BIP-141 Weight / VSize Constants
+// Reference: bitcoin-core/src/consensus/consensus.h:14-24
+//            bitcoin-core/src/policy/policy.h:25,38,50
+// =============================================================================
+
+/**
+ * Maximum allowed weight for a block (BIP-141 network rule).
+ * Reference: consensus.h:15  static const unsigned int MAX_BLOCK_WEIGHT = 4000000;
+ */
+export const MAX_BLOCK_WEIGHT = 4_000_000;
+
+/**
+ * Witness scale factor (BIP-141).
+ * Non-witness data costs 4 weight units per byte; witness data costs 1.
+ * Equivalently: weight = stripped_size * 3 + total_size.
+ * Reference: consensus.h:21  static const int WITNESS_SCALE_FACTOR = 4;
+ */
+export const WITNESS_SCALE_FACTOR = 4;
+
+/**
+ * Minimum transaction weight (DoS upper-bound for loop counts, NOT a per-tx floor).
+ * 60 bytes × 4 = 240 WU.  Used in Core to bound transaction count in block headers
+ * and compact block messages, not to reject individual transactions.
+ * Reference: consensus.h:23  static const size_t MIN_TRANSACTION_WEIGHT = 4 * 60;
+ */
+export const MIN_TRANSACTION_WEIGHT = 240;
+
+/**
+ * Minimum serializable transaction weight (wire format lower bound).
+ * 10 bytes × 4 = 40 WU.  Used to bound loop counts when reading compact blocks.
+ * Reference: consensus.h:24  static const size_t MIN_SERIALIZABLE_TRANSACTION_WEIGHT = 4 * 10;
+ */
+export const MIN_SERIALIZABLE_TRANSACTION_WEIGHT = 40;
+
+// =============================================================================
 // Sigop Counting Constants
 // =============================================================================
 
@@ -30,12 +65,6 @@ import { isP2SH, isP2WPKH, isP2WSH, isPushOnly, Opcode } from "../script/interpr
  * Legacy/P2SH sigops cost 4x, witness sigops cost 1x.
  */
 export const MAX_BLOCK_SIGOPS_COST = 80_000;
-
-/**
- * Witness scale factor for sigop cost calculation.
- * Legacy and P2SH sigops are multiplied by this factor.
- */
-export const WITNESS_SCALE_FACTOR = 4;
 
 /**
  * Maximum pubkeys in a CHECKMULTISIG operation.
@@ -467,14 +496,15 @@ export function validateBlock(
     }
   }
 
-  // Calculate block weight
-  let totalWeight = 0;
-  for (const tx of block.transactions) {
-    totalWeight += getTxWeight(tx);
-  }
-
-  // Add header weight (80 bytes * 4 = 320 weight units)
-  totalWeight += 80 * 4;
+  // Calculate block weight using the canonical getBlockWeight() formula.
+  // Bitcoin Core ContextualCheckBlock (validation.cpp:4179):
+  //   if (GetBlockWeight(block) > MAX_BLOCK_WEIGHT) ...
+  // GetBlockWeight uses stripped_size * 3 + total_size over the FULL block
+  // serialization including the tx-count varint. The previous shortcut:
+  //   sum(getTxWeight(tx)) + 80*4
+  // was incorrect because it omitted varintSize(txCount)*4 weight units
+  // (Bug 3 fixed here).
+  const totalWeight = getBlockWeight(block);
 
   if (totalWeight > params.maxBlockWeight) {
     return { valid: false, error: "Block weight exceeds maximum" };
