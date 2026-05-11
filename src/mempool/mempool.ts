@@ -455,20 +455,40 @@ export const MAX_PACKAGE_WEIGHT = 404_000;
 export const MAX_STANDARD_TX_WEIGHT = 400_000n;
 
 /**
- * Default mempool size (300 MB in vbytes).
+ * Default mempool size (300 MB).
+ * kernel/mempool_options.h: DEFAULT_MAX_MEMPOOL_SIZE_MB = 300 → 300 * 1_000_000 bytes.
  */
 const DEFAULT_MAX_SIZE = 300_000_000;
 
 /**
- * Default minimum fee rate (1 sat/vB).
+ * Default mempool expiry in seconds (336 hours = 14 days).
+ * kernel/mempool_options.h: DEFAULT_MEMPOOL_EXPIRY_HOURS = 336.
+ * Reference: bitcoin-core/src/txmempool.cpp:811-827 (Expire)
  */
-const DEFAULT_MIN_FEE_RATE = 1;
+export const MEMPOOL_EXPIRY_SECONDS = 336 * 60 * 60; // 1_209_600 seconds
 
 /**
- * Default incremental relay fee rate (1 sat/vB).
- * Replacement must pay at least this much per vbyte more than what it evicts.
+ * Rolling fee halflife in seconds (12 hours).
+ * Reference: bitcoin-core/src/txmempool.h:212
+ *   static const int ROLLING_FEE_HALFLIFE = 60 * 60 * 12;
+ * Used in GetMinFee() decay: rate /= pow(2, Δt / halflife).
+ * Halflife is halved when pool is < half-full, quartered when < quarter-full.
  */
-const DEFAULT_INCREMENTAL_RELAY_FEE = 1;
+const ROLLING_FEE_HALFLIFE = 60 * 60 * 12; // 43_200 seconds
+
+/**
+ * Default minimum fee rate (sat/vB).
+ * This is the initial floor; the dynamic floor rises during TrimToSize eviction.
+ */
+const DEFAULT_MIN_FEE_RATE = 0;
+
+/**
+ * Default incremental relay fee rate (sat/vB).
+ * Core policy.h:48: DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB = 0.1 sat/vB.
+ * Bug fixed: was 1 sat/vB (10× too high), causing RBF Rule #4 to demand too much.
+ * Reference: bitcoin-core/src/policy/policy.h:48
+ */
+const DEFAULT_INCREMENTAL_RELAY_FEE = 0.1; // 100 sat/kvB
 
 // MAX_REPLACEMENT_CANDIDATES (100) is imported from ./rbf.js.
 
@@ -1037,6 +1057,33 @@ export class Mempool {
   /** Monotonically increasing sequence number for mempool events. */
   private mempoolSequence: bigint;
 
+  // ============================================================================
+  // Rolling minimum fee state (GetMinFee / TrimToSize / trackPackageRemoved)
+  // Reference: bitcoin-core/src/txmempool.h:195-197, txmempool.cpp:829-859
+  // ============================================================================
+
+  /**
+   * Current rolling minimum fee rate (sat/kvB, floating-point double).
+   * Starts at 0 and rises when TrimToSize evicts transactions.
+   * Decays exponentially toward 0 with ROLLING_FEE_HALFLIFE (12h).
+   * Reference: bitcoin-core/src/txmempool.h:197
+   */
+  private rollingMinimumFeeRate: number;
+
+  /**
+   * Whether a block has been received since the last rolling fee rate bump.
+   * When true, decay is applied in GetMinFee(). When false (bump just happened),
+   * the rate is returned as-is until the next decay interval.
+   * Reference: bitcoin-core/src/txmempool.h:196
+   */
+  private blockSinceLastRollingFeeBump: boolean;
+
+  /**
+   * Unix timestamp (seconds) of the last rolling fee rate decay computation.
+   * Reference: bitcoin-core/src/txmempool.h:195
+   */
+  private lastRollingFeeUpdate: number;
+
   /**
    * Optional header sync for assumevalid ancestor checks.
    * When set, the script-verification skip gate is evaluated before each
@@ -1068,6 +1115,10 @@ export class Mempool {
     this.clusterCacheDirty = false;
     this.notificationEmitter = notificationEmitter;
     this.mempoolSequence = 0n;
+    // Rolling fee state (txmempool.h:195-197)
+    this.rollingMinimumFeeRate = 0;
+    this.blockSinceLastRollingFeeBump = false;
+    this.lastRollingFeeUpdate = Math.floor(Date.now() / 1000);
   }
 
   /**
@@ -2010,6 +2061,13 @@ export class Mempool {
 
     // Rebuild cluster structure from scratch
     this.rebuildClusters();
+
+    // After a block is connected, reset rolling fee decay timer and set the
+    // blockSinceLastRollingFeeBump flag so that GetMinFee() will apply decay
+    // going forward.
+    // Reference: bitcoin-core/src/txmempool.cpp:426-427
+    this.lastRollingFeeUpdate = Math.floor(Date.now() / 1000);
+    this.blockSinceLastRollingFeeBump = true;
   }
 
   /**
@@ -2762,65 +2820,244 @@ export class Mempool {
   }
 
   /**
-   * Evict lowest mining-score transactions to make room.
+   * Expire transactions that have been in the mempool too long.
    *
-   * Uses cluster-based eviction: finds the transaction with the lowest
-   * mining score (chunk fee rate) from the worst cluster and removes it.
-   * Updates minFeeRate to the rate of the last evicted transaction.
+   * Removes all transactions whose addedTime is older than `time` (Unix seconds),
+   * including all descendants of each expired transaction.
+   *
+   * Reference: bitcoin-core/src/txmempool.cpp:811-827 (CTxMemPool::Expire)
+   * Core signature: int CTxMemPool::Expire(std::chrono::seconds time)
+   *
+   * @param time - Expiry cutoff in Unix seconds. Transactions added before this
+   *               time are removed. Defaults to (now - MEMPOOL_EXPIRY_SECONDS).
+   * @returns Number of transactions removed.
+   */
+  expire(time?: number): number {
+    const cutoff = time ?? (Math.floor(Date.now() / 1000) - MEMPOOL_EXPIRY_SECONDS);
+
+    // Collect all txids whose addedTime is before the cutoff, in insertion order.
+    // We remove in topological order (parents first) to avoid removing children
+    // of entries we haven't yet removed; removeTransaction(removeDependents=true)
+    // handles cascading cleanly regardless, but collecting the set first mirrors
+    // Core's approach.
+    const toRemove = new Set<string>();
+    for (const [txidHex, entry] of this.entries) {
+      if (entry.addedTime < cutoff) {
+        toRemove.add(txidHex);
+      }
+    }
+
+    // Expand to include all descendants (mirrors Core's CalculateDescendants +
+    // RemoveStaged).
+    const stage = new Set<string>(toRemove);
+    for (const txidHex of toRemove) {
+      const descendants = this.getDescendantSet(txidHex);
+      for (const d of descendants) {
+        stage.add(d);
+      }
+    }
+
+    for (const txidHex of stage) {
+      if (this.entries.has(txidHex)) {
+        const entry = this.entries.get(txidHex)!;
+        this.removeTransactionInternal(entry.txid);
+      }
+    }
+
+    return stage.size;
+  }
+
+  /**
+   * Update the rolling minimum fee rate when a chunk is evicted.
+   *
+   * Called by trimToSize() for each evicted chunk. If the chunk's fee rate
+   * exceeds the current rolling minimum, the rolling minimum is updated and
+   * blockSinceLastRollingFeeBump is cleared (rate just bumped, no decay yet).
+   *
+   * Reference: bitcoin-core/src/txmempool.cpp:853-859 (CTxMemPool::trackPackageRemoved)
+   */
+  private trackPackageRemoved(rateSatPerKvB: number): void {
+    if (rateSatPerKvB > this.rollingMinimumFeeRate) {
+      this.rollingMinimumFeeRate = rateSatPerKvB;
+      this.blockSinceLastRollingFeeBump = false;
+    }
+  }
+
+  /**
+   * Get the dynamic minimum fee rate for mempool admission.
+   *
+   * When the mempool is full and transactions are being evicted, this returns
+   * the fee rate of the last-evicted chunk (plus incrementalRelayFee) so that
+   * new transactions must pay at least that much to enter.
+   *
+   * The rate decays exponentially with ROLLING_FEE_HALFLIFE (12 hours):
+   *   - If pool usage < sizelimit/4: halflife is quartered (faster decay)
+   *   - If pool usage < sizelimit/2: halflife is halved (faster decay)
+   *   - Otherwise: full 12h halflife
+   *
+   * Returns 0 once the rate decays below incrementalRelayFee/2. The floor
+   * when non-zero is max(rollingMinimumFeeRate, incrementalRelayFee).
+   *
+   * Reference: bitcoin-core/src/txmempool.cpp:829-851 (CTxMemPool::GetMinFee)
+   *
+   * @returns Minimum fee rate in sat/kvB.
+   */
+  getMinFee(): number {
+    if (!this.blockSinceLastRollingFeeBump || this.rollingMinimumFeeRate === 0) {
+      return this.rollingMinimumFeeRate;
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    if (now > this.lastRollingFeeUpdate + 10) {
+      // Choose halflife based on how full the pool is.
+      // Reference: txmempool.cpp:836-841
+      let halflife = ROLLING_FEE_HALFLIFE;
+      if (this.currentSize < this.maxSize / 4) {
+        halflife /= 4;
+      } else if (this.currentSize < this.maxSize / 2) {
+        halflife /= 2;
+      }
+
+      // Exponential decay: rate /= 2^(Δt / halflife)
+      // Reference: txmempool.cpp:842
+      this.rollingMinimumFeeRate =
+        this.rollingMinimumFeeRate / Math.pow(2.0, (now - this.lastRollingFeeUpdate) / halflife);
+      this.lastRollingFeeUpdate = now;
+
+      // Floor: once rate < incrementalRelayFee/2, zero it out entirely.
+      // Reference: txmempool.cpp:845-848
+      const incrementalRelayKvB = this.incrementalRelayFee * 1000; // sat/vB → sat/kvB
+      if (this.rollingMinimumFeeRate < incrementalRelayKvB / 2) {
+        this.rollingMinimumFeeRate = 0;
+        return 0;
+      }
+    }
+
+    // Return the greater of the rolling rate and the incremental relay fee.
+    // Reference: txmempool.cpp:850
+    const incrementalRelayKvB = this.incrementalRelayFee * 1000;
+    return Math.max(this.rollingMinimumFeeRate, incrementalRelayKvB);
+  }
+
+  /**
+   * Trim the mempool to `sizelimit` bytes by evicting the lowest-feerate chunks.
+   *
+   * Core eviction algorithm (TrimToSize, txmempool.cpp:861-911):
+   *  1. While DynamicMemoryUsage() > sizelimit:
+   *     a. Get the worst chunk from the cluster linearization (lowest fee-rate chunk
+   *        in the worst-ordered cluster).
+   *     b. Compute removed_feerate = chunk_feerate + incrementalRelayFee.
+   *     c. Call trackPackageRemoved(removed_feerate) to bump the rolling minimum.
+   *     d. Remove all transactions in the chunk.
+   *  2. Log the max fee rate removed.
+   *
+   * The crucial difference from the old evict(): Core evicts an entire *chunk*
+   * atomically (which may be multiple transactions), not just the single
+   * worst-scoring individual transaction. This ensures the CPFP cluster is
+   * evicted together.
+   *
+   * Reference: bitcoin-core/src/txmempool.cpp:861-911
    */
   private evict(): void {
     this.rebuildClusterCache();
 
-    let evictedFeeRate = this.minFeeRate;
+    let nTxnRemoved = 0;
+    let maxFeeRateRemovedKvB = 0;
 
     while (this.currentSize > this.maxSize && this.entries.size > 0) {
-      // Find the transaction with the lowest mining score
-      let worstTxidHex: string | null = null;
-      let worstScore = Infinity;
+      // Find the worst chunk across all clusters.
+      // "Worst" = lowest chunk fee rate in the last (tail) position of some
+      // cluster's linearization, since linearizations are sorted best-first.
+      // We scan all cluster linearizations and pick the lowest tail-chunk.
+      let worstChunkTxids: string[] = [];
+      let worstChunkFeeRate = Infinity;
+      let worstChunkTotalVsize = 0;
+      let worstChunkTotalFee = 0n;
 
-      for (const [txidHex, entry] of this.entries) {
-        // Use mining score (chunk fee rate) for eviction
-        const score = entry.miningScore;
-        if (score < worstScore) {
-          worstScore = score;
-          worstTxidHex = txidHex;
+      for (const [, cluster] of this.clusterCache) {
+        const lin = cluster.linearization;
+        if (lin.chunks.length === 0) continue;
+        // The last chunk in the linearization has the lowest fee rate.
+        const tailChunk = lin.chunks[lin.chunks.length - 1];
+        if (tailChunk.feeRate < worstChunkFeeRate) {
+          worstChunkFeeRate = tailChunk.feeRate;
+          worstChunkTxids = Array.from(tailChunk.txids);
+          worstChunkTotalVsize = tailChunk.totalVsize;
+          worstChunkTotalFee = tailChunk.totalFee;
         }
       }
 
-      if (!worstTxidHex) break;
+      if (worstChunkTxids.length === 0) break;
 
-      const entry = this.entries.get(worstTxidHex)!;
-      evictedFeeRate = entry.miningScore;
+      // Compute the evicted fee rate in sat/kvB and add incrementalRelayFee.
+      // Reference: txmempool.cpp:870-878
+      // removed = chunk_feerate_sat_per_kvB + incrementalRelayFee_sat_per_kvB
+      const chunkFeeRateKvB =
+        worstChunkTotalVsize > 0
+          ? (Number(worstChunkTotalFee) / worstChunkTotalVsize) * 1000
+          : 0;
+      const incrementalRelayKvB = this.incrementalRelayFee * 1000;
+      const removedKvB = chunkFeeRateKvB + incrementalRelayKvB;
 
-      // Remove the transaction and all its descendants
-      this.removeTransaction(entry.txid, true);
+      this.trackPackageRemoved(removedKvB);
+      if (removedKvB > maxFeeRateRemovedKvB) {
+        maxFeeRateRemovedKvB = removedKvB;
+      }
 
-      // Mark cluster cache as dirty since we removed transactions
+      nTxnRemoved += worstChunkTxids.length;
+
+      // Remove all transactions in the chunk.
+      // removeTransactionInternal handles descendant stats + index cleanup.
+      for (const txidHex of worstChunkTxids) {
+        if (this.entries.has(txidHex)) {
+          const entry = this.entries.get(txidHex)!;
+          this.removeTransactionInternal(entry.txid);
+        }
+      }
+
+      // Rebuild cluster cache after removals to get the next worst chunk.
       this.clusterCacheDirty = true;
       this.rebuildClusterCache();
     }
 
-    // Update minimum fee rate to slightly above the last evicted rate
-    this.minFeeRate = Math.max(this.minFeeRate, evictedFeeRate * 1.1);
+    // Sync the admission minFeeRate from the rolling rate (sat/vB).
+    // This ensures that new transactions must pay at least the rate of what
+    // was just evicted.
+    if (maxFeeRateRemovedKvB > 0) {
+      // Convert sat/kvB → sat/vB for the admission gate comparison.
+      const newMinSatPerVB = maxFeeRateRemovedKvB / 1000;
+      this.minFeeRate = Math.max(this.minFeeRate, newMinSatPerVB);
+    }
   }
 
   /**
    * Get mempool statistics.
    */
   getInfo(): { size: number; bytes: number; minFeeRate: number } {
+    // Expose the dynamic minimum (rolling + static floor) as sat/vB.
+    const dynamicMinSatPerVB = Math.max(this.minFeeRate, this.getMinFee() / 1000);
     return {
       size: this.entries.size,
       bytes: this.currentSize,
-      minFeeRate: this.minFeeRate,
+      minFeeRate: dynamicMinSatPerVB,
     };
   }
 
   /**
    * Get the minimum fee rate in sat/kvB (for BIP133 feefilter).
-   * Returns the current minimum relay fee rate * 1000.
+   *
+   * Returns the rolling dynamic minimum (with decay), floored by the static
+   * admission minFeeRate, converted to sat/kvB as an integer.
+   *
+   * Reference: bitcoin-core/src/txmempool.cpp:829-851 (GetMinFee),
+   *            net_processing.cpp BIP133 feefilter message construction.
    */
   getMinFeeRateKvB(): bigint {
-    return BigInt(Math.floor(this.minFeeRate * 1000));
+    // getMinFee() returns sat/kvB (rolling minimum with decay).
+    // Convert the static admission floor (sat/vB) to sat/kvB for comparison.
+    const rollingKvB = this.getMinFee();
+    const admissionKvB = this.minFeeRate * 1000;
+    return BigInt(Math.floor(Math.max(rollingKvB, admissionKvB)));
   }
 
   /**
@@ -2856,6 +3093,10 @@ export class Mempool {
     this.clusters.clear();
     this.clusterCache.clear();
     this.clusterCacheDirty = false;
+    // Reset rolling fee state.
+    this.rollingMinimumFeeRate = 0;
+    this.blockSinceLastRollingFeeBump = false;
+    this.lastRollingFeeUpdate = Math.floor(Date.now() / 1000);
   }
 
   /**
