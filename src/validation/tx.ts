@@ -987,72 +987,112 @@ export function sigHashLegacyRaw(
 
 /**
  * Basic transaction validation (structure only, not script execution).
+ *
+ * Mirrors Bitcoin Core consensus/tx_check.cpp::CheckTransaction gate-for-gate:
+ *   1. bad-txns-vin-empty
+ *   2. bad-txns-vout-empty
+ *   3. bad-txns-oversize  (stripped_size * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT)
+ *   4. bad-txns-vout-negative   (CVE-2010-5139)
+ *   5. bad-txns-vout-toolarge   (CVE-2010-5139)
+ *   6. bad-txns-txouttotal-toolarge (CVE-2010-5139)
+ *   7. bad-txns-inputs-duplicate    (CVE-2018-17144)
+ *   8. bad-cb-length    (coinbase scriptSig 2..100 bytes)
+ *   9. bad-txns-prevout-null  (non-coinbase inputs must not have null prevout)
+ *
+ * Error strings match Core's reject reason tokens exactly so they flow through
+ * bip22Result() / P2P reject messages unchanged.
+ *
+ * Reference: bitcoin-core/src/consensus/tx_check.cpp:11-59
  */
 export function validateTxBasic(tx: Transaction): { valid: boolean; error?: string } {
-  // Must have at least one input
+  // Gate 1: bad-txns-vin-empty
+  // Core tx_check.cpp:14-15
   if (tx.inputs.length === 0) {
-    return { valid: false, error: "Transaction has no inputs" };
+    return { valid: false, error: "bad-txns-vin-empty" };
   }
 
-  // Must have at least one output
+  // Gate 2: bad-txns-vout-empty
+  // Core tx_check.cpp:16-17
   if (tx.outputs.length === 0) {
-    return { valid: false, error: "Transaction has no outputs" };
+    return { valid: false, error: "bad-txns-vout-empty" };
   }
 
-  // Check for duplicate inputs
-  const seenOutpoints = new Set<string>();
-  for (const input of tx.inputs) {
-    const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
-    if (seenOutpoints.has(key)) {
-      return { valid: false, error: "Duplicate input" };
-    }
-    seenOutpoints.add(key);
+  // Gate 3: bad-txns-oversize
+  // Core tx_check.cpp:18-21:
+  //   GetSerializeSize(TX_NO_WITNESS(tx)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+  // i.e. stripped_size * 4 > 4_000_000  →  stripped_size > 1_000_000.
+  // We check stripped (non-witness) size * 4, NOT total wire size.
+  const strippedSize = serializeTx(tx, false).length;
+  if (strippedSize * 4 > 4_000_000) {
+    return { valid: false, error: "bad-txns-oversize" };
   }
 
-  // Check output values
+  // Gates 4-6: output value range checks (CVE-2010-5139).
+  // Core tx_check.cpp:23-34.
   // NOTE: value is deserialized from wire as uint64 (readUInt64LE), but Bitcoin's
   // wire format is signed int64.  A negative wire value (e.g. -1 = 0xffffffffffffffff)
   // will have the high bit set, producing a large unsigned bigint.  We must
-  // reinterpret as signed before the negative check — mirrors Bitcoin Core
-  // consensus/tx_check.cpp::CheckTransaction (negative check before toolarge).
+  // reinterpret as signed before the negative check — mirrors Core (negative before toolarge).
+  const MAX_MONEY = 2_100_000_000_000_000n; // 21_000_000 * COIN
   const INT64_MAX = 0x7fffffffffffffffn;
   const UINT64_WRAP = 0x10000000000000000n; // 2^64
   let totalOutput = 0n;
   for (const output of tx.outputs) {
     // Reinterpret uint64 as int64: if high bit is set, value is negative.
     const signedValue = output.value > INT64_MAX ? output.value - UINT64_WRAP : output.value;
-    // Value must be non-negative (consensus/tx_check.cpp::CheckTransaction)
+
+    // Gate 4: bad-txns-vout-negative
     if (signedValue < 0n) {
-      return { valid: false, error: "Negative output value" };
+      return { valid: false, error: "bad-txns-vout-negative" };
     }
 
-    // Value must not exceed max coins (21M BTC = 2.1e15 satoshis)
-    if (output.value > 2_100_000_000_000_000n) {
-      return { valid: false, error: "Output value exceeds maximum" };
+    // Gate 5: bad-txns-vout-toolarge
+    if (output.value > MAX_MONEY) {
+      return { valid: false, error: "bad-txns-vout-toolarge" };
     }
 
     totalOutput += output.value;
 
-    // Total must not overflow
-    if (totalOutput > 2_100_000_000_000_000n) {
-      return { valid: false, error: "Total output value exceeds maximum" };
+    // Gate 6: bad-txns-txouttotal-toolarge
+    if (totalOutput > MAX_MONEY) {
+      return { valid: false, error: "bad-txns-txouttotal-toolarge" };
     }
   }
 
-  // Check transaction oversize (consensus rule).
-  // Bitcoin Core consensus/tx_check.cpp:19:
-  //   GetSerializeSize(TX_NO_WITNESS(tx)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
-  // i.e. stripped_size * 4 > 4_000_000  →  stripped_size > 1_000_000
-  // Note: we check stripped (non-witness) size * 4, NOT total wire size.
-  // A witness-heavy tx with stripped_size 1_000_001 would be rejected by Core
-  // even if its total wire size is below 4_000_000. Using total size as the
-  // threshold is wrong (Bug 1 fixed here).
-  // Also: there is NO consensus minimum transaction weight floor —
-  // MIN_TRANSACTION_WEIGHT (240) in consensus.h is a DoS upper-bound on
-  // loop counts, not a per-tx floor (Bug 2 comment removed).
-  const strippedSize = serializeTx(tx, false).length;
-  if (strippedSize * 4 > 4_000_000) {
-    return { valid: false, error: "bad-txns-oversize" };
+  // Gate 7: bad-txns-inputs-duplicate (CVE-2018-17144).
+  // Core tx_check.cpp:36-45.
+  // Failure to check this causes either a crash or an inflation bug depending
+  // on the underlying UTXO DB implementation — this is the CVE-2018-17144 class.
+  const seenOutpoints = new Set<string>();
+  for (const input of tx.inputs) {
+    const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+    if (seenOutpoints.has(key)) {
+      return { valid: false, error: "bad-txns-inputs-duplicate" };
+    }
+    seenOutpoints.add(key);
+  }
+
+  // Gates 8-9: coinbase vs non-coinbase specific checks.
+  // Core tx_check.cpp:47-57.
+  const coinbaseTx = isCoinbase(tx);
+  if (coinbaseTx) {
+    // Gate 8: bad-cb-length — coinbase scriptSig must be 2..100 bytes.
+    // Core: COINBASE_SCRIPT_SIZE_MIN=2, COINBASE_SCRIPT_SIZE_MAX=100.
+    const cbLen = tx.inputs[0].scriptSig.length;
+    if (cbLen < 2 || cbLen > 100) {
+      return { valid: false, error: "bad-cb-length" };
+    }
+  } else {
+    // Gate 9: bad-txns-prevout-null — non-coinbase inputs must not reference null outpoints.
+    // Core tx_check.cpp:54-56: if (txin.prevout.IsNull()) → "bad-txns-prevout-null".
+    // A null prevout (all-zero txid + 0xffffffff vout) is reserved for coinbase
+    // transactions only; encountering it in a non-coinbase tx is a consensus error.
+    const NULL_TXID = Buffer.alloc(32, 0);
+    for (const input of tx.inputs) {
+      if (input.prevOut.txid.equals(NULL_TXID) && input.prevOut.vout === 0xffffffff) {
+        return { valid: false, error: "bad-txns-prevout-null" };
+      }
+    }
   }
 
   return { valid: true };
