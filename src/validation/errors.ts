@@ -193,6 +193,12 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
   if (s === "duplicate") return "duplicate";
   if (s === "duplicate-invalid") return "duplicate-invalid";
 
+  // Difficulty mismatch: nBits does not match GetNextWorkRequired.
+  // Core validation.cpp:4089: "bad-diffbits"
+  // Also catches powLimit violation (we emit "bad-diffbits: target exceeds powLimit").
+  if (s.includes("bad-diffbits") || s.includes("target exceeds powlimit")) {
+    return "bad-diffbits";
+  }
   if (s.includes("high-hash") || s.includes("proof of work") || s.includes("does not meet target")) {
     return "high-hash";
   }
@@ -255,6 +261,16 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
   }
   if (s.includes("time-too-new") || (s.includes("timestamp") && s.includes("too far"))) {
     return "time-too-new";
+  }
+  // BIP-94 timewarp attack rejection (testnet4/enforce_BIP94 only).
+  // Core validation.cpp:4102: "time-timewarp-attack"
+  if (s.includes("time-timewarp-attack") || s.includes("timewarp")) {
+    return "time-timewarp-attack";
+  }
+  // Outdated block version rejected after BIP34/66/65 activation.
+  // Core validation.cpp:4116: strprintf("bad-version(0x%08x)", block.nVersion)
+  if (s.includes("bad-version")) {
+    return s.split(":")[0].trim(); // preserve "bad-version(0x00000001)" form
   }
   if (s.includes("weight") || s.includes("oversize")) {
     return "bad-blk-length";
