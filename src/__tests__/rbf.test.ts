@@ -625,24 +625,27 @@ describe("RBF - Replace By Fee", () => {
   // =========================================================================
   // Gate #7 — PaysForRBF Rule #4 (incremental relay fee)
   // policy/rbf.cpp:PaysForRBF line 118
+  // DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB = 0.1 sat/vB
+  // W86 fix: was 1 sat/vB (10× too high). Tests updated to use correct values.
   // =========================================================================
   describe("Gate #7 — PaysForRBF Rule #4 (incremental relay fee)", () => {
     test("requires minimum incremental fee for bandwidth", async () => {
       const inputTxid = Buffer.alloc(32, 0x04);
       await setupUTXO(inputTxid, 0, 100000n);
 
-      // Original: small fee
+      // Original: 100 sat fee
       const original = createTestTx(
         [{ txid: inputTxid, vout: 0 }],
         [{ value: 99900n }] // 100 sat fee
       );
       await mempool.addTransaction(original);
 
-      // Replacement: marginally higher fee but not enough for bandwidth
-      // Incremental relay fee is 1 sat/vB, so for ~68 vB tx we need at least 68 sat more
+      // Replacement: 101 sat fee (only +1 sat).
+      // incrementalRelayFee = 0.1 sat/vB. For a ~200 vB tx, minimum increment
+      // = ceil(0.1 * 200) = 20 sat. So +1 sat is insufficient.
       const replacement = createTestTx(
         [{ txid: inputTxid, vout: 0 }],
-        [{ value: 99850n }] // 150 sat fee (only 50 sat more)
+        [{ value: 99899n }] // 101 sat fee (+1 sat only, well under 0.1*vsize)
       );
       const result = await mempool.addTransaction(replacement);
       expect(result.accepted).toBe(false);
