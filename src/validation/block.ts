@@ -219,6 +219,55 @@ export function computeWitnessMerkleRoot(wtxids: Buffer[]): Buffer {
 }
 
 /**
+ * BIP-141 witness commitment constants.
+ * Reference: bitcoin-core/src/consensus/validation.h:15,18
+ */
+export const NO_WITNESS_COMMITMENT = -1;
+export const MINIMUM_WITNESS_COMMITMENT = 38;
+
+/**
+ * Compute the vout index of the witness commitment in the coinbase, or
+ * NO_WITNESS_COMMITMENT (-1) if not found.
+ *
+ * Scans ALL coinbase outputs forward; the LAST matching output wins
+ * (Core convention: commitpos is updated in a forward loop).
+ *
+ * Matching criteria (Core consensus/validation.h:147-165):
+ *   scriptPubKey.length >= 38
+ *   && scriptPubKey[0] == OP_RETURN (0x6a)
+ *   && scriptPubKey[1] == 0x24
+ *   && scriptPubKey[2..5] == 0xaa21a9ed
+ *
+ * Reference: bitcoin-core/src/consensus/validation.h GetWitnessCommitmentIndex()
+ */
+export function getWitnessCommitmentIndex(block: Block): number {
+  if (block.transactions.length === 0) {
+    return NO_WITNESS_COMMITMENT;
+  }
+
+  const coinbase = block.transactions[0];
+  let commitpos = NO_WITNESS_COMMITMENT;
+
+  for (let o = 0; o < coinbase.outputs.length; o++) {
+    const script = coinbase.outputs[o].scriptPubKey;
+
+    if (
+      script.length >= MINIMUM_WITNESS_COMMITMENT &&
+      script[0] === 0x6a &&  // OP_RETURN
+      script[1] === 0x24 &&  // push 36 bytes
+      script[2] === 0xaa &&
+      script[3] === 0x21 &&
+      script[4] === 0xa9 &&
+      script[5] === 0xed
+    ) {
+      commitpos = o;  // keep updating — last match wins
+    }
+  }
+
+  return commitpos;
+}
+
+/**
  * Extract the witness commitment from a block's coinbase transaction.
  * Returns null if no witness commitment is found.
  *
@@ -226,48 +275,94 @@ export function computeWitnessMerkleRoot(wtxids: Buffer[]): Buffer {
  * OP_RETURN (0x6a) 0x24 0xaa21a9ed <32-byte commitment>
  *
  * If multiple commitments exist, the last one is used.
+ *
+ * Reference: bitcoin-core/src/consensus/validation.h GetWitnessCommitmentIndex()
  */
 export function getWitnessCommitment(block: Block): Buffer | null {
-  if (block.transactions.length === 0) {
+  const commitpos = getWitnessCommitmentIndex(block);
+  if (commitpos === NO_WITNESS_COMMITMENT) {
     return null;
   }
+  const script = block.transactions[0].outputs[commitpos].scriptPubKey;
+  return script.subarray(6, 38);
+}
 
-  const coinbase = block.transactions[0];
+/**
+ * Check witness malleation for a block.
+ *
+ * Mirrors Bitcoin Core's CheckWitnessMalleation() (validation.cpp:3864-3916):
+ *
+ * Gate A — if segwit is expected (active):
+ *   If a witness commitment output exists in the coinbase:
+ *     Gate B — coinbase input witness stack must have exactly 1 item (bad-witness-nonce-size)
+ *     Gate C — that item must be exactly 32 bytes (bad-witness-nonce-size)
+ *     Gate D — SHA256d(witness_merkle_root || witness_nonce) must match the
+ *               32 bytes at scriptPubKey[6..38] of the commitment output (bad-witness-merkle-match)
+ *     → return true (valid; short-circuit, do NOT run unexpected-witness check)
+ *   If no commitment output exists, fall through to unexpected-witness check.
+ * Gate E — unexpected-witness:
+ *   If ANY transaction in the block has witness data, reject (unexpected-witness).
+ *   This fires when:
+ *     (a) segwit is NOT active, or
+ *     (b) segwit IS active but no commitment output was found.
+ *
+ * Reference: bitcoin-core/src/validation.cpp:3864-3916
+ *            bitcoin-core/src/consensus/validation.h:147-165
+ *            bitcoin-core/src/consensus/merkle.cpp:76-85
+ */
+export function checkWitnessMalleation(
+  block: Block,
+  expectWitnessCommitment: boolean
+): { valid: boolean; error?: string } {
+  if (expectWitnessCommitment) {
+    // Precondition: block.vtx is non-empty and coinbase has at least one input
+    // (caller guarantees this after the coinbase/empty-block checks above).
+    const commitpos = getWitnessCommitmentIndex(block);
 
-  // Search outputs in reverse order (last commitment wins)
-  for (let i = coinbase.outputs.length - 1; i >= 0; i--) {
-    const script = coinbase.outputs[i].scriptPubKey;
+    if (commitpos !== NO_WITNESS_COMMITMENT) {
+      const coinbase = block.transactions[0];
+      const witnessStack = coinbase.inputs[0].witness;
 
-    // Minimum length: OP_RETURN(1) + 0x24(1) + 0xaa21a9ed(4) + commitment(32) = 38
-    if (script.length < 38) {
-      continue;
+      // Gate B+C: coinbase input witness must be exactly one 32-byte item.
+      // Reference: validation.cpp:3880-3885
+      if (witnessStack.length !== 1 || witnessStack[0].length !== 32) {
+        return { valid: false, error: "bad-witness-nonce-size" };
+      }
+
+      // Gate D: SHA256d(witness_merkle_root || witness_nonce) must equal
+      //         commitment at scriptPubKey[6..38].
+      // Witness merkle root: coinbase wtxid is 0x000...000, rest are real wtxids.
+      // Reference: validation.cpp:3890-3898, consensus/merkle.cpp:76-85
+      const wtxids = block.transactions.map((tx, i) =>
+        i === 0 ? Buffer.alloc(32, 0) : getWTxId(tx)
+      );
+      const witnessMerkleRoot = computeMerkleRoot(wtxids);
+      const witnessNonce = witnessStack[0];
+      const hashWitness = hash256(Buffer.concat([witnessMerkleRoot, witnessNonce]));
+
+      const commitScript = block.transactions[0].outputs[commitpos].scriptPubKey;
+      const committed = commitScript.subarray(6, 38);
+
+      if (!hashWitness.equals(committed)) {
+        return { valid: false, error: "bad-witness-merkle-match" };
+      }
+
+      // Commitment validated; skip the unexpected-witness scan.
+      return { valid: true };
     }
-
-    // Check for OP_RETURN (0x6a)
-    if (script[0] !== 0x6a) {
-      continue;
-    }
-
-    // Check for push of 36 bytes (0x24)
-    if (script[1] !== 0x24) {
-      continue;
-    }
-
-    // Check for commitment header: aa21a9ed
-    if (
-      script[2] !== 0xaa ||
-      script[3] !== 0x21 ||
-      script[4] !== 0xa9 ||
-      script[5] !== 0xed
-    ) {
-      continue;
-    }
-
-    // Extract the 32-byte commitment
-    return script.subarray(6, 38);
+    // No commitment found — fall through to the unexpected-witness scan below.
   }
 
-  return null;
+  // Gate E: no witness data is allowed in blocks that don't commit to witness data.
+  // Fires when segwit is not active, OR segwit is active but no commitment exists.
+  // Reference: validation.cpp:3906-3913
+  for (const tx of block.transactions) {
+    if (hasWitness(tx)) {
+      return { valid: false, error: "unexpected-witness" };
+    }
+  }
+
+  return { valid: true };
 }
 
 /**
@@ -458,42 +553,20 @@ export function validateBlock(
     return { valid: false, error: "Merkle root mismatch" };
   }
 
-  // Check if segwit is active
+  // BIP-141 witness commitment / malleation check.
+  // Reference: bitcoin-core/src/validation.cpp:4161-4171 (ContextualCheckBlock),
+  //            CheckWitnessMalleation() at validation.cpp:3870-3916.
+  //
+  // This must run even when no non-coinbase transactions carry witness data,
+  // because:
+  //  (a) A commitment output may exist with only a coinbase witness nonce, and
+  //  (b) When segwit is NOT active, any witness data at all is invalid
+  //      ("unexpected-witness"), which the old `segwitActive && hasWitnessData`
+  //      gate silently allowed through.
   const segwitActive = height >= params.segwitHeight;
-
-  // Check for witness data in block
-  const hasWitnessData = block.transactions.some((tx) => hasWitness(tx));
-
-  // Verify witness commitment if segwit is active and block has witness data
-  if (segwitActive && hasWitnessData) {
-    const commitment = getWitnessCommitment(block);
-    if (commitment === null) {
-      return { valid: false, error: "Missing witness commitment" };
-    }
-
-    // Compute expected commitment
-    const wtxids = block.transactions.map((tx) => getWTxId(tx));
-    const witnessMerkleRoot = computeWitnessMerkleRoot(wtxids);
-
-    // Get witness nonce from coinbase (should be in witness stack)
-    let witnessNonce: Buffer;
-    if (
-      coinbaseTx.inputs[0].witness.length > 0 &&
-      coinbaseTx.inputs[0].witness[0].length === 32
-    ) {
-      witnessNonce = coinbaseTx.inputs[0].witness[0];
-    } else {
-      // Default to 32 zero bytes if no nonce
-      witnessNonce = Buffer.alloc(32, 0);
-    }
-
-    const expectedCommitment = hash256(
-      Buffer.concat([witnessMerkleRoot, witnessNonce])
-    );
-
-    if (!commitment.equals(expectedCommitment)) {
-      return { valid: false, error: "Witness commitment mismatch" };
-    }
+  const witnessMalleation = checkWitnessMalleation(block, segwitActive);
+  if (!witnessMalleation.valid) {
+    return { valid: false, error: witnessMalleation.error };
   }
 
   // Calculate block weight using the canonical getBlockWeight() formula.
