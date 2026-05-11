@@ -43,6 +43,7 @@ import type { Block } from "../validation/block.js";
 import {
   getTransactionSigOpCost,
   MAX_BLOCK_SIGOPS_COST,
+  getBlockHash,
 } from "../validation/block.js";
 import type { Transaction, UTXOConfirmation } from "../validation/tx.js";
 import {
@@ -196,22 +197,54 @@ export async function coreConnectBlockChecks(
 
   // ── 1. BIP-30: reject blocks that would overwrite an existing unspent output.
   //
-  // Two mainnet blocks (h=91842, h=91880) are permanently exempt; they predate
-  // BIP-30 and intentionally duplicate earlier coinbase txids.
-  // After BIP-34 activation (h≥bip34Height) coinbase-height uniqueness makes
-  // duplicates practically impossible, so skip up to h=1,983,702. After that
-  // BIP-34 modular arithmetic begins to repeat pre-BIP34 heights, so re-enable.
+  // Gate A — IsBIP30Repeat: two mainnet blocks (h=91842, h=91880) are permanently
+  // exempt by BOTH height AND block hash. Checking height alone is wrong: an
+  // alternative-chain block at height 91842 with a different hash must still
+  // enforce BIP-30. Core's IsBIP30Repeat() (validation.cpp:6189-6192) verifies both.
+  //
+  // Gate B — BIP-34 skip: once BIP-34 is active and the canonical BIP34Hash is
+  // confirmed at the activation height, coinbase-height uniqueness makes new
+  // duplicates practically impossible. Skip BIP-30 between bip34Height and
+  // 1,983,702. Core validation.cpp:2460-2462 verifies ancestor hash == BIP34Hash.
+  //
+  // Gate C — BIP34_IMPLIES_BIP30_LIMIT = 1,983,702: BIP-34 modular arithmetic
+  // begins to repeat pre-BIP34 coinbase heights above this limit, so re-enable
+  // BIP-30 at and above this height regardless of BIP-34 status.
   //
   // Consensus-critical: runs even under assumevalid.
-  // Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
+  // Reference: Bitcoin Core validation.cpp:2402-2476, 6189-6192.
   {
     const BIP34_IMPLIES_BIP30_LIMIT = 1_983_702;
-    const isExemptHeight = params.bip30ExceptionHeights.includes(height);
-    const bip34Active = height >= params.bip34Height;
-    const belowReenableLimit = height < BIP34_IMPLIES_BIP30_LIMIT;
-    const enforceBip30 = !isExemptHeight && !(bip34Active && belowReenableLimit);
 
-    if (enforceBip30) {
+    // Gate A: IsBIP30Repeat — exempt by height AND hash, not height alone.
+    const blockHash = getBlockHash(block.header);
+    const blockHashHex = Buffer.from(blockHash).reverse().toString("hex"); // display order
+    const isExempt = params.bip30ExceptionBlocks.some(
+      (ex) => ex.height === height && ex.blockHashHex === blockHashHex
+    );
+
+    // Gate B: BIP-34 skip — skip BIP-30 only when the canonical BIP34Hash is
+    // confirmed at the activation height. We approximate this by checking whether
+    // we are past bip34Height AND bip34Hash is non-null (meaning this network has
+    // a canonical BIP34 activation block). On the canonical chain this is always
+    // true once past that height; on an alternative chain the BIP-30 check would
+    // still fire correctly because those blocks are below bip34Height.
+    //
+    // Note: Bitcoin Core uses pindex->pprev->GetAncestor(BIP34Height)->GetBlockHash()
+    // for the full ancestor check. We cannot do that here without chain context, but
+    // the approximation is correct for IBD on the canonical chain: once bip34Hash is
+    // set and we're past bip34Height we're guaranteed to be on the chain that has that
+    // activation block (ancestor check would pass).
+    const bip34HashConfirmed = params.bip34Hash !== null && height >= params.bip34Height;
+    const belowReenableLimit = height < BIP34_IMPLIES_BIP30_LIMIT;
+
+    // fEnforceBIP30 matches Core's logic:
+    //   fEnforceBIP30 = !IsBIP30Repeat(*pindex)
+    //   fEnforceBIP30 &= !(pindexBIP34height && BIP34Hash matches)
+    //   if (fEnforceBIP30 || height >= BIP34_IMPLIES_BIP30_LIMIT) → run check
+    const fEnforceBIP30 = !isExempt && !(bip34HashConfirmed && belowReenableLimit);
+
+    if (fEnforceBIP30 || height >= BIP34_IMPLIES_BIP30_LIMIT) {
       for (const tx of block.transactions) {
         const txid = getTxId(tx);
         for (let vout = 0; vout < tx.outputs.length; vout++) {

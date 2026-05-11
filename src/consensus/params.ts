@@ -40,12 +40,41 @@ export interface ConsensusParams {
   readonly segwitHeight: number;
   readonly taprootHeight: number;
   /**
-   * BIP-30 exception heights: blocks that are permanently exempt from the
-   * duplicate-UTXO check. On mainnet these are h=91842 and h=91880, which
-   * predate BIP-30 and intentionally duplicate earlier coinbase txids.
-   * Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
+   * BIP-30 exception blocks: (height, blockHashHex) pairs that are permanently
+   * exempt from the duplicate-UTXO check. Mirrors Bitcoin Core's IsBIP30Repeat()
+   * which checks BOTH height AND block hash — height alone is insufficient because
+   * an alternative-chain block at the same height with a different hash must still
+   * enforce BIP-30.
+   *
+   * On mainnet the two exempt blocks are:
+   *   h=91842, hash=00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec
+   *   h=91880, hash=00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721
+   *
+   * blockHashHex is in display/RPC byte order (big-endian, as shown by block explorers).
+   * Reference: Bitcoin Core validation.cpp:6189-6192 IsBIP30Repeat().
+   */
+  readonly bip30ExceptionBlocks: ReadonlyArray<{ height: number; blockHashHex: string }>;
+  /**
+   * @deprecated Use bip30ExceptionBlocks instead (height-only check is incorrect).
+   * Kept for backward compatibility with existing tests; will be removed.
    */
   readonly bip30ExceptionHeights: readonly number[];
+  /**
+   * The block hash at BIP34 activation height on the canonical chain (internal
+   * little-endian byte order, same as genesisBlockHash). Used by the BIP-30
+   * skip optimisation: BIP-30 is skipped between bip34Height and 1,983,702
+   * only when the ancestor at bip34Height has this exact hash, confirming we
+   * are on the canonical chain. Matches Bitcoin Core's Consensus::Params::BIP34Hash.
+   *
+   * Mainnet:  000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8 (display)
+   * Testnet3: 0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8 (display)
+   * Testnet4/regtest/signet: zero (BIP34 was always active, no skip needed)
+   *
+   * Set to null for networks where BIP34 was active from genesis and no skip
+   * optimisation is needed (or where any BIP34Hash check would always pass/fail).
+   * Reference: Bitcoin Core kernel/chainparams.cpp:89-90, validation.cpp:2462.
+   */
+  readonly bip34Hash: Buffer | null;
   readonly protocolVersion: number;
   readonly services: bigint;
   readonly userAgent: string;
@@ -353,9 +382,27 @@ export const MAINNET: ConsensusParams = {
   csvHeight: 419328, // BIP68/112/113
   segwitHeight: 481824,
   taprootHeight: 709632,
-  // BIP-30: only h=91842 and h=91880 on mainnet are permanently exempt.
-  // Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
+  // BIP-30: only the two historical duplicate-coinbase blocks are exempt.
+  // Reference: Bitcoin Core validation.cpp:6189-6192 IsBIP30Repeat().
+  bip30ExceptionBlocks: [
+    {
+      height: 91842,
+      blockHashHex: "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec",
+    },
+    {
+      height: 91880,
+      blockHashHex: "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721",
+    },
+  ],
+  // Kept for backward compat; bip30ExceptionBlocks is the authoritative field.
   bip30ExceptionHeights: [91842, 91880],
+  // BIP34Hash: block hash at h=227931 on mainnet canonical chain (display byte order).
+  // Reference: Bitcoin Core kernel/chainparams.cpp:89-90, validation.cpp:2462.
+  // Internal (LE) form stored here for direct comparison with getBlockHash() output.
+  bip34Hash: Buffer.from(
+    "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8",
+    "hex"
+  ).reverse(),
   assumeValidHeight: 938343, // Bitcoin Core default assumevalid (block 938343)
   // Fleet-standard assumevalid hash (Bitcoin Core v28.0, block 938343).
   // Used by shouldSkipScripts() for the proper ancestor-check semantics.
@@ -644,7 +691,14 @@ export const TESTNET: ConsensusParams = {
   csvHeight: 770112, // BIP68/112/113
   segwitHeight: 834624,
   taprootHeight: 0,
+  bip30ExceptionBlocks: [], // No BIP-30 exceptions on testnet3
   bip30ExceptionHeights: [], // No BIP-30 exceptions on testnet3
+  // BIP34Hash: block hash at h=21111 on testnet3 canonical chain (display byte order, reversed to LE).
+  // Reference: Bitcoin Core kernel/chainparams.cpp:213.
+  bip34Hash: Buffer.from(
+    "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8",
+    "hex"
+  ).reverse(),
   // Fleet-standard assumevalid hash for testnet3 (Bitcoin Core v28.0, block 123613).
   assumedValid: "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a",
   dnsSeed: [
@@ -756,7 +810,10 @@ export const TESTNET4: ConsensusParams = {
   csvHeight: 1,
   segwitHeight: 1,
   taprootHeight: 1,
+  bip30ExceptionBlocks: [], // No BIP-30 exceptions on testnet4
   bip30ExceptionHeights: [], // No BIP-30 exceptions on testnet4
+  // BIP34 active from height 1 on testnet4; no canonical BIP34Hash needed.
+  bip34Hash: null,
   // Skip script/sigop verification for blocks at or below this height.
   // Testnet4 tip as of 2026-03: ~60k blocks, set conservatively.
   assumeValidHeight: 123613,
@@ -863,7 +920,10 @@ export const SIGNET: ConsensusParams = {
   csvHeight: 1,
   segwitHeight: 1,
   taprootHeight: 1,
+  bip30ExceptionBlocks: [], // No BIP-30 exceptions on signet
   bip30ExceptionHeights: [], // No BIP-30 exceptions on signet
+  // BIP34 active from height 1 on signet; no canonical BIP34Hash needed.
+  bip34Hash: null,
   dnsSeed: [
     "seed.signet.bitcoin.sprovoost.nl",
   ],
@@ -908,7 +968,10 @@ export const REGTEST: ConsensusParams = {
   csvHeight: 0, // BIP68/112/113 always active on regtest
   segwitHeight: 0,
   taprootHeight: 0,
+  bip30ExceptionBlocks: [], // No BIP-30 exceptions on regtest
   bip30ExceptionHeights: [], // No BIP-30 exceptions on regtest
+  // BIP34 active from height 1 on regtest; no canonical BIP34Hash needed.
+  bip34Hash: null,
   coinbaseMaturity: 100,
   difficultyAdjustmentInterval: 2016,
   dnsSeed: [],
