@@ -434,7 +434,7 @@ describe("full node integration", () => {
 
       await expect(
         chainState.connectBlock(minedBlock, height)
-      ).rejects.toThrow(/exceeds maximum|exceeds subsidy/);
+      ).rejects.toThrow(/bad-cb-amount|exceeds maximum|exceeds subsidy/);
     });
 
     test("rejects block spending non-existent UTXO", async () => {
@@ -484,10 +484,12 @@ describe("full node integration", () => {
 
       const minedBlock = mineRegtestBlock(block);
 
-      // Should reject due to missing UTXO
+      // Should reject due to missing UTXO.
+      // W93: canonical reject reason is now bad-txns-inputs-missingorspent
+      // (matches Core consensus/tx_verify.cpp:168).
       await expect(
         chainState.connectBlock(minedBlock, height)
-      ).rejects.toThrow(/Missing UTXO/);
+      ).rejects.toThrow(/bad-txns-inputs-missingorspent|Missing UTXO/);
     });
   });
 });

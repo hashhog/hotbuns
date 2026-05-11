@@ -303,14 +303,54 @@ export class ChainStateManager {
     //     re-run checks for correctness (cheap relative to DB I/O)
     //   - reorganize reconnects blocks from a previously validated alternative chain
     const csvActive = height >= this.params.csvHeight;
+
+    // W93: thread the canonical genesis hash so coreConnectBlockChecks can
+    // short-circuit the per-tx loop on genesis (Core validation.cpp:2339-2343).
+    const genesisHashHexLE = Buffer.from(this.params.genesisBlockHash)
+      .reverse()
+      .toString("hex");
+
+    // W93: pass the UTXO view's current best-block hash for the
+    // hashPrevBlock == view.GetBestBlock() invariant (Core validation.cpp:2333).
+    // Wrapped in a try because cold start / dumptxoutset reload may leave the
+    // view's bestBlock unset — coreConnectBlockChecks treats an all-zero or
+    // empty hash as "fresh start" and skips the check.
+    let utxoBestBlockHashHexLE: string | undefined;
+    try {
+      const viewBest = await this.utxo.getCoinsViewCache().getBestBlock();
+      if (viewBest && viewBest.length === 32) {
+        utxoBestBlockHashHexLE = Buffer.from(viewBest).reverse().toString("hex");
+      }
+    } catch {
+      // best-block unavailable (fresh datadir or migration) — skip the gate
+      utxoBestBlockHashHexLE = undefined;
+    }
+
+    // W93: prefer prev block's Median Time Past from HeaderSync when wired.
+    // Falls back to the block's own timestamp only when HeaderSync is absent
+    // (e.g. regtest generateblock pre-tip-sync).
+    let computedPrevMTP = block.header.timestamp;
+    if (this.headerSync && height > 0) {
+      try {
+        const prevHeader = this.headerSync.getHeaderByHeight(height - 1);
+        if (prevHeader) {
+          computedPrevMTP = this.headerSync.getMedianTimePast(prevHeader);
+        }
+      } catch {
+        // header-sync lookup failed — keep the fallback
+      }
+    }
+
     const result = await coreConnectBlockChecks(block, height, this.utxo, this.params, {
       assumeValid: false,
       skipScripts: false,
-      prevMTP: block.header.timestamp, // no HeaderSync here; use block timestamp as MTP fallback
+      prevMTP: computedPrevMTP,
       enforceBIP68: csvActive,
       scriptThreads: 1, // this path is not IBD-hot; serial is fine
       verifyP2SH: height >= this.params.bip16Height,
       verifyWitness: height >= this.params.segwitHeight,
+      genesisHashHex: genesisHashHexLE,
+      utxoBestBlockHashHex: utxoBestBlockHashHexLE,
     });
 
     if (!result.ok) {
@@ -321,6 +361,15 @@ export class ChainStateManager {
     }
 
     const { spentOutputs } = result;
+
+    // W93: update the UTXO view's best-block pointer BEFORE flush, mirroring
+    // Bitcoin Core validation.cpp:2654 (`view.SetBestBlock(pindex->GetBlockHash())`).
+    // The disconnect path (state.ts:630) already does this symmetrically with
+    // `this.utxo.setBestBlock(prevHash)` — the missing connect-side call was an
+    // asymmetry that left the in-memory view best-block stale until the next
+    // flush completed.  Setting it here makes the W93 view-consistency gate
+    // (utxoBestBlockHashHex) work correctly on the very next connect call.
+    this.utxo.setBestBlock(blockHash);
 
     // Serialize and store undo data
     const undoData = serializeUndoData(spentOutputs);
@@ -390,6 +439,32 @@ export class ChainStateManager {
       bestHeight: height,
       totalWork: chainWork,
     });
+
+    // ── W93 Gate: ConnectTip — mempool.removeForBlock ──
+    //
+    // Bitcoin Core ConnectTip (validation.cpp:3073-3076) does:
+    //   m_mempool->removeForBlock(block_to_connect->vtx, pindexNew->nHeight);
+    //   disconnectpool.removeForBlock(block_to_connect->vtx);
+    // immediately after the ConnectBlock + flush completes.  This evicts
+    // confirmed txs from the mempool so they're not re-served via getmempool /
+    // sendrawtransaction.  Pre-W93 the chain/state.ts connect path (regtest
+    // generateblock + dumptxoutset reload + reorganize re-apply) NEVER called
+    // mempool.removeForBlock — confirmed txs stayed in the mempool until they
+    // were explicitly evicted by mempoolTrim or replaced.  Sync/blocks.ts has
+    // the same bug; the fix there lives in the sister change.
+    //
+    // Best-effort: a removeForBlock failure must NOT roll back the connect.
+    if (this.mempool) {
+      try {
+        this.mempool.removeForBlock(block);
+      } catch (err) {
+        console.warn(
+          `[mempool.removeForBlock] non-fatal failure for block ${blockHash
+            .toString("hex")
+            .slice(0, 16)}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
 
     // Emit notification for ZMQ
     if (this.notificationEmitter) {

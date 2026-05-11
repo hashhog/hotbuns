@@ -153,8 +153,14 @@ function bip22FromConnectError(err: string): string {
   // Core consensus/tx_verify.cpp::CheckTxInputs "bad-txns-in-belowout".
   // connect_block.ts emits "...outputs exceed inputs...(bad-txns-in-belowout)".
   if (s.includes("bad-txns-in-belowout") || s.includes("outputs exceed inputs")) return "bad-txns-in-belowout";
-  if ((s.includes("coinbase value") || s.includes("coinbase output")) && s.includes("exceeds")) return "bad-cb-amount";
-  if (s.includes("sigops")) return "bad-blk-sigops";
+  // W93: emit canonical token directly when the error string is already
+  // prefixed "bad-cb-amount:" (coreConnectBlockChecks now emits this).
+  if (s.includes("bad-cb-amount") ||
+      ((s.includes("coinbase value") || s.includes("coinbase output")) && s.includes("exceeds")) ||
+      (s.includes("coinbase") && s.includes("pays too much"))) return "bad-cb-amount";
+  // W93: accumulated fee out-of-range is its own canonical token.
+  if (s.includes("accumulated-fee-outofrange")) return "bad-txns-accumulated-fee-outofrange";
+  if (s.includes("bad-blk-sigops") || s.includes("sigops")) return "bad-blk-sigops";
   if (s.includes("merkle")) return "bad-txnmrklroot";
   if (s.includes("witness commitment")) return "bad-witness-merkle-match";
   if (s.includes("coinbase scriptsig") || s.includes("bad-cb-length")) return "bad-cb-length";
@@ -2386,6 +2392,24 @@ export class BlockSync {
     //
     // On return ok=true the utxoManager reflects the post-block state.
     // On return ok=false nothing has been flushed; the error is recorded.
+    // W93: thread the canonical genesis hash so coreConnectBlockChecks can
+    // short-circuit the per-tx loop on genesis (Core validation.cpp:2339-2343).
+    const genesisHashHexLE = Buffer.from(this.params.genesisBlockHash)
+      .reverse()
+      .toString("hex");
+
+    // W93: pass the UTXO view's current best-block hash for the
+    // hashPrevBlock == view.GetBestBlock() invariant (Core validation.cpp:2333).
+    let utxoBestBlockHashHexLE: string | undefined;
+    try {
+      const viewBest = await this.utxoManager.getCoinsViewCache().getBestBlock();
+      if (viewBest && viewBest.length === 32) {
+        utxoBestBlockHashHexLE = Buffer.from(viewBest).reverse().toString("hex");
+      }
+    } catch {
+      utxoBestBlockHashHexLE = undefined;
+    }
+
     const coreResult = await coreConnectBlockChecks(
       block,
       height,
@@ -2399,6 +2423,8 @@ export class BlockSync {
         scriptThreads: this.scriptThreads,
         verifyP2SH: height >= this.params.bip16Height,
         verifyWitness: height >= this.params.segwitHeight,
+        genesisHashHex: genesisHashHexLE,
+        utxoBestBlockHashHex: utxoBestBlockHashHexLE,
         // Per-coin MTP for accurate BIP-68 time-based sequence lock enforcement.
         // Uses HeaderSync to look up the MTP at (coinHeight - 1).
         getUTXOMTP: (coinHeight: number) => {
@@ -2604,11 +2630,21 @@ export class BlockSync {
         extraOps.push(...newTipTxIndexOps);
       }
 
+      // W93: status bits must include HAVE_UNDO (16) when undo data was
+      // persisted on this connect.  Pre-fix, only HEADER_VALID | TXS_KNOWN |
+      // TXS_VALID | (atTip ? HAVE_DATA : 0) was set, lying to the block-index
+      // about undo availability — pruning + reorg-disconnect both read this
+      // bit and would skip rev-data lookup that actually exists on disk.
+      // Mirrors Core validation.cpp:2648-2651 RaiseValidity(BLOCK_VALID_SCRIPTS)
+      // + WriteBlockUndo's implied HAVE_UNDO marker (Core stores nUndoPos +
+      // BLOCK_HAVE_UNDO in CBlockIndex).
+      const haveUndo = newTipUndoOp !== null ? 16 : 0;
       const blockRecord: BlockIndexRecord = {
         height,
         header: serializeBlockHeader(block.header),
         nTx: block.transactions.length,
-        status: 1 | 2 | 4 | (atTip ? 8 : 0), // header-valid, txs-known, txs-valid, have-data when at tip
+        // 1=HEADER_VALID, 2=TXS_KNOWN, 4=TXS_VALID, 8=HAVE_DATA, 16=HAVE_UNDO.
+        status: 1 | 2 | 4 | (atTip ? 8 : 0) | haveUndo,
         dataPos: atTip ? 1 : 0,
       };
       const indexValue = this.serializeBlockIndex(blockRecord);
@@ -2687,6 +2723,33 @@ export class BlockSync {
     // mempool-refill-on-reorg corpus entry as Pattern B1 (mempool=EMPTY).
     if (this.mempool) {
       this.mempool.setTipHeight(height);
+    }
+
+    // ── W93 Gate: ConnectTip — mempool.removeForBlock ──
+    //
+    // Bitcoin Core ConnectTip (validation.cpp:3073-3076) calls
+    // mempool->removeForBlock(block.vtx, height) immediately after the
+    // ConnectBlock + flush completes.  This evicts confirmed txs from the
+    // mempool so they don't linger and get re-served via getrawmempool /
+    // sendrawtransaction (which would otherwise stall or return spurious
+    // "already in chain" errors).
+    //
+    // Gated on `atTip` because deep-IBD blocks (during the IBD fast path)
+    // are unlikely to overlap with mempool contents — there's no peer feed
+    // until we're synced — so skipping the iteration saves a tiny per-block
+    // overhead.  Tip-extension and reorg-reconnect both run the removal.
+    //
+    // Best-effort: a removeForBlock failure must NOT roll back the connect.
+    if (this.mempool && atTip) {
+      try {
+        this.mempool.removeForBlock(block);
+      } catch (err) {
+        console.warn(
+          `[mempool.removeForBlock] non-fatal failure for block ${blockHash
+            .toString("hex")
+            .slice(0, 16)} at h=${height}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
     }
 
     // Relay new tip blocks to peers so they learn about the chain extension.
