@@ -321,11 +321,51 @@ export function getTxWeight(tx: Transaction): number {
 }
 
 /**
- * Calculate transaction virtual size (vsize).
+ * Calculate transaction virtual size (vsize, naive — no sigop adjustment).
  * vsize = ceil(weight / 4)
+ *
+ * This is the plain vsize used for RPC output fields like
+ * decoderawtransaction.vsize. For mempool fee-rate math, use
+ * getSigOpsAdjustedVSize() which accounts for sigop cost inflation.
  */
 export function getTxVSize(tx: Transaction): number {
   return Math.ceil(getTxWeight(tx) / 4);
+}
+
+/**
+ * Compute the sigop-adjusted weight of a transaction.
+ *
+ * Mirrors Bitcoin Core GetSigOpsAdjustedWeight() (policy/policy.cpp:390-393):
+ *   return std::max(weight, sigop_cost * bytes_per_sigop);
+ *
+ * Reference: bitcoin-core/src/policy/policy.h:196
+ */
+export function getSigOpsAdjustedWeight(
+  weight: number,
+  sigOpCost: number,
+  bytesPerSigop: number
+): number {
+  return Math.max(weight, sigOpCost * bytesPerSigop);
+}
+
+/**
+ * Compute the virtual size of a transaction, optionally adjusted for sigop cost.
+ *
+ * Mirrors Bitcoin Core GetVirtualTransactionSize() (policy/policy.cpp:395-398):
+ *   return (GetSigOpsAdjustedWeight(nWeight, nSigOpCost, bytes_per_sigop)
+ *           + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR;
+ *
+ * When sigOpCost and bytesPerSigop are 0, this reduces to the naive vsize.
+ *
+ * Reference: bitcoin-core/src/policy/policy.h:182-188
+ */
+export function getVirtualTransactionSize(
+  weight: number,
+  sigOpCost: number,
+  bytesPerSigop: number
+): number {
+  const adjWeight = getSigOpsAdjustedWeight(weight, sigOpCost, bytesPerSigop);
+  return Math.ceil(adjWeight / 4); // WITNESS_SCALE_FACTOR = 4
 }
 
 /**
@@ -999,16 +1039,20 @@ export function validateTxBasic(tx: Transaction): { valid: boolean; error?: stri
     }
   }
 
-  // Check transaction size (rough sanity check)
-  const serialized = serializeTx(tx, true);
-  if (serialized.length < 10) {
-    return { valid: false, error: "Transaction too small" };
-  }
-
-  // Max transaction size is 100KB for standard transactions
-  // (consensus allows up to 4MB weight)
-  if (serialized.length > 4_000_000) {
-    return { valid: false, error: "Transaction too large" };
+  // Check transaction oversize (consensus rule).
+  // Bitcoin Core consensus/tx_check.cpp:19:
+  //   GetSerializeSize(TX_NO_WITNESS(tx)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+  // i.e. stripped_size * 4 > 4_000_000  →  stripped_size > 1_000_000
+  // Note: we check stripped (non-witness) size * 4, NOT total wire size.
+  // A witness-heavy tx with stripped_size 1_000_001 would be rejected by Core
+  // even if its total wire size is below 4_000_000. Using total size as the
+  // threshold is wrong (Bug 1 fixed here).
+  // Also: there is NO consensus minimum transaction weight floor —
+  // MIN_TRANSACTION_WEIGHT (240) in consensus.h is a DoS upper-bound on
+  // loop counts, not a per-tx floor (Bug 2 comment removed).
+  const strippedSize = serializeTx(tx, false).length;
+  if (strippedSize * 4 > 4_000_000) {
+    return { valid: false, error: "bad-txns-oversize" };
   }
 
   return { valid: true };
