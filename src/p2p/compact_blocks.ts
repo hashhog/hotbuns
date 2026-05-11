@@ -19,7 +19,12 @@ import type { Block, BlockHeader } from "../validation/block.js";
 import type { Transaction } from "../validation/tx.js";
 import type { Mempool, MempoolEntry } from "../mempool/mempool.js";
 import { getTxId, getWTxId } from "../validation/tx.js";
-import { serializeBlockHeader } from "../validation/block.js";
+import {
+  serializeBlockHeader,
+  MAX_BLOCK_WEIGHT,
+  MIN_SERIALIZABLE_TRANSACTION_WEIGHT,
+  checkWitnessMalleation,
+} from "../validation/block.js";
 import { sha256Hash } from "../crypto/primitives.js";
 import { sipHash24 } from "../storage/indexes.js";
 import type {
@@ -352,44 +357,94 @@ export class PartiallyDownloadedBlock {
   /**
    * Initialize the partially downloaded block from a compact block.
    *
-   * @param compact - Compact block payload
+   * Mirrors Bitcoin Core PartiallyDownloadedBlock::InitData()
+   * (blockencodings.cpp:59-181).
+   *
+   * Gates checked (Core line refs):
+   *  G1  header.IsNull() || both lists empty  → INVALID  (L62-63)
+   *  G2  BlockTxCount > MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT → INVALID (L64-65)
+   *  G3  BlockTxCount > uint16_t::max → INVALID  (serializer gate, L125-128)
+   *  G4  prefilled tx IsNull() → INVALID  (L74-76)
+   *  G5  prefilled absolute index overflow uint16_t → INVALID  (L77-79)
+   *  G6  prefilled index > available slots → INVALID  (L80-85)
+   *  G7  short-ID bucket size > 12 → FAILED  (L110-111, DoS gate)
+   *  G8  short-ID set collision (map.size != count) → FAILED  (L115-116)
+   *
+   * @param compact - Compact block payload (with absolute-decoded prefilled indices)
    * @returns Status code
    */
   initData(compact: CmpctBlockPayload): ReadStatus {
-    // Validate bounds
+    // G1: header null or both lists empty
     if (this.txCount === 0) {
       return ReadStatus.INVALID;
     }
 
-    // Per Bitcoin Core: max tx count = MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT
-    // We'll use a conservative limit
-    if (this.txCount > 100000) {
+    // G2: max tx count = MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT
+    // Core: blockencodings.cpp:64-65
+    const MAX_CMPCT_TX_COUNT = Math.floor(MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT);
+    if (this.txCount > MAX_CMPCT_TX_COUNT) {
+      return ReadStatus.INVALID;
+    }
+
+    // G3: BlockTxCount must fit in uint16_t (65535)
+    // Core: blockencodings.h:125-128 serializer gate
+    if (this.txCount > 0xffff) {
       return ReadStatus.INVALID;
     }
 
     // Place prefilled transactions
-    let lastIndex = -1;
-    for (const prefilled of compact.prefilledTxns) {
-      // Decode differential index
+    let lastPrefilledIndex = -1;
+    for (let i = 0; i < compact.prefilledTxns.length; i++) {
+      const prefilled = compact.prefilledTxns[i];
+
+      // G4: prefilled tx must not be null/empty
+      // Core: blockencodings.cpp:74-76
+      if (!prefilled.tx) {
+        return ReadStatus.INVALID;
+      }
+
       const absoluteIndex = prefilled.index;
+
+      // G5: absolute index must fit in uint16_t
+      // Core: blockencodings.cpp:77-79 (lastprefilledindex > uint16_t max)
+      if (absoluteIndex > 0xffff) {
+        return ReadStatus.INVALID;
+      }
+
+      // G6: index must not exceed available slots
+      // Core: blockencodings.cpp:80-85
+      // "If inserting at an index greater than shorttxids.size() + prefilled inserted so far"
+      if (absoluteIndex > compact.shortIds.length + i) {
+        return ReadStatus.INVALID;
+      }
 
       if (absoluteIndex >= this.txCount) {
         return ReadStatus.INVALID;
       }
 
-      // Check for index ordering issues
-      if (absoluteIndex <= lastIndex) {
+      // Indices must be strictly increasing
+      if (absoluteIndex <= lastPrefilledIndex) {
         return ReadStatus.INVALID;
       }
 
       this.txnAvailable[absoluteIndex] = prefilled.tx;
-      lastIndex = absoluteIndex;
+      lastPrefilledIndex = absoluteIndex;
     }
     this.prefilledCount = compact.prefilledTxns.length;
 
-    // Build short ID -> index mapping
+    // Build short ID -> index mapping with bucket-size DoS guard.
+    // Core uses std::unordered_map with default load-factor=1.0, bucket_size().
+    // We simulate the bucket-size-12 gate with a collision-count map.
+    // Core: blockencodings.cpp:94-116
+    //
+    // G7: bucket-size > 12 → READ_STATUS_FAILED
+    //   With S short IDs and load factor 1.0, bucket count ≈ S.
+    //   P(any bucket > 12) ≈ 0 for honest traffic; adversarial input can
+    //   force collisions deterministically — bail early at depth 12.
+    //
+    // G8: size mismatch after insert (exact duplicate short ID) → FAILED
+    const bucketCollisionCount = new Map<bigint, number>();
     let shortIdIdx = 0;
-    const shortIdCollisionCheck = new Set<bigint>();
 
     for (let i = 0; i < this.txCount; i++) {
       if (this.txnAvailable[i] === undefined) {
@@ -399,73 +454,130 @@ export class PartiallyDownloadedBlock {
 
         const shortIdValue = shortIdToValue(compact.shortIds[shortIdIdx]);
 
-        // Check for collision in the compact block itself
-        if (shortIdCollisionCheck.has(shortIdValue)) {
-          // Short ID collision detected
+        // G7: bucket-size check — each unique short ID maps to one bucket;
+        // collisions increment that bucket's count.
+        const prev = bucketCollisionCount.get(shortIdValue) ?? 0;
+        if (prev >= 12) {
           return ReadStatus.FAILED;
         }
-        shortIdCollisionCheck.add(shortIdValue);
+        bucketCollisionCount.set(shortIdValue, prev + 1);
 
         this.shortIdToIndex.set(shortIdValue, i);
         shortIdIdx++;
       }
     }
 
+    // G8: exact duplicate detection — if any short ID appeared more than once,
+    // shortIdToIndex.size < compact.shortIds.length.
+    // Core: blockencodings.cpp:115-116
+    if (this.shortIdToIndex.size !== compact.shortIds.length) {
+      return ReadStatus.FAILED;
+    }
+
     return ReadStatus.OK;
   }
 
   /**
-   * Try to fill missing transactions from mempool.
+   * Try to fill missing transactions from mempool and extra pool.
+   *
+   * Mirrors Bitcoin Core PartiallyDownloadedBlock::InitData() mempool scan
+   * and extra_txn scan (blockencodings.cpp:118-176).
+   *
+   * Key correctness invariants (Core line refs):
+   *  - have_txn[] tracks which slots are claimed, preventing a third mempool
+   *    tx from re-filling a slot that was already cleared by a collision
+   *    (L125-136).  Without this a 3-way collision can silently fill a slot
+   *    with the wrong tx.
+   *  - extra_txn collision gate: only clear when the new tx's witness hash
+   *    differs from the previously-installed one (L163-165).  Avoids thrashing
+   *    on duplicate extra entries that carry the same tx.
+   *  - Early exit when all short-ID slots are filled (L142-144, L174-176).
    *
    * @param mempool - Mempool to search for transactions
-   * @param extraTxn - Extra transactions to search (e.g., recently received)
+   * @param extraTxn - Extra transactions to search (e.g., recently evicted, orphan pool)
    * @returns List of missing indices after mempool search
    */
   fillFromMempool(
     mempool: { getTransaction(txid: Buffer): MempoolEntry | null; getAllEntries?(): MempoolEntry[] },
     extraTxn: Transaction[] = []
   ): number[] {
-    // Build set of indices we've filled
-    const filled = new Set<number>();
+    // have_txn[i] tracks whether slot i has been claimed (filled OR collided-and-cleared).
+    // Core: blockencodings.cpp:118 `std::vector<bool> have_txn(txn_available.size())`
+    const haveTxn: boolean[] = new Array(this.txCount).fill(false);
 
-    // Search mempool
-    // We need to iterate all mempool transactions and compute their short IDs
-    // This matches Bitcoin Core's approach for optimal cache behavior
+    // Pre-mark prefilled slots as "have" so they are not re-filled.
+    for (let i = 0; i < this.txCount; i++) {
+      if (this.txnAvailable[i] !== undefined) {
+        haveTxn[i] = true;
+      }
+    }
+
+    // Search mempool — iterate all entries and compute short IDs.
+    // Core: blockencodings.cpp:120-145
     if (mempool.getAllEntries) {
       for (const entry of mempool.getAllEntries()) {
         const wtxid = getWTxId(entry.tx);
         const shortId = computeShortTxIdValue(this.k0, this.k1, wtxid);
         const idx = this.shortIdToIndex.get(shortId);
 
-        if (idx !== undefined && !filled.has(idx)) {
-          if (this.txnAvailable[idx] === undefined) {
+        if (idx !== undefined) {
+          if (!haveTxn[idx]) {
+            // First match for this slot — fill it.
             this.txnAvailable[idx] = entry.tx;
-            filled.add(idx);
+            haveTxn[idx] = true;
             this.mempoolCount++;
           } else {
-            // Collision: two mempool txs match the same short ID
-            // Clear and request via getblocktxn
-            this.txnAvailable[idx] = undefined;
-            this.mempoolCount--;
+            // Collision: a second mempool tx hashes to the same short ID.
+            // Clear the slot; request via getblocktxn.
+            // haveTxn[idx] stays true to prevent a third tx refilling the slot.
+            // Core: blockencodings.cpp:132-136
+            if (this.txnAvailable[idx] !== undefined) {
+              this.txnAvailable[idx] = undefined;
+              this.mempoolCount--;
+            }
+            // (if already undefined, this is a 3rd+ collision — no-op)
           }
         }
 
-        // Early exit if we've filled all slots
-        if (filled.size === this.shortIdToIndex.size) {
+        // Early exit: all short-ID slots are filled (Core L142-144).
+        if (this.mempoolCount === this.shortIdToIndex.size) {
           break;
         }
       }
     }
 
-    // Search extra transactions (recently received, orphan pool, etc.)
+    // Search extra transactions (recently received, recently evicted, etc.)
+    // Core: blockencodings.cpp:147-176
     for (const tx of extraTxn) {
       const wtxid = getWTxId(tx);
       const shortId = computeShortTxIdValue(this.k0, this.k1, wtxid);
       const idx = this.shortIdToIndex.get(shortId);
 
-      if (idx !== undefined && this.txnAvailable[idx] === undefined) {
-        this.txnAvailable[idx] = tx;
-        filled.add(idx);
+      if (idx !== undefined) {
+        if (!haveTxn[idx]) {
+          // First match — fill from extra pool.
+          this.txnAvailable[idx] = tx;
+          haveTxn[idx] = true;
+          this.mempoolCount++;
+        } else {
+          // Collision between extra_txn and an already-filled slot.
+          // Only clear if the witness hashes differ — avoids thrashing on
+          // duplicate entries that carry the same transaction.
+          // Core: blockencodings.cpp:163-168
+          if (
+            this.txnAvailable[idx] !== undefined &&
+            !getWTxId(this.txnAvailable[idx]!).equals(wtxid)
+          ) {
+            this.txnAvailable[idx] = undefined;
+            this.mempoolCount--;
+          }
+          // (if already undefined, or same wtxid, no-op)
+        }
+      }
+
+      // Early exit (Core L174-176).
+      if (this.mempoolCount === this.shortIdToIndex.size) {
+        break;
       }
     }
 
@@ -522,11 +634,24 @@ export class PartiallyDownloadedBlock {
   }
 
   /**
-   * Get the fully reconstructed block.
+   * Get the fully reconstructed block, with optional mutation check.
    *
-   * @returns Block if complete, null otherwise
+   * Mirrors Bitcoin Core PartiallyDownloadedBlock::FillBlock()
+   * (blockencodings.cpp:191-237).
+   *
+   * After filling all slots, Core calls IsBlockMutated(block, segwit_active)
+   * to detect short-ID collisions that produced a formally-complete but
+   * internally-inconsistent block (e.g. wrong merkle root or bad witness
+   * commitment).  On failure it returns READ_STATUS_FAILED ("Possible Short
+   * ID collision", L221).
+   *
+   * segwitActive defaults to true — callers that know segwit is not active
+   * for this block height may pass false to skip the witness commitment check.
+   *
+   * @param segwitActive - Whether segwit is active at this block's height
+   * @returns Block if complete and not mutated, null otherwise
    */
-  getBlock(): Block | null {
+  getBlock(segwitActive: boolean = true): Block | null {
     if (!this.isComplete()) {
       return null;
     }
@@ -541,10 +666,22 @@ export class PartiallyDownloadedBlock {
       transactions.push(tx);
     }
 
-    return {
+    const block: Block = {
       header: this.header,
       transactions,
     };
+
+    // IsBlockMutated check: verify merkle root and (if segwit active) witness
+    // commitment.  A short-ID collision can produce a syntactically valid
+    // compact block that reconstructs into a mutated full block.
+    // Core: blockencodings.cpp:219-221
+    const malleation = checkWitnessMalleation(block, segwitActive);
+    if (!malleation.valid) {
+      // READ_STATUS_FAILED — possible short-ID collision
+      return null;
+    }
+
+    return block;
   }
 }
 
