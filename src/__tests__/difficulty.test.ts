@@ -404,8 +404,16 @@ describe("Difficulty adjustment", () => {
 
   describe("Regtest", () => {
     it("should always return powLimit (no retargeting)", () => {
+      // Regtest: fPowNoRetargeting + fPowAllowMinDifficultyBlocks.
+      // Core does NOT short-circuit on fPowNoRetargeting in GetNextWorkRequired;
+      // it runs the min-difficulty walk-back path.  Walk-back halts when it finds
+      // non-min-diff bits.  To get powLimit back, the parent must itself carry
+      // powLimitBits so the walk-back either exits immediately (non-min-diff check
+      // false) with powLimitBits, or finds genesis which also has powLimitBits.
+      // Bug fix: previous code had an early return for fPowNoRetargeting that masked
+      // this path — now the correct protocol is followed.
       const chain = new Map<number, { timestamp: number; bits: number }>();
-      const bits = 0x1a01bc00; // doesn't matter
+      const bits = REGTEST.powLimitBits; // all regtest blocks carry min-diff
 
       chain.set(100, { timestamp: 1700000000, bits });
 
@@ -417,7 +425,7 @@ describe("Difficulty adjustment", () => {
       const lookup = createMockChain(chain);
       const target = getNextWorkRequired(parent, 1700000600, REGTEST, lookup);
 
-      // Regtest: always powLimit
+      // Regtest: powLimitBits → target = powLimit
       expect(target).toBe(REGTEST.powLimit);
     });
 

@@ -64,10 +64,15 @@ export function getNextWorkRequired(
   const powLimit = params.powLimit;
   const powLimitBits = params.powLimitBits;
 
-  // Regtest: no retargeting, always return powLimit (if enabled)
-  if (params.fPowNoRetargeting) {
-    return powLimit;
-  }
+  // NOTE: fPowNoRetargeting is intentionally NOT checked here.
+  // Core's GetNextWorkRequired has no such early exit; the check lives only in
+  // CalculateNextWorkRequired (pow.cpp:52).  On regtest (fPowNoRetargeting=true
+  // + fPowAllowMinDifficultyBlocks=true) the protocol path still runs the
+  // fPowAllowMinDifficultyBlocks branch on non-adjustment blocks and the
+  // retarget formula on adjustment blocks — CalculateNextWorkRequired returns
+  // pindexLast->nBits immediately due to fPowNoRetargeting, producing the same
+  // powLimit result, but via the correct code path.
+  // Reference: Bitcoin Core pow.cpp:14-48 (no fPowNoRetargeting guard).
 
   // Non-adjustment block
   if (height % interval !== 0) {
