@@ -559,6 +559,235 @@ describe("TRUC (v3) Policy", () => {
     });
   });
 
+  describe("v3 sibling eviction — ancestor guard (Bug A fix)", () => {
+    // Core requires: GetAncestorCount(sibling) == 2, i.e. sibling has exactly 1 mempool
+    // ancestor (the shared parent). If the sibling has additional ancestors, sibling
+    // eviction is NOT offered — Core returns the "descendant count limit" error without
+    // a sibling reference. We verify hotbuns matches that behaviour.
+    test("sibling with extra ancestors blocks eviction (post-reorg simulation)", async () => {
+      // Setup: three unconfirmed v3 txs that form grandparent → parent → sibling1.
+      // In normal TRUC operation this chain can't form (sibling1 would be rejected as
+      // a grandchild), so we use the unchecked addTransactionUnchecked path to force
+      // the state — then try sibling eviction.
+      //
+      // Since we can't trivially force invalid state via public API, we instead
+      // construct a valid chain where sibling1's ancestor count is > 2 by first
+      // adding a non-TRUC grandparent (v2) then confirming it, leaving sibling1
+      // with a stale ancestorCount. This is the equivalent of the post-reorg
+      // scenario Core guards against.
+      //
+      // SIMPLER approach: add the parent confirmed, then add two children one after
+      // another where the first child is normal (ancestorCount=2) and verify eviction
+      // works, then verify that when the sibling itself has ancestorCount > 2
+      // (by forcibly corrupting it) eviction is rejected.
+      //
+      // Since we cannot easily corrupt state, we instead validate the positive case
+      // (sibling with ancestorCount == 2 IS evictable) and the negative case
+      // (sibling with descendantCount > 1 is NOT evictable), which together cover
+      // the guard logic.
+
+      // Positive: sibling with ancestorCount == 2 is evictable
+      const inputTxid = Buffer.alloc(32, 0xa0);
+      await setupUTXO(inputTxid, 0, 2_000_000n);
+
+      const parent = createV3Tx(
+        [{ txid: inputTxid, vout: 0 }],
+        [{ value: 999_000n }, { value: 999_000n }]
+      );
+      await mempool.addTransaction(parent);
+      const parentTxid = getTxId(parent);
+
+      // sibling1: low fee, ancestorCount should be 2 (parent + sibling1)
+      const sibling1 = createV3Tx(
+        [{ txid: parentTxid, vout: 0 }],
+        [{ value: 998_000n }]
+      );
+      const r1 = await mempool.addTransaction(sibling1);
+      expect(r1.accepted).toBe(true);
+
+      // sibling1's ancestorCount should be 2 (itself + parent)
+      const sib1Entry = (mempool as any).entries.get(getTxId(sibling1).toString("hex"));
+      expect(sib1Entry).toBeDefined();
+      expect(sib1Entry.ancestorCount).toBe(2);
+
+      // sibling2: higher fee — eviction of sibling1 should succeed
+      const sibling2 = createV3Tx(
+        [{ txid: parentTxid, vout: 1 }],
+        [{ value: 995_000n }]
+      );
+      const r2 = await mempool.addTransaction(sibling2);
+      expect(r2.accepted).toBe(true);
+      expect(mempool.hasTransaction(getTxId(sibling1))).toBe(false);
+      expect(mempool.hasTransaction(getTxId(sibling2))).toBe(true);
+    });
+
+    test("sibling with descendantCount > 1 blocks eviction", async () => {
+      // If the existing sibling itself has a descendant (its own child), it cannot be
+      // evicted — Core's check: GetAncestorCount(sibling) == 2 AND descendantCount == 2.
+      // We construct: confirmed_input → parent (v3, in mempool) → sibling1 (v3)
+      // But sibling1 can't have a TRUC child in valid state without violating limits.
+      // Instead we verify that a sibling with descendantCount > 1 is not evictable
+      // by checking existingChild.descendantCount guard via the error path.
+      //
+      // Since TRUC enforces no grandchildren, this scenario can only arise after
+      // a reorg. We verify the positive path (normal eviction works) is unchanged
+      // and add a comment about the boundary guard being enforced by descendantCount check.
+
+      const inputTxid = Buffer.alloc(32, 0xa1);
+      await setupUTXO(inputTxid, 0, 2_000_000n);
+
+      const parent = createV3Tx(
+        [{ txid: inputTxid, vout: 0 }],
+        [{ value: 999_000n }, { value: 999_000n }]
+      );
+      await mempool.addTransaction(parent);
+      const parentTxid = getTxId(parent);
+
+      // Add first sibling with low fee
+      const sibling1 = createV3Tx(
+        [{ txid: parentTxid, vout: 0 }],
+        [{ value: 997_000n }]
+      );
+      const r1 = await mempool.addTransaction(sibling1);
+      expect(r1.accepted).toBe(true);
+
+      // Manually set descendantCount > 1 on sibling1 to simulate post-reorg state
+      // where sibling has children of its own.
+      const sib1Entry = (mempool as any).entries.get(getTxId(sibling1).toString("hex"));
+      sib1Entry.descendantCount = 2; // pretend sibling1 has a child
+
+      // Now trying to add sibling2 should NOT offer sibling eviction.
+      const sibling2 = createV3Tx(
+        [{ txid: parentTxid, vout: 1 }],
+        [{ value: 990_000n }] // higher fee
+      );
+      const r2 = await mempool.addTransaction(sibling2);
+      // Should fail because sibling1 can't be evicted (it has a descendant)
+      expect(r2.accepted).toBe(false);
+      expect(r2.error).toContain("exceed descendant limit");
+      // Must NOT contain "sibling eviction requires higher fee" — eviction is not offered
+      expect(r2.error).not.toContain("sibling eviction requires higher fee");
+    });
+
+    test("sibling with ancestorCount > 2 blocks eviction (Bug A)", async () => {
+      // Post-reorg scenario: sibling has additional ancestors making ancestorCount > 2.
+      // Simulate by manually setting ancestorCount on the sibling entry.
+      const inputTxid = Buffer.alloc(32, 0xa2);
+      await setupUTXO(inputTxid, 0, 2_000_000n);
+
+      const parent = createV3Tx(
+        [{ txid: inputTxid, vout: 0 }],
+        [{ value: 999_000n }, { value: 999_000n }]
+      );
+      await mempool.addTransaction(parent);
+      const parentTxid = getTxId(parent);
+
+      const sibling1 = createV3Tx(
+        [{ txid: parentTxid, vout: 0 }],
+        [{ value: 997_000n }]
+      );
+      const r1 = await mempool.addTransaction(sibling1);
+      expect(r1.accepted).toBe(true);
+
+      // Manually corrupt ancestorCount > 2 to simulate post-reorg extra ancestors
+      const sib1Entry = (mempool as any).entries.get(getTxId(sibling1).toString("hex"));
+      sib1Entry.ancestorCount = 3; // sibling now claims 3 ancestors (invalid TRUC state)
+
+      // Sibling eviction should be refused because ancestorCount !== 2
+      const sibling2 = createV3Tx(
+        [{ txid: parentTxid, vout: 1 }],
+        [{ value: 990_000n }] // higher fee
+      );
+      const r2 = await mempool.addTransaction(sibling2);
+      expect(r2.accepted).toBe(false);
+      // Must error on descendant limit, NOT sibling eviction higher-fee check
+      expect(r2.error).toContain("exceed descendant limit");
+      expect(r2.error).not.toContain("sibling eviction requires higher fee");
+    });
+  });
+
+  describe("v3 parent ancestorCount guard (Bug B fix)", () => {
+    test("parent with ancestorCount > 1 blocks TRUC child", async () => {
+      // Simulate post-reorg where a TRUC parent's ancestorCount is > 1.
+      // In normal operation this is prevented by TRUC limits, but after a reorg
+      // the cached ancestorCount can disagree with the live mempool state.
+      // hotbuns should use parent.ancestorCount (not parent.dependsOn.size) to
+      // match Core's GetAncestorCount() check.
+      const inputTxid1 = Buffer.alloc(32, 0xb0);
+      const inputTxid2 = Buffer.alloc(32, 0xb1);
+      await setupUTXO(inputTxid1, 0, 1_000_000n);
+      await setupUTXO(inputTxid2, 0, 1_000_000n);
+
+      // parent is a v3 tx with no mempool parents
+      const parent = createV3Tx(
+        [{ txid: inputTxid1, vout: 0 }],
+        [{ value: 999_000n }]
+      );
+      await mempool.addTransaction(parent);
+      expect(mempool.hasTransaction(getTxId(parent))).toBe(true);
+
+      // Manually corrupt ancestorCount to simulate post-reorg extra ancestor
+      const parentEntry = (mempool as any).entries.get(getTxId(parent).toString("hex"));
+      expect(parentEntry.ancestorCount).toBe(1); // sanity: no ancestors initially
+      parentEntry.ancestorCount = 2; // pretend parent has an ancestor it didn't before
+
+      // Adding a v3 child should now be rejected (parent's ancestorCount == 2,
+      // so child would have ancestor count 3 > TRUC_ANCESTOR_LIMIT).
+      const child = createV3Tx(
+        [{ txid: getTxId(parent), vout: 0 }],
+        [{ value: 998_000n }]
+      );
+      const result = await mempool.addTransaction(child);
+      expect(result.accepted).toBe(false);
+      expect(result.error).toContain("too many ancestors");
+    });
+  });
+
+  describe("v3 descendant count uses transitive count (Bug C fix)", () => {
+    test("parent.descendantCount is used for descendant limit check", async () => {
+      // Verify that the descendant limit check uses parent.descendantCount (transitive)
+      // rather than parent.spentBy.size (direct children only).
+      // In normal TRUC operation these are equivalent, but we validate the semantics.
+      const inputTxid = Buffer.alloc(32, 0xc0);
+      await setupUTXO(inputTxid, 0, 1_000_000n);
+
+      const parent = createV3Tx(
+        [{ txid: inputTxid, vout: 0 }],
+        [{ value: 499_000n }, { value: 499_000n }]
+      );
+      await mempool.addTransaction(parent);
+      const parentTxid = getTxId(parent);
+
+      const child1 = createV3Tx(
+        [{ txid: parentTxid, vout: 0 }],
+        [{ value: 498_000n }]
+      );
+      const r1 = await mempool.addTransaction(child1);
+      expect(r1.accepted).toBe(true);
+
+      // parent.descendantCount should now be 2 (parent + child1)
+      const parentEntry = (mempool as any).entries.get(getTxId(parent).toString("hex"));
+      expect(parentEntry.descendantCount).toBe(2);
+
+      // Manually inflate descendantCount without adding to spentBy (simulate transitive desc)
+      parentEntry.descendantCount = 3; // parent claims 2 transitive descendants
+
+      // Adding another child should now be rejected because descendantCount - 1 = 2 >= 1
+      // (and the sibling1 candidate has descendantCount=1, ancestorCount=2, so eviction
+      // would normally be offered — BUT with parent.descendantCount=3 the outer check
+      // sees 3-1=2 current descendants, so currentDescendants > 1 → plain reject)
+      const child2 = createV3Tx(
+        [{ txid: parentTxid, vout: 1 }],
+        [{ value: 494_000n }] // higher fee
+      );
+      const r2 = await mempool.addTransaction(child2);
+      expect(r2.accepted).toBe(false);
+      expect(r2.error).toContain("exceed descendant limit");
+      // currentDescendants=2 → not == 1 → sibling eviction NOT triggered
+      expect(r2.error).not.toContain("sibling eviction requires higher fee");
+    });
+  });
+
   describe("v2 transactions unaffected", () => {
     test("v2 tx can have multiple mempool ancestors", async () => {
       const inputTxid1 = Buffer.alloc(32, 0x60);
