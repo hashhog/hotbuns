@@ -47,6 +47,14 @@ interface PeerRelayQueue {
   peer: Peer;
   /** Whether this is an inbound peer (determines delay). */
   isInbound: boolean;
+  /**
+   * Whether the remote peer sent us `wtxidrelay` during the handshake.
+   * When true, inv announcements must use MSG_WTX (=5) + wtxid.
+   * When false, inv announcements use MSG_TX (=1) + txid.
+   * Reference: Bitcoin Core net_processing.cpp RelayTransaction,
+   * protocol.h MSG_WTX = 5 (BIP-339).
+   */
+  wtxidRelay: boolean;
   /** Pending transaction hashes to announce (hex). */
   pendingTxs: Set<string>;
   /** Next scheduled flush time (ms since epoch). */
@@ -81,8 +89,11 @@ export class InventoryRelay {
    *
    * @param peer - The peer to register
    * @param isInbound - Whether this is an inbound connection
+   * @param wtxidRelay - Whether the remote peer sent `wtxidrelay` during
+   *   handshake (BIP-339).  When true, flushes use MSG_WTX(5) + wtxid;
+   *   when false, flushes use MSG_TX(1) + txid.
    */
-  addPeer(peer: Peer, isInbound: boolean = false): void {
+  addPeer(peer: Peer, isInbound: boolean = false, wtxidRelay: boolean = false): void {
     const key = `${peer.host}:${peer.port}`;
 
     if (this.queues.has(key)) {
@@ -96,6 +107,7 @@ export class InventoryRelay {
     const queue: PeerRelayQueue = {
       peer,
       isInbound,
+      wtxidRelay,
       pendingTxs: new Set(),
       nextFlushTime: Date.now() + this.poissonDelay(interval),
       timer: null,
@@ -335,9 +347,15 @@ export class InventoryRelay {
       // Shuffle using Fisher-Yates for privacy
       this.shuffleArray(txidsToSend);
 
-      // Build and send inv message
+      // Build and send inv message.
+      // Per BIP-339 / Core net_processing.cpp RelayTransaction:
+      //   wtxid-relay peer → MSG_WTX (=5) + wtxid
+      //   legacy peer      → MSG_TX  (=1) + txid
+      // MSG_WITNESS_TX (0x40000001) is a BIP-144 *getdata flag*, not a
+      // valid inv type — Core peers silently discard such inv entries.
+      const invType = queue.wtxidRelay ? InvType.MSG_WTX : InvType.MSG_TX;
       const inventory: InvVector[] = txidsToSend.map((txid) => ({
-        type: InvType.MSG_WITNESS_TX,
+        type: invType,
         hash: Buffer.from(txid, "hex"),
       }));
 

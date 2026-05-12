@@ -165,6 +165,14 @@ export const enum InvType {
   MSG_BLOCK = 2,
   MSG_FILTERED_BLOCK = 3,
   MSG_CMPCT_BLOCK = 4,
+  /**
+   * BIP-339 / Bitcoin Core protocol.h: MSG_WTX = 5.
+   * Used in inv messages to announce a transaction by wtxid to a
+   * wtxid-relay peer.  This is the correct inv type for wtxid-relay peers.
+   * Note: MSG_WITNESS_TX (0x40000001) is a BIP-144 *getdata flag*, not a
+   * valid inv type — Core peers silently discard inv entries with that type.
+   */
+  MSG_WTX = 5,
   MSG_WITNESS_TX = 0x40000001,
   MSG_WITNESS_BLOCK = 0x40000002,
 }
