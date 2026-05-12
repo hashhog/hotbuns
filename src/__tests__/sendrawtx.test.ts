@@ -84,7 +84,10 @@ class MockMempool {
     return this.entries.has(txid.toString("hex"));
   }
 
-  async addTransaction(tx: Transaction) {
+  async addTransaction(
+    tx: Transaction,
+    options?: { maxFeeRateSatPerVB?: number },
+  ) {
     this.addTransactionCalls.push(tx);
 
     if (!this.acceptTransaction) {
@@ -99,6 +102,25 @@ class MockMempool {
     // Default fee rate based on test settings
     const fee = BigInt(vsize * 10); // 10 sat/vB
     const feeRate = 10;
+
+    // W96: honor the caller-provided max fee rate inline (matches real
+    // Mempool.addTransaction behavior). If the computed fee rate exceeds the
+    // cap, reject before adding to entries so the notification side-effects
+    // don't fire for txs that will end up rejected.
+    if (
+      options?.maxFeeRateSatPerVB !== undefined &&
+      options.maxFeeRateSatPerVB > 0 &&
+      feeRate > options.maxFeeRateSatPerVB
+    ) {
+      // Mirror the RPC's expected error text so the test stays meaningful.
+      const feeRateBTCkvB = (feeRate * 1000) / 100_000_000;
+      return {
+        accepted: false,
+        error: `Fee rate ${feeRateBTCkvB.toFixed(8)} BTC/kvB exceeds max rate ${(
+          options.maxFeeRateSatPerVB / 100_000
+        ).toFixed(8)} BTC/kvB`,
+      };
+    }
 
     this.entries.set(txidHex, {
       tx,
@@ -433,7 +455,6 @@ describe("sendrawtransaction", () => {
     it("should reject transaction with fee rate exceeding maxfeerate", async () => {
       const tx = createTestTransaction();
       const txHex = serializeTx(tx, true).toString("hex");
-      const txid = getTxId(tx);
 
       // Set a high fee rate on the mempool entry (1000 sat/vB = 0.01 BTC/kvB)
       // We need to intercept after addTransaction to set the fee rate
@@ -448,8 +469,12 @@ describe("sendrawtransaction", () => {
       expect(result.error!.code).toBe(RPCErrorCodes.RPC_TRANSACTION_REJECTED);
       expect(result.error!.message).toContain("exceeds max rate");
 
-      // Transaction should be removed from mempool
-      expect(mockMempool.removeTransactionCalls.length).toBe(1);
+      // W96: maxfeerate is now enforced INSIDE Mempool.addTransaction (via the
+      // `maxFeeRateSatPerVB` option) so the tx is never added to the pool and
+      // therefore never needs to be removed. Previously the RPC handler added
+      // the tx, then removed it on max-fee violation — firing txAccepted /
+      // mempoolSequence side-effects on a tx that would ultimately be rejected.
+      expect(mockMempool.removeTransactionCalls.length).toBe(0);
     });
   });
 

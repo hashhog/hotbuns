@@ -1546,7 +1546,15 @@ async function startNode(config: NodeConfig): Promise<void> {
   // (script fail, fee too low, double-spend) is a definitive reject and
   // would be a DoS hole if held.
   function isMissingInputError(err: string | undefined): boolean {
-    return typeof err === "string" && err.startsWith("Missing input:");
+    if (typeof err !== "string") return false;
+    // Mempool emits Bitcoin Core's canonical reject reason
+    // (`bad-txns-inputs-missingorspent`, see validation.cpp:866). The legacy
+    // `Missing input:` form is kept for back-compat with any older callers;
+    // either is treated as "route to orphan pool".
+    return (
+      err.startsWith("bad-txns-inputs-missingorspent") ||
+      err.startsWith("Missing input:")
+    );
   }
 
   // Block-connected hook: drop orphans that just got mined (Core's

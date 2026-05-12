@@ -135,7 +135,9 @@ describe("Mempool", () => {
       const result = await mempool.addTransaction(tx);
 
       expect(result.accepted).toBe(false);
-      expect(result.error).toContain("already in mempool");
+      // W96: error name matches Bitcoin Core canonical reject reason
+      // (validation.cpp:823-830). Same-wtxid resubmission → txn-already-in-mempool.
+      expect(result.error).toContain("txn-already-in-mempool");
     });
 
     test("rejects transaction with missing input", async () => {
@@ -146,7 +148,9 @@ describe("Mempool", () => {
 
       const result = await mempool.addTransaction(tx);
       expect(result.accepted).toBe(false);
-      expect(result.error).toContain("Missing input");
+      // W96: error name matches Bitcoin Core's canonical reject reason
+      // (validation.cpp:866). Was `Missing input: ...` previously.
+      expect(result.error).toContain("bad-txns-inputs-missingorspent");
     });
 
     test("rejects transaction below explicit min fee rate", async () => {
@@ -191,7 +195,9 @@ describe("Mempool", () => {
 
       const result = await mempool.addTransaction(tx);
       expect(result.accepted).toBe(false);
-      expect(result.error).toContain("Coinbase maturity");
+      // W96: error name matches Bitcoin Core's canonical reject reason
+      // (tx_verify.cpp:180). Was `Coinbase maturity not met: ...` previously.
+      expect(result.error).toContain("bad-txns-premature-spend-of-coinbase");
     });
 
     test("accepts transaction spending mature coinbase", async () => {
@@ -262,7 +268,9 @@ describe("Mempool", () => {
 
       const result = await mempool.addTransaction(tx);
       expect(result.accepted).toBe(false);
-      expect(result.error).toContain("Insufficient input");
+      // W96: error name matches Bitcoin Core canonical reject reason
+      // (tx_verify.cpp:196-199). Was `Insufficient input value: ...` previously.
+      expect(result.error).toContain("bad-txns-in-belowout");
     });
   });
 
