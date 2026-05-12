@@ -1365,6 +1365,367 @@ describe("assumeUTXO", () => {
   });
 
   // -----------------------------------------------------------------------
+  // W102 AssumeUTXO load-time validation guards (BUG-1..6).
+  //
+  // Reference: Bitcoin Core validation.cpp:5787-5883 (PopulateAndValidateSnapshot)
+  // and :5600 (ActivateSnapshot double-activation guard).
+  // -----------------------------------------------------------------------
+  describe("W102 AssumeUTXO load-time validation guards", () => {
+    let db: ChainDB;
+
+    beforeEach(async () => {
+      db = new ChainDB(join(testDbPath, "w102-guards-" + Math.random().toString(36).slice(2)));
+      await db.open();
+    });
+
+    afterEach(async () => {
+      await db.close();
+    });
+
+    /**
+     * Build a minimal valid snapshot file in a tmp path for the given
+     * params+tip. Uses a real dumpSnapshot round-trip so the file is
+     * byte-valid (passes header, magic, network-magic, hash checks).
+     * Returns the path; caller must clean up.
+     */
+    async function buildValidSnapshot(
+      snapDb: ChainDB,
+      tip: Buffer,
+      height: number,
+      params: ConsensusParams,
+      snapPath: string
+    ): Promise<void> {
+      await snapDb.putChainState({ bestBlockHash: tip, bestHeight: height, totalWork: 1n });
+      await snapDb.putBlockIndex(tip, {
+        height,
+        header: Buffer.alloc(80, 0),
+        nTx: 1,
+        status: 0x1f,
+        dataPos: 0,
+      });
+      const mgr = new ChainstateManager(snapDb, params);
+      await mgr.dumpSnapshot(snapPath);
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG-5: double-activation guard
+    // Mirrors validation.cpp:5600 — "Can't activate a snapshot-based
+    // chainstate more than once".
+    // -----------------------------------------------------------------------
+    it("BUG-5: loadSnapshot throws when activeChainstate is already a snapshot", async () => {
+      const tip = Buffer.alloc(32, 0xb5);
+      const { hash: serializedHash } = await computeUTXOSetHash(db);
+      const params: ConsensusParams = {
+        ...REGTEST,
+        assumeutxo: new Map([
+          [tip.toString("hex"), { height: 50, hashSerialized: serializedHash, nChainTx: 0n, blockHash: tip }],
+        ]),
+      };
+
+      const snapPath = join(testDbPath, "bug5-double.dat");
+      await buildValidSnapshot(db, tip, 50, params, snapPath);
+
+      // Wipe UTXOs so loadSnapshot reloads from file.
+      const it1 = (db as any).db.iterator({
+        gte: Buffer.from([DBPrefix.UTXO]),
+        lt: Buffer.from([DBPrefix.UTXO + 1]),
+      });
+      const delKeys: Buffer[] = [];
+      for await (const [k] of it1) delKeys.push(k);
+      await it1.close();
+      await db.batch(delKeys.map((k) => ({ type: "del" as const, prefix: k[0]!, key: k.subarray(1) })));
+
+      const mgr = new ChainstateManager(db, params);
+
+      // First load should succeed (activates the snapshot chainstate).
+      await mgr.loadSnapshot(snapPath);
+
+      // Second load on the same manager (whose active chainstate is now a
+      // snapshot) must throw the double-activation error.
+      await expect(mgr.loadSnapshot(snapPath)).rejects.toThrow(
+        "Can't activate a snapshot-based chainstate more than once"
+      );
+
+      try { (await import("node:fs/promises")).unlink(snapPath).catch(() => {}); } catch {}
+    });
+
+    // -----------------------------------------------------------------------
+    // BUG-6: work-vs-active-tip check
+    // Mirrors validation.cpp:5787-5789 — "Work does not exceed active
+    // chainstate". We approximate with height: snapshot height must be
+    // strictly greater than the current active tip height.
+    // -----------------------------------------------------------------------
+    it("BUG-6: loadSnapshot throws when snapshot height ≤ active tip height", async () => {
+      const tip = Buffer.alloc(32, 0xb6);
+      const snapshotHeight = 100;
+
+      const { hash: serializedHash } = await computeUTXOSetHash(db);
+      const params: ConsensusParams = {
+        ...REGTEST,
+        assumeutxo: new Map([
+          [tip.toString("hex"), { height: snapshotHeight, hashSerialized: serializedHash, nChainTx: 0n, blockHash: tip }],
+        ]),
+      };
+
+      const snapPath = join(testDbPath, "bug6-stale.dat");
+      await buildValidSnapshot(db, tip, snapshotHeight, params, snapPath);
+
+      // Active tip is at height 100 — equal to snapshot height → must reject.
+      const mgr = new ChainstateManager(db, params);
+      mgr.current().tipHeight = snapshotHeight; // simulate active tip at same height
+
+      await expect(mgr.loadSnapshot(snapPath)).rejects.toThrow(
+        "Work does not exceed active chainstate"
+      );
+
+      // Active tip is ABOVE snapshot height → must also reject.
+      mgr.current().tipHeight = snapshotHeight + 1;
+      await expect(mgr.loadSnapshot(snapPath)).rejects.toThrow(
+        "Work does not exceed active chainstate"
+      );
+
+      // Active tip BELOW snapshot height → must succeed.
+      const wipeIter = (db as any).db.iterator({
+        gte: Buffer.from([DBPrefix.UTXO]),
+        lt: Buffer.from([DBPrefix.UTXO + 1]),
+      });
+      const wipeKeys: Buffer[] = [];
+      for await (const [k] of wipeIter) wipeKeys.push(k);
+      await wipeIter.close();
+      await db.batch(wipeKeys.map((k) => ({ type: "del" as const, prefix: k[0]!, key: k.subarray(1) })));
+
+      const mgrOk = new ChainstateManager(db, params);
+      mgrOk.current().tipHeight = snapshotHeight - 1; // strictly less → OK
+      await expect(mgrOk.loadSnapshot(snapPath)).resolves.toBeDefined();
+
+      try { (await import("node:fs/promises")).unlink(snapPath).catch(() => {}); } catch {}
+    });
+
+    // -----------------------------------------------------------------------
+    // BUG-1: per-txid overflow guard
+    // Mirrors validation.cpp:5804-5806 — coins_per_txid > coins_left.
+    // A snapshot that claims 1 coin total but has a txid group with
+    // numOutputs=2 must be rejected immediately.
+    // -----------------------------------------------------------------------
+    it("BUG-1: loadSnapshot throws when per-txid coin count overflows coins_left", async () => {
+      const tip = Buffer.alloc(32, 0xb1);
+      const fspMod = await import("node:fs/promises");
+
+      // Build a one-coin snapshot first, then patch the per-txid numOutputs
+      // byte to 2 so it exceeds the declared coinsCount of 1.
+      const txid = Buffer.alloc(32, 0xc1);
+      const spk = Buffer.from([0x76, 0xa9, 0x14, ...Buffer.alloc(20, 0x11), 0x88, 0xac]);
+      await db.putUTXO(txid, 0, { height: 5, coinbase: false, amount: 1_00000000n, scriptPubKey: spk });
+
+      const { hash: serializedHash } = await computeUTXOSetHash(db);
+      const params: ConsensusParams = {
+        ...REGTEST,
+        assumeutxo: new Map([
+          [tip.toString("hex"), { height: 10, hashSerialized: serializedHash, nChainTx: 1n, blockHash: tip }],
+        ]),
+      };
+
+      const goodPath = join(testDbPath, "bug1-good.dat");
+      await buildValidSnapshot(db, tip, 10, params, goodPath);
+
+      // Read the file, locate the first per-txid numOutputs byte (after 51-byte
+      // header + 32-byte txid = byte offset 83), and change 1 → 2.
+      // The header says coinsCount=1; numOutputs=2 > coinsLeft=1 → reject.
+      const raw = Buffer.from(await fspMod.readFile(goodPath));
+      // Offset 83 = 51 (header) + 32 (txid). The CompactSize for count=1 is
+      // a single byte 0x01; patch it to 0x02.
+      raw[83] = 0x02;
+      const patchedPath = join(testDbPath, "bug1-patched.dat");
+      await fspMod.writeFile(patchedPath, raw);
+
+      const mgr = new ChainstateManager(db, params);
+      await expect(mgr.loadSnapshot(patchedPath)).rejects.toThrow(
+        "Mismatch in coins count in snapshot metadata and actual snapshot data"
+      );
+
+      try { fspMod.unlink(goodPath).catch(() => {}); fspMod.unlink(patchedPath).catch(() => {}); } catch {}
+    });
+
+    // -----------------------------------------------------------------------
+    // BUG-2: trailing-bytes EOF check
+    // Mirrors validation.cpp:5872-5883 — extra bytes after all declared
+    // coins are consumed must trigger "Bad snapshot - coins left over ...".
+    // -----------------------------------------------------------------------
+    it("BUG-2: loadSnapshot throws when extra bytes trail the declared coin count", async () => {
+      const tip = Buffer.alloc(32, 0xb2);
+      const fspMod = await import("node:fs/promises");
+
+      const txid = Buffer.alloc(32, 0xc2);
+      const spk = Buffer.from([0x76, 0xa9, 0x14, ...Buffer.alloc(20, 0x22), 0x88, 0xac]);
+      await db.putUTXO(txid, 0, { height: 5, coinbase: false, amount: 2_00000000n, scriptPubKey: spk });
+
+      const { hash: serializedHash } = await computeUTXOSetHash(db);
+      const params: ConsensusParams = {
+        ...REGTEST,
+        assumeutxo: new Map([
+          [tip.toString("hex"), { height: 10, hashSerialized: serializedHash, nChainTx: 1n, blockHash: tip }],
+        ]),
+      };
+
+      const goodPath = join(testDbPath, "bug2-good.dat");
+      await buildValidSnapshot(db, tip, 10, params, goodPath);
+
+      // Append a stray byte to the end of the snapshot file.
+      const raw = Buffer.from(await fspMod.readFile(goodPath));
+      const patched = Buffer.concat([raw, Buffer.from([0x00])]);
+      const patchedPath = join(testDbPath, "bug2-trailing.dat");
+      await fspMod.writeFile(patchedPath, patched);
+
+      // loadSnapshot will reload from the db after wipe, but the hash check
+      // will fail because the hash was computed on clean data. We need params
+      // with the correct hash so only the trailing-byte check fires, not the
+      // hash check. Since trailing bytes are checked before hash computation,
+      // this test only needs the guard to fire before we get to the hash step.
+      const mgr = new ChainstateManager(db, params);
+      // Wipe UTXOs so the snapshot file's coins are actually loaded.
+      const it2 = (db as any).db.iterator({
+        gte: Buffer.from([DBPrefix.UTXO]),
+        lt: Buffer.from([DBPrefix.UTXO + 1]),
+      });
+      const dk2: Buffer[] = [];
+      for await (const [k] of it2) dk2.push(k);
+      await it2.close();
+      await db.batch(dk2.map((k) => ({ type: "del" as const, prefix: k[0]!, key: k.subarray(1) })));
+
+      await expect(mgr.loadSnapshot(patchedPath)).rejects.toThrow(
+        /Bad snapshot - coins left over after deserializing/
+      );
+
+      try { fspMod.unlink(goodPath).catch(() => {}); fspMod.unlink(patchedPath).catch(() => {}); } catch {}
+    });
+
+    // -----------------------------------------------------------------------
+    // BUG-3: per-coin MoneyRange check
+    // Mirrors validation.cpp:5820-5823 — !MoneyRange(coin.out.nValue).
+    // We need a snapshot file where a coin's compressed amount decodes to
+    // a value > MAX_MONEY. MAX_MONEY = 2_100_000_000_000_000n sat.
+    // We craft the coin bytes directly since dumpSnapshot wouldn't write
+    // an invalid value in normal operation.
+    // -----------------------------------------------------------------------
+    it("BUG-3: loadSnapshot throws when a coin value exceeds MAX_MONEY", async () => {
+      // The easiest approach is to build a valid snapshot, then inspect its
+      // binary format and reconstruct a version with a supra-MAX_MONEY coin.
+      // CompressAmount(MAX_MONEY + 1) is a value the decompressor returns as > MAX.
+      // We directly write the snapshot bytes, bypassing dumpSnapshot.
+      //
+      // Snapshot header (51 bytes):
+      //   5 magic | 2 version(2) | 4 netmagic | 32 basehash | 8 coinsCount(1)
+      // Coin group:
+      //   32 txid | 1 numOutputs(1=CompactSize) | 1 vout(0=CompactSize) |
+      //   VARINT(code=height*2+coinbase) | VARINT(compressedAmount) | nSize...
+      //
+      // We use a raw (non-special) script so nSize = NUM_SPECIAL_SCRIPTS (6)
+      // and payload is 0 bytes (nSize - 6 = 0).
+      const { BufferWriter: BW, BufferReader: BR } = await import("../wire/serialization.js");
+      const { writeVarIntCore: wvi, compressAmount } = await import("../wire/compressor.js");
+      const fspMod = await import("node:fs/promises");
+
+      // MAX_MONEY + 1 — clearly out of range.
+      const overValue = 2_100_000_000_000_001n;
+      // We need to craft the compressed amount bytes for overValue.
+      // compressAmount is defined for valid values; we compute manually:
+      // compressAmount formula: if n == 0: 0. else find e, d such that...
+      // Actually we can use a raw 0-byte script with a huge amount.
+      // Use CompressAmount(overValue) directly.
+      const compOver = compressAmount(overValue);
+
+      const tip = Buffer.alloc(32, 0xb3);
+      // Register the tip with coinsCount=1 and a dummy hash (since this will
+      // fail before the hash check — MoneyRange fires at coin deserialization).
+      const dummyHash = Buffer.alloc(32, 0xde);
+      const params: ConsensusParams = {
+        ...REGTEST,
+        assumeutxo: new Map([
+          [tip.toString("hex"), { height: 10, hashSerialized: dummyHash, nChainTx: 1n, blockHash: tip }],
+        ]),
+      };
+
+      // Build raw snapshot bytes.
+      const w = new BW();
+      // 5-byte magic
+      w.writeBytes(SNAPSHOT_MAGIC);
+      // 2-byte version
+      w.writeUInt16LE(SNAPSHOT_VERSION);
+      // 4-byte network magic (REGTEST = 0xdab5bffa)
+      w.writeUInt32LE(REGTEST.networkMagic);
+      // 32-byte base block hash
+      w.writeHash(tip);
+      // 8-byte coinsCount = 1
+      w.writeUInt64LE(1n);
+      // Coin group: txid (32) | numOutputs CompactSize(1) | vout CompactSize(0) | code VARINT(0) | compAmount VARINT | nSize VARINT(6) [0-byte raw script]
+      const txid = Buffer.alloc(32, 0xc3);
+      w.writeBytes(txid);
+      w.writeVarInt(1);  // numOutputs
+      w.writeVarInt(0);  // vout
+      wvi(w, 0n);        // code = height(0)*2 + coinbase(0) = 0
+      wvi(w, compOver);  // compressed overValue
+      wvi(w, 6n);        // nSize = NUM_SPECIAL_SCRIPTS (raw, 0-byte script)
+
+      const snapPath = join(testDbPath, "bug3-over-money.dat");
+      await fspMod.writeFile(snapPath, w.toBuffer());
+
+      const mgr = new ChainstateManager(db, params);
+      // No UTXO wipe needed — DB is empty; the snapshot will try to load 1 coin.
+      await expect(mgr.loadSnapshot(snapPath)).rejects.toThrow(
+        /Bad snapshot data after deserializing .* coins - bad tx out value/
+      );
+
+      try { fspMod.unlink(snapPath).catch(() => {}); } catch {}
+    });
+
+    // -----------------------------------------------------------------------
+    // BUG-4: vout upper-bound check
+    // Mirrors validation.cpp:5815-5818 — outpoint.n >= UINT32_MAX is
+    // rejected to avoid integer wrap-around in coinstats.cpp ApplyHash.
+    // -----------------------------------------------------------------------
+    it("BUG-4: loadSnapshot throws when vout >= UINT32_MAX (0xFFFFFFFF)", async () => {
+      const { BufferWriter: BW } = await import("../wire/serialization.js");
+      const { writeVarIntCore: wvi, compressAmount } = await import("../wire/compressor.js");
+      const fspMod = await import("node:fs/promises");
+
+      const tip = Buffer.alloc(32, 0xb4);
+      const dummyHash = Buffer.alloc(32, 0xde);
+      const params: ConsensusParams = {
+        ...REGTEST,
+        assumeutxo: new Map([
+          [tip.toString("hex"), { height: 10, hashSerialized: dummyHash, nChainTx: 1n, blockHash: tip }],
+        ]),
+      };
+
+      // Build raw snapshot with vout = 0xFFFFFFFF (UINT32_MAX).
+      const w = new BW();
+      w.writeBytes(SNAPSHOT_MAGIC);
+      w.writeUInt16LE(SNAPSHOT_VERSION);
+      w.writeUInt32LE(REGTEST.networkMagic);
+      w.writeHash(tip);
+      w.writeUInt64LE(1n);
+
+      const txid = Buffer.alloc(32, 0xc4);
+      w.writeBytes(txid);
+      w.writeVarInt(1);              // numOutputs
+      w.writeVarInt(0xFFFF_FFFF);    // vout = UINT32_MAX — must be rejected
+      wvi(w, 0n);                    // code
+      wvi(w, compressAmount(1000n)); // valid amount
+      wvi(w, 6n);                    // nSize = 6, raw 0-byte script
+
+      const snapPath = join(testDbPath, "bug4-max-vout.dat");
+      await fspMod.writeFile(snapPath, w.toBuffer());
+
+      const mgr = new ChainstateManager(db, params);
+      await expect(mgr.loadSnapshot(snapPath)).rejects.toThrow(
+        /Bad snapshot data after deserializing .* coins/
+      );
+
+      try { fspMod.unlink(snapPath).catch(() => {}); } catch {}
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // High-vout iteration order regression test.
   //
   // Bug history: hotbuns LevelDB encodes UTXO keys as

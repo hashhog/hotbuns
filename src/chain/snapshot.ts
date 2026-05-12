@@ -48,6 +48,19 @@ export const SNAPSHOT_VERSION = 2;
 const COINS_LOAD_BATCH_SIZE = 120_000;
 
 /**
+ * Maximum valid coin value (21M BTC in satoshis).
+ * Mirrors Bitcoin Core's MAX_MONEY = 21_000_000 * COIN.
+ */
+const MAX_MONEY = 2_100_000_000_000_000n;
+
+/**
+ * Maximum valid vout index (uint32 max − 1).
+ * Core's PopulateAndValidateSnapshot rejects outpoint.n >= UINT32_MAX to
+ * avoid integer wrap-around in coinstats.cpp ApplyHash.
+ */
+const MAX_VOUT = 0xffff_ffff;
+
+/**
  * assumeUTXO data hardcoded in chain parameters.
  */
 export interface AssumeutxoData {
@@ -628,6 +641,16 @@ class StreamingBufferReader {
   }
 
   /**
+   * Returns true when the entire file has been consumed (no trailing bytes).
+   */
+  isEOF(): boolean {
+    return (
+      this.filePos >= this.fileSize &&
+      this.windowOff >= this.windowEnd
+    );
+  }
+
+  /**
    * Ensure at least `n` bytes are available starting at windowOff. Compacts
    * the unread tail to position 0 then refills from disk.
    */
@@ -804,6 +827,22 @@ export class ChainstateManager {
     filePath: string,
     interruptCheck?: () => boolean
   ): Promise<LoadSnapshotResult> {
+    // BUG-5: double-activation guard.
+    // Mirrors validation.cpp:5600 — "Can't activate a snapshot-based
+    // chainstate more than once".
+    if (this.activeChainstate.isSnapshot()) {
+      throw new Error("Can't activate a snapshot-based chainstate more than once");
+    }
+
+    // BUG-6: work-vs-active-tip check.
+    // Mirrors validation.cpp:5787-5789 — "Work does not exceed active
+    // chainstate". We approximate chained-work comparison using height: the
+    // snapshot height must be strictly greater than the current active tip
+    // height so loading a stale snapshot is rejected.
+    // Note: Core performs this check again at activation time inside
+    // ActivateSnapshot() after PopulateAndValidateSnapshot succeeds.
+    const activeTipHeight = this.activeChainstate.tipHeight;
+
     let stat;
     try {
       stat = await fsp.stat(filePath);
@@ -841,6 +880,13 @@ export class ChainstateManager {
       }
       auData = lookup;
 
+      // BUG-6: work-vs-active-tip height guard (continued from precondition
+      // above). Reject if the snapshot base height does not strictly exceed
+      // the current active tip; a stale snapshot would regress the chain.
+      if (auData.height <= activeTipHeight) {
+        throw new Error("Work does not exceed active chainstate");
+      }
+
       // Create snapshot chainstate.
       snapshotChainstate = new Chainstate(this.db, this.params, {
         snapshotBaseBlockHash: metadata.baseBlockHash,
@@ -863,9 +909,30 @@ export class ChainstateManager {
         // Read number of outputs for this transaction (CompactSize).
         const numOutputs = await stream.readVarInt();
 
+        // BUG-1: per-txid overflow guard.
+        // Mirrors validation.cpp:5804-5806 — coins_per_txid > coins_left
+        // means the file claims more coins for this txid than the header
+        // declared in total, which indicates corrupt snapshot data.
+        if (BigInt(numOutputs) > metadata.coinsCount - coinsLoaded) {
+          throw new Error(
+            "Mismatch in coins count in snapshot metadata and actual snapshot data",
+          );
+        }
+
         for (let i = 0; i < numOutputs; i++) {
           // vout index — CompactSize.
           const vout = await stream.readVarInt();
+
+          // BUG-4: vout upper-bound check.
+          // Mirrors validation.cpp:5815-5818 — outpoint.n >= UINT32_MAX is
+          // rejected to avoid integer wrap-around in coinstats.cpp ApplyHash.
+          // The CompactSize-encoded vout is read as a JS number, so we
+          // compare against MAX_VOUT (0xFFFFFFFF = uint32_max).
+          if (vout >= MAX_VOUT) {
+            throw new Error(
+              `Bad snapshot data after deserializing ${coinsLoaded} coins`,
+            );
+          }
 
           // Coin payload: VARINT(code) + VARINT(CompressAmount(value)) +
           // ScriptCompression(scriptPubKey). Mirrors
@@ -878,6 +945,15 @@ export class ChainstateManager {
 
           const compAmount = await stream.readVarIntCore();
           const value = decompressAmount(compAmount);
+
+          // BUG-3: per-coin MoneyRange check.
+          // Mirrors validation.cpp:5820-5823 — !MoneyRange(coin.out.nValue).
+          // MoneyRange: 0 ≤ value ≤ MAX_MONEY (2_100_000_000_000_000n sat).
+          if (value < 0n || value > MAX_MONEY) {
+            throw new Error(
+              `Bad snapshot data after deserializing ${coinsLoaded} coins - bad tx out value`,
+            );
+          }
 
           const nSizeBig = await stream.readVarIntCore();
           const nSize = Number(nSizeBig);
@@ -927,6 +1003,17 @@ export class ChainstateManager {
 
       if (batchOps.length > 0) {
         await this.db.batch(batchOps);
+      }
+
+      // BUG-2: trailing-bytes EOF check.
+      // Mirrors validation.cpp:5872-5883 — after all declared coins are
+      // read, attempt to read one more byte: if it succeeds the file has
+      // extra data beyond what the header claimed, which indicates a
+      // malformed or corrupted snapshot.
+      if (!stream.isEOF()) {
+        throw new Error(
+          `Bad snapshot - coins left over after deserializing ${coinsLoaded} coins`,
+        );
       }
     } finally {
       await fh.close().catch(() => { /* close-on-error best-effort */ });
