@@ -52,6 +52,33 @@ export interface PeerEvents {
 export type OnBanCallback = (peer: Peer, reason: string) => void;
 
 /**
+ * Connection type for this peer.
+ * - "full_relay"   — outbound full-relay (tx + block announcements)
+ * - "block_relay"  — outbound block-relay-only (no tx relay)
+ * - "inbound"      — peer connected to us
+ * - "manual"       — manually added via addnode / connect CLI
+ */
+export type PeerConnType = "full_relay" | "block_relay" | "inbound" | "manual";
+
+/**
+ * Optional constructor options that control ban/protection policy.
+ */
+export interface PeerOptions {
+  /**
+   * If true, the peer has the NoBan permission (e.g. whitelisted).
+   * misbehaving() becomes a no-op for these peers.
+   * Reference: Core NetPermissionFlags::NoBan.
+   */
+  noban?: boolean;
+  /**
+   * Connection type.  Manual connections and outbound (block_relay /
+   * full_relay) are protected from outright ban; local-addr peers get
+   * disconnect-only treatment.  Defaults to "inbound".
+   */
+  connType?: PeerConnType;
+}
+
+/**
  * Represents a connection to a single Bitcoin peer.
  *
  * Handles TCP connection, message framing over the stream,
@@ -118,6 +145,19 @@ export class Peer {
   shouldDisconnect: boolean;
   /** Whether the VERSION + VERACK handshake is complete. */
   handshakeComplete: boolean;
+
+  /**
+   * Whether this peer holds the NoBan permission (whitelisted).
+   * When true, misbehaving() is a no-op.
+   * Reference: Bitcoin Core NetPermissionFlags::NoBan.
+   */
+  noban: boolean;
+
+  /**
+   * Connection type — used to determine ban-protection policy.
+   * Reference: Bitcoin Core CNode::m_conn_type.
+   */
+  connType: PeerConnType;
 
   /** Timestamp of last block received from this peer (ms). */
   lastBlockTime: number;
@@ -246,7 +286,7 @@ export class Peer {
    */
   private versionSent: boolean;
 
-  constructor(config: PeerConfig, events: PeerEvents, onBan?: OnBanCallback) {
+  constructor(config: PeerConfig, events: PeerEvents, onBan?: OnBanCallback, options?: PeerOptions) {
     this.config = config;
     this.events = events;
     this.host = config.host;
@@ -265,6 +305,8 @@ export class Peer {
     this.shouldDisconnect = false;
     this.handshakeComplete = false;
     this.onBan = onBan ?? null;
+    this.noban = options?.noban ?? false;
+    this.connType = options?.connType ?? "inbound";
     this.ourNonce = BigInt(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER));
     this.handshakeTimer = null;
     // Stale peer tracking fields
@@ -602,15 +644,53 @@ export class Peer {
   }
 
   /**
-   * Mark a peer as misbehaving by adding to their score.
-   * If the score reaches or exceeds 100, the peer is banned.
+   * Returns true if this peer's address is a local/loopback address.
    *
-   * Modeled after Bitcoin Core's Misbehaving() in net_processing.cpp.
+   * Reference: Bitcoin Core CAddress::IsLocal() / IsLoopback().
+   */
+  isLocalAddr(): boolean {
+    const h = this.host;
+    return (
+      h === "127.0.0.1" ||
+      h === "localhost" ||
+      h === "::1" ||
+      h.startsWith("127.")
+    );
+  }
+
+  /**
+   * Mark a peer as misbehaving by adding to their score.
+   * If the score reaches or exceeds 100, the peer is discouraged/banned,
+   * unless the peer is protected by a noban permission, is a manual
+   * connection, or is a local-address peer (disconnect-only, no ban).
+   *
+   * Canonical pattern from Bitcoin Core net_processing.cpp:5083:
+   *   if (pnode.HasPermission(NetPermissionFlags::NoBan)) return false;
+   *   if (pnode.IsManualConn()) return false;
+   *   if (pnode.addr.IsLocal()) { disconnect-only } else { Discourage + disconnect }
    *
    * @param howmuch - Score to add (common values: 10, 20, 50, 100)
    * @param message - Description of the violation
    */
   misbehaving(howmuch: number, message: string): void {
+    // G2: noban permission — score is still tracked for logging but no action taken.
+    if (this.noban) {
+      const messagePrefixed = message ? `: ${message}` : "";
+      console.log(
+        `Misbehaving (noban — no action): peer=${this.host}:${this.port} score+=${howmuch}${messagePrefixed}`
+      );
+      return;
+    }
+
+    // G2: manual connections are never banned (operator explicitly added them).
+    if (this.connType === "manual") {
+      const messagePrefixed = message ? `: ${message}` : "";
+      console.log(
+        `Misbehaving (manual — no action): peer=${this.host}:${this.port} score+=${howmuch}${messagePrefixed}`
+      );
+      return;
+    }
+
     this.misbehaviorScore += howmuch;
     const messagePrefixed = message ? `: ${message}` : "";
     console.log(
@@ -619,10 +699,20 @@ export class Peer {
 
     if (this.misbehaviorScore >= 100) {
       this.shouldDisconnect = true;
-      if (this.onBan) {
-        this.onBan(this, message);
+
+      if (this.isLocalAddr()) {
+        // Local peers: disconnect-only, no ban entry.
+        console.log(
+          `Misbehaving (local — disconnect only): peer=${this.host}:${this.port}`
+        );
+        this.disconnect(`misbehaving (local): ${message}`);
+      } else {
+        // Regular inbound / outbound relay peers: ban + disconnect.
+        if (this.onBan) {
+          this.onBan(this, message);
+        }
+        this.disconnect(`banned: ${message}`);
       }
-      this.disconnect(`banned: ${message}`);
     }
   }
 

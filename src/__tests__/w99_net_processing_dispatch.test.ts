@@ -29,6 +29,7 @@ import {
   type PeerConfig,
   type PeerEvents,
   type OnBanCallback,
+  type PeerOptions,
   MIN_PEER_PROTO_VERSION,
   PING_TIMEOUT_MS,
 } from "../p2p/peer.js";
@@ -133,37 +134,61 @@ describe("G1: Misbehaving — single-event score accumulation", () => {
 });
 
 // ===========================================================================
-// G2 — noban/manual/outbound protections
+// G2 — noban/manual/local peer protection (W99 G2 fix)
 // ===========================================================================
 
-describe("G2: Misbehaving — missing noban/manual/outbound guard", () => {
+describe("G2: Misbehaving — noban/manual/local guards (W99 G2 fixed)", () => {
   /**
-   * BUG-G2: Bitcoin Core's Misbehaving() checks
-   *   - if (pnode->HasPermission(NetPermissionFlags::NoBan)) return;
-   *   - if (pnode->IsManualConn() || pnode->IsManualOrFullOutboundConn()) ...
-   * hotbuns peer.misbehaving() has NO such guard — every peer is equally
-   * punishable regardless of connection type or permissions.
-   * A whitelisted peer or block-relay-only outbound peer will be banned on
-   * accumulating 100 points, which Core would never do.
+   * FIX-G2: peer.misbehaving() now follows the canonical Bitcoin Core
+   * net_processing.cpp:5083 pattern:
+   *   1. noban permission → no-op (score not even incremented)
+   *   2. manual connection → no-op
+   *   3. local address → disconnect-only (no ban callback)
+   *   4. regular inbound → discourage (ban callback) + disconnect at 100
+   *
+   * Reference: bitcoin-core/src/net_processing.cpp Misbehaving() guards.
    */
-  test("BUG-G2: misbehaving bans outbound peers with no protection check", () => {
+
+  // Case 1: noban permission — misbehaving must be a complete no-op.
+  test("noban peer: misbehaving is a no-op (no ban, no disconnect)", () => {
     let banned = false;
     const onBan: OnBanCallback = () => { banned = true; };
-    // This simulates an outbound block-relay-only peer — Core would protect it
-    const peer = new Peer(makePeerConfig(), makeNullEvents(), onBan);
-    // Score to 100; Core would skip for noban/outbound, hotbuns does not
-    peer.misbehaving(100, "should-not-ban-outbound");
-    // In hotbuns, this always bans — documenting the missing guard
-    expect(banned).toBe(true); // documents the bug: should be false for protected peers
+    const opts: PeerOptions = { noban: true };
+    const peer = new Peer(makePeerConfig(), makeNullEvents(), onBan, opts);
+    peer.misbehaving(100, "should-be-ignored");
+    expect(banned).toBe(false);
+    expect(peer.shouldDisconnect).toBe(false);
   });
 
-  test("peer with any host is subject to ban at 100 (no whitelist path)", () => {
-    const peers = ["127.0.0.1", "192.168.1.1", "1.2.3.4"];
-    for (const host of peers) {
-      const peer = new Peer(makePeerConfig({ host }), makeNullEvents());
-      peer.misbehaving(100, "test");
-      expect(peer.shouldDisconnect).toBe(true); // all hosts banned equally
-    }
+  // Case 2: manual connection — misbehaving must be a complete no-op.
+  test("manual peer: misbehaving is a no-op (no ban, no disconnect)", () => {
+    let banned = false;
+    const onBan: OnBanCallback = () => { banned = true; };
+    const opts: PeerOptions = { connType: "manual" };
+    const peer = new Peer(makePeerConfig(), makeNullEvents(), onBan, opts);
+    peer.misbehaving(100, "should-be-ignored");
+    expect(banned).toBe(false);
+    expect(peer.shouldDisconnect).toBe(false);
+  });
+
+  // Case 3: local-address peer — disconnect-only at 100, no ban callback.
+  test("local peer (127.0.0.1): disconnect-only at 100, no ban callback fired", () => {
+    let banned = false;
+    const onBan: OnBanCallback = () => { banned = true; };
+    const peer = new Peer(makePeerConfig({ host: "127.0.0.1" }), makeNullEvents(), onBan);
+    peer.misbehaving(100, "local-violator");
+    expect(banned).toBe(false);           // no ban entry
+    expect(peer.shouldDisconnect).toBe(true); // but does disconnect
+  });
+
+  // Case 4: regular inbound peer — ban callback fired + disconnect at 100.
+  test("regular inbound peer: ban callback fired and disconnected at 100", () => {
+    let bannedHost = "";
+    const onBan: OnBanCallback = (p) => { bannedHost = p.host; };
+    const peer = new Peer(makePeerConfig({ host: "5.6.7.8" }), makeNullEvents(), onBan);
+    peer.misbehaving(100, "bad-actor");
+    expect(bannedHost).toBe("5.6.7.8");
+    expect(peer.shouldDisconnect).toBe(true);
   });
 });
 
