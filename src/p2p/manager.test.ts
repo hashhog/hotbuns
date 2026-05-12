@@ -359,7 +359,7 @@ describe("PeerManager", () => {
     await manager.stop();
   }, TEST_TIMEOUT);
 
-  test("increases ban score and evicts misbehaving peer", async () => {
+  test("increases ban score and evicts misbehaving peer (single-event, Core PR #25974)", async () => {
     const config: PeerManagerConfig = {
       maxOutbound: 8,
       maxInbound: 117,
@@ -375,24 +375,19 @@ describe("PeerManager", () => {
 
     await waitFor(() => peer.state === "connected");
 
-    // Increase ban score below threshold
+    // G1 FIX: single-event discourage — the FIRST misbehaving() call immediately
+    // disconnects the peer regardless of howmuch. No score accumulation threshold.
     manager.increaseBanScore(peer, 50, "test reason");
 
-    // Peer should still be connected
-    expect(manager.getConnectedPeers()).toHaveLength(1);
-
-    // Increase ban score above threshold
-    manager.increaseBanScore(peer, 60, "another test reason");
-
-    // Peer should be disconnected and banned
+    // Peer should be disconnected immediately (single-event model)
     await waitFor(() => peer.state === "disconnected");
     expect(manager.getConnectedPeers()).toHaveLength(0);
 
-    // Check that peer is banned
+    // Check that ban score was recorded in knownAddresses
     const addresses = manager.getKnownAddresses();
     const key = `127.0.0.1:${mockServer1.port}`;
     const info = addresses.get(key);
-    expect(info?.banScore).toBeGreaterThanOrEqual(100);
+    expect(info?.banScore).toBeGreaterThanOrEqual(50);
 
     await manager.stop();
   }, TEST_TIMEOUT);

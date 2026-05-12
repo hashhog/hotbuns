@@ -139,7 +139,11 @@ export class Peer {
   state: PeerState;
   versionPayload: VersionPayload | null;
   latency: number;
-  /** Accumulated misbehavior score; peer is banned at 100. */
+  /**
+   * Misbehavior score (kept for logging/diagnostics only — NOT used for
+   * the discourage decision since Core PR #25974 removed score accumulation).
+   * Any call to misbehaving() now immediately sets m_should_discourage = true.
+   */
   misbehaviorScore: number;
   /** Tracks whether this peer should be discouraged/banned. */
   shouldDisconnect: boolean;
@@ -659,60 +663,70 @@ export class Peer {
   }
 
   /**
-   * Mark a peer as misbehaving by adding to their score.
-   * If the score reaches or exceeds 100, the peer is discouraged/banned,
-   * unless the peer is protected by a noban permission, is a manual
-   * connection, or is a local-address peer (disconnect-only, no ban).
+   * Mark a peer as misbehaving. Per Bitcoin Core PR #25974 (2022), ANY call
+   * to Misbehaving() immediately sets m_should_discourage = true — there is
+   * no score accumulation. The peer is discouraged and disconnected on the
+   * next MaybeDiscourageAndDisconnect() pass (here: immediately, synchronously).
    *
-   * Canonical pattern from Bitcoin Core net_processing.cpp:5083:
-   *   if (pnode.HasPermission(NetPermissionFlags::NoBan)) return false;
-   *   if (pnode.IsManualConn()) return false;
-   *   if (pnode.addr.IsLocal()) { disconnect-only } else { Discourage + disconnect }
+   * Canonical Core pattern (net_processing.cpp Misbehaving + MaybeDiscourageAndDisconnect):
+   *   1. Misbehaving() → m_should_discourage = true  (no howmuch, no threshold)
+   *   2. MaybeDiscourageAndDisconnect():
+   *      a. noban permission → no-op (log warning only)
+   *      b. manual connection → no-op (log warning only)
+   *      c. local address → disconnect-only (no ban entry)
+   *      d. regular peer → Discourage (ban) + disconnect
    *
-   * @param howmuch - Score to add (common values: 10, 20, 50, 100)
-   * @param message - Description of the violation
+   * The `howmuch` parameter is accepted for API compatibility with existing
+   * call sites but is IGNORED for the discourage decision; it is only used
+   * for diagnostic logging.
+   *
+   * Reference: bitcoin-core/src/net_processing.cpp:1893 Misbehaving()
+   *            bitcoin-core/src/net_processing.cpp:5083 MaybeDiscourageAndDisconnect()
+   *            Bitcoin Core PR #25974 "net processing: Remove misbehavior score"
+   *
+   * @param howmuch - Ignored for ban decision; kept for logging only.
+   * @param message - Description of the violation.
    */
   misbehaving(howmuch: number, message: string): void {
-    // G2: noban permission — score is still tracked for logging but no action taken.
-    if (this.noban) {
-      const messagePrefixed = message ? `: ${message}` : "";
-      console.log(
-        `Misbehaving (noban — no action): peer=${this.host}:${this.port} score+=${howmuch}${messagePrefixed}`
-      );
-      return;
-    }
-
-    // G2: manual connections are never banned (operator explicitly added them).
-    if (this.connType === "manual") {
-      const messagePrefixed = message ? `: ${message}` : "";
-      console.log(
-        `Misbehaving (manual — no action): peer=${this.host}:${this.port} score+=${howmuch}${messagePrefixed}`
-      );
-      return;
-    }
-
-    this.misbehaviorScore += howmuch;
     const messagePrefixed = message ? `: ${message}` : "";
+
+    // G2: noban permission — log warning, take no action.
+    if (this.noban) {
+      console.log(
+        `Misbehaving (noban — no action): peer=${this.host}:${this.port}${messagePrefixed}`
+      );
+      return;
+    }
+
+    // G2: manual connections are never discouraged (operator explicitly added them).
+    if (this.connType === "manual") {
+      console.log(
+        `Misbehaving (manual — no action): peer=${this.host}:${this.port}${messagePrefixed}`
+      );
+      return;
+    }
+
+    // G1: single-event discourage — any misbehavior immediately triggers disconnect.
+    // m_should_discourage = true (Core model); we set shouldDisconnect synchronously.
+    this.misbehaviorScore += howmuch; // diagnostic only
     console.log(
-      `Misbehaving: peer=${this.host}:${this.port} score=${this.misbehaviorScore}${messagePrefixed}`
+      `Misbehaving: peer=${this.host}:${this.port}${messagePrefixed}`
     );
 
-    if (this.misbehaviorScore >= 100) {
-      this.shouldDisconnect = true;
+    this.shouldDisconnect = true;
 
-      if (this.isLocalAddr()) {
-        // Local peers: disconnect-only, no ban entry.
-        console.log(
-          `Misbehaving (local — disconnect only): peer=${this.host}:${this.port}`
-        );
-        this.disconnect(`misbehaving (local): ${message}`);
-      } else {
-        // Regular inbound / outbound relay peers: ban + disconnect.
-        if (this.onBan) {
-          this.onBan(this, message);
-        }
-        this.disconnect(`banned: ${message}`);
+    if (this.isLocalAddr()) {
+      // Local peers: disconnect-only, no ban entry (Core: "disconnecting but not discouraging local peer").
+      console.log(
+        `Misbehaving (local — disconnect only): peer=${this.host}:${this.port}`
+      );
+      this.disconnect(`misbehaving (local): ${message}`);
+    } else {
+      // Regular inbound / outbound relay peers: discourage (ban) + disconnect.
+      if (this.onBan) {
+        this.onBan(this, message);
       }
+      this.disconnect(`banned: ${message}`);
     }
   }
 
