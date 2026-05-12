@@ -315,6 +315,15 @@ export class BlockSync {
    *  classify the failure as consensus vs chainstate vs unknown. */
   private lastConnectError: string;
 
+  /**
+   * Tracks which peer (peerKey = "host:port") delivered each downloaded block.
+   * Keyed by the same hashHex used in state.downloadedBlocks.  Absent for
+   * blocks injected via submitblock (no peer source).  Used by
+   * processOrderedBlocksInner to call peer.misbehaving(100) on BLOCK_MUTATED
+   * (connectBlock() returns false) — G16 fix.
+   */
+  private downloadedBlockPeers: Map<string, string>;
+
   /** Chain state manager — updated after each connected block so RPC
    *  methods like getblockcount reflect the latest chain tip. */
   private chainStateManager: ChainStateManager | null;
@@ -401,6 +410,7 @@ export class BlockSync {
     this.consecutiveFailures = 0;
     this.lastFailedHeight = -1;
     this.lastConnectError = "";
+    this.downloadedBlockPeers = new Map();
 
     this.state = {
       pendingBlocks: new Map(),
@@ -700,7 +710,11 @@ export class BlockSync {
       // Check if it's the next block we need
       const headerEntry = this.headerSync.getHeader(blockHash);
       if (!headerEntry) {
-        // Unknown block
+        // Unknown block — peer sent a block whose header we have never seen.
+        // Core: ProcessNewBlockHeaders returns nBlocksWithValidHeaders==0 and
+        // ProcessBlock calls Misbehaving(pfrom, 100, "invalid header received").
+        // G17 fix: score the peer so it cannot flood us with garbage blocks.
+        peer.misbehaving(100, "block-invalid-header");
         return;
       }
 
@@ -719,6 +733,7 @@ export class BlockSync {
       if (headerEntry.height >= this.state.nextHeightToProcess &&
           this.state.downloadedBlocks.size < MAX_DOWNLOADED_BUFFER) {
         this.state.downloadedBlocks.set(hashHex, block);
+        this.downloadedBlockPeers.set(hashHex, peerKey); // G16: track peer source
         // Try to process blocks in order
         await this.processOrderedBlocks();
       }
@@ -743,6 +758,7 @@ export class BlockSync {
 
     // Store in downloaded blocks
     this.state.downloadedBlocks.set(hashHex, block);
+    this.downloadedBlockPeers.set(hashHex, peerKey); // G16: track peer source
 
     // Try to process blocks in order
     await this.processOrderedBlocks();
@@ -1371,10 +1387,23 @@ export class BlockSync {
           this.lastFailedHeight = height;
         }
 
+        // G16 fix: score the peer that delivered this invalid block.
+        // Core: ProcessBlock sets BLOCK_MUTATED and calls Misbehaving(pfrom, 100).
+        // We look up the delivering peer by peerKey stored at download time.
+        const blockPeerKey = this.downloadedBlockPeers.get(hashHex);
+        if (blockPeerKey && this.peerManager) {
+          const deliverer = this.peerManager.getConnectedPeers()
+            .find((p) => `${p.host}:${p.port}` === blockPeerKey);
+          if (deliverer) {
+            deliverer.misbehaving(100, "block-mutated");
+          }
+        }
+
         console.error(
           `Block validation failed at height ${height} (attempt ${this.consecutiveFailures})${coords}, discarding and re-requesting: ${failureMsg}`
         );
         this.state.downloadedBlocks.delete(hashHex);
+        this.downloadedBlockPeers.delete(hashHex);
 
         // Reset the UTXO cache to avoid corrupt state from partial processing
         this.utxoManager.clearCache();
@@ -1457,12 +1486,14 @@ export class BlockSync {
 
         // Discard any buffered blocks that are now stale
         this.state.downloadedBlocks.clear();
+        this.downloadedBlockPeers.clear();
 
         break;
       }
 
       // Remove from downloaded
       this.state.downloadedBlocks.delete(hashHex);
+      this.downloadedBlockPeers.delete(hashHex);
       // Help V8 GC by nulling block reference
       block = null as any;
 
@@ -3040,6 +3071,7 @@ export class BlockSync {
             );
             if (!entry || entry.height > maxKeepHeight || entry.height < this.state.nextHeightToProcess) {
               this.state.downloadedBlocks.delete(hashHex);
+              this.downloadedBlockPeers.delete(hashHex);
               evicted++;
             }
           }
@@ -3174,6 +3206,7 @@ export class BlockSync {
       const headerEntry = this.headerSync.getHeader(Buffer.from(hashHex, "hex"));
       if (headerEntry && headerEntry.height > pruneThreshold) {
         this.state.downloadedBlocks.delete(hashHex);
+        this.downloadedBlockPeers.delete(hashHex);
         // Allow this height to be re-requested later
         if (headerEntry.height < this.state.nextHeightToRequest) {
           this.state.nextHeightToRequest = headerEntry.height;
