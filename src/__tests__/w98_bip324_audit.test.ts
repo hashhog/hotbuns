@@ -704,25 +704,43 @@ describe("G8 HEADER_LEN=1, IGNORE_BIT=0x80", () => {
 });
 
 // ============================================================================
-// G13-BUG: processKeyMaybeV1 checks only 4 bytes, not 16
+// G13-FIX: processKeyMaybeV1 now checks full 16-byte prefix (W98 G13)
 // ============================================================================
-describe("G13-BUG processKeyMaybeV1 4-byte check vs Core 16-byte disambiguation", () => {
-  test("responder falls back to v1 when first 4 bytes match magic (only)", () => {
-    // Core requires 16 bytes: magic + "version\0\0\0\0\0".
-    // hotbuns uses only 4-byte magic check in processKeyMaybeV1.
-    // This means a v2 ellswift pubkey whose first 4 bytes collide with the
-    // magic (prob 2^-32) triggers false v1 fallback — 1-in-4 billion handshake failure.
+describe("G13-FIX processKeyMaybeV1 full 16-byte check matches Core", () => {
+  test("responder does NOT fall back to v1 on magic-only (4-byte) match", () => {
+    // Fix: Core requires all 16 bytes (magic + "version\0\0\0\0\0") to match.
+    // A v2 pubkey whose first 4 bytes collide with magic but whose next 12
+    // bytes do not match the command field must NOT trigger v1 fallback.
     const responder = new V2Transport(MAINNET_MAGIC, false);
-    // Craft bytes that start with MAINNET_MAGIC but are NOT a v1 VERSION command.
-    const fakeV1Prefix = Buffer.concat([
-      MAINNET_MAGIC,
-      Buffer.from([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    // Craft 16 bytes: magic followed by NON-version bytes (0x42…).
+    const notVersionCmd = Buffer.alloc(12, 0x42);
+    const fakePrefix = Buffer.concat([MAINNET_MAGIC, notVersionCmd]);
+    expect(fakePrefix.length).toBe(16);
+    const result = responder.receiveBytes(fakePrefix);
+    // FIXED: mismatch on bytes 4-15 → treated as v2, no v1 fallback.
+    expect(result.fallbackV1).toBe(false);
+  });
+
+  test("responder waits for all 16 bytes before deciding when prefix matches so far", () => {
+    // With only 4 bytes (matching magic) received, responder must NOT decide yet.
+    const responder = new V2Transport(MAINNET_MAGIC, false);
+    const result = responder.receiveBytes(MAINNET_MAGIC);
+    // Not enough bytes to decide — no fallback, no state change.
+    expect(result.fallbackV1).toBe(false);
+    expect(result.continue).toBe(false);
+  });
+
+  test("responder falls back to v1 only on exact full 16-byte match", () => {
+    // Send the full correct v1 version prefix: magic + "version\0\0\0\0\0".
+    const V1_VERSION_CMD = Buffer.from([
+      0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0, 0, 0, 0, 0,
     ]);
-    const result = responder.receiveBytes(fakeV1Prefix.subarray(0, 4));
-    // After only 4 bytes (just the magic), hotbuns falls back to v1.
+    const responder = new V2Transport(MAINNET_MAGIC, false);
+    const realV1Prefix = Buffer.concat([MAINNET_MAGIC, V1_VERSION_CMD]);
+    expect(realV1Prefix.length).toBe(16);
+    const result = responder.receiveBytes(realV1Prefix);
+    // Full 16-byte match → legitimate v1 fallback.
     expect(result.fallbackV1).toBe(true);
-    // BUG: Core would need all 16 bytes before deciding; a 64-byte pubkey
-    // that starts with magic bytes (1 in 4B chance) falsely triggers v1 fallback.
   });
 });
 

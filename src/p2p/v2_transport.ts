@@ -341,29 +341,39 @@ export class V2Transport {
   }
 
   /**
-   * Responder-only: peek the first 4 bytes for v1 magic.  If we see v1
-   * magic, fall back to v1 immediately.  Otherwise transition to KEY and
-   * read the peer's 64-byte ElligatorSwift pubkey.
+   * Responder-only: wait for the full 16-byte v1 prefix (4-byte magic +
+   * 12-byte "version\0\0\0\0\0" command field) before deciding v1 vs v2.
    *
-   * Note: full v1-vs-v2 disambiguation requires looking at all 16 bytes
-   * (magic + "version\0\0\0\0\0").  However, by BIP-324 a peer's
-   * ElligatorSwift pubkey collides with the 4-byte network magic with
-   * probability 2^-32, and any v2 implementation that picks a colliding
-   * pubkey is allowed to fail the handshake.  To match Bitcoin Core's
-   * heuristic (and clearbit), we use the 4-byte magic check here.
+   * Core (net.cpp V1_PREFIX_LEN=16) requires ALL 16 bytes to match before
+   * falling back to v1.  Using only 4 bytes (magic) produces a false-positive
+   * v1 fallback for any v2 ElligatorSwift pubkey whose first 4 bytes collide
+   * with the network magic (probability 2^-32).  The fix matches Core exactly.
    */
   private processKeyMaybeV1(): RecvResult {
-    if (this.recvBuffer.length < 4) {
+    // Need at least 1 byte to check for early mismatch.
+    if (this.recvBuffer.length === 0) {
       return { continue: false, fallbackV1: false };
     }
-    if (this.recvBuffer.subarray(0, 4).equals(this.networkMagic)) {
-      this.recvState = RecvState.V1;
-      this.sendState = SendState.V1;
-      this.v1Fallback = true;
-      return { continue: false, fallbackV1: true };
+    // Build the expected 16-byte prefix: networkMagic + V1_VERSION_COMMAND.
+    const v1Prefix = Buffer.concat([this.networkMagic, V1_VERSION_COMMAND]);
+    const received = this.recvBuffer.length;
+    // Check byte-by-byte as far as we have received; any mismatch → v2.
+    for (let i = 0; i < Math.min(received, V1_PREFIX_LEN); i++) {
+      if (this.recvBuffer[i] !== v1Prefix[i]) {
+        // Mismatch before 16 bytes — this is a v2 connection.
+        this.recvState = RecvState.KEY;
+        return { continue: true, fallbackV1: false };
+      }
     }
-    this.recvState = RecvState.KEY;
-    return { continue: true, fallbackV1: false };
+    if (received < V1_PREFIX_LEN) {
+      // All bytes received so far match, but we haven't seen all 16 yet.
+      return { continue: false, fallbackV1: false };
+    }
+    // Full 16-byte match — this is a v1 connection.
+    this.recvState = RecvState.V1;
+    this.sendState = SendState.V1;
+    this.v1Fallback = true;
+    return { continue: false, fallbackV1: true };
   }
 
   /**
