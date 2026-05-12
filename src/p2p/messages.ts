@@ -46,8 +46,8 @@ export {
   getNetworkName,
 } from "./addrv2.js";
 
-/** Maximum message payload size: 32 MiB */
-export const MAX_MESSAGE_SIZE = 32 * 1024 * 1024;
+/** Maximum message payload size: 4 MB (matches Core MAX_PROTOCOL_MESSAGE_LENGTH) */
+export const MAX_MESSAGE_SIZE = 4 * 1000 * 1000;
 
 /** Message header size in bytes */
 export const MESSAGE_HEADER_SIZE = 24;

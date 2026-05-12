@@ -150,19 +150,16 @@ const TV_ELLSWIFT2 = Buffer.from(
 const MAINNET_MAGIC = Buffer.from([0xf9, 0xbe, 0xb4, 0xd9]);
 
 // ============================================================================
-// G24-BUG: MAX_V2_MESSAGE_SIZE should be ~4MB not 32MB
+// G24-FIX: MAX_V2_MESSAGE_SIZE corrected to 4 MB (Core MAX_PROTOCOL_MESSAGE_LENGTH)
 // ============================================================================
-describe("G24-BUG MAX_V2_MESSAGE_SIZE too large", () => {
-  test("MAX_V2_MESSAGE_SIZE is 32MB but Core cap is ~4MB (4000013 bytes)", () => {
-    // Core: MAX_CONTENTS_LEN = 1 + 12 + min(MAX_SIZE, MAX_PROTOCOL_MESSAGE_LENGTH)
-    //                        = 1 + 12 + 4_000_000 = 4_000_013
-    // hotbuns: 32 * 1024 * 1024 = 33_554_432 (~8× too large)
-    const CORE_MAX_CONTENTS_LEN = 1 + 12 + 4_000_000;
-    expect(MAX_V2_MESSAGE_SIZE).toBeGreaterThan(CORE_MAX_CONTENTS_LEN);
-    // This test documents the bug: hotbuns value should equal Core's
-    expect(MAX_V2_MESSAGE_SIZE).not.toBe(CORE_MAX_CONTENTS_LEN);
-    // The 8× amplification factor
-    expect(MAX_V2_MESSAGE_SIZE / CORE_MAX_CONTENTS_LEN).toBeGreaterThan(8);
+describe("G24-FIX MAX_V2_MESSAGE_SIZE capped at 4 MB", () => {
+  test("MAX_V2_MESSAGE_SIZE equals Core MAX_PROTOCOL_MESSAGE_LENGTH (4_000_000)", () => {
+    // Core: MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000 = 4_000_000
+    // Fixed: hotbuns now matches Core exactly
+    const CORE_MAX = 4 * 1000 * 1000;
+    expect(MAX_V2_MESSAGE_SIZE).toBe(CORE_MAX);
+    // No longer 8x too large
+    expect(MAX_V2_MESSAGE_SIZE).not.toBe(32 * 1024 * 1024);
   });
 });
 

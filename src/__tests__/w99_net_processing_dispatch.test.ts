@@ -540,30 +540,22 @@ describe("G21: Handshake ordering (version before verack)", () => {
 });
 
 // ===========================================================================
-// G23 — 4 MiB payload cap (BUG: hotbuns uses 32 MiB)
+// G23 — 4 MB payload cap (FIX: corrected to Core's 4 MB)
 // ===========================================================================
 
-describe("G23: Payload size cap (BUG: 32 MiB instead of Core's 4 MiB)", () => {
+describe("G23: Payload size cap (FIX: now matches Core MAX_PROTOCOL_MESSAGE_LENGTH)", () => {
   /**
-   * BUG-G23: Bitcoin Core's net_processing.cpp uses MAX_PROTOCOL_MESSAGE_LENGTH
-   * which is 4 * 1024 * 1024 (4 MiB). hotbuns messages.ts defines
-   * MAX_MESSAGE_SIZE = 32 * 1024 * 1024 (32 MiB) — 8× too large.
-   *
-   * This allows a peer to send 32 MiB messages without being disconnected.
-   * On a high-bandwidth link, a single peer can consume ~256 Mbit/s of
-   * processing bandwidth with oversized messages, a real DoS amplifier.
+   * FIX-G23: Bitcoin Core's MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000 = 4_000_000.
+   * hotbuns messages.ts MAX_MESSAGE_SIZE is now corrected to match.
    *
    * Reference: bitcoin-core src/net.h::MAX_PROTOCOL_MESSAGE_LENGTH = 4000000
-   * hotbuns: src/p2p/messages.ts:50 MAX_MESSAGE_SIZE = 32 * 1024 * 1024
+   * hotbuns: src/p2p/messages.ts MAX_MESSAGE_SIZE = 4 * 1000 * 1000
    */
-  test("BUG-G23: MAX_MESSAGE_SIZE is 32 MiB, not Core's 4 MiB", () => {
-    const CORE_MAX = 4 * 1024 * 1024;
-    // This assertion FAILS — documents the bug
-    // expect(MAX_MESSAGE_SIZE).toBe(CORE_MAX);
-
-    // Documenting: hotbuns allows 8× larger messages than Core
-    expect(MAX_MESSAGE_SIZE).toBe(32 * 1024 * 1024);
-    expect(MAX_MESSAGE_SIZE).toBeGreaterThan(CORE_MAX); // BUG
+  test("FIX-G23: MAX_MESSAGE_SIZE equals Core MAX_PROTOCOL_MESSAGE_LENGTH (4_000_000)", () => {
+    const CORE_MAX = 4 * 1000 * 1000;
+    expect(MAX_MESSAGE_SIZE).toBe(CORE_MAX);
+    // No longer 8x too large
+    expect(MAX_MESSAGE_SIZE).not.toBe(32 * 1024 * 1024);
   });
 });
 

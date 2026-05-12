@@ -959,8 +959,8 @@ describe("message constants", () => {
     expect(MESSAGE_HEADER_SIZE).toBe(24);
   });
 
-  test("MAX_MESSAGE_SIZE is 32 MiB", () => {
-    expect(MAX_MESSAGE_SIZE).toBe(32 * 1024 * 1024);
+  test("MAX_MESSAGE_SIZE is 4 MB (Core MAX_PROTOCOL_MESSAGE_LENGTH)", () => {
+    expect(MAX_MESSAGE_SIZE).toBe(4 * 1000 * 1000);
   });
 });
 

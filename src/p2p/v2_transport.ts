@@ -22,8 +22,8 @@ import {
 import { EllSwiftPubKey, ELLSWIFT_PUBLIC_KEY_SIZE } from "./bip324/elligator_swift.js";
 import { encodeMessageType, decodeMessageType } from "./bip324/message_ids.js";
 
-/** Maximum v2 protocol message payload size */
-export const MAX_V2_MESSAGE_SIZE = 32 * 1024 * 1024;
+/** Maximum v2 protocol message payload size (matches Core MAX_PROTOCOL_MESSAGE_LENGTH) */
+export const MAX_V2_MESSAGE_SIZE = 4 * 1000 * 1000;
 
 /** Version byte for v2 transport (used for future upgrades) */
 export const V2_VERSION = 0;
