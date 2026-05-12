@@ -346,7 +346,7 @@ export class HeaderSync {
    * Process incoming headers message. Validate and store each header.
    * Returns new valid headers count.
    */
-  async processHeaders(headers: BlockHeader[], fromPeer?: Peer | null): Promise<number> {
+  async processHeaders(headers: BlockHeader[], fromPeer?: Peer | null, minPowChecked: boolean = true): Promise<number> {
     let validCount = 0;
 
     for (const header of headers) {
@@ -382,6 +382,29 @@ export class HeaderSync {
       // Calculate chain work
       const headerWork = this.getHeaderWork(header.bits);
       const chainWork = parent.chainWork + headerWork;
+
+      // G8 / AcceptBlockHeader gate: if the caller has not already verified that
+      // this header chain meets MIN_CHAIN_WORK (minPowChecked == false), we
+      // reject headers whose cumulative chain work falls below nMinimumChainWork.
+      //
+      // Core canonical (validation.cpp:4229):
+      //   if (!min_pow_checked)
+      //     return state.Invalid(BLOCK_HEADER_LOW_WORK, "too-little-chainwork");
+      //
+      // The PRESYNC/REDOWNLOAD anti-DoS gate sets minPowChecked = true because
+      // it has already verified the chain reaches nMinimumChainWork before
+      // releasing headers for permanent storage.  The submitblock direct path
+      // and any raw P2P path that bypasses PRESYNC must pass minPowChecked = false
+      // so that low-work header chains are rejected here.
+      //
+      // Skipped for regtest (nMinimumChainWork === 0n) to allow test chains.
+      if (!minPowChecked && this.params.nMinimumChainWork > 0n && chainWork < this.params.nMinimumChainWork) {
+        console.warn(
+          `Rejected low-chainwork header from ${fromPeer?.host ?? "local"}: ` +
+          `chainWork=${chainWork} < nMinimumChainWork=${this.params.nMinimumChainWork} (too-little-chainwork)`
+        );
+        continue;
+      }
 
       // Height of this header
       const headerHeight = parent.height + 1;

@@ -766,7 +766,10 @@ export class BlockSync {
       // This allows submitblock to work even when header sync is stalled
       // (e.g. after IBD completes but chain work hasn't reached nMinimumChainWork,
       // causing the anti-DoS PRESYNC to block new headers from peers).
-      const accepted = await this.headerSync.processHeaders([block.header]);
+      // minPowChecked=false: the submitblock direct path bypasses the
+      // PRESYNC/REDOWNLOAD anti-DoS gate, so we must enforce the
+      // too-little-chainwork guard here.  (Core validation.cpp:4229.)
+      const accepted = await this.headerSync.processHeaders([block.header], null, false);
       if (accepted > 0) {
         headerEntry = this.headerSync.getHeader(blockHash);
       }
