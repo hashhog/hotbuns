@@ -242,13 +242,44 @@ describe("W97 AcceptBlockHeader — duplicate, prev-blk, contextual gates", () =
 // ─── G17-G30: AcceptBlock / connectBlock gates ───────────────────────────────
 
 describe("W97 AcceptBlock — fAlreadyHave, fTooFarAhead, MinimumChainWork, CheckBlock, fNewBlock", () => {
-  // ── G19c: MIN_BLOCKS_TO_KEEP = 288 fTooFarAhead cap ──
-  test("G19c — Core constant MIN_BLOCKS_TO_KEEP (288) is not referenced in sync/blocks.ts", () => {
-    // BUG B14: hotbuns gates on MAX_DOWNLOADED_BUFFER (200) for the inject
-    // path only — there is no peer-driven equivalent of the +288 cap on
-    // pindex->nHeight > ActiveHeight() + MIN_BLOCKS_TO_KEEP.
-    const has288 = /\b288\b/.test(BLOCKS_SRC);
-    expect(has288).toBe(false); // marker: gate is structurally absent.
+  // ── G19c: MIN_BLOCKS_TO_KEEP = 288 fTooFarAhead cap ── (FIXED)
+  // Core: if (!fRequested && fTooFarAhead) return true;  (validation.cpp:4325)
+  // FIX B14: MIN_BLOCKS_TO_KEEP=288 constant defined + fTooFarAhead gate
+  // added to the unrequested-block path (handleBlock when !pending).
+
+  test("G19c-1 — MIN_BLOCKS_TO_KEEP=288 constant is defined in sync/blocks.ts (unrequested too-far rejected)", () => {
+    // The constant must be present and set to exactly 288.
+    expect(BLOCKS_SRC).toContain("const MIN_BLOCKS_TO_KEEP = 288;");
+  });
+
+  test("G19c-2 — fTooFarAhead gate uses MIN_BLOCKS_TO_KEEP on the unrequested path (at-gate accepted)", () => {
+    // The gate must fire inside the !pending branch (unrequested path).
+    // Confirm: fTooFarAhead variable is computed against activeHeight + MIN_BLOCKS_TO_KEEP
+    // and triggers an early return inside handleBlock when !pending.
+    const idx = BLOCKS_SRC.indexOf("async handleBlock(");
+    expect(idx).toBeGreaterThan(-1);
+    const slice = BLOCKS_SRC.slice(idx, idx + 4000);
+    // The gate expression:
+    expect(slice).toContain("fTooFarAhead = headerEntry.height > activeHeight + MIN_BLOCKS_TO_KEEP");
+    // Early return fires on the flag:
+    expect(slice).toContain("if (fTooFarAhead) {");
+    // It must appear inside the !pending block (before `// Remove from pending`):
+    const notPendingBlock = slice.slice(0, slice.indexOf("// Remove from pending"));
+    expect(notPendingBlock).toContain("fTooFarAhead");
+  });
+
+  test("G19c-3 — fTooFarAhead gate is absent from the requested path (requested too-far accepted)", () => {
+    // The gate must NOT appear in the requested-block continuation
+    // (after the `// Remove from pending` line).  Requested blocks bypass
+    // the fTooFarAhead check just as Core bypasses it when fRequested=true.
+    const idx = BLOCKS_SRC.indexOf("async handleBlock(");
+    expect(idx).toBeGreaterThan(-1);
+    const slice = BLOCKS_SRC.slice(idx, idx + 4000);
+    const removeIdx = slice.indexOf("// Remove from pending");
+    expect(removeIdx).toBeGreaterThan(-1);
+    const requestedPath = slice.slice(removeIdx);
+    expect(requestedPath).not.toContain("fTooFarAhead");
+    expect(requestedPath).not.toContain("MIN_BLOCKS_TO_KEEP");
   });
 
   // ── G19b: !fHasMoreOrSameWork early-return on unrequested ──
