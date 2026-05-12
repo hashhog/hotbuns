@@ -410,18 +410,27 @@ export function ecdsaVerifyLaxFFI(
 /**
  * Verify a BIP-340 Schnorr signature using libsecp256k1.
  *
+ * In Bitcoin consensus the message is always the 32-byte tap-sighash and
+ * the signature ships either as 64 bytes (SIGHASH_DEFAULT) or 65 bytes
+ * (explicit hashtype, stripped by the caller before reaching here). The
+ * BIP-340 spec however permits arbitrary message lengths, and the
+ * official test vector set covers msg lengths of 0, 1, 17, and 100; this
+ * function accepts any length so the conformance suite can exercise
+ * libsecp256k1 directly. Pre-W95 hotbuns hard-coded msglen=32 and the
+ * variable-length test vectors were quietly dropped.
+ *
  * @param signature    64-byte Schnorr signature
- * @param msgHash      32-byte message hash (sighash)
+ * @param msg          message bytes (any length; Bitcoin uses 32)
  * @param xonlyPubkey  32-byte x-only public key
  * @returns true if signature is valid per BIP-340
  */
 export function schnorrVerifyFFI(
   signature: Buffer | Uint8Array,
-  msgHash: Buffer | Uint8Array,
+  msg: Buffer | Uint8Array,
   xonlyPubkey: Buffer | Uint8Array
 ): boolean {
   if (!FFI_AVAILABLE) return false;
-  if (signature.length !== 64 || msgHash.length !== 32 || xonlyPubkey.length !== 32) {
+  if (signature.length !== 64 || xonlyPubkey.length !== 32) {
     return false;
   }
 
@@ -432,8 +441,17 @@ export function schnorrVerifyFFI(
   }
 
   const sigPtr = ptr(signature as Uint8Array);
-  const msgPtr = ptr(msgHash as Uint8Array);
-  return _syms!.secp256k1_schnorrsig_verify(_ctx, sigPtr, msgPtr, 32, _xonlyPubkeyPtr) === 1;
+  // For zero-length messages, Bun's ptr() will throw on an empty Uint8Array;
+  // libsecp256k1's API allows msg=NULL when msglen=0 so we synthesize a
+  // dummy 1-byte buffer pointer and pass msglen=0.
+  let msgPtr: number;
+  if (msg.length === 0) {
+    const dummy = new Uint8Array(1);
+    msgPtr = ptr(dummy);
+  } else {
+    msgPtr = ptr(msg as Uint8Array);
+  }
+  return _syms!.secp256k1_schnorrsig_verify(_ctx, sigPtr, msgPtr, msg.length, _xonlyPubkeyPtr) === 1;
 }
 
 // ---------------------------------------------------------------------------

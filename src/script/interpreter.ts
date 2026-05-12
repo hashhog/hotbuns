@@ -2665,6 +2665,13 @@ function encodeCompactSize(n: number): Buffer {
 /**
  * Tweak a public key and return both the tweaked key and its parity.
  */
+// secp256k1 curve order (n).  Used for BIP-341 step-2 tweak validation:
+// the tagged-hash tweak must be a valid scalar (t < n) or the result of
+// the tweak is undefined per spec.
+const SECP256K1_ORDER = BigInt(
+  "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"
+);
+
 function tweakPublicKeyWithParity(pubkey: Buffer, tweak: Buffer): { key: Buffer; parity: number } {
   if (pubkey.length !== 32) {
     throw new Error("Public key must be 32 bytes (x-only)");
@@ -2673,12 +2680,25 @@ function tweakPublicKeyWithParity(pubkey: Buffer, tweak: Buffer): { key: Buffer;
     throw new Error("Tweak must be 32 bytes");
   }
 
-  // Lift x to a point (assume even y)
+  // Convert tweak to bigint.
+  //
+  // BIP-341 ("Tweaking a public key"):
+  //   t = int_from_bytes(taggedHash("TapTweak", pubkey + h))
+  //   if t >= SECP256K1_ORDER: raise ValueError
+  //
+  // Pre-W95: this check was missing — Point.BASE.multiply(t) would silently
+  // reduce mod n and emit a tweaked key that disagreed with libsecp256k1's
+  // `secp256k1_xonly_pubkey_tweak_add_check` (Core uses the latter via
+  // `XOnlyPubKey::CheckTapTweak` in src/pubkey.cpp). The catch in the
+  // caller maps this throw to WITNESS_PROGRAM_MISMATCH.
+  const t = BigInt("0x" + tweak.toString("hex"));
+  if (t >= SECP256K1_ORDER) {
+    throw new Error("tweakPublicKeyWithParity: tweak overflows curve order");
+  }
+
+  // Lift x to a point (assume even y); throws if x >= p or not on curve.
   const x = BigInt("0x" + pubkey.toString("hex"));
   const P = schnorr.utils.lift_x(x);
-
-  // Convert tweak to bigint
-  const t = BigInt("0x" + tweak.toString("hex"));
 
   // Compute tweak*G
   const Point = schnorr.Point;
@@ -2687,7 +2707,17 @@ function tweakPublicKeyWithParity(pubkey: Buffer, tweak: Buffer): { key: Buffer;
   // Add P + tG
   const tweaked = P.add(tG);
 
-  // Check if y is even or odd
+  // BIP-341 step 4: "if Q is point at infinity: raise ValueError".
+  // noble's toAffine() returns {x:0n, y:0n} for the infinity point and
+  // does NOT throw; without this guard we'd silently emit an all-zero
+  // x-only key with parity=0 and the parity branch below would assert
+  // tweakedKey != outputKey via the byte compare (in practice always),
+  // but spec says reject up-front.
+  if (tweaked.is0()) {
+    throw new Error("tweakPublicKeyWithParity: tweaked point is at infinity");
+  }
+
+  // Check if y is even or odd. `.y` returns the affine y-coordinate.
   const parity = tweaked.y % 2n === 0n ? 0 : 1;
 
   // Return x-only key (32 bytes)

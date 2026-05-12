@@ -1629,7 +1629,7 @@ function tweakPublicKey(xOnlyPubkey: Buffer, tweak: Buffer): Buffer {
   // Get the tweak as a scalar
   const tweakScalar = BigInt("0x" + tweak.toString("hex"));
 
-  // Check if tweak is valid (must be < curve order)
+  // BIP-341 step 2: t must be a valid scalar (t < n).
   if (tweakScalar >= CURVE_ORDER) {
     throw new Error("Invalid tweak - exceeds curve order");
   }
@@ -1637,6 +1637,11 @@ function tweakPublicKey(xOnlyPubkey: Buffer, tweak: Buffer): Buffer {
   // Compute tweaked point: P' = P + t*G
   const tweakPoint = schnorr.Point.BASE.multiply(tweakScalar);
   const tweakedPoint = point.add(tweakPoint);
+
+  // BIP-341 step 4: reject infinity (descriptor expand path).
+  if (tweakedPoint.is0()) {
+    throw new Error("Invalid tweak - tweaked point is at infinity");
+  }
 
   // Get the x-only coordinate (32 bytes)
   const tweakedBytes = schnorr.utils.pointToBytes(tweakedPoint);
