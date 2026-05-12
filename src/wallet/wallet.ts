@@ -722,7 +722,8 @@ export class Wallet {
     // Get the tweak as a scalar
     const tweakScalar = BigInt("0x" + tweak.toString("hex"));
 
-    // Check if tweak is valid (must be < curve order)
+    // BIP-341 step 2: t must be a valid scalar (t < n). Otherwise the
+    // tweaked output key disagrees with libsecp256k1.
     if (tweakScalar >= CURVE_ORDER) {
       throw new Error("Invalid tweak - exceeds curve order");
     }
@@ -730,6 +731,14 @@ export class Wallet {
     // Compute tweaked point: P' = P + t*G
     const tweakPoint = schnorr.Point.BASE.multiply(tweakScalar);
     const tweakedPoint = point.add(tweakPoint);
+
+    // BIP-341 step 4: reject infinity. noble's pointToBytes(infinity)
+    // calls toBytes(true)→assertValidity() which throws (FpIsValidNot0),
+    // so this guard mostly matches what noble would surface anyway, but
+    // we want a stable error string for the caller.
+    if (tweakedPoint.is0()) {
+      throw new Error("Invalid tweak - tweaked point is at infinity");
+    }
 
     // Get the x-only coordinate (32 bytes) using the schnorr utils
     const tweakedBytes = schnorr.utils.pointToBytes(tweakedPoint);

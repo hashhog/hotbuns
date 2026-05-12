@@ -519,6 +519,12 @@ export function schnorrSign(
 /**
  * Verify a Schnorr signature (BIP-340) for Taproot.
  *
+ * Bitcoin consensus always hashes the spend pre-image to a 32-byte sighash
+ * before invoking Schnorr; this wrapper enforces the 32-byte length to
+ * catch caller bugs early. The lower-level `schnorrVerifyFFI` accepts
+ * variable-length messages for BIP-340 conformance testing — use that
+ * path directly if you need to verify the spec's variable-length vectors.
+ *
  * @param signature 64-byte Schnorr signature
  * @param msgHash 32-byte message hash
  * @param publicKey 32-byte x-only public key
@@ -694,14 +700,31 @@ export function tweakPrivateKey(privateKey: Buffer, tweak: Buffer): Buffer {
   // secp256k1 curve order
   const n = BigInt("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
 
+  // Convert d and t to bigints.
+  let d = BigInt("0x" + privateKey.toString("hex"));
+  const t = BigInt("0x" + tweak.toString("hex"));
+
+  // BIP-340 / secp256k1 valid-scalar check: 0 < d < n.  Pre-W95 this was
+  // skipped, so a private key of 0 (silently turned into the all-zero
+  // x-only pubkey) or >= n (over-flow on (d + t) mod n) would still be
+  // accepted.
+  if (d === 0n || d >= n) {
+    throw new Error("tweakPrivateKey: privateKey is not a valid secp256k1 scalar (0 < d < n)");
+  }
+
+  // BIP-341 step 2: "if t >= SECP256K1_ORDER: raise ValueError". The tweak
+  // is a 32-byte tagged hash so the failure probability is ~ 2^-128, but
+  // Core enforces this and so must we (`secp256k1_ec_seckey_tweak_add`
+  // returns 0 on overflow). Pre-W95 the modular reduction silently
+  // produced a wrong key for invalid input.
+  if (t >= n) {
+    throw new Error("tweakPrivateKey: tweak is not a valid scalar (t < n required by BIP-341)");
+  }
+
   // Derive the internal pubkey P = d*G (compressed: 33 bytes; first byte is the
   // Y-parity tag, 0x02 = even Y, 0x03 = odd Y).
   const compressedPubkey = Buffer.from(secp256k1.getPublicKey(privateKey, true));
   const hasEvenY = compressedPubkey[0] === 0x02;
-
-  // Convert d and t to bigints.
-  let d = BigInt("0x" + privateKey.toString("hex"));
-  const t = BigInt("0x" + tweak.toString("hex"));
 
   // BIP-341 even-y negation: if P has odd Y, replace d with (n - d).
   if (!hasEvenY) {
@@ -737,12 +760,20 @@ export function tweakPublicKey(publicKey: Buffer, tweak: Buffer): Buffer {
     throw new Error(`tweakPublicKey: tweak must be 32 bytes`);
   }
 
-  // Lift x to a point
+  // secp256k1 curve order
+  const n = BigInt("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
+
+  // Convert tweak to bigint and validate per BIP-341 step 2: t < n.
+  // Pre-W95 this was missing; the multiply(t) would silently reduce mod n
+  // and produce a tweaked key that disagrees with libsecp256k1.
+  const t = BigInt("0x" + tweak.toString("hex"));
+  if (t >= n) {
+    throw new Error("tweakPublicKey: tweak is not a valid scalar (t < n required by BIP-341)");
+  }
+
+  // Lift x to a point (throws if x >= p or not on curve, matching BIP-340 lift_x).
   const x = BigInt("0x" + publicKey.toString("hex"));
   const P = schnorr.utils.lift_x(x);
-
-  // Convert tweak to bigint
-  const t = BigInt("0x" + tweak.toString("hex"));
 
   // Access Point via schnorr.Point (the Pointk1 class)
   const Point = schnorr.Point;
@@ -752,6 +783,14 @@ export function tweakPublicKey(publicKey: Buffer, tweak: Buffer): Buffer {
 
   // Add P + tG
   const tweaked = P.add(tG);
+
+  // BIP-341 step 4: "if Q is point at infinity: raise ValueError".
+  // noble's toAffine() returns {x:0n, y:0n} for the infinity point and
+  // does NOT throw, so a missing guard here would silently emit a 32-byte
+  // all-zero x-only key.
+  if (tweaked.is0()) {
+    throw new Error("tweakPublicKey: tweaked point is at infinity");
+  }
 
   // Return x-only (32 bytes)
   const xHex = tweaked.x.toString(16).padStart(64, "0");
