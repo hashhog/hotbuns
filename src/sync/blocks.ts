@@ -2309,20 +2309,27 @@ export class BlockSync {
       );
     }
 
-    // Under assume-valid, skip expensive structural checks (merkle root,
-    // witness commitment, per-tx validation) for blocks we trust.
-    const assumeValid = this.params.assumeValidHeight > 0 && height <= this.params.assumeValidHeight;
-
-    if (!assumeValid) {
-      // Validate the block structure
-      const validation = validateBlock(block, height, this.params);
-      if (!validation.valid) {
-        const m = `Block ${hashHex.slice(0, 16)}... at height ${height} failed validation: ${validation.error}`;
-        console.warn(m);
-        this.recordConnectError(m);
-        return false;
-      }
+    // Structural block validation (CheckBlock equivalent) always runs regardless
+    // of assumevalid.  Bitcoin Core's assumevalid optimization ONLY skips
+    // per-input script/signature verification (fScriptChecks gate in
+    // ConnectBlock).  All structural gates — merkle root, witness commitment,
+    // BIP-34 height-in-coinbase, block weight, tx-structure — remain active.
+    // Reference: Bitcoin Core validation.cpp::CheckBlock (line 3918+) which is
+    // always called, and ConnectBlock where only
+    //   bool fScriptChecks = !fJustCheck && !fAssumeValid;
+    // is gated on assumevalid.
+    const validation = validateBlock(block, height, this.params);
+    if (!validation.valid) {
+      const m = `Block ${hashHex.slice(0, 16)}... at height ${height} failed validation: ${validation.error}`;
+      console.warn(m);
+      this.recordConnectError(m);
+      return false;
     }
+
+    // assumeValid is used only to gate per-input script verification (see
+    // coreConnectBlockChecks / skipScripts).  Structural checks above are
+    // unconditional.
+    const assumeValid = this.params.assumeValidHeight > 0 && height <= this.params.assumeValidHeight;
 
     // Verify the block connects to the header chain
     const headerEntry = this.headerSync.getHeaderByHeight(height);

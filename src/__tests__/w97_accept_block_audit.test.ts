@@ -297,14 +297,23 @@ describe("W97 AcceptBlock — fAlreadyHave, fTooFarAhead, MinimumChainWork, Chec
     expect(slice).not.toMatch(/nTx\s*!==?\s*0[^{}]+return/);
   });
 
-  // ── G20: validateBlock (structural CheckBlock) is GATED on !assumeValid ──
-  test("G20 — validateBlock is skipped under assumevalid (covers structural checks)", () => {
-    // BUG B16: Core's assumevalid skips ONLY script verification.  Hotbuns
-    // also skips merkle root, witness commitment, BIP-34, weight, and basic
-    // tx checks.
+  // ── G20: validateBlock (structural CheckBlock) must run unconditionally ──
+  test("G20 — validateBlock is NOT gated on !assumeValid (structural checks always run)", () => {
+    // FIX B16: Core's assumevalid skips ONLY per-input script verification.
+    // Structural checks — merkle root, witness commitment, BIP-34, block weight,
+    // tx-structure — must run even inside the assumevalid range.
+    // Reference: Bitcoin Core validation.cpp::CheckBlock (line 3918+) always
+    // runs; only ConnectBlock's fScriptChecks is gated on !fAssumeValid.
     const idx = BLOCKS_SRC.indexOf("async connectBlock(");
     const slice = BLOCKS_SRC.slice(idx, idx + 8000);
-    expect(slice).toMatch(/if \(!assumeValid\) {[^}]*validation = validateBlock\(/s);
+    // The old buggy gate must be absent.
+    expect(slice).not.toMatch(/if \(!assumeValid\) {[^}]*validation = validateBlock\(/s);
+    // validateBlock must be called unconditionally (before the assumeValid variable).
+    const validateCallIdx = slice.indexOf("validateBlock(block, height");
+    const assumeVarIdx = slice.indexOf("const assumeValid =");
+    expect(validateCallIdx).toBeGreaterThan(-1);
+    expect(assumeVarIdx).toBeGreaterThan(-1);
+    expect(validateCallIdx).toBeLessThan(assumeVarIdx);
   });
 
   // ── G21: ContextualCheckBlock invocation independent of validateBlock ──
