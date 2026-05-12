@@ -1227,8 +1227,8 @@ export class ChainStateManager {
       };
     }
 
-    // Check if already marked invalid
-    if (blockIndex.status & BlockStatus.FAILED_VALID) {
+    // Check if already marked invalid (FAILED_VALID or FAILED_CHILD)
+    if (blockIndex.status & (BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD)) {
       return { success: true, blocksAffected: 0 };
     }
 
@@ -1312,43 +1312,50 @@ export class ChainStateManager {
 
   /**
    * Mark descendants of an invalid block as FAILED_CHILD.
+   *
+   * G17a fix: iterate ALL block index entries (not just the active-chain
+   * height→hash mapping) and mark any entry whose ancestor chain contains
+   * the invalidated block.  Mirrors Bitcoin Core validation.cpp:3699
+   * SetBlockFailureFlags which walks the full block_index by ancestry.
    */
   private async markDescendantsInvalid(
     parentHash: Buffer,
     parentHeight: number
   ): Promise<void> {
-    // This is a simplified implementation
-    // A full implementation would iterate through all block index entries
-    // and check ancestry. For now, we rely on the header chain to track
-    // which blocks descend from the invalid block.
+    // Collect all entries in a single pass, then propagate FAILED_CHILD in
+    // topological order (lower heights before higher).  Using a two-pass
+    // approach mirrors Core's SetBlockFailureFlags which also walks the full
+    // m_block_index map and checks IsAncestorOf.
+    const allEntries: Array<[Buffer, import("../storage/database.js").BlockIndexRecord]> = [];
+    for await (const entry of this.db.iterateBlockIndexEntries()) {
+      allEntries.push(entry);
+    }
 
-    // Walk through heights above parent looking for descendants
-    let height = parentHeight + 1;
-    while (height <= this.bestBlock.height + 1000) {
-      // Look up to 1000 blocks ahead
-      const hashAtHeight = await this.db.getBlockHashByHeight(height);
-      if (!hashAtHeight) break;
+    // Sort ascending by height so parents are always processed before children.
+    allEntries.sort((a, b) => a[1].height - b[1].height);
 
-      const idx = await this.db.getBlockIndex(hashAtHeight);
-      if (!idx) {
-        height++;
-        continue;
-      }
+    for (const [hash, idx] of allEntries) {
+      // Only consider blocks strictly above the invalidated block.
+      if (idx.height <= parentHeight) continue;
 
-      // Check if this block's parent chain contains the invalid block
-      // by comparing prevBlock
+      // Already marked — nothing to do.
+      if (idx.status & BlockStatus.FAILED_CHILD) continue;
+
+      // Check if the direct parent is invalid (FAILED_VALID or FAILED_CHILD).
+      // Because we sorted by height, if any ancestor is invalid it will have
+      // already been marked by the time we reach this entry.
       const prevBlockHash = idx.header.subarray(4, 36);
       const prevIdx = await this.db.getBlockIndex(prevBlockHash);
 
-      if (prevIdx && prevIdx.status & (BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD)) {
-        // Parent is invalid, mark this as FAILED_CHILD
+      if (prevIdx && (prevIdx.status & (BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD))) {
         await this.db.updateBlockStatus(
-          hashAtHeight,
+          hash,
           idx.status | BlockStatus.FAILED_CHILD
         );
+        // Update the in-memory copy so subsequent children of this block
+        // see the updated status in the same pass.
+        idx.status = idx.status | BlockStatus.FAILED_CHILD;
       }
-
-      height++;
     }
   }
 
@@ -1412,41 +1419,49 @@ export class ChainStateManager {
 
   /**
    * Clear FAILED_CHILD flags from descendants of a reconsidered block.
+   *
+   * G20 fix: iterate ALL block index entries (not just the active-chain
+   * height→hash mapping) and clear FAILED_CHILD on any entry whose parent
+   * is now valid.  Mirrors Bitcoin Core validation.cpp::ResetBlockFailureFlags
+   * which walks the full block_index and clears flags on all descendants.
    */
   private async clearDescendantInvalidFlags(
     parentHash: Buffer,
     parentHeight: number
   ): Promise<void> {
-    // Similar to markDescendantsInvalid, but clears flags instead
-    let height = parentHeight + 1;
-    while (height <= this.bestBlock.height + 1000) {
-      const hashAtHeight = await this.db.getBlockHashByHeight(height);
-      if (!hashAtHeight) break;
+    // Collect all entries and sort ascending by height so parents are
+    // always processed before children.  This ensures that when we clear
+    // a FAILED_CHILD flag, the subsequent children of that block see the
+    // cleared status in the same pass.
+    const allEntries: Array<[Buffer, import("../storage/database.js").BlockIndexRecord]> = [];
+    for await (const entry of this.db.iterateBlockIndexEntries()) {
+      allEntries.push(entry);
+    }
 
-      const idx = await this.db.getBlockIndex(hashAtHeight);
-      if (!idx) {
-        height++;
-        continue;
+    allEntries.sort((a, b) => a[1].height - b[1].height);
+
+    for (const [hash, idx] of allEntries) {
+      // Only consider blocks strictly above the reconsidered block.
+      if (idx.height <= parentHeight) continue;
+
+      // Only need to process entries that have FAILED_CHILD set.
+      if (!(idx.status & BlockStatus.FAILED_CHILD)) continue;
+
+      // Check if the direct parent is now valid.
+      const prevBlockHash = idx.header.subarray(4, 36);
+      const prevIdx = await this.db.getBlockIndex(prevBlockHash);
+
+      const parentStillInvalid =
+        prevIdx &&
+        (prevIdx.status & (BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD));
+
+      if (!parentStillInvalid) {
+        const newStatus = idx.status & ~BlockStatus.FAILED_CHILD;
+        await this.db.updateBlockStatus(hash, newStatus);
+        // Update in-memory copy so subsequent children of this block see
+        // the cleared status in the same pass.
+        idx.status = newStatus;
       }
-
-      // Check if this block has FAILED_CHILD set
-      if (idx.status & BlockStatus.FAILED_CHILD) {
-        // Check if its parent is now valid
-        const prevBlockHash = idx.header.subarray(4, 36);
-        const prevIdx = await this.db.getBlockIndex(prevBlockHash);
-
-        const parentStillInvalid =
-          prevIdx &&
-          prevIdx.status & (BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD);
-
-        if (!parentStillInvalid) {
-          // Clear FAILED_CHILD flag
-          const newStatus = idx.status & ~BlockStatus.FAILED_CHILD;
-          await this.db.updateBlockStatus(hashAtHeight, newStatus);
-        }
-      }
-
-      height++;
     }
   }
 

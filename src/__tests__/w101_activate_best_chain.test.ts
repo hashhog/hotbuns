@@ -343,12 +343,10 @@ describe("W101 ActivateBestChain + InvalidateBlock gates", () => {
 
     const idxC = await db.getBlockIndex(hashC);
     expect(idxC).not.toBeNull();
-    // BUG: FAILED_CHILD is NOT set on hashC because getBlockHashByHeight(2)
-    // returns hashC2 (the active-chain block), not hashC.
-    // Core's SetBlockFailureFlags walks ALL block_index entries so it would
-    // mark both hashC2 (if it's a descendant) and hashC.
-    expect((idxC!.status & BlockStatus.FAILED_CHILD)).toBe(0);
-    // This SHOULD be non-zero (64) after a correct Core-faithful walk.
+    // G17a FIXED: markDescendantsInvalid now iterates ALL block index entries
+    // (not just the active-chain height→hash mapping), so hashC — an off-chain
+    // descendant of hashA — is correctly marked FAILED_CHILD.
+    expect((idxC!.status & BlockStatus.FAILED_CHILD)).toBe(BlockStatus.FAILED_CHILD);
   });
 
   /**
@@ -432,15 +430,10 @@ describe("W101 ActivateBestChain + InvalidateBlock gates", () => {
     );
 
     const result = await cs.invalidateBlock(hash1);
-    // BUG: should return early with blocksAffected=0 because FAILED_CHILD
-    // means an ancestor is already invalid. Core treats both flags as
-    // making the block invalid — but hotbuns only checks FAILED_VALID here.
-    // The call succeeds (possibly re-invalidating) instead of returning early.
+    // G17c FIXED: early-return guard now checks FAILED_VALID | FAILED_CHILD.
+    // A block already carrying FAILED_CHILD returns early with blocksAffected=0.
     expect(result.success).toBe(true);
-    // If correctly implemented, blocksAffected should be 0 (already-invalid
-    // path). With the bug the block is processed again.
-    // Document the current behaviour (not the correct one):
-    expect(result.blocksAffected).toBeGreaterThanOrEqual(0); // no crash
+    expect(result.blocksAffected).toBe(0);
   });
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -495,12 +488,13 @@ describe("W101 ActivateBestChain + InvalidateBlock gates", () => {
     const result = await cs.reconsiderBlock(hash1);
     expect(result.success).toBe(true);
 
-    // BUG: hash2side is still FAILED_CHILD because clearDescendantInvalidFlags
-    // only queries getBlockHashByHeight(2) which returns hash2main (not hash2side).
+    // G20 FIXED: clearDescendantInvalidFlags now iterates ALL block index entries
+    // (not just the active-chain height→hash mapping), so hash2side — an off-chain
+    // block with FAILED_CHILD — is correctly cleared when its parent (hash1) is
+    // no longer invalid.
     const idx2side = await db.getBlockIndex(hash2side);
     expect(idx2side).not.toBeNull();
-    // Documents the bug: should be cleared (0), but isn't (still 64).
-    expect(idx2side!.status & BlockStatus.FAILED_CHILD).toBe(BlockStatus.FAILED_CHILD);
+    expect(idx2side!.status & BlockStatus.FAILED_CHILD).toBe(0);
   });
 
   /**
