@@ -898,7 +898,9 @@ describe("RBF - Replace By Fee", () => {
 
       const result2 = await mempool.addTransaction(tx);
       expect(result2.accepted).toBe(false);
-      expect(result2.error).toContain("already in mempool");
+      // W96: canonical Bitcoin Core reject reason for exact-wtxid duplicate.
+      // Reference: bitcoin-core/src/validation.cpp:823-825.
+      expect(result2.error).toContain("txn-already-in-mempool");
     });
   });
 });

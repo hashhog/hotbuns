@@ -3041,36 +3041,23 @@ export class RPCServer {
       );
     }
 
-    // Calculate fee rate before adding to mempool to check maxfeerate
-    // This requires knowing the fee, which we get from addTransaction
-    // For now, we add to mempool first, then check fee rate
-    // (mempool.addTransaction already validates minimum fee rate)
-
-    // Add to mempool (includes validation)
-    const result = await this.mempool.addTransaction(tx);
+    // Thread the caller-supplied maxfeerate into addTransaction so the gate
+    // fires inline BEFORE the tx is committed to the pool. Previously this
+    // happened AFTER addTransaction returned, which meant a tx rejected for
+    // max-fee fired the txAccepted notification, bumped mempoolSequence, and
+    // then was removed — confusing downstream ZMQ subscribers and racing
+    // with peer inv broadcasting. Mirrors Bitcoin Core
+    // ATMPArgs.m_client_maxfeerate (validation.cpp:1367-1371).
+    //
+    // maxFeeRate from the RPC is in BTC/kvB. Convert to sat/vB for the
+    // mempool gate: BTC/kvB → sat/vB is `* 100_000_000 / 1000` = `* 100_000`.
+    const maxFeeRateSatPerVB = maxFeeRate > 0 ? maxFeeRate * 100_000 : undefined;
+    const result = await this.mempool.addTransaction(tx, { maxFeeRateSatPerVB });
     if (!result.accepted) {
       throw this.rpcError(
         RPCErrorCodes.RPC_TRANSACTION_REJECTED,
         result.error || "Transaction rejected"
       );
-    }
-
-    // Now check maxfeerate if specified (and not 0 which means accept any rate)
-    if (maxFeeRate > 0) {
-      const entry = this.mempool.getTransaction(txid);
-      if (entry) {
-        // Convert fee rate from sat/vB to BTC/kvB for comparison
-        // sat/vB * 1000 / 100_000_000 = BTC/kvB
-        const feeRateBTCkvB = (entry.feeRate * 1000) / 100_000_000;
-        if (feeRateBTCkvB > maxFeeRate) {
-          // Remove from mempool since we're rejecting it
-          this.mempool.removeTransaction(txid);
-          throw this.rpcError(
-            RPCErrorCodes.RPC_TRANSACTION_REJECTED,
-            `Fee rate ${feeRateBTCkvB.toFixed(8)} BTC/kvB exceeds max rate ${maxFeeRate} BTC/kvB`
-          );
-        }
-      }
     }
 
     // Broadcast inv to peers

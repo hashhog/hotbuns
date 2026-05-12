@@ -15,7 +15,11 @@ import type { UTXOEntry } from "../storage/database.js";
 import type { UTXOManager } from "../chain/utxo.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import type { Block } from "../validation/block.js";
-import { getTransactionSigOpCost, WITNESS_SCALE_FACTOR } from "../validation/block.js";
+import {
+  getTransactionSigOpCost,
+  WITNESS_SCALE_FACTOR,
+  countScriptSigOps,
+} from "../validation/block.js";
 import type { Transaction, OutPoint, UTXOConfirmation } from "../validation/tx.js";
 import {
   validateTxBasic,
@@ -194,6 +198,16 @@ export const DEFAULT_BYTES_PER_SIGOP = 20;
  * policy.cpp TAPROOT_LEAF_TAPSCRIPT = 0xc0.
  */
 const TAPROOT_LEAF_TAPSCRIPT = 0xc0;
+
+/**
+ * Maximum number of sigops allowed in a P2SH redeem script (policy gate).
+ *
+ * Reference: bitcoin-core/src/policy/policy.h:42 — MAX_P2SH_SIGOPS = 15.
+ * Used by `validateInputsStandardness` to reject P2SH inputs whose
+ * redeem script declares more than 15 sigops, mirroring Core's
+ * "p2sh redeemscript sigops exceed limit" policy gate.
+ */
+const MAX_P2SH_SIGOPS = 15;
 
 /**
  * Evaluate a push-only scriptSig into a stack of buffer items.
@@ -388,6 +402,77 @@ function isWitnessStandard(
     }
   }
 
+  return { ok: true };
+}
+
+/**
+ * ValidateInputsStandardness policy check.
+ *
+ * Mirrors Bitcoin Core's `ValidateInputsStandardness()` (policy/policy.cpp:214-263).
+ * Called during ATMP PreChecks after CheckTxInputs has resolved all prevouts.
+ *
+ * For each input:
+ *  - If the prevScript classifies as `nonstandard` → reject "bad-txns-nonstandard-inputs".
+ *  - If the prevScript classifies as `witness_unknown` (witness v2-v16) → reject
+ *    "bad-txns-nonstandard-inputs (witness program undefined)". The script
+ *    interpreter would also catch this via DISCOURAGE flags later, but Core
+ *    rejects earlier as a defense-in-depth gate.
+ *  - If the prevScript is P2SH, eval the (already-validated push-only) scriptSig
+ *    to obtain the redeemScript (the top stack item), then count its sigops
+ *    in accurate mode. Reject if the redeemScript count exceeds
+ *    MAX_P2SH_SIGOPS (=15).
+ *
+ * Reference: bitcoin-core/src/policy/policy.cpp:226-260.
+ *
+ * @param tx          The transaction being validated.
+ * @param inputUtxos  Resolved UTXOs for each input (same order as tx.inputs).
+ */
+function validateInputsStandardness(
+  tx: Transaction,
+  inputUtxos: Array<{ utxo: { scriptPubKey: Buffer }; input: (typeof tx.inputs)[0] }>
+): { ok: true } | { ok: false; reason: string } {
+  for (let i = 0; i < inputUtxos.length; i++) {
+    const { utxo, input } = inputUtxos[i];
+    const spk = utxo.scriptPubKey;
+    const scriptType = getScriptType(spk);
+
+    if (scriptType === "nonstandard") {
+      return { ok: false, reason: `bad-txns-nonstandard-inputs: input ${i} script unknown` };
+    }
+    if (scriptType === "witness_unknown") {
+      return {
+        ok: false,
+        reason: `bad-txns-nonstandard-inputs: input ${i} witness program is undefined`,
+      };
+    }
+    if (scriptType === "p2sh") {
+      // The scriptSig has already been validated as push-only by IsStandardTx.
+      // Eval it to a stack; the top item is the redeemScript.
+      const stack = evalPushOnlyScriptSig(input.scriptSig);
+      if (stack === null) {
+        return {
+          ok: false,
+          reason: `bad-txns-nonstandard-inputs: p2sh scriptsig malformed (input ${i})`,
+        };
+      }
+      if (stack.length === 0) {
+        return {
+          ok: false,
+          reason: `bad-txns-nonstandard-inputs: input ${i} P2SH redeemscript missing`,
+        };
+      }
+      const redeemScript = stack[stack.length - 1];
+      // Core uses accurate sigop counting on the redeemScript
+      // (policy.cpp:254: subscript.GetSigOpCount(true)).
+      const sigopCount = countScriptSigOps(redeemScript, true);
+      if (sigopCount > MAX_P2SH_SIGOPS) {
+        return {
+          ok: false,
+          reason: `bad-txns-nonstandard-inputs: p2sh redeemscript sigops exceed limit (input ${i}: ${sigopCount} > ${MAX_P2SH_SIGOPS})`,
+        };
+      }
+    }
+  }
   return { ok: true };
 }
 
@@ -1002,6 +1087,28 @@ export interface Cluster {
 }
 
 /**
+ * Caller-provided options for AcceptToMemoryPool / addTransaction.
+ *
+ * Mirrors a subset of Bitcoin Core's `ATMPArgs` (validation.cpp:451-489) that is
+ * meaningful for the single-tx path:
+ *
+ *  - `maxFeeRateSatPerVB`: caller-defined max fee rate in sat/vB. If the
+ *    transaction's effective feerate exceeds this, the tx is rejected inline
+ *    with error `max-fee-exceeded`. Mirrors `args.m_client_maxfeerate` and
+ *    its check at validation.cpp:1367-1371. Pass 0 / undefined to disable.
+ *
+ *    The previous hotbuns sendrawtransaction handler enforced this AFTER
+ *    addTransaction returned, then removed the tx — which fired the
+ *    txAccepted notification and bumped mempoolSequence even for txs that
+ *    ultimately ended up rejected. Threading the option through here lets
+ *    the gate fire BEFORE the tx is committed to the pool.
+ */
+export interface AcceptToMemoryPoolOptions {
+  /** Caller-defined max fee rate (sat/vB). Reject if the tx exceeds this. */
+  maxFeeRateSatPerVB?: number;
+}
+
+/**
  * Transaction memory pool.
  *
  * Validates and stores unconfirmed transactions. When full, evicts transactions
@@ -1187,9 +1294,10 @@ export class Mempool {
    * script verification, and cluster mempool limits.
    */
   async acceptToMemoryPool(
-    tx: Transaction
+    tx: Transaction,
+    options?: AcceptToMemoryPoolOptions,
   ): Promise<{ accepted: boolean; error?: string }> {
-    return this.addTransaction(tx);
+    return this.addTransaction(tx, options);
   }
 
   /**
@@ -1207,7 +1315,8 @@ export class Mempool {
    * 9. Ancestor/descendant limits
    */
   async addTransaction(
-    tx: Transaction
+    tx: Transaction,
+    options?: AcceptToMemoryPoolOptions,
   ): Promise<{ accepted: boolean; error?: string }> {
     // 1. Basic structural validation
     const basicResult = validateTxBasic(tx);
@@ -1222,10 +1331,28 @@ export class Mempool {
 
     const txid = getTxId(tx);
     const txidHex = txid.toString("hex");
+    const wtxidHex = getWTxId(tx).toString("hex");
 
-    // 2. Not already in mempool
-    if (this.entries.has(txidHex)) {
-      return { accepted: false, error: "Transaction already in mempool" };
+    // 2. Mempool duplicate detection: Core checks both (a) exact wtxid match
+    //    → "txn-already-in-mempool", and (b) same nonwitness data (= same txid)
+    //    but DIFFERENT witness → "txn-same-nonwitness-data-in-mempool".
+    //    Reference: bitcoin-core/src/validation.cpp:823-830.
+    //
+    //    hotbuns keys entries by txid only, so we recover (a) vs (b) by comparing
+    //    the wtxid of the existing entry against the incoming tx's wtxid.
+    //    Returning the correct error matters for the p2p layer: case (a) is a
+    //    legitimate "we already have it" signal; case (b) means a peer relayed
+    //    a malleated witness that we should not re-relay.
+    {
+      const existing = this.entries.get(txidHex);
+      if (existing) {
+        const existingWtxidHex = getWTxId(existing.tx).toString("hex");
+        if (existingWtxidHex === wtxidHex) {
+          return { accepted: false, error: "txn-already-in-mempool" };
+        } else {
+          return { accepted: false, error: "txn-same-nonwitness-data-in-mempool" };
+        }
+      }
     }
 
     // 2a. IsStandardTx: version range [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION]
@@ -1399,6 +1526,12 @@ export class Mempool {
       isMempool: boolean;
     }> = [];
 
+    // MAX_MONEY = 21_000_000 * 100_000_000 satoshis. Defined here locally so
+    // we can run the per-input MoneyRange check below without importing a new
+    // constant. Mirrors Bitcoin Core consensus/amount.h:MAX_MONEY.
+    const MAX_MONEY_SATS = 2_100_000_000_000_000n;
+    const moneyInRange = (v: bigint): boolean => v >= 0n && v <= MAX_MONEY_SATS;
+
     for (const input of tx.inputs) {
       const outpointKey = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
       const parentTxidHex = input.prevOut.txid.toString("hex");
@@ -1414,7 +1547,18 @@ export class Mempool {
         }
 
         const output = mempoolParent.tx.outputs[input.prevOut.vout];
+        // bad-txns-inputvalues-outofrange: per-input + accumulated MoneyRange.
+        // Reference: bitcoin-core/src/consensus/tx_verify.cpp:184-188.
+        // Defense-in-depth: a mempool parent should already be value-range-clean,
+        // but a confirmed-coin path could be corrupted (DB read error, etc.),
+        // and accumulated overflow is its own gate.
+        if (!moneyInRange(output.value)) {
+          return { accepted: false, error: "bad-txns-inputvalues-outofrange" };
+        }
         totalInput += output.value;
+        if (!moneyInRange(totalInput)) {
+          return { accepted: false, error: "bad-txns-inputvalues-outofrange" };
+        }
         parentTxids.add(parentTxidHex);
         inputUtxos.push({
           utxo: {
@@ -1430,9 +1574,24 @@ export class Mempool {
         // Check UTXO set
         const utxo = await this.utxo.getUTXOAsync(input.prevOut);
         if (!utxo) {
+          // Inputs missing: Core distinguishes "we already have this tx (it's
+          // confirmed)" from "we don't have the parent yet (orphan)" by checking
+          // whether any of this tx's OWN outputs are present in the coins cache.
+          // If yes → `txn-already-known`; if no → `bad-txns-inputs-missingorspent`.
+          //
+          // Reference: bitcoin-core/src/validation.cpp:857-867 — this distinction
+          // drives different downstream behavior at the p2p layer (already-known
+          // is silent dedup; missingorspent enters the orphan-tx flow).
+          for (let outIdx = 0; outIdx < tx.outputs.length; outIdx++) {
+            const ownOutpoint = { txid, vout: outIdx };
+            const ownCoin = await this.utxo.getUTXOAsync(ownOutpoint);
+            if (ownCoin) {
+              return { accepted: false, error: "txn-already-known" };
+            }
+          }
           return {
             accepted: false,
-            error: `Missing input: ${outpointKey}`,
+            error: `bad-txns-inputs-missingorspent: ${outpointKey}`,
           };
         }
 
@@ -1442,12 +1601,20 @@ export class Mempool {
           if (confirmations < this.params.coinbaseMaturity) {
             return {
               accepted: false,
-              error: `Coinbase maturity not met: ${confirmations} < ${this.params.coinbaseMaturity}`,
+              error: `bad-txns-premature-spend-of-coinbase: depth ${confirmations} < ${this.params.coinbaseMaturity}`,
             };
           }
         }
 
+        // bad-txns-inputvalues-outofrange: per-input + accumulated MoneyRange
+        // for the confirmed-UTXO path. Reference: tx_verify.cpp:184-188.
+        if (!moneyInRange(utxo.amount)) {
+          return { accepted: false, error: "bad-txns-inputvalues-outofrange" };
+        }
         totalInput += utxo.amount;
+        if (!moneyInRange(totalInput)) {
+          return { accepted: false, error: "bad-txns-inputvalues-outofrange" };
+        }
         inputUtxos.push({ utxo, input, isMempool: false });
       }
     }
@@ -1459,13 +1626,22 @@ export class Mempool {
     }
 
     if (totalInput < totalOutput) {
+      // Reference: bitcoin-core/src/consensus/tx_verify.cpp:196-199 —
+      // `bad-txns-in-belowout` is the canonical consensus error name.
       return {
         accepted: false,
-        error: `Insufficient input value: ${totalInput} < ${totalOutput}`,
+        error: `bad-txns-in-belowout: value in ${totalInput} < value out ${totalOutput}`,
       };
     }
 
     const fee = totalInput - totalOutput;
+
+    // bad-txns-fee-outofrange: defense-in-depth on the computed fee.
+    // Core's tx_verify.cpp:203-210 notes this is unreachable given the
+    // preconditions, but checks anyway. We mirror that.
+    if (!moneyInRange(fee)) {
+      return { accepted: false, error: "bad-txns-fee-outofrange" };
+    }
 
     // Calculate weight and sigop cost; derive sigop-adjusted vsize.
     //
@@ -1501,6 +1677,22 @@ export class Mempool {
     // If sigops are expensive (sigOpCost * 20 > weight), vsize inflates to reflect that cost.
     const adjWeight = Math.max(weight, sigOpCost * DEFAULT_BYTES_PER_SIGOP);
     const vsize = Math.ceil(adjWeight / WITNESS_SCALE_FACTOR);
+
+    // 8a. PreCheckEphemeralTx: a tx with dust outputs must have 0 fee
+    //     so that no miner has an incentive to mine it alone.
+    //     Reference: bitcoin-core/src/policy/ephemeral_policy.cpp:23-31
+    //     and validation.cpp:935-939 (called in single-tx ATMP after vsize is
+    //     known, before the sigop-cost gate).
+    //
+    //     Previously this gate was only run from the package-validation path
+    //     (validatePackage in mempool.ts), so a single-tx submission with a dust
+    //     output and a non-zero fee bypassed the dust-relay-fee gate.
+    {
+      const ephemeralPreCheck = preCheckEphemeralTx(tx, fee);
+      if (!ephemeralPreCheck.valid) {
+        return { accepted: false, error: ephemeralPreCheck.error };
+      }
+    }
 
     // 8c. BIP-113 IsFinalTx: nLockTime must be satisfied at the next block.
     //     Reference: Bitcoin Core CheckFinalTxAtTip() (validation.cpp).
@@ -1549,12 +1741,55 @@ export class Mempool {
       }
     }
 
-    // 6. Check fee rate
+    // 6. Check fee rate.
+    //
+    //    Bitcoin Core's CheckFeeRate (validation.cpp:699-713) enforces two
+    //    distinct gates with distinct error strings:
+    //
+    //      (a) Rolling minimum fee (`mempool min fee not met`):
+    //          m_pool.GetMinFee().GetFee(package_size) — the dynamic floor
+    //          set by the most recently evicted chunk, decayed exponentially
+    //          with ROLLING_FEE_HALFLIFE. Returns sat/kvB.
+    //
+    //      (b) Static min-relay fee (`min relay fee not met`):
+    //          m_pool.m_opts.min_relay_feerate.GetFee(package_size).
+    //
+    //    Previously hotbuns only enforced (b) via `this.minFeeRate`, and
+    //    `getMinFee()` (the rolling rate) only got reflected into
+    //    `this.minFeeRate` during eviction — between eviction events the
+    //    rolling rate could decay back below `this.minFeeRate` (correct) but
+    //    could ALSO stay above without being checked here against the
+    //    current decayed value. We now query getMinFee() inline so the
+    //    rolling-min decay path is enforced at admission time as well.
     const feeRate = Number(fee) / vsize;
+    // getMinFee() returns sat/kvB; convert to sat/vB for the gate.
+    const rollingMinSatPerVB = this.getMinFee() / 1000;
+    if (rollingMinSatPerVB > 0 && feeRate < rollingMinSatPerVB) {
+      return {
+        accepted: false,
+        error: `mempool min fee not met: ${feeRate.toFixed(8)} sat/vB < ${rollingMinSatPerVB.toFixed(8)} sat/vB`,
+      };
+    }
     if (feeRate < this.minFeeRate) {
       return {
         accepted: false,
-        error: `Fee rate ${feeRate.toFixed(2)} sat/vB below minimum ${this.minFeeRate}`,
+        error: `min relay fee not met: ${feeRate.toFixed(8)} sat/vB < ${this.minFeeRate} sat/vB`,
+      };
+    }
+
+    // 6a. Caller-defined max fee rate (matches Bitcoin Core ATMPArgs.m_client_maxfeerate
+    //     at validation.cpp:1367-1371). RPC callers (e.g. sendrawtransaction) use
+    //     this to refuse to broadcast obviously-overpaying txs. Checking here, before
+    //     conflict-eviction or notification emit, avoids the prior-pattern "accept,
+    //     emit notification, then remove" race.
+    if (
+      options?.maxFeeRateSatPerVB !== undefined &&
+      options.maxFeeRateSatPerVB > 0 &&
+      feeRate > options.maxFeeRateSatPerVB
+    ) {
+      return {
+        accepted: false,
+        error: `max-fee-exceeded: ${feeRate.toFixed(8)} sat/vB > ${options.maxFeeRateSatPerVB} sat/vB`,
       };
     }
 
@@ -1684,8 +1919,24 @@ export class Mempool {
     }
 
     // 9b. Check cluster size limit (replaces ancestor/descendant limits)
-    // For TRUC, we've already checked in checkTRUCPolicy with stricter limits
-    const clusterResult = this.checkClusterSizeLimit(parentTxids, vsize);
+    //
+    // For RBF, evaluate against the POST-eviction state: the conflicts (and
+    // their descendants gathered above into `conflictsToEvict`) will be
+    // removed before the new tx is added, so they must not count toward the
+    // cluster's count/vbytes when checking the limit. Mirrors
+    // `m_subpackage.m_changeset->CheckMemPoolPolicyLimits()` in
+    // bitcoin-core/src/validation.cpp:1023 (ReplacementChecks).
+    //
+    // For non-RBF the excluded set is empty and this reduces to the prior
+    // behavior. For TRUC, checkTRUCPolicy has already applied its own (stricter)
+    // limits with the same eviction semantics.
+    const evictedTxidSet = new Set<string>();
+    if (isReplacement) {
+      for (const e of conflictsToEvict) {
+        evictedTxidSet.add(e.txid.toString("hex"));
+      }
+    }
+    const clusterResult = this.checkClusterSizeLimit(parentTxids, vsize, evictedTxidSet);
     if (!clusterResult.valid) {
       return { accepted: false, error: clusterResult.error };
     }
@@ -1694,6 +1945,20 @@ export class Mempool {
     const ancestorResult = this.checkAncestorLimits(parentTxids, vsize);
     if (!ancestorResult.valid) {
       return { accepted: false, error: ancestorResult.error };
+    }
+
+    // 2e1. ValidateInputsStandardness: per-input prevScript policy checks.
+    //      Mirrors Bitcoin Core's ValidateInputsStandardness() (policy/policy.cpp:214-263),
+    //      called from PreChecks (validation.cpp:896-901) after CheckTxInputs.
+    //      Three rejections:
+    //        - nonstandard prevScript → "bad-txns-nonstandard-inputs"
+    //        - witness_unknown prevScript (witness v2-v16) → undefined witness program
+    //        - P2SH redeemScript with > MAX_P2SH_SIGOPS (=15) sigops in accurate mode
+    {
+      const inputsStdResult = validateInputsStandardness(tx, inputUtxos);
+      if (!inputsStdResult.ok) {
+        return { accepted: false, error: inputsStdResult.reason };
+      }
     }
 
     // 2e. IsWitnessStandard: per-input witness policy checks.
@@ -1711,6 +1976,22 @@ export class Mempool {
       const witnessResult = isWitnessStandard(tx, inputUtxos);
       if (!witnessResult.ok) {
         return { accepted: false, error: witnessResult.reason };
+      }
+    }
+
+    // 9c. CheckEphemeralSpends (single-tx ATMP path).
+    //     Mirrors Bitcoin Core's CheckEphemeralSpends() (policy/ephemeral_policy.cpp:33-95),
+    //     called in single-tx ATMP at validation.cpp:1373-1378 with the singleton
+    //     package {ptx}.
+    //
+    //     For every mempool parent with ephemeral dust outputs, the child must
+    //     spend all of those dust outpoints. Without this gate in the single-tx
+    //     path, a CPFP child that doesn't actually pay for the dust gets in,
+    //     and the dust parent becomes unprunable.
+    {
+      const ephemeralSpendResult = checkEphemeralSpends([tx], this.entries);
+      if (!ephemeralSpendResult.valid) {
+        return { accepted: false, error: ephemeralSpendResult.error };
       }
     }
 
@@ -1766,13 +2047,13 @@ export class Mempool {
     // Mempool uses standard (policy) flags — stricter than consensus block flags.
     const flags = getStandardFlags(this.tipHeight);
 
-    if (!skipScripts) {
+    // Helper to verify all inputs under a given flag set. Used twice: once
+    // for PolicyScriptChecks (standard flags) and once for
+    // ConsensusScriptChecks (consensus block flags).
+    const verifyAllInputs = (flagSet: ScriptFlags): { ok: true } | { ok: false; reason: string } => {
       for (let i = 0; i < tx.inputs.length; i++) {
-        const { utxo, input, isMempool } = inputUtxos[i];
-
-        // Create sighash function for this input
+        const { utxo, input } = inputUtxos[i];
         const sigHasher = (subscript: Buffer, hashType: number): Buffer => {
-          // Determine if this is a witness input
           const witnessProgram = utxo.scriptPubKey;
           const isSegwit =
             (witnessProgram.length === 22 &&
@@ -1781,30 +2062,54 @@ export class Mempool {
             (witnessProgram.length === 34 &&
               witnessProgram[0] === 0x00 &&
               witnessProgram[1] === 32);
-
           if (isSegwit || input.witness.length > 0) {
             return sigHashWitnessV0(tx, i, subscript, utxo.amount, hashType);
           } else {
             return sigHashLegacy(tx, i, subscript, hashType);
           }
         };
-
         const valid = verifyScript(
           input.scriptSig,
           utxo.scriptPubKey,
           input.witness,
-          flags,
+          flagSet,
           sigHasher,
-          undefined, // taprootCtx — mempool uses P2SH/segwit-v0 paths
+          undefined,
           { txVersion: tx.version, txLockTime: tx.lockTime, txSequence: input.sequence }
         );
-
         if (!valid) {
-          return {
-            accepted: false,
-            error: `Script validation failed for input ${i}`,
-          };
+          return { ok: false, reason: `Script validation failed for input ${i}` };
         }
+      }
+      return { ok: true };
+    };
+
+    if (!skipScripts) {
+      // PolicyScriptChecks: verify with STANDARD (policy) flags.
+      // Mirrors bitcoin-core/src/validation.cpp:1135-1156 — uses
+      // STANDARD_SCRIPT_VERIFY_FLAGS, the strictest set, and is the
+      // "expensive checks last" gate of ATMP.
+      const policyResult = verifyAllInputs(flags);
+      if (!policyResult.ok) {
+        return { accepted: false, error: policyResult.reason };
+      }
+
+      // ConsensusScriptChecks: re-verify with current-block CONSENSUS flags.
+      // Mirrors bitcoin-core/src/validation.cpp:1158-1189. This is a defense-
+      // in-depth check that catches bugs where STANDARD_SCRIPT_VERIFY_FLAGS
+      // would *accept* a script that the looser MANDATORY/consensus flags would
+      // *reject* — historically the STRICTENC flag was incorrectly allowing
+      // certain CHECKSIG NOT scripts to pass even though they were invalid.
+      // If policy passed but consensus rejects, we still reject (better safe).
+      // Cheap to run since the sig cache (when wired) would already have
+      // cached the signature verifications.
+      const consensusFlags = getConsensusFlags(this.tipHeight);
+      const consensusResult = verifyAllInputs(consensusFlags);
+      if (!consensusResult.ok) {
+        return {
+          accepted: false,
+          error: `ConsensusScriptChecks: ${consensusResult.reason}`,
+        };
       }
     }
 
@@ -3044,6 +3349,15 @@ export class Mempool {
   }
 
   /**
+   * Set the static admission min-relay fee rate (sat/vB). Mirrors the
+   * `-minrelaytxfee` configuration knob in Bitcoin Core. The dynamic
+   * rolling-min always supersedes this when higher.
+   */
+  setMinFeeRate(satPerVB: number): void {
+    this.minFeeRate = satPerVB;
+  }
+
+  /**
    * Get the minimum fee rate in sat/kvB (for BIP133 feefilter).
    *
    * Returns the rolling dynamic minimum (with decay), floored by the static
@@ -3139,20 +3453,42 @@ export class Mempool {
    * A new transaction may merge multiple existing clusters together when it spends
    * outputs from transactions in different clusters.
    */
-  private checkClusterSizeLimit(parentTxids: Set<string>, newTxVsize: number): { valid: boolean; error?: string } {
+  private checkClusterSizeLimit(
+    parentTxids: Set<string>,
+    newTxVsize: number,
+    excludeTxids?: Set<string>,
+  ): { valid: boolean; error?: string } {
+    // `excludeTxids` is the set of txids that will be removed by this admission
+    // (e.g. RBF conflicts and their descendants). They contribute zero to the
+    // post-eviction cluster — mirrors Bitcoin Core's
+    // `m_subpackage.m_changeset->CheckMemPoolPolicyLimits()` (validation.cpp:1023)
+    // which evaluates limits against the staged-changeset state, not the
+    // pre-eviction state. Without this, an RBF replacement is falsely rejected
+    // when the conflicts it evicts inflate the cluster past MAX_CLUSTER_COUNT
+    // or MAX_CLUSTER_SIZE_VBYTES.
+    const excluded = excludeTxids ?? new Set<string>();
+
     // Find all unique cluster roots that would be merged by adding this tx.
     const clusterRoots = new Set<string>();
     for (const parentTxidHex of parentTxids) {
+      // Treat a parent that's being evicted as "not in the mempool" for cluster
+      // purposes — its outputs come from chainstate post-eviction.
+      if (excluded.has(parentTxidHex)) continue;
       if (this.entries.has(parentTxidHex)) {
         clusterRoots.add(this.clusters.find(parentTxidHex));
       }
     }
 
     // Gate 1: cluster count.
-    // Sum the transaction counts of all clusters that would be merged + 1 for the new tx.
-    let mergedCount = 1;
-    for (const root of clusterRoots) {
-      mergedCount += this.clusters.getSize(root);
+    // Sum entries in each merged cluster, subtracting any entries being evicted.
+    let mergedCount = 1; // +1 for the new tx
+    let mergedVsize = newTxVsize;
+    for (const [txidHex, entry] of this.entries) {
+      const root = this.clusters.find(txidHex);
+      if (!clusterRoots.has(root)) continue;
+      if (excluded.has(txidHex)) continue;
+      mergedCount += 1;
+      mergedVsize += entry.vsize;
     }
 
     if (mergedCount > MAX_CLUSTER_COUNT) {
@@ -3160,17 +3496,6 @@ export class Mempool {
         valid: false,
         error: `too-large-cluster: cluster would exceed maximum count ${MAX_CLUSTER_COUNT} (would be ${mergedCount})`,
       };
-    }
-
-    // Gate 2: cluster vbytes.
-    // Sum the total vsize of all entries in each cluster that would be merged + this tx's vsize.
-    // We compute this by iterating entries — O(n) over the merged cluster but n ≤ 64 by gate 1.
-    let mergedVsize = newTxVsize;
-    for (const [txidHex, entry] of this.entries) {
-      const root = this.clusters.find(txidHex);
-      if (clusterRoots.has(root)) {
-        mergedVsize += entry.vsize;
-      }
     }
 
     if (mergedVsize > MAX_CLUSTER_SIZE_VBYTES) {

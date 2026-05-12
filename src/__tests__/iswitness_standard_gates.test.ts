@@ -235,7 +235,12 @@ describe("IsWitnessStandard policy gates (W72)", () => {
       });
       const result = await mempool.addTransaction(tx);
       expect(result.accepted).toBe(false);
-      expect(result.error).toContain("bad-witness-nonstandard");
+      // W96: the new `ValidateInputsStandardness` gate (Core policy.cpp:241-258,
+      // wired ahead of IsWitnessStandard in mempool ATMP) catches the empty
+      // P2SH redeemScript case as `bad-txns-nonstandard-inputs` before
+      // IsWitnessStandard runs. Either canonical Core reject reason is
+      // acceptable here.
+      expect(result.error).toMatch(/bad-witness-nonstandard|bad-txns-nonstandard-inputs/);
     });
 
     test("P2SH input with non-witness redeemScript + witness is rejected (not a witness program)", async () => {

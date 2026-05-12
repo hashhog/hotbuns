@@ -68,7 +68,14 @@ async function setupUTXO(
 
 /** Mirrors the predicate used in cli.ts for routing missing-input rejects to the orphan pool. */
 function isMissingInputError(err: string | undefined): boolean {
-  return typeof err === "string" && err.startsWith("Missing input:");
+  if (typeof err !== "string") return false;
+  // W96: mempool emits Bitcoin Core's canonical reject reason
+  // (`bad-txns-inputs-missingorspent`, see validation.cpp:866). Legacy
+  // `Missing input:` is kept for back-compat with older callers.
+  return (
+    err.startsWith("bad-txns-inputs-missingorspent") ||
+    err.startsWith("Missing input:")
+  );
 }
 
 /**
