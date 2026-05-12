@@ -652,36 +652,57 @@ describe("G19: ProcessOrphan cascade — PASS", () => {
 });
 
 // ---------------------------------------------------------------------------
-// G20 — RelayTx: MSG_WITNESS_TX used instead of MSG_WTX for wtxid peers (BUG-14)
+// G20 — RelayTx: per-peer MSG_WTX(5)/MSG_TX(1) selection (BUG-14 FIXED)
 // ---------------------------------------------------------------------------
 
-describe("G20: RelayTx uses MSG_WITNESS_TX not MSG_WTX for wtxid-relay peers — BUG (BUG-14)", () => {
-  test("BUG-14: relay.ts flush() always uses InvType.MSG_WITNESS_TX (0x40000001)", () => {
+describe("G20: RelayTx uses MSG_WTX(5) for wtxid-relay peers, MSG_TX(1) for legacy — FIXED (BUG-14)", () => {
+  test("wtxid-relay peer receives MSG_WTX (=5) inv, not MSG_WITNESS_TX (0x40000001)", () => {
     // Core net_processing.cpp:2259: use MSG_WTX (=5) when m_wtxid_relay, else MSG_TX (=1).
-    // hotbuns relay.ts flush() always uses InvType.MSG_WITNESS_TX (0x40000001).
+    // Fix: relay.ts addPeer(peer, isInbound, wtxidRelay=true) selects MSG_WTX + wtxid.
     const sentInvs: any[] = [];
     const relay = new InventoryRelay((peer, inventory) => {
       sentInvs.push(...inventory);
     });
     const peer = makePeer();
-    relay.addPeer(peer, false);
+    // wtxidRelay=true: remote peer sent us `wtxidrelay` during handshake
+    relay.addPeer(peer, false, true);
     relay.queueTx(peer, Buffer.alloc(32, 1).toString("hex"));
     relay.flushNow(peer);
     expect(sentInvs.length).toBeGreaterThan(0);
-    // BUG-14: type should be MSG_WTX (5) for wtxid-relay peers,
-    // but hotbuns always sends MSG_WITNESS_TX (0x40000001)
     const type = sentInvs[0].type;
-    expect(type).toBe(InvType.MSG_WITNESS_TX); // = 0x40000001 — the bug
-    expect(type).not.toBe(CORE_MSG_WTX);       // = 5 — what Core uses
+    // FIXED: wtxid-relay peer receives MSG_WTX (=5), not MSG_WITNESS_TX (0x40000001)
+    expect(type).toBe(InvType.MSG_WTX);          // = 5 — BIP-339 correct inv type
+    expect(type).toBe(CORE_MSG_WTX);             // = 5 — matches Core protocol.h
+    expect(type).not.toBe(InvType.MSG_WITNESS_TX); // != 0x40000001 — BIP-144 getdata flag, not inv type
     relay.stop();
   });
 
-  test("Core reference: MSG_WTX = 5 (BIP-339 protocol.h)", () => {
+  test("legacy peer (no wtxidrelay) receives MSG_TX (=1) inv", () => {
+    // Core net_processing.cpp: legacy peer with m_wtxid_relay=false → MSG_TX(1) + txid.
+    const sentInvs: any[] = [];
+    const relay = new InventoryRelay((peer, inventory) => {
+      sentInvs.push(...inventory);
+    });
+    const peer = makePeer();
+    // wtxidRelay=false (default): legacy peer, no wtxidrelay signal received
+    relay.addPeer(peer, false, false);
+    relay.queueTx(peer, Buffer.alloc(32, 2).toString("hex"));
+    relay.flushNow(peer);
+    expect(sentInvs.length).toBeGreaterThan(0);
+    const type = sentInvs[0].type;
+    expect(type).toBe(InvType.MSG_TX); // = 1 — correct for legacy peers
+    expect(type).not.toBe(InvType.MSG_WTX);          // != 5
+    expect(type).not.toBe(InvType.MSG_WITNESS_TX);    // != 0x40000001
+    relay.stop();
+  });
+
+  test("InvType enum has both MSG_WTX = 5 and MSG_WITNESS_TX = 0x40000001 defined", () => {
     expect(CORE_MSG_WTX).toBe(5);
-    // InvType const enum only defines MSG_WITNESS_TX (0x40000001), not MSG_WTX (5).
-    // MSG_WTX is never announced by relay.ts because it's not defined in InvType.
+    expect(InvType.MSG_WTX).toBe(5);
+    expect(InvType.MSG_WTX).toBe(CORE_MSG_WTX);
     expect(InvType.MSG_WITNESS_TX).toBe(0x40000001);
-    expect(InvType.MSG_WITNESS_TX).not.toBe(CORE_MSG_WTX);
+    // They must be different: MSG_WTX is the inv type, MSG_WITNESS_TX is the getdata flag
+    expect(InvType.MSG_WTX).not.toBe(InvType.MSG_WITNESS_TX);
   });
 });
 

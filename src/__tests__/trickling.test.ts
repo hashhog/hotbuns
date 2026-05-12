@@ -254,9 +254,10 @@ describe("InventoryRelay flush behavior", () => {
     expect(sentInvs[0].inventory).toHaveLength(5);
     expect(relay.getPendingCount(peer)).toBe(0);
 
-    // All should be witness tx type
+    // Legacy peer (no wtxidrelay) should receive MSG_TX (=1), not MSG_WITNESS_TX.
+    // BIP-339 / Core net_processing.cpp: wtxid-relay peers get MSG_WTX (=5).
     for (const inv of sentInvs[0].inventory) {
-      expect(inv.type).toBe(InvType.MSG_WITNESS_TX);
+      expect(inv.type).toBe(InvType.MSG_TX);
     }
   });
 
@@ -511,9 +512,10 @@ describe("InventoryRelay integration", () => {
       OUTBOUND_INVENTORY_BROADCAST_INTERVAL * 3
     );
 
-    // Transaction should now be sent
+    // Transaction should now be sent.
+    // Legacy peer (no wtxidrelay): expect MSG_TX (=1), not MSG_WITNESS_TX (0x40000001).
     const txInv = sentInvs.find((s) =>
-      s.inventory.some((i) => i.type === InvType.MSG_WITNESS_TX)
+      s.inventory.some((i) => i.type === InvType.MSG_TX)
     );
     expect(txInv).toBeDefined();
 
