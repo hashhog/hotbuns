@@ -248,6 +248,9 @@ export interface ScriptFlags {
   verifyDiscourageUpgradableNops?: boolean; // policy - unused NOPs must error
   verifyCleanStack?: boolean; // BIP 62 - stack must have exactly one element after execution
   verifyDiscourageUpgradableWitnessProgram?: boolean; // policy - unknown witness versions must error
+  verifyDiscourageUpgradablePubkeyType?: boolean; // BIP 342 - policy - unknown tapscript pubkey types must error
+  verifyDiscourageOpSuccess?: boolean; // BIP 342 - policy - OP_SUCCESSx must error
+  verifyDiscourageUpgradableTaprootVersion?: boolean; // BIP 341 - policy - unknown leaf versions must error
 }
 
 /**
@@ -665,32 +668,66 @@ function checkMinimalPush(chunk: ScriptChunk): boolean {
 }
 
 /**
- * Verify a Schnorr signature for tapscript (BIP-342).
+ * Verify a Schnorr signature for tapscript (BIP-342). Mirrors Core's
+ * `EvalChecksigTapscript` in `script/interpreter.cpp` (lines 347-385) plus
+ * `CheckSchnorrSignature` (lines 1717-1742).
+ *
+ * Consensus-critical ordering, identical to Core:
+ *   success = !sig.empty();
+ *   if (success) deduct validation-weight budget;     // sigops/witnesssize ratio
+ *   if (pubkey.size() == 0) -> TAPSCRIPT_EMPTY_PUBKEY  // ALWAYS, even with empty sig
+ *   else if (pubkey.size() == 32) { if (success) verify; }
+ *   else -> upgradable pubkey, success unchanged (DISCOURAGE flag may error)
+ *
+ * Returns the verification result (true/false) — this is what gets pushed onto
+ * the stack by OP_CHECKSIG / accumulated by OP_CHECKSIGADD. Throws on hard
+ * errors (empty pubkey, malformed Schnorr sig, exhausted budget).
+ *
+ * NOTE on budget: the caller is responsible for decrementing the validation-
+ * weight budget BEFORE invoking this function (when sig is non-empty), so that
+ * the budget-exhaustion error is reported with the correct error code
+ * (TAPSCRIPT_VALIDATION_WEIGHT) and order relative to TAPSCRIPT_EMPTY_PUBKEY.
+ * This function does NOT touch ctx.sigopsBudget.
+ *
+ * Earlier versions short-circuited on `sig.length === 0` before checking
+ * pubkey.length === 0 — a consensus split vs Core, which rejects empty-pubkey
+ * even with empty sig. Fixed in W94 BIP-341/342 audit.
  *
  * @param sig - Signature (64 bytes, or 65 bytes with sighash type)
- * @param pubkey - 32-byte x-only public key
+ * @param pubkey - x-only public key (32 bytes, or upgradable)
  * @param ctx - Execution context with taproot sighash function
  * @param codeSepPos - Position of last OP_CODESEPARATOR
- * @returns true if signature is valid
+ * @param flags - Script verification flags (for DISCOURAGE_UPGRADABLE_PUBKEYTYPE)
+ * @returns true if signature is valid (or upgradable pubkey + non-empty sig)
  */
 function verifySchnorrSig(
   sig: Buffer,
   pubkey: Buffer,
   ctx: ExecutionContext,
-  codeSepPos: number
+  codeSepPos: number,
+  flags?: ScriptFlags
 ): boolean {
-  // Empty signature means "not signing this key"
-  if (sig.length === 0) {
-    return false;
-  }
-
-  // BIP-342: Empty pubkey (0 bytes) always fails
+  // BIP-342: Empty pubkey (0 bytes) always fails — checked BEFORE the empty-sig
+  // short-circuit, because Core's EvalChecksigTapscript performs this check
+  // unconditionally (interpreter.cpp:367-368). An empty sig + empty pubkey must
+  // still trigger TAPSCRIPT_EMPTY_PUBKEY, not silently push 0.
   if (pubkey.length === 0) {
     throw new ScriptError("TAPSCRIPT_EMPTY_PUBKEY");
   }
 
-  // BIP-342: Unknown pubkey type (not 32 bytes) succeeds for forward compatibility
+  // Empty signature → no Schnorr check (sigops budget was already deducted
+  // by the caller if sig was non-empty). For empty sig, success=false.
+  if (sig.length === 0) {
+    return false;
+  }
+
+  // BIP-342: Unknown pubkey type (not 32 bytes) — successful for forward
+  // compatibility. Policy flag DISCOURAGE_UPGRADABLE_PUBKEYTYPE may make this
+  // a hard error (e.g. on mempool acceptance), but consensus accepts.
   if (pubkey.length !== 32) {
+    if (flags?.verifyDiscourageUpgradablePubkeyType) {
+      throw new ScriptError("DISCOURAGE_UPGRADABLE_PUBKEYTYPE");
+    }
     return true;
   }
 
@@ -1609,8 +1646,11 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
               throw new ScriptError("TAPSCRIPT_VALIDATION_WEIGHT");
             }
           }
-          // Tapscript: use Schnorr signatures (BIP-342)
-          success = verifySchnorrSig(sig, pubkey, ctx, codeSepPos);
+          // Tapscript: use Schnorr signatures (BIP-342). Note that the
+          // budget was just deducted above; verifySchnorrSig still performs
+          // the unconditional EMPTY_PUBKEY check before short-circuiting on
+          // empty sig, so an empty sig + empty pubkey case correctly errors.
+          success = verifySchnorrSig(sig, pubkey, ctx, codeSepPos, flags);
         } else {
           // Legacy or witness v0: use ECDSA
 
@@ -1652,8 +1692,24 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
       }
 
       case Opcode.OP_CHECKSIGADD: {
-        // BIP-342: OP_CHECKSIGADD for tapscript
+        // BIP-342: OP_CHECKSIGADD for tapscript.
         // Stack: ... sig n pubkey -> ... n+sig_result (where sig_result is 0 or 1)
+        //
+        // Mirrors Core's interpreter.cpp:1058-1102 (OP_CHECKSIGADD case) which
+        // delegates to EvalChecksig -> EvalChecksigTapscript. Consensus-critical
+        // ordering identical to OP_CHECKSIG:
+        //   1) budget deduct iff sig non-empty (BEFORE pubkey check, so a
+        //      budget-exhausted upgradable-pubkey-only failure still surfaces
+        //      as TAPSCRIPT_VALIDATION_WEIGHT not TAPSCRIPT_EMPTY_PUBKEY)
+        //   2) empty pubkey -> TAPSCRIPT_EMPTY_PUBKEY (ALWAYS, even empty sig)
+        //   3) 32-byte pubkey -> Schnorr verify if non-empty sig
+        //   4) other size -> upgradable, success preserved
+        //
+        // Pre-W94 behavior: if `sig.length === 0`, the function silently set
+        // sigResult=0 and SKIPPED the empty-pubkey check entirely, allowing
+        // CHECKSIGADD with an empty pubkey + empty sig to push n+0 instead
+        // of erroring. That was a consensus split vs Core, which always
+        // rejects empty pubkey.
         if (sigVersion !== SigVersion.TAPSCRIPT) {
           // OP_CHECKSIGADD is only valid in tapscript
           return false;
@@ -1665,27 +1721,28 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
         const nElement = stack.pop()!;
         const sig = stack.pop()!;
 
-        // Decode n as a script number
+        // Decode n as a script number. BIP-342 explicitly bounds the
+        // accumulator to 4-byte CScriptNum (same as the rest of script).
         const n = scriptNumDecode(nElement, 4, !!flags.verifyMinimalData);
 
-        // Verify signature
-        let sigResult = 0;
-        if (sig.length === 0) {
-          // Empty signature means no signature provided (result is 0)
-          sigResult = 0;
-        } else {
-          // Verify the Schnorr signature
-          const success = verifySchnorrSig(sig, pubkey, ctx, codeSepPos);
-          sigResult = success ? 1 : 0;
-
-          // Consume sigops budget
-          if (ctx.sigopsBudget !== undefined) {
-            ctx.sigopsBudget -= TAPSCRIPT_SIGOPS_PER_SIGCHECK;
-            if (ctx.sigopsBudget < 0) {
-              throw new ScriptError("TAPSCRIPT_VALIDATION_WEIGHT");
-            }
+        // 1) Budget deduction BEFORE pubkey check (Core: EvalChecksigTapscript
+        //    interpreter.cpp:357-366). Only fires when sig is non-empty —
+        //    empty sig => `success=false` => budget untouched.
+        if (sig.length > 0 && ctx.sigopsBudget !== undefined) {
+          ctx.sigopsBudget -= TAPSCRIPT_SIGOPS_PER_SIGCHECK;
+          if (ctx.sigopsBudget < 0) {
+            throw new ScriptError("TAPSCRIPT_VALIDATION_WEIGHT");
           }
         }
+
+        // 2-4) verifySchnorrSig encapsulates the unconditional empty-pubkey
+        //      check, the 32-byte Schnorr verify path, and the upgradable
+        //      pubkey type policy gate. Returns false for empty sig + valid
+        //      32-byte pubkey (no error), true for non-empty sig that
+        //      verifies, true for non-empty sig with upgradable pubkey
+        //      type (DISCOURAGE may flip that to a hard error).
+        const success = verifySchnorrSig(sig, pubkey, ctx, codeSepPos, flags);
+        const sigResult = success ? 1 : 0;
 
         // Push n + sig_result
         stack.push(scriptNumEncode(n + sigResult));
@@ -2359,14 +2416,28 @@ export function verifyTaproot(
     return false;
   }
 
-  // Check for annex: if >= 2 witness elements and last element starts with 0x50
+  // Check for annex: if >= 2 witness elements and last element starts with 0x50.
+  // BIP-341: annex is consumed (not executed) and contributes only its hash to
+  // the sighash via the spend_type byte. Annex hash is computed as
+  // SHA256(compact_size(len(annex)) || annex) — i.e. SHA256 of the wire-format
+  // varbytes serialization, matching Core's
+  // `(HashWriter{} << annex).GetSHA256()` at interpreter.cpp:1954 (the `<< annex`
+  // operator on a vector serializes a CompactSize length prefix then the bytes).
+  //
+  // Pre-W94 this was `sha256Hash(annex)` — missing the compact-size prefix. The
+  // hash is only consumed by the BIP-341 sigmsg; in production the
+  // canonical annex hash is computed in `validation/tx.ts` and baked into the
+  // taprootCtx sighash closures before `verifyTaproot` runs, so the bug was
+  // latent (the locally-recomputed annexHash here was never threaded into
+  // sighash computation). The fix below keeps `verifyTaproot` self-consistent
+  // for test callers that DON'T pre-bake the annexHash into their sigHasher.
   let annexHash: Buffer | undefined;
   let witnessStack = witness;
 
   if (witness.length >= 2 && witness[witness.length - 1][0] === TAPROOT_ANNEX_TAG) {
-    // Extract annex and compute its hash
     const annex = witness[witness.length - 1];
-    annexHash = sha256Hash(annex);
+    // SHA256(compact_size(annex.length) || annex.bytes)
+    annexHash = sha256Hash(Buffer.concat([encodeCompactSize(annex.length), annex]));
     // Remove annex from witness stack for further processing
     witnessStack = witness.slice(0, -1);
   }
@@ -2542,7 +2613,14 @@ function verifyTaprootScriptPath(
     return executeTapscript(tapscript, stack, leafHash, annexHash, flags, taprootCtx, fullWitness, txContext);
   }
 
-  // Unknown leaf version: succeed (future extensibility)
+  // Unknown leaf version: consensus accepts for forward extensibility
+  // (Core: interpreter.cpp:1985-1988). Policy flag
+  // `DISCOURAGE_UPGRADABLE_TAPROOT_VERSION` may turn this into a hard error,
+  // used in IsStandard / mempool acceptance to prevent accidental dust on
+  // unrecognized leaf versions.
+  if (flags.verifyDiscourageUpgradableTaprootVersion) {
+    throw new ScriptError("DISCOURAGE_UPGRADABLE_TAPROOT_VERSION");
+  }
   return true;
 }
 
@@ -2661,9 +2739,35 @@ function executeTapscript(
     throw new ScriptError("TAPROOT_CONTEXT_MISSING");
   }
 
-  // Check for OP_SUCCESSx opcodes - if present, script succeeds immediately
+  // BIP-342 (Core interpreter.cpp:1836-1853): OP_SUCCESSx scanning happens
+  // BEFORE any stack/element size enforcement, because "OP_SUCCESSx processing
+  // overrides everything, including stack element size limits". If found,
+  // the script unconditionally succeeds (subject to DISCOURAGE_OP_SUCCESS).
   if (containsOpSuccess(script)) {
+    if (flags.verifyDiscourageOpSuccess) {
+      throw new ScriptError("DISCOURAGE_OP_SUCCESS");
+    }
     return true;
+  }
+
+  // BIP-342 (Core interpreter.cpp:1854-1861): post-OP_SUCCESS-scan, enforce
+  // tapscript initial-stack invariants.
+  //   1) MAX_STACK_SIZE (1000) on initial stack — fires only for TAPSCRIPT.
+  //   2) MAX_SCRIPT_ELEMENT_SIZE (520) on every initial stack item — fires
+  //      for both WITNESS_V0 and TAPSCRIPT.
+  // Pre-W94 hotbuns enforced neither on the initial witness stack — both
+  // checks only ran during script execution, which never sees the unconsumed
+  // top-of-stack items if execution succeeded with fewer pops. A 1001-item
+  // witness or a 521-byte witness element could ride through validation as
+  // long as the script didn't touch those items. Core rejects, hotbuns
+  // accepted: consensus split.
+  if (stack.length > MAX_STACK_SIZE) {
+    throw new ScriptError("STACK_SIZE");
+  }
+  for (const elem of stack) {
+    if (elem.length > MAX_ELEMENT_SIZE) {
+      throw new ScriptError("PUSH_SIZE");
+    }
   }
 
   // Parse the script
@@ -2823,6 +2927,18 @@ function verifyWitnessV0(
     // Witness stack (excluding the script itself). Wire format is already
     // bottom-to-top (index 0 = bottom, last = top). No reversal needed.
     const witnessStack = [...witness.slice(0, -1)];
+
+    // BIP-141 / Core interpreter.cpp:1858-1861: enforce 520-byte element-size
+    // limit on the initial witness stack BEFORE handing it to the interpreter.
+    // The in-interpreter PUSH_SIZE check at line ~988 only fires on
+    // explicit OP_PUSHDATA operations, not on items already on the stack.
+    // Without this gate a witness with >520-byte items could ride through
+    // validation if the redeem script doesn't touch them.
+    for (const elem of witnessStack) {
+      if (elem.length > MAX_ELEMENT_SIZE) {
+        throw new ScriptError("PUSH_SIZE");
+      }
+    }
 
     // Per BIP 141, MINIMALIF is enforced unconditionally in witness v0 (P2WSH)
     const witnessFlags: ScriptFlags = { ...flags, verifyMinimalIf: true };
