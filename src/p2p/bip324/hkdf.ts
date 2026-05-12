@@ -14,7 +14,7 @@ import { createHmac } from "crypto";
  * specialized for BIP324's needs.
  */
 export class HKDF_SHA256_L32 {
-  private readonly prk: Buffer;
+  private prk: Buffer;
   private static readonly OUTPUT_SIZE = 32;
 
   /**
@@ -48,6 +48,17 @@ export class HKDF_SHA256_L32 {
     hmac.update(Buffer.from(info, "utf-8"));
     hmac.update(Buffer.from([0x01]));
     return hmac.digest();
+  }
+
+  /**
+   * Zero the PRK buffer to remove sensitive key material from the heap.
+   *
+   * Mirrors Bitcoin Core's memory_cleanse(&hkdf, sizeof(hkdf)) call in
+   * BIP324Cipher::Initialize (bip324.cpp:69).  Call after all expand32()
+   * invocations are complete.
+   */
+  cleanse(): void {
+    this.prk.fill(0);
   }
 }
 
@@ -102,16 +113,24 @@ export function deriveBIP324Keys(
     sendPKey = initiatorP;
     recvLKey = responderL;
     recvPKey = responderP;
-    sendGarbageTerminator = garbageTerminators.subarray(0, 16);
-    recvGarbageTerminator = garbageTerminators.subarray(16, 32);
+    // Copy into independent Buffers before zeroing the source OKM below.
+    sendGarbageTerminator = Buffer.from(garbageTerminators.subarray(0, 16));
+    recvGarbageTerminator = Buffer.from(garbageTerminators.subarray(16, 32));
   } else {
     sendLKey = responderL;
     sendPKey = responderP;
     recvLKey = initiatorL;
     recvPKey = initiatorP;
-    sendGarbageTerminator = garbageTerminators.subarray(16, 32);
-    recvGarbageTerminator = garbageTerminators.subarray(0, 16);
+    sendGarbageTerminator = Buffer.from(garbageTerminators.subarray(16, 32));
+    recvGarbageTerminator = Buffer.from(garbageTerminators.subarray(0, 16));
   }
+
+  // Zero the garbage_terminators OKM (intermediate; the per-direction copies
+  // above are independent Buffers).  Mirror Core's memory_cleanse(hkdf_32_okm).
+  garbageTerminators.fill(0);
+
+  // Zero the HKDF PRK.  Mirror Core's memory_cleanse(&hkdf, sizeof(hkdf)).
+  hkdf.cleanse();
 
   return {
     sendLKey,
