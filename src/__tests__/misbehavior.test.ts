@@ -17,8 +17,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 describe("Peer misbehavior scoring", () => {
-  const createMockPeerConfig = (): PeerConfig => ({
-    host: "127.0.0.1",
+  const createMockPeerConfig = (host = "127.0.0.1"): PeerConfig => ({
+    host,
     port: 8333,
     magic: 0xd9b4bef9,
     protocolVersion: 70016,
@@ -41,38 +41,30 @@ describe("Peer misbehavior scoring", () => {
     expect(peer.shouldDisconnect).toBe(false);
   });
 
-  test("misbehaving adds to score", () => {
-    const peer = new Peer(createMockPeerConfig(), createMockEvents());
+  /**
+   * G1 FIXED (Core PR #25974): single-event discourage.
+   * Any call to misbehaving() immediately sets shouldDisconnect = true.
+   * There is no score accumulation threshold — the first call discourages.
+   */
+  test("misbehaving immediately discourages on first call (single-event, Core PR #25974)", () => {
+    const peer = new Peer(createMockPeerConfig("5.6.7.8"), createMockEvents());
+    peer.misbehaving(10, "test violation");
+    expect(peer.shouldDisconnect).toBe(true);
+  });
 
+  test("misbehaving with small score (10) still discourages immediately", () => {
+    const peer = new Peer(createMockPeerConfig("5.6.7.8"), createMockEvents());
+    peer.misbehaving(10, "small violation");
+    expect(peer.shouldDisconnect).toBe(true);
+  });
+
+  test("misbehaviorScore is incremented for diagnostic logging only", () => {
+    const peer = new Peer(createMockPeerConfig("5.6.7.8"), createMockEvents());
     peer.misbehaving(10, "test violation");
     expect(peer.misbehaviorScore).toBe(10);
-    expect(peer.shouldDisconnect).toBe(false);
-
-    peer.misbehaving(20, "another violation");
-    expect(peer.misbehaviorScore).toBe(30);
-    expect(peer.shouldDisconnect).toBe(false);
   });
 
-  test("score reaching 100 triggers shouldDisconnect", () => {
-    const peer = new Peer(createMockPeerConfig(), createMockEvents());
-
-    peer.misbehaving(50, "first");
-    expect(peer.shouldDisconnect).toBe(false);
-
-    peer.misbehaving(50, "second");
-    expect(peer.misbehaviorScore).toBe(100);
-    expect(peer.shouldDisconnect).toBe(true);
-  });
-
-  test("score exceeding 100 triggers shouldDisconnect", () => {
-    const peer = new Peer(createMockPeerConfig(), createMockEvents());
-
-    peer.misbehaving(150, "instant ban");
-    expect(peer.misbehaviorScore).toBe(150);
-    expect(peer.shouldDisconnect).toBe(true);
-  });
-
-  test("onBan callback is invoked when threshold reached", () => {
+  test("onBan callback is invoked on first misbehaving call", () => {
     let banCallbackInvoked = false;
     let bannedPeer: Peer | null = null;
     let banReason = "";
@@ -83,8 +75,8 @@ describe("Peer misbehavior scoring", () => {
       banReason = reason;
     };
 
-    const peer = new Peer(createMockPeerConfig(), createMockEvents(), onBan);
-    peer.misbehaving(100, "invalid block header");
+    const peer = new Peer(createMockPeerConfig("5.6.7.8"), createMockEvents(), onBan);
+    peer.misbehaving(10, "invalid block header");
 
     expect(banCallbackInvoked).toBe(true);
     expect(bannedPeer as unknown as Peer).toBe(peer);
@@ -99,24 +91,18 @@ describe("Peer misbehavior scoring", () => {
     expect(BanScores.PROTOCOL_VIOLATION).toBe(10);
   });
 
-  test("invalid block header causes instant ban", () => {
-    const peer = new Peer(createMockPeerConfig(), createMockEvents());
-
+  test("invalid block header causes immediate ban", () => {
+    const peer = new Peer(createMockPeerConfig("5.6.7.8"), createMockEvents());
     peer.misbehaving(BanScores.INVALID_BLOCK_HEADER, "header with invalid proof of work");
-
     expect(peer.misbehaviorScore).toBe(100);
     expect(peer.shouldDisconnect).toBe(true);
   });
 
-  test("multiple small violations accumulate to ban", () => {
-    const peer = new Peer(createMockPeerConfig(), createMockEvents());
-
-    // 10 invalid transaction reports
-    for (let i = 0; i < 10; i++) {
-      peer.misbehaving(BanScores.INVALID_TRANSACTION, `invalid tx ${i}`);
-    }
-
-    expect(peer.misbehaviorScore).toBe(100);
+  test("even a small protocol violation immediately discourages (no accumulation needed)", () => {
+    const peer = new Peer(createMockPeerConfig("5.6.7.8"), createMockEvents());
+    // Under old score-accumulate model this would NOT discourage (10 < 100).
+    // Under Core 2022 single-event model it MUST discourage immediately.
+    peer.misbehaving(BanScores.INVALID_TRANSACTION, "invalid tx 0");
     expect(peer.shouldDisconnect).toBe(true);
   });
 });

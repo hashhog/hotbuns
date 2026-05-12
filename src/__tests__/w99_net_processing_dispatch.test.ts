@@ -86,32 +86,57 @@ function makeTx(inputCount: number, txidSuffix = 0): Transaction {
 }
 
 // ===========================================================================
-// G1 — Misbehaving single-event discourage
+// G1 — Misbehaving single-event discourage (FIXED: Core PR #25974)
 // ===========================================================================
 
-describe("G1: Misbehaving — single-event score accumulation", () => {
-  test("score accumulates linearly across calls", () => {
-    const peer = new Peer(makePeerConfig(), makeNullEvents());
-    peer.misbehaving(10, "test1");
-    peer.misbehaving(10, "test2");
-    expect(peer.misbehaviorScore).toBe(20);
-  });
+describe("G1: Misbehaving — single-event discourage (FIX: Core PR #25974)", () => {
+  /**
+   * FIX-G1: misbehaving() now follows Bitcoin Core PR #25974 (2022).
+   * Any single call to misbehaving() immediately sets m_should_discourage=true
+   * and discourages + disconnects the peer. There is NO score accumulation
+   * threshold — the old model of summing howmuch to 100 is removed.
+   *
+   * Reference: bitcoin-core/src/net_processing.cpp:1893 Misbehaving()
+   *   → simply sets peer.m_should_discourage = true; no howmuch parameter.
+   *            bitcoin-core/src/net_processing.cpp:5083 MaybeDiscourageAndDisconnect()
+   *   → checks m_should_discourage, then applies noban/manual/local guards.
+   */
 
-  test("reaching exactly 100 triggers shouldDisconnect", () => {
-    const peer = new Peer(makePeerConfig(), makeNullEvents());
-    peer.misbehaving(99, "below");
-    expect(peer.shouldDisconnect).toBe(false);
-    peer.misbehaving(1, "exactly100");
+  test("FIX-G1: first misbehaving call immediately discourages (no accumulation)", () => {
+    let bannedHost = "";
+    const onBan: OnBanCallback = (p) => { bannedHost = p.host; };
+    const peer = new Peer(makePeerConfig(), makeNullEvents(), onBan);
+    peer.misbehaving(10, "small-violation");
+    // Under old model (score-accumulate): 10 < 100, so no ban → bannedHost = ""
+    // Under Core 2022 model (single-event): first call → ban immediately
+    expect(bannedHost).toBe("10.0.0.1");
     expect(peer.shouldDisconnect).toBe(true);
   });
 
-  test("exceeding 100 in a single call triggers ban", () => {
+  test("FIX-G1: misbehaving with score=1 immediately discourages", () => {
+    let banned = false;
+    const onBan: OnBanCallback = () => { banned = true; };
+    const peer = new Peer(makePeerConfig(), makeNullEvents(), onBan);
+    peer.misbehaving(1, "duplicate-version");
+    expect(banned).toBe(true);
+    expect(peer.shouldDisconnect).toBe(true);
+  });
+
+  test("FIX-G1: misbehaving with score=100 discourages (same as any other score)", () => {
     let bannedHost = "";
     const onBan: OnBanCallback = (p) => { bannedHost = p.host; };
     const peer = new Peer(makePeerConfig(), makeNullEvents(), onBan);
     peer.misbehaving(100, "instant-ban");
     expect(bannedHost).toBe("10.0.0.1");
     expect(peer.shouldDisconnect).toBe(true);
+  });
+
+  test("misbehaviorScore accumulates for diagnostic logging only", () => {
+    // misbehaviorScore is kept as a diagnostic counter, not a threshold.
+    const peer = new Peer(makePeerConfig(), makeNullEvents());
+    peer.misbehaving(10, "test1");
+    // Already discouraged after first call; score is logged for diagnostics.
+    expect(peer.misbehaviorScore).toBe(10);
   });
 
   /**
@@ -126,7 +151,7 @@ describe("G1: Misbehaving — single-event score accumulation", () => {
     // pattern by checking that the nonce in the sent version message is
     // generated from Math.random. We document this as an audit finding:
     // the implementation does NOT use crypto.getRandomValues or randomBytes.
-    // Evidence: peer.ts line 268 is:
+    // Evidence: peer.ts line ~268 is:
     //   this.ourNonce = BigInt(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER));
     // This is a known weakness documented in the audit.
     expect(true).toBe(true); // placeholder: finding documented above
@@ -486,9 +511,9 @@ describe("G17: BLOCK_INVALID_HEADER → Misbehaving (FIX: wired in handleBlock)"
    * when ProcessNewBlockHeaders returns nBlocksWithValidHeaders == 0.
    * Reference: bitcoin-core/src/net_processing.cpp ProcessBlock.
    */
-  test("FIX-G17: misbehaving(100, block-invalid-header) score reaches ban threshold", () => {
-    // Verify the score value used (100) immediately trips the ban/disconnect
-    // threshold, matching Core's Misbehaving(pfrom, 100) call.
+  test("FIX-G17: misbehaving(100, block-invalid-header) immediately discourages", () => {
+    // Under Core 2022 single-event model, any misbehaving() call immediately
+    // sets m_should_discourage = true.
     let bannedHost = "";
     const onBan: OnBanCallback = (p) => { bannedHost = p.host; };
     const peer = new Peer(makePeerConfig({ host: "2.3.4.5" }), makeNullEvents(), onBan);
@@ -497,14 +522,14 @@ describe("G17: BLOCK_INVALID_HEADER → Misbehaving (FIX: wired in handleBlock)"
     expect(peer.shouldDisconnect).toBe(true);
   });
 
-  test("FIX-G17: partial misbehaving score does not yet ban", () => {
-    // A peer that has not yet been caught sending invalid-header blocks
-    // should NOT be pre-emptively disconnected.
-    const peer = new Peer(makePeerConfig(), makeNullEvents());
-    peer.misbehaving(50, "something-else");
-    expect(peer.shouldDisconnect).toBe(false);
-    // Now tip it to 100 (simulating a second invalid-header block)
+  test("FIX-G17+G1: even a partial-score violation immediately discourages (single-event)", () => {
+    // Under the old score-accumulate model, a score of 50 would NOT ban (50 < 100).
+    // Under Core 2022 single-event model, ANY misbehaving() call immediately discourages.
+    let bannedHost = "";
+    const onBan: OnBanCallback = (p) => { bannedHost = p.host; };
+    const peer = new Peer(makePeerConfig({ host: "2.3.4.5" }), makeNullEvents(), onBan);
     peer.misbehaving(50, "block-invalid-header");
+    expect(bannedHost).toBe("2.3.4.5");
     expect(peer.shouldDisconnect).toBe(true);
   });
 });
