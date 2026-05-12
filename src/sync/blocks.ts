@@ -207,6 +207,15 @@ const MAX_GETDATA_ITEMS = 50000;
  *  are processed fast enough that a larger buffer isn't needed. */
 const MAX_DOWNLOADED_BUFFER = 32;
 
+/**
+ * Mirror of Bitcoin Core's MIN_BLOCKS_TO_KEEP (validation.cpp).
+ * Unrequested blocks further than this many heights ahead of the active
+ * tip are silently ignored — they cannot contribute to chain selection
+ * in the near future and could be used for memory exhaustion by a peer.
+ * Core: `if (fTooFarAhead) return true;` (validation.cpp:4325).
+ */
+const MIN_BLOCKS_TO_KEEP = 288;
+
 /** How often (in connected blocks) to ask the prune manager whether files
  *  should be pruned.  Bitcoin Core checks during chainstate flushes; hotbuns
  *  flushes every FLUSH_INTERVAL (2000) blocks during IBD, but we run the
@@ -692,6 +701,17 @@ export class BlockSync {
       const headerEntry = this.headerSync.getHeader(blockHash);
       if (!headerEntry) {
         // Unknown block
+        return;
+      }
+
+      // G19c: fTooFarAhead — Core's MIN_BLOCKS_TO_KEEP=288 cap.
+      // Unrequested blocks that are more than 288 heights ahead of the
+      // active tip cannot advance chain selection soon and could be used
+      // for memory exhaustion.  Silently ignore them.
+      // Core: if (!fRequested && fTooFarAhead) return true;  (validation.cpp:4325)
+      const activeHeight = this.state.nextHeightToProcess - 1;
+      const fTooFarAhead = headerEntry.height > activeHeight + MIN_BLOCKS_TO_KEEP;
+      if (fTooFarAhead) {
         return;
       }
 
