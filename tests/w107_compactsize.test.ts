@@ -128,48 +128,44 @@ describe("G1 — CompactSize encode thresholds (0xfc = 252 boundary)", () => {
 // ---------------------------------------------------------------------------
 // G2 — Non-canonical CompactSize rejection
 // Core: throws "non-canonical ReadCompactSize()" on over-wide encodings.
-// BUG-1: hotbuns silently accepts non-canonical encodings.
-// Tests document CURRENT broken behaviour — they all PASS (the bug is live).
-// After fix, update: non-canonical tests should .toThrow(), not return a value.
+// BUG-1: FIXED — hotbuns now rejects non-canonical encodings.
 // ---------------------------------------------------------------------------
-describe("G2 — Non-canonical CompactSize rejection (BUG-1 — documents current broken behaviour)", () => {
+describe("G2 — Non-canonical CompactSize rejection (BUG-1 — FIXED)", () => {
   // 0xfd prefix with value 0x00fc (252) — should be a 1-byte encoding.
-  // Core throws; hotbuns currently ACCEPTS silently (BUG-1).
-  test("BUG-1: 0xfd-prefix with value 252 silently accepted (should throw 'non-canonical' post-fix)", () => {
+  test("BUG-1 FIXED: 0xfd-prefix with value 252 throws 'non-canonical'", () => {
     const buf = Buffer.from([0xfd, 0xfc, 0x00]); // encodes 252 non-canonically
     const r = new BufferReader(buf);
-    // BUG: no throw — returns 252 instead of raising non-canonical error
-    expect(r.readVarIntBig()).toBe(252n); // post-fix: expect this to .toThrow()
+    expect(() => r.readVarIntBig()).toThrow(/non-canonical/i);
   });
 
-  test("BUG-1: 0xfd-prefix with value 0 silently accepted (should throw post-fix)", () => {
+  test("BUG-1 FIXED: 0xfd-prefix with value 0 throws 'non-canonical'", () => {
     const buf = Buffer.from([0xfd, 0x00, 0x00]);
     const r = new BufferReader(buf);
-    expect(r.readVarIntBig()).toBe(0n); // BUG: should throw non-canonical
+    expect(() => r.readVarIntBig()).toThrow(/non-canonical/i);
   });
 
-  test("BUG-1: 0xfe-prefix with value 0xffff (< 0x10000) silently accepted (should throw post-fix)", () => {
+  test("BUG-1 FIXED: 0xfe-prefix with value 0xffff (< 0x10000) throws 'non-canonical'", () => {
     const buf = Buffer.from([0xfe, 0xff, 0xff, 0x00, 0x00]);
     const r = new BufferReader(buf);
-    expect(r.readVarIntBig()).toBe(0xffffn); // BUG: should throw non-canonical
+    expect(() => r.readVarIntBig()).toThrow(/non-canonical/i);
   });
 
-  test("BUG-1: 0xfe-prefix with value 0 silently accepted (should throw post-fix)", () => {
+  test("BUG-1 FIXED: 0xfe-prefix with value 0 throws 'non-canonical'", () => {
     const buf = Buffer.from([0xfe, 0x00, 0x00, 0x00, 0x00]);
     const r = new BufferReader(buf);
-    expect(r.readVarIntBig()).toBe(0n); // BUG: should throw non-canonical
+    expect(() => r.readVarIntBig()).toThrow(/non-canonical/i);
   });
 
-  test("BUG-1: 0xff-prefix with value 0xffffffff (< 0x100000000) silently accepted (should throw post-fix)", () => {
+  test("BUG-1 FIXED: 0xff-prefix with value 0xffffffff (< 0x100000000) throws 'non-canonical'", () => {
     const buf = Buffer.from([0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00]);
     const r = new BufferReader(buf);
-    expect(r.readVarIntBig()).toBe(0xffffffffn); // BUG: should throw non-canonical
+    expect(() => r.readVarIntBig()).toThrow(/non-canonical/i);
   });
 
-  test("BUG-1: 0xff-prefix with value 0 silently accepted (should throw post-fix)", () => {
+  test("BUG-1 FIXED: 0xff-prefix with value 0 throws 'non-canonical'", () => {
     const buf = Buffer.from([0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
     const r = new BufferReader(buf);
-    expect(r.readVarIntBig()).toBe(0n); // BUG: should throw non-canonical
+    expect(() => r.readVarIntBig()).toThrow(/non-canonical/i);
   });
 
   // Canonical encodings must NOT throw (both pre- and post-fix).
@@ -198,28 +194,23 @@ describe("G2 — Non-canonical CompactSize rejection (BUG-1 — documents curren
 
 // ---------------------------------------------------------------------------
 // G3 — MAX_SIZE range check (Core MAX_SIZE = 0x02000000 = 33_554_432)
-// BUG-2: hotbuns readVarInt / readVarIntBig has no MAX_SIZE guard.
-// Tests document CURRENT broken behaviour (all PASS, bugs confirmed live).
-// After fix: the first two "succeeds" tests should flip to .toThrow().
+// BUG-2: FIXED — hotbuns now enforces MAX_SIZE in readVarInt / readVarIntBig.
 // ---------------------------------------------------------------------------
-describe("G3 — MAX_SIZE range check (BUG-2 — documents current broken behaviour)", () => {
+describe("G3 — MAX_SIZE range check (BUG-2 — FIXED)", () => {
   const MAX_SIZE = 0x02000000n;
 
-  test("BUG-2: readVarIntBig with value > MAX_SIZE silently succeeds (should throw post-fix)", () => {
+  test("BUG-2 FIXED: readVarIntBig with value > MAX_SIZE throws 'size too large'", () => {
     // Core: if (range_check && nSizeRet > MAX_SIZE) throw "ReadCompactSize(): size too large"
-    // hotbuns: no such check.
     const val = MAX_SIZE + 1n;
     const buf = encodeCompactSize(val);
     const r = new BufferReader(buf);
-    // BUG: returns value instead of throwing
-    expect(r.readVarIntBig()).toBe(val); // post-fix: expect .toThrow()
+    expect(() => r.readVarIntBig()).toThrow(/size too large/i);
   });
 
-  test("BUG-2: readVarInt with value >> MAX_SIZE (0xffffffff) silently succeeds (should throw post-fix)", () => {
+  test("BUG-2 FIXED: readVarInt with value >> MAX_SIZE (0xffffffff) throws 'size too large'", () => {
     const buf = encodeCompactSize(0xffffffff);
     const r = new BufferReader(buf);
-    // BUG: no throw
-    expect(r.readVarInt()).toBe(0xffffffff); // post-fix: expect .toThrow()
+    expect(() => r.readVarInt()).toThrow(/size too large/i);
   });
 
   test("readVarIntBig with exactly MAX_SIZE should NOT throw (Core boundary: > MAX_SIZE throws)", () => {
@@ -239,20 +230,17 @@ describe("G3 — MAX_SIZE range check (BUG-2 — documents current broken behavi
 
 // ---------------------------------------------------------------------------
 // G4 — readVarBytes MAX_SIZE allocation guard (BUG-3)
-// readVarBytes reads the length as a VarInt and allocates without a cap.
-// Tests document CURRENT broken behaviour.
-// After fix: the BUG-3 test should throw BEFORE the "remaining bytes" check.
+// BUG-3: FIXED — readVarBytes now throws "size too large" BEFORE allocation
+//         when the claimed length exceeds MAX_SIZE = 0x02000000.
 // ---------------------------------------------------------------------------
-describe("G4 — readVarBytes allocation guard (BUG-3 — documents current broken behaviour)", () => {
-  test("BUG-3: readVarBytes with claimed length > MAX_SIZE throws (but on 'remaining', not 'size too large')", () => {
+describe("G4 — readVarBytes allocation guard (BUG-3 — FIXED)", () => {
+  test("BUG-3 FIXED: readVarBytes with claimed length > MAX_SIZE throws 'size too large' before allocation", () => {
     // Encode a 5-byte CompactSize claiming 0x02000001 bytes, followed by nothing.
-    // BUG: hotbuns throws "remaining bytes" (hits buffer underrun check)
-    // NOT the intended "size too large" / MAX_SIZE guard.
-    // Post-fix: should throw with a message about size too large, BEFORE trying to read.
+    // Post-fix: should throw "size too large" from the MAX_SIZE guard in readVarIntBig,
+    // BEFORE attempting to read (and before hitting ensureAvailable "remaining" check).
     const header = encodeCompactSize(0x02000001);
     const r = new BufferReader(header); // no actual payload bytes
-    // It does throw (from ensureAvailable), but for the wrong reason.
-    expect(() => r.readVarBytes()).toThrow(); // throws on remaining, not on MAX_SIZE
+    expect(() => r.readVarBytes()).toThrow(/size too large/i);
   });
 
   test("readVarBytes with small length reads correctly", () => {
@@ -566,12 +554,15 @@ describe("G14 — writeVarInt BigInt path matches number path for boundary value
 
 // ---------------------------------------------------------------------------
 // G15 — readVarIntBig 0xff path uses readUInt64LE (8-byte LE)
-// PASS
+// Note: 0xff with value < 0x100000000 is non-canonical (BUG-1 fix applies).
+// The first test originally expected 0n (pre-BUG-1-fix behaviour). Post-fix,
+// 0xff with value=0 is correctly rejected as non-canonical.
 // ---------------------------------------------------------------------------
 describe("G15 — readVarIntBig 0xff path reads 8 LE bytes", () => {
-  test("0xff prefix followed by 8 zero bytes decodes to 0n", () => {
+  test("0xff prefix followed by 8 zero bytes throws non-canonical (value=0 should be 1-byte encoding)", () => {
+    // Post BUG-1 fix: 0xff with value < 0x100000000 is non-canonical.
     const buf = Buffer.from([0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    expect(decodeCompactSize(buf)).toBe(0n);
+    expect(() => decodeCompactSize(buf)).toThrow(/non-canonical/i);
   });
 
   test("0xff prefix with max uint64 decodes to 0xffffffffffffffffn", () => {
@@ -588,41 +579,28 @@ describe("G15 — readVarIntBig 0xff path reads 8 LE bytes", () => {
 
 // ---------------------------------------------------------------------------
 // G16 — deserializeTx manual inline varint (legacy non-segwit path)
-//        does NOT enforce non-canonical encoding.
-// BUG-4: over-wide encodings accepted for input count field.
-// Test documents CURRENT broken behaviour (throws wrong error, not canonical).
-// After fix: the error message should contain "non-canonical".
+// BUG-4: FIXED — inline varint now validates canonical encoding.
 // ---------------------------------------------------------------------------
-describe("G16 — deserializeTx inline varint non-canonical rejection (BUG-4)", () => {
-  // deserializeTx reads marker byte manually and then decodes a partial
-  // CompactSize inline for the legacy (non-segwit) path:
-  //   if (marker === 0xfe) inputCount = reader.readUInt32LE();
-  // This doesn't check that the 4-byte value is >= 0x10000 (canonical).
-  // A non-canonical 0xfe with value 0x00000001 (should be a 1-byte CS) is accepted.
-
-  test("BUG-4: 0xfe marker with count=1 (non-canonical) throws 'remaining' not 'non-canonical'", async () => {
+describe("G16 — deserializeTx inline varint non-canonical rejection (BUG-4 — FIXED)", () => {
+  test("BUG-4 FIXED: 0xfe marker with count=1 (non-canonical) throws 'non-canonical'", async () => {
     const { deserializeTx } = await import("../src/validation/tx.js");
     // Build a partial buffer: version=1, marker=0xfe (non-canonical for count=1), count=1 LE uint32
     const w = new BufferWriter();
     w.writeInt32LE(1); // version
     w.writeUInt8(0xfe); // non-canonical prefix (value=1 < 0x10000, should be 1-byte CS)
     w.writeUInt32LE(1); // 4-byte count = 1 (non-canonical)
-    // No actual inputs follow — will fail on readHash()
     const r = new BufferReader(w.toBuffer());
-    // BUG-4: hotbuns accepts non-canonical and proceeds to read 1 input,
-    // then throws "remaining bytes" when it runs out of data.
-    // Post-fix: should throw "non-canonical" BEFORE attempting to read inputs.
+    // Post-fix: throws "non-canonical" BEFORE attempting to read inputs.
     let caughtMessage = "";
     try {
       deserializeTx(r);
     } catch (e: any) {
       caughtMessage = e.message ?? "";
     }
-    // Documents BUG-4: error is about remaining bytes, NOT non-canonical.
-    expect(caughtMessage).toMatch(/remaining/i); // BUG: should match /non-canonical/i
+    expect(caughtMessage).toMatch(/non-canonical/i);
   });
 
-  test("BUG-4: 0xff marker with count=0 (non-canonical) throws 'remaining' not 'non-canonical'", async () => {
+  test("BUG-4 FIXED: 0xff marker with count=1 (non-canonical) throws 'non-canonical'", async () => {
     const { deserializeTx } = await import("../src/validation/tx.js");
     const w = new BufferWriter();
     w.writeInt32LE(1); // version
@@ -638,8 +616,7 @@ describe("G16 — deserializeTx inline varint non-canonical rejection (BUG-4)", 
     } catch (e: any) {
       caughtMessage = e.message ?? "";
     }
-    // BUG-4: hotbuns proceeds to try to read inputs from an empty buffer.
-    expect(caughtMessage).toBeTruthy(); // throws something; post-fix should be "non-canonical"
+    expect(caughtMessage).toMatch(/non-canonical/i);
   });
 });
 
@@ -696,18 +673,14 @@ describe("G18 — DoS caps on message-level varint counts", () => {
 
 // ---------------------------------------------------------------------------
 // G19 — Non-canonical VarInt rejection at message parse layer
-// CompactSize counts in inv/getdata/headers are read without canonical checks.
-// BUG-1 (same root cause): non-canonical count fields accepted.
-// PASS (same as G2 — root cause documented, no redundant assertion)
+// BUG-1 FIXED: non-canonical count fields now throw.
 // ---------------------------------------------------------------------------
-describe("G19 — Non-canonical CompactSize in message payloads (same root as BUG-1)", () => {
-  test("non-canonical 3-byte encoding 0xfd-0x00-0x00 (value=0) is accepted by readVarInt (documents BUG-1)", () => {
-    // After fix, this should throw.  For now verify it returns 0.
+describe("G19 — Non-canonical CompactSize in message payloads (BUG-1 FIXED)", () => {
+  test("non-canonical 3-byte encoding 0xfd-0x00-0x00 (value=0) now throws 'non-canonical'", () => {
+    // Post-fix: throws non-canonical.
     const buf = Buffer.from([0xfd, 0x00, 0x00]); // non-canonical for 0
     const r = new BufferReader(buf);
-    // Current broken behaviour:
-    const v = r.readVarIntBig();
-    expect(v).toBe(0n); // documents bug; post-fix should throw
+    expect(() => r.readVarIntBig()).toThrow(/non-canonical/i);
   });
 });
 
@@ -785,24 +758,23 @@ describe("G22 — VarInt (coin serialize) vs CompactSize (wire) not confused", (
 // ---------------------------------------------------------------------------
 // G23 — readVarString / readVarBytes lack an explicit length limit
 //        (LimitedStringFormatter equivalent missing)
-// BUG-5: readVarString has no explicit limit.
-// Tests document CURRENT broken behaviour.
-// After fix: error should be "size too large" (MAX_SIZE guard), not "remaining".
+// BUG-5: FIXED — readVarString now throws "size too large" via the MAX_SIZE
+//         guard in readVarIntBig (called from readVarBytes, called from
+//         readVarString) BEFORE attempting any allocation.
 // ---------------------------------------------------------------------------
-describe("G23 — readVarString lacks MAX_SIZE length limit (BUG-5)", () => {
-  test("BUG-5: readVarString with huge claimed length throws 'remaining' not 'size too large'", () => {
+describe("G23 — readVarString lacks MAX_SIZE length limit (BUG-5 — FIXED)", () => {
+  test("BUG-5 FIXED: readVarString with huge claimed length throws 'size too large' not 'remaining'", () => {
     // Encode a CompactSize claiming 0x10000000 bytes for the string length.
     const fakeLen = Buffer.from([0xfe, 0x00, 0x00, 0x00, 0x10]); // 0x10000000 = 268MB
     const r = new BufferReader(fakeLen); // no actual payload
-    // BUG-5: throws only because the buffer runs out, not because of a MAX_SIZE guard.
-    // Post-fix: should throw "size too large" or similar BEFORE attempting to allocate.
+    // Post-fix: throws "size too large" from MAX_SIZE guard BEFORE attempting to allocate.
     let caughtMessage = "";
     try {
       r.readVarString();
     } catch (e: any) {
       caughtMessage = e.message ?? "";
     }
-    expect(caughtMessage).toMatch(/remaining/i); // documents BUG-5
+    expect(caughtMessage).toMatch(/size too large/i);
   });
 
   test("readVarString works for normal short strings", () => {

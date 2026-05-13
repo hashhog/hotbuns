@@ -176,16 +176,28 @@ export function deserializeTx(reader: BufferReader): Transaction {
   } else {
     // Legacy format: marker is actually first byte of varint input count
     // We need to "unread" the marker and read it as part of the varint
-    // Since BufferReader doesn't support unread, handle inline
+    // Since BufferReader doesn't support unread, handle inline.
+    // Non-canonical encoding is rejected (Core: "non-canonical ReadCompactSize()").
     if (marker <= 0xfc) {
       inputCount = marker;
     } else if (marker === 0xfd) {
-      inputCount = reader.readUInt16LE();
+      const raw16 = reader.readUInt16LE();
+      if (raw16 < 253) {
+        throw new Error("non-canonical CompactSize");
+      }
+      inputCount = raw16;
     } else if (marker === 0xfe) {
-      inputCount = reader.readUInt32LE();
+      const raw32 = reader.readUInt32LE();
+      if (raw32 < 0x10000) {
+        throw new Error("non-canonical CompactSize");
+      }
+      inputCount = raw32;
     } else {
       // 0xff - 8 byte varint, but for input counts this shouldn't happen
       const bigVal = reader.readUInt64LE();
+      if (bigVal < 0x100000000n) {
+        throw new Error("non-canonical CompactSize");
+      }
       if (bigVal > BigInt(Number.MAX_SAFE_INTEGER)) {
         throw new Error("Input count exceeds safe integer range");
       }
