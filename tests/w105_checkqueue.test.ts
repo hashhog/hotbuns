@@ -28,10 +28,61 @@
  * INFO    — documented limitation (single-threaded JS), not a consensus bug
  */
 
-import { describe, test, expect } from "bun:test";
-import { SigCache } from "../src/validation/sig_cache.js";
+import { describe, test, expect, beforeEach } from "bun:test";
+import { SigCache, globalSigCache } from "../src/validation/sig_cache.js";
 import { scriptFlagsFromBitmask, getConsensusFlags } from "../src/script/interpreter.js";
-import { ScriptFlags } from "../src/validation/tx.js";
+import {
+  ScriptFlags,
+  verifyInputSignature,
+  sigHashLegacy,
+  SIGHASH_ALL,
+  type SigHashCache,
+  type Transaction,
+} from "../src/validation/tx.js";
+import { ecdsaSign, privateKeyToPublicKey, hash160 } from "../src/crypto/primitives.js";
+import type { UTXOEntry } from "../src/storage/database.js";
+
+// ---------------------------------------------------------------------------
+// Minimal P2PKH helpers reused by BUG-9 + BUG-10 converted tests
+// ---------------------------------------------------------------------------
+
+const _BUG9_PRIV = Buffer.from(
+  "0202020202020202020202020202020202020202020202020202020202020202",
+  "hex"
+);
+const _BUG9_PUB = privateKeyToPublicKey(_BUG9_PRIV, true);
+const _BUG9_PKH = hash160(_BUG9_PUB);
+
+function _p2pkhScript(pkh: Buffer): Buffer {
+  return Buffer.concat([Buffer.from([0x76, 0xa9, 0x14]), pkh, Buffer.from([0x88, 0xac])]);
+}
+
+/** Build a valid P2PKH spending transaction and return it + its UTXO. */
+function _buildValidP2PKHTx(): { tx: Transaction; utxo: UTXOEntry } {
+  const utxoScript = _p2pkhScript(_BUG9_PKH);
+  const tx: Transaction = {
+    version: 2,
+    inputs: [{
+      prevOut: { txid: Buffer.alloc(32, 0xcd), vout: 0 },
+      scriptSig: Buffer.alloc(0),
+      sequence: 0xffffffff,
+      witness: [],
+    }],
+    outputs: [{ value: 50_000n, scriptPubKey: utxoScript }],
+    lockTime: 0,
+  };
+  const sighash = sigHashLegacy(tx, 0, utxoScript, SIGHASH_ALL);
+  const derSig = ecdsaSign(sighash, _BUG9_PRIV);
+  const sigWithType = Buffer.concat([derSig, Buffer.from([SIGHASH_ALL])]);
+  tx.inputs[0].scriptSig = Buffer.concat([
+    Buffer.from([sigWithType.length]),
+    sigWithType,
+    Buffer.from([_BUG9_PUB.length]),
+    _BUG9_PUB,
+  ]);
+  const utxo: UTXOEntry = { height: 1, coinbase: false, amount: 100_000n, scriptPubKey: utxoScript };
+  return { tx, utxo };
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -373,21 +424,29 @@ describe("G9 — CachingTransactionSignatureChecker (per-sig cache lookup)", () 
    * Post-fix: add a sig cache lookup/store wrapper around ecdsaVerify and
    * schnorrVerify calls inside the script interpreter (or in verifyInputSignature).
    */
-  test("BUG-9: SigCache.lookup() is never called during script verification (dead lookup path)", () => {
-    // The globalSigCache is only cleared (chain/state.ts:763) and size-checked
-    // (chain/state.ts:1147). It is never populated during block connect.
+  test("BUG-9 fixed: verifyInputSignature now inserts into globalSigCache on successful verification", () => {
+    // Fixed: globalSigCache is now consulted and populated by verifyInputSignature.
+    // A successful verification inserts the (txid, inputIndex, flags) key so that
+    // a second call for the same input short-circuits without re-running secp256k1.
+    globalSigCache.clear();
+    expect(globalSigCache.size).toBe(0);
 
-    const cache = new SigCache(1000);
+    const { tx, utxo } = _buildValidP2PKHTx();
+    const cache: SigHashCache = {};
 
-    // Simulate "pre-populate from mempool" — which also never happens
-    cache.insert({ txid: "deadbeef".padEnd(64, "0"), inputIndex: 0, flags: 3 });
-    expect(cache.size).toBe(1);
+    // First call: cache miss → runs interpreter → inserts on success
+    const result1 = verifyInputSignature(tx, 0, utxo, cache, [utxo]);
+    expect(result1.valid).toBe(true);
+    // After the fix the cache must have grown by 1
+    expect(globalSigCache.size).toBeGreaterThan(0);
 
-    // Post-fix: verifyInputSignature should check the cache BEFORE calling
-    // ecdsaVerify/schnorrVerify, and insert on success.
-    // The cache is currently a completely dead code path at verify time.
-    // After the fix, the size should grow as new sigs are verified.
-    expect(cache.size).toBe(1); // unchanged — no inserts from verify
+    // Second call: cache hit → short-circuits immediately (no secp256k1 work)
+    const result2 = verifyInputSignature(tx, 0, utxo, cache, [utxo]);
+    expect(result2.valid).toBe(true);
+    // Size should not grow again (duplicate-insert guard in SigCache.insert)
+    expect(globalSigCache.size).toBe(1);
+
+    globalSigCache.clear();
   });
 });
 
@@ -411,25 +470,32 @@ describe("G10 — SigCache consulted on block-connect (mempool→block speedup)"
    * Post-fix: integrate globalSigCache into verifyInputSignature and call
    * insert() after successful ECDSA/Schnorr verification.
    */
-  test("BUG-10: globalSigCache never populated by verifyInputSignature — mempool→block cache hit absent", () => {
-    // Direct evidence: the import chain for verifyInputSignature is:
-    //   tx.ts → does NOT import from sig_cache.ts
-    //   connect_block.ts → does NOT import from sig_cache.ts
-    //   sig_cache.ts is only imported by chain/state.ts (for clear() and .size)
-    //
-    // Post-fix: tx.ts should import { globalSigCache } and use it in
-    // verifyInputSignature to look up cached sig results before ecdsaVerify.
+  test("BUG-10 fixed: mempool→block cache speedup — globalSigCache hit skips secp256k1 on block connect", () => {
+    // Fixed: tx.ts now imports globalSigCache; verifyInputSignature does a
+    // lookup before secp256k1 and an insert on success.  A tx validated at
+    // mempool time populates the cache so that block-connect re-validation for
+    // the same (txid, inputIndex, flags) triple short-circuits immediately.
 
-    const cache = new SigCache(100);
-    const key = { txid: "mempooltx".padEnd(64, "0"), inputIndex: 0, flags: 3 };
+    globalSigCache.clear();
 
-    // Simulate mempool validation writing to cache
-    cache.insert(key);
-    expect(cache.lookup(key)).toBe(true);
+    const { tx, utxo } = _buildValidP2PKHTx();
+    const cache: SigHashCache = {};
+    const flags =
+      ScriptFlags.VERIFY_P2SH | ScriptFlags.VERIFY_WITNESS | ScriptFlags.VERIFY_TAPROOT;
 
-    // If verifyInputSignature used globalSigCache, the cache hit rate during
-    // block connect would skip secp256k1 operations for known-good inputs.
-    // Currently: cache.lookup() is never called during block connect.
+    // Simulate mempool ATMP: verifyInputSignature runs secp256k1, inserts into cache.
+    const mempoolResult = verifyInputSignature(tx, 0, utxo, cache, [utxo], undefined, flags);
+    expect(mempoolResult.valid).toBe(true);
+    expect(globalSigCache.size).toBe(1); // cache now holds the mempool-validated entry
+
+    // Simulate block-connect: same (txid, inputIndex, flags) → cache HIT.
+    // The test cannot directly measure "secp256k1 was skipped" but we can confirm
+    // the cache lookup fires by verifying the result is still valid and size unchanged.
+    const blockResult = verifyInputSignature(tx, 0, utxo, cache, [utxo], undefined, flags);
+    expect(blockResult.valid).toBe(true);
+    expect(globalSigCache.size).toBe(1); // no second insert — already present
+
+    globalSigCache.clear();
   });
 });
 
