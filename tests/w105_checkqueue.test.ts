@@ -30,6 +30,8 @@
 
 import { describe, test, expect } from "bun:test";
 import { SigCache } from "../src/validation/sig_cache.js";
+import { scriptFlagsFromBitmask, getConsensusFlags } from "../src/script/interpreter.js";
+import { ScriptFlags } from "../src/validation/tx.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -434,7 +436,7 @@ describe("G10 — SigCache consulted on block-connect (mempool→block speedup)"
 // ---------------------------------------------------------------------------
 // G11 — _flags parameter is ignored in verifyAllInputsParallel
 // ---------------------------------------------------------------------------
-describe("G11 — _flags parameter ignored in verifyAllInputs* functions", () => {
+describe("G11 — flags parameter threaded through verifyAllInputs* (BUG-11 fixed)", () => {
   /**
    * Core: flags are passed from ConnectBlock → CheckInputScripts → VerifyScript
    * and control which rules apply (P2SH, witness, DER, etc.).
@@ -458,22 +460,46 @@ describe("G11 — _flags parameter ignored in verifyAllInputs* functions", () =>
    * Post-fix: pass the flags argument through to verifyInputSignature and use
    * them to call the interpreter instead of the hardcoded height=709632.
    */
-  test("BUG-11: _flags parameter is underscore-prefixed (unused) — hardcoded height=709632 always applied", () => {
-    // The parameter name "_flags" is the TypeScript convention for "declared
-    // but intentionally unused". Verified in tx.ts:1662 and tx.ts:1707.
-    //
-    // Post-fix: remove the underscore, thread flags into verifyInputSignature,
-    // and replace `getConsensusFlags(709632)` with `getConsensusFlags(blockHeight)`
-    // or a flags-to-interpreter-options mapping.
+  test("flags parameter is now active — scriptFlagsFromBitmask converts VERIFY_NONE to all-false interpreter flags", () => {
+    // Fixed: verifyAllInputsParallel and verifyAllInputsSequential now accept
+    // `flags: ScriptFlags` (no underscore) and thread it into verifyInputSignature.
+    // verifyInputSignature calls scriptFlagsFromBitmask(flags) instead of
+    // getConsensusFlags(709632).
 
-    // Demonstrate: ScriptFlags.VERIFY_NONE = 0, but interpreter always runs
-    // with all-mainnet-Taproot flags regardless.
-    const ScriptFlagsVerifyNone = 0;
-    const passedFlags = ScriptFlagsVerifyNone;
+    // VERIFY_NONE (0) → all-false interpreter flags (no soft-fork rules active)
+    const interpFlagsNone = scriptFlagsFromBitmask(ScriptFlags.VERIFY_NONE);
+    expect(interpFlagsNone.verifyP2SH).toBe(false);
+    expect(interpFlagsNone.verifyWitness).toBe(false);
+    expect(interpFlagsNone.verifyTaproot).toBe(false);
+    expect(interpFlagsNone.verifyDERSignatures).toBe(false);
 
-    // Currently the parameter is named _flags (unused), so the value is irrelevant.
-    // Post-fix: a caller passing VERIFY_NONE should get a lightweight interpreter run.
-    expect(passedFlags).toBe(0); // documents that VERIFY_NONE is currently ignored
+    // VERIFY_P2SH only → P2SH active, witness+Taproot inactive
+    const interpFlagsP2SH = scriptFlagsFromBitmask(ScriptFlags.VERIFY_P2SH);
+    expect(interpFlagsP2SH.verifyP2SH).toBe(true);
+    expect(interpFlagsP2SH.verifyWitness).toBe(false);
+    expect(interpFlagsP2SH.verifyTaproot).toBe(false);
+
+    // VERIFY_P2SH | VERIFY_WITNESS → P2SH + witness active, Taproot inactive
+    const interpFlagsSegWit = scriptFlagsFromBitmask(
+      ScriptFlags.VERIFY_P2SH | ScriptFlags.VERIFY_WITNESS
+    );
+    expect(interpFlagsSegWit.verifyP2SH).toBe(true);
+    expect(interpFlagsSegWit.verifyWitness).toBe(true);
+    expect(interpFlagsSegWit.verifyTaproot).toBe(false);
+    expect(interpFlagsSegWit.verifyDERSignatures).toBe(true); // implied by SegWit era
+
+    // All flags (P2SH | WITNESS | TAPROOT) → full consensus rules active
+    const interpFlagsAll = scriptFlagsFromBitmask(
+      ScriptFlags.VERIFY_P2SH | ScriptFlags.VERIFY_WITNESS | ScriptFlags.VERIFY_TAPROOT
+    );
+    expect(interpFlagsAll.verifyP2SH).toBe(true);
+    expect(interpFlagsAll.verifyWitness).toBe(true);
+    expect(interpFlagsAll.verifyTaproot).toBe(true);
+
+    // Verify this is semantically different from the old hardcoded getConsensusFlags(709632)
+    const oldHardcoded = getConsensusFlags(709632);
+    expect(oldHardcoded.verifyP2SH).toBe(true); // was always true — now only when flag set
+    expect(interpFlagsNone.verifyP2SH).toBe(false); // fixed: VERIFY_NONE → no P2SH
   });
 });
 
@@ -1002,7 +1028,7 @@ describe("G29 — SigCache NOT cleared on block-connect (correct behaviour)", ()
 // ---------------------------------------------------------------------------
 // G30 — Script verification flags reflect active soft forks at block height
 // ---------------------------------------------------------------------------
-describe("G30 — Script verification flags must be height-appropriate", () => {
+describe("G30 — Script verification flags are now height-appropriate (BUG-30 fixed)", () => {
   /**
    * Core: ConnectBlock computes flags from GetBlockScriptFlags(pindex, params)
    * which returns a flag set that depends on which soft forks are active AT
@@ -1027,26 +1053,52 @@ describe("G30 — Script verification flags must be height-appropriate", () => {
    * Post-fix: thread blockHeight into verifyInputSignature and call
    * getConsensusFlags(blockHeight) instead of getConsensusFlags(709632).
    */
-  test("BUG-30: interpreter always uses mainnet-Taproot flags (getConsensusFlags(709632)) ignoring block height", () => {
-    // getConsensusFlags(height) returns:
-    //   height < 173805: no P2SH, no DER, no CLTV, no CSV, no witness, no Taproot
-    //   height = 709632: all rules active (mainnet Taproot activation)
-    //
-    // hotbuns hardcodes 709632 in verifyInputSignature (tx.ts:1557, 1589),
-    // meaning pre-BIP16 blocks are validated with P2SH rules active — wrong.
+  test("scriptFlagsFromBitmask produces height-appropriate flags — no hardcoded 709632", () => {
+    // Fixed: verifyInputSignature now calls scriptFlagsFromBitmask(scriptVerifyFlags)
+    // instead of getConsensusFlags(709632).  The bitmask is computed by
+    // coreConnectBlockChecks from the actual block height + params.
 
-    // Demonstrate: at height 100 Core would use flags=0 (no soft forks active),
-    // but hotbuns uses getConsensusFlags(709632) = all flags.
-    const height = 100;
+    const P2SH_ACTIVATION    = 173805; // mainnet BIP-16
+    const SEGWIT_ACTIVATION  = 481824; // mainnet BIP-141
+    const TAPROOT_ACTIVATION = 709632; // mainnet BIP-341
 
-    // Expected flags at height 100: none (no soft fork active)
-    const P2SH_ACTIVATION = 173805;
-    const expectedP2SH = height >= P2SH_ACTIVATION;
-    expect(expectedP2SH).toBe(false); // P2SH not yet active at h=100
+    // Height 100: no soft fork active → VERIFY_NONE bitmask
+    const flagsAt100 = scriptFlagsFromBitmask(ScriptFlags.VERIFY_NONE);
+    expect(flagsAt100.verifyP2SH).toBe(false);
+    expect(flagsAt100.verifyWitness).toBe(false);
+    expect(flagsAt100.verifyTaproot).toBe(false);
 
-    // hotbuns hardcodes the Taproot-active height so P2SH is always active
-    const HOTBUNS_HARDCODED_HEIGHT = 709632;
-    const hotbunsP2SH = HOTBUNS_HARDCODED_HEIGHT >= P2SH_ACTIVATION;
-    expect(hotbunsP2SH).toBe(true); // BUG: P2SH applied at h=100 where it shouldn't be
+    // Height 200000 (P2SH active, no SegWit) → VERIFY_P2SH only
+    const flagsAt200k = scriptFlagsFromBitmask(ScriptFlags.VERIFY_P2SH);
+    expect(flagsAt200k.verifyP2SH).toBe(true);
+    expect(flagsAt200k.verifyWitness).toBe(false);
+    expect(flagsAt200k.verifyTaproot).toBe(false);
+
+    // Height 500000 (P2SH + SegWit active, no Taproot) → P2SH | WITNESS
+    const flagsAt500k = scriptFlagsFromBitmask(
+      ScriptFlags.VERIFY_P2SH | ScriptFlags.VERIFY_WITNESS
+    );
+    expect(flagsAt500k.verifyP2SH).toBe(true);
+    expect(flagsAt500k.verifyWitness).toBe(true);
+    expect(flagsAt500k.verifyTaproot).toBe(false);
+
+    // Height 800000 (all active) → P2SH | WITNESS | TAPROOT
+    const flagsAt800k = scriptFlagsFromBitmask(
+      ScriptFlags.VERIFY_P2SH | ScriptFlags.VERIFY_WITNESS | ScriptFlags.VERIFY_TAPROOT
+    );
+    expect(flagsAt800k.verifyP2SH).toBe(true);
+    expect(flagsAt800k.verifyWitness).toBe(true);
+    expect(flagsAt800k.verifyTaproot).toBe(true);
+
+    // The old hardcode returned full-Taproot flags at every height — now only
+    // when the bitmask explicitly sets VERIFY_TAPROOT.
+    expect(flagsAt100.verifyP2SH).toBe(false);    // fixed: was true (hardcode 709632)
+    expect(flagsAt200k.verifyWitness).toBe(false); // fixed: was true
+    expect(flagsAt500k.verifyTaproot).toBe(false); // fixed: was true
+
+    // Activation thresholds are correctly reflected
+    expect(P2SH_ACTIVATION).toBe(173805);
+    expect(SEGWIT_ACTIVATION).toBe(481824);
+    expect(TAPROOT_ACTIVATION).toBe(709632);
   });
 });

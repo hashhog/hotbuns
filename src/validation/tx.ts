@@ -26,6 +26,8 @@ export const enum ScriptFlags {
   VERIFY_CHECKLOCKTIMEVERIFY = 1 << 5,
   VERIFY_CHECKSEQUENCEVERIFY = 1 << 6,
   VERIFY_MINIMALDATA = 1 << 7,
+  /** BIP-341 Taproot (consensus). Active on mainnet from height 709632. */
+  VERIFY_TAPROOT = 1 << 9,
 }
 
 /** Result of input verification. */
@@ -1487,7 +1489,13 @@ export function verifyInputSignature(
   utxo: UTXOEntry,
   cache: SigHashCache,
   utxos?: UTXOEntry[],
-  taprootCache?: TaprootSigHashCache
+  taprootCache?: TaprootSigHashCache,
+  /** Per-block script verification flags (from coreConnectBlockChecks). When
+   *  omitted the function defaults to all consensus rules active, matching the
+   *  pre-fix behaviour for standalone / wallet call sites. */
+  scriptVerifyFlags: ScriptFlags = ScriptFlags.VERIFY_P2SH |
+    ScriptFlags.VERIFY_WITNESS |
+    ScriptFlags.VERIFY_TAPROOT
 ): InputVerifyResult {
   const input = tx.inputs[inputIndex];
   const scriptPubKey = utxo.scriptPubKey;
@@ -1554,7 +1562,9 @@ export function verifyInputSignature(
 
     // Lazy require to avoid a circular import (interpreter.ts ↔ tx.ts).
     const interp = require("../script/interpreter.js") as typeof import("../script/interpreter.js");
-    const flags = interp.getConsensusFlags(709632); // height-independent: Taproot active
+    // Build interpreter flags from the per-block bitmask so that pre-activation
+    // blocks are not validated with rules that were not yet active.
+    const flags = interp.scriptFlagsFromBitmask(scriptVerifyFlags);
 
     try {
       const ok = interp.verifyTaproot(scriptPubKey, input.witness, flags, taprootCtx);
@@ -1581,12 +1591,11 @@ export function verifyInputSignature(
   }
 
   const interp = require("../script/interpreter.js") as typeof import("../script/interpreter.js");
-  // Mainnet-active flags. Hard-coded to a height past every soft-fork
-  // activation; this entry point is reached after assumevalid + height
-  // checks anyway, so a height-conditional flag set isn't needed here.
-  // (TODO: thread the actual block height in if any caller wants
-  // pre-soft-fork validation.)
-  const flags = interp.getConsensusFlags(709632);
+  // Build interpreter flags from the per-block bitmask so that pre-activation
+  // blocks are not validated with rules that were not yet active (BUG-11/BUG-30
+  // fix: was hardcoded getConsensusFlags(709632) which applied Taproot/SegWit/P2SH
+  // rules on regtest blocks at height 0).
+  const flags = interp.scriptFlagsFromBitmask(scriptVerifyFlags);
 
   const tprCache = taprootCache ?? {};
   const prevOuts = utxos.map(u => ({
@@ -1659,7 +1668,9 @@ export function verifyInputSignature(
 export async function verifyAllInputsParallel(
   tx: Transaction,
   utxos: UTXOEntry[],
-  _flags: ScriptFlags = ScriptFlags.VERIFY_NONE
+  flags: ScriptFlags = ScriptFlags.VERIFY_P2SH |
+    ScriptFlags.VERIFY_WITNESS |
+    ScriptFlags.VERIFY_TAPROOT
 ): Promise<TxVerifyResult> {
   // Skip verification for coinbase
   if (isCoinbase(tx)) {
@@ -1678,7 +1689,7 @@ export async function verifyAllInputsParallel(
 
   // Create verification promises for each input
   const verifyPromises = tx.inputs.map((_, index) =>
-    Promise.resolve(verifyInputSignature(tx, index, utxos[index], cache, utxos, taprootCache))
+    Promise.resolve(verifyInputSignature(tx, index, utxos[index], cache, utxos, taprootCache, flags))
   );
 
   // Run all verifications in parallel
@@ -1704,7 +1715,9 @@ export async function verifyAllInputsParallel(
 export function verifyAllInputsSequential(
   tx: Transaction,
   utxos: UTXOEntry[],
-  _flags: ScriptFlags = ScriptFlags.VERIFY_NONE
+  flags: ScriptFlags = ScriptFlags.VERIFY_P2SH |
+    ScriptFlags.VERIFY_WITNESS |
+    ScriptFlags.VERIFY_TAPROOT
 ): TxVerifyResult {
   // Skip verification for coinbase
   if (isCoinbase(tx)) {
@@ -1723,7 +1736,7 @@ export function verifyAllInputsSequential(
 
   // Verify each input
   for (let i = 0; i < tx.inputs.length; i++) {
-    const result = verifyInputSignature(tx, i, utxos[i], cache, utxos, taprootCache);
+    const result = verifyInputSignature(tx, i, utxos[i], cache, utxos, taprootCache, flags);
     if (!result.valid) {
       return {
         valid: false,
