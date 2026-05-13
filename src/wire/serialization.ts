@@ -332,25 +332,65 @@ export class BufferReader {
   /**
    * Read a CompactSize (varint) encoded value as bigint.
    * Use this for values that may exceed Number.MAX_SAFE_INTEGER.
+   *
+   * Enforces:
+   *  - Non-canonical encoding rejection (Core: "non-canonical ReadCompactSize()").
+   *    0xfd prefix requires value >= 253; 0xfe requires value >= 0x10000;
+   *    0xff requires value >= 0x100000000.
+   *  - MAX_SIZE range check (Core: "ReadCompactSize(): size too large").
+   *    For the 1-byte and multi-byte (0xfd/0xfe) paths, values > MAX_SIZE =
+   *    0x02000000 are rejected.  The 9-byte (0xff) path is not range-checked
+   *    here because it is legitimately used for 64-bit fields (e.g. satoshi
+   *    amounts); callers that need a size/count cap (e.g. readVarBytes) must
+   *    apply their own guard.
    */
   readVarIntBig(): bigint {
+    const MAX_SIZE = 0x02000000n;
     const first = this.readUInt8();
+    let value: bigint;
     if (first <= 0xfc) {
       return BigInt(first);
     } else if (first === 0xfd) {
-      return BigInt(this.readUInt16LE());
+      value = BigInt(this.readUInt16LE());
+      if (value < 253n) {
+        throw new Error("non-canonical CompactSize");
+      }
+      if (value > MAX_SIZE) {
+        throw new Error("ReadCompactSize(): size too large");
+      }
     } else if (first === 0xfe) {
-      return BigInt(this.readUInt32LE());
+      value = BigInt(this.readUInt32LE());
+      if (value < 0x10000n) {
+        throw new Error("non-canonical CompactSize");
+      }
+      if (value > MAX_SIZE) {
+        throw new Error("ReadCompactSize(): size too large");
+      }
     } else {
-      return this.readUInt64LE();
+      // 0xff: 8-byte LE field; legitimately used for 64-bit values.
+      value = this.readUInt64LE();
+      if (value < 0x100000000n) {
+        throw new Error("non-canonical CompactSize");
+      }
     }
+    return value;
   }
 
   /**
    * Read a varint length prefix followed by that many bytes.
+   *
+   * Enforces MAX_SIZE = 0x02000000 before allocation to prevent OOM from
+   * adversarial peers claiming gigantic byte strings.
+   * Note: readVarInt() / readVarIntBig() already enforce MAX_SIZE; this guard
+   * additionally covers the readVarInt → readBytes path explicitly for clarity
+   * and defence-in-depth.
    */
   readVarBytes(): Buffer {
+    const MAX_SIZE = 0x02000000;
     const length = this.readVarInt();
+    if (length > MAX_SIZE) {
+      throw new Error("ReadCompactSize(): size too large");
+    }
     return this.readBytes(length);
   }
 
