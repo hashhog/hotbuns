@@ -1572,6 +1572,14 @@ async function startNode(config: NodeConfig): Promise<void> {
       if (removed > 0) {
         console.log(`[orphan-pool] erased ${removed} orphans confirmed in block`);
       }
+      // Expire stale orphans (Core: ORPHAN_TX_EXPIRE_TIME = 300s). Run on every
+      // block connection so the sweep rate tracks block arrival (~10 min avg on
+      // mainnet, faster on testnet4). Matches the cadence implied by Core's
+      // EraseForBlock + LimitOrphans sweep pattern.
+      const expired = orphanPool.expireOldOrphans();
+      if (expired > 0) {
+        console.log(`[orphan-pool] expired ${expired} stale orphan(s) (TTL=${300}s)`);
+      }
       // Some confirmed txs may have been parents to orphans still in the
       // pool. Cascade-promote so their children can re-attempt admission
       // now that the chain has caught up.

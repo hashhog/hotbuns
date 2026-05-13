@@ -60,6 +60,18 @@ export const MAX_ORPHAN_TX_SIZE = 100_000;
 export const MAX_PEER_ORPHAN_TX = 50;
 
 /**
+ * Orphan transaction TTL in seconds (Core parity).
+ *
+ * Bitcoin Core (historically net_processing.cpp, now in txorphanage) evicts
+ * orphans that have been sitting for more than 5 minutes (300 s). The old
+ * value was 20 minutes (1200 s); Core PR #22503 tightened it to 300 s to
+ * reduce replay-pin pressure. We match the tighter bound.
+ *
+ * Reference: bitcoin-core/src/node/txorphanage.cpp (ORPHAN_TX_EXPIRE_TIME).
+ */
+export const ORPHAN_TX_EXPIRE_TIME = 300; // seconds
+
+/**
  * One orphan entry. The entry tracks its arrival time so eviction can fall
  * back to oldest-first when random eviction would dislodge a fresh arrival.
  */
@@ -331,6 +343,32 @@ export class OrphanPool {
     this.txidIndex.clear();
     this.byPrevout.clear();
     this.peerCount.clear();
+  }
+
+  /**
+   * Evict orphans that have exceeded their TTL.
+   *
+   * Mirrors Bitcoin Core's orphan expiry sweep (historically called from
+   * `LimitOrphans` / `EraseForBlock`). Any orphan whose `addedAt` is older
+   * than `ORPHAN_TX_EXPIRE_TIME` seconds relative to `now` is removed.
+   *
+   * @param now  Current time in milliseconds since epoch (defaults to Date.now()).
+   *             Tests pass a synthetic value to exercise time-advance without
+   *             real wall-clock delays.
+   * @returns    Number of orphans evicted.
+   */
+  expireOldOrphans(now: number = Date.now()): number {
+    const cutoffMs = ORPHAN_TX_EXPIRE_TIME * 1000;
+    const toRemove: OrphanEntry[] = [];
+    for (const entry of this.byWtxid.values()) {
+      if (now - entry.addedAt >= cutoffMs) {
+        toRemove.push(entry);
+      }
+    }
+    for (const entry of toRemove) {
+      this.removeEntry(entry);
+    }
+    return toRemove.length;
   }
 
   /**
