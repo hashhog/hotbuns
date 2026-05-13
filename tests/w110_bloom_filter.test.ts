@@ -609,49 +609,92 @@ describe("G30: -peerbloomfilters default OFF — PASS", () => {
   });
 });
 
-describe("G30: NODE_BLOOM hardcoded in manager.ts regardless of config — P0 BUG-16", () => {
-  test("manager.ts hardcodes NODE_BLOOM in outbound version handshake services (BUG-16)", () => {
-    // Core init.cpp: nLocalServices |= NODE_BLOOM only when -peerbloomfilters=1.
-    // hotbuns manager.ts lines ~529, ~549, ~565, ~808:
+describe("G30: NODE_BLOOM gated on --peerbloomfilters via params.services — FIX-35", () => {
+  // FIX-35: BUG-16 closed.  manager.ts no longer hardcodes NODE_BLOOM in
+  // address-record initializations.  The four previously-broken sites
+  // (--connect seeds, DNS-seed pool, fallback peers, connectPeer new-entry)
+  // now use NODE_NETWORK | NODE_WITNESS as the conservative baseline.
+  // The bloom bit is controlled exclusively by cli.ts via params.services
+  // (OR'd in when --peerbloomfilters=1, absent by default).
+
+  test("manager.ts does NOT hardcode NODE_BLOOM in address-record services (FIX-35)", () => {
+    // After fix: the pattern
     //   services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS | ServiceFlags.NODE_BLOOM
-    // These are hardcoded ALWAYS — not gated on peerBloomFilters config.
-    // This means hotbuns permanently advertises NODE_BLOOM even when default (peerBloomFilters=false).
+    // must be absent from manager.ts.  All four former sites now use
+    //   services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS
     const managerSrc = require("fs").readFileSync(
       require("path").join(__dirname, "../src/p2p/manager.ts"),
       "utf8"
     );
-    // Count occurrences of the hardcoded pattern (not gated on any config):
-    const pattern = /ServiceFlags\.NODE_NETWORK \| ServiceFlags\.NODE_WITNESS \| ServiceFlags\.NODE_BLOOM/g;
-    const matches = managerSrc.match(pattern) ?? [];
-    // At least 4 hardcoded occurrences (lines ~529, ~549, ~565, ~808):
-    expect(matches.length).toBeGreaterThanOrEqual(4);
+    const hardcodedPattern = /ServiceFlags\.NODE_NETWORK \| ServiceFlags\.NODE_WITNESS \| ServiceFlags\.NODE_BLOOM/g;
+    const matches = managerSrc.match(hardcodedPattern) ?? [];
+    // Must be zero — no hardcoded bloom in address-record initializations.
+    expect(matches.length).toBe(0);
   });
 
-  test("manager.ts does NOT read peerBloomFilters from config before advertising NODE_BLOOM", () => {
-    // The correct gate would be: params.services & NODE_BLOOM_BIT (set conditionally in cli.ts).
-    // manager.ts ignores params.services for version-message construction; it uses its own
-    // hardcoded ServiceFlags.NODE_BLOOM OR-combination.
-    const managerSrc = require("fs").readFileSync(
-      require("path").join(__dirname, "../src/p2p/manager.ts"),
-      "utf8"
-    );
-    // The manager does not read peerBloomFilters or check params.services for bloom gating:
-    expect(managerSrc).not.toContain("peerBloomFilters");
-    // The conditional bloom bit in cli.ts (params.services | NODE_BLOOM_BIT) is not
-    // propagated to version message construction in manager.ts.
-    expect(managerSrc).not.toContain("NODE_BLOOM_BIT");
+  test("getAdvertisedServices(): NODE_BLOOM absent when peerBloomFilters=false (default)", () => {
+    // Core DEFAULT_PEERBLOOMFILTERS = false → node must NOT advertise NODE_BLOOM.
+    // params.services = 0x09n (NODE_NETWORK | NODE_WITNESS) when bloom is off.
+    const { PeerManager } = require("../src/p2p/manager.js");
+    const { MAINNET } = require("../src/consensus/params.js");
+    // Default params: services = 0x09n, no NODE_BLOOM bit.
+    const pm = new PeerManager({
+      params: MAINNET,
+      datadir: "/tmp/w110-fix35-test-off",
+      listen: false,
+      maxOutbound: 8,
+      maxInbound: 117,
+      bestHeight: 0,
+    });
+    const advertised = pm.getAdvertisedServices();
+    // NODE_BLOOM (4n) must NOT be set when peerBloomFilters=false.
+    expect(advertised & ServiceFlags.NODE_BLOOM).toBe(0n);
+    // NODE_NETWORK and NODE_WITNESS must still be set.
+    expect(advertised & ServiceFlags.NODE_NETWORK).toBe(ServiceFlags.NODE_NETWORK);
+    expect(advertised & ServiceFlags.NODE_WITNESS).toBe(ServiceFlags.NODE_WITNESS);
   });
 
-  test("params.services bloom-gating in cli.ts is present but does NOT propagate to manager version msgs", () => {
-    // cli.ts correctly gates bloom bit in params.services (used for mempool gate only).
+  test("getAdvertisedServices(): NODE_BLOOM present when peerBloomFilters=true", () => {
+    // When operator passes --peerbloomfilters, cli.ts sets
+    //   params.services = baseParams.services | 4n
+    // PeerManager.getAdvertisedServices() returns params.services (or +NETWORK_LIMITED for prune).
+    // Simulate the cli.ts behaviour by constructing params with the bloom bit set.
+    const { PeerManager } = require("../src/p2p/manager.js");
+    const { MAINNET } = require("../src/consensus/params.js");
+    const paramsWithBloom = { ...MAINNET, services: MAINNET.services | ServiceFlags.NODE_BLOOM };
+    const pm = new PeerManager({
+      params: paramsWithBloom,
+      datadir: "/tmp/w110-fix35-test-on",
+      listen: false,
+      maxOutbound: 8,
+      maxInbound: 117,
+      bestHeight: 0,
+    });
+    const advertised = pm.getAdvertisedServices();
+    // NODE_BLOOM (4n) MUST be set when peerBloomFilters=true.
+    expect(advertised & ServiceFlags.NODE_BLOOM).toBe(ServiceFlags.NODE_BLOOM);
+    // NODE_NETWORK and NODE_WITNESS must also still be set.
+    expect(advertised & ServiceFlags.NODE_NETWORK).toBe(ServiceFlags.NODE_NETWORK);
+    expect(advertised & ServiceFlags.NODE_WITNESS).toBe(ServiceFlags.NODE_WITNESS);
+  });
+
+  test("params.services bloom-gating in cli.ts flows through to PeerManager", () => {
+    // cli.ts correctly gates bloom bit in params.services, and PeerManager
+    // getAdvertisedServices() reads params.services (not hardcoded constants).
     const cliSrc = require("fs").readFileSync(
       require("path").join(__dirname, "../src/cli/cli.ts"),
       "utf8"
     );
     expect(cliSrc).toContain("NODE_BLOOM_BIT");
     expect(cliSrc).toContain("mergedConfig.peerBloomFilters");
-    // But manager.ts still hardcodes NODE_BLOOM, so the conditional in cli.ts has no effect
-    // on what services the node advertises in version messages.
+    // manager.ts version-message construction uses this.config.params.services,
+    // which is the params object built by cli.ts with the conditional bloom bit.
+    const managerSrc = require("fs").readFileSync(
+      require("path").join(__dirname, "../src/p2p/manager.ts"),
+      "utf8"
+    );
+    // Version-message construction must reference params.services (not NODE_BLOOM directly).
+    expect(managerSrc).toContain("this.config.params.services");
   });
 });
 
