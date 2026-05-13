@@ -29,7 +29,7 @@
  */
 
 import { describe, test, expect, beforeEach } from "bun:test";
-import { SigCache, globalSigCache } from "../src/validation/sig_cache.js";
+import { SigCache, globalSigCache, type CacheKey } from "../src/validation/sig_cache.js";
 import { scriptFlagsFromBitmask, getConsensusFlags } from "../src/script/interpreter.js";
 import {
   ScriptFlags,
@@ -41,6 +41,29 @@ import {
 } from "../src/validation/tx.js";
 import { ecdsaSign, privateKeyToPublicKey, hash160 } from "../src/crypto/primitives.js";
 import type { UTXOEntry } from "../src/storage/database.js";
+
+// ---------------------------------------------------------------------------
+// CacheKey helper — build keys via the canonical computeKey() API so that
+// tests don't depend on the internal entry format.
+// ---------------------------------------------------------------------------
+
+/** Shared single-instance cache used by tests that need consistent nonce. */
+const _testCache = new SigCache(10_000);
+
+/**
+ * Build a CacheKey for a given (scriptSig, witness, flags) triple.
+ * Uses _testCache so all tests in this file share one nonce.
+ */
+function _makeKey(
+  scriptSigHex: string,
+  witnessHex: string[],
+  flags: number,
+  cache: SigCache = _testCache,
+): CacheKey {
+  const scriptSig = Buffer.from(scriptSigHex, "hex");
+  const witness = witnessHex.map((h) => Buffer.from(h, "hex"));
+  return cache.computeKey(scriptSig, witness, flags);
+}
 
 // ---------------------------------------------------------------------------
 // Minimal P2PKH helpers reused by BUG-9 + BUG-10 converted tests
@@ -271,14 +294,17 @@ describe("G5 — SigCache (SignatureCache equivalent) exists", () => {
    * Core: SignatureCache (script/sigcache.h) — per-ECDSA/Schnorr signature
    * cache keyed on SHA256(nonce || type || sig_hash || pubkey || sig).
    *
-   * hotbuns: SigCache (validation/sig_cache.ts) keyed on txid:inputIndex:flags.
-   * The class exists and is structurally sound.
+   * hotbuns: SigCache (validation/sig_cache.ts) keyed on
+   * SHA256(nonce || scriptSig || witness_stack || flagsLE4)[0..8].
+   * The class exists, carries a per-process nonce, and is structurally sound.
    *
-   * Status: PASS (class exists).
+   * Status: PASS (class exists and includes nonce + sig material).
    */
-  test("PASS — SigCache class exists and stores entries", () => {
+  test("PASS — SigCache class exists, has nonce, and stores entries via computeKey()", () => {
     const cache = new SigCache(10);
-    const key = { txid: "aabbcc", inputIndex: 0, flags: 0 };
+    expect(Buffer.isBuffer(cache.nonce)).toBe(true);
+    expect(cache.nonce.length).toBe(32);
+    const key = cache.computeKey(Buffer.from("aabbcc", "hex"), [], 0);
     expect(cache.lookup(key)).toBe(false);
     cache.insert(key);
     expect(cache.lookup(key)).toBe(true);
@@ -295,25 +321,31 @@ describe("G6 — SigCache nonce / salted hash", () => {
    * poisoning (sigcache.h constructor seeds m_salted_hasher_ecdsa and
    * m_salted_hasher_schnorr with a 32-byte nonce).
    *
-   * hotbuns: SigCache key is `${txid}:${inputIndex}:${flags}` — a plain string
-   * with NO nonce/salt. Two processes running the same transaction would have
-   * identical cache keys, but since the cache is in-process only (JS Map), this
-   * is not a security issue. The salt is purely defensive in Core to resist
-   * cache-key collision attacks in shared-memory environments.
+   * hotbuns FIX: SigCache now uses SHA256(nonce || scriptSig || witness || flags)
+   * where `nonce` is crypto.randomBytes(32) generated at construction.
+   * Two SigCache instances (simulating two process restarts) produce different
+   * nonces → different cache entry hashes for the same spending material.
    *
-   * Severity: LOW (in-process Map cannot be attacked cross-process; not a
-   * practical issue for a single-process JS node).
-   *
-   * Status: PASS for correctness (non-salted keys are fine for in-process use).
+   * Status: FIXED (nonce added; keys are unpredictable across restarts and
+   * different sig bytes always produce distinct keys).
    */
-  test("PASS — in-process Map cannot be poisoned cross-process (salt unnecessary)", () => {
+  test("FIXED — nonce makes cache keys unpredictable across process restarts", () => {
     const c1 = new SigCache(100);
     const c2 = new SigCache(100);
-    const key = { txid: "deadbeef", inputIndex: 0, flags: 0 };
 
-    c1.insert(key);
-    // c2 is independent — isolation is guaranteed by JS object model
-    expect(c2.lookup(key)).toBe(false);
+    // Both instances see the same spending material
+    const sig = Buffer.from("deadbeef", "hex");
+    const key1 = c1.computeKey(sig, [], 0);
+    const key2 = c2.computeKey(sig, [], 0);
+
+    // Different nonces → different entry hashes
+    expect(key1.entryHex).not.toBe(key2.entryHex);
+
+    // Isolation: an entry inserted in c1 is NOT found in c2
+    c1.insert(key1);
+    expect(c1.lookup(key1)).toBe(true);
+    expect(c2.lookup(key1)).toBe(false);  // c2 has a different nonce
+    expect(c2.lookup(key2)).toBe(false);  // not inserted in c2 either
   });
 });
 
@@ -325,37 +357,32 @@ describe("G7 — SigCache cache key should use wtxid not txid", () => {
    * Core: script execution cache key is SHA256(nonce || wtxid || flags)
    * (validation.cpp:2081: tx.GetWitnessHash()).
    *
-   * hotbuns SigCache: key includes txid (non-witness) not wtxid. For legacy
-   * transactions txid == wtxid, so this is correct. For segwit transactions the
-   * witness hash differs from txid. A cache hit keyed on txid would match a
-   * different witness structure (witness malleation), potentially allowing a
-   * re-validated block to return a false-positive cache hit for a tx whose
-   * witness was replaced.
+   * hotbuns FIX: the new key is SHA256(nonce || scriptSig || witness_stack ||
+   * flags) which directly covers the witness bytes.  A witness-malleated copy
+   * of a segwit input has different witness stack bytes → different cache entry
+   * → the malleated version never gets a false-positive hit from a cached
+   * honest verification.
    *
-   * Severity: MEDIUM — the cache is not currently used on the connect-block
-   * path (BUG-10: dead lookup), so no live exploitability today. Once BUG-10
-   * is fixed, this becomes a witness-malleation cache confusion risk.
-   *
-   * Post-fix: CacheKey.txid should be replaced with wtxid (witness txid).
+   * Status: FIXED — witness bytes are part of the key material.
    */
-  test("BUG-7: cache key uses txid not wtxid — witness malleation could produce false cache hit", () => {
+  test("FIXED — witness bytes are part of key: malleated witness produces a different cache entry", () => {
     const cache = new SigCache(100);
 
-    // Simulate txid (non-witness) == wtxid (legacy tx — same)
-    const legacyTxid = "aaaa".repeat(16);
-    cache.insert({ txid: legacyTxid, inputIndex: 0, flags: 0 });
-    expect(cache.lookup({ txid: legacyTxid, inputIndex: 0, flags: 0 })).toBe(true);
+    // Honest segwit input witness
+    const honestWitness = ["304402" + "aa".repeat(35) + "01"]; // DER sig + SIGHASH_ALL
+    const keyHonest = cache.computeKey(Buffer.alloc(0), honestWitness.map((h) => Buffer.from(h, "hex")), 0);
 
-    // Simulate txid != wtxid (segwit tx — they differ)
-    // Post-fix: lookup should use wtxid, which would be a different key
-    const nonWitnessId = "bbbb".repeat(16);
-    const witnessId    = "cccc".repeat(16); // different from txid for segwit
+    // Malleated witness — different sig bytes at same input position
+    const malleatedWitness = ["304402" + "bb".repeat(35) + "01"];
+    const keyMalleated = cache.computeKey(Buffer.alloc(0), malleatedWitness.map((h) => Buffer.from(h, "hex")), 0);
 
-    cache.insert({ txid: witnessId, inputIndex: 0, flags: 0 }); // correctly keyed by wtxid
-    // Lookup by txid (current broken behaviour) would miss
-    expect(cache.lookup({ txid: nonWitnessId, inputIndex: 0, flags: 0 })).toBe(false);
-    // Lookup by wtxid (correct post-fix) would hit
-    expect(cache.lookup({ txid: witnessId, inputIndex: 0, flags: 0 })).toBe(true);
+    // Different witness bytes → different keys
+    expect(keyHonest.entryHex).not.toBe(keyMalleated.entryHex);
+
+    // Inserting the honest verification does NOT satisfy the malleated lookup
+    cache.insert(keyHonest);
+    expect(cache.lookup(keyHonest)).toBe(true);
+    expect(cache.lookup(keyMalleated)).toBe(false);
   });
 });
 
@@ -382,11 +409,17 @@ describe("G8 — Script execution cache (per-tx, not per-sig)", () => {
   test("BUG-8: no full-tx script execution cache — every block-connect re-verifies all scripts", () => {
     // Demonstrate the gap: SigCache tracks per-input, not per-tx-all-inputs.
     const cache = new SigCache(100);
-    const txid = "tx1234".padEnd(64, "0");
 
-    // Insert both inputs of a 2-input tx
-    cache.insert({ txid, inputIndex: 0, flags: 0 });
-    cache.insert({ txid, inputIndex: 1, flags: 0 });
+    // Two inputs of the same tx have different scriptSig/witness bytes
+    const sig0 = Buffer.alloc(72, 0x01); // input 0 signature bytes
+    const sig1 = Buffer.alloc(72, 0x02); // input 1 signature bytes
+
+    const keyIn0 = cache.computeKey(sig0, [], 0);
+    const keyIn1 = cache.computeKey(sig1, [], 0);
+
+    // Insert both inputs
+    cache.insert(keyIn0);
+    cache.insert(keyIn1);
 
     // There is no "did all inputs of this tx pass" query — we'd have to
     // enumerate each input manually. Core's script_execution_cache avoids this
@@ -394,8 +427,8 @@ describe("G8 — Script execution cache (per-tx, not per-sig)", () => {
     //
     // Post-fix: introduce ScriptExecutionCache with has(wtxid, flags) and
     // insert(wtxid, flags) semantics, checked BEFORE the per-input loop.
-    expect(cache.lookup({ txid, inputIndex: 0, flags: 0 })).toBe(true);
-    expect(cache.lookup({ txid, inputIndex: 1, flags: 0 })).toBe(true);
+    expect(cache.lookup(keyIn0)).toBe(true);
+    expect(cache.lookup(keyIn1)).toBe(true);
     // But there is no O(1) "entire tx is clean" query available today:
     // the caller would need to check every input individually.
     // (This absence is what BUG-8 documents.)
@@ -653,10 +686,10 @@ describe("G14 — SigCache eviction strategy (FIFO vs CuckooCache)", () => {
   test("BUG-14: FIFO eviction evicts oldest entry regardless of access recency", () => {
     const cache = new SigCache(3); // tiny cache to demonstrate eviction
 
-    const k1 = { txid: "tx1", inputIndex: 0, flags: 0 };
-    const k2 = { txid: "tx2", inputIndex: 0, flags: 0 };
-    const k3 = { txid: "tx3", inputIndex: 0, flags: 0 };
-    const k4 = { txid: "tx4", inputIndex: 0, flags: 0 };
+    const k1 = cache.computeKey(Buffer.from([0x01]), [], 0);
+    const k2 = cache.computeKey(Buffer.from([0x02]), [], 0);
+    const k3 = cache.computeKey(Buffer.from([0x03]), [], 0);
+    const k4 = cache.computeKey(Buffer.from([0x04]), [], 0);
 
     cache.insert(k1);
     cache.insert(k2);
@@ -763,7 +796,7 @@ describe("G17 — SigCache clear on reorg/disconnect", () => {
    */
   test("PASS — clear() is called on disconnect; semantics correct once BUG-10 is fixed", () => {
     const cache = new SigCache(100);
-    const key = { txid: "tx1", inputIndex: 0, flags: 0 };
+    const key = cache.computeKey(Buffer.from("deadbeef", "hex"), [], 0);
 
     cache.insert(key);
     expect(cache.size).toBe(1);
@@ -865,22 +898,26 @@ describe("G21 — SigCache key includes flags for isolation", () => {
    * to prevent a cache entry verified under VERIFY_WITNESS from satisfying
    * a lookup under stricter flags (or vice versa).
    *
-   * hotbuns: SigCache CacheKey includes `flags: number` and keyToString uses
-   * `${txid}:${inputIndex}:${flags}` — correctly isolates entries by flag set.
+   * hotbuns: flags is included in SHA256(nonce || scriptSig || witness || flagsLE4),
+   * so different flag sets produce different hash outputs.
    *
    * Status: PASS.
    */
   test("PASS — different flags produce different cache keys", () => {
     const cache = new SigCache(100);
-    const txid = "aa".repeat(32);
+    const sig = Buffer.from("aa".repeat(32), "hex");
 
-    cache.insert({ txid, inputIndex: 0, flags: 0b01 }); // P2SH only
-    cache.insert({ txid, inputIndex: 0, flags: 0b11 }); // P2SH + WITNESS
+    const kP2SH     = cache.computeKey(sig, [], 0b01); // P2SH only
+    const kP2SHWit  = cache.computeKey(sig, [], 0b11); // P2SH + WITNESS
+    const kWitOnly  = cache.computeKey(sig, [], 0b10); // WITNESS only
 
-    // Same txid+input, different flags → different keys
-    expect(cache.lookup({ txid, inputIndex: 0, flags: 0b01 })).toBe(true);
-    expect(cache.lookup({ txid, inputIndex: 0, flags: 0b11 })).toBe(true);
-    expect(cache.lookup({ txid, inputIndex: 0, flags: 0b10 })).toBe(false); // never inserted
+    cache.insert(kP2SH);
+    cache.insert(kP2SHWit);
+
+    // Same sig, different flags → different keys
+    expect(cache.lookup(kP2SH)).toBe(true);
+    expect(cache.lookup(kP2SHWit)).toBe(true);
+    expect(cache.lookup(kWitOnly)).toBe(false); // never inserted
   });
 });
 
@@ -1078,14 +1115,16 @@ describe("G29 — SigCache NOT cleared on block-connect (correct behaviour)", ()
    */
   test("PASS — globalSigCache is not cleared during block connect (preserves mempool→block hits)", () => {
     const cache = new SigCache(100);
-    const key = { txid: "mempoolTx".padEnd(64, "0"), inputIndex: 0, flags: 3 };
+    // Simulate a mempool-validated input's scriptSig bytes
+    const mempoolSig = Buffer.alloc(72, 0xab);
+    const key = cache.computeKey(mempoolSig, [], 3);
 
     // Simulate mempool validation populating cache
     cache.insert(key);
     expect(cache.size).toBe(1);
 
     // Simulated connect-block: does NOT clear the cache
-    // (only disconnectBlock clears; once BUG-10 is fixed, connect would HIT this)
+    // (only disconnectBlock clears; BUG-10 fix makes connect HIT this)
     expect(cache.size).toBe(1); // still there after "connect"
     expect(cache.lookup(key)).toBe(true);
   });
@@ -1166,5 +1205,113 @@ describe("G30 — Script verification flags are now height-appropriate (BUG-30 f
     expect(P2SH_ACTIVATION).toBe(173805);
     expect(SEGWIT_ACTIVATION).toBe(481824);
     expect(TAPROOT_ACTIVATION).toBe(709632);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// G31 — SigCache nonce + signature material (W105 BUG-9 root-cause fix)
+// ---------------------------------------------------------------------------
+describe("G31 — SigCache nonce + sig-material hardening (W105 BUG-9 fix)", () => {
+  /**
+   * BUG-9 root cause (now fixed):
+   *   FIX-22 wired globalSigCache but the key was `txid:inputIndex:flags` —
+   *   no per-process nonce and no coverage of the actual sig bytes.
+   *   An adversary that can submit two different transactions spending the
+   *   same input (same txid+idx, different sig — e.g. witness malleation or
+   *   a replacement tx) would get a false-positive cache hit for the second
+   *   submission once the first was verified.
+   *
+   * Fix: key is now SHA256(nonce || scriptSig || witness_stack || flagsLE4)
+   *   - nonce = crypto.randomBytes(32) at construction (unpredictable across
+   *     restarts; mirrors Core sigcache.h m_salted_hasher_ecdsa init).
+   *   - scriptSig + witness bytes = the actual signing material; any change
+   *     to sig bytes changes the cache key.
+   */
+
+  test("BUG-9 fixed: SigCache nonce field exists and is 32 random bytes", () => {
+    const cache = new SigCache(100);
+    expect(Buffer.isBuffer(cache.nonce)).toBe(true);
+    expect(cache.nonce.length).toBe(32);
+    // Nonce is not all-zeroes (overwhelmingly likely with randomBytes)
+    expect(cache.nonce.every((b) => b === 0)).toBe(false);
+  });
+
+  test("BUG-9 fixed: two SigCache instances (=two process restarts) have different nonces", () => {
+    const c1 = new SigCache(100);
+    const c2 = new SigCache(100);
+    expect(c1.nonce.toString("hex")).not.toBe(c2.nonce.toString("hex"));
+  });
+
+  test("BUG-9 fixed: same spending material, different nonces → different cache keys (cross-restart unpredictability)", () => {
+    // Simulate two process restarts with deterministic (test-injected) nonces.
+    const nonce1 = Buffer.alloc(32, 0xaa);
+    const nonce2 = Buffer.alloc(32, 0xbb);
+    const c1 = new SigCache(100, nonce1);
+    const c2 = new SigCache(100, nonce2);
+
+    // Identical spending material
+    const scriptSig = Buffer.from("304402" + "cd".repeat(35) + "01", "hex");
+    const flags = ScriptFlags.VERIFY_P2SH | ScriptFlags.VERIFY_WITNESS;
+
+    const key1 = c1.computeKey(scriptSig, [], flags);
+    const key2 = c2.computeKey(scriptSig, [], flags);
+
+    expect(key1.entryHex).not.toBe(key2.entryHex);
+  });
+
+  test("BUG-9 fixed: different sig bytes with same (txid, inputIndex, flags) produce different cache keys — adversarial poisoning prevented", () => {
+    // Adversary scenario: two inputs at the same position but with different
+    // sig bytes (witness malleation, replacement tx, etc.).  The second tx must
+    // not get a free hit from the first's cache entry.
+    const cache = new SigCache(100);
+
+    const honestSig  = Buffer.alloc(71, 0x01); // honest signature
+    const forgedSig  = Buffer.alloc(71, 0x02); // adversarial / forged signature
+
+    const keyHonest = cache.computeKey(honestSig, [], 7);
+    const keyForged = cache.computeKey(forgedSig, [], 7);
+
+    // Keys must differ
+    expect(keyHonest.entryHex).not.toBe(keyForged.entryHex);
+
+    // After caching the honest verification, the forged sig must NOT hit
+    cache.insert(keyHonest);
+    expect(cache.lookup(keyHonest)).toBe(true);
+    expect(cache.lookup(keyForged)).toBe(false);
+  });
+
+  test("BUG-9 fixed: witness-malleated segwit input produces a distinct cache key from the original", () => {
+    const cache = new SigCache(100);
+
+    // Original P2WPKH witness: [DER_sig, compressed_pubkey]
+    const origSig    = Buffer.alloc(71, 0xde);
+    const origPubkey = Buffer.alloc(33, 0xad);
+    const keyOrig    = cache.computeKey(Buffer.alloc(0), [origSig, origPubkey], 3);
+
+    // Malleated P2WPKH witness: same pubkey, different (malleated) sig bytes
+    const malleatedSig = Buffer.alloc(71, 0xbe);
+    const keyMalleated = cache.computeKey(Buffer.alloc(0), [malleatedSig, origPubkey], 3);
+
+    expect(keyOrig.entryHex).not.toBe(keyMalleated.entryHex);
+
+    cache.insert(keyOrig);
+    expect(cache.lookup(keyOrig)).toBe(true);
+    expect(cache.lookup(keyMalleated)).toBe(false);
+  });
+
+  test("BUG-9 fixed: nonce override (constructor arg) allows deterministic test keys", () => {
+    // Tests that inject a known nonce can reproduce exact cache entry values.
+    const fixedNonce = Buffer.alloc(32, 0x42);
+    const c1 = new SigCache(100, fixedNonce);
+    const c2 = new SigCache(100, fixedNonce);
+
+    const sig   = Buffer.from("abcd1234", "hex");
+    const flags = 0x07;
+
+    const k1 = c1.computeKey(sig, [], flags);
+    const k2 = c2.computeKey(sig, [], flags);
+
+    // Same nonce + same material → same key (reproducible)
+    expect(k1.entryHex).toBe(k2.entryHex);
   });
 });

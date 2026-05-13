@@ -1,5 +1,21 @@
 import { describe, expect, test, beforeEach } from "bun:test";
-import { SigCache, CacheKey, globalSigCache } from "./sig_cache";
+import { SigCache, globalSigCache } from "./sig_cache";
+
+// ---------------------------------------------------------------------------
+// Helpers — build CacheKeys using the canonical computeKey() method so that
+// tests are not coupled to the internal key format.
+// ---------------------------------------------------------------------------
+
+function makeKey(
+  cache: SigCache,
+  scriptSigHex: string,
+  witnessHex: string[],
+  flags: number,
+) {
+  const scriptSig = Buffer.from(scriptSigHex, "hex");
+  const witness = witnessHex.map((h) => Buffer.from(h, "hex"));
+  return cache.computeKey(scriptSig, witness, flags);
+}
 
 describe("sig_cache", () => {
   let cache: SigCache;
@@ -10,36 +26,28 @@ describe("sig_cache", () => {
 
   describe("insert and lookup", () => {
     test("lookup returns false for non-existent key", () => {
-      const key: CacheKey = {
-        txid: "abc123",
-        inputIndex: 0,
-        flags: 0,
-      };
+      const key = makeKey(cache, "aabbcc", [], 0);
       expect(cache.lookup(key)).toBe(false);
     });
 
     test("lookup returns true after insert", () => {
-      const key: CacheKey = {
-        txid: "abc123",
-        inputIndex: 0,
-        flags: 0,
-      };
+      const key = makeKey(cache, "aabbcc", [], 0);
       cache.insert(key);
       expect(cache.lookup(key)).toBe(true);
     });
 
-    test("different txids are stored separately", () => {
-      const key1: CacheKey = { txid: "abc123", inputIndex: 0, flags: 0 };
-      const key2: CacheKey = { txid: "def456", inputIndex: 0, flags: 0 };
+    test("different scriptSigs are stored separately", () => {
+      const key1 = makeKey(cache, "aabbcc", [], 0);
+      const key2 = makeKey(cache, "ddeeff", [], 0);
 
       cache.insert(key1);
       expect(cache.lookup(key1)).toBe(true);
       expect(cache.lookup(key2)).toBe(false);
     });
 
-    test("different input indices are stored separately", () => {
-      const key1: CacheKey = { txid: "abc123", inputIndex: 0, flags: 0 };
-      const key2: CacheKey = { txid: "abc123", inputIndex: 1, flags: 0 };
+    test("different witness stacks are stored separately", () => {
+      const key1 = makeKey(cache, "", ["aabbcc"], 0);
+      const key2 = makeKey(cache, "", ["ddeeff"], 0);
 
       cache.insert(key1);
       expect(cache.lookup(key1)).toBe(true);
@@ -47,8 +55,8 @@ describe("sig_cache", () => {
     });
 
     test("different flags are stored separately", () => {
-      const key1: CacheKey = { txid: "abc123", inputIndex: 0, flags: 0 };
-      const key2: CacheKey = { txid: "abc123", inputIndex: 0, flags: 1 };
+      const key1 = makeKey(cache, "aabbcc", [], 0);
+      const key2 = makeKey(cache, "aabbcc", [], 1);
 
       cache.insert(key1);
       expect(cache.lookup(key1)).toBe(true);
@@ -56,7 +64,7 @@ describe("sig_cache", () => {
     });
 
     test("inserting same key twice does not increase size", () => {
-      const key: CacheKey = { txid: "abc123", inputIndex: 0, flags: 0 };
+      const key = makeKey(cache, "aabbcc", [], 0);
 
       cache.insert(key);
       expect(cache.size).toBe(1);
@@ -68,13 +76,12 @@ describe("sig_cache", () => {
 
   describe("eviction at max capacity", () => {
     test("evicts oldest entry when at max capacity", () => {
-      // Create cache with max 3 entries
       const smallCache = new SigCache(3);
 
-      const key1: CacheKey = { txid: "tx1", inputIndex: 0, flags: 0 };
-      const key2: CacheKey = { txid: "tx2", inputIndex: 0, flags: 0 };
-      const key3: CacheKey = { txid: "tx3", inputIndex: 0, flags: 0 };
-      const key4: CacheKey = { txid: "tx4", inputIndex: 0, flags: 0 };
+      const key1 = makeKey(smallCache, "01", [], 0);
+      const key2 = makeKey(smallCache, "02", [], 0);
+      const key3 = makeKey(smallCache, "03", [], 0);
+      const key4 = makeKey(smallCache, "04", [], 0);
 
       smallCache.insert(key1);
       smallCache.insert(key2);
@@ -98,10 +105,10 @@ describe("sig_cache", () => {
     test("FIFO eviction order is maintained", () => {
       const smallCache = new SigCache(2);
 
-      const key1: CacheKey = { txid: "tx1", inputIndex: 0, flags: 0 };
-      const key2: CacheKey = { txid: "tx2", inputIndex: 0, flags: 0 };
-      const key3: CacheKey = { txid: "tx3", inputIndex: 0, flags: 0 };
-      const key4: CacheKey = { txid: "tx4", inputIndex: 0, flags: 0 };
+      const key1 = makeKey(smallCache, "01", [], 0);
+      const key2 = makeKey(smallCache, "02", [], 0);
+      const key3 = makeKey(smallCache, "03", [], 0);
+      const key4 = makeKey(smallCache, "04", [], 0);
 
       smallCache.insert(key1);
       smallCache.insert(key2);
@@ -125,8 +132,8 @@ describe("sig_cache", () => {
     test("re-inserting existing key does not cause eviction", () => {
       const smallCache = new SigCache(2);
 
-      const key1: CacheKey = { txid: "tx1", inputIndex: 0, flags: 0 };
-      const key2: CacheKey = { txid: "tx2", inputIndex: 0, flags: 0 };
+      const key1 = makeKey(smallCache, "01", [], 0);
+      const key2 = makeKey(smallCache, "02", [], 0);
 
       smallCache.insert(key1);
       smallCache.insert(key2);
@@ -144,8 +151,8 @@ describe("sig_cache", () => {
 
   describe("clear", () => {
     test("clear empties the cache", () => {
-      const key1: CacheKey = { txid: "tx1", inputIndex: 0, flags: 0 };
-      const key2: CacheKey = { txid: "tx2", inputIndex: 0, flags: 0 };
+      const key1 = makeKey(cache, "01", [], 0);
+      const key2 = makeKey(cache, "02", [], 0);
 
       cache.insert(key1);
       cache.insert(key2);
@@ -159,7 +166,7 @@ describe("sig_cache", () => {
     });
 
     test("cache works normally after clear", () => {
-      const key: CacheKey = { txid: "tx1", inputIndex: 0, flags: 0 };
+      const key = makeKey(cache, "aabb", [], 0);
 
       cache.insert(key);
       cache.clear();
@@ -177,7 +184,8 @@ describe("sig_cache", () => {
 
     test("size increases with inserts", () => {
       for (let i = 0; i < 10; i++) {
-        cache.insert({ txid: `tx${i}`, inputIndex: 0, flags: 0 });
+        const k = makeKey(cache, Buffer.from([i]).toString("hex"), [], 0);
+        cache.insert(k);
         expect(cache.size).toBe(i + 1);
       }
     });
@@ -186,7 +194,8 @@ describe("sig_cache", () => {
       const smallCache = new SigCache(5);
 
       for (let i = 0; i < 10; i++) {
-        smallCache.insert({ txid: `tx${i}`, inputIndex: 0, flags: 0 });
+        const k = makeKey(smallCache, Buffer.from([i]).toString("hex"), [], 0);
+        smallCache.insert(k);
       }
 
       expect(smallCache.size).toBe(5);
@@ -194,31 +203,113 @@ describe("sig_cache", () => {
   });
 
   describe("realistic usage", () => {
-    test("caching multiple inputs of same transaction", () => {
-      const txid = "deadbeef1234567890abcdef";
-
-      // Insert verifications for 3 inputs with same flags
+    test("caching multiple inputs of same transaction (different scriptSigs)", () => {
+      // In a real tx each input has a distinct scriptSig/witness,
+      // so per-input keys are distinct even if flags are the same.
+      const flags = 0x1f;
       for (let i = 0; i < 3; i++) {
-        cache.insert({ txid, inputIndex: i, flags: 0x1f });
+        const sig = Buffer.alloc(72, i + 1); // distinct per-input signature bytes
+        const k = makeKey(cache, sig.toString("hex"), [], flags);
+        cache.insert(k);
       }
 
-      // All should be cached
+      // All three should be present
       for (let i = 0; i < 3; i++) {
-        expect(cache.lookup({ txid, inputIndex: i, flags: 0x1f })).toBe(true);
+        const sig = Buffer.alloc(72, i + 1);
+        const k = makeKey(cache, sig.toString("hex"), [], flags);
+        expect(cache.lookup(k)).toBe(true);
       }
 
-      // Different flags should not be cached
+      // Different flags → different keys
       for (let i = 0; i < 3; i++) {
-        expect(cache.lookup({ txid, inputIndex: i, flags: 0x00 })).toBe(false);
+        const sig = Buffer.alloc(72, i + 1);
+        const k = makeKey(cache, sig.toString("hex"), [], 0x00);
+        expect(cache.lookup(k)).toBe(false);
       }
     });
 
-    test("64-character hex txid works correctly", () => {
-      const txid = "a".repeat(64);
-      const key: CacheKey = { txid, inputIndex: 5, flags: 255 };
+    test("witness stack entries produce distinct keys from identical scriptSig inputs", () => {
+      const legacyKey = makeKey(cache, "deadbeef", [], 7);
+      const segwitKey = makeKey(cache, "", ["deadbeef"], 7);
+      expect(legacyKey.entryHex).not.toBe(segwitKey.entryHex);
+    });
+  });
 
-      cache.insert(key);
-      expect(cache.lookup(key)).toBe(true);
+  // ---------------------------------------------------------------------------
+  // Nonce hardening tests (W105 BUG-9 root-cause fix)
+  // ---------------------------------------------------------------------------
+
+  describe("nonce hardening (W105)", () => {
+    test("nonce field is a 32-byte Buffer set at construction", () => {
+      const c = new SigCache(100);
+      expect(Buffer.isBuffer(c.nonce)).toBe(true);
+      expect(c.nonce.length).toBe(32);
+    });
+
+    test("two independent SigCache instances have different nonces", () => {
+      const c1 = new SigCache(100);
+      const c2 = new SigCache(100);
+      // Probability of collision is 1/2^256 — effectively impossible
+      expect(c1.nonce.toString("hex")).not.toBe(c2.nonce.toString("hex"));
+    });
+
+    test("same spending material with different nonces produces different cache keys — cross-restart unpredictability", () => {
+      // Simulate two separate process starts (different nonces) for the same tx input.
+      const nonce1 = Buffer.alloc(32, 0xaa);
+      const nonce2 = Buffer.alloc(32, 0xbb);
+      const c1 = new SigCache(100, nonce1);
+      const c2 = new SigCache(100, nonce2);
+
+      const scriptSig = Buffer.from("304402dead01", "hex");
+      const witness: Buffer[] = [];
+      const flags = 7;
+
+      const key1 = c1.computeKey(scriptSig, witness, flags);
+      const key2 = c2.computeKey(scriptSig, witness, flags);
+
+      // Different nonces → different entry hashes
+      expect(key1.entryHex).not.toBe(key2.entryHex);
+    });
+
+    test("different sig bytes for same (txid, inputIndex, flags) produce different keys — adversarial poisoning prevented", () => {
+      // Adversary scenario: two different signatures at the same input position
+      // (e.g. witness malleation, or a replacement transaction with a different sig).
+      // Both must have distinct cache entries so a forged sig cannot get a free hit.
+      const sig1 = Buffer.alloc(71, 0x01); // valid sig from honest tx
+      const sig2 = Buffer.alloc(71, 0x02); // forged/different sig (adversarial)
+
+      const key1 = cache.computeKey(sig1, [], 7);
+      const key2 = cache.computeKey(sig2, [], 7);
+
+      expect(key1.entryHex).not.toBe(key2.entryHex);
+
+      // Insert the honest sig — adversarial sig must NOT get a hit
+      cache.insert(key1);
+      expect(cache.lookup(key1)).toBe(true);
+      expect(cache.lookup(key2)).toBe(false);
+    });
+
+    test("witness stack element order is part of the key — different orderings are distinct", () => {
+      const elem1 = Buffer.from("aabb", "hex");
+      const elem2 = Buffer.from("ccdd", "hex");
+
+      const keyAB = cache.computeKey(Buffer.alloc(0), [elem1, elem2], 7);
+      const keyBA = cache.computeKey(Buffer.alloc(0), [elem2, elem1], 7);
+
+      expect(keyAB.entryHex).not.toBe(keyBA.entryHex);
+    });
+
+    test("nonce override (constructor second arg) allows deterministic tests", () => {
+      const fixedNonce = Buffer.alloc(32, 0x42);
+      const c1 = new SigCache(100, fixedNonce);
+      const c2 = new SigCache(100, fixedNonce);
+
+      const sig = Buffer.from("abcd", "hex");
+      const k1 = c1.computeKey(sig, [], 3);
+      const k2 = c2.computeKey(sig, [], 3);
+
+      // Same nonce + same material → same key (deterministic)
+      expect(k1.entryHex).toBe(k2.entryHex);
     });
   });
 
@@ -227,15 +318,16 @@ describe("sig_cache", () => {
       expect(globalSigCache).toBeInstanceOf(SigCache);
     });
 
-    test("global cache can store and retrieve entries", () => {
-      const key: CacheKey = {
-        txid: "global_test_tx_" + Date.now(),
-        inputIndex: 0,
-        flags: 0,
-      };
+    test("global cache has a 32-byte nonce set at module load time", () => {
+      expect(Buffer.isBuffer(globalSigCache.nonce)).toBe(true);
+      expect(globalSigCache.nonce.length).toBe(32);
+    });
 
-      // Clear any existing entry
+    test("global cache can store and retrieve entries", () => {
       globalSigCache.clear();
+
+      const sig = Buffer.from("deadbeef" + Date.now().toString(16).padStart(16, "0"), "hex");
+      const key = globalSigCache.computeKey(sig, [], 0);
 
       expect(globalSigCache.lookup(key)).toBe(false);
       globalSigCache.insert(key);
