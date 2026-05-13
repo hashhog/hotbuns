@@ -526,7 +526,12 @@ export class PeerManager {
           this.knownAddresses.set(key, {
             host,
             port,
-            services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS | ServiceFlags.NODE_BLOOM,
+            // Conservative baseline: assume full-node + segwit only.  We learn
+            // the real services during the version handshake and update
+            // info.services (see handleHandshakeComplete).  NODE_BLOOM is NOT
+            // assumed here — advertising or honoring it is controlled by the
+            // --peerbloomfilters flag via params.services, not hardcoded.
+            services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS,
             lastSeen: now,
             banScore: 0,
             lastConnected: 0,
@@ -546,7 +551,9 @@ export class PeerManager {
         this.knownAddresses.set(key, {
           host: ip,
           port: this.config.params.defaultPort,
-          services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS | ServiceFlags.NODE_BLOOM,
+          // Conservative baseline: assume full-node + segwit only.
+          // Real services are learned during version handshake.
+          services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS,
           lastSeen: now,
           banScore: 0,
           lastConnected: 0,
@@ -562,7 +569,9 @@ export class PeerManager {
         this.knownAddresses.set(key, {
           host,
           port,
-          services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS | ServiceFlags.NODE_BLOOM,
+          // Conservative baseline: assume full-node + segwit only.
+          // Real services are learned during version handshake.
+          services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS,
           lastSeen: now,
           banScore: 0,
           lastConnected: 0,
@@ -805,7 +814,10 @@ export class PeerManager {
         this.knownAddresses.set(key, {
           host,
           port,
-          services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS | ServiceFlags.NODE_BLOOM,
+          // Conservative baseline: assume full-node + segwit only.
+          // Real services are learned during version handshake and
+          // updated via info.services = peer.versionPayload.services.
+          services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS,
           lastSeen: now,
           banScore: 0,
           lastConnected: now,
