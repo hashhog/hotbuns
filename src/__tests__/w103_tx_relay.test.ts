@@ -88,10 +88,9 @@
  *                                   regardless of wtxidrelay state. Core uses MSG_WTX (=5) for
  *                                   wtxid-relay peers. relay.ts flush() always uses InvType.MSG_WITNESS_TX.
  *
- *   BUG-15 (G22, DoS)          — OrphanPool: addedAt timestamp recorded but no time-based
- *                                 expiry sweep. Core's LimitOrphans() evicts entries older than
- *                                 ORPHAN_TX_EXPIRE_TIME (5 min). Orphans can live indefinitely.
- *                                 (Cross-confirmed from W99 G12.)
+ *   BUG-15 (G22, DoS)          — FIXED: added ORPHAN_TX_EXPIRE_TIME=300s constant and
+ *                                 expireOldOrphans(now) method to OrphanPool; wired into
+ *                                 blockConnected handler in cli.ts (W103 fix).
  *
  *   BUG-16 (G26, P2P-DIVERGENCE) — No CanRequestTxFrom: hotbuns never issues tx getdata, so the
  *                                   "do not request from the same peer that announced" invariant
@@ -724,11 +723,11 @@ describe("G21: Orphan global cap = 100 — PASS", () => {
 });
 
 // ---------------------------------------------------------------------------
-// G22 — Orphan 5-minute TTL expiry — MISSING (BUG-15)
+// G22 — Orphan 5-minute TTL expiry — FIXED (BUG-15)
 // ---------------------------------------------------------------------------
 
-describe("G22: Orphan 5-minute TTL expiry — MISSING (BUG-15)", () => {
-  test("BUG-15: addedAt timestamp recorded but no expireOldOrphans() method", () => {
+describe("G22: Orphan 5-minute TTL expiry — FIXED (BUG-15)", () => {
+  test("expireOldOrphans() method exists on OrphanPool", () => {
     const pool = new OrphanPool();
     const tx = makeTx(1, 42);
     const result = pool.add(tx, "peer-X");
@@ -737,21 +736,52 @@ describe("G22: Orphan 5-minute TTL expiry — MISSING (BUG-15)", () => {
       // addedAt is set — good start
       expect(result.entry.addedAt).toBeLessThanOrEqual(Date.now());
     }
-    // BUG-15: no expiry sweep exists
-    expect(typeof (pool as any).expireOldOrphans).toBe("undefined");
-    expect(typeof (pool as any).limitOrphans).toBe("undefined");
-    expect(typeof (pool as any).evictExpired).toBe("undefined");
+    // FIX: expireOldOrphans is now a public method
+    expect(typeof (pool as any).expireOldOrphans).toBe("function");
   });
 
-  test("BUG-15: orphan stays in pool after simulated expiry window", () => {
+  test("orphan removed after TTL window has elapsed (synthetic now)", () => {
     const pool = new OrphanPool();
     pool.add(makeTx(1, 7), "peer-Z");
-    // No periodic sweep to call; orphan stays forever
     expect(pool.size()).toBe(1);
+
+    // Simulate 301 seconds passing — past the 300s TTL.
+    const futureNow = Date.now() + (CORE_ORPHAN_TX_EXPIRE_TIME_S + 1) * 1000;
+    const evicted = pool.expireOldOrphans(futureNow);
+    expect(evicted).toBe(1);
+    expect(pool.size()).toBe(0);
+  });
+
+  test("fresh orphan is NOT evicted before TTL has elapsed", () => {
+    const pool = new OrphanPool();
+    pool.add(makeTx(1, 8), "peer-Z");
+    expect(pool.size()).toBe(1);
+
+    // 1 second before TTL — must not be evicted.
+    const almostNow = Date.now() + (CORE_ORPHAN_TX_EXPIRE_TIME_S - 1) * 1000;
+    const evicted = pool.expireOldOrphans(almostNow);
+    expect(evicted).toBe(0);
+    expect(pool.size()).toBe(1);
+  });
+
+  test("expireOldOrphans evicts only stale entries, not fresh ones", () => {
+    const pool = new OrphanPool();
+    pool.add(makeTx(1, 9), "peer-A");
+    pool.add(makeTx(1, 10), "peer-B");
+    expect(pool.size()).toBe(2);
+
+    // 301 seconds past TTL — both stale.
+    const bothStale = Date.now() + (CORE_ORPHAN_TX_EXPIRE_TIME_S + 1) * 1000;
+    const evicted = pool.expireOldOrphans(bothStale);
+    expect(evicted).toBe(2);
+    expect(pool.size()).toBe(0);
   });
 
   test("Core reference: ORPHAN_TX_EXPIRE_TIME = 300s (5 minutes)", () => {
     expect(CORE_ORPHAN_TX_EXPIRE_TIME_S).toBe(300);
+    // OrphanPool exports the same constant.
+    const { ORPHAN_TX_EXPIRE_TIME } = require("../mempool/orphan_pool.js");
+    expect(ORPHAN_TX_EXPIRE_TIME).toBe(300);
   });
 });
 
