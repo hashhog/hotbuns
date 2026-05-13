@@ -3036,6 +3036,42 @@ export function getConsensusFlags(height: number): ScriptFlags {
 }
 
 /**
+ * Convert a ScriptFlags bitmask (from validation/tx.ts) to an interpreter
+ * ScriptFlags object.
+ *
+ * Called by verifyInputSignature to translate the per-block bitmask that
+ * coreConnectBlockChecks computes from height/params into the interpreter's
+ * structured form.  This replaces the old getConsensusFlags(709632) hardcode
+ * (BUG-11 + BUG-30 fix).
+ *
+ * Bitmask bit definitions (must mirror validation/tx.ts ScriptFlags enum;
+ * kept as literals here to avoid a circular import):
+ *   VERIFY_P2SH   = 1 << 0
+ *   VERIFY_WITNESS = 1 << 1
+ *   VERIFY_TAPROOT = 1 << 9
+ */
+export function scriptFlagsFromBitmask(bitmask: number): ScriptFlags {
+  const verifyP2SH    = (bitmask & (1 << 0)) !== 0;
+  const verifyWitness = (bitmask & (1 << 1)) !== 0;
+  const verifyTaproot = (bitmask & (1 << 9)) !== 0;
+  return {
+    verifyP2SH,
+    verifyWitness,
+    verifyTaproot,
+    // When SegWit (BIP-141) is active the accompanying consensus flags are also active.
+    verifyDERSignatures:       verifyWitness,  // BIP-66, active since SegWit era
+    verifyCheckLockTimeVerify: verifyWitness,  // BIP-65
+    verifyCheckSequenceVerify: verifyWitness,  // BIP-112
+    verifyNullDummy:           verifyWitness,  // BIP-147
+    // Policy flags are never set during block validation.
+    verifyNullFail:            false,
+    verifyWitnessPubkeyType:   false,
+    verifyStrictEncoding:      false,
+    verifyLowS:                false,
+  };
+}
+
+/**
  * Create standard (mempool/relay) script verification flags for a given height.
  *
  * Composes the consensus flags from getConsensusFlags() and adds the policy-only

@@ -165,6 +165,12 @@ export interface ConnectBlockOpts {
   verifyWitness?: boolean;
 
   /**
+   * Whether to verify Taproot scripts (BIP-341/342).
+   * True when height >= params.taprootHeight.
+   */
+  verifyTaproot?: boolean;
+
+  /**
    * Optional per-coin MTP provider for BIP-68 time-based sequence locks.
    *
    * Called with the block height at which a UTXO was created; should return
@@ -247,6 +253,7 @@ export async function coreConnectBlockChecks(
     scriptThreads = 4,
     verifyP2SH = height >= params.bip16Height,
     verifyWitness = height >= params.segwitHeight,
+    verifyTaproot = height >= params.taprootHeight,
     getUTXOMTP,
     genesisHashHex,
     utxoBestBlockHashHex,
@@ -565,8 +572,9 @@ export async function coreConnectBlockChecks(
       // ── Script verification (skipped when skipScripts=true).
       if (!skipScripts) {
         const scriptFlags =
-          (verifyP2SH ? ScriptFlags.VERIFY_P2SH : ScriptFlags.VERIFY_NONE) |
-          (verifyWitness ? ScriptFlags.VERIFY_WITNESS : ScriptFlags.VERIFY_NONE);
+          (verifyP2SH    ? ScriptFlags.VERIFY_P2SH    : ScriptFlags.VERIFY_NONE) |
+          (verifyWitness ? ScriptFlags.VERIFY_WITNESS  : ScriptFlags.VERIFY_NONE) |
+          (verifyTaproot ? ScriptFlags.VERIFY_TAPROOT  : ScriptFlags.VERIFY_NONE);
 
         let scriptResult;
         if (scriptThreads === 1) {
