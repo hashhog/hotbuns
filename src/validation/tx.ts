@@ -12,6 +12,7 @@
 import { BufferReader, BufferWriter, varIntSize } from "../wire/serialization.js";
 import { hash256, sha256Hash, ecdsaVerify, schnorrVerify, taggedHash } from "../crypto/primitives.js";
 import type { UTXOEntry } from "../storage/database.js";
+import { globalSigCache } from "./sig_cache.js";
 
 /**
  * Script verification flags.
@@ -1500,6 +1501,18 @@ export function verifyInputSignature(
   const input = tx.inputs[inputIndex];
   const scriptPubKey = utxo.scriptPubKey;
 
+  // Sig-cache lookup: if this (txid, inputIndex, flags) triple was already
+  // verified successfully (e.g. during mempool ATMP), skip the secp256k1 work.
+  // This mirrors Core's CachingTransactionSignatureChecker / sigcache.h logic.
+  const cacheKey = {
+    txid: getTxId(tx).toString("hex"),
+    inputIndex,
+    flags: scriptVerifyFlags,
+  };
+  if (globalSigCache.lookup(cacheKey)) {
+    return { valid: true, inputIndex };
+  }
+
   // P2PKH/P2WPKH fast paths previously short-circuited here with a hand-rolled
   // <sig><pubkey> parser that called ecdsaVerify directly.  That bypassed the
   // script interpreter entirely and skipped DERSIG (BIP-66), NULLDUMMY, push-only
@@ -1571,6 +1584,7 @@ export function verifyInputSignature(
       if (!ok) {
         return { valid: false, inputIndex, error: "Taproot verify returned false" };
       }
+      globalSigCache.insert(cacheKey);
       return { valid: true, inputIndex };
     } catch (e) {
       return {
@@ -1650,6 +1664,7 @@ export function verifyInputSignature(
     if (!ok) {
       return { valid: false, inputIndex, error: "Script verify returned false" };
     }
+    globalSigCache.insert(cacheKey);
     return { valid: true, inputIndex };
   } catch (e) {
     return {
