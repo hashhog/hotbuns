@@ -992,3 +992,162 @@ describe("G30 — CHAIN_WORK persisted to DB per block; Core keeps nChainWork me
     // Core never reads 'w' keys — the stored chainwork is invisible to Core
   });
 });
+
+// ---------------------------------------------------------------------------
+// FIX-33 — BLOCK_HAVE_DATA / BLOCK_HAVE_UNDO set after WriteBlock + WriteUndo
+//
+// W109 audit finding: hotbuns side-branch + reorg-intermediate paths stored
+// block/undo bytes but never updated the block index status with BLOCK_HAVE_DATA
+// (8) / BLOCK_HAVE_UNDO (16).  FindMostWorkChain, prune, AssumeUTXO, and
+// crash-recovery all gate on these bits.
+//
+// Fix: ChainDB.buildBlockIndexOrStatusOp ORs bits into an existing record and
+// returns a BatchOperation so the update rides the same atomic batch as the
+// undo write.
+//
+// References:
+//   bitcoin-core/src/chain.h:75-77 — BLOCK_HAVE_DATA=8, BLOCK_HAVE_UNDO=16
+//   bitcoin-core/src/node/blockstorage.cpp:1029 — set HAVE_UNDO after undo write
+//   bitcoin-core/src/validation.cpp:3784 — set HAVE_DATA after position written
+// ---------------------------------------------------------------------------
+describe("FIX-33 — BLOCK_HAVE_DATA / BLOCK_HAVE_UNDO set after WriteBlock+WriteUndo", () => {
+  let tmpDir: string;
+  let db: ChainDB;
+
+  beforeEach(async () => {
+    tmpDir = await makeTmpDir();
+    db = await openDB(tmpDir);
+  });
+
+  afterEach(async () => {
+    await db.close();
+    await rm(tmpDir, { recursive: true });
+  });
+
+  test("BLOCK_HAVE_DATA = 8, BLOCK_HAVE_UNDO = 16 match Core chain.h values", () => {
+    // Core: BLOCK_HAVE_DATA = 8, BLOCK_HAVE_UNDO = 16 (chain.h:75-77)
+    expect(BlockStatus.HAVE_DATA).toBe(8);
+    expect(BlockStatus.HAVE_UNDO).toBe(16);
+    // No slot conflicts: 8 and 16 are not used by any other flag in hotbuns
+    expect(BlockStatus.HEADER_VALID).toBe(1);
+    expect(BlockStatus.TXS_KNOWN).toBe(2);
+    expect(BlockStatus.TXS_VALID).toBe(4);
+    expect(BlockStatus.FAILED_VALID).toBe(32);
+    expect(BlockStatus.FAILED_CHILD).toBe(64);
+    expect(BlockStatus.OPT_WITNESS).toBe(128);
+  });
+
+  test("buildBlockIndexOrStatusOp ORs HAVE_DATA into an existing record", async () => {
+    // Simulate a block index entry written by headers.ts (header-only, no data yet)
+    const hash = makeBlockHash(501);
+    const header = makeHeader(Buffer.alloc(32));
+    await db.putBlockIndex(hash, {
+      height: 10,
+      header,
+      nTx: 0,
+      status: BlockStatus.HEADER_VALID, // only HEADER_VALID — no HAVE_DATA yet
+      dataPos: 0,
+    });
+
+    // After putBlock (side-branch path), we call buildBlockIndexOrStatusOp
+    const op = await db.buildBlockIndexOrStatusOp(hash, BlockStatus.HAVE_DATA);
+    expect(op).not.toBeNull();
+    expect(op!.type).toBe("put");
+    expect(op!.prefix).toBe(DBPrefix.BLOCK_INDEX);
+
+    // Apply the op by writing it directly
+    await db.putBlockIndex(hash, {
+      height: 10,
+      header,
+      nTx: 0,
+      status: BlockStatus.HEADER_VALID | BlockStatus.HAVE_DATA,
+      dataPos: 1,
+    });
+
+    const after = await db.getBlockIndex(hash);
+    expect(after).not.toBeNull();
+    expect(!!(after!.status & BlockStatus.HAVE_DATA)).toBe(true); // HAVE_DATA set
+    expect(!!(after!.status & BlockStatus.HEADER_VALID)).toBe(true); // HEADER_VALID preserved
+    expect(!!(after!.status & BlockStatus.HAVE_UNDO)).toBe(false); // HAVE_UNDO not yet set
+  });
+
+  test("buildBlockIndexOrStatusOp ORs HAVE_DATA|HAVE_UNDO for intermediate reorg block", async () => {
+    // Simulate an intermediate block that gained its block body as a side-branch
+    // and is now being reconnected during a reorg
+    const hash = makeBlockHash(502);
+    const header = makeHeader(Buffer.alloc(32));
+
+    // Initial state: only HEADER_VALID (set by headers.ts)
+    await db.putBlockIndex(hash, {
+      height: 5,
+      header,
+      nTx: 3,
+      status: BlockStatus.HEADER_VALID,
+      dataPos: 0,
+    });
+
+    // After reorg-reconnect: both undo and block body are on disk
+    const op = await db.buildBlockIndexOrStatusOp(
+      hash,
+      BlockStatus.HAVE_DATA | BlockStatus.HAVE_UNDO,
+    );
+    expect(op).not.toBeNull();
+    expect(op!.prefix).toBe(DBPrefix.BLOCK_INDEX);
+
+    // Simulate the batch being applied
+    const existingRecord = await db.getBlockIndex(hash);
+    expect(existingRecord).not.toBeNull();
+    await db.putBlockIndex(hash, {
+      ...existingRecord!,
+      status: existingRecord!.status | BlockStatus.HAVE_DATA | BlockStatus.HAVE_UNDO,
+      dataPos: 1,
+    });
+
+    const after = await db.getBlockIndex(hash);
+    expect(after).not.toBeNull();
+    expect(!!(after!.status & BlockStatus.HAVE_DATA)).toBe(true);  // HAVE_DATA set
+    expect(!!(after!.status & BlockStatus.HAVE_UNDO)).toBe(true);  // HAVE_UNDO set
+    expect(!!(after!.status & BlockStatus.HEADER_VALID)).toBe(true); // HEADER_VALID preserved
+    expect(!!(after!.status & BlockStatus.FAILED_VALID)).toBe(false); // no corruption
+    // Numeric value: 1 | 8 | 16 = 25
+    expect(after!.status).toBe(
+      BlockStatus.HEADER_VALID | BlockStatus.HAVE_DATA | BlockStatus.HAVE_UNDO
+    );
+  });
+
+  test("buildBlockIndexOrStatusOp returns null for non-existent block", async () => {
+    // No block index entry exists — should return null (caller skips the op)
+    const missingHash = makeBlockHash(999);
+    const op = await db.buildBlockIndexOrStatusOp(missingHash, BlockStatus.HAVE_DATA);
+    expect(op).toBeNull();
+  });
+
+  test("updateBlockStatus correctly ORs HAVE_DATA after side-branch putBlock", async () => {
+    // Simulate the side-branch path in sync/blocks.ts:
+    //   1. headers.ts writes HEADER_VALID entry
+    //   2. putBlock writes the raw body to DB
+    //   3. updateBlockStatus ORs in HAVE_DATA
+    const hash = makeBlockHash(503);
+    const header = makeHeader(Buffer.alloc(32));
+
+    // Step 1: header sync writes HEADER_VALID
+    await db.putBlockIndex(hash, {
+      height: 7,
+      header,
+      nTx: 1,
+      status: BlockStatus.HEADER_VALID,
+      dataPos: 0,
+    });
+    const before = await db.getBlockIndex(hash);
+    expect(before!.status & BlockStatus.HAVE_DATA).toBe(0); // HAVE_DATA not set yet
+
+    // Step 2+3: body written, then HAVE_DATA ORed in
+    await db.updateBlockStatus(hash, before!.status | BlockStatus.HAVE_DATA);
+
+    const after = await db.getBlockIndex(hash);
+    expect(after).not.toBeNull();
+    expect(!!(after!.status & BlockStatus.HAVE_DATA)).toBe(true);  // HAVE_DATA now set
+    expect(!!(after!.status & BlockStatus.HEADER_VALID)).toBe(true); // HEADER_VALID preserved
+    expect(!!(after!.status & BlockStatus.HAVE_UNDO)).toBe(false);  // HAVE_UNDO not set (no undo yet)
+  });
+});
