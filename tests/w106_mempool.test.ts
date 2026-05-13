@@ -678,67 +678,96 @@ describe("G14 — RBF Rule 4: incremental relay fee", () => {
   });
 });
 
-describe("G15 — ImprovesFeerateDiagram (BUG-3)", () => {
+describe("G15 — ImprovesFeerateDiagram (BUG-3 FIXED)", () => {
   /**
-   * BUG-3 [P1] — ImprovesFeerateDiagram check is absent.
+   * BUG-3 [P1] — ImprovesFeerateDiagram check implemented.
    *
    * Bitcoin Core 27+ (cluster mempool) requires that an RBF replacement strictly
-   * improves the mempool's feerate diagram (CompareChunks). hotbuns explicitly
-   * defers this with the comment "The ImprovesFeerateDiagram check (Core 27+)
-   * handles the feerate diagram comparison and is deferred (Gate #8)."
+   * improves the mempool's feerate diagram (CompareChunks).  The check is now
+   * wired in as Gate #8 in addTransaction.
    *
-   * A classic adversarial case: a high-feerate parent P with a large low-feerate
-   * child C. Replacement R conflicts with C but has the same absolute fee as C
-   * and a much larger vsize. This passes Rules 3+4 but makes the diagram worse
-   * (P+R is less efficient than P+C when R is big and slow).
+   * Reference: bitcoin-core/src/policy/rbf.cpp:127-138 (ImprovesFeerateDiagram),
+   *            bitcoin-core/src/util/feefrac.cpp:10-73 (CompareChunks).
    *
-   * Without ImprovesFeerateDiagram, R is accepted.
+   * Adversarial test:
+   *   P  — high-feerate root (fee=5_000_000 sats, vsize≈74 vB → ~67_568 sat/vB)
+   *   C  — child of P, small fee (fee=5_000 sats, vsize≈74 vB → ~67.6 sat/vB)
+   *   R  — replacement of C; passes Rules 3+4 but has a MUCH larger vsize (≈191 vB)
+   *         because makeTx adds 10 extra outputs to inflate size.  The increased
+   *         vsize means the P+R diagram at cumvsize=148 is far below P+C at 148.
    *
-   * This test documents the gap. Post-fix: R should be rejected with
-   * "insufficient feerate: does not improve feerate diagram".
+   * Before diagram (P+C): [{5_000_000, 74}, {5_005_000, 148}]
+   * After  diagram (P+R): [{5_000_000, 74}, {5_005_020, 265}]
+   * At cumvsize=148: before=5_005_000, after≈5_001_946 → before better → REJECT.
    */
-  test("G15-BUG: replacement degrading feerate diagram accepted (diagram check absent)", async () => {
-    const fund1 = Buffer.alloc(32, 0xe1);
-    const fund2 = Buffer.alloc(32, 0xe2);
-    await setupUTXO(fund1, 0, 10_000_000n);
-    await setupUTXO(fund2, 0, 10_000_000n);
+  test("G15: replacement degrading feerate diagram is rejected (diagram check enforced)", async () => {
+    const fundP = Buffer.alloc(32, 0xe1);
+    // Fund P with enough to pay a huge fee
+    await setupUTXO(fundP, 0, 100_000_000n);
 
-    // Parent P: high fee rate
+    // P: high feerate root.  vsize ≈ 74 vB.  fee = 5_000_000 sats.
     const txP = makeTxRbfOptIn(
-      [{ txid: fund1, vout: 0 }],
-      [{ value: 9_900_000n }]  // fee 100_000, small vsize → high sat/vB
+      [{ txid: fundP, vout: 0 }],
+      [{ value: 95_000_000n }]   // fee = 100_000_000 - 95_000_000 = 5_000_000
+    );
+    const rP = await mempool.addTransaction(txP);
+    expect(rP.accepted).toBe(true);
+    const txPid = getTxId(txP);
+
+    // C: child of P, small fee (5_000 sats), vsize ≈ 74 vB.
+    const txC = makeTxRbfOptIn(
+      [{ txid: txPid, vout: 0 }],
+      [{ value: 94_995_000n }]   // fee = 95_000_000 - 94_995_000 = 5_000
+    );
+    const rC = await mempool.addTransaction(txC);
+    expect(rC.accepted).toBe(true);
+
+    // R: conflicts with C (spends same P output).  Has 10 custom outputs to
+    // inflate vsize to ≈ 191 vB.  Fee = 5_020 (passes Rule 3: 5020 ≥ 5000,
+    // passes Rule 4: additionalFee=20 ≥ ceil(0.1 * 191)=20).
+    //
+    // At cumvsize=148 (end of P+C chunk):
+    //   before = 5_005_000
+    //   after  ≈ 5_000_000 + 74/191 * 5_020 ≈ 5_001_946  →  before > after → REJECT
+    const txR = makeTxRbfOptIn(
+      [{ txid: txPid, vout: 0 }],
+      // 10 outputs, sum = 94_994_980 → fee = 95_000_000 - 94_994_980 = 5_020
+      Array.from({ length: 10 }, () => ({ value: 9_499_498n }))
+    );
+    const rR = await mempool.addTransaction(txR);
+
+    // POST-FIX: rejected because the feerate diagram is not improved.
+    expect(rR.accepted).toBe(false);
+    expect(rR.error).toMatch(/feerate diagram|insufficient feerate/i);
+  });
+
+  test("G15: replacement genuinely improving feerate diagram is accepted", async () => {
+    const fundP = Buffer.alloc(32, 0xe3);
+    await setupUTXO(fundP, 0, 10_000_000n);
+
+    // P: moderate feerate root.
+    const txP = makeTxRbfOptIn(
+      [{ txid: fundP, vout: 0 }],
+      [{ value: 9_000_000n }]   // fee = 1_000_000
     );
     await mempool.addTransaction(txP);
     const txPid = getTxId(txP);
 
-    // Child C: spends P, low absolute fee but satisfies minimum
+    // C: child of P, very low fee.
     const txC = makeTxRbfOptIn(
       [{ txid: txPid, vout: 0 }],
-      [{ value: 9_800_000n }]  // fee 100_000
+      [{ value: 8_999_000n }]   // fee = 1_000
     );
     await mempool.addTransaction(txC);
 
-    // Replacement R: double-spends fund2 (not P's output) but conflicts with C indirectly
-    // via spending same inputs is impossible without conflicting with P.
-    // Simpler: R double-spends txC's input (P output) with same fee but much higher fee for test.
-    // Let R pay higher fee to pass Rules 3+4:
+    // R: replacement with significantly higher fee (500_000 > 1_000), same vsize.
+    // After diagram is clearly better everywhere.
     const txR = makeTxRbfOptIn(
       [{ txid: txPid, vout: 0 }],
-      [{ value: 9_700_000n }]  // fee 200_000 > txC's 100_000 → passes R3+R4
+      [{ value: 8_500_000n }]   // fee = 500_000 >> 1_000 → improves diagram
     );
     const rR = await mempool.addTransaction(txR);
-
-    // CURRENT BUGGY BEHAVIOUR: accepted because feerate diagram not checked.
-    // POST-FIX: whether accepted depends on whether the cluster diagram improved.
-    // For this test, R pays more absolute fee, so it would likely pass the diagram check too.
-    // A more precise test would construct a case where R passes R3+R4 but fails the diagram —
-    // that requires a complex cluster with many txs where R fragments the optimal chunk.
-    // For now document that the gate is absent via the code comment check.
     expect(rR.accepted).toBe(true);
-
-    // The key documentation: assert ImprovesFeerateDiagram is not called:
-    // (The test above would fail if diagram check incorrectly rejected a valid improvement.)
-    // The bug is that it's also absent for adversarial replacements — no regression yet.
   });
 });
 
