@@ -197,8 +197,11 @@ const MAX_STALL_TIMEOUT = 300000;
 /** Interval for progress logging (milliseconds). */
 const LOG_INTERVAL = 10000;
 
-/** Maximum items per getdata message. */
-const MAX_GETDATA_ITEMS = 50000;
+/** Maximum items per getdata message.
+ *  Mirrors Bitcoin Core net_processing.cpp:128 MAX_GETDATA_SZ = 1000.
+ *  Using the INV cap (50000) here caused 50× bandwidth amplification on
+ *  inv→getdata fan-out. */
+const MAX_GETDATA_ITEMS = 1000;
 
 /** Maximum downloaded blocks buffered in memory before throttling requests.
  *  At mainnet heights (500K+), blocks average 2-4MB serialized but expand to
