@@ -21,6 +21,8 @@ import { compactToBigInt, bigIntToCompact, getBlockSubsidy } from "../consensus/
 import {
   VersionBitsCache,
   buildBlockIndex,
+  DeploymentState,
+  getStateFor,
   MAINNET_DEPLOYMENTS,
   TESTNET4_DEPLOYMENTS,
   REGTEST_DEPLOYMENTS,
@@ -4904,12 +4906,61 @@ export class RPCServer {
     // Core: versionbits.cpp:265-279 ComputeBlockVersion.
     const blockVersion = this.computeNextBlockVersion(bestBlock.height);
 
+    // Build GBT rules array.
+    // Core (mining.cpp:950-963): csv always present; !segwit and taproot added
+    // when segwit is active (!fPreSegWit).  Taproot is active when the new block
+    // height is >= taprootHeight (height-based buried deployment).
+    // Fix W108 G4 + G20: taproot was never added even on REGTEST (taprootHeight=0).
+    const gbtRules: string[] = ["csv"];
+    const fPreSegWit = height < this.params.segwitHeight;
+    if (!fPreSegWit) {
+      gbtRules.push("!segwit");
+      if (height >= this.params.taprootHeight) {
+        gbtRules.push("taproot");
+      }
+    }
+
+    // Build vbavailable from STARTED/LOCKED_IN BIP9 deployments.
+    // Core (mining.cpp:965-983): iterates gbtstatus.signalling + locked_in and
+    // populates vbavailable with {ruleName: bitNumber}.
+    // Fix W108 G19: was always hardcoded {}.
+    const vbavailable: Record<string, number> = {};
+    if (parentEntry) {
+      const deployments = this.getVersionBitsDeployments();
+      const pindexPrevForVb = buildBlockIndex(
+        {
+          hash: parentEntry.hash,
+          height: parentEntry.height,
+          version: parentEntry.header.version,
+          medianTimePast: this.headerSync.getMedianTimePast(parentEntry),
+        },
+        (h: number) => {
+          const e = this.headerSync.getHeaderByHeight?.(h);
+          if (!e) return undefined;
+          return {
+            hash: e.hash,
+            height: e.height,
+            version: e.header.version,
+            medianTimePast: this.headerSync.getMedianTimePast(e),
+          };
+        }
+      );
+      // Use a local state-cache to avoid polluting the shared versionBitsCache.
+      const localCache = new Map<string | null, DeploymentState>();
+      for (const [name, deployment] of deployments) {
+        const state = getStateFor(pindexPrevForVb, deployment, localCache);
+        if (state === DeploymentState.Started || state === DeploymentState.LockedIn) {
+          vbavailable[name] = deployment.bit;
+        }
+      }
+    }
+
     // Build the result
     const result: Record<string, unknown> = {
       capabilities: ["proposal"],
       version: blockVersion,
-      rules: ["csv", "!segwit"],
-      vbavailable: {},
+      rules: gbtRules,
+      vbavailable,
       vbrequired: 0,
       previousblockhash,
       transactions,

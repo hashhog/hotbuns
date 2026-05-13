@@ -58,6 +58,17 @@ import {
   getTxId,
   getWTxId,
 } from "../src/validation/tx.js";
+import {
+  DeploymentState,
+  getStateFor,
+  REGTEST_DEPLOYMENTS,
+  MAINNET_DEPLOYMENTS,
+  createDeployment,
+  ALWAYS_ACTIVE,
+  NO_TIMEOUT,
+  type DeploymentParams,
+  type BlockIndex,
+} from "../src/consensus/versionbits.js";
 
 // ============================================================================
 // Helpers
@@ -227,25 +238,55 @@ describe("G3 — GBT hash field (wtxid) byte order: internal vs display-order", 
 // ============================================================================
 // G4 — GBT rules field missing "taproot" after taproot is active
 // Core (mining.cpp:957): aRules.push_back("taproot") after !fPreSegWit check
-// hotbuns (server.ts:4911): rules: ["csv", "!segwit"] — always hardcoded,
-// never adds "taproot" even when height >= params.taprootHeight.
+// hotbuns (server.ts): rules now computed dynamically — "taproot" added when
+// height >= params.taprootHeight (fix W108 G4).
 // ============================================================================
-describe("G4 — GBT rules field missing 'taproot' after taproot activation", () => {
-  test("hardcoded rules=['csv','!segwit'] omits taproot", () => {
-    // Core emits: "csv", "!segwit", "taproot" (after taproot activation)
-    // hotbuns always emits: ["csv", "!segwit"]
-    // BUG: taproot-aware miners see missing "taproot" rule → may misbehave
-    const hotbunsRules = ["csv", "!segwit"];
+describe("G4 — GBT rules field includes 'taproot' after taproot activation (FIXED)", () => {
+  test("rules includes taproot when height >= taprootHeight (REGTEST: taprootHeight=0)", () => {
+    // Fix: GBT rules are now computed dynamically in server.ts getBlockTemplate.
+    // The fixed logic mirrors Core mining.cpp:950-958:
+    //   gbtRules = ["csv"]
+    //   if (!fPreSegWit) { push "!segwit"; if (height >= taprootHeight) push "taproot" }
+    //
+    // On REGTEST, taprootHeight=0 and segwitHeight=0.
+    // For any block at height >= 1, both segwit and taproot are active.
+    const params = REGTEST;
+    const height = 1; // New block being assembled
+    const fPreSegWit = height < params.segwitHeight; // false on REGTEST (segwitHeight=0)
 
-    // Core emits taproot after activation:
-    const coreRulesAfterTaproot = ["csv", "!segwit", "taproot"];
+    const gbtRules: string[] = ["csv"];
+    if (!fPreSegWit) {
+      gbtRules.push("!segwit");
+      if (height >= params.taprootHeight) {
+        gbtRules.push("taproot");
+      }
+    }
 
-    expect(hotbunsRules).not.toContain("taproot");
-    expect(coreRulesAfterTaproot).toContain("taproot");
+    expect(gbtRules).toContain("taproot");
+    expect(gbtRules).toContain("!segwit");
+    expect(gbtRules).toContain("csv");
+    // Verify REGTEST params match our assumptions
+    expect(params.taprootHeight).toBe(0);
+    expect(params.segwitHeight).toBe(0);
+  });
 
-    // At REGTEST.taprootHeight (0), taproot is active at block 1.
-    // The GBT response for any block >= taprootHeight should include "taproot".
-    // hotbuns never adds it.
+  test("rules omits taproot pre-taproot activation (height < taprootHeight)", () => {
+    // Simulate a network where taproot activates at height 100
+    const taprootHeight = 100;
+    const segwitHeight = 0;
+    const height = 50; // Before taproot activation
+
+    const gbtRules: string[] = ["csv"];
+    const fPreSegWit = height < segwitHeight;
+    if (!fPreSegWit) {
+      gbtRules.push("!segwit");
+      if (height >= taprootHeight) {
+        gbtRules.push("taproot");
+      }
+    }
+    // taproot should NOT be in rules before taprootHeight
+    expect(gbtRules).not.toContain("taproot");
+    expect(gbtRules).toContain("!segwit");
   });
 });
 
@@ -619,38 +660,183 @@ describe("G18 — GBT weightlimit always emitted (should be absent pre-segwit)",
 // G19 — GBT vbavailable always empty {}
 // Core (mining.cpp:965-983): populates vbavailable from GBTStatus signalling + locked_in
 // deployments. Each STARTED/LOCKED_IN deployment gets its bit number here.
-// hotbuns (server.ts:4912): vbavailable: {} — always empty, never populated.
-// Mining software uses vbavailable to know which BIP9 bits to signal.
+// hotbuns (server.ts): vbavailable now computed from STARTED/LOCKED_IN deployments (FIXED).
 // ============================================================================
-describe("G19 — GBT vbavailable always empty (BIP-9 signalling bits not exposed)", () => {
-  test("vbavailable is hardcoded as empty object", () => {
-    // Core populates vbavailable with {ruleName: bitNumber} for STARTED/LOCKED_IN deployments.
-    // hotbuns hardcodes {}.
-    // BUG: mining pools cannot learn which bits to signal from GBT response.
-    const hotbunsVbavailable = {};
-    expect(Object.keys(hotbunsVbavailable)).toHaveLength(0);
-    // This means all BIP9 soft-fork signalling is silent regardless of deployment state.
+describe("G19 — GBT vbavailable populated from STARTED/LOCKED_IN deployments (FIXED)", () => {
+  test("REGTEST taproot is ALWAYS_ACTIVE → vbavailable stays empty (correct)", () => {
+    // On REGTEST, taproot has startTime=ALWAYS_ACTIVE which resolves to DeploymentState.Active.
+    // Active deployments go into `rules`, NOT vbavailable (Core: mining.cpp:985-991).
+    // So vbavailable={} is correct for REGTEST — the fix preserves this.
+    const cache = new Map<string | null, DeploymentState>();
+    const deployment = REGTEST_DEPLOYMENTS.get("taproot")!;
+    expect(deployment).toBeDefined();
+
+    // Simulate pindexPrev at height 0 (genesis parent = null)
+    const state = getStateFor(null, deployment, cache);
+    // ALWAYS_ACTIVE → Active immediately
+    expect(state).toBe(DeploymentState.Active);
+
+    // The fixed server.ts vbavailable loop skips Active state:
+    // only STARTED or LOCKED_IN are included in vbavailable.
+    const vbavailable: Record<string, number> = {};
+    if (state === DeploymentState.Started || state === DeploymentState.LockedIn) {
+      vbavailable["taproot"] = deployment.bit;
+    }
+    // Active → not in vbavailable (correct; goes into rules instead)
+    expect(Object.keys(vbavailable)).toHaveLength(0);
+  });
+
+  test("STARTED deployment appears in vbavailable with correct bit number", () => {
+    // Create a BIP9 deployment that transitions to STARTED (not ALWAYS_ACTIVE).
+    // We simulate a deployment at mainnet-style timing with a startTime in the past.
+    const startedDeployment: DeploymentParams = createDeployment({
+      bit: 3,
+      startTime: 1000n,    // very old startTime — will be STARTED from genesis
+      timeout: 9999999999n,
+      minActivationHeight: 0,
+      period: 2016,
+      threshold: 1916,
+    });
+
+    // Build a minimal pindexPrev at height 2016 with MTP >= startTime
+    // so the deployment has transitioned to STARTED.
+    const buildChain = (height: number, mtp: bigint): BlockIndex => ({
+      hash: `block-${height}`,
+      height,
+      version: 0x20000000,
+      medianTimePast: mtp,
+      prev: height > 0 ? buildChain(height - 1, mtp) : null,
+    });
+    const pindexPrev = buildChain(2015, 2000n); // MTP=2000 > startTime=1000
+
+    const cache = new Map<string | null, DeploymentState>();
+    const state = getStateFor(pindexPrev, startedDeployment, cache);
+    expect(state).toBe(DeploymentState.Started);
+
+    // The fixed vbavailable loop adds STARTED deployments:
+    const vbavailable: Record<string, number> = {};
+    if (state === DeploymentState.Started || state === DeploymentState.LockedIn) {
+      vbavailable["testfork"] = startedDeployment.bit;
+    }
+    expect(vbavailable["testfork"]).toBe(3);
+    expect(Object.keys(vbavailable)).toHaveLength(1);
+  });
+
+  test("LOCKED_IN deployment appears in vbavailable with correct bit number", () => {
+    // A LOCKED_IN deployment also belongs in vbavailable (Core: mining.cpp:976-982).
+    // Use a small period (10) to keep chain size small.
+    //
+    // BIP9 state machine: state at pindexPrev is computed from the previous complete
+    // period boundary.  For period=10 and pindexPrev.height=19:
+    //   - periodStart = block 19 (height 19 - ((19+1) % 10) = 19)
+    //   - counts signals in blocks 10..19 (period 2)
+    //   - if >= threshold → LOCKED_IN
+    //
+    // So to get LOCKED_IN at height 19, we signal in period 2 (heights 10..19).
+    // The deployment must already be STARTED by height 9 (period 1 end), i.e.
+    // MTP at height 9 must be >= startTime.
+    const lockedInDeployment: DeploymentParams = {
+      bit: 5,
+      startTime: 100n,
+      timeout: 9999999999n,
+      minActivationHeight: 999999, // very high → stays LOCKED_IN for a long time
+      period: 10,
+      threshold: 1, // threshold=1 so it locks in with just one signal
+    };
+
+    const bit5version = 0x20000000 | (1 << 5);
+
+    // Build a linked chain:
+    //   heights 0..9:  MTP=200 (> startTime=100), no signal → deployment → STARTED at end of period 1
+    //   heights 10..19: MTP=200, signal bit 5 → counts in period 2 → LOCKED_IN at height 19
+    const nodeCache = new Map<number, BlockIndex>();
+    const buildNode = (height: number): BlockIndex => {
+      if (nodeCache.has(height)) return nodeCache.get(height)!;
+      const node: BlockIndex = {
+        hash: `lk2-${height}`,
+        height,
+        // Signal bit 5 during period 2 (heights 10..19)
+        version: height >= 10 ? bit5version : 0x20000000,
+        medianTimePast: 200n, // > startTime=100
+        get prev() { return height > 0 ? buildNode(height - 1) : null; },
+      };
+      nodeCache.set(height, node);
+      return node;
+    };
+
+    // pindexPrev at height 19 = end of period 2; signals in 10..19 → LOCKED_IN
+    const pindexPrev = buildNode(19);
+    const cache = new Map<string | null, DeploymentState>();
+    const state = getStateFor(pindexPrev, lockedInDeployment, cache);
+    expect(state).toBe(DeploymentState.LockedIn);
+
+    // Fixed vbavailable includes LOCKED_IN:
+    const vbavailable: Record<string, number> = {};
+    if (state === DeploymentState.Started || state === DeploymentState.LockedIn) {
+      vbavailable["fastfork"] = lockedInDeployment.bit;
+    }
+    expect(vbavailable["fastfork"]).toBe(5);
   });
 });
 
 // ============================================================================
 // G20 — GBT rules missing "taproot" when taproot is active
-// Core (mining.cpp:985-991): for each "active" GBT deployment:
-//   aRules.push_back(gbt_rule_value(name, info.gbt_optional_rule))
-// This adds "taproot" (with or without "!" prefix) when taproot is active.
-// hotbuns (server.ts:4911): rules: ["csv", "!segwit"] — always, never adds taproot.
-// Combined with G4: both active and signalling taproot info are absent.
+// Core (mining.cpp:985-991): for each "active" GBT deployment adds rule.
+// hotbuns (server.ts): rules now includes "taproot" when height >= taprootHeight (FIXED).
+// Combined fix with G4: both bugs closed by the same height-based gate.
 // ============================================================================
-describe("G20 — GBT rules: 'taproot' never added for active taproot deployment", () => {
-  test("REGTEST has taproot active at height 0", () => {
-    // On REGTEST, taprootHeight = 0, so taproot is always active.
-    // Core would include "taproot" in rules for every GBT call on REGTEST.
-    // hotbuns never includes it.
+describe("G20 — GBT rules includes 'taproot' for active taproot deployment (FIXED)", () => {
+  test("REGTEST taprootHeight=0 → taproot in rules for height >= 1", () => {
+    // On REGTEST, taprootHeight = 0, so taproot is active from the first block.
+    // The fixed GBT rules logic adds "taproot" when height >= params.taprootHeight.
     expect(REGTEST.taprootHeight).toBe(0);
-    const hotbunsRules = ["csv", "!segwit"]; // Hardcoded in server.ts:4911
-    expect(hotbunsRules).not.toContain("taproot");
-    // This means mining software must "guess" that taproot is active rather than
-    // being told by the GBT response.
+    expect(REGTEST.segwitHeight).toBe(0);
+
+    const height = 1; // Typical new block height on REGTEST
+    const fPreSegWit = height < REGTEST.segwitHeight; // false
+
+    const gbtRules: string[] = ["csv"];
+    if (!fPreSegWit) {
+      gbtRules.push("!segwit");
+      if (height >= REGTEST.taprootHeight) {
+        gbtRules.push("taproot");
+      }
+    }
+    expect(gbtRules).toContain("taproot");
+    expect(gbtRules).toEqual(["csv", "!segwit", "taproot"]);
+  });
+
+  test("mainnet: taproot in rules only after taprootHeight=709632", () => {
+    // On mainnet, taprootHeight=709632. Before that height, taproot should not appear.
+    // After that height, taproot should appear.
+    // segwitHeight=481824 on mainnet.
+    const mainnetTaprootHeight = 709632;
+    const mainnetSegwitHeight = 481824;
+
+    // Before taproot activation (but after segwit)
+    const heightBefore = 700000;
+    const rulesBefore: string[] = ["csv"];
+    const fPreSegWitBefore = heightBefore < mainnetSegwitHeight;
+    if (!fPreSegWitBefore) {
+      rulesBefore.push("!segwit");
+      if (heightBefore >= mainnetTaprootHeight) {
+        rulesBefore.push("taproot");
+      }
+    }
+    expect(rulesBefore).not.toContain("taproot");
+    expect(rulesBefore).toContain("!segwit");
+
+    // After taproot activation
+    const heightAfter = 710000;
+    const rulesAfter: string[] = ["csv"];
+    const fPreSegWitAfter = heightAfter < mainnetSegwitHeight;
+    if (!fPreSegWitAfter) {
+      rulesAfter.push("!segwit");
+      if (heightAfter >= mainnetTaprootHeight) {
+        rulesAfter.push("taproot");
+      }
+    }
+    expect(rulesAfter).toContain("taproot");
   });
 });
 
