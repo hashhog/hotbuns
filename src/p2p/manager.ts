@@ -247,6 +247,55 @@ export function isLocalAddress(addr: string): boolean {
 }
 
 /**
+ * Check if an IPv4 address string is publicly routable on the global internet.
+ *
+ * Mirrors Bitcoin Core CNetAddr::IsRoutable() / netaddress.cpp.
+ * Rejects:
+ *   RFC1918  — 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+ *   RFC2544  — 198.18.0.0/15  (benchmarking)
+ *   RFC3927  — 169.254.0.0/16 (link-local / APIPA)
+ *   RFC6598  — 100.64.0.0/10  (shared address space)
+ *   RFC5737  — 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 (documentation)
+ *   Loopback — 0.0.0.0/8, 127.0.0.0/8
+ *
+ * Core ref: addrman.cpp AddSingle() `if (!addr.IsRoutable()) return false;`
+ *           netaddress.cpp CNetAddr::IsRoutable()
+ */
+export function isRoutable(addr: string): boolean {
+  const parts = addr.split(".");
+  if (parts.length !== 4) return false; // Only IPv4 handled here
+
+  const [a, b, c] = parts.map(Number);
+  if (parts.some((p) => isNaN(Number(p)) || Number(p) < 0 || Number(p) > 255)) {
+    return false;
+  }
+
+  // Loopback / unspecified (IsLocal): 127.0.0.0/8 and 0.0.0.0/8
+  if (a === 127 || a === 0) return false;
+
+  // RFC1918 — private ranges
+  if (a === 10) return false;
+  if (a === 172 && b >= 16 && b <= 31) return false;
+  if (a === 192 && b === 168) return false;
+
+  // RFC2544 — benchmarking: 198.18.0.0/15
+  if (a === 198 && (b === 18 || b === 19)) return false;
+
+  // RFC3927 — link-local: 169.254.0.0/16
+  if (a === 169 && b === 254) return false;
+
+  // RFC6598 — shared address space: 100.64.0.0/10
+  if (a === 100 && b >= 64 && b <= 127) return false;
+
+  // RFC5737 — documentation ranges
+  if (a === 192 && b === 0 && c === 2) return false;
+  if (a === 198 && b === 51 && c === 100) return false;
+  if (a === 203 && b === 0 && c === 113) return false;
+
+  return true;
+}
+
+/**
  * Candidate for eviction from inbound slots.
  * Contains metadata needed for the eviction algorithm.
  */
@@ -1526,6 +1575,10 @@ export class PeerManager {
 
       const ip = bufferToIPv4(entry.addr.ip);
       if (!ip) continue; // Skip non-IPv4 addresses
+
+      // Reject non-routable addresses (RFC1918, loopback, link-local, etc.)
+      // Core: addrman.cpp AddSingle() `if (!addr.IsRoutable()) return false;`
+      if (!isRoutable(ip)) continue;
 
       const key = `${ip}:${entry.addr.port}`;
 
