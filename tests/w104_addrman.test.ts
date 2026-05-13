@@ -555,15 +555,32 @@ describe("G12 — ADDRMAN_MAX_FAILURES = 10 guard", () => {
  */
 describe("G13 — CSPRNG for all randomness in addrman / peer selection", () => {
   test("address shuffle in resolveDNSSeeds uses crypto.getRandomValues, not Math.random", () => {
-    // POST-FIX: the DNS seed shuffle should use a CSPRNG.
-    // We test that Math.random is not the sole source by checking that a
-    // CSPRNG-based helper exists.
+    // FIXED: Math.random() replaced with this.secureRandInt() in manager.ts.
+    // secureRandInt() uses crypto.randomBytes() (CSPRNG) for all AddrMan-related
+    // shuffles: resolveDNSSeeds(), maintainConnections(), relayAddrToRandomPeers().
     const pm = new PeerManager(makeConfig());
-    const hasSecureRand = typeof (pm as any).secureRandInt === "function"
-      || typeof (pm as any).insecureRand === "function";
-    // This is a structural check; the real fix is replacing Math.random calls.
-    // For now this verifies the intent is documented.
-    expect(hasSecureRand).toBe(true); // BUG-13
+    // Assert the CSPRNG helper exists and returns values in range.
+    expect(typeof (pm as any).secureRandInt).toBe("function"); // BUG-13 fixed
+    const fn: (n: number) => number = (pm as any).secureRandInt.bind(pm);
+    // secureRandInt(n) must return [0, n)
+    for (let i = 0; i < 20; i++) {
+      const v = fn(10);
+      expect(v).toBeGreaterThanOrEqual(0);
+      expect(v).toBeLessThan(10);
+    }
+    // Returns 0 for n <= 0 (guard)
+    expect(fn(0)).toBe(0);
+  });
+
+  test("secureRandInt produces distinct values (not constant / degenerate)", () => {
+    // Regression: Math.random() was used; verify CSPRNG produces spread.
+    const pm = new PeerManager(makeConfig());
+    const fn: (n: number) => number = (pm as any).secureRandInt.bind(pm);
+    const seen = new Set<number>();
+    for (let i = 0; i < 50; i++) seen.add(fn(100));
+    // With 50 draws over [0,100) a degenerate constant returns 1 unique value.
+    // A real CSPRNG should easily produce ≥10 distinct values.
+    expect(seen.size).toBeGreaterThanOrEqual(10);
   });
 });
 

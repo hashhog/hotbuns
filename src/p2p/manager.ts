@@ -37,6 +37,7 @@ import {
   MAX_MONEY,
   FEEFILTER_VERSION,
 } from "./feefilter.js";
+import { randomBytes } from "node:crypto";
 
 /**
  * Maximum number of addresses retained in the v1-only fallback cache.
@@ -426,6 +427,23 @@ export class PeerManager {
   }
 
   /**
+   * Return a cryptographically secure random integer in [0, n).
+   *
+   * Uses crypto.randomBytes() (CSPRNG) rather than Math.random().
+   * Reference: Bitcoin Core FastRandomContext (random.h).
+   *
+   * This is the equivalent of Core's insecure_rand() used throughout
+   * AddrMan for shuffling, peer selection, and bucket assignment.
+   */
+  secureRandInt(n: number): number {
+    if (n <= 0) return 0;
+    // Draw 4 bytes from the OS CSPRNG and interpret as unsigned 32-bit BE.
+    const val = randomBytes(4).readUInt32BE(0);
+    // Modulo bias is negligible for small n relative to 2^32.
+    return val % n;
+  }
+
+  /**
    * Mark `addr` (host:port key) as v1-only — future outbound attempts
    * skip the v2 probe and go straight to v1.  Bounded at
    * {@link V1_ONLY_CACHE_MAX} entries; oldest insertion is dropped on
@@ -651,9 +669,9 @@ export class PeerManager {
       }
     }
 
-    // Shuffle addresses using Fisher-Yates
+    // Shuffle addresses using Fisher-Yates (CSPRNG — Core: FastRandomContext)
     for (let i = addresses.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
+      const j = this.secureRandInt(i + 1);
       [addresses[i], addresses[j]] = [addresses[j], addresses[i]];
     }
 
@@ -987,8 +1005,8 @@ export class PeerManager {
     // Periodically ask connected peers for more addresses
     const connectedPeers = this.getConnectedPeers();
     if (connectedPeers.length > 0 && this.knownAddresses.size < 1000) {
-      // Ask a random peer for addresses
-      const randomPeer = connectedPeers[Math.floor(Math.random() * connectedPeers.length)];
+      // Ask a random peer for addresses (CSPRNG — Core: FastRandomContext)
+      const randomPeer = connectedPeers[this.secureRandInt(connectedPeers.length)];
       randomPeer.send({ type: "getaddr", payload: null });
     }
 
@@ -2335,9 +2353,9 @@ export class PeerManager {
     }
     if (candidates.length === 0) return;
 
-    // Shuffle and pick up to 2
+    // Shuffle and pick up to 2 (CSPRNG — Core: FastRandomContext)
     for (let i = candidates.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
+      const j = this.secureRandInt(i + 1);
       [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
     }
     const targets = candidates.slice(0, Math.min(2, candidates.length));
