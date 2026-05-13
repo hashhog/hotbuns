@@ -329,25 +329,20 @@ describe("G4: mempool response inv cap = 50000", () => {
 // G5 — getdata batch cap: blocks.ts MAX_GETDATA_ITEMS = 50000, not 1000 (BUG-3)
 // ---------------------------------------------------------------------------
 
-describe("G5: getdata batch cap MAX_GETDATA_SZ — BUG: 50000 instead of 1000 (BUG-3)", () => {
-  test("BUG-3: BlockSync MAX_GETDATA_ITEMS is 50000, not Core's 1000", () => {
+describe("G5: getdata batch cap MAX_GETDATA_SZ = 1000 (BUG-3 fixed)", () => {
+  test("BUG-3 fixed: BlockSync MAX_GETDATA_ITEMS is Core's 1000, not 50000", () => {
     // Core net_processing.cpp:128: static const unsigned int MAX_GETDATA_SZ = 1000;
-    // blocks.ts: const MAX_GETDATA_ITEMS = 50000;
-    // This means hotbuns sends up to 50000 block hashes in one getdata — 50× Core's limit.
-    const { BlockSync } = require("../sync/blocks.js");
-    const proto = BlockSync.prototype as any;
-    const src = proto.sendGetData?.toString() ?? "";
-    // sendGetData batches by MAX_GETDATA_ITEMS; verify the constant in source:
+    // Previously blocks.ts had MAX_GETDATA_ITEMS = 50000 — 50× bandwidth amplification.
+    // Fixed: MAX_GETDATA_ITEMS = 1000.
     const blocksModSrc = require("fs")
       .readFileSync(require.resolve("../sync/blocks.js"), "utf8")
       .toString();
     const match = blocksModSrc.match(/MAX_GETDATA_ITEMS\s*=\s*(\d+)/);
-    if (match) {
-      const val = parseInt(match[1], 10);
-      // BUG-3: value is 50000, not CORE_MAX_GETDATA_SZ (1000)
-      expect(val).not.toBe(CORE_MAX_GETDATA_SZ);
-      expect(val).toBe(50_000);
-    }
+    expect(match).not.toBeNull();
+    const val = parseInt(match![1], 10);
+    // Assert fixed: value must be 1000, not 50000
+    expect(val).toBe(CORE_MAX_GETDATA_SZ);
+    expect(val).toBe(1000);
   });
 
   test("Core MAX_GETDATA_SZ = 1000 (reference value)", () => {
