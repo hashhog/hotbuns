@@ -1878,8 +1878,28 @@ export class Mempool {
       // NOTE: No per-conflict fee-rate comparison. Bitcoin Core (policy/rbf.cpp)
       // does NOT require the replacement's fee rate to exceed every individual
       // conflicting tx's fee rate — only the absolute and incremental fee gates
-      // above apply. The ImprovesFeerateDiagram check (Core 27+) handles the
-      // feerate diagram comparison and is deferred (Gate #8).
+      // above apply.
+
+      // Gate #8 / ImprovesFeerateDiagram (Core 27+ cluster mempool).
+      // Reference: bitcoin-core/src/policy/rbf.cpp:127-138 (ImprovesFeerateDiagram),
+      //            bitcoin-core/src/util/feefrac.cpp:10-73 (CompareChunks).
+      //
+      // The replacement must strictly improve the mempool's feerate diagram.
+      // "Before" = linearize(affected cluster); "After" = same cluster minus
+      // conflicts plus replacement.  After must dominate Before at every
+      // cumulative-vsize boundary (CompareChunks(after, before) > 0).
+      {
+        const diagramErr = this.improvesFeerateDiagram(
+          txid.toString("hex"),
+          fee,
+          vsize,
+          parentTxids,
+          conflictsToEvict,
+        );
+        if (diagramErr !== null) {
+          return { accepted: false, error: diagramErr };
+        }
+      }
     }
 
     // 9a. Check TRUC (v3) policy rules
@@ -3657,6 +3677,263 @@ export class Mempool {
     if (lhs > rhs) return 1;
     if (lhs < rhs) return -1;
     return 0;
+  }
+
+  // ─── ImprovesFeerateDiagram helpers ────────────────────────────────────────
+
+  /**
+   * Produce the cumulative feerate diagram (list of {totalFee, totalVsize}
+   * points in ascending vsize order) from a linearized cluster.
+   *
+   * Each element is the *cumulative* fee and vsize at the end of that chunk
+   * (i.e. the diagram is the staircase of chunk endpoints).
+   *
+   * Reference: bitcoin-core/src/util/feefrac.h / cluster_linearize.h —
+   * FeeFrac-based cumulative diagram used by CompareChunks.
+   */
+  private linearizeVirtualCluster(
+    virtualEntries: Map<string, { fee: bigint; vsize: number; dependsOn: Set<string> }>,
+  ): Array<{ cumFee: bigint; cumVsize: number }> {
+    if (virtualEntries.size === 0) return [];
+
+    // Topological sort using Kahn's algorithm over the virtual entries.
+    const inDegree = new Map<string, number>();
+    const children = new Map<string, Set<string>>();
+    for (const txidHex of virtualEntries.keys()) {
+      inDegree.set(txidHex, 0);
+      children.set(txidHex, new Set());
+    }
+    for (const [txidHex, e] of virtualEntries) {
+      for (const parentHex of e.dependsOn) {
+        if (virtualEntries.has(parentHex)) {
+          inDegree.set(txidHex, (inDegree.get(txidHex) ?? 0) + 1);
+          children.get(parentHex)!.add(txidHex);
+        }
+      }
+    }
+    const queue: string[] = [];
+    for (const [txidHex, deg] of inDegree) {
+      if (deg === 0) queue.push(txidHex);
+    }
+    // Deterministic order: sort by feerate desc so high-feerate roots come first
+    queue.sort((a, b) => {
+      const ea = virtualEntries.get(a)!;
+      const eb = virtualEntries.get(b)!;
+      const lhs = ea.fee * BigInt(eb.vsize);
+      const rhs = eb.fee * BigInt(ea.vsize);
+      return lhs > rhs ? -1 : lhs < rhs ? 1 : 0;
+    });
+    const topoOrder: string[] = [];
+    while (queue.length > 0) {
+      const cur = queue.shift()!;
+      topoOrder.push(cur);
+      const sortedKids = Array.from(children.get(cur)!);
+      for (const child of sortedKids) {
+        const nd = (inDegree.get(child) ?? 0) - 1;
+        inDegree.set(child, nd);
+        if (nd === 0) queue.push(child);
+      }
+      queue.sort((a, b) => {
+        const ea = virtualEntries.get(a)!;
+        const eb = virtualEntries.get(b)!;
+        const lhs = ea.fee * BigInt(eb.vsize);
+        const rhs = eb.fee * BigInt(ea.vsize);
+        return lhs > rhs ? -1 : lhs < rhs ? 1 : 0;
+      });
+    }
+
+    // Greedy chunk-merging (same algorithm as linearizeCluster).
+    interface VChunk { fee: bigint; vsize: number }
+    const chunks: VChunk[] = [];
+    const chunkMergeable = (a: VChunk, b: VChunk): boolean => {
+      // a has higher feerate than b iff a.fee * b.vsize > b.fee * a.vsize
+      return a.fee * BigInt(b.vsize) > b.fee * BigInt(a.vsize);
+    };
+    for (const txidHex of topoOrder) {
+      const e = virtualEntries.get(txidHex)!;
+      let cur: VChunk = { fee: e.fee, vsize: e.vsize };
+      while (chunks.length > 0 && chunkMergeable(cur, chunks[chunks.length - 1])) {
+        const last = chunks.pop()!;
+        cur = { fee: cur.fee + last.fee, vsize: cur.vsize + last.vsize };
+      }
+      chunks.push(cur);
+    }
+
+    // Build cumulative diagram points (staircase endpoints).
+    const diagram: Array<{ cumFee: bigint; cumVsize: number }> = [];
+    let cumFee = 0n;
+    let cumVsize = 0;
+    for (const chunk of chunks) {
+      cumFee += chunk.fee;
+      cumVsize += chunk.vsize;
+      diagram.push({ cumFee, cumVsize });
+    }
+    return diagram;
+  }
+
+  /**
+   * Compare two feerate diagrams.
+   *
+   * Returns "better" if `after` strictly dominates `before` at every vsize
+   * point, "worse" if `before` strictly dominates `after`, "equal" if they
+   * are identical, or "incomparable" if neither dominates.
+   *
+   * Implements bitcoin-core/src/util/feefrac.cpp:10-73 (CompareChunks) in
+   * terms of cumulative {cumFee, cumVsize} staircase diagrams.
+   *
+   * The interpolation rule: given consecutive staircase endpoints A and B on
+   * one side, the value at a vsize v ∈ (A.cumVsize, B.cumVsize) is linearly
+   * interpolated along the line from A to B.  This is equivalent to checking
+   * that each chunk-endpoint of one diagram lies above/on/below the piecewise-
+   * linear "other" diagram.
+   *
+   * For the RBF gate we only need to know whether `after` strictly beats
+   * `before` (i.e. the result is "better").
+   */
+  private compareFeeDiagrams(
+    before: Array<{ cumFee: bigint; cumVsize: number }>,
+    after: Array<{ cumFee: bigint; cumVsize: number }>,
+  ): "better" | "worse" | "equal" | "incomparable" {
+    // Walk both diagrams in tandem.  At each vsize boundary we interpolate the
+    // value of the *other* diagram and compare.  Mirrors feefrac.cpp CompareChunks.
+
+    let afterBetterSomewhere = false;
+    let beforeBetterSomewhere = false;
+
+    // Evaluate fee of `diag` at cumulative vsize `v` (linear interp).
+    const feeAt = (
+      diag: Array<{ cumFee: bigint; cumVsize: number }>,
+      v: number,
+    ): bigint => {
+      if (diag.length === 0) return 0n;
+      // v beyond the last point → use the last fee (tail slope = 0)
+      if (v >= diag[diag.length - 1].cumVsize) return diag[diag.length - 1].cumFee;
+      // v before the first point → interpolate from origin (0,0)
+      if (v <= 0) return 0n;
+
+      let prevFee = 0n;
+      let prevVsize = 0;
+      for (const pt of diag) {
+        if (pt.cumVsize >= v) {
+          // Interpolate: fee = prevFee + (v - prevVsize) * (pt.cumFee - prevFee) / (pt.cumVsize - prevVsize)
+          const dv = pt.cumVsize - prevVsize;
+          if (dv === 0) return pt.cumFee;
+          const df = pt.cumFee - prevFee;
+          // Use BigInt arithmetic: multiply then divide to avoid fractions.
+          return prevFee + (BigInt(v - prevVsize) * df) / BigInt(dv);
+        }
+        prevFee = pt.cumFee;
+        prevVsize = pt.cumVsize;
+      }
+      return diag[diag.length - 1].cumFee;
+    };
+
+    // Collect all unique vsize boundaries from both diagrams.
+    const vsizes = new Set<number>();
+    for (const pt of before) vsizes.add(pt.cumVsize);
+    for (const pt of after) vsizes.add(pt.cumVsize);
+
+    for (const v of vsizes) {
+      const bFee = feeAt(before, v);
+      const aFee = feeAt(after, v);
+      if (aFee > bFee) afterBetterSomewhere = true;
+      if (bFee > aFee) beforeBetterSomewhere = true;
+      if (afterBetterSomewhere && beforeBetterSomewhere) return "incomparable";
+    }
+
+    if (afterBetterSomewhere && !beforeBetterSomewhere) return "better";
+    if (beforeBetterSomewhere && !afterBetterSomewhere) return "worse";
+    return "equal";
+  }
+
+  /**
+   * Gate #8: ImprovesFeerateDiagram.
+   *
+   * Returns null if the replacement improves (or ties) the feerate diagram,
+   * or an error string if it does not.
+   *
+   * Algorithm:
+   *   1. Find all cluster txids that are in any cluster touched by a conflict.
+   *   2. Build a "before" virtual-entries map from those txids.
+   *   3. Build an "after" virtual-entries map: same minus conflicts, plus the
+   *      replacement transaction (with the correct dependsOn set).
+   *   4. Linearize both and compare diagrams.
+   *
+   * Reference: bitcoin-core/src/policy/rbf.cpp:127-138.
+   */
+  private improvesFeerateDiagram(
+    replacementTxidHex: string,
+    replacementFee: bigint,
+    replacementVsize: number,
+    replacementParents: Set<string>,   // in-mempool parent txids (hex)
+    conflictsToEvict: MempoolEntry[],
+  ): string | null {
+    // Collect all cluster roots touched by any conflict.
+    const touchedClusterRoots = new Set<string>();
+    for (const conflict of conflictsToEvict) {
+      const conflictHex = conflict.txid.toString("hex");
+      if (this.entries.has(conflictHex)) {
+        touchedClusterRoots.add(this.clusters.find(conflictHex));
+      }
+    }
+
+    // Gather all txids in those clusters.
+    const clusterTxids = new Set<string>();
+    for (const [txidHex] of this.entries) {
+      const root = this.clusters.find(txidHex);
+      if (touchedClusterRoots.has(root)) {
+        clusterTxids.add(txidHex);
+      }
+    }
+
+    if (clusterTxids.size === 0) return null; // nothing to compare
+
+    const conflictSet = new Set<string>(conflictsToEvict.map((e) => e.txid.toString("hex")));
+
+    // Build "before" virtual-entries from clusterTxids.
+    type VEntry = { fee: bigint; vsize: number; dependsOn: Set<string> };
+    const beforeMap = new Map<string, VEntry>();
+    for (const txidHex of clusterTxids) {
+      const entry = this.entries.get(txidHex)!;
+      // dependsOn restricted to the cluster
+      const deps = new Set<string>();
+      for (const dep of entry.dependsOn) {
+        if (clusterTxids.has(dep)) deps.add(dep);
+      }
+      beforeMap.set(txidHex, { fee: entry.fee, vsize: entry.vsize, dependsOn: deps });
+    }
+
+    // Build "after" virtual-entries: remove conflicts, add replacement.
+    const afterMap = new Map<string, VEntry>();
+    for (const [txidHex, e] of beforeMap) {
+      if (!conflictSet.has(txidHex)) {
+        afterMap.set(txidHex, e);
+      }
+    }
+    // Replacement's dependsOn = parents that survive into afterMap.
+    const replacementDeps = new Set<string>();
+    for (const parentHex of replacementParents) {
+      if (afterMap.has(parentHex)) replacementDeps.add(parentHex);
+    }
+    afterMap.set(replacementTxidHex, {
+      fee: replacementFee,
+      vsize: replacementVsize,
+      dependsOn: replacementDeps,
+    });
+
+    const beforeDiagram = this.linearizeVirtualCluster(beforeMap);
+    const afterDiagram = this.linearizeVirtualCluster(afterMap);
+
+    const cmp = this.compareFeeDiagrams(beforeDiagram, afterDiagram);
+    if (cmp === "better" || cmp === "equal") {
+      // "equal" is technically a non-improvement, but Core accepts ties
+      // (std::is_gt — strictly greater is required).  We mirror that.
+      if (cmp === "equal") {
+        return "insufficient feerate: does not improve feerate diagram";
+      }
+      return null; // "better" → OK
+    }
+    return "insufficient feerate: does not improve feerate diagram";
   }
 
   /**
