@@ -1501,14 +1501,17 @@ export function verifyInputSignature(
   const input = tx.inputs[inputIndex];
   const scriptPubKey = utxo.scriptPubKey;
 
-  // Sig-cache lookup: if this (txid, inputIndex, flags) triple was already
-  // verified successfully (e.g. during mempool ATMP), skip the secp256k1 work.
-  // This mirrors Core's CachingTransactionSignatureChecker / sigcache.h logic.
-  const cacheKey = {
-    txid: getTxId(tx).toString("hex"),
-    inputIndex,
-    flags: scriptVerifyFlags,
-  };
+  // Sig-cache lookup: if this input's signing material was already verified
+  // successfully (e.g. during mempool ATMP), skip the secp256k1 work.
+  // Key = SHA256(nonce || scriptSig || witness_stack_with_lengths || flags_LE4)
+  // — covers the actual signature bytes so different sigs for the same
+  // (txid, inputIndex) produce distinct keys (prevents adversarial poisoning).
+  // Mirrors Core's CachingTransactionSignatureChecker / sigcache.h logic.
+  const cacheKey = globalSigCache.computeKey(
+    input.scriptSig,
+    input.witness,
+    scriptVerifyFlags,
+  );
   if (globalSigCache.lookup(cacheKey)) {
     return { valid: true, inputIndex };
   }
