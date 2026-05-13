@@ -511,6 +511,39 @@ export class ChainDB {
     };
   }
 
+  /**
+   * Build a {@link BatchOperation} that ORs new status bits into the existing
+   * block index record for `blockHash`.  Returns `null` if the block index
+   * entry does not exist (caller should skip the op in that case).
+   *
+   * Used by the reorg-reconnect path in sync/blocks.ts so that
+   * BLOCK_HAVE_DATA (8) and BLOCK_HAVE_UNDO (16) are recorded in the block
+   * index atomically with the undo-data write — both riding the same
+   * flushDirty batch.  Mirrors Core's behaviour in
+   * blockstorage.cpp::WriteBlock / WriteUndoDataForBlock which set nStatus
+   * bits before flushing the dirty block index.
+   */
+  async buildBlockIndexOrStatusOp(
+    blockHash: Buffer,
+    statusBitsToSet: number,
+  ): Promise<BatchOperation | null> {
+    const existing = await this.getBlockIndex(blockHash);
+    if (!existing) {
+      return null;
+    }
+    const updated: BlockIndexRecord = {
+      ...existing,
+      status: existing.status | statusBitsToSet,
+    };
+    const key = makeKey(DBPrefix.BLOCK_INDEX, blockHash);
+    return {
+      type: 'put',
+      prefix: DBPrefix.BLOCK_INDEX,
+      key: blockHash,
+      value: serializeBlockIndex(updated),
+    };
+  }
+
   async getChainState(): Promise<ChainState | null> {
     const key = makeKey(DBPrefix.CHAIN_STATE, Buffer.alloc(0));
     const value = await this.db.get(key);

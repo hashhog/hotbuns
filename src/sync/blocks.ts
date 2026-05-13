@@ -819,6 +819,22 @@ export class BlockSync {
       // only execute once per sibling per submitblock.
       try {
         await this.db.putBlock(blockHash, serializeBlock(block));
+        // W109 FIX-33: set BLOCK_HAVE_DATA (8) in the block index after
+        // writing the body.  Pre-fix the side-branch path stored the raw
+        // block bytes but never updated the index status, so
+        // FindMostWorkChain / prune / AssumeUTXO would not see HAVE_DATA
+        // on these blocks.  Mirrors Core blockstorage.cpp::WriteBlock
+        // which sets BLOCK_HAVE_DATA before the dirty-index flush.
+        // Best-effort: a failure here is non-fatal — the block body is
+        // already on disk; worst case the status bit will be corrected
+        // when the block is eventually connected.
+        const sideBranchIdx = await this.db.getBlockIndex(blockHash);
+        if (sideBranchIdx && !(sideBranchIdx.status & 8 /* HAVE_DATA */)) {
+          await this.db.updateBlockStatus(
+            blockHash,
+            sideBranchIdx.status | 8 /* HAVE_DATA */,
+          );
+        }
       } catch (err) {
         // Best-effort: a put failure here surfaces later as a
         // "missing block" log line during the reorg dispatch, not as
@@ -2142,13 +2158,37 @@ export class BlockSync {
       // op.  Falls back to a standalone `db.putUndoData` when called
       // outside the atomic-batch path (defensive, kept for symmetry
       // with `disconnectBlockUtxo`).
+      //
+      // W109 FIX-33: also OR BLOCK_HAVE_DATA (8) | BLOCK_HAVE_UNDO (16)
+      // into the block index for the intermediate.  The body was already
+      // on disk (stored as a side-branch) and we just persisted undo, so
+      // both bits must be set.  Mirrors Core blockstorage.cpp::WriteBlock
+      // + WriteUndoDataForBlock which set nStatus before the dirty-index
+      // flush.  Rides the same atomic pendingOps batch so crash-recovery
+      // sees a consistent (data+undo present ↔ bits set) invariant.
       try {
         const { serializeUndoData } = await import("../chain/utxo.js");
         const undoData = serializeUndoData(intermResult.spentOutputs);
         if (pendingOps) {
           pendingOps.push(this.db.buildUndoDataPutOp(intermediate.hash, undoData));
+          // Set HAVE_DATA (8) | HAVE_UNDO (16) in the block index.
+          const statusOp = await this.db.buildBlockIndexOrStatusOp(
+            intermediate.hash,
+            8 /* HAVE_DATA */ | 16 /* HAVE_UNDO */,
+          );
+          if (statusOp) {
+            pendingOps.push(statusOp);
+          }
         } else {
           await this.db.putUndoData(intermediate.hash, undoData);
+          // Standalone path: OR the bits directly.
+          const intermIdx = await this.db.getBlockIndex(intermediate.hash);
+          if (intermIdx) {
+            await this.db.updateBlockStatus(
+              intermediate.hash,
+              intermIdx.status | 8 /* HAVE_DATA */ | 16 /* HAVE_UNDO */,
+            );
+          }
         }
       } catch {
         // Best-effort; ignore.
