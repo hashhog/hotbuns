@@ -667,48 +667,40 @@ describe("G16 — isRoutable() check on addr messages", () => {
     // We test the effective behaviour: after processing an addr message with
     // a private IP, it should NOT appear in knownAddresses.
     const pm = new PeerManager(makeConfig());
-    const handleAddrMsg: ((payload: { addrs: Array<{ timestamp: number; addr: { ip: Buffer; port: number; services: bigint } }> }) => void) | undefined =
-      (pm as any).handleAddrMessage?.bind(pm);
+    expect(typeof (pm as any).handleAddrMessage).toBe("function");
 
-    if (handleAddrMsg) {
-      // Build an IPv4-mapped buffer for 192.168.1.1
-      const ip = Buffer.alloc(16);
-      ip[10] = 0xff; ip[11] = 0xff; // IPv4-mapped prefix
-      ip[12] = 192; ip[13] = 168; ip[14] = 1; ip[15] = 1;
-      handleAddrMsg({
-        addrs: [{
-          timestamp: Math.floor(Date.now() / 1000) - 60,
-          addr: { ip, port: 8333, services: ServiceFlags.NODE_NETWORK },
-        }],
-      });
-      const stored = knownAddresses(pm).get("192.168.1.1:8333");
-      expect(stored).toBeUndefined(); // BUG-16
-    } else {
-      // No addr handler exposed; the bug stands
-      expect(typeof (pm as any).handleAddrMessage).toBe("function"); // BUG-16
-    }
+    // Build an IPv4-mapped buffer for 192.168.1.1
+    const ip = Buffer.alloc(16);
+    ip[10] = 0xff; ip[11] = 0xff; // IPv4-mapped prefix
+    ip[12] = 192; ip[13] = 168; ip[14] = 1; ip[15] = 1;
+    // _peer arg is unused; pass null to satisfy the two-arg signature.
+    (pm as any).handleAddrMessage(null, {
+      addrs: [{
+        timestamp: Math.floor(Date.now() / 1000) - 60,
+        addr: { ip, port: 8333, services: ServiceFlags.NODE_NETWORK },
+      }],
+    });
+    const stored = knownAddresses(pm).get("192.168.1.1:8333");
+    // POST-FIX: RFC1918 address must be rejected (isRoutable filter)
+    expect(stored).toBeUndefined();
   });
 
   test("loopback 127.0.0.1 is not stored from addr message", () => {
     const pm = new PeerManager(makeConfig());
-    const handleAddrMsg: ((payload: { addrs: Array<{ timestamp: number; addr: { ip: Buffer; port: number; services: bigint } }> }) => void) | undefined =
-      (pm as any).handleAddrMessage?.bind(pm);
+    expect(typeof (pm as any).handleAddrMessage).toBe("function");
 
-    if (handleAddrMsg) {
-      const ip = Buffer.alloc(16);
-      ip[10] = 0xff; ip[11] = 0xff;
-      ip[12] = 127; ip[13] = 0; ip[14] = 0; ip[15] = 1;
-      handleAddrMsg({
-        addrs: [{
-          timestamp: Math.floor(Date.now() / 1000) - 60,
-          addr: { ip, port: 8333, services: ServiceFlags.NODE_NETWORK },
-        }],
-      });
-      const stored = knownAddresses(pm).get("127.0.0.1:8333");
-      expect(stored).toBeUndefined(); // BUG-16
-    } else {
-      expect(typeof (pm as any).handleAddrMessage).toBe("function"); // BUG-16
-    }
+    const ip = Buffer.alloc(16);
+    ip[10] = 0xff; ip[11] = 0xff;
+    ip[12] = 127; ip[13] = 0; ip[14] = 0; ip[15] = 1;
+    (pm as any).handleAddrMessage(null, {
+      addrs: [{
+        timestamp: Math.floor(Date.now() / 1000) - 60,
+        addr: { ip, port: 8333, services: ServiceFlags.NODE_NETWORK },
+      }],
+    });
+    const stored = knownAddresses(pm).get("127.0.0.1:8333");
+    // POST-FIX: loopback address must be rejected (isRoutable filter)
+    expect(stored).toBeUndefined();
   });
 });
 
