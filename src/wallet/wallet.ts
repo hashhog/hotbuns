@@ -1708,7 +1708,7 @@ export class Wallet {
         for (let pass = 0; pass < 2 && !reachedTarget; pass++) {
           for (let i = 0; i < utxoData.length; i++) {
             // First pass: random selection, second pass: fill in missing
-            if (pass === 0 ? Math.random() < 0.5 : !included[i]) {
+            if (pass === 0 ? (crypto.randomBytes(4).readUInt32BE(0) < 0x80000000) : !included[i]) {
               total += utxoData[i].effectiveValue;
               included[i] = true;
 
@@ -1849,7 +1849,7 @@ export class Wallet {
    */
   private shuffleArray<T>(array: T[]): void {
     for (let i = array.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
+      const j = crypto.randomBytes(4).readUInt32BE(0) % (i + 1);
       [array[i], array[j]] = [array[j], array[i]];
     }
   }
