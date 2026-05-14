@@ -38,6 +38,12 @@ import {
   FEEFILTER_VERSION,
 } from "./feefilter.js";
 import { randomBytes } from "node:crypto";
+import {
+  loadAsmap,
+  getMappedAS as asmapGetMappedAS,
+  getAsnGroup,
+  asmapVersion,
+} from "./asmap.js";
 
 /**
  * Maximum number of addresses retained in the v1-only fallback cache.
@@ -88,6 +94,16 @@ export interface PeerManagerConfig {
    * blocks below the recent-`MIN_BLOCKS_TO_KEEP` (288) keep window.
    */
   pruneMode?: boolean;
+  /**
+   * Path to an asmap binary file for ASN-aware outbound peer grouping.
+   * Mirrors Bitcoin Core's `-asmap=<file>` (init.cpp:540).
+   * When set, the bytecode is loaded and validated at construction time;
+   * startup throws if the file is missing or fails sanity checking.
+   * Relative paths are resolved against the network-specific datadir.
+   * When null/undefined, falls back to the legacy /16 (IPv4) or /32 (IPv6)
+   * prefix-based bucketing.
+   */
+  asmapPath?: string | null;
 }
 
 /** Stored information about a known peer address. */
@@ -382,6 +398,15 @@ export class PeerManager {
    */
   private v1OnlyCache: Map<string, number>;
 
+  /**
+   * Loaded ASMap bytecode, or null when no --asmap flag was supplied.
+   * When non-null, getMappedAS() and getNetGroup() use ASN-based bucketing
+   * instead of the legacy /16 (IPv4) or /32 (IPv6) prefix scheme.
+   *
+   * Reference: Bitcoin Core NetGroupManager::m_asmap (netgroup.h)
+   */
+  private asmapData: Uint8Array | null;
+
   constructor(config: PeerManagerConfig) {
     this.config = {
       maxOutbound: config.maxOutbound ?? MAX_OUTBOUND_FULL_RELAY + MAX_OUTBOUND_BLOCK_RELAY,
@@ -424,6 +449,22 @@ export class PeerManager {
     this.feeFilterInterval = null;
     this.tcpListener = null;
     this.v1OnlyCache = new Map();
+
+    // Load asmap if --asmap path was supplied.
+    // Mirrors Bitcoin Core init.cpp:1590-1605: resolve path, load, validate.
+    // Throws on load/sanity failure (startup must fail loudly on bad asmap).
+    if (config.asmapPath) {
+      const data = loadAsmap(config.asmapPath);
+      if (!data) {
+        throw new Error(
+          `Failed to load or validate asmap file: ${config.asmapPath}. ` +
+          `File may be missing, too large (>8 MiB), or contain invalid bytecode.`
+        );
+      }
+      this.asmapData = data;
+    } else {
+      this.asmapData = null;
+    }
   }
 
   /**
@@ -441,6 +482,95 @@ export class PeerManager {
     const val = randomBytes(4).readUInt32BE(0);
     // Modulo bias is negligible for small n relative to 2^32.
     return val % n;
+  }
+
+  // ---------------------------------------------------------------------------
+  // ASMap API — mirrors Bitcoin Core's NetGroupManager public interface
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Return the network group string for `addr`, using ASN-based bucketing
+   * when an asmap is loaded, otherwise falling back to the /16 (IPv4) or
+   * /32 (IPv6) prefix string.
+   *
+   * Used internally for all outbound diversity checks and eviction logic.
+   * The public standalone `getNetGroup()` (no-asmap) is retained for callers
+   * that do not have access to the PeerManager instance.
+   */
+  private getNetGroupForAddr(addr: string): string {
+    if (this.asmapData && this.asmapData.length > 0) {
+      const asn = asmapGetMappedAS(this.asmapData, addr);
+      if (asn !== 0) {
+        return `asn:${asn}`;
+      }
+    }
+    return getNetGroup(addr);
+  }
+
+  /**
+   * Returns true iff an asmap file was loaded successfully at startup.
+   * Mirrors Bitcoin Core's NetGroupManager::UsingASMap().
+   */
+  usingASMap(): boolean {
+    return this.asmapData !== null && this.asmapData.length > 0;
+  }
+
+  /**
+   * Look up the ASN for a peer address string (IPv4 or IPv6).
+   * Returns 0 if asmap is not loaded, the address is not IP-based
+   * (Tor, I2P, hostname), or the prefix has no ASN mapping.
+   * AS0 is reserved by RFC 7607 — always means "no mapping".
+   *
+   * Mirrors Bitcoin Core's NetGroupManager::GetMappedAS().
+   *
+   * @param addr  Peer address string (dotted-decimal IPv4 or bracketed/bare IPv6).
+   */
+  getMappedAS(addr: string): number {
+    return asmapGetMappedAS(this.asmapData, addr);
+  }
+
+  /**
+   * Return the SHA-256 checksum of the loaded asmap data as a hex string,
+   * or null when no asmap is loaded.  Used to detect asmap file changes
+   * and trigger re-bucketing of addrman entries.
+   *
+   * Mirrors Bitcoin Core's NetGroupManager::GetAsmapVersion() + AsmapVersion().
+   */
+  getAsmapVersion(): string | null {
+    if (!this.asmapData || this.asmapData.length === 0) return null;
+    return asmapVersion(this.asmapData);
+  }
+
+  /**
+   * Log a summary of how well the loaded asmap covers the current peer set.
+   * Mirrors Bitcoin Core's NetGroupManager::ASMapHealthCheck(clearnet_addrs).
+   *
+   * Returns an object with { total, mapped, unmapped, distinctASNs } — also
+   * logs a one-line summary at info level.
+   *
+   * Reference: bitcoin-core/src/net.cpp:4188 post-addrman construction call.
+   */
+  asmapHealthCheck(): { total: number; mapped: number; unmapped: number; distinctASNs: number } {
+    const asnSet = new Set<number>();
+    let mapped = 0;
+    let total = 0;
+    for (const info of this.knownAddresses.values()) {
+      // Only count clearnet (IPv4/IPv6) peers
+      if (info.host.includes(":") || /^\d+\.\d+\.\d+\.\d+$/.test(info.host)) {
+        total++;
+        const asn = asmapGetMappedAS(this.asmapData, info.host);
+        if (asn !== 0) {
+          mapped++;
+          asnSet.add(asn);
+        }
+      }
+    }
+    const result = { total, mapped, unmapped: total - mapped, distinctASNs: asnSet.size };
+    console.log(
+      `ASMap Health Check: ${total} clearnet peers, ` +
+      `${mapped} mapped to ${asnSet.size} ASNs, ${result.unmapped} unmapped.`
+    );
+    return result;
   }
 
   /**
@@ -719,7 +849,7 @@ export class PeerManager {
     // Network group diversity check for outbound connections
     // Skip for localhost (allows testing with multiple connections)
     if (connectionType !== "inbound" && !isLocalAddress(host)) {
-      const netGroup = getNetGroup(host);
+      const netGroup = this.getNetGroupForAddr(host);
       if (this.outboundNetGroups.has(netGroup)) {
         throw new Error(`Already have outbound connection in netgroup ${netGroup}`);
       }
@@ -802,7 +932,7 @@ export class PeerManager {
 
       // Track network group for outbound connections
       if (connectionType !== "inbound") {
-        const netGroup = getNetGroup(host);
+        const netGroup = this.getNetGroupForAddr(host);
         this.outboundNetGroups.add(netGroup);
       } else {
         this.inboundPeers.add(key);
@@ -859,7 +989,7 @@ export class PeerManager {
       this.peerConnectionType.delete(key);
 
       if (connType !== "inbound") {
-        const netGroup = getNetGroup(peer.host);
+        const netGroup = this.getNetGroupForAddr(peer.host);
         this.outboundNetGroups.delete(netGroup);
       } else {
         this.inboundPeers.delete(key);
@@ -1354,7 +1484,7 @@ export class PeerManager {
       }
 
       // Check network group diversity
-      const netGroup = getNetGroup(anchor.host);
+      const netGroup = this.getNetGroupForAddr(anchor.host);
       if (this.outboundNetGroups.has(netGroup)) {
         continue;
       }
@@ -1377,7 +1507,7 @@ export class PeerManager {
         if (connected >= neededFullRelay) break;
 
         // Check network group diversity
-        const netGroup = getNetGroup(info.host);
+        const netGroup = this.getNetGroupForAddr(info.host);
         if (this.outboundNetGroups.has(netGroup)) {
           continue;
         }
@@ -1401,7 +1531,7 @@ export class PeerManager {
         if (connected >= neededBlockRelay) break;
 
         // Check network group diversity
-        const netGroup = getNetGroup(info.host);
+        const netGroup = this.getNetGroupForAddr(info.host);
         if (this.outboundNetGroups.has(netGroup)) {
           continue;
         }
@@ -2105,7 +2235,7 @@ export class PeerManager {
         minPingTime: info?.minPingTime ?? (peer.latency || Infinity),
         lastBlockTime: info?.lastBlockTime ?? 0,
         lastTxTime: info?.lastTxTime ?? 0,
-        keyedNetGroup: getNetGroup(peer.host),
+        keyedNetGroup: this.getNetGroupForAddr(peer.host),
         isBlockRelayOnly: connType === "block_relay",
         isLocal: isLocalAddress(peer.host),
       });
