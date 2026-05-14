@@ -343,26 +343,25 @@ describe("G5: SipHash-2-4 key derivation (BIP-152 FillShortTxIDSelector)", () =>
 // G6: sendcmpct negotiation — BUG-1 (version != 2 not rejected), BUG-18 (v1 wtxid bug)
 // ============================================================================
 
-describe("G6: sendcmpct version validation — BUG-1 FAIL", () => {
-  test("FAIL: handleSendCmpct does NOT reject version=0 (Core rejects non-2)", () => {
+describe("G6: sendcmpct version validation — BUG-1 FIXED (FIX-43)", () => {
+  test("PASS: handleSendCmpct rejects version=0 (Core rejects non-2)", () => {
     // Core: if (sendcmpct_version != CMPCTBLOCKS_VERSION) return;  (net_processing.cpp:3907)
-    // hotbuns: no such check
+    // FIX-43: version guard added — version != 2n returns immediately
     const mgr = new CompactBlockManager();
-    mgr.handleSendCmpct("p1", true, 0n); // version 0 — should be rejected
-    // Bug: peer is now marked as compact-capable with version 0
-    expect(mgr.peerSupportsCompact("p1")).toBe(true); // FAIL — should be false
+    mgr.handleSendCmpct("p1", true, 0n); // version 0 — rejected
+    expect(mgr.peerSupportsCompact("p1")).toBe(false); // PASS — state unchanged
   });
 
-  test("FAIL: handleSendCmpct does NOT reject version=1 (Core rejects non-2)", () => {
+  test("PASS: handleSendCmpct rejects version=1 (Core rejects non-2)", () => {
     const mgr = new CompactBlockManager();
     mgr.handleSendCmpct("p1", true, 1n); // version 1 (non-witness) — Core rejects
-    expect(mgr.peerSupportsCompact("p1")).toBe(true); // FAIL — should be false
+    expect(mgr.peerSupportsCompact("p1")).toBe(false); // PASS — state unchanged
   });
 
-  test("FAIL: handleSendCmpct does NOT reject version=3 (future version)", () => {
+  test("PASS: handleSendCmpct rejects version=3 (future version)", () => {
     const mgr = new CompactBlockManager();
     mgr.handleSendCmpct("p1", true, 3n); // version 3 — unknown, Core rejects
-    expect(mgr.peerSupportsCompact("p1")).toBe(true); // FAIL — should be false
+    expect(mgr.peerSupportsCompact("p1")).toBe(false); // PASS — state unchanged
   });
 
   test("PASS: handleSendCmpct correctly accepts version=2", () => {
@@ -466,10 +465,12 @@ describe("G9: Received sendcmpct is logged but not recorded — BUG-4 MEDIUM", (
 // ============================================================================
 
 describe("G10: Version negotiation takes min(ours, peer's)", () => {
-  test("PASS: getNegotiatedVersion returns min of our v2 and peer v1", () => {
+  test("PASS: getNegotiatedVersion returns 0 when peer sends version=1 (rejected by FIX-43)", () => {
+    // Core drops sendcmpct with version != 2; after FIX-43 hotbuns does the same.
+    // A peer announcing version=1 is silently ignored — state stays at default (0n).
     const mgr = new CompactBlockManager();
     mgr.handleSendCmpct("p1", true, 1n);
-    expect(mgr.getNegotiatedVersion("p1")).toBe(1n);
+    expect(mgr.getNegotiatedVersion("p1")).toBe(0n);
   });
 
   test("PASS: getNegotiatedVersion returns v2 when peer also supports v2", () => {
@@ -480,7 +481,7 @@ describe("G10: Version negotiation takes min(ours, peer's)", () => {
 
   test("PASS: getNegotiatedVersion returns 0 when peer doesn't support compact", () => {
     const mgr = new CompactBlockManager();
-    mgr.handleSendCmpct("p1", false, 0n);
+    mgr.handleSendCmpct("p1", false, 2n);
     expect(mgr.getNegotiatedVersion("p1")).toBe(0n);
   });
 });
