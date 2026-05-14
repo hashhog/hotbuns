@@ -10,7 +10,7 @@ import { ChainDB, UTXOEntry } from "../storage/database.js";
 import { UTXOManager } from "../chain/utxo.js";
 import { REGTEST } from "../consensus/params.js";
 import { Mempool } from "../mempool/mempool.js";
-import { FeeEstimator, ConfirmationBucket } from "./estimator.js";
+import { FeeEstimator, ConfirmationBucket, Horizon, DECAY } from "./estimator.js";
 import type { Transaction } from "../validation/tx.js";
 import type { Block, BlockHeader } from "../validation/block.js";
 import { getTxId } from "../validation/tx.js";
@@ -261,7 +261,8 @@ describe("FeeEstimator", () => {
 
       // totalConfirmed should be decayed
       expect(bucket.totalConfirmed).toBeLessThan(initialConfirmed);
-      expect(bucket.totalConfirmed).toBeCloseTo(initialConfirmed * 0.998, 5);
+      // getBuckets() uses medium-horizon decay (FIX-48: was 0.998, now 0.9952)
+      expect(bucket.totalConfirmed).toBeCloseTo(initialConfirmed * DECAY[Horizon.Medium], 5);
     });
   });
 

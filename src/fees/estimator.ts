@@ -4,6 +4,11 @@
  * Tracks how long transactions at various fee rates take to confirm,
  * then uses this data to estimate the fee rate needed to confirm
  * within a target number of blocks.
+ *
+ * Three time horizons mirror Bitcoin Core's CBlockPolicyEstimator:
+ *   short  — decay 0.962,   scale 1,  periods 12  (≤12 blocks)
+ *   medium — decay 0.9952,  scale 2,  periods 24  (≤48 blocks)
+ *   long   — decay 0.99931, scale 24, periods 42  (≤1008 blocks)
  */
 
 import type { Mempool, MempoolEntry } from "../mempool/mempool.js";
@@ -51,11 +56,78 @@ const DEFAULT_FEE_RATE = 20;
 /** Required confidence threshold for fee estimation. */
 const CONFIDENCE_THRESHOLD = 0.85;
 
-/** Decay factor applied to confirmation counts each block. */
-const DECAY_FACTOR = 0.998;
-
 /** Maximum blocks to track for confirmation time. */
 const MAX_CONFIRMATION_BLOCKS = 1008;
+
+/**
+ * Time-horizon identifiers, matching Core's feeStats / shortStats / longStats.
+ */
+export const enum Horizon {
+  Short = 0,
+  Medium = 1,
+  Long = 2,
+}
+
+/**
+ * Per-horizon decay constants.
+ * Core: src/policy/fees.cpp — SHORT_DECAY, MED_DECAY, LONG_DECAY.
+ */
+export const DECAY: Record<Horizon, number> = {
+  [Horizon.Short]: 0.962,
+  [Horizon.Medium]: 0.9952,
+  [Horizon.Long]: 0.99931,
+};
+
+/**
+ * Per-horizon period-scale multipliers (blocks per period).
+ * Core: SHORT_SCALE=1, MED_SCALE=2, LONG_SCALE=24.
+ */
+export const SCALE: Record<Horizon, number> = {
+  [Horizon.Short]: 1,
+  [Horizon.Medium]: 2,
+  [Horizon.Long]: 24,
+};
+
+/**
+ * Number of tracking periods per horizon.
+ * Coverage = SCALE × PERIODS blocks.
+ *   short:  1  × 12 = 12 blocks
+ *   medium: 2  × 24 = 48 blocks
+ *   long:   24 × 42 = 1008 blocks
+ */
+export const PERIODS: Record<Horizon, number> = {
+  [Horizon.Short]: 12,
+  [Horizon.Medium]: 24,
+  [Horizon.Long]: 42,
+};
+
+/**
+ * Statistics kept per bucket per horizon.
+ * Core's TxConfirmStats tracks a flat confirmed[period] array (decay-accumulated)
+ * and an unconfirmed[period] ring-buffer. We keep the same approach per horizon.
+ */
+interface HorizonBucketStats {
+  /** Decay-accumulated confirmed count. */
+  confirmed: number;
+  /** Decay-accumulated unconfirmed count. */
+  unconfirmed: number;
+  /** Raw confirmation wait times (blocks), kept for percentile estimates. */
+  confirmationBlocks: number[];
+}
+
+/**
+ * All data for a single time horizon.
+ */
+export interface HorizonStats {
+  /** Decay constant for this horizon. */
+  readonly decay: number;
+  /** Blocks-per-period scale for this horizon. */
+  readonly scale: number;
+  /** Number of tracking periods for this horizon. */
+  readonly periods: number;
+  /** Per-bucket stats array, parallel to the shared BUCKET_BOUNDARIES. */
+  buckets: HorizonBucketStats[];
+}
 
 /**
  * Fee rate bucket boundaries (sat/vB).
@@ -72,9 +144,17 @@ const BUCKET_BOUNDARIES: readonly number[] = [
  *
  * Tracks when transactions enter the mempool and when they confirm,
  * grouping them into fee rate buckets to estimate confirmation times.
+ * Three independent time horizons (short/medium/long) mirror Core's
+ * CBlockPolicyEstimator with distinct decay and scale constants.
  */
 export class FeeEstimator {
-  /** Confirmation buckets, one per fee rate range. */
+  /**
+   * Three independent TxConfirmStats-equivalent horizon trackers.
+   * Keyed by Horizon enum value so property lookup is O(1).
+   */
+  readonly horizons: Record<Horizon, HorizonStats>;
+
+  /** Confirmation buckets, one per fee rate range (medium horizon view). */
   private buckets: ConfirmationBucket[];
 
   /** Fee rate boundaries for bucket assignment. */
@@ -91,6 +171,24 @@ export class FeeEstimator {
     this.bucketBoundaries = [...BUCKET_BOUNDARIES];
     this.txEntryHeights = new Map();
     this.buckets = this.initializeBuckets();
+
+    // Initialize per-horizon stats arrays, one entry per bucket boundary.
+    const makeHorizonStats = (h: Horizon): HorizonStats => ({
+      decay: DECAY[h],
+      scale: SCALE[h],
+      periods: PERIODS[h],
+      buckets: BUCKET_BOUNDARIES.map(() => ({
+        confirmed: 0,
+        unconfirmed: 0,
+        confirmationBlocks: [],
+      })),
+    });
+
+    this.horizons = {
+      [Horizon.Short]: makeHorizonStats(Horizon.Short),
+      [Horizon.Medium]: makeHorizonStats(Horizon.Medium),
+      [Horizon.Long]: makeHorizonStats(Horizon.Long),
+    };
   }
 
   /**
@@ -99,11 +197,11 @@ export class FeeEstimator {
   private initializeBuckets(): ConfirmationBucket[] {
     const buckets: ConfirmationBucket[] = [];
 
-    for (let i = 0; i < this.bucketBoundaries.length; i++) {
-      const min = this.bucketBoundaries[i];
+    for (let i = 0; i < BUCKET_BOUNDARIES.length; i++) {
+      const min = BUCKET_BOUNDARIES[i];
       const max =
-        i + 1 < this.bucketBoundaries.length
-          ? this.bucketBoundaries[i + 1]
+        i + 1 < BUCKET_BOUNDARIES.length
+          ? BUCKET_BOUNDARIES[i + 1]
           : Infinity;
 
       buckets.push({
@@ -165,11 +263,17 @@ export class FeeEstimator {
     if (entry) {
       const bucketIndex = this.getBucketIndex(entry.feeRate);
       this.buckets[bucketIndex].totalUnconfirmed += 1;
+      // Update per-horizon unconfirmed counts
+      for (const h of [Horizon.Short, Horizon.Medium, Horizon.Long] as Horizon[]) {
+        this.horizons[h].buckets[bucketIndex].unconfirmed += 1;
+      }
     }
   }
 
   /**
    * Record that a transaction was confirmed.
+   * Updates the shared ConfirmationBucket (medium horizon) and all
+   * three per-horizon HorizonBucketStats arrays.
    */
   recordConfirmation(
     txid: Buffer,
@@ -187,7 +291,7 @@ export class FeeEstimator {
     const bucketIndex = this.getBucketIndex(feeRate);
     const bucket = this.buckets[bucketIndex];
 
-    // Update bucket statistics
+    // Update shared bucket statistics (medium-horizon view for getBuckets())
     bucket.totalConfirmed += 1;
     bucket.confirmationBlocks.push(blocksWaited);
 
@@ -202,16 +306,26 @@ export class FeeEstimator {
       bucket.avgConfirmationBlocks = sum / bucket.confirmationBlocks.length;
     }
 
+    // Update per-horizon stats
+    for (const h of [Horizon.Short, Horizon.Medium, Horizon.Long] as Horizon[]) {
+      const hb = this.horizons[h].buckets[bucketIndex];
+      hb.confirmed += 1;
+      hb.confirmationBlocks.push(blocksWaited);
+      if (hb.unconfirmed > 0) {
+        hb.unconfirmed -= 1;
+      }
+    }
+
     // Remove from tracking
     this.txEntryHeights.delete(txid.toString("hex"));
   }
 
   /**
    * Process a new block: record confirmations for all transactions in it.
-   * Also applies decay to old data.
+   * Also applies per-horizon decay to old data.
    */
   processBlock(block: Block, height: number): void {
-    // Apply decay to all buckets
+    // Apply per-horizon decay to all buckets
     this.applyDecay();
 
     // Process each transaction in the block
@@ -254,13 +368,16 @@ export class FeeEstimator {
   }
 
   /**
-   * Apply decay factor to all bucket statistics.
-   * This gradually forgets old data to adapt to changing conditions.
+   * Apply per-horizon decay factor to all bucket statistics.
+   * Short horizon decays fastest (0.962), long horizon slowest (0.99931).
+   * The shared ConfirmationBucket array uses the medium horizon decay.
    */
   private applyDecay(): void {
+    // Apply medium-horizon decay to the shared bucket array (backward compat)
+    const medDecay = DECAY[Horizon.Medium];
     for (const bucket of this.buckets) {
-      bucket.totalConfirmed *= DECAY_FACTOR;
-      bucket.totalUnconfirmed *= DECAY_FACTOR;
+      bucket.totalConfirmed *= medDecay;
+      bucket.totalUnconfirmed *= medDecay;
 
       // Trim very old confirmation data
       if (bucket.confirmationBlocks.length > 10000) {
@@ -270,6 +387,18 @@ export class FeeEstimator {
         if (bucket.confirmationBlocks.length > 0) {
           const sum = bucket.confirmationBlocks.reduce((a, b) => a + b, 0);
           bucket.avgConfirmationBlocks = sum / bucket.confirmationBlocks.length;
+        }
+      }
+    }
+
+    // Apply per-horizon decay to horizon-specific stats
+    for (const h of [Horizon.Short, Horizon.Medium, Horizon.Long] as Horizon[]) {
+      const hDecay = DECAY[h];
+      for (const hb of this.horizons[h].buckets) {
+        hb.confirmed *= hDecay;
+        hb.unconfirmed *= hDecay;
+        if (hb.confirmationBlocks.length > 10000) {
+          hb.confirmationBlocks = hb.confirmationBlocks.slice(-5000);
         }
       }
     }
@@ -359,7 +488,80 @@ export class FeeEstimator {
   }
 
   /**
+   * Select the appropriate horizon for a given target block count.
+   * Mirrors Core's selection: short for ≤12 blocks, long for >48, medium otherwise.
+   */
+  private selectHorizon(targetBlocks: number): Horizon {
+    const shortMax = SCALE[Horizon.Short] * PERIODS[Horizon.Short];   // 12
+    const medMax   = SCALE[Horizon.Medium] * PERIODS[Horizon.Medium]; // 48
+    if (targetBlocks <= shortMax) {
+      return Horizon.Short;
+    }
+    if (targetBlocks <= medMax) {
+      return Horizon.Medium;
+    }
+    return Horizon.Long;
+  }
+
+  /**
+   * Estimate fee for a specific horizon's bucket stats.
+   */
+  private estimateFeeForHorizon(targetBlocks: number, horizon: Horizon): number | null {
+    const hBuckets = this.horizons[horizon].buckets;
+    const minDataPoints = 10;
+
+    for (let i = hBuckets.length - 1; i >= 0; i--) {
+      const hb = hBuckets[i];
+
+      if (hb.confirmationBlocks.length < minDataPoints) {
+        continue;
+      }
+
+      const confirmedWithinTarget = hb.confirmationBlocks.filter(
+        (blocks) => blocks <= targetBlocks
+      ).length;
+
+      const total = confirmedWithinTarget + hb.unconfirmed;
+      if (total < minDataPoints) {
+        continue;
+      }
+
+      const probability = confirmedWithinTarget / total;
+
+      if (probability >= CONFIDENCE_THRESHOLD) {
+        let lowestBucketIndex = i;
+
+        for (let j = i - 1; j >= 0; j--) {
+          const lowerHb = hBuckets[j];
+          if (lowerHb.confirmationBlocks.length < minDataPoints) {
+            continue;
+          }
+
+          const lowerConfirmedWithinTarget = lowerHb.confirmationBlocks.filter(
+            (blocks) => blocks <= targetBlocks
+          ).length;
+
+          const lowerTotal = lowerConfirmedWithinTarget + lowerHb.unconfirmed;
+          if (lowerTotal < minDataPoints) {
+            continue;
+          }
+
+          const lowerProbability = lowerConfirmedWithinTarget / lowerTotal;
+          if (lowerProbability >= CONFIDENCE_THRESHOLD) {
+            lowestBucketIndex = j;
+          }
+        }
+
+        return this.buckets[lowestBucketIndex].feeRateRange.min;
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Estimate fee for common targets with additional information.
+   * Dispatches to the appropriate horizon (short/medium/long) based on target.
    * May return a longer target than requested if there isn't enough data.
    */
   estimateSmartFee(targetBlocks: number): { feeRate: number; blocks: number } {
@@ -371,8 +573,15 @@ export class FeeEstimator {
       targetBlocks = MAX_CONFIRMATION_BLOCKS;
     }
 
-    // Try the requested target first
-    let feeRate = this.estimateFeeWithData(targetBlocks);
+    // Select horizon based on target, then try the requested target
+    const horizon = this.selectHorizon(targetBlocks);
+    let feeRate = this.estimateFeeForHorizon(targetBlocks, horizon);
+    if (feeRate !== null) {
+      return { feeRate, blocks: targetBlocks };
+    }
+
+    // Fall back to estimateFeeWithData (uses shared medium buckets)
+    feeRate = this.estimateFeeWithData(targetBlocks);
     if (feeRate !== null) {
       return { feeRate, blocks: targetBlocks };
     }
@@ -474,6 +683,7 @@ export class FeeEstimator {
 
   /**
    * Get all buckets (for debugging/inspection).
+   * Returns the medium-horizon view, which is the primary estimation surface.
    */
   getBuckets(): readonly ConfirmationBucket[] {
     return this.buckets;
@@ -544,5 +754,14 @@ export class FeeEstimator {
   clear(): void {
     this.buckets = this.initializeBuckets();
     this.txEntryHeights.clear();
+
+    // Reset horizon stats too
+    for (const h of [Horizon.Short, Horizon.Medium, Horizon.Long] as Horizon[]) {
+      for (const hb of this.horizons[h].buckets) {
+        hb.confirmed = 0;
+        hb.unconfirmed = 0;
+        hb.confirmationBlocks = [];
+      }
+    }
   }
 }
