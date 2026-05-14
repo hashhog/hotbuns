@@ -5,7 +5,7 @@
  * address types, storage, encryption, KeyPool, signing, and PSBT.
  *
  * Findings:
- *   BUG-1  (HIGH)   Math.random() in coin-selection + shuffleArray (wallet.ts:1711,1852)
+ *   BUG-1  (HIGH)   Math.random() in coin-selection + shuffleArray (wallet.ts:1711,1852) — FIXED FIX-40
  *   BUG-2  (HIGH)   Dual encryption schemes — save() PBKDF2+GCM vs encryptWallet() scrypt+CBC (incompatible)
  *   BUG-3  (MEDIUM) signPSBTInput() throws for P2TR scriptPubKey (taproot signing absent)
  *   BUG-4  (MEDIUM) KeyPool absent — no keypoolrefill / getkeypoolsize RPC
@@ -609,42 +609,63 @@ describe("G26-G28: Signing", () => {
     expect(tx.inputs[0].witness[0].length).toBe(64); // SIGHASH_DEFAULT = 64-byte sig
   });
 
-  // BUG-1: Math.random() in coin selection
-  test("FAIL BUG-1: Math.random() used in knapsack coin selection and shuffleArray (anti-pattern)", () => {
-    // Verify the vulnerability: wallet.ts uses Math.random() at two places:
-    //   1. Line 1711: knapsack first pass (random inclusion)
-    //   2. Line 1852: shuffleArray (output ordering)
+  // BUG-1 (FIXED): Math.random() replaced with crypto.randomBytes() in coin selection
+  test("PASS BUG-1 fixed: coin selection + shuffleArray use CSPRNG (Math.random monkey-patch has no effect)", () => {
+    // After FIX-40: wallet.ts line 1711 (knapsack) and 1852 (shuffleArray)
+    // now call crypto.randomBytes(4).readUInt32BE(0) instead of Math.random().
     //
-    // These should use crypto.getRandomValues() per W88 anti-pattern guidance.
-    // We document the bug here; it does not affect test correctness but
-    // is a privacy/security concern (predictable UTXO selection).
-    //
-    // The bug is confirmed by source inspection. We assert that the wallet
-    // still *works* (does not throw) but note the anti-pattern.
-    const w = Wallet.create(makeConfig("mainnet"), ABANDON_MNEMONIC);
-    w.addUTXO({
-      outpoint: { txid: Buffer.alloc(32, 0x03), vout: 0 },
-      amount: 500000n,
-      address: w.getNewAddress("bech32"),
-      keyPath: "m/84'/0'/0'/0/0",
-      confirmations: 6,
-      addressType: AddressType.P2WPKH,
-      isCoinbase: false,
-    });
-    w.addUTXO({
-      outpoint: { txid: Buffer.alloc(32, 0x04), vout: 0 },
-      amount: 500000n,
-      address: w.getNewAddress("bech32"),
-      keyPath: "m/84'/0'/0'/0/1",
-      confirmations: 6,
-      addressType: AddressType.P2WPKH,
-      isCoinbase: false,
-    });
+    // Verification strategy: monkey-patch Math.random to always return a fixed
+    // constant (0.0). If the wallet still produces a valid coin selection and
+    // mathRandomCalled remains false, then randomness is NOT sourced from Math.random.
+    const originalRandom = Math.random;
+    let mathRandomCalled = false;
+    Math.random = () => {
+      mathRandomCalled = true;
+      return 0.0; // fixed constant — would produce deterministic/broken results
+    };
 
-    // coinSelection uses Math.random — functional but not secure
-    const result = w.selectCoinsAdvanced(300000n, 1);
-    expect(result.inputs.length).toBeGreaterThan(0);
-    // BUG: Math.random() is used internally (not crypto.getRandomValues)
+    try {
+      const w = Wallet.create(makeConfig("mainnet"), ABANDON_MNEMONIC);
+      const addr0 = w.getNewAddress("bech32");
+      const addr1 = w.getNewAddress("bech32");
+      const addr2 = w.getNewAddress("bech32");
+      w.addUTXO({
+        outpoint: { txid: Buffer.alloc(32, 0x03), vout: 0 },
+        amount: 200000n,
+        address: addr0,
+        keyPath: "m/84'/0'/0'/0/0",
+        confirmations: 6,
+        addressType: AddressType.P2WPKH,
+        isCoinbase: false,
+      });
+      w.addUTXO({
+        outpoint: { txid: Buffer.alloc(32, 0x04), vout: 0 },
+        amount: 300000n,
+        address: addr1,
+        keyPath: "m/84'/0'/0'/0/1",
+        confirmations: 6,
+        addressType: AddressType.P2WPKH,
+        isCoinbase: false,
+      });
+      w.addUTXO({
+        outpoint: { txid: Buffer.alloc(32, 0x05), vout: 0 },
+        amount: 250000n,
+        address: addr2,
+        keyPath: "m/84'/0'/0'/0/2",
+        confirmations: 6,
+        addressType: AddressType.P2WPKH,
+        isCoinbase: false,
+      });
+
+      // Exercises knapsack (random first pass) + shuffleArray (output ordering)
+      const result = w.selectCoinsAdvanced(150000n, 1);
+      expect(result.inputs.length).toBeGreaterThan(0);
+
+      // CSPRNG assertion: Math.random must NOT have been called
+      expect(mathRandomCalled).toBe(false);
+    } finally {
+      Math.random = originalRandom;
+    }
   });
 
   test("PASS G28: PSBT signPSBTInput handles P2WPKH", () => {
