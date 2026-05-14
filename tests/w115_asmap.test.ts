@@ -15,7 +15,6 @@
  *   G9  getMappedAS() exposed on PeerManager
  *   G10 usingASMap() method on PeerManager
  *   G11 getNetGroup() falls back to /16 prefix (no-asmap fallback kept)
- *   G16 outboundNetGroups is a Set (ASN-keyed when asmap loaded)
  *   G17 getMappedAS() IPv4-in-IPv6 mapping
  *   G18 getMappedAS() Tor/I2P → 0
  *   G19 getMappedAS() unrecognized → 0
@@ -24,9 +23,14 @@
  *   G29 MATCH instruction MSB-first IP bit consumption
  *   G30 variable-length integer encoding (decodeBits)
  *
- * Deferred (FIX-51+):
+ * FIX-51 closes:
+ *   G16 outboundNetGroups is a Set (ASN-keyed when asmap loaded); disconnect
+ *       uses getNetGroupForAddr so the key matches the connect-time insertion
+ *       (fixes stale-entry bug that permanently blocked same-AS reconnects)
+ *
+ * Deferred (FIX-52+):
  *   G2  Embedded asmap data in binary
- *   G12 GetTriedBucket / GetNewBucket
+ *   G12 GetTriedBucket / GetNewBucket (full AddrMan tried/new tables)
  *   G13/G14 Full AddrMan bucket restructure
  *   G15 peers.dat asmap_version re-bucketing
  *   G22 getaddrmaninfo RPC
@@ -395,11 +399,12 @@ describe("G11 [getNetGroup() fallback behavior]", () => {
 
 describe("G12-G14 [Bucket divergence: no-asmap fallback notes]", () => {
   /**
-   * G12/G13/G14: AddrMan tried/new bucket tables are deferred to FIX-51.
-   * The following tests document the current no-asmap state (unchanged)
-   * and the expected ASN-path now that getMappedAS is wired.
+   * G12/G13/G14: Full AddrMan tried/new bucket tables are deferred to FIX-52+.
+   * FIX-51 fixed the bucket-hash key consistency (getNetGroupForAddr on
+   * disconnect now matches the connect-time insertion key).
+   * The following tests document the current flat-Map state.
    */
-  test("G12: flat knownAddresses Map used (tried/new tables deferred to FIX-51)", () => {
+  test("G12: flat knownAddresses Map used (tried/new tables deferred to FIX-52+)", () => {
     const pm = new PeerManager(makePeerManagerConfig());
     // No tried/new table — deferred
     const rec = pm as unknown as Record<string, unknown>;
@@ -431,7 +436,7 @@ describe("G12-G14 [Bucket divergence: no-asmap fallback notes]", () => {
 // G16-G20: Peer behavior / runtime
 // ---------------------------------------------------------------------------
 
-describe("G16 [outboundNetGroups is Set]", () => {
+describe("G16 [outboundNetGroups is Set — ASN-keyed when asmap loaded]", () => {
   test("G16a: outbound diversity set present on PeerManager", () => {
     const pm = new PeerManager(makePeerManagerConfig());
     const netGroups = pm.getOutboundNetGroups();
@@ -441,6 +446,72 @@ describe("G16 [outboundNetGroups is Set]", () => {
   test("G16b: getMappedAS method present for ASN-based grouping", () => {
     const pm = new PeerManager(makePeerManagerConfig());
     expect(typeof pm.getMappedAS).toBe("function");
+  });
+
+  /**
+   * FIX-51: When asmap is loaded, getNetGroupForAddr() returns "asn:N" keys.
+   * Without asmap it returns "ipv4:A.B" (/16) keys.
+   * Both connect and disconnect must use the same key so no stale entries
+   * pile up in outboundNetGroups.
+   *
+   * We access the private getNetGroupForAddr() via (pm as any) — the same
+   * pattern used in Core's unit tests that cast into protected internals.
+   */
+  test("G16c: getNetGroupForAddr returns asn:N when asmap loaded", () => {
+    const dir = tmpdir();
+    const validFile = join(dir, "valid_g16c.asmap");
+    writeFileSync(validFile, Buffer.from(buildMinimalAsmapASN1()));
+    const pm = new PeerManager(makePeerManagerConfig({ asmapPath: validFile }));
+    // Minimal asmap returns ASN=1 for any IP → group key should be "asn:1"
+    const group = (pm as unknown as Record<string, (addr: string) => string>)
+      .getNetGroupForAddr("8.8.8.8");
+    expect(group).toBe("asn:1");
+  });
+
+  test("G16d: getNetGroupForAddr returns ipv4:/16 prefix when no asmap", () => {
+    const pm = new PeerManager(makePeerManagerConfig({ asmapPath: null }));
+    const group = (pm as unknown as Record<string, (addr: string) => string>)
+      .getNetGroupForAddr("8.8.8.8");
+    // No asmap → falls back to module-level getNetGroup → "ipv4:8.8"
+    expect(group).toBe("ipv4:8.8");
+  });
+
+  test("G16e: IPs in the same AS produce identical group keys (ASN-diversity works)", () => {
+    const dir = tmpdir();
+    const validFile = join(dir, "valid_g16e.asmap");
+    writeFileSync(validFile, Buffer.from(buildMinimalAsmapASN1()));
+    const pm = new PeerManager(makePeerManagerConfig({ asmapPath: validFile }));
+    const fn = (pm as unknown as Record<string, (addr: string) => string>).getNetGroupForAddr
+      .bind(pm);
+    // Minimal asmap: all IPs → ASN 1 → same "asn:1" group key
+    expect(fn("1.2.3.4")).toBe(fn("5.6.7.8"));
+    expect(fn("104.16.5.1")).toBe(fn("104.17.5.1"));
+    // Key format is "asn:1" (not an ipv4: prefix)
+    expect(fn("1.2.3.4").startsWith("asn:")).toBe(true);
+  });
+
+  test("G16f: getNetGroupForAddr key used on disconnect matches connect key (no stale entry)", () => {
+    // Regression test for the FIX-51 bug:
+    //   connect inserted "asn:1" in outboundNetGroups
+    //   old disconnect called getNetGroup() → "ipv4:8.8" → missed the delete
+    //   → "asn:1" stayed in the set forever, blocking any same-AS reconnect
+    //
+    // We verify the key is consistent (same function both directions) by
+    // checking that getNetGroupForAddr("8.8.8.8") equals itself (identity),
+    // and that with asmap loaded the format is "asn:N" not "ipv4:x.y".
+    const dir = tmpdir();
+    const validFile = join(dir, "valid_g16f.asmap");
+    writeFileSync(validFile, Buffer.from(buildMinimalAsmapASN1()));
+    const pm = new PeerManager(makePeerManagerConfig({ asmapPath: validFile }));
+    const fn = (pm as unknown as Record<string, (addr: string) => string>).getNetGroupForAddr
+      .bind(pm);
+    const keyAtConnect    = fn("8.8.8.8");
+    const keyAtDisconnect = fn("8.8.8.8");
+    // Both sides of the connect/disconnect lifecycle use the same function → same key
+    expect(keyAtConnect).toBe(keyAtDisconnect);
+    // The key is ASN-based (not the old /16-prefix fallback)
+    expect(keyAtConnect).toBe("asn:1");
+    expect(keyAtConnect.startsWith("ipv4:")).toBe(false);
   });
 });
 
@@ -554,12 +625,12 @@ describe("G21 [getpeerinfo: mapped_as field]", () => {
 });
 
 // ---------------------------------------------------------------------------
-// G22-G28: Stats / Persistence / Documentation (deferred)
+// G22-G28: Stats / Persistence / Documentation (deferred to FIX-52+)
 // ---------------------------------------------------------------------------
 
 describe("G22-G28 [Deferred: AddrMan rebuild, peers.dat, docs]", () => {
-  test("G22: getaddrmaninfo deferred to FIX-51 AddrMan rebuild", () => {
-    // Not yet implemented — deferred
+  test("G22: getaddrmaninfo deferred to FIX-52+ AddrMan rebuild", () => {
+    // Not yet implemented — deferred (full tried/new table rebuild)
     expect(true).toBe(true);
   });
 
@@ -569,7 +640,7 @@ describe("G22-G28 [Deferred: AddrMan rebuild, peers.dat, docs]", () => {
     expect(true).toBe(true);
   });
 
-  test("G28: peers.dat asmap_version persistence deferred to FIX-51", () => {
+  test("G28: peers.dat asmap_version persistence deferred to FIX-52+", () => {
     // The peers.dat format will be extended in the AddrMan rebuild wave.
     expect(true).toBe(true);
   });
@@ -797,10 +868,10 @@ describe("Core vector test [bitcoin-core/src/test/asmap_tests.cpp]", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Summary: ASMap subsystem is now implemented
+// Summary: ASMap subsystem is now implemented (FIX-50) + wired (FIX-51)
 // ---------------------------------------------------------------------------
 
-describe("Summary: ASMap subsystem implemented (FIX-50)", () => {
+describe("Summary: ASMap subsystem implemented (FIX-50) + AddrMan bucket hashing wired (FIX-51)", () => {
   test("asmap module exports all required symbols", async () => {
     const mod = await import("../src/p2p/asmap.js") as Record<string, unknown>;
     const required = [

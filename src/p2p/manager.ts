@@ -1623,7 +1623,12 @@ export class PeerManager {
     this.peerConnectionType.delete(key);
 
     if (connType !== "inbound") {
-      const netGroup = getNetGroup(peer.host);
+      // FIX-51: use getNetGroupForAddr (ASN-aware when asmap loaded) so the
+      // key matches what was inserted in connectPeer().  The old getNetGroup()
+      // call returned an ipv4:/16 string even when the outboundNetGroups entry
+      // was keyed as "asn:N", causing stale entries that permanently blocked
+      // new connections to any peer in the same AS.
+      const netGroup = this.getNetGroupForAddr(peer.host);
       this.outboundNetGroups.delete(netGroup);
     } else {
       this.inboundPeers.delete(key);
