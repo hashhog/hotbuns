@@ -462,16 +462,18 @@ describe("BIP152 CompactBlockManager", () => {
 
   test("handleSendCmpct with disabled clears support", () => {
     manager.handleSendCmpct("peer1", true, COMPACT_BLOCK_VERSION_2);
-    manager.handleSendCmpct("peer1", false, 0n);
+    // Must use version=2 to clear — Core drops any sendcmpct with version != 2 (net_processing.cpp:3907)
+    manager.handleSendCmpct("peer1", false, COMPACT_BLOCK_VERSION_2);
 
     expect(manager.peerSupportsCompact("peer1")).toBe(false);
   });
 
-  test("getNegotiatedVersion returns minimum version", () => {
-    // Peer supports version 1, we support version 2
+  test("getNegotiatedVersion returns 0 when peer sends version=1 (rejected per Core:3907)", () => {
+    // Core: if (sendcmpct_version != CMPCTBLOCKS_VERSION) return; — version 1 is silently dropped.
+    // State remains at default; getNegotiatedVersion returns 0n.
     manager.handleSendCmpct("peer1", true, COMPACT_BLOCK_VERSION_1);
 
-    expect(manager.getNegotiatedVersion("peer1")).toBe(COMPACT_BLOCK_VERSION_1);
+    expect(manager.getNegotiatedVersion("peer1")).toBe(0n);
   });
 
   test("high bandwidth peer limit is enforced", () => {

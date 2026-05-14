@@ -742,11 +742,20 @@ export class CompactBlockManager {
   /**
    * Handle received sendcmpct message.
    *
+   * Core net_processing.cpp:3907 — immediately returns for any version other
+   * than CMPCTBLOCKS_VERSION (2). Only version 2 (witness serialization) is
+   * supported; version 1 (pre-segwit) and unknown future versions are ignored.
+   *
    * @param peerId - Peer identifier
    * @param enabled - Whether peer enables compact blocks
    * @param version - BIP152 version peer supports
    */
   handleSendCmpct(peerId: string, enabled: boolean, version: bigint): void {
+    // Drop sendcmpct for any version other than 2.
+    // Core: if (sendcmpct_version != CMPCTBLOCKS_VERSION) return;  (net_processing.cpp:3907)
+    if (version !== COMPACT_BLOCK_VERSION_2) {
+      return;
+    }
     const state = this.getState(peerId);
     state.peerSupportsCompact = enabled;
     state.peerVersion = version;
