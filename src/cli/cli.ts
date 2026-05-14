@@ -1580,6 +1580,12 @@ async function startNode(config: NodeConfig): Promise<void> {
       if (expired > 0) {
         console.log(`[orphan-pool] expired ${expired} stale orphan(s) (TTL=${300}s)`);
       }
+      // Feed confirmed block data into the fee estimator so it can record
+      // confirmation times for tracked transactions (Core: CBlockPolicyEstimator::
+      // processBlock). Uses chainState.getBestBlock().height since the Block type
+      // carries no height field and the emitter fires post-connect (tip updated).
+      const blockHeight = chainState.getBestBlock().height;
+      feeEstimator.processBlock(block, blockHeight);
       // Some confirmed txs may have been parents to orphans still in the
       // pool. Cascade-promote so their children can re-attempt admission
       // now that the chain has caught up.
@@ -1638,6 +1644,10 @@ async function startNode(config: NodeConfig): Promise<void> {
       const feeRate = entry ? entry.feeRate : 0;
       txRelay.queueTxToAllFiltered(txidHex, feeRate);
       console.log(`[mempool] Accepted tx ${txidHex.slice(0, 16)}... from ${peer.host}`);
+      // Track the newly-admitted tx in the fee estimator so processBlock can
+      // record its confirmation time later (Core: CBlockPolicyEstimator::
+      // processTransaction). Only called post-IBD (guarded above).
+      feeEstimator.trackTransaction(txid, chainState.getBestBlock().height);
       await processOrphanCascade(tx);
     } else if (isMissingInputError(result.error)) {
       // Missing input — try the orphan pool. Core's net_processing.cpp
