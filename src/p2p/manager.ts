@@ -60,6 +60,12 @@ export const V1_ONLY_CACHE_MAX = 256;
  */
 export const V1_ONLY_CACHE_TTL_MS = 60 * 60 * 1000;
 
+/**
+ * Interval (ms) for periodic ASMap health-check log.
+ * 3600 s = 1 hour, matching Bitcoin Core's AddrMan periodic maintenance cadence.
+ */
+const ASMAP_HEALTH_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+
 /** Service bit flags for peer capabilities. */
 export const ServiceFlags = {
   NODE_NETWORK: 1n,          // Full node, can serve full blocks
@@ -380,6 +386,8 @@ export class PeerManager {
   private feeFilterManager: FeeFilterManager;
   /** Interval for periodic feefilter checks. */
   private feeFilterInterval: ReturnType<typeof setInterval> | null;
+  /** Interval for periodic ASMap health-check log (every 3600 s). */
+  private asmapHealthCheckInterval: ReturnType<typeof setInterval> | null;
   /** TCP listener for inbound P2P connections (Bun.listen). */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private tcpListener: any;
@@ -447,6 +455,7 @@ export class PeerManager {
       peer.send({ type: "feefilter", payload: { feeRate } });
     });
     this.feeFilterInterval = null;
+    this.asmapHealthCheckInterval = null;
     this.tcpListener = null;
     this.v1OnlyCache = new Map();
 
@@ -712,6 +721,13 @@ export class PeerManager {
     // Fill initial connections
     await this.fillConnections();
 
+    // Startup ASMap health-check log (once, after addresses are populated).
+    // Mirrors Bitcoin Core net.cpp:4188 — called immediately after addrman
+    // construction so the operator sees coverage statistics at launch.
+    if (this.usingASMap()) {
+      this.asmapHealthCheck();
+    }
+
     // Start maintenance loop (every 30 seconds)
     this.maintainInterval = setInterval(() => {
       this.maintain().catch((err) => {
@@ -728,6 +744,14 @@ export class PeerManager {
     this.staleCheckInterval = setInterval(() => {
       this.checkForStaleTipAndEvictPeers();
     }, STALE_CHECK_INTERVAL_MS);
+
+    // Start ASMap health-check periodic log (every 3600 s).
+    // Mirrors Bitcoin Core's periodic per-hour AddrMan maintenance.
+    if (this.usingASMap()) {
+      this.asmapHealthCheckInterval = setInterval(() => {
+        this.asmapHealthCheck();
+      }, ASMAP_HEALTH_CHECK_INTERVAL_MS);
+    }
   }
 
   /**
@@ -761,6 +785,12 @@ export class PeerManager {
     if (this.staleCheckInterval) {
       clearInterval(this.staleCheckInterval);
       this.staleCheckInterval = null;
+    }
+
+    // Stop ASMap health-check interval
+    if (this.asmapHealthCheckInterval) {
+      clearInterval(this.asmapHealthCheckInterval);
+      this.asmapHealthCheckInterval = null;
     }
 
     // Clear protected peers
