@@ -4140,47 +4140,63 @@ export class RPCServer {
   private async getPeerInfo(): Promise<unknown[]> {
     const peers = this.peerManager.getConnectedPeers();
 
-    return peers.map((peer, index) => ({
-      id: index,
-      addr: `${peer.host}:${peer.port}`,
-      addrlocal: `127.0.0.1:${this.config.port}`,
-      addrbind: `0.0.0.0:${peer.port}`,
-      services: peer.versionPayload?.services.toString(16).padStart(16, "0") ?? "0000000000000000",
-      servicesnames: this.getServiceNames(peer.versionPayload?.services ?? 0n),
-      relaytxes: peer.versionPayload?.relay ?? true,
-      lastsend: peer.lastSend > 0 ? Math.floor(peer.lastSend / 1000) : 0,
-      lastrecv: peer.lastRecv > 0 ? Math.floor(peer.lastRecv / 1000) : 0,
-      last_transaction: peer.lastTxTime > 0 ? Math.floor(peer.lastTxTime / 1000) : 0,
-      last_block: peer.lastBlockTime > 0 ? Math.floor(peer.lastBlockTime / 1000) : 0,
-      bytessent: peer.bytesSent,
-      bytesrecv: peer.bytesRecv,
-      conntime: Math.floor(peer.connectedTime / 1000),
-      timeoffset: peer.versionPayload && peer.versionReceivedAt > 0
-        ? Number(peer.versionPayload.timestamp) - Math.floor(peer.versionReceivedAt / 1000)
-        : 0,
-      pingtime: peer.latency / 1000,
-      minping: 0,
-      version: peer.versionPayload?.version ?? 0,
-      subver: peer.versionPayload?.userAgent ?? "",
-      inbound: false,
-      bip152_hb_to: false,
-      bip152_hb_from: false,
-      startingheight: peer.versionPayload?.startHeight ?? 0,
-      presynced_headers: -1,
-      synced_headers: -1,
-      synced_blocks: -1,
-      inflight: [],
-      addr_relay_enabled: true,
-      addr_processed: 0,
-      addr_rate_limited: 0,
-      permissions: [],
-      minfeefilter: 0,
-      bytessent_per_msg: {},
-      bytesrecv_per_msg: {},
-      connection_type: "outbound-full-relay",
-      transport_protocol_type: "v1",
-      session_id: "",
-    }));
+    return peers.map((peer, index) => {
+      // mapped_as: include iff asmap is active and the peer's IP has a known ASN.
+      // Mirrors Bitcoin Core rpc/net.cpp:236:
+      //   if (stats.m_mapped_as != 0) obj.pushKV("mapped_as", stats.m_mapped_as);
+      const mappedAs = this.peerManager.usingASMap()
+        ? this.peerManager.getMappedAS(peer.host)
+        : 0;
+
+      const entry: Record<string, unknown> = {
+        id: index,
+        addr: `${peer.host}:${peer.port}`,
+        addrlocal: `127.0.0.1:${this.config.port}`,
+        addrbind: `0.0.0.0:${peer.port}`,
+        services: peer.versionPayload?.services.toString(16).padStart(16, "0") ?? "0000000000000000",
+        servicesnames: this.getServiceNames(peer.versionPayload?.services ?? 0n),
+        relaytxes: peer.versionPayload?.relay ?? true,
+        lastsend: peer.lastSend > 0 ? Math.floor(peer.lastSend / 1000) : 0,
+        lastrecv: peer.lastRecv > 0 ? Math.floor(peer.lastRecv / 1000) : 0,
+        last_transaction: peer.lastTxTime > 0 ? Math.floor(peer.lastTxTime / 1000) : 0,
+        last_block: peer.lastBlockTime > 0 ? Math.floor(peer.lastBlockTime / 1000) : 0,
+        bytessent: peer.bytesSent,
+        bytesrecv: peer.bytesRecv,
+        conntime: Math.floor(peer.connectedTime / 1000),
+        timeoffset: peer.versionPayload && peer.versionReceivedAt > 0
+          ? Number(peer.versionPayload.timestamp) - Math.floor(peer.versionReceivedAt / 1000)
+          : 0,
+        pingtime: peer.latency / 1000,
+        minping: 0,
+        version: peer.versionPayload?.version ?? 0,
+        subver: peer.versionPayload?.userAgent ?? "",
+        inbound: false,
+        bip152_hb_to: false,
+        bip152_hb_from: false,
+        startingheight: peer.versionPayload?.startHeight ?? 0,
+        presynced_headers: -1,
+        synced_headers: -1,
+        synced_blocks: -1,
+        inflight: [],
+        addr_relay_enabled: true,
+        addr_processed: 0,
+        addr_rate_limited: 0,
+        permissions: [],
+        minfeefilter: 0,
+        bytessent_per_msg: {},
+        bytesrecv_per_msg: {},
+        connection_type: "outbound-full-relay",
+        transport_protocol_type: "v1",
+        session_id: "",
+      };
+
+      // Only include mapped_as when asmap is active and we have a mapping.
+      if (mappedAs !== 0) {
+        entry["mapped_as"] = mappedAs;
+      }
+
+      return entry;
+    });
   }
 
   /**

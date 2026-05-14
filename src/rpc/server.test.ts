@@ -102,6 +102,11 @@ class MockPeerManager {
   addMockPeer(peer: any) {
     this.peers.push(peer);
   }
+
+  // ASMap stubs — always return no-asmap state in tests
+  usingASMap(): boolean { return false; }
+  getMappedAS(_addr: string): number { return 0; }
+  getOutboundNetGroups(): Set<string> { return new Set(); }
 }
 
 class MockFeeEstimator {

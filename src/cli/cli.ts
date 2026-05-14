@@ -174,6 +174,18 @@ export interface NodeConfig {
    * Reference: BIP-157, BIP-158, bitcoin-core/src/index/blockfilterindex.cpp
    */
   blockfilterindex: boolean;
+  /**
+   * Path to an ASMap binary file for ASN-aware peer grouping.
+   * Mirrors Bitcoin Core's `-asmap=<file>` (init.cpp:540).
+   * Relative paths are resolved against the network-specific datadir.
+   * When null/undefined, falls back to the legacy /16 (IPv4) or /32 (IPv6)
+   * prefix-based bucketing.
+   *
+   * Reference: bitcoin-core/src/util/asmap.h/cpp,
+   *            bitcoin-core/src/netgroup.h/cpp,
+   *            bitcoin-core/src/init.cpp:1590-1605
+   */
+  asmapPath?: string | null;
 }
 
 /**
@@ -461,6 +473,14 @@ export function parseArgs(argv: string[]): ParsedArgs {
           } else if (value === "0" || value === "false") {
             config.blockfilterindex = false;
           }
+          break;
+        case "asmap":
+          // Bitcoin Core flag `-asmap=<file>` (init.cpp:540).
+          // Points to an ASMap binary file for ASN-aware outbound peer
+          // grouping.  Relative paths are resolved at startup against the
+          // network-specific datadir.  A bare `--asmap` with no value is
+          // reserved for future embedded-data support; for now it is a no-op.
+          if (value) config.asmapPath = value;
           break;
         case "password":
           // For wallet commands
@@ -1451,6 +1471,16 @@ async function startNode(config: NodeConfig): Promise<void> {
   // `init.cpp` (`nLocalServices |= NODE_NETWORK_LIMITED` when IsPruneMode).
   // Without this wire-up the bit was never advertised even with --prune>0,
   // causing peers to request blocks below the prune horizon and disconnect.
+  // Resolve asmap path.  Mirrors Bitcoin Core init.cpp:1590-1592:
+  // relative paths are resolved against the network-specific datadir.
+  let resolvedAsmapPath: string | null = null;
+  if (mergedConfig.asmapPath) {
+    resolvedAsmapPath = path.isAbsolute(mergedConfig.asmapPath)
+      ? mergedConfig.asmapPath
+      : path.join(mergedConfig.datadir, mergedConfig.asmapPath);
+    console.log(`Loading asmap from: ${resolvedAsmapPath}`);
+  }
+
   const peerManager = new PeerManager({
     maxOutbound: mergedConfig.maxOutbound,
     maxInbound: 117,
@@ -1461,7 +1491,12 @@ async function startNode(config: NodeConfig): Promise<void> {
     listen: mergedConfig.listen,
     port: mergedConfig.port,
     pruneMode: pruneManager !== undefined,
+    asmapPath: resolvedAsmapPath,
   });
+
+  if (peerManager.usingASMap()) {
+    console.log(`Using ASMap-aware outbound connection routing (version: ${peerManager.getAsmapVersion()})`);
+  }
 
   // Register header sync with peer manager
   headerSync.registerWithPeerManager(peerManager);
