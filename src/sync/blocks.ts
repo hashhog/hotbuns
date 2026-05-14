@@ -34,6 +34,10 @@ import {
   type AssumeValidContext,
 } from "../consensus/assumevalid.js";
 import { coreConnectBlockChecks } from "../consensus/connect_block.js";
+import {
+  MAX_CMPCTBLOCK_DEPTH,
+  MAX_BLOCKTXN_DEPTH,
+} from "../p2p/compact_blocks.js";
 
 /**
  * Classify a connect-block error string into one of three buckets so the
@@ -632,18 +636,38 @@ export class BlockSync {
     });
 
     // BIP 152: Handle compact block messages
-    // Since we don't have a mempool, fall back to requesting the full block
+    // Since we don't have a mempool, fall back to requesting the full block.
+    // Depth guard: ignore cmpctblocks for blocks deeper than MAX_CMPCTBLOCK_DEPTH=5
+    // from the tip — they are stale or orphan blocks not worth reconstructing.
+    // Core: net_processing.cpp MAX_CMPCTBLOCK_DEPTH = 5 (L2466).
     peerManager.onMessage("cmpctblock", (peer, msg) => {
       if (msg.type === "cmpctblock") {
         const header = msg.payload.header;
         const blockHash = getBlockHash(header);
         const hashHex = blockHash.toString("hex");
+
+        // Compute depth below current tip.
+        const tipHeight = this.state.nextHeightToProcess - 1;
+        const headerEntry = this.headerSync.getHeader(blockHash);
+        const blockHeight = headerEntry?.height;
+        const depth = blockHeight !== undefined ? tipHeight - blockHeight : 0;
+
+        if (depth > MAX_CMPCTBLOCK_DEPTH) {
+          console.log(
+            `Ignoring cmpctblock from ${peer.host}:${peer.port} — ` +
+            `depth=${depth} exceeds MAX_CMPCTBLOCK_DEPTH=${MAX_CMPCTBLOCK_DEPTH} ` +
+            `(hash=${hashHex.slice(0, 16)})`
+          );
+          return;
+        }
+
         console.log(
           `Received cmpctblock from ${peer.host}:${peer.port}, ` +
           `falling back to full block request (hash=${hashHex})`
         );
         // Request the full block via getdata since we can't reconstruct
-        // from compact block without a mempool
+        // from compact block without a mempool (BUG-2/BUG-3 — CompactBlockManager
+        // dead helper; wiring it is out of scope for FIX-42).
         const inv: InvVector = {
           type: InvType.MSG_WITNESS_BLOCK,
           hash: blockHash,
@@ -665,9 +689,33 @@ export class BlockSync {
       }
     });
 
-    // BIP 152: Handle getblocktxn — peer requesting missing txs for reconstruction
-    peerManager.onMessage("getblocktxn", (_peer, _msg) => {
-      // We don't serve compact blocks yet, so ignore these
+    // BIP 152: Handle getblocktxn — peer requesting missing txs for compact block
+    // reconstruction they are performing. Depth guard: ignore requests for blocks
+    // deeper than MAX_BLOCKTXN_DEPTH=10 from the tip — stale requests waste I/O.
+    // Core: net_processing.cpp MAX_BLOCKTXN_DEPTH = 10.
+    peerManager.onMessage("getblocktxn", (peer, msg) => {
+      if (msg.type !== "getblocktxn") return;
+
+      const blockHash = msg.payload.blockHash;
+      const hashHex = blockHash.toString("hex");
+
+      // Depth guard: refuse to serve getblocktxn for old blocks.
+      const tipHeight = this.state.nextHeightToProcess - 1;
+      const headerEntry = this.headerSync.getHeader(blockHash);
+      const blockHeight = headerEntry?.height;
+      const depth = blockHeight !== undefined ? tipHeight - blockHeight : 0;
+
+      if (depth > MAX_BLOCKTXN_DEPTH) {
+        console.log(
+          `Ignoring getblocktxn from ${peer.host}:${peer.port} — ` +
+          `depth=${depth} exceeds MAX_BLOCKTXN_DEPTH=${MAX_BLOCKTXN_DEPTH} ` +
+          `(hash=${hashHex.slice(0, 16)})`
+        );
+        return;
+      }
+
+      // We don't serve compact blocks yet (BUG-5 — getblocktxn serve path is a stub).
+      // The depth guard above is in place; full serving is out of scope for FIX-42.
     });
 
     // BIP 152: Handle blocktxn — response to our getblocktxn request

@@ -124,6 +124,8 @@ import {
   COMPACT_BLOCK_VERSION_2,
   MAX_HIGH_BANDWIDTH_PEERS,
   MAX_EXTRA_TXN,
+  MAX_CMPCTBLOCK_DEPTH,
+  MAX_BLOCKTXN_DEPTH,
 } from "../src/p2p/compact_blocks.js";
 import { serializeBlockHeader } from "../src/validation/block.js";
 import { getTxId, getWTxId, serializeTx } from "../src/validation/tx.js";
@@ -865,20 +867,69 @@ describe("G24: have_txn[] prevents 3-way mempool collision from re-filling a cle
 });
 
 // ============================================================================
-// G25: MAX_CMPCTBLOCK_DEPTH=5 guard — BUG-7
+// G25: MAX_CMPCTBLOCK_DEPTH=5 guard — BUG-7 (FIXED in FIX-42)
 // ============================================================================
 
-describe("G25: MAX_CMPCTBLOCK_DEPTH=5 guard — BUG-7 MEDIUM", () => {
-  test("FAIL: No depth check in CompactBlockManager (BUG-7)", () => {
+describe("G25: MAX_CMPCTBLOCK_DEPTH=5 guard — FIX-42", () => {
+  test("PASS: MAX_CMPCTBLOCK_DEPTH constant is 5", () => {
+    expect(MAX_CMPCTBLOCK_DEPTH).toBe(5);
+  });
+
+  test("PASS: startBlockReconstruction rejects depth > MAX_CMPCTBLOCK_DEPTH", () => {
     // Core net_processing.cpp:2466 — refuses cmpctblock for blocks at tip-6 or deeper
-    // CompactBlockManager has no such guard.
+    // FIX-42: depth parameter added to startBlockReconstruction; depth > 5 → null
     const block = mkBlock(3);
     const compact = createCompactBlockFromBlock(block, 0n);
     const mgr = new CompactBlockManager();
     mgr.handleSendCmpct("p1", true, 2n);
-    // Any block depth accepted — should reject for depth > 5 from tip
-    const partial = mgr.startBlockReconstruction(compact, "b0".repeat(32), "p1");
-    expect(partial).not.toBeNull(); // Accepted unconditionally — BUG-7
+    // depth = MAX_CMPCTBLOCK_DEPTH + 1 → should be rejected
+    const partial = mgr.startBlockReconstruction(compact, "b0".repeat(32), "p1", MAX_CMPCTBLOCK_DEPTH + 1);
+    expect(partial).toBeNull(); // PASS: depth guard rejects stale block
+  });
+
+  test("PASS: startBlockReconstruction accepts depth = MAX_CMPCTBLOCK_DEPTH exactly", () => {
+    const block = mkBlock(3);
+    const compact = createCompactBlockFromBlock(block, 0n);
+    const mgr = new CompactBlockManager();
+    mgr.handleSendCmpct("p1", true, 2n);
+    const partial = mgr.startBlockReconstruction(compact, "b1".repeat(32), "p1", MAX_CMPCTBLOCK_DEPTH);
+    expect(partial).not.toBeNull(); // depth == 5 is allowed
+  });
+
+  test("PASS: startBlockReconstruction accepts depth 0 (tip block)", () => {
+    const block = mkBlock(3);
+    const compact = createCompactBlockFromBlock(block, 0n);
+    const mgr = new CompactBlockManager();
+    mgr.handleSendCmpct("p1", true, 2n);
+    const partial = mgr.startBlockReconstruction(compact, "b2".repeat(32), "p1", 0);
+    expect(partial).not.toBeNull();
+  });
+
+  test("PASS: startBlockReconstruction accepts depth=0 by default (backward compat)", () => {
+    // Existing callers without depth param still work (default = 0 = tip).
+    const block = mkBlock(3);
+    const compact = createCompactBlockFromBlock(block, 0n);
+    const mgr = new CompactBlockManager();
+    mgr.handleSendCmpct("p1", true, 2n);
+    const partial = mgr.startBlockReconstruction(compact, "b3".repeat(32), "p1");
+    expect(partial).not.toBeNull();
+  });
+});
+
+// ============================================================================
+// G25b: MAX_BLOCKTXN_DEPTH=10 constant — FIX-42
+// ============================================================================
+
+describe("G25b: MAX_BLOCKTXN_DEPTH=10 constant — FIX-42", () => {
+  test("PASS: MAX_BLOCKTXN_DEPTH constant is 10", () => {
+    // Core net_processing.cpp MAX_BLOCKTXN_DEPTH = 10:
+    // getblocktxn serve requests are ignored for blocks deeper than tip-10.
+    expect(MAX_BLOCKTXN_DEPTH).toBe(10);
+  });
+
+  test("PASS: MAX_BLOCKTXN_DEPTH > MAX_CMPCTBLOCK_DEPTH (wider serve window)", () => {
+    // We may serve blocktxn for slightly older blocks than we reconstruct from.
+    expect(MAX_BLOCKTXN_DEPTH).toBeGreaterThan(MAX_CMPCTBLOCK_DEPTH);
   });
 });
 

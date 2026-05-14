@@ -53,6 +53,21 @@ export const MAX_HIGH_BANDWIDTH_PEERS = 3;
 /** Maximum extra transactions to search for collision resolution */
 export const MAX_EXTRA_TXN = 100;
 
+/**
+ * Maximum depth from the chain tip at which we process received cmpctblocks.
+ * Core net_processing.cpp:2466 — refuses to create cmpctblocks for blocks
+ * deeper than tip-5; receivers apply the same guard to avoid reconstructing
+ * stale or orphan blocks.
+ */
+export const MAX_CMPCTBLOCK_DEPTH = 5;
+
+/**
+ * Maximum depth from the chain tip at which we serve getblocktxn requests.
+ * Core net_processing.cpp — peers requesting transaction data for compact
+ * block reconstruction are ignored when the block is deeper than tip-10.
+ */
+export const MAX_BLOCKTXN_DEPTH = 10;
+
 /** Mask for extracting 6-byte short ID from SipHash result */
 const SHORT_ID_MASK = 0xffffffffffffn;
 
@@ -827,13 +842,25 @@ export class CompactBlockManager {
    * @param compact - Received compact block
    * @param blockHash - Block hash (hex)
    * @param peerId - Sending peer
-   * @returns PartiallyDownloadedBlock or null if invalid
+   * @param depth - Depth of this block below the chain tip (0 = tip, 1 = tip-1, …)
+   *                If depth > MAX_CMPCTBLOCK_DEPTH (5), reconstruction is refused to
+   *                avoid wasting resources on stale or orphan compact blocks.
+   *                Core: net_processing.cpp MAX_CMPCTBLOCK_DEPTH=5.
+   * @returns PartiallyDownloadedBlock or null if invalid or too old
    */
   startBlockReconstruction(
     compact: CmpctBlockPayload,
     blockHash: string,
-    peerId: string
+    peerId: string,
+    depth: number = 0
   ): PartiallyDownloadedBlock | null {
+    // Depth guard: refuse to reconstruct compact blocks that are too far behind
+    // the tip — they are either stale or orphans and wasting bandwidth/CPU.
+    // Core: net_processing.cpp MAX_CMPCTBLOCK_DEPTH = 5.
+    if (depth > MAX_CMPCTBLOCK_DEPTH) {
+      return null;
+    }
+
     this.stats.compactBlocksReceived++;
 
     const partial = new PartiallyDownloadedBlock(compact, blockHash);
