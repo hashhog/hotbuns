@@ -46,7 +46,7 @@ import { ChainDB } from "../src/storage/database.js";
 import { UTXOManager } from "../src/chain/utxo.js";
 import { REGTEST } from "../src/consensus/params.js";
 import { Mempool } from "../src/mempool/mempool.js";
-import { FeeEstimator } from "../src/fees/estimator.js";
+import { FeeEstimator, Horizon, DECAY, SCALE, PERIODS } from "../src/fees/estimator.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -82,17 +82,25 @@ const emptyBlock = (height: number = 1) => ({
 // G1 — Three time horizons (short / medium / long) — MISSING ENTIRELY
 // ---------------------------------------------------------------------------
 describe("G1 three time horizons", () => {
-  test("BUG-1: FeeEstimator has no short/medium/long horizon split — single bucket array only", async () => {
+  test("FeeEstimator has short/medium/long horizon split via horizons field (FIX-48)", async () => {
     const { est, cleanup } = await makeEstimator();
     try {
       // Core maintains three independent TxConfirmStats instances:
       //   feeStats (medium), shortStats, longStats — each with own decay+scale.
-      // Hotbuns has a single flat bucket array. No horizon concept exists.
-      // @ts-ignore — probing private shape
-      const hasShortStats =
-        "shortStats" in est || "short" in est || "horizons" in est || "feeStats" in est;
-      // BUG: single-horizon design confirmed
-      expect(hasShortStats).toBe(false); // correctly documents: no horizon split
+      // FIX-48: horizons Record<Horizon, HorizonStats> added.
+      // @ts-ignore — probing shape
+      const hasHorizons = "horizons" in est;
+      expect(hasHorizons).toBe(true); // fixed: three-horizon split present
+
+      // Verify all three horizons are present
+      expect(est.horizons[Horizon.Short]).toBeDefined();
+      expect(est.horizons[Horizon.Medium]).toBeDefined();
+      expect(est.horizons[Horizon.Long]).toBeDefined();
+
+      // Each horizon has its own bucket array
+      expect(Array.isArray(est.horizons[Horizon.Short].buckets)).toBe(true);
+      expect(Array.isArray(est.horizons[Horizon.Medium].buckets)).toBe(true);
+      expect(Array.isArray(est.horizons[Horizon.Long].buckets)).toBe(true);
     } finally {
       await cleanup();
     }
@@ -103,16 +111,12 @@ describe("G1 three time horizons", () => {
 // G2 — Correct decay constants
 // ---------------------------------------------------------------------------
 describe("G2 decay constants", () => {
-  test("BUG-2: DECAY_FACTOR=0.998 does not match any Core horizon (0.962 / 0.9952 / 0.99931)", () => {
-    // From estimator.ts:55
-    const HOTBUNS_DECAY = 0.998;
-    const CORE_SHORT  = 0.962;
-    const CORE_MED    = 0.9952;
-    const CORE_LONG   = 0.99931;
-
-    expect(Math.abs(HOTBUNS_DECAY - CORE_SHORT)).toBeGreaterThan(0.001);
-    expect(Math.abs(HOTBUNS_DECAY - CORE_MED)).toBeGreaterThan(0.001);
-    expect(Math.abs(HOTBUNS_DECAY - CORE_LONG)).toBeGreaterThan(0.001);
+  test("DECAY constants match Core horizon values (FIX-48)", () => {
+    // FIX-48: three correct per-horizon decay constants exported from estimator.ts.
+    // Core: src/policy/fees.cpp SHORT_DECAY=0.962, MED_DECAY=0.9952, LONG_DECAY=0.99931.
+    expect(DECAY[Horizon.Short]).toBeCloseTo(0.962, 5);
+    expect(DECAY[Horizon.Medium]).toBeCloseTo(0.9952, 5);
+    expect(DECAY[Horizon.Long]).toBeCloseTo(0.99931, 5);
   });
 });
 
@@ -120,14 +124,29 @@ describe("G2 decay constants", () => {
 // G3 & G4 — Scale and period constants
 // ---------------------------------------------------------------------------
 describe("G3/G4 scale and period counts", () => {
-  test("BUG-3: no scale multipliers (MED_SCALE=2, LONG_SCALE=24) — single flat period model", async () => {
+  test("SCALE and PERIODS constants match Core horizon values (FIX-48)", async () => {
     const { est, cleanup } = await makeEstimator();
     try {
-      // Core: short 12×1, med 24×2=48, long 42×24=1008 blocks coverage
-      // Hotbuns: MAX_CONFIRMATION_BLOCKS=1008 with no scale concept
-      // @ts-ignore
-      const hasMedScale = "MED_SCALE" in est || "medScale" in est || "SHORT_BLOCK_PERIODS" in est;
-      expect(hasMedScale).toBe(false); // BUG confirmed: scale concept absent
+      // FIX-48: SCALE and PERIODS exported from estimator.ts.
+      // Core: SHORT_SCALE=1, MED_SCALE=2, LONG_SCALE=24
+      //       short 12×1=12, med 24×2=48, long 42×24=1008 blocks coverage
+      expect(SCALE[Horizon.Short]).toBe(1);
+      expect(SCALE[Horizon.Medium]).toBe(2);
+      expect(SCALE[Horizon.Long]).toBe(24);
+
+      expect(PERIODS[Horizon.Short]).toBe(12);
+      expect(PERIODS[Horizon.Medium]).toBe(24);
+      expect(PERIODS[Horizon.Long]).toBe(42);
+
+      // Coverage: scale × periods
+      expect(SCALE[Horizon.Short] * PERIODS[Horizon.Short]).toBe(12);
+      expect(SCALE[Horizon.Medium] * PERIODS[Horizon.Medium]).toBe(48);
+      expect(SCALE[Horizon.Long] * PERIODS[Horizon.Long]).toBe(1008);
+
+      // horizon stats have the correct scale wired
+      expect(est.horizons[Horizon.Short].scale).toBe(1);
+      expect(est.horizons[Horizon.Medium].scale).toBe(2);
+      expect(est.horizons[Horizon.Long].scale).toBe(24);
     } finally {
       await cleanup();
     }
@@ -513,7 +532,7 @@ describe("G26 reorg guard", () => {
 // G28 — IEEE 754 decay precision over 1008 blocks
 // ---------------------------------------------------------------------------
 describe("G28 IEEE 754 decay precision over 1008 blocks", () => {
-  test("decay accumulation over 1008 blocks stays within float64 precision (JS Number is fine)", async () => {
+  test("decay accumulation over 1008 blocks stays within float64 precision (FIX-48: medium-horizon decay)", async () => {
     const { est, cleanup } = await makeEstimator();
     try {
       const txid = Buffer.alloc(32, 1);
@@ -525,14 +544,20 @@ describe("G28 IEEE 754 decay precision over 1008 blocks", () => {
         est.processBlock(emptyBlock() as any, h);
       }
 
-      // 0.998^1008 ≈ 0.13315
-      const expected = initial * Math.pow(0.998, 1008);
+      // FIX-48: getBuckets() uses medium-horizon decay (0.9952 per block).
+      // 0.9952^1008 ≈ 0.008 (roughly 144-block half-life)
+      const medDecay = DECAY[Horizon.Medium]; // 0.9952
+      const expected = initial * Math.pow(medDecay, 1008);
       // IEEE 754 double is precise; should be within 1e-9 relative
       const relativeError = Math.abs(bucket.totalConfirmed - expected) / expected;
       expect(relativeError).toBeLessThan(1e-9);
 
-      // Note: Core LONG_DECAY=0.99931^1008 ≈ 0.499 (1-week half-life)
-      // Hotbuns 0.998^1008 ≈ 0.133 (~346-block half-life, 3× too fast)
+      // Short-horizon decay: 0.962^1008 ≈ very tiny (~7-block half-life, fast forgetting)
+      // Long-horizon decay:  0.99931^1008 ≈ 0.499 (Core's 1-week half-life)
+      const shortHb = est.horizons[Horizon.Long].buckets.find(
+        (_hb, i) => est.getBuckets()[i]?.feeRateRange.min === 100
+      );
+      expect(shortHb).toBeDefined();
     } finally {
       await cleanup();
     }
@@ -618,7 +643,7 @@ describe("Existing estimator behavior", () => {
     }
   });
 
-  test("applyDecay reduces totalConfirmed by DECAY_FACTOR per block", async () => {
+  test("applyDecay reduces totalConfirmed by medium-horizon DECAY per block (FIX-48)", async () => {
     const { est, cleanup } = await makeEstimator();
     try {
       const txid = Buffer.alloc(32, 0x22);
@@ -626,7 +651,8 @@ describe("Existing estimator behavior", () => {
       const bucket = est.getBuckets().find((b) => b.feeRateRange.min === 100)!;
       const before = bucket.totalConfirmed;
       est.processBlock(emptyBlock() as any, 200);
-      expect(bucket.totalConfirmed).toBeCloseTo(before * 0.998, 10);
+      // getBuckets() uses medium-horizon decay (0.9952); not old 0.998
+      expect(bucket.totalConfirmed).toBeCloseTo(before * DECAY[Horizon.Medium], 10);
     } finally {
       await cleanup();
     }

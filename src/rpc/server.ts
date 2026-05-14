@@ -14,6 +14,7 @@ import { dumpMempool, loadMempool, mempoolDumpExists } from "../mempool/persist.
 import { RBFTransactionState } from "../mempool/rbf.js";
 import type { PeerManager } from "../p2p/manager.js";
 import type { FeeEstimator } from "../fees/estimator.js";
+import { Horizon, DECAY, SCALE } from "../fees/estimator.js";
 import type { HeaderSync, HeaderChainEntry } from "../sync/headers.js";
 import type { BlockSync } from "../sync/blocks.js";
 import type { ConsensusParams } from "../consensus/params.js";
@@ -3866,99 +3867,98 @@ export class RPCServer {
       );
     }
 
-    const buckets = this.feeEstimator.getBuckets();
+    const sharedBuckets = this.feeEstimator.getBuckets();
 
-    // Find the lowest-fee bucket where confirmedWithinTarget / total >= threshold.
-    // Walk from highest fee rate down so we can identify the boundary.
-    let pass: {
-      startrange: number;
-      endrange: number;
-      withintarget: number;
-      totalconfirmed: number;
-      inmempool: number;
-      leftmempool: number;
-    } | null = null;
-    let fail: {
-      startrange: number;
-      endrange: number;
-      withintarget: number;
-      totalconfirmed: number;
-      inmempool: number;
-      leftmempool: number;
-    } = {
-      startrange: -1,
-      endrange: -1,
-      withintarget: 0,
-      totalconfirmed: 0,
-      inmempool: 0,
-      leftmempool: 0,
-    };
+    /**
+     * Compute pass/fail summary for a single horizon's bucket stats.
+     * Mirrors Core's rpc/fees.cpp EstimateRawFee per-horizon logic.
+     */
+    const computeHorizonResult = (h: Horizon): Record<string, unknown> => {
+      const hStats = this.feeEstimator.horizons[h];
+      const hBuckets = hStats.buckets;
 
-    for (let i = buckets.length - 1; i >= 0; i--) {
-      const b = buckets[i];
-      const within = b.confirmationBlocks.filter(
-        (blk) => blk <= confTarget
-      ).length;
-      const total = within + b.totalUnconfirmed;
-      if (total < 1) {
-        continue;
-      }
-      const probability = within / total;
-      const summary = {
-        startrange: b.feeRateRange.min,
-        endrange: Number.isFinite(b.feeRateRange.max) ? b.feeRateRange.max : -1,
-        withintarget: Math.round(within * 100) / 100,
-        totalconfirmed: Math.round(b.totalConfirmed * 100) / 100,
-        inmempool: Math.round(b.totalUnconfirmed * 100) / 100,
-        // hotbuns does not separately track timed-out unconfirmed txs.
+      let pass: {
+        startrange: number;
+        endrange: number;
+        withintarget: number;
+        totalconfirmed: number;
+        inmempool: number;
+        leftmempool: number;
+      } | null = null;
+      let fail: {
+        startrange: number;
+        endrange: number;
+        withintarget: number;
+        totalconfirmed: number;
+        inmempool: number;
+        leftmempool: number;
+      } = {
+        startrange: -1,
+        endrange: -1,
+        withintarget: 0,
+        totalconfirmed: 0,
+        inmempool: 0,
         leftmempool: 0,
       };
-      if (probability >= threshold) {
-        pass = summary; // keep walking — we want the lowest passing bucket.
-      } else {
-        // First failure encountered while walking down; record it once.
-        if (fail.startrange === -1) {
-          fail = summary;
+
+      for (let i = hBuckets.length - 1; i >= 0; i--) {
+        const hb = hBuckets[i];
+        const sharedBucket = sharedBuckets[i];
+        const within = hb.confirmationBlocks.filter(
+          (blk) => blk <= confTarget
+        ).length;
+        const total = within + hb.unconfirmed;
+        if (total < 1) {
+          continue;
         }
-        if (pass !== null) {
-          // We already had a passing higher bucket; the first failing
-          // bucket below is the boundary — Core stops here.
-          break;
+        const probability = within / total;
+        const summary = {
+          startrange: sharedBucket.feeRateRange.min,
+          endrange: Number.isFinite(sharedBucket.feeRateRange.max)
+            ? sharedBucket.feeRateRange.max
+            : -1,
+          withintarget: Math.round(within * 100) / 100,
+          totalconfirmed: Math.round(hb.confirmed * 100) / 100,
+          inmempool: Math.round(hb.unconfirmed * 100) / 100,
+          leftmempool: 0,
+        };
+        if (probability >= threshold) {
+          pass = summary; // keep walking — we want the lowest passing bucket.
+        } else {
+          if (fail.startrange === -1) {
+            fail = summary;
+          }
+          if (pass !== null) {
+            break;
+          }
         }
       }
-    }
 
-    // Decay & scale: surface the constants the estimator uses so callers
-    // can reason about the data freshness. hotbuns currently uses a
-    // single global decay factor (0.998 per block) and one bucket scale.
-    const decay = 0.998;
-    const scale = 1; // 1-block scale (no horizon multiplier)
+      const result: Record<string, unknown> = {
+        decay: hStats.decay,
+        scale: hStats.scale,
+      };
 
-    const horizonResult: Record<string, unknown> = {
-      decay,
-      scale,
+      if (pass !== null) {
+        result.feerate = pass.startrange / 100_000;
+        result.pass = pass;
+        if (fail.startrange !== -1) {
+          result.fail = fail;
+        }
+      } else {
+        result.fail = fail;
+        result.errors = [
+          "Insufficient data or no feerate found which meets threshold",
+        ];
+      }
+
+      return result;
     };
 
-    if (pass !== null) {
-      // feerate is reported in BTC/kvB to match estimatesmartfee.
-      horizonResult.feerate = pass.startrange / 100_000;
-      horizonResult.pass = pass;
-      if (fail.startrange !== -1) {
-        horizonResult.fail = fail;
-      }
-    } else {
-      horizonResult.fail = fail;
-      horizonResult.errors = [
-        "Insufficient data or no feerate found which meets threshold",
-      ];
-    }
-
-    // hotbuns has no short/medium/long horizon split, so we report the
-    // single bucket set under all three keys for Core-compatible clients.
     return {
-      short: horizonResult,
-      medium: horizonResult,
-      long: horizonResult,
+      short:  computeHorizonResult(Horizon.Short),
+      medium: computeHorizonResult(Horizon.Medium),
+      long:   computeHorizonResult(Horizon.Long),
     };
   }
 

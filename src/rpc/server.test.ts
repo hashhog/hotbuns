@@ -119,6 +119,25 @@ class MockFeeEstimator {
   getBuckets() {
     return this.buckets;
   }
+
+  /**
+   * horizons mock: mirrors the shared buckets array under all three
+   * horizons so estimaterawfee can iterate per-horizon bucket stats.
+   * Each horizon bucket maps confirmed/unconfirmed from the shared bucket.
+   */
+  get horizons(): Record<number, { decay: number; scale: number; periods: number; buckets: any[] }> {
+    const makeBuckets = () =>
+      this.buckets.map((b: any) => ({
+        confirmed: b.totalConfirmed ?? 0,
+        unconfirmed: b.totalUnconfirmed ?? 0,
+        confirmationBlocks: b.confirmationBlocks ?? [],
+      }));
+    return {
+      0: { decay: 0.962,   scale: 1,  periods: 12, buckets: makeBuckets() }, // Short
+      1: { decay: 0.9952,  scale: 2,  periods: 24, buckets: makeBuckets() }, // Medium
+      2: { decay: 0.99931, scale: 24, periods: 42, buckets: makeBuckets() }, // Long
+    };
+  }
 }
 
 class MockHeaderSync {
