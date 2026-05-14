@@ -4155,6 +4155,30 @@ export class Mempool {
       };
     }
 
+    // BUG-4 (W116): enforce child-with-parents-tree topology.
+    // Core's submitpackage RPC (mempool.cpp:1395) rejects multi-tx packages that are not
+    // IsChildWithParentsTree — i.e. chains (gp→p→c) or packages where parents depend on each other.
+    // validatePackage only checks topo-sort and consistency; this is the additional topology guard.
+    if (!isChildWithParentsTree(transactions)) {
+      for (const tx of transactions) {
+        const txid = getTxId(tx).toString("hex");
+        const wtxid = getWTxId(tx).toString("hex");
+        txResults.set(wtxid, {
+          txid,
+          wtxid,
+          accepted: false,
+          error: "package-not-validated",
+        });
+      }
+
+      return {
+        result: PackageValidationResult.PCKG_POLICY,
+        message: "package topology disallowed. not child-with-parents or parents depend on each other.",
+        txResults,
+        replacedTxids,
+      };
+    }
+
     // Build a map of pending transactions for fee calculation
     // This allows us to look up outputs from package members that aren't in mempool yet
     const pendingTxs = new Map<string, Transaction>();

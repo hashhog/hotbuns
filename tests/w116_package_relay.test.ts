@@ -433,9 +433,9 @@ describe("G10 — testmempoolaccept reject-reason", () => {
 // BUG-4: Core rejects chains (not IsChildWithParentsTree); hotbuns allows them
 // ---------------------------------------------------------------------------
 describe("G11 — submitpackage topology guard [BUG-4]", () => {
-  test("FAIL: submitPackage accepts a 3-tx chain (gp→p→c) — should reject per Core", async () => {
+  test("submitPackage rejects a 3-tx chain (gp→p→c) per Core IsChildWithParentsTree", async () => {
     // Core: if (txns.size() > 1 && !IsChildWithParentsTree(txns)) → INVALID_PACKAGE
-    // hotbuns: validatePackage checks isTopoSortedPackage but NOT isChildWithParentsTree
+    // Fixed (FIX-53): submitPackage now calls isChildWithParentsTree after validatePackage.
     const gpInput = Buffer.alloc(32, 0x50);
     await addUTXO(gpInput, 0, 300_000n);
 
@@ -446,12 +446,10 @@ describe("G11 — submitpackage topology guard [BUG-4]", () => {
     // isChildWithParentsTree should be false for a 3-tx chain
     expect(isChildWithParentsTree([gp, p, c])).toBe(false);
 
-    // Core would reject this with "package topology disallowed"
-    // hotbuns incorrectly accepts it (because validatePackage only checks topo-sort)
+    // Core rejects this with "package topology disallowed"
     const r = await mempool.submitPackage([gp, p, c]);
-    // Document the bug: hotbuns accepts chains that Core rejects
-    // If this test fails (chain IS rejected), the bug is fixed
-    expect(r.result).toBe(PackageValidationResult.PCKG_RESULT_UNSET); // BUG: should be PCKG_POLICY
+    expect(r.result).toBe(PackageValidationResult.PCKG_POLICY);
+    expect(r.message).toContain("package topology disallowed");
   });
 
   test("submitPackage correctly accepts child-with-independent-parents", async () => {
@@ -832,11 +830,12 @@ describe("G27 — MAX constants match Bitcoin Core", () => {
 // G28 — Edge case: isChildWithParentsTree absent from submitpackage path
 // BUG-4 duplicate — confirms at the function level
 // ---------------------------------------------------------------------------
-describe("G28 — isChildWithParentsTree not enforced in submitpackage [BUG-4]", () => {
-  test("validatePackage does NOT call isChildWithParentsTree", () => {
-    // validatePackage checks: count, weight, duplicates, topo-sort, consistency
-    // It does NOT check IsChildWithParentsTree — which Core's submitpackage does.
-    // A 3-tx chain passes validatePackage even though Core would reject it.
+describe("G28 — validatePackage (CheckPackage equivalent) does not check topology [BUG-4 fixed in submitPackage]", () => {
+  test("validatePackage does NOT call isChildWithParentsTree (correct — mirrors Core CheckPackage)", () => {
+    // validatePackage mirrors Core's CheckPackage (packages.cpp): count, weight, dedup, topo-sort, consistency.
+    // IsChildWithParentsTree is checked by the RPC handler (submitpackage in Core's mempool.cpp:1395),
+    // not by CheckPackage. Same split in hotbuns: submitPackage (FIX-53) calls isChildWithParentsTree;
+    // validatePackage intentionally does not.
     const gp = makeTx([{ txid: Buffer.alloc(32, 0x10), vout: 0 }], [{ value: 300n }]);
     const p = makeTx([{ txid: getTxId(gp), vout: 0 }], [{ value: 200n }]);
     const c = makeTx([{ txid: getTxId(p), vout: 0 }], [{ value: 100n }]);
@@ -844,9 +843,9 @@ describe("G28 — isChildWithParentsTree not enforced in submitpackage [BUG-4]",
     // Chain is NOT a valid child-with-parents-tree structure
     expect(isChildWithParentsTree([gp, p, c])).toBe(false);
 
-    // But validatePackage accepts it (BUG-4: missing check)
+    // validatePackage intentionally accepts it — topology guard is in submitPackage (correct behavior)
     const r = validatePackage([gp, p, c]);
-    expect(r.valid).toBe(true); // documents the bug
+    expect(r.valid).toBe(true);
   });
 });
 
