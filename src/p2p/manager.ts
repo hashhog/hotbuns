@@ -30,6 +30,8 @@ import {
   legacyAddressToNetworkAddressV2,
   isAddrV1Compatible,
   formatNetworkAddressV2,
+  formatTorV3,
+  formatI2P,
 } from "./addrv2.js";
 import {
   FeeFilterManager,
@@ -44,6 +46,7 @@ import {
   getAsnGroup,
   asmapVersion,
 } from "./asmap.js";
+import type { ProxyManager, NetworkType } from "./proxy.js";
 
 /**
  * Maximum number of addresses retained in the v1-only fallback cache.
@@ -110,6 +113,25 @@ export interface PeerManagerConfig {
    * prefix-based bucketing.
    */
   asmapPath?: string | null;
+  /**
+   * Optional multi-network proxy manager.  When non-null and initialized,
+   * outbound connects to `.onion` / `.b32.i2p` addresses route through
+   * the configured SOCKS5 / I2P SAM proxies; clearnet routes through the
+   * default proxy if one is set (otherwise direct).
+   *
+   * Constructed in cli.ts from --proxy / --onion / --i2psam flags and
+   * passed in here so PeerManager can dispatch on PeerInfo.networkId.
+   * When null, all outbound goes through Bun.connect directly and the
+   * candidate set is filtered to clearnet-only.
+   */
+  proxyManager?: ProxyManager | null;
+  /**
+   * Mirrors Bitcoin Core's `-cjdnsreachable`. When true, CJDNS peers
+   * (fc00::/8 IPv6, BIP155 network id 6) are eligible for outbound
+   * connects (direct, no SOCKS5). When false (default), CJDNS peers
+   * are filtered out of {@link getCandidateAddresses}.
+   */
+  cjdnsReachable?: boolean;
 }
 
 /** Stored information about a known peer address. */
@@ -415,6 +437,21 @@ export class PeerManager {
    */
   private asmapData: Uint8Array | null;
 
+  /**
+   * Multi-network proxy manager (Tor SOCKS5 + I2P SAM + clearnet SOCKS5).
+   * Constructed by cli.ts from --proxy / --onion / --i2psam flags and
+   * passed in via {@link PeerManagerConfig.proxyManager}.  Null when no
+   * proxy flag was supplied; in that case only IPv4/IPv6 candidates are
+   * returned by {@link getCandidateAddresses}.
+   *
+   * Reference: bitcoin-core/src/init.cpp `-proxy`/`-onion`/`-i2psam`,
+   *            netbase.cpp SetProxy(NET_*).
+   */
+  private proxyManager: ProxyManager | null;
+
+  /** Mirrors `-cjdnsreachable`. See {@link PeerManagerConfig.cjdnsReachable}. */
+  private cjdnsReachable: boolean;
+
   constructor(config: PeerManagerConfig) {
     this.config = {
       maxOutbound: config.maxOutbound ?? MAX_OUTBOUND_FULL_RELAY + MAX_OUTBOUND_BLOCK_RELAY,
@@ -473,6 +510,100 @@ export class PeerManager {
       this.asmapData = data;
     } else {
       this.asmapData = null;
+    }
+
+    // Wire in the proxy manager and CJDNS reachability flag from cli.ts.
+    // Both default to "off" (null / false); existing call sites that
+    // construct PeerManager without these fields keep the historical
+    // clearnet-only behavior.
+    this.proxyManager = config.proxyManager ?? null;
+    this.cjdnsReachable = config.cjdnsReachable ?? false;
+  }
+
+  /**
+   * Returns the proxy manager, or null when none is configured.
+   * Exposed for {@link Peer.connect} routing and unit tests.
+   */
+  getProxyManager(): ProxyManager | null {
+    return this.proxyManager;
+  }
+
+  /**
+   * Returns true iff CJDNS outbound is enabled (`--cjdnsreachable`).
+   */
+  isCJDNSReachable(): boolean {
+    return this.cjdnsReachable;
+  }
+
+  /**
+   * Resolve a {@link PeerInfo} entry into the dialable network type +
+   * host string used for outbound connects. Returns null when the peer
+   * cannot be reached given the current proxy configuration.
+   *
+   * For IPv4/IPv6 the host string is used directly (Bun.connect or
+   * SOCKS5 over the default proxy).  For TorV3, the 32-byte pubkey is
+   * encoded as the proper `.onion` address (base32 of pubkey || checksum
+   * || version).  For I2P the 32-byte hash is encoded as `.b32.i2p`.
+   * For CJDNS the 16-byte address is formatted as IPv6.
+   *
+   * Returns null when:
+   *   - networkId is TorV3 and no SOCKS5 proxy is configured,
+   *   - networkId is I2P and no SAM bridge is configured,
+   *   - networkId is CJDNS and `--cjdnsreachable` was not set,
+   *   - networkId is unknown (BIP-155 forward compatibility).
+   *
+   * Used by {@link getCandidateAddresses} (BUG-5 filter) and
+   * {@link connectPeerInfo} to route outbound connects through the
+   * appropriate transport.
+   */
+  resolveDialable(info: PeerInfo): { host: string; networkType: NetworkType } | null {
+    const networkId = info.networkId ?? BIP155Network.IPV4;
+    switch (networkId) {
+      case BIP155Network.IPV4:
+        return { host: info.host, networkType: "ipv4" };
+      case BIP155Network.IPV6: {
+        // Older code stored the raw 32-char hex in info.host; if rawAddr
+        // is present we re-derive the canonical IPv6 string. If only the
+        // legacy hex string is present, accept it as-is — Bun.connect
+        // tolerates either form for in-fleet round-trips.
+        if (info.rawAddr && info.rawAddr.length === 16) {
+          const groups: string[] = [];
+          for (let i = 0; i < 16; i += 2) {
+            const v = (info.rawAddr[i] << 8) | info.rawAddr[i + 1];
+            groups.push(v.toString(16));
+          }
+          return { host: groups.join(":"), networkType: "ipv6" };
+        }
+        return { host: info.host, networkType: "ipv6" };
+      }
+      case BIP155Network.TORV3: {
+        if (!this.proxyManager) return null;
+        if (!info.rawAddr || info.rawAddr.length !== 32) return null;
+        return {
+          host: formatTorV3(info.rawAddr),
+          networkType: "onion",
+        };
+      }
+      case BIP155Network.I2P: {
+        if (!this.proxyManager) return null;
+        if (!info.rawAddr || info.rawAddr.length !== 32) return null;
+        return {
+          host: formatI2P(info.rawAddr),
+          networkType: "i2p",
+        };
+      }
+      case BIP155Network.CJDNS: {
+        if (!this.cjdnsReachable) return null;
+        if (!info.rawAddr || info.rawAddr.length !== 16) return null;
+        const groups: string[] = [];
+        for (let i = 0; i < 16; i += 2) {
+          const v = (info.rawAddr[i] << 8) | info.rawAddr[i + 1];
+          groups.push(v.toString(16));
+        }
+        return { host: groups.join(":"), networkType: "cjdns" };
+      }
+      default:
+        return null;
     }
   }
 
@@ -858,7 +989,8 @@ export class PeerManager {
   async connectPeer(
     host: string,
     port: number,
-    connectionType: ConnectionType = "full_relay"
+    connectionType: ConnectionType = "full_relay",
+    networkType: NetworkType = "ipv4"
   ): Promise<Peer> {
     const key = `${host}:${port}`;
 
@@ -902,7 +1034,13 @@ export class PeerManager {
       services: advertisedServices,
       userAgent: this.config.params.userAgent,
       bestHeight: this.config.bestHeight,
-      relay: connectionType !== "block_relay", // Block-relay-only connections don't relay txs
+      relay: connectionType !== "block_relay", // Block-relay-only connections don't relay txs,
+      // FIX-56 W117: plumb the proxy manager + network type into the Peer
+      // so non-clearnet outbound (.onion, .b32.i2p) routes through SOCKS5
+      // or I2P SAM rather than the direct Bun.connect path.  CJDNS is
+      // direct-IPv6 from the node's perspective (no proxy hop).
+      proxyManager: this.proxyManager ?? undefined,
+      networkType,
     };
 
     const events: PeerEvents = {
@@ -1536,14 +1674,26 @@ export class PeerManager {
       for (const info of candidates) {
         if (connected >= neededFullRelay) break;
 
-        // Check network group diversity
+        // BUG-5: resolve into a dialable string + network type.  Already
+        // gated by getCandidateAddresses, but keep this explicit so future
+        // refactors can't bypass the proxy dispatch.
+        const dialable = this.resolveDialable(info);
+        if (!dialable) continue;
+
+        // Check network group diversity (use original host so legacy
+        // /16 + ASN bucketing keep their semantics).
         const netGroup = this.getNetGroupForAddr(info.host);
         if (this.outboundNetGroups.has(netGroup)) {
           continue;
         }
 
         try {
-          await this.connectPeer(info.host, info.port, "full_relay");
+          await this.connectPeer(
+            dialable.host,
+            info.port,
+            "full_relay",
+            dialable.networkType
+          );
           connected++;
         } catch {
           // Connection failed, try next
@@ -1560,6 +1710,9 @@ export class PeerManager {
       for (const info of candidates) {
         if (connected >= neededBlockRelay) break;
 
+        const dialable = this.resolveDialable(info);
+        if (!dialable) continue;
+
         // Check network group diversity
         const netGroup = this.getNetGroupForAddr(info.host);
         if (this.outboundNetGroups.has(netGroup)) {
@@ -1567,7 +1720,12 @@ export class PeerManager {
         }
 
         try {
-          await this.connectPeer(info.host, info.port, "block_relay");
+          await this.connectPeer(
+            dialable.host,
+            info.port,
+            "block_relay",
+            dialable.networkType
+          );
           connected++;
         } catch {
           // Connection failed, try next
@@ -1579,6 +1737,20 @@ export class PeerManager {
   /**
    * Get candidate addresses for connection, sorted by preference.
    * Prefers peers with NODE_WITNESS, recently seen, low ban scores.
+   *
+   * BUG-5 (W117): filters out peers whose network is unreachable in the
+   * current configuration so we never hand a hex-encoded TorV3 / I2P /
+   * CJDNS string to `Bun.connect`.  Reachability is determined by:
+   *
+   *   - IPv4 / IPv6        — always reachable (clearnet or `--proxy`)
+   *   - TorV3 (.onion)     — only when `--onion` or `--proxy` is set
+   *                          (i.e. {@link proxyManager} non-null)
+   *   - I2P (.b32.i2p)     — only when `--i2psam` is set
+   *   - CJDNS (fc00::/8)   — only when `--cjdnsreachable`
+   *   - unknown networkId  — never reachable (BIP-155 forward compat)
+   *
+   * Reference: Bitcoin Core net.cpp `CConnman::ConnectNode` /
+   * `IsReachable(Network)`.
    */
   private getCandidateAddresses(limit: number): PeerInfo[] {
     const now = Date.now();
@@ -1602,6 +1774,14 @@ export class PeerManager {
           // Recently tried but not connected - skip
           continue;
         }
+      }
+
+      // BUG-5: Network reachability filter.  Without it,
+      // getCandidateAddresses would happily return TorV3 / I2P / CJDNS
+      // entries whose `host` is a 32-char hex blob, and connectPeer would
+      // then pass that string straight to Bun.connect → instant failure.
+      if (this.resolveDialable(info) === null) {
+        continue;
       }
 
       candidates.push(info);

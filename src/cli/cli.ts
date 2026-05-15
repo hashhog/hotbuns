@@ -21,6 +21,11 @@ import { OrphanPool } from "../mempool/orphan_pool.js";
 import { dumpMempool, loadMempool } from "../mempool/persist.js";
 import { FeeEstimator } from "../fees/estimator.js";
 import { PeerManager } from "../p2p/manager.js";
+import {
+  ProxyManager,
+  type MultiProxyConfig,
+  type ProxyConfig as SocksProxyConfig,
+} from "../p2p/proxy.js";
 import { HeaderSync } from "../sync/headers.js";
 import { BlockSync } from "../sync/blocks.js";
 import { RPCServer, type RPCServerConfig, type RPCServerDeps } from "../rpc/server.js";
@@ -186,6 +191,41 @@ export interface NodeConfig {
    *            bitcoin-core/src/init.cpp:1590-1605
    */
   asmapPath?: string | null;
+  /**
+   * Default SOCKS5 proxy for outbound connections (host:port). Mirrors
+   * Bitcoin Core's `-proxy=<ip:port>`. When set, ALL outbound clearnet
+   * connections route through this proxy, and (unless `--onion` is also
+   * set) Tor `.onion` addresses route through it as well.
+   *
+   * Reference: bitcoin-core/src/init.cpp `-proxy`, netbase.cpp Socks5().
+   */
+  proxy?: string;
+  /**
+   * Dedicated SOCKS5 proxy for Tor `.onion` addresses (host:port).
+   * Mirrors Bitcoin Core's `-onion=<ip:port>`. Overrides `--proxy` for
+   * `.onion` destinations. Typically points at the local Tor daemon's
+   * SOCKS5 listener (default 127.0.0.1:9050).
+   *
+   * Reference: bitcoin-core/src/init.cpp `-onion`.
+   */
+  onion?: string;
+  /**
+   * I2P SAM bridge endpoint (host:port). Mirrors Bitcoin Core's
+   * `-i2psam=<ip:port>`. When set, outbound connections to `.b32.i2p`
+   * destinations and inbound listening are handled via the I2P SAM v3.1
+   * bridge.
+   *
+   * Reference: bitcoin-core/src/init.cpp `-i2psam`, i2p.cpp Session.
+   */
+  i2psam?: string;
+  /**
+   * Indicate that CJDNS (fc00::/8 IPv6) is reachable. Mirrors Bitcoin
+   * Core's `-cjdnsreachable`. CJDNS peers are routed directly (no SOCKS5);
+   * setting this flag opts in to attempting outbound CJDNS connects.
+   *
+   * Reference: bitcoin-core/src/init.cpp `-cjdnsreachable`.
+   */
+  cjdnsReachable?: boolean;
 }
 
 /**
@@ -482,6 +522,33 @@ export function parseArgs(argv: string[]): ParsedArgs {
           // reserved for future embedded-data support; for now it is a no-op.
           if (value) config.asmapPath = value;
           break;
+        case "proxy":
+          // Bitcoin Core flag `-proxy=<ip:port>`. Default SOCKS5 proxy for
+          // outbound connections. Plumbed into ProxyManager at startup; see
+          // src/p2p/proxy.ts.
+          if (value) config.proxy = value;
+          break;
+        case "onion":
+          // Bitcoin Core flag `-onion=<ip:port>`. Dedicated SOCKS5 proxy for
+          // .onion addresses, overriding `--proxy` for Tor traffic.
+          if (value) config.onion = value;
+          break;
+        case "i2psam":
+          // Bitcoin Core flag `-i2psam=<ip:port>`. I2P SAM v3.1 bridge
+          // endpoint, enabling outbound `.b32.i2p` connections (and inbound
+          // listen via STREAM ACCEPT) through the SAM session.
+          if (value) config.i2psam = value;
+          break;
+        case "cjdnsreachable":
+          // Bitcoin Core flag `-cjdnsreachable`. Opt-in to CJDNS (fc00::/8)
+          // outbound connects (direct, no SOCKS5). Without this flag, CJDNS
+          // peers are filtered out of the candidate set.
+          if (value === undefined || value === "1" || value === "true") {
+            config.cjdnsReachable = true;
+          } else if (value === "0" || value === "false") {
+            config.cjdnsReachable = false;
+          }
+          break;
         case "password":
           // For wallet commands
           if (value) remainingArgs.push(`--password=${value}`);
@@ -735,6 +802,13 @@ interface NodeState {
    * `/rest/blockfilterheaders/<filtertype>/<count>/<hash>`.
    */
   filterIndex?: BlockFilterIndex;
+  /**
+   * Optional Tor/I2P proxy manager. Constructed only when `--proxy`,
+   * `--onion`, or `--i2psam` is set. Closed during gracefulShutdown so
+   * any active Tor hidden service (ADD_ONION) is torn down and SAM
+   * sessions are released.
+   */
+  proxyManager?: ProxyManager;
 }
 
 let runningNode: NodeState | null = null;
@@ -1481,6 +1555,62 @@ async function startNode(config: NodeConfig): Promise<void> {
     console.log(`Loading asmap from: ${resolvedAsmapPath}`);
   }
 
+  // 6a. Build proxy configuration from --proxy / --onion / --i2psam flags
+  // and instantiate ProxyManager. Mirrors Bitcoin Core init.cpp's
+  // SetProxy(NET_*, ...) wiring under -proxy/-onion/-i2psam. When no
+  // proxy flag is set, proxyManager is null and PeerManager falls back
+  // to direct Bun.connect for clearnet (existing behavior).
+  let proxyManager: ProxyManager | null = null;
+  const parseHostPort = (s: string): SocksProxyConfig | null => {
+    // Accept "host:port"; bracketed IPv6 like "[::1]:9050" supported.
+    const m = s.match(/^\[([^\]]+)\]:(\d+)$/) || s.match(/^([^:]+):(\d+)$/);
+    if (!m) return null;
+    const port = parseInt(m[2], 10);
+    if (isNaN(port) || port <= 0 || port > 65535) return null;
+    return { host: m[1], port };
+  };
+  if (mergedConfig.proxy || mergedConfig.onion || mergedConfig.i2psam) {
+    const proxyCfg: MultiProxyConfig = { streamIsolation: true };
+    if (mergedConfig.proxy) {
+      const p = parseHostPort(mergedConfig.proxy);
+      if (!p) {
+        console.error(`Error: --proxy must be host:port (got '${mergedConfig.proxy}')`);
+        process.exit(1);
+      }
+      proxyCfg.proxy = p;
+    }
+    if (mergedConfig.onion) {
+      const p = parseHostPort(mergedConfig.onion);
+      if (!p) {
+        console.error(`Error: --onion must be host:port (got '${mergedConfig.onion}')`);
+        process.exit(1);
+      }
+      proxyCfg.onionProxy = p;
+    }
+    if (mergedConfig.i2psam) {
+      const p = parseHostPort(mergedConfig.i2psam);
+      if (!p) {
+        console.error(`Error: --i2psam must be host:port (got '${mergedConfig.i2psam}')`);
+        process.exit(1);
+      }
+      proxyCfg.i2pSam = { host: p.host, port: p.port, transient: true };
+    }
+    proxyManager = new ProxyManager(proxyCfg);
+    try {
+      await proxyManager.initialize();
+      if (proxyCfg.proxy)
+        console.log(`P2P: clearnet proxy ${proxyCfg.proxy.host}:${proxyCfg.proxy.port}`);
+      if (proxyCfg.onionProxy)
+        console.log(`P2P: .onion proxy ${proxyCfg.onionProxy.host}:${proxyCfg.onionProxy.port}`);
+      if (proxyCfg.i2pSam)
+        console.log(`P2P: I2P SAM ${proxyCfg.i2pSam.host}:${proxyCfg.i2pSam.port}`);
+    } catch (err) {
+      console.error("P2P: ProxyManager initialize failed:", (err as Error).message);
+      // Don't abort — leave proxyManager unusable, fall back to clearnet only
+      proxyManager = null;
+    }
+  }
+
   const peerManager = new PeerManager({
     maxOutbound: mergedConfig.maxOutbound,
     maxInbound: 117,
@@ -1492,6 +1622,8 @@ async function startNode(config: NodeConfig): Promise<void> {
     port: mergedConfig.port,
     pruneMode: pruneManager !== undefined,
     asmapPath: resolvedAsmapPath,
+    proxyManager,
+    cjdnsReachable: mergedConfig.cjdnsReachable ?? false,
   });
 
   if (peerManager.usingASMap()) {
@@ -1861,6 +1993,7 @@ async function startNode(config: NodeConfig): Promise<void> {
     datadir: mergedConfig.datadir,
     pruneManager,
     filterIndex,
+    proxyManager: proxyManager ?? undefined,
   };
 
   // Set shutdown callback for RPC stop command
@@ -2006,6 +2139,16 @@ async function gracefulShutdown(): Promise<void> {
 
   // 3. Stop peer manager
   await runningNode.peerManager.stop();
+
+  // 3b. Close proxy manager (tears down Tor hidden service, ends I2P SAM
+  // session). Best-effort: never block shutdown on a hung proxy peer.
+  if (runningNode.proxyManager) {
+    try {
+      await runningNode.proxyManager.close();
+    } catch (err) {
+      console.error("Failed to close proxy manager:", (err as Error).message);
+    }
+  }
 
   // 4. Save fee estimates
   try {
@@ -2412,6 +2555,10 @@ OPTIONS:
   --debug=<cat>         Enable debug logging for category (repeatable; 'all'/'1' = every category, 'none'/'0' = off)
   --printtoconsole      Force log output to stdout/stderr
   --connect=<host:port> Connect to specific peer
+  --proxy=<host:port>   Route outbound connections through SOCKS5 proxy
+  --onion=<host:port>   Dedicated SOCKS5 proxy for .onion (overrides --proxy)
+  --i2psam=<host:port>  I2P SAM v3.1 bridge endpoint
+  --cjdnsreachable      Opt in to outbound CJDNS (fc00::/8) connects
   --prune=<n>           Prune block storage to n MiB (0=disabled, 1=manual via RPC, ≥550=auto)
   --dbcache=<n>         UTXO cache size in MiB (default: 512)
   --load-snapshot=<path> Load Bitcoin Core-format UTXO snapshot (assumeutxo)

@@ -24,6 +24,7 @@ import {
   V1_PREFIX_LEN,
   looksLikeV1Version,
 } from "./v2_transport.js";
+import type { ProxyManager, NetworkType } from "./proxy.js";
 
 /** State of a peer connection. */
 export type PeerState = "connecting" | "handshaking" | "connected" | "disconnected";
@@ -38,6 +39,28 @@ export interface PeerConfig {
   userAgent: string;
   bestHeight: number;
   relay: boolean;
+  /**
+   * Optional multi-network proxy manager.  When supplied AND
+   * {@link networkType} is "onion" or "i2p", outbound connects are
+   * routed through `proxyManager.connect(host, port)` instead of
+   * directly through `Bun.connect`.  Clearnet (ipv4/ipv6/cjdns) uses the
+   * direct path unless the manager has a default clearnet proxy
+   * configured — that decision is made inside ProxyManager.
+   *
+   * Wired in by the PeerManager from --proxy/--onion/--i2psam CLI flags.
+   * Reference: bitcoin-core/src/init.cpp `-proxy`/`-onion`/`-i2psam`.
+   */
+  proxyManager?: ProxyManager;
+  /**
+   * Network type for the destination address.  Drives the dispatch in
+   * {@link Peer.connect}:
+   *   - "onion" / "i2p"  → route via {@link proxyManager}
+   *   - "cjdns"          → direct (only reachable when --cjdnsreachable)
+   *   - "ipv4" / "ipv6"  → direct (or via default proxy if configured)
+   *
+   * Defaults to "ipv4" when not supplied (preserves existing callers).
+   */
+  networkType?: NetworkType;
 }
 
 /** Event handlers for peer lifecycle events. */
@@ -396,6 +419,32 @@ export class Peer {
     }
     this.state = "connecting";
 
+    // FIX-56 W117: dispatch on network type.  ProxyManager handles the
+    // SOCKS5 / I2P SAM handshake and returns a connected Socket; we then
+    // call socket.reload() to install our handlers on top of the already-
+    // open transport.  Direct clearnet uses the historical Bun.connect
+    // path with handlers wired up-front.
+    const useProxy =
+      this.config.proxyManager !== undefined &&
+      (this.config.networkType === "onion" ||
+        this.config.networkType === "i2p");
+
+    if (useProxy) {
+      await this.connectViaProxy(useV2);
+      return;
+    }
+
+    await this.connectDirect(useV2);
+  }
+
+  /**
+   * Direct Bun.connect path (historical default).  Used for IPv4, IPv6,
+   * CJDNS, and clearnet-via-default-proxy (the default proxy is handled
+   * by SOCKS5 transparently — but right now we only route .onion / .b32.i2p
+   * through ProxyManager.connect; clearnet-with-default-proxy would
+   * require a new dispatch branch above).
+   */
+  private async connectDirect(useV2: boolean): Promise<void> {
     const connectPromise = Bun.connect({
       hostname: this.host,
       port: this.port,
@@ -464,6 +513,95 @@ export class Peer {
     } catch (error) {
       this.state = "disconnected";
       throw error;
+    }
+  }
+
+  /**
+   * Proxy path for .onion / .b32.i2p destinations.
+   *
+   * 1. Call `proxyManager.connect(host, port)` — this opens a TCP socket
+   *    to the SOCKS5 proxy (or I2P SAM bridge), performs the SOCKS5
+   *    handshake (or SAM HELLO + STREAM CONNECT), and returns the
+   *    connected Socket once the proxy has wired the tunnel through.
+   * 2. Reinstall our handlers on the returned Socket via
+   *    `socket.reload({ socket: ... })` so subsequent data/close/error
+   *    events are dispatched to {@link onData} / {@link disconnect}
+   *    rather than the proxy's internal state machine.
+   * 3. Emit the v1 VERSION (or queue the v2 cipher handshake) exactly as
+   *    in {@link connectDirect}.
+   *
+   * Reference: Bitcoin Core net.cpp `CConnman::ConnectNode` connect-via-
+   * proxy branch + Bun's `Socket.reload` (per-socket handler swap for
+   * Bun.connect-created sockets).
+   */
+  private async connectViaProxy(useV2: boolean): Promise<void> {
+    const proxy = this.config.proxyManager;
+    if (!proxy) {
+      throw new Error("connectViaProxy called without a proxy manager");
+    }
+
+    const connectPromise: Promise<Socket> = (async () => {
+      const socket = await proxy.connect(this.host, this.port);
+      // Reinstall our handlers.  This works for Bun.connect-derived
+      // sockets per the Bun runtime docs.
+      socket.reload({
+        socket: {
+          data: (_s, data) => this.onData(Buffer.from(data)),
+          close: () => {
+            this.cleanupHandshakeTimer();
+            if (this.state !== "disconnected") {
+              this.state = "disconnected";
+              this.events.onDisconnect(this);
+            }
+          },
+          error: (_s, error) => {
+            this.cleanupHandshakeTimer();
+            if (this.state !== "disconnected") {
+              this.state = "disconnected";
+              this.events.onDisconnect(this, error);
+            }
+          },
+          // open / connectError do not fire on a reload — the socket is
+          // already open by the time ProxyManager.connect resolves.
+        },
+      });
+      return socket;
+    })();
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(
+        () => reject(new Error("Proxy connection timeout")),
+        CONNECT_TIMEOUT_MS
+      );
+    });
+
+    let socket: Socket;
+    try {
+      socket = await Promise.race([connectPromise, timeoutPromise]);
+    } catch (error) {
+      this.state = "disconnected";
+      throw error;
+    }
+
+    this.socket = socket;
+    this.state = "handshaking";
+    this.events.onConnect(this);
+
+    if (useV2) {
+      // Drain the V2Transport's queued ellswift pubkey + garbage.
+      this.flushV2SendBuffer();
+      this.handshakeTimer = setTimeout(() => {
+        if (!this.handshakeComplete && this.state !== "disconnected") {
+          this.disconnect("v2 handshake timeout");
+        }
+      }, V2_HANDSHAKE_DEADLINE_MS);
+    } else {
+      this.sendVersionMessage();
+      this.handshakeTimer = setTimeout(() => {
+        if (!this.handshakeComplete && this.state !== "disconnected") {
+          this.disconnect("handshake timeout");
+        }
+      }, HANDSHAKE_TIMEOUT_MS);
     }
   }
 
