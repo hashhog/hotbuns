@@ -197,6 +197,16 @@ export class Peer {
   wantsAddrV2: boolean;
 
   /**
+   * Whether this peer negotiated BIP-339 wtxid-relay.
+   * Set when we receive a `wtxidrelay` message during the handshake
+   * (before VERACK).  When true, tx inv announcements must use MSG_WTX (=5)
+   * + wtxid; when false, use MSG_TX (=1) + txid.
+   * Reference: Bitcoin Core net_processing.cpp m_wtxid_relay, protocol.h
+   * MSG_WTX = 5.
+   */
+  wtxidRelay: boolean;
+
+  /**
    * The fee rate (sat/kvB) that this peer announced via feefilter (BIP133).
    * Transactions below this rate should not be relayed to this peer.
    * 0n means no feefilter has been received.
@@ -328,6 +338,7 @@ export class Peer {
     this.blocksInFlight = new Map();
     this.bestKnownHeight = 0;
     this.wantsAddrV2 = false;
+    this.wtxidRelay = false;
     // BIP133 feefilter state
     this.feeFilterReceived = 0n;
     this.feeFilterSent = 0n;
@@ -1108,6 +1119,17 @@ export class Peer {
         // They acknowledged our version
         this.receivedVerack = true;
         this.checkHandshakeComplete();
+        break;
+
+      case "wtxidrelay":
+        // BIP-339: Peer wants to receive tx inv entries as MSG_WTX (=5) + wtxid.
+        // This message must arrive between VERSION and VERACK (Core enforces
+        // this in net_processing.cpp ProcessMessage "wtxidrelay" handler).
+        if (this.handshakeComplete) {
+          this.misbehaving(10, "wtxidrelay received after verack");
+          return;
+        }
+        this.wtxidRelay = true;
         break;
 
       case "sendaddrv2":

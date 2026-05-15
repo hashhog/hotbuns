@@ -3278,20 +3278,29 @@ export class RPCServer {
 
   /**
    * Broadcast a transaction inventory message to all connected peers.
+   *
+   * Per BIP-339 / Bitcoin Core net_processing.cpp RelayTransaction:
+   *   - BIP-339-negotiated peer (peer.wtxidRelay=true): MSG_WTX (=5) + wtxid
+   *   - Legacy peer (peer.wtxidRelay=false): MSG_TX (=1) + txid
+   * MSG_WITNESS_TX (0x40000001) is a BIP-144 *getdata flag*, not a valid inv
+   * type — Core peers silently discard inv entries with that type.
    */
   private broadcastTxInv(txid: Buffer): void {
-    const invMsg: NetworkMessage = {
-      type: "inv",
-      payload: {
-        inventory: [
-          {
-            type: InvType.MSG_WITNESS_TX,
-            hash: txid,
-          },
-        ],
-      },
-    };
-    this.peerManager.broadcast(invMsg);
+    for (const peer of this.peerManager.getConnectedPeers()) {
+      const invType = peer.wtxidRelay ? InvType.MSG_WTX : InvType.MSG_TX;
+      const invMsg: NetworkMessage = {
+        type: "inv",
+        payload: {
+          inventory: [
+            {
+              type: invType,
+              hash: txid,
+            },
+          ],
+        },
+      };
+      peer.send(invMsg);
+    }
   }
 
   /**
