@@ -387,28 +387,30 @@ describe("G8 — testmempoolaccept fee fields [BUG-2, BUG-3]", () => {
 // G9 — testmempoolaccept is a dry-run (should NOT mutate mempool)
 // BUG-1: hotbuns testMempoolAccept calls addTransaction() which actually adds!
 // ---------------------------------------------------------------------------
-describe("G9 — testmempoolaccept must be dry-run [BUG-1]", () => {
-  test("FAIL: testMempoolAccept calls addTransaction which MUTATES the mempool [BUG-1]", async () => {
-    // submitPackage is NOT dry-run — it is designed to add.
-    // testmempoolaccept (the RPC) calls addTransaction directly (BUG-1).
-    // This test documents that addTransaction persists the tx, so a call
-    // to testmempoolaccept would incorrectly add the tx.
+describe("G9 — testmempoolaccept must be dry-run [BUG-1 fixed]", () => {
+  test("addTransaction with testAccept:true validates but does NOT add to mempool", async () => {
+    // FIX-54 (BUG-1): addTransaction now accepts { testAccept: true } which runs all
+    // validation checks but skips the commit (entries.set / outpointIndex / cluster / ZMQ).
+    // Mirrors Bitcoin Core's AcceptToMemoryPool(... test_accept=true) path.
     const inputTxid = Buffer.alloc(32, 0x30);
     await addUTXO(inputTxid, 0, 100_000n);
 
-    // makeTx with OP_RETURN padding to reach >= 65 bytes
     const tx = makeTx([{ txid: inputTxid, vout: 0 }], [{ value: 90_000n }]);
+    const txid = getTxId(tx);
 
-    expect(mempool.hasTransaction(getTxId(tx))).toBe(false);
-    const result = await mempool.addTransaction(tx);
-    // addTransaction is not a dry-run — it adds the tx
-    if (result.accepted) {
-      expect(mempool.hasTransaction(getTxId(tx))).toBe(true);
-    } else {
-      // If rejection happens for any reason, document the error but still check BUG-1 conceptually
-      console.log("BUG-1 check: addTransaction error:", result.error);
-    }
-    // BUG-1: testmempoolaccept calling addTransaction() MUTATES the mempool when accepted
+    expect(mempool.hasTransaction(txid)).toBe(false);
+
+    // Dry-run: should report accepted but NOT add to the pool
+    const result = await mempool.addTransaction(tx, { testAccept: true });
+    expect(result.accepted).toBe(true);
+    // Mempool must remain empty — no mutation
+    expect(mempool.hasTransaction(txid)).toBe(false);
+    expect(mempool.getSize()).toBe(0);
+
+    // Verify the same tx can still be added normally afterwards
+    const realResult = await mempool.addTransaction(tx);
+    expect(realResult.accepted).toBe(true);
+    expect(mempool.hasTransaction(txid)).toBe(true);
   });
 });
 
