@@ -923,20 +923,25 @@ describe("G30 — P2P package relay handlers missing [BUG-6, BUG-7]", () => {
     // Confirms BUG-6: no per-peer package relay capability state
   });
 
-  test("FAIL: broadcastTxInv uses MSG_WITNESS_TX instead of MSG_WTX [BUG-7]", async () => {
-    // Core uses MSG_WTX = 5 for transaction invs to wtxid-relay peers.
-    // hotbuns broadcastTxInv uses InvType.MSG_WITNESS_TX (0x40000001) — wrong.
+  test("PASS: broadcastTxInv uses MSG_WTX/MSG_TX not MSG_WITNESS_TX [BUG-7 fixed]", async () => {
+    // BUG-7 fixed: broadcastTxInv now uses MSG_WTX (=5) for BIP-339-negotiated
+    // peers and MSG_TX (=1) for legacy peers, never MSG_WITNESS_TX (0x40000001).
     const serverSrc = await Bun.file(
       new URL("../src/rpc/server.ts", import.meta.url).pathname
     ).text();
-    // Confirm the bug is present
-    expect(serverSrc).toContain("InvType.MSG_WITNESS_TX");
-    // And that MSG_WTX is not used in broadcastTxInv
+    // The broadcastTxInv section must use MSG_WTX
     const broadcastSection = serverSrc.substring(
       serverSrc.indexOf("private broadcastTxInv"),
       serverSrc.indexOf("private broadcastBlockInv")
     );
-    expect(broadcastSection).not.toContain("MSG_WTX");
+    expect(broadcastSection).toContain("MSG_WTX");
+    expect(broadcastSection).toContain("MSG_TX");
+    // MSG_WITNESS_TX must NOT appear as the inv type in broadcastTxInv
+    // (it may still be defined in messages.ts or used in getdata, but not here)
+    expect(broadcastSection).not.toContain("MSG_WITNESS_TX");
+    // Also confirm per-peer iteration: broadcastTxInv must use getConnectedPeers
+    expect(broadcastSection).toContain("getConnectedPeers");
+    expect(broadcastSection).toContain("wtxidRelay");
   });
 
   test("MSG_WTX = 5 is the correct inv type per Bitcoin Core protocol.h", () => {

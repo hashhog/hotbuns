@@ -185,8 +185,30 @@ class MockMempool {
   }
 }
 
+class MockPeer {
+  id: string;
+  address: string;
+  wtxidRelay: boolean;
+  sentMessages: NetworkMessage[] = [];
+
+  constructor(opts: { id: string; address: string; wtxidRelay?: boolean }) {
+    this.id = opts.id;
+    this.address = opts.address;
+    this.wtxidRelay = opts.wtxidRelay ?? false;
+  }
+
+  send(msg: NetworkMessage) {
+    this.sentMessages.push(msg);
+  }
+
+  reset() {
+    this.sentMessages = [];
+  }
+}
+
 class MockPeerManager {
-  private peers: { id: string; address: string }[] = [];
+  private peers: MockPeer[] = [];
+  /** Aggregated sent messages across all peers (for backward-compat). */
   public broadcastCalls: NetworkMessage[] = [];
 
   getConnectedPeers() {
@@ -197,8 +219,15 @@ class MockPeerManager {
     this.broadcastCalls.push(msg);
   }
 
-  addMockPeer(peer: { id: string; address: string }) {
+  addMockPeer(opts: { id: string; address: string; wtxidRelay?: boolean }) {
+    const peer = new MockPeer(opts);
     this.peers.push(peer);
+    // Proxy peer.send → broadcastCalls so existing length-checks still work.
+    const origSend = peer.send.bind(peer);
+    peer.send = (msg: NetworkMessage) => {
+      origSend(msg);
+      this.broadcastCalls.push(msg);
+    };
   }
 
   reset(): void {
@@ -484,6 +513,9 @@ describe("sendrawtransaction", () => {
       const txHex = serializeTx(tx, true).toString("hex");
       const txid = getTxId(tx);
 
+      // Add a peer so broadcastTxInv has someone to send to
+      mockPeerManager.addMockPeer({ id: "peer1", address: "192.0.2.1:8333", wtxidRelay: false });
+
       // Add tx to mempool first
       mockMempool.addTestTransaction(txid, { tx });
 
@@ -573,38 +605,48 @@ describe("sendrawtransaction", () => {
   });
 
   describe("broadcast to peers", () => {
-    it("should broadcast inv message after accepting transaction", async () => {
+    it("should broadcast inv message to each peer after accepting transaction", async () => {
       const tx = createTestTransaction();
       const txHex = serializeTx(tx, true).toString("hex");
       const txid = getTxId(tx);
 
-      // Add some mock peers
-      mockPeerManager.addMockPeer({ id: "peer1", address: "192.168.1.1:8333" });
-      mockPeerManager.addMockPeer({ id: "peer2", address: "192.168.1.2:8333" });
+      // Add two legacy peers (no BIP-339 wtxidrelay)
+      mockPeerManager.addMockPeer({ id: "peer1", address: "192.0.2.1:8333", wtxidRelay: false });
+      mockPeerManager.addMockPeer({ id: "peer2", address: "192.0.2.2:8333", wtxidRelay: false });
 
       const result = await rpcRequest(testPort, "sendrawtransaction", [txHex]);
 
       expect(result.error).toBeUndefined();
       expect(result.result).toBe(Buffer.from(txid).reverse().toString("hex"));
 
-      // Should broadcast inv message
-      expect(mockPeerManager.broadcastCalls.length).toBe(1);
+      // broadcastTxInv sends one inv per peer (2 peers → 2 calls)
+      expect(mockPeerManager.broadcastCalls.length).toBe(2);
       const invMsg = mockPeerManager.broadcastCalls[0];
       expect(invMsg.type).toBe("inv");
       expect((invMsg.payload as any).inventory.length).toBe(1);
-      expect((invMsg.payload as any).inventory[0].type).toBe(InvType.MSG_WITNESS_TX);
+      // Legacy peer: MSG_TX (=1), not MSG_WITNESS_TX (0x40000001)
+      expect((invMsg.payload as any).inventory[0].type).toBe(InvType.MSG_TX);
       expect(Buffer.compare((invMsg.payload as any).inventory[0].hash, txid)).toBe(0);
     });
 
-    it("should use MSG_WITNESS_TX type for inv", async () => {
+    it("should use MSG_WTX for BIP-339-negotiated peers and MSG_TX for legacy peers", async () => {
       const tx = createTestTransaction();
       const txHex = serializeTx(tx, true).toString("hex");
 
+      // One BIP-339 peer, one legacy peer
+      mockPeerManager.addMockPeer({ id: "bip339-peer", address: "192.0.2.3:8333", wtxidRelay: true });
+      mockPeerManager.addMockPeer({ id: "legacy-peer", address: "192.0.2.4:8333", wtxidRelay: false });
+
       await rpcRequest(testPort, "sendrawtransaction", [txHex]);
 
-      expect(mockPeerManager.broadcastCalls.length).toBe(1);
-      const invMsg = mockPeerManager.broadcastCalls[0];
-      expect((invMsg.payload as any).inventory[0].type).toBe(InvType.MSG_WITNESS_TX);
+      expect(mockPeerManager.broadcastCalls.length).toBe(2);
+      // BIP-339 peer gets MSG_WTX (=5)
+      expect((mockPeerManager.broadcastCalls[0].payload as any).inventory[0].type).toBe(InvType.MSG_WTX);
+      // Legacy peer gets MSG_TX (=1)
+      expect((mockPeerManager.broadcastCalls[1].payload as any).inventory[0].type).toBe(InvType.MSG_TX);
+      // Neither should be MSG_WITNESS_TX (0x40000001)
+      expect((mockPeerManager.broadcastCalls[0].payload as any).inventory[0].type).not.toBe(InvType.MSG_WITNESS_TX);
+      expect((mockPeerManager.broadcastCalls[1].payload as any).inventory[0].type).not.toBe(InvType.MSG_WITNESS_TX);
     });
   });
 
@@ -666,6 +708,9 @@ describe("broadcast integration", () => {
 
     server = new RPCServer(config, deps);
     server.start();
+
+    // Add one legacy peer by default so broadcastTxInv has someone to send to.
+    mockPeerManager.addMockPeer({ id: "peer-default", address: "192.0.2.1:8333", wtxidRelay: false });
   });
 
   afterEach(() => {

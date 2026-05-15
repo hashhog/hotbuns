@@ -286,28 +286,22 @@ describe("G2: getdata for tx types — BUG: silently ignored (BUG-1)", () => {
 // G3 — wtxidrelay handshake: per-peer remote state NOT tracked (BUG-2)
 // ---------------------------------------------------------------------------
 
-describe("G3: wtxidrelay per-peer remote state — BUG: field absent (BUG-2)", () => {
-  test("BUG-2: Peer has no field to record remote wtxidrelay", () => {
+describe("G3: wtxidrelay per-peer remote state — FIXED (BUG-2 closed by FIX-55)", () => {
+  test("FIXED: Peer.wtxidRelay field exists and defaults to false", () => {
     const peer = makePeer();
-    // Core: peer.m_wtxid_relay (atomic<bool>) set when *we receive* their wtxidrelay.
-    // hotbuns sends wtxidrelay but has no field to track whether the peer sent it back.
-    expect((peer as any).wtxidRelay).toBeUndefined();
-    expect((peer as any).m_wtxid_relay).toBeUndefined();
-    expect((peer as any).supportsWtxidRelay).toBeUndefined();
-    expect((peer as any).peerWtxidRelay).toBeUndefined();
-    expect((peer as any).remoteWtxidRelay).toBeUndefined();
+    // BUG-2 fixed: Peer now has wtxidRelay field (mirrors Core m_wtxid_relay).
+    // Defaults to false; set to true when we receive their wtxidrelay message.
+    expect((peer as any).wtxidRelay).toBe(false);
   });
 
-  test("BUG-2: handleHandshake has no wtxidrelay case to set remote state", () => {
-    // The allowed-during-handshake list in peer.ts includes "wtxidrelay",
-    // but it falls through to the default case (ignored) without setting any field.
-    // Confirm by looking at what peer.ts allowedDuringHandshake handles:
+  test("FIXED: handleHandshake has wtxidrelay case that sets peer.wtxidRelay", () => {
+    // BUG-2 fixed: peer.ts now has case "wtxidrelay" in handleHandshake
+    // that sets this.wtxidRelay = true.
     const peer = makePeer();
     const proto = Object.getPrototypeOf(peer) as any;
     const src = proto.handleHandshake?.toString() ?? "";
-    // The switch cases are: version, verack, sendaddrv2, sendtxrcncl.
-    // wtxidrelay is listed in allowedDuringHandshake but not in the switch.
-    expect(src.includes('case "wtxidrelay"')).toBe(false);
+    // The switch must now include the wtxidrelay case.
+    expect(src.includes('case "wtxidrelay"')).toBe(true);
   });
 });
 
