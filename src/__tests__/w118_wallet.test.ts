@@ -94,7 +94,7 @@ import {
 
 import { privateKeyToPublicKey, hash160 } from "../crypto/primitives";
 import { AddressType } from "../address/encoding";
-import { type Transaction, SIGHASH_ALL } from "../validation/tx";
+import { type Transaction, SIGHASH_ALL, getTxId } from "../validation/tx";
 
 const TEST_DATADIR = "/tmp/hotbuns-w118-audit";
 
@@ -752,28 +752,159 @@ describe("G18: PSBTv2 (BIP-370) support", () => {
 });
 
 // ============================================================================
-// G19: bumpfee RPC — expected MISSING
+// G19: bumpfee RPC — FIX-61 closure
 // ============================================================================
 describe("G19: bumpfee RPC (BIP-125 RBF)", () => {
-  test("MISSING: Wallet has no bumpFee / bumpTransactionFee method", () => {
-    const w = Object.create(Wallet.prototype) as Record<string, unknown>;
-    expect(w.bumpFee).toBeUndefined();
-    expect(w.bumpTransactionFee).toBeUndefined();
-    expect(w.bumpfee).toBeUndefined();
+  beforeEach(() => mkdirSync(TEST_DATADIR, { recursive: true }));
+  afterEach(() => rmSync(TEST_DATADIR, { recursive: true, force: true }));
+
+  test("PASS (FIX-61): Wallet.bumpFee exists and bumps unconfirmed RBF tx", () => {
+    // Method should be defined on the prototype now that FIX-61 landed.
+    expect(typeof (Wallet.prototype as unknown as Record<string, unknown>).bumpFee).toBe(
+      "function"
+    );
+
+    const wallet = Wallet.create(makeConfig("mainnet"), ABANDON_MNEMONIC);
+    const myAddress = wallet.getNewAddress("bech32");
+    wallet.addUTXO(
+      makeUTXO({
+        txidSeed: 100,
+        vout: 0,
+        amount: 1_000_000n,
+        address: myAddress,
+        keyPath: "m/84'/0'/0'/0/0",
+        confirmations: 6,
+      })
+    );
+
+    // Build and broadcast (via createTransaction's outgoingTxs tracking) at
+    // 1 sat/vB.
+    const dest = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
+    const orig = wallet.createTransaction(
+      [{ address: dest, amount: 500_000n }],
+      1
+    );
+    const origTxid = getTxidHex(orig);
+
+    const tracked = wallet.getOutgoingTx(origTxid);
+    expect(tracked).toBeDefined();
+    expect(tracked!.fee).toBeGreaterThan(0n);
+
+    const bumped = wallet.bumpFee(origTxid, 5); // 5 sat/vB
+    expect(bumped.newFee).toBeGreaterThan(bumped.origFee);
+    expect(bumped.tx.inputs.length).toBe(orig.inputs.length);
+    expect(bumped.tx.outputs.length).toBe(orig.outputs.length);
+    // BIP-125 signaling preserved.
+    expect(bumped.tx.inputs[0].sequence).toBeLessThan(0xfffffffe);
+    // Replacement is signed (witness populated for P2WPKH).
+    expect(bumped.tx.inputs[0].witness.length).toBeGreaterThan(0);
+  });
+
+  test("PASS (FIX-61): rejects unknown txid", () => {
+    const wallet = Wallet.create(makeConfig("mainnet"), ABANDON_MNEMONIC);
+    expect(() => wallet.bumpFee("00".repeat(32), 5)).toThrow(/no such wallet transaction/);
+  });
+
+  test("PASS (FIX-61): rejects confirmed tx", () => {
+    const wallet = Wallet.create(makeConfig("mainnet"), ABANDON_MNEMONIC);
+    const myAddress = wallet.getNewAddress("bech32");
+    wallet.addUTXO(
+      makeUTXO({
+        txidSeed: 101,
+        vout: 0,
+        amount: 1_000_000n,
+        address: myAddress,
+        keyPath: "m/84'/0'/0'/0/0",
+        confirmations: 6,
+      })
+    );
+    const dest = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
+    const orig = wallet.createTransaction(
+      [{ address: dest, amount: 500_000n }],
+      1
+    );
+    const origTxidHex = getTxidHex(orig);
+
+    // Force confirmation by directly tagging the OutgoingTx — mirrors what
+    // processBlock does when it sees the tx in a connected block.
+    wallet.getOutgoingTx(origTxidHex)!.confirmed = true;
+
+    expect(() => wallet.bumpFee(origTxidHex, 5)).toThrow(/has been mined/);
+  });
+
+  test("PASS (FIX-61): rejects when new fee rate not greater than original", () => {
+    const wallet = Wallet.create(makeConfig("mainnet"), ABANDON_MNEMONIC);
+    const myAddress = wallet.getNewAddress("bech32");
+    wallet.addUTXO(
+      makeUTXO({
+        txidSeed: 102,
+        vout: 0,
+        amount: 1_000_000n,
+        address: myAddress,
+        keyPath: "m/84'/0'/0'/0/0",
+        confirmations: 6,
+      })
+    );
+    const dest = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
+    const orig = wallet.createTransaction(
+      [{ address: dest, amount: 500_000n }],
+      5
+    );
+    const origTxidHex = getTxidHex(orig);
+    // Try to bump at the same rate — must fail.
+    expect(() => wallet.bumpFee(origTxidHex, 5)).toThrow(/must be greater than original/);
   });
 });
 
 // ============================================================================
-// G20: psbtbumpfee RPC — expected MISSING
+// G20: psbtbumpfee RPC — FIX-61 closure
 // ============================================================================
 describe("G20: psbtbumpfee RPC", () => {
-  test("MISSING: no psbtBumpFee export in wallet or psbt module", async () => {
-    const walletMod = (await import("../wallet/wallet")) as Record<string, unknown>;
-    const psbtMod = (await import("../wallet/psbt")) as Record<string, unknown>;
-    expect(walletMod.psbtBumpFee).toBeUndefined();
-    expect(psbtMod.psbtBumpFee).toBeUndefined();
+  beforeEach(() => mkdirSync(TEST_DATADIR, { recursive: true }));
+  afterEach(() => rmSync(TEST_DATADIR, { recursive: true, force: true }));
+
+  test("PASS (FIX-61): Wallet.psbtBumpFee exists and returns unsigned tx", () => {
+    expect(typeof (Wallet.prototype as unknown as Record<string, unknown>).psbtBumpFee).toBe(
+      "function"
+    );
+
+    const wallet = Wallet.create(makeConfig("mainnet"), ABANDON_MNEMONIC);
+    const myAddress = wallet.getNewAddress("bech32");
+    wallet.addUTXO(
+      makeUTXO({
+        txidSeed: 200,
+        vout: 0,
+        amount: 1_000_000n,
+        address: myAddress,
+        keyPath: "m/84'/0'/0'/0/0",
+        confirmations: 6,
+      })
+    );
+    const dest = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
+    const orig = wallet.createTransaction(
+      [{ address: dest, amount: 500_000n }],
+      1
+    );
+    const origTxidHex = getTxidHex(orig);
+
+    const psbtResult = wallet.psbtBumpFee(origTxidHex, 5);
+    expect(psbtResult.newFee).toBeGreaterThan(psbtResult.origFee);
+    // PSBT-mode: inputs must be UNSIGNED (no witness, empty scriptSig).
+    for (const inp of psbtResult.unsignedTx.inputs) {
+      expect(inp.witness.length).toBe(0);
+      expect(inp.scriptSig.length).toBe(0);
+      // BIP-125 signaling preserved.
+      expect(inp.sequence).toBeLessThan(0xfffffffe);
+    }
+    expect(psbtResult.inputUtxos.length).toBe(orig.inputs.length);
   });
 });
+
+// Helper: compute a canonical txid hex string for a Transaction. Mirrors
+// what Wallet.createTransaction stores under outgoingTxs.
+function getTxidHex(tx: Transaction): string {
+  return getTxId(tx).toString("hex");
+}
 
 // ============================================================================
 // G21: Anti-fee-sniping nLockTime
@@ -817,7 +948,7 @@ describe("G22: RBF (BIP-125) opt-in sequence", () => {
   beforeEach(() => mkdirSync(TEST_DATADIR, { recursive: true }));
   afterEach(() => rmSync(TEST_DATADIR, { recursive: true, force: true }));
 
-  test("FAIL BUG-22: createTransaction emits sequence=0xffffffff (RBF opt-out)", () => {
+  test("PASS (FIX-61): createTransaction emits sequence=0xfffffffd (BIP-125 opt-in RBF)", () => {
     const wallet = Wallet.create(makeConfig("mainnet"), ABANDON_MNEMONIC);
     const myAddress = wallet.getNewAddress("bech32");
     wallet.addUTXO(
@@ -835,9 +966,12 @@ describe("G22: RBF (BIP-125) opt-in sequence", () => {
     const tx = wallet.createTransaction([{ address: dest, amount: 500_000n }], 1);
 
     // BIP-125: any input with sequence < 0xfffffffe signals RBF replaceability.
-    // hotbuns hardcodes 0xffffffff in src/wallet/wallet.ts:1002 — RBF is
-    // never signaled by default. Core's wallet defaults to OPTIN (0xfffffffd).
-    expect(tx.inputs[0].sequence).toBe(0xffffffff);
+    // Hotbuns now emits 0xfffffffd (MAX_BIP125_RBF_SEQUENCE), matching Core's
+    // wallet default. This is BOTH a prerequisite for bumpfee (Part 2 of
+    // FIX-61) and the fix for the W118 BUG-22 "RBF opt-out" finding.
+    expect(tx.inputs[0].sequence).toBe(0xfffffffd);
+    // Must also be < 0xfffffffe to satisfy the BIP-125 signaling check.
+    expect(tx.inputs[0].sequence).toBeLessThan(0xfffffffe);
   });
 });
 

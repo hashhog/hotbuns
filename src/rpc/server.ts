@@ -997,6 +997,11 @@ export class RPCServer {
       this.registerMethod("walletcreatefundedpsbt", (params) =>
         this.walletCreateFundedPSBT(params)
       );
+      // BIP-125 RBF: bump the fee of an unconfirmed wallet tx by re-signing
+      // a replacement that pays more, reducing change. psbtbumpfee returns
+      // the unsigned PSBT instead of broadcasting.
+      this.registerMethod("bumpfee", (params) => this.bumpFee(params));
+      this.registerMethod("psbtbumpfee", (params) => this.psbtBumpFee(params));
     }
 
     // Descriptor methods (work without wallet)
@@ -7424,6 +7429,202 @@ export class RPCServer {
     // validation + peer broadcast for free.
     const txHex = serializeTx(tx, true).toString("hex");
     return await this.sendRawTransaction([txHex]);
+  }
+
+  /**
+   * bumpfee: Bump the fee of an unconfirmed wallet transaction by re-signing
+   * a BIP-125 replacement that pays more. Reduces the change output by the
+   * fee delta, re-signs every input, and broadcasts via the regular
+   * sendrawtransaction path.
+   *
+   * Reference: bitcoin-core/src/wallet/rpc/spend.cpp::bumpfee +
+   *            bitcoin-core/src/wallet/feebumper.cpp::CreateRateBumpTransaction.
+   *
+   * @param params [txid, options?]
+   *   options: { fee_rate?: number (sat/vB), conf_target?, ... } (most
+   *   Core fields are tolerated but only fee_rate is honored.)
+   *
+   * @returns { txid, origfee, fee, errors }
+   */
+  private async bumpFee(params: unknown[]): Promise<Record<string, unknown>> {
+    const [txidParam, optionsParam] = params;
+
+    if (typeof txidParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "txid must be a string");
+    }
+    // Normalize hex (Core accepts both cases; we store lowercased).
+    const txid = txidParam.toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(txid)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "txid must be a 64-char hex string"
+      );
+    }
+
+    let newFeeRate: number | undefined;
+    if (optionsParam && typeof optionsParam === "object") {
+      const opt = optionsParam as Record<string, unknown>;
+      const fr = opt.fee_rate ?? opt.feeRate;
+      if (typeof fr === "number") {
+        if (!(fr > 0) || !Number.isFinite(fr)) {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_PARAMS,
+            "fee_rate must be a positive finite number (sat/vB)"
+          );
+        }
+        newFeeRate = fr;
+      }
+    }
+
+    const wallet = this.getCurrentWallet();
+    if (wallet.isLocked()) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_UNLOCK_NEEDED,
+        "Error: Please enter the wallet passphrase with walletpassphrase first."
+      );
+    }
+
+    let result: ReturnType<Wallet["bumpFee"]>;
+    try {
+      result = wallet.bumpFee(txid, newFeeRate);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // bumpfee precondition failures map to WALLET_ERROR in Core.
+      throw this.rpcError(RPCErrorCodes.WALLET_ERROR, msg);
+    }
+
+    // Broadcast the replacement via the standard mempool / peer path.
+    const txHex = serializeTx(result.tx, true).toString("hex");
+    let newTxid: string;
+    try {
+      newTxid = await this.sendRawTransaction([txHex]);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // If broadcast fails (e.g. mempool rejects the replacement), still
+      // return the structured Core-shaped error rather than crashing.
+      return {
+        txid: "",
+        origfee: Number(result.origFee) / 100_000_000,
+        fee: Number(result.newFee) / 100_000_000,
+        errors: [msg],
+      };
+    }
+
+    return {
+      txid: newTxid,
+      origfee: Number(result.origFee) / 100_000_000,
+      fee: Number(result.newFee) / 100_000_000,
+      errors: [],
+    };
+  }
+
+  /**
+   * psbtbumpfee: Like bumpfee, but return the unsigned replacement as a
+   * base64 PSBT instead of broadcasting. External signers can re-sign,
+   * finalize, and extract.
+   *
+   * Reference: bitcoin-core/src/wallet/rpc/spend.cpp::psbtbumpfee.
+   *
+   * @param params [txid, options?]
+   *   options: { fee_rate?: number (sat/vB), ... }
+   *
+   * @returns { psbt: <base64>, origfee, fee, errors }
+   */
+  private async psbtBumpFee(params: unknown[]): Promise<Record<string, unknown>> {
+    const [txidParam, optionsParam] = params;
+
+    if (typeof txidParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "txid must be a string");
+    }
+    const txid = txidParam.toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(txid)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "txid must be a 64-char hex string"
+      );
+    }
+
+    let newFeeRate: number | undefined;
+    if (optionsParam && typeof optionsParam === "object") {
+      const opt = optionsParam as Record<string, unknown>;
+      const fr = opt.fee_rate ?? opt.feeRate;
+      if (typeof fr === "number") {
+        if (!(fr > 0) || !Number.isFinite(fr)) {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_PARAMS,
+            "fee_rate must be a positive finite number (sat/vB)"
+          );
+        }
+        newFeeRate = fr;
+      }
+    }
+
+    const wallet = this.getCurrentWallet();
+    if (wallet.isLocked()) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_UNLOCK_NEEDED,
+        "Error: Please enter the wallet passphrase with walletpassphrase first."
+      );
+    }
+
+    let result: ReturnType<Wallet["psbtBumpFee"]>;
+    try {
+      result = wallet.psbtBumpFee(txid, newFeeRate);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(RPCErrorCodes.WALLET_ERROR, msg);
+    }
+
+    // Wrap the unsigned tx in a PSBT and attach witness_utxo so signers
+    // have the prevout scriptPubKey + amount they need.
+    const psbt = convertToPSBT(result.unsignedTx);
+    for (let i = 0; i < result.inputUtxos.length && i < psbt.inputs.length; i++) {
+      const u = result.inputUtxos[i];
+      try {
+        const decoded = decodeAddress(u.address);
+        const scriptPubKey = this.buildScriptPubKeyForBumpFee(decoded.type, decoded.hash);
+        psbt.inputs[i].witnessUtxo = { value: u.amount, scriptPubKey };
+      } catch {
+        // If we can't decode the address (shouldn't happen for wallet UTXOs),
+        // leave witness_utxo unset — the signer will need to populate it.
+      }
+    }
+
+    return {
+      psbt: encodePSBTBase64(psbt),
+      origfee: Number(result.origFee) / 100_000_000,
+      fee: Number(result.newFee) / 100_000_000,
+      errors: [],
+    };
+  }
+
+  /**
+   * Helper for psbtbumpfee: build a scriptPubKey from an AddressType+hash.
+   * Local copy to avoid exposing Wallet.buildScriptPubKey (private).
+   */
+  private buildScriptPubKeyForBumpFee(type: AddressType, hash: Buffer): Buffer {
+    switch (type) {
+      case AddressType.P2WPKH:
+        return Buffer.concat([Buffer.from([0x00, 0x14]), hash]);
+      case AddressType.P2WSH:
+        return Buffer.concat([Buffer.from([0x00, 0x20]), hash]);
+      case AddressType.P2PKH:
+        return Buffer.concat([
+          Buffer.from([0x76, 0xa9, 0x14]),
+          hash,
+          Buffer.from([0x88, 0xac]),
+        ]);
+      case AddressType.P2SH:
+        return Buffer.concat([
+          Buffer.from([0xa9, 0x14]),
+          hash,
+          Buffer.from([0x87]),
+        ]);
+      case AddressType.P2TR:
+        return Buffer.concat([Buffer.from([0x51, 0x20]), hash]);
+      default:
+        throw new Error(`Unsupported address type: ${type}`);
+    }
   }
 
   /**
