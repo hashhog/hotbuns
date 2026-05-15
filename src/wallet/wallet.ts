@@ -69,6 +69,23 @@ const CURVE_ORDER = BigInt(
 );
 
 /**
+ * BIP-125 opt-in RBF sequence value.
+ *
+ * Per BIP-125 / bitcoin-core/src/util/rbf.h::MAX_BIP125_RBF_SEQUENCE,
+ * a transaction signals replaceability when at least one input's nSequence
+ * is < 0xfffffffe (SEQUENCE_FINAL - 1). Core's wallet defaults to
+ * 0xfffffffd (SEQUENCE_FINAL - 2): RBF-replaceable AND nLockTime-honoring.
+ *
+ * Hotbuns previously hardcoded 0xffffffff (SEQUENCE_FINAL), which:
+ *   1. opts out of RBF — bumpfee would have had nothing to bump.
+ *   2. disables nLockTime — even when set, Core treats final-sequence inputs
+ *      as ignoring locktime (anti-fee-sniping does not apply).
+ *
+ * This is the worst-case BIP-125 violation in the W118 fleet audit.
+ */
+export const BIP125_RBF_SEQUENCE = 0xfffffffd;
+
+/**
  * Recoverable error signalling that BIP-32 CKD landed on the spec-mandated
  * skip case: parse256(IL) >= n  OR  k_i == 0. Both conditions are extremely
  * rare (~2^-127) but the spec REQUIRES the caller to bump the child index
@@ -192,6 +209,41 @@ export interface CoinSelectionResult {
 }
 
 /**
+ * Tracked outgoing wallet transaction, retained until confirmed so that
+ * bumpfee / psbtbumpfee can re-sign a replacement. Records both the tx
+ * itself and the per-input UTXO metadata (which we lose once the originals
+ * are deleted from `utxos`).
+ */
+export interface OutgoingTx {
+  /** The signed transaction we broadcast. */
+  tx: Transaction;
+  /** Per-input UTXOs that funded the original tx, in input order. */
+  inputUtxos: WalletUTXO[];
+  /** Index of the change output in tx.outputs, or -1 if no change. */
+  changeIndex: number;
+  /** Original fee paid (sat). */
+  fee: bigint;
+  /** Original effective fee rate (sat/vB). */
+  feeRate: number;
+  /** Whether the tx has been confirmed (set in processBlock). */
+  confirmed: boolean;
+}
+
+/**
+ * Result of a bumpfee operation — mirrors Core's bumpfee RPC result.
+ */
+export interface BumpFeeResult {
+  /** New signed replacement transaction. */
+  tx: Transaction;
+  /** Original tx fee in sat. */
+  origFee: bigint;
+  /** New replacement tx fee in sat. */
+  newFee: bigint;
+  /** New effective fee rate in sat/vB. */
+  newFeeRate: number;
+}
+
+/**
  * Encrypted wallet file format.
  */
 interface EncryptedWalletFile {
@@ -270,6 +322,13 @@ export class Wallet {
   // Address labels (address -> label)
   private labels: Map<string, string>;
 
+  // Outgoing wallet transactions, keyed by txid (hex). Populated by
+  // createTransaction() so bumpfee/psbtbumpfee can locate the original tx
+  // along with the per-input UTXO metadata required to re-sign. Entries are
+  // removed in processBlock() once the tx is confirmed (we only need to
+  // bump unconfirmed txs).
+  private outgoingTxs: Map<string, OutgoingTx>;
+
   constructor(config: WalletConfig) {
     this.config = config;
     this.keys = new Map();
@@ -277,6 +336,7 @@ export class Wallet {
     this.seed = Buffer.alloc(0);
     this.masterKey = { key: Buffer.alloc(0), chainCode: Buffer.alloc(0) };
     this.labels = new Map();
+    this.outgoingTxs = new Map();
 
     // Initialize encryption state
     this.encryption = {
@@ -995,11 +1055,16 @@ export class Wallet {
       );
     }
 
-    // Build transaction inputs
+    // Build transaction inputs.
+    //
+    // BIP-125: default to OPTIN RBF (sequence == 0xfffffffd) so a later
+    // bumpfee can replace this tx. Setting 0xffffffff opts out of RBF
+    // entirely AND disables nLockTime. This mirrors Core's wallet default
+    // (see CWallet::CreateTransactionInternal).
     const txInputs: TxIn[] = selectedUtxos.map((utxo) => ({
       prevOut: utxo.outpoint,
       scriptSig: Buffer.alloc(0), // Empty for P2WPKH
-      sequence: 0xffffffff,
+      sequence: BIP125_RBF_SEQUENCE,
       witness: [], // Will be filled by signInput
     }));
 
@@ -1012,11 +1077,14 @@ export class Wallet {
       };
     });
 
-    // Add change output if significant (> dust threshold of 546 sats)
+    // Add change output if significant (> dust threshold of 546 sats).
+    // Track changeIndex (-1 if no change) so bumpfee can locate it.
     const DUST_THRESHOLD = 546n;
+    let changeIndex = -1;
     if (change > DUST_THRESHOLD) {
       const changeAddress = this.getChangeAddress();
       const decoded = decodeAddress(changeAddress);
+      changeIndex = txOutputs.length;
       txOutputs.push({
         value: change,
         scriptPubKey: this.buildScriptPubKey(decoded.type, decoded.hash),
@@ -1050,7 +1118,257 @@ export class Wallet {
       this.signInput(tx, i, key, utxo, prevOuts);
     }
 
+    // Compute the actual fee (which may differ from estimatedFee since the
+    // size estimate is approximate). totalInput - sum(outputs) = fee.
+    let totalOut = 0n;
+    for (const out of tx.outputs) totalOut += out.value;
+    const actualFee = totalInput - totalOut;
+
+    // Record the outgoing tx so bumpfee/psbtbumpfee can find it later.
+    // Use the same effective vsize estimator we use for fee calc so the
+    // recorded feeRate is internally consistent.
+    const txid = getTxId(tx).toString("hex");
+    const actualVSize = 10 + 68 * selectedUtxos.length + 31 * tx.outputs.length;
+    this.outgoingTxs.set(txid, {
+      tx,
+      inputUtxos: [...selectedUtxos],
+      changeIndex,
+      fee: actualFee,
+      feeRate: Number(actualFee) / actualVSize,
+      confirmed: false,
+    });
+
     return tx;
+  }
+
+  /**
+   * Get an outgoing wallet transaction by txid. Returns undefined if not
+   * tracked (either never sent by this wallet, or pruned). Exposed so
+   * the RPC layer can introspect for bumpfee.
+   */
+  getOutgoingTx(txid: string): OutgoingTx | undefined {
+    return this.outgoingTxs.get(txid);
+  }
+
+  /**
+   * List all currently tracked outgoing wallet txids (hex).
+   */
+  listOutgoingTxs(): string[] {
+    return Array.from(this.outgoingTxs.keys());
+  }
+
+  /**
+   * Build a fee-bumped replacement for `txid` and return the new signed
+   * transaction. Mirrors bitcoin-core feebumper::CreateRateBumpTransaction
+   * + CommitTransaction — minimal viable shape:
+   *
+   *   1. Locate the original outgoing tx (must be unconfirmed + tracked).
+   *   2. Verify BIP-125 signaling (all inputs nSequence < 0xfffffffe).
+   *   3. Verify we have keys for every input (AllInputsMine).
+   *   4. Compute new fee: max(user-supplied fee_rate, oldFee/vsize + 1 sat/vB).
+   *   5. Reduce change output by the delta. Reject if change < dust.
+   *   6. Re-sign every input. Stage the new tx into outgoingTxs for chained
+   *      bumps.
+   *
+   * Reference: bitcoin-core/src/wallet/feebumper.cpp.
+   *
+   * @param txid hex-encoded txid of the original outgoing tx.
+   * @param newFeeRate optional explicit replacement fee rate (sat/vB). If
+   *   omitted, uses oldFeeRate + 1 sat/vB (Core's bumpfee default).
+   */
+  bumpFee(txid: string, newFeeRate?: number): BumpFeeResult {
+    const out = this.outgoingTxs.get(txid);
+    if (!out) {
+      throw new Error(`bumpfee: no such wallet transaction: ${txid}`);
+    }
+    if (out.confirmed) {
+      throw new Error(
+        "bumpfee: transaction has been mined, or is conflicted with a mined transaction"
+      );
+    }
+
+    // BIP-125 signaling: Core's PreconditionChecks indirectly requires this
+    // via SignalsOptInRBF — at least one input nSequence < 0xfffffffe.
+    const anyRbf = out.tx.inputs.some((i) => i.sequence < 0xfffffffe);
+    if (!anyRbf) {
+      throw new Error(
+        "bumpfee: transaction is not BIP-125 replaceable (no input has sequence < 0xfffffffe)"
+      );
+    }
+
+    // AllInputsMine: every input must be funded by a UTXO we have the key
+    // for. createTransaction guarantees this for wallet-originated txs,
+    // but check anyway in case the wallet was re-loaded after restart.
+    for (const u of out.inputUtxos) {
+      if (!this.keys.has(u.address)) {
+        throw new Error(
+          `bumpfee: transaction contains inputs that don't belong to this wallet (${u.address})`
+        );
+      }
+    }
+
+    if (out.changeIndex < 0) {
+      throw new Error(
+        "bumpfee: cannot bump transaction without a change output (would need to drop a payment output)"
+      );
+    }
+
+    // Compute target fee. The replacement tx will have the same input/output
+    // shape as the original, so its vsize estimate matches.
+    const oldVSize =
+      10 + 68 * out.tx.inputs.length + 31 * out.tx.outputs.length;
+    const oldFeeRate = Number(out.fee) / oldVSize;
+    const targetRate = newFeeRate ?? oldFeeRate + 1;
+
+    // BIP-125 Rule 4 / Core CheckFeeRate: replacement fee must be strictly
+    // greater than the original.
+    if (targetRate <= oldFeeRate) {
+      throw new Error(
+        `bumpfee: new fee rate (${targetRate.toFixed(3)} sat/vB) must be greater than original (${oldFeeRate.toFixed(3)} sat/vB)`
+      );
+    }
+
+    const newFee = BigInt(Math.ceil(oldVSize * targetRate));
+    if (newFee <= out.fee) {
+      throw new Error(
+        `bumpfee: new fee (${newFee}) must exceed original fee (${out.fee})`
+      );
+    }
+
+    // Build replacement outputs: copy originals, then reduce change by the
+    // fee delta. If change would drop below dust, refuse.
+    const DUST_THRESHOLD = 546n;
+    const feeDelta = newFee - out.fee;
+    const origChange = out.tx.outputs[out.changeIndex].value;
+    const newChange = origChange - feeDelta;
+    if (newChange <= DUST_THRESHOLD) {
+      throw new Error(
+        `bumpfee: change output would drop below dust (${newChange} <= ${DUST_THRESHOLD})`
+      );
+    }
+
+    const newOutputs: TxOut[] = out.tx.outputs.map((o, i) =>
+      i === out.changeIndex
+        ? { value: newChange, scriptPubKey: o.scriptPubKey }
+        : { value: o.value, scriptPubKey: o.scriptPubKey }
+    );
+
+    // Build replacement inputs: same prevOuts/sequence, empty signatures
+    // to be re-filled.
+    const newInputs: TxIn[] = out.tx.inputs.map((i) => ({
+      prevOut: i.prevOut,
+      scriptSig: Buffer.alloc(0),
+      sequence: i.sequence < 0xfffffffe ? i.sequence : BIP125_RBF_SEQUENCE,
+      witness: [],
+    }));
+
+    const newTx: Transaction = {
+      version: out.tx.version,
+      inputs: newInputs,
+      outputs: newOutputs,
+      lockTime: out.tx.lockTime,
+    };
+
+    // Re-sign every input. Use the recorded inputUtxos for amount/scriptPubKey.
+    const prevOuts = out.inputUtxos.map((u) => {
+      const decoded = decodeAddress(u.address);
+      return {
+        scriptPubKey: this.buildScriptPubKey(decoded.type, decoded.hash),
+        value: u.amount,
+      };
+    });
+    for (let i = 0; i < newInputs.length; i++) {
+      const u = out.inputUtxos[i];
+      const key = this.keys.get(u.address);
+      if (!key) {
+        throw new Error(`bumpfee: missing key for input ${i} (${u.address})`);
+      }
+      this.signInput(newTx, i, key, u, prevOuts);
+    }
+
+    // Track the replacement for further chained bumps.
+    const newTxid = getTxId(newTx).toString("hex");
+    this.outgoingTxs.set(newTxid, {
+      tx: newTx,
+      inputUtxos: [...out.inputUtxos],
+      changeIndex: out.changeIndex,
+      fee: newFee,
+      feeRate: Number(newFee) / oldVSize,
+      confirmed: false,
+    });
+
+    return {
+      tx: newTx,
+      origFee: out.fee,
+      newFee,
+      newFeeRate: Number(newFee) / oldVSize,
+    };
+  }
+
+  /**
+   * Build a fee-bumped replacement and return it as an unsigned PSBT instead
+   * of a signed tx — the PSBT-mode variant of bumpfee. Mirrors Core's
+   * psbtbumpfee RPC: same precondition checks, same fee math, same change
+   * reduction; but signatures are STRIPPED so external signers can re-sign.
+   *
+   * Returned PSBT is in the BIP-174 v0 shape (unsigned tx + per-input UTXO
+   * witness_utxo). The replacement is NOT recorded in outgoingTxs (since
+   * it's not signed and won't go to the mempool from this wallet).
+   *
+   * Reference: bitcoin-core/src/wallet/rpc/spend.cpp::psbtbumpfee.
+   *
+   * @param txid hex-encoded txid of the original outgoing tx.
+   * @param newFeeRate optional explicit replacement fee rate (sat/vB).
+   * @returns an unsigned Transaction + per-input witness_utxo metadata.
+   *   The caller passes this to convertToPSBT() / signPSBTInput().
+   */
+  psbtBumpFee(
+    txid: string,
+    newFeeRate?: number
+  ): {
+    unsignedTx: Transaction;
+    inputUtxos: WalletUTXO[];
+    origFee: bigint;
+    newFee: bigint;
+    newFeeRate: number;
+  } {
+    // Reuse bumpFee's precondition + math by building the replacement, then
+    // strip signatures. Cheaper than duplicating ~80 LOC of validation.
+    const bumped = this.bumpFee(txid, newFeeRate);
+
+    // Strip signatures from inputs — PSBT consumers will re-sign.
+    const unsignedTx: Transaction = {
+      version: bumped.tx.version,
+      inputs: bumped.tx.inputs.map((i) => ({
+        prevOut: i.prevOut,
+        scriptSig: Buffer.alloc(0),
+        sequence: i.sequence,
+        witness: [],
+      })),
+      outputs: bumped.tx.outputs.map((o) => ({
+        value: o.value,
+        scriptPubKey: o.scriptPubKey,
+      })),
+      lockTime: bumped.tx.lockTime,
+    };
+
+    // Remove the signed replacement from outgoingTxs — only signed txs that
+    // we actually broadcast should be tracked (otherwise we'd offer to bump
+    // a PSBT that's still in the signer's hands).
+    const signedTxid = getTxId(bumped.tx).toString("hex");
+    this.outgoingTxs.delete(signedTxid);
+
+    // Refetch the original to return its inputUtxos for the caller.
+    const orig = this.outgoingTxs.get(txid);
+    const inputUtxos = orig ? [...orig.inputUtxos] : [];
+
+    return {
+      unsignedTx,
+      inputUtxos,
+      origFee: bumped.origFee,
+      newFee: bumped.newFee,
+      newFeeRate: bumped.newFeeRate,
+    };
   }
 
   /**
@@ -1880,6 +2198,15 @@ export class Wallet {
     for (const tx of block.transactions) {
       const txid = getTxId(tx);
       const txIsCoinbase = isCoinbase(tx);
+      const txidHex = txid.toString("hex");
+
+      // If this is one of our tracked outgoing txs, mark it confirmed so
+      // bumpfee no longer offers to bump it. (Bumpfee only operates on
+      // unconfirmed txs — see PreconditionChecks GetTxDepthInMainChain != 0.)
+      const out = this.outgoingTxs.get(txidHex);
+      if (out) {
+        out.confirmed = true;
+      }
 
       // Check outputs for incoming payments
       for (let vout = 0; vout < tx.outputs.length; vout++) {
