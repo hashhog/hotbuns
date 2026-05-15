@@ -149,6 +149,26 @@ export interface RPCServerConfig {
    * When true, no cookie is generated and all requests are allowed.
    */
   noAuth?: boolean;
+  /**
+   * Optional path to a PEM-encoded TLS certificate (or full chain).
+   * MUST be paired with {@link tlsKeyPath}. When both are set the
+   * server listens via HTTPS using Bun.serve's `tls` config — the
+   * Bun runtime parses + terminates TLS natively (BoringSSL).
+   *
+   * Bitcoin Core does not ship native TLS in its HTTP RPC server;
+   * the operator-recommended pattern is a TLS reverse proxy. hotbuns
+   * also supports the reverse-proxy pattern (just leave these unset)
+   * but adds a direct-TLS option for environments where standing up
+   * an additional process is undesirable (W119 "no TLS client lib"
+   * follow-up; FIX-64).
+   *
+   * Mismatched configuration (one set, the other not) is a fatal
+   * startup error — silent HTTP fallback when TLS was requested
+   * would be a footgun.
+   */
+  tlsCertPath?: string;
+  /** Path to PEM-encoded private key, paired with {@link tlsCertPath}. */
+  tlsKeyPath?: string;
 }
 
 /**
@@ -439,6 +459,19 @@ export class RPCServer {
   private versionBitsDeployments: Map<string, DeploymentParams> | null = null;
 
   constructor(config: RPCServerConfig, deps: RPCServerDeps) {
+    // TLS pair validation: both or neither. Failing fast at construct
+    // time means an operator that passes `--rpc-tls-cert` without
+    // `--rpc-tls-key` (or vice-versa) gets a clear error rather than
+    // silently falling back to plaintext HTTP.
+    const hasCert = !!config.tlsCertPath;
+    const hasKey = !!config.tlsKeyPath;
+    if (hasCert !== hasKey) {
+      throw new Error(
+        "RPC TLS configuration error: --rpc-tls-cert and --rpc-tls-key " +
+          "must both be provided, or both omitted (one was set, the other was not)."
+      );
+    }
+
     this.config = {
       port: config.port ?? 8332,
       host: config.host ?? "127.0.0.1",
@@ -446,6 +479,8 @@ export class RPCServer {
       rpcPassword: config.rpcPassword,
       datadir: config.datadir,
       noAuth: config.noAuth,
+      tlsCertPath: config.tlsCertPath,
+      tlsKeyPath: config.tlsKeyPath,
     };
     this.chainState = deps.chainState;
     this.mempool = deps.mempool;
@@ -541,10 +576,19 @@ export class RPCServer {
   }
 
   /**
-   * Start the HTTP server.
+   * Start the HTTP (or HTTPS, when TLS is configured) server.
    * Generates a 32-byte random cookie and writes `__cookie__:<hex>` to
    * `{datadir}/.cookie` so external tools can authenticate without a
    * configured rpcUser/rpcPassword.
+   *
+   * When {@link RPCServerConfig.tlsCertPath} and {@link
+   * RPCServerConfig.tlsKeyPath} are both set, the listener uses
+   * `Bun.serve({ tls: { cert, key } })` so the same handler is served
+   * over HTTPS. Cert/key files are read synchronously at startup so
+   * that a missing or unreadable file is a hard failure (rather than
+   * a deferred per-request error). This is intentionally a fail-loud
+   * path — silent HTTP fallback when TLS was requested would let an
+   * operator believe RPC traffic is encrypted when it is not.
    */
   start(): void {
     if (!this.config.noAuth) {
@@ -560,14 +604,45 @@ export class RPCServer {
       }
     }
 
+    const tlsEnabled = !!(this.config.tlsCertPath && this.config.tlsKeyPath);
+    let tlsConfig: { cert: string; key: string } | undefined;
+    if (tlsEnabled) {
+      // Read PEM-encoded cert + key synchronously. We use Node's
+      // readFileSync rather than Bun.file().text() (which is async)
+      // because Bun.serve must observe the cert/key contents at the
+      // moment it's called — passing a pending Promise would not work.
+      const fsSync = require("fs") as typeof import("fs");
+      let certData: string;
+      let keyData: string;
+      try {
+        certData = fsSync.readFileSync(this.config.tlsCertPath!, "utf8");
+      } catch (err) {
+        const msg = (err as Error)?.message ?? String(err);
+        throw new Error(
+          `RPC TLS: failed to read cert file '${this.config.tlsCertPath}': ${msg}`
+        );
+      }
+      try {
+        keyData = fsSync.readFileSync(this.config.tlsKeyPath!, "utf8");
+      } catch (err) {
+        const msg = (err as Error)?.message ?? String(err);
+        throw new Error(
+          `RPC TLS: failed to read key file '${this.config.tlsKeyPath}': ${msg}`
+        );
+      }
+      tlsConfig = { cert: certData, key: keyData };
+    }
+
     this.server = Bun.serve({
       port: this.config.port,
       hostname: this.config.host,
       fetch: (req) => this.handleRequest(req),
+      ...(tlsConfig ? { tls: tlsConfig } : {}),
     });
 
+    const scheme = tlsEnabled ? "https" : "http";
     console.log(
-      `RPC server listening on http://${this.config.host}:${this.config.port}`
+      `RPC server listening on ${scheme}://${this.config.host}:${this.config.port}`
     );
   }
 

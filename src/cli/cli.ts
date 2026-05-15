@@ -226,6 +226,24 @@ export interface NodeConfig {
    * Reference: bitcoin-core/src/init.cpp `-cjdnsreachable`.
    */
   cjdnsReachable?: boolean;
+  /**
+   * Optional path to a PEM-encoded TLS certificate (or full chain) for
+   * the JSON-RPC HTTP server. MUST be paired with {@link rpcTlsKey}.
+   * When both are set, the RPC listener serves HTTPS via Bun.serve's
+   * built-in TLS support (BoringSSL); when both are unset, the listener
+   * stays on plaintext HTTP (backward-compat).
+   *
+   * Bitcoin Core relies on a TLS reverse proxy in front of HTTP RPC.
+   * hotbuns supports that pattern too, but Bun has a first-class TLS
+   * runtime so we also expose direct termination for environments
+   * that prefer one fewer hop (W119 follow-up; FIX-64).
+   *
+   * Reference: bitcoin-core/src/httpserver.cpp (no native TLS),
+   *            Bun.serve docs (`tls: { cert, key }`).
+   */
+  rpcTlsCert?: string;
+  /** Path to PEM-encoded private key, paired with {@link rpcTlsCert}. */
+  rpcTlsKey?: string;
 }
 
 /**
@@ -549,6 +567,19 @@ export function parseArgs(argv: string[]): ParsedArgs {
             config.cjdnsReachable = false;
           }
           break;
+        case "rpc-tls-cert":
+        case "rpctlscert":
+          // PEM-encoded TLS cert (or chain) for HTTPS RPC. Paired with
+          // --rpc-tls-key. Both-or-neither is enforced at RPCServer
+          // construct time (FIX-64).
+          if (value) config.rpcTlsCert = value;
+          break;
+        case "rpc-tls-key":
+        case "rpctlskey":
+          // PEM-encoded private key for HTTPS RPC. Paired with
+          // --rpc-tls-cert. See above.
+          if (value) config.rpcTlsKey = value;
+          break;
         case "password":
           // For wallet commands
           if (value) remainingArgs.push(`--password=${value}`);
@@ -723,6 +754,12 @@ export async function loadConfig(
           // Mirror CLI: 0/false = off; 1/true/basic = on.
           config.blockfilterindex =
             value === "1" || value === "true" || value === "basic";
+          break;
+        case "rpctlscert":
+          if (value) config.rpcTlsCert = value;
+          break;
+        case "rpctlskey":
+          if (value) config.rpcTlsKey = value;
           break;
       }
     }
@@ -1922,6 +1959,8 @@ async function startNode(config: NodeConfig): Promise<void> {
     rpcUser: mergedConfig.rpcUser,
     rpcPassword: mergedConfig.rpcPassword,
     datadir: mergedConfig.datadir,
+    tlsCertPath: mergedConfig.rpcTlsCert,
+    tlsKeyPath: mergedConfig.rpcTlsKey,
   };
 
   const rpcDeps: RPCServerDeps = {
@@ -2550,6 +2589,8 @@ OPTIONS:
   --metrics-port=<port> Prometheus metrics port (default: 9332, 0 = disabled)
   --rpc-user=<user>     RPC username (default: user)
   --rpc-password=<pass> RPC password (default: pass)
+  --rpc-tls-cert=<path> PEM cert for HTTPS RPC (pair with --rpc-tls-key)
+  --rpc-tls-key=<path>  PEM key for HTTPS RPC (pair with --rpc-tls-cert)
   --max-outbound=<n>    Max outbound connections (default: 8)
   --log-level=<level>   Log level: debug, info, warn, error (default: info)
   --debug=<cat>         Enable debug logging for category (repeatable; 'all'/'1' = every category, 'none'/'0' = off)
