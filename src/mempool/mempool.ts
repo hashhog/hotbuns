@@ -1106,6 +1106,13 @@ export interface Cluster {
 export interface AcceptToMemoryPoolOptions {
   /** Caller-defined max fee rate (sat/vB). Reject if the tx exceeds this. */
   maxFeeRateSatPerVB?: number;
+  /**
+   * Dry-run mode: run all validation but do NOT commit the transaction to the
+   * pool (skip entries.set, outpointIndex.set, cluster wiring, and ZMQ emit).
+   * Mirrors Bitcoin Core's test_accept path in AcceptToMemoryPool
+   * (validation.cpp — ATMPArgs::m_test_accept).
+   */
+  testAccept?: boolean;
 }
 
 /**
@@ -2179,6 +2186,12 @@ export class Mempool {
       hasEphemeralDust: txHasEphemeralDust,
       sigOpCost,
     };
+
+    // Dry-run path: validation passed but caller only wants a yes/no answer.
+    // Do NOT commit anything to the pool (mirrors Core's test_accept=true path).
+    if (options?.testAccept) {
+      return { accepted: true };
+    }
 
     // Add to mempool
     this.entries.set(txidHex, entry);

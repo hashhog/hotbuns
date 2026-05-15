@@ -3517,8 +3517,10 @@ export class RPCServer {
           continue;
         }
 
-        // Test mempool acceptance
-        const result = await this.mempool.addTransaction(tx);
+        // Test mempool acceptance — dry-run: validate but do NOT commit.
+        // Mirrors Bitcoin Core's testmempoolaccept using test_accept=true in
+        // AcceptToMemoryPool (validation.cpp).
+        const result = await this.mempool.addTransaction(tx, { testAccept: true });
 
         if (result.accepted) {
           const vsize = getTxVSize(tx);
