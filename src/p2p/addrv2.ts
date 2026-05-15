@@ -535,32 +535,72 @@ function formatIPv6(addr: Buffer): string {
 }
 
 /**
+ * Lowercase RFC 4648 base32 alphabet (no padding).
+ * Used for both .onion (TorV3) and .b32.i2p address encodings.
+ */
+const BASE32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
+
+/**
+ * Encode a buffer to lowercase RFC 4648 base32 with no padding.
+ */
+function encodeBase32NoPad(data: Buffer): string {
+  let result = "";
+  let bits = 0;
+  let value = 0;
+  for (let i = 0; i < data.length; i++) {
+    value = (value << 8) | data[i];
+    bits += 8;
+    while (bits >= 5) {
+      result += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) {
+    result += BASE32_ALPHABET[(value << (5 - bits)) & 31];
+  }
+  return result;
+}
+
+/**
  * Format TorV3 address bytes as .onion address.
  *
- * TorV3 onion addresses are base32-encoded: pubkey + checksum + version
+ * TorV3 onion addresses are base32-encoded: pubkey || checksum || version
+ *   checksum = first 2 bytes of SHA3-256(".onion checksum" || pubkey || version)
+ *   version  = 0x03
+ *
+ * Reference: rend-spec-v3.txt §6 (onion service descriptor address spec),
+ *            tor-source rend-service.c rend_service_derive_key_digest().
  */
-function formatTorV3(pubkey: Buffer): string {
+export function formatTorV3(pubkey: Buffer): string {
   if (pubkey.length !== 32) {
     return pubkey.toString("hex") + ".onion";
   }
 
-  // The onion address is base32(pubkey || checksum || version)
-  // checksum = first 2 bytes of SHA3-256(".onion checksum" || pubkey || version)
-  // version = 0x03
-  // For display, we just show the hex for now (full encoding requires sha3)
-  return pubkey.toString("hex").substring(0, 16) + "...onion";
+  // Compute checksum = SHA3-256(".onion checksum" || pubkey || 0x03)[0..2]
+  const version = Buffer.from([0x03]);
+  const checksumInput = Buffer.concat([
+    Buffer.from(".onion checksum"),
+    pubkey,
+    version,
+  ]);
+  const fullDigest = new Bun.CryptoHasher("sha3-256")
+    .update(checksumInput)
+    .digest();
+  const checksum = fullDigest.subarray(0, 2);
+
+  const onionBytes = Buffer.concat([pubkey, checksum, version]);
+  return encodeBase32NoPad(onionBytes) + ".onion";
 }
 
 /**
  * Format I2P address bytes as .b32.i2p address.
  *
- * I2P addresses are base32-encoded 32-byte hashes.
+ * I2P addresses are base32-encoded 32-byte SHA-256 hashes of the destination.
+ * Reference: I2P SAM v3 spec, https://geti2p.net/en/docs/naming.
  */
-function formatI2P(hash: Buffer): string {
+export function formatI2P(hash: Buffer): string {
   if (hash.length !== 32) {
     return hash.toString("hex") + ".b32.i2p";
   }
-
-  // Full encoding requires base32, show truncated hex for now
-  return hash.toString("hex").substring(0, 16) + "...b32.i2p";
+  return encodeBase32NoPad(hash) + ".b32.i2p";
 }
