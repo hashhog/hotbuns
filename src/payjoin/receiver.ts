@@ -540,11 +540,72 @@ export async function handlePayJoinRequest(
 
   // 5. Build the modified transaction.
   //    BIP-78 §F.3 says receiver "increases its own output by the input
-  //    value minus its fee share". For this minimal implementation we
-  //    consume the FULL receiver UTXO amount into the receiver output —
-  //    the sender keeps the same fee they originally allocated (no extra
-  //    fee share extracted by receiver). This is conservative and matches
-  //    the simplest BTCPay reference flow.
+  //    value minus its fee share". The "fee share" is what the receiver
+  //    extracts to cover the cost of its extra input. Two policies are
+  //    implemented based on sender's BIP-78 §D query params:
+  //
+  //    (a) Sender provided BOTH `additionalfeeoutputindex` (G6) AND
+  //        `maxadditionalfeecontribution` (G9): receiver MAY shave up
+  //        to `maxAdditionalFeeContribution` sats off the indicated
+  //        sender output to cover its added-input vbyte cost. The
+  //        receiver-output is bumped by (utxo_amount + fee_share_extracted).
+  //        Equivalently: net fee delta to sender == feeShareExtracted ≤ cap.
+  //
+  //    (b) Otherwise (sender omitted either param): receiver does NOT
+  //        extract a fee share — full UTXO value goes into the receiver
+  //        output, sender keeps the same fee they originally allocated.
+  //        This is the conservative default and trivially satisfies G9.
+  //
+  //    G8 (output substitution / pjos): the receiver only modifies its
+  //    OWN output (bumping it by the contribution) and, optionally, the
+  //    `additionalfeeoutputindex`-pointed sender output (reducing it by
+  //    the fee share). When the sender set `disableOutputSubstitution=true`
+  //    (pjos=0), the receiver MUST NOT reduce ANY sender output — so the
+  //    fee-share extraction is forbidden in that case and the receiver
+  //    falls back to policy (b) above.
+  //
+  //    G15 (minfeerate floor): if sender supplied minfeerate, the receiver
+  //    MUST ensure the response tx's effective fee rate is ≥ that floor.
+  //    Since policy (b) keeps the original fee unchanged AND adds a single
+  //    input (~68 vB more), the effective rate DROPS. We compute the
+  //    post-bump rate using the same vsize formula the sender uses
+  //    (sender.ts validateMinFeeRate) and reject with NOT_ENOUGH_MONEY
+  //    if it falls below the floor.
+
+  // G6 + G9 fee-share extraction policy.
+  let feeShareExtracted = 0n;
+  if (
+    query.additionalFeeOutputIndex !== undefined &&
+    query.maxAdditionalFeeContribution !== undefined &&
+    query.maxAdditionalFeeContribution > 0n &&
+    !query.disableOutputSubstitution
+  ) {
+    const afoi = query.additionalFeeOutputIndex;
+    if (
+      afoi < 0 ||
+      afoi >= originalPsbt.tx.outputs.length ||
+      afoi === receiverOutputIndex
+    ) {
+      // Sender pointed at a nonexistent output OR at the receiver-owned
+      // output. Both are invalid per BIP-78 §F.2 (the fee output must be
+      // sender-owned). Reject so the sender re-builds rather than us
+      // silently picking a wrong policy.
+      throw new PayJoinError(
+        PAYJOIN_ERROR_ORIGINAL_PSBT_REJECTED,
+        `additionalfeeoutputindex=${afoi} is invalid (must point at a sender output)`
+      );
+    }
+    // Cap the share at the cap AND at what the targeted output can spare
+    // without going below dust (we use 546 sats as the universal dust
+    // floor; BIP-78 doesn't specify but ecosystem clients converge here).
+    const DUST = 546n;
+    const targetOutput = originalPsbt.tx.outputs[afoi];
+    const spareInTarget =
+      targetOutput.value > DUST ? targetOutput.value - DUST : 0n;
+    const cap = query.maxAdditionalFeeContribution;
+    feeShareExtracted = spareInTarget < cap ? spareInTarget : cap;
+  }
+
   const newInputs: TxIn[] = [
     ...originalPsbt.tx.inputs.map((i) => ({
       prevOut: { txid: Buffer.from(i.prevOut.txid), vout: i.prevOut.vout },
@@ -569,8 +630,28 @@ export async function handlePayJoinRequest(
 
   const newOutputs: TxOut[] = originalPsbt.tx.outputs.map((o, idx) => {
     if (idx === receiverOutputIndex) {
+      // Receiver-owned output: bump by (full UTXO contribution + fee share).
+      // The fee share is added back here so that
+      //   (extra input value)
+      //   minus (fee share moved into the fee bucket via reducing sender output)
+      // ends up flowing into the receiver-owned output by the right amount.
+      // Actually the simpler accounting is:
+      //   Σ inputs delta  =  +candidate.amount
+      //   Σ outputs delta =  +candidate.amount  (receiver-output bump)
+      //                   +  -feeShareExtracted (sender fee-output reduction)
+      //   ⇒ fee delta     =  +feeShareExtracted  (the extra fee bucket)
+      // So the receiver-output is bumped by exactly candidate.amount (NOT
+      // candidate.amount + feeShareExtracted) — the fee share comes from
+      // the SENDER output, not from the receiver bump.
       return {
         value: o.value + candidate.amount,
+        scriptPubKey: Buffer.from(o.scriptPubKey),
+      };
+    }
+    if (idx === query.additionalFeeOutputIndex && feeShareExtracted > 0n) {
+      // G6: reduce sender-indicated fee output by the extracted share.
+      return {
+        value: o.value - feeShareExtracted,
         scriptPubKey: Buffer.from(o.scriptPubKey),
       };
     }
@@ -583,6 +664,44 @@ export async function handlePayJoinRequest(
     outputs: newOutputs,
     lockTime: originalPsbt.tx.lockTime,
   };
+
+  // G15 receiver-side minfeerate floor.
+  //
+  // BIP-78 §F: if sender supplied `minfeerate`, the receiver SHOULD only
+  // return a tx whose effective fee rate is ≥ that floor. We compute the
+  // post-bump fee rate using the same vsize formula sender.ts uses
+  // (validateMinFeeRate); a stricter cross-impl might also include the
+  // receiver-input's witness weight, but a single 68 vB segwit input
+  // estimate keeps the two sides in lockstep.
+  if (query.minFeeRate !== undefined) {
+    let origInputTotal = 0n;
+    let canCompute = true;
+    for (const psbtIn of originalPsbt.inputs) {
+      if (!psbtIn.witnessUtxo) { canCompute = false; break; }
+      origInputTotal += psbtIn.witnessUtxo.value;
+    }
+    if (canCompute) {
+      const inputTotal = origInputTotal + candidate.amount;
+      let outputTotal = 0n;
+      for (const o of newOutputs) outputTotal += o.value;
+      const fee = inputTotal - outputTotal;
+      if (fee < 0n) {
+        throw new PayJoinError(
+          PAYJOIN_ERROR_ORIGINAL_PSBT_REJECTED,
+          `payjoin tx would have negative fee (${fee})`
+        );
+      }
+      const vsize =
+        10 + 68 * newInputs.length + 31 * newOutputs.length;
+      const rate = Number(fee) / vsize;
+      if (rate < query.minFeeRate) {
+        throw new PayJoinError(
+          PAYJOIN_ERROR_NOT_ENOUGH_MONEY,
+          `payjoin effective fee rate ${rate.toFixed(3)} sat/vB < minfeerate ${query.minFeeRate}`
+        );
+      }
+    }
+  }
 
   // 6. Sign only the receiver-added input (last index). For this minimal
   //    receiver we only handle P2WPKH UTXOs; the wallet's main
