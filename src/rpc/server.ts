@@ -116,6 +116,12 @@ import {
   PayJoinError,
   type PendingPayJoinRequestsMap,
 } from "../payjoin/receiver.js";
+import {
+  sendPayJoinRequestWithFallback,
+  buildOriginalPsbtFromSignedTx,
+  PayJoinSenderError,
+  type PayJoinSenderOptions,
+} from "../payjoin/sender.js";
 
 /**
  * JSON-RPC request format.
@@ -1199,6 +1205,17 @@ export class RPCServer {
       // the unsigned PSBT instead of broadcasting.
       this.registerMethod("bumpfee", (params) => this.bumpFee(params));
       this.registerMethod("psbtbumpfee", (params) => this.psbtBumpFee(params));
+      // BIP-78 PayJoin RPCs (FIX-66). `getpayjoinrequest` is a receiver-side
+      // introspection method (G26) — list pending requests in the TTL map.
+      // `sendpayjoinrequest` is the sender-side entry point (G27): build an
+      // Original PSBT, POST to the receiver's endpoint, validate the response,
+      // and broadcast either the payjoin or fall back to the Original.
+      this.registerMethod("getpayjoinrequest", (params) =>
+        this.getPayJoinRequest(params)
+      );
+      this.registerMethod("sendpayjoinrequest", (params) =>
+        this.sendPayJoinRequestRpc(params)
+      );
     }
 
     // Descriptor methods (work without wallet)
@@ -7822,6 +7839,283 @@ export class RPCServer {
       default:
         throw new Error(`Unsupported address type: ${type}`);
     }
+  }
+
+  /**
+   * getpayjoinrequest (FIX-66, BIP-78 G26): Return the pending PayJoin
+   * receiver requests this node has SEEN within the TTL window.
+   *
+   * Receiver-side introspection — useful for operators to see whether a
+   * sender has hit the endpoint (with what hash, when), without having to
+   * grep logs. Each pending entry corresponds to an Original PSBT that
+   * passed the validate-but-not-yet-broadcast stage in handlePayJoinRequest;
+   * entries expire after PAYJOIN_REQUEST_TTL_MS (default 60s).
+   *
+   * @param params [verbose?]
+   *   verbose: when true (default), include input outpoint sets per entry.
+   *
+   * @returns { count, ttlMs, entries: [{ hash, receivedAt, expiresAt,
+   *           senderOutpoints? }, ...] }
+   */
+  private async getPayJoinRequest(params: unknown[]): Promise<Record<string, unknown>> {
+    const [verboseParam] = params;
+    const verbose = verboseParam === undefined ? true : Boolean(verboseParam);
+
+    const now = Date.now();
+    // Cheap prune so the snapshot only reflects live entries.
+    for (const [hash, entry] of this.pendingPayJoinRequests) {
+      if (entry.expiresAtMs <= now) {
+        this.pendingPayJoinRequests.delete(hash);
+      }
+    }
+
+    const entries: Array<Record<string, unknown>> = [];
+    for (const entry of this.pendingPayJoinRequests.values()) {
+      const row: Record<string, unknown> = {
+        hash: entry.originalPsbtHash,
+        // ISO + epoch ms for operator-readable + machine-readable timestamps.
+        receivedAt: new Date(entry.receivedAtMs).toISOString(),
+        receivedAtMs: entry.receivedAtMs,
+        expiresAt: new Date(entry.expiresAtMs).toISOString(),
+        expiresAtMs: entry.expiresAtMs,
+        ttlRemainingMs: Math.max(0, entry.expiresAtMs - now),
+      };
+      if (verbose) {
+        row.senderOutpoints = [...entry.senderOutpoints];
+        row.numInputs = entry.originalPsbt.tx.inputs.length;
+        row.numOutputs = entry.originalPsbt.tx.outputs.length;
+      }
+      entries.push(row);
+    }
+    return {
+      count: entries.length,
+      ttlMs: 60_000, // PAYJOIN_REQUEST_TTL_MS — surfaced for operators
+      entries,
+    };
+  }
+
+  /**
+   * sendpayjoinrequest (FIX-66, BIP-78 G27): Sender-side end-to-end flow.
+   *
+   *   1. Build a signed Original transaction via wallet.createTransaction().
+   *   2. Wrap it as an Original PSBT (finalScriptSig/finalScriptWitness
+   *      populated from the signed tx).
+   *   3. POST to the receiver's pj= endpoint, applying the BIP-78 query
+   *      string options (`v=1`, `additionalfeeoutputindex`,
+   *      `maxadditionalfeecontribution`, `disableoutputsubstitution`,
+   *      `minfeerate`).
+   *   4. Validate the response via the 6 anti-snoop validators G10-G15.
+   *   5. On success: extract the finalized payjoin tx and broadcast it via
+   *      sendRawTransaction. On any retryable failure (transport,
+   *      validation, parse, unavailable, not-enough-money): fall back to
+   *      broadcasting the Original (BIP-78 §H / G22).
+   *
+   * @param params [endpoint, outputs, options?]
+   *   endpoint:  string — receiver's pj= URL.
+   *   outputs:   [{ address, amount }] — same shape as sendtoaddress' addr+amt.
+   *   options:   {
+   *     fee_rate?: number,                            // sat/vB
+   *     max_additional_fee_contribution?: number,     // sat
+   *     min_fee_rate?: number,                        // sat/vB
+   *     disable_output_substitution?: boolean,
+   *     additional_fee_output_index?: number,
+   *     timeout_ms?: number,
+   *   }
+   *
+   * @returns {
+   *   kind: "payjoin" | "fallback",
+   *   txid: string,                                  // broadcast txid
+   *   original_psbt: base64,
+   *   payjoin_psbt?: base64,                         // only when kind="payjoin"
+   *   fallback_reason?: string,                      // only when kind="fallback"
+   * }
+   */
+  private async sendPayJoinRequestRpc(params: unknown[]): Promise<Record<string, unknown>> {
+    const [endpointParam, outputsParam, optionsParam] = params;
+    if (typeof endpointParam !== "string" || endpointParam.length === 0) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "endpoint must be a non-empty string"
+      );
+    }
+    if (!Array.isArray(outputsParam) || outputsParam.length === 0) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "outputs must be a non-empty array of { address, amount }"
+      );
+    }
+    const outputs: { address: string; amount: bigint }[] = [];
+    for (const raw of outputsParam) {
+      if (!raw || typeof raw !== "object") {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "each output must be { address: string, amount: number|string }"
+        );
+      }
+      const o = raw as Record<string, unknown>;
+      if (typeof o.address !== "string") {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "output.address must be a string"
+        );
+      }
+      // Accept either BTC decimal (number) or satoshi BigInt-able string.
+      let amount: bigint;
+      if (typeof o.amount === "number") {
+        if (!(o.amount > 0) || !Number.isFinite(o.amount)) {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_PARAMS,
+            "output.amount must be positive finite"
+          );
+        }
+        amount = BigInt(Math.round(o.amount * 100_000_000));
+      } else if (typeof o.amount === "string") {
+        try {
+          amount = BigInt(o.amount);
+        } catch {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_PARAMS,
+            "output.amount string must be integer satoshis"
+          );
+        }
+      } else if (typeof o.amount === "bigint") {
+        amount = o.amount;
+      } else {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "output.amount must be number|string|bigint"
+        );
+      }
+      outputs.push({ address: o.address, amount });
+    }
+    // Default fee rate matches sendtoaddress' fallback path.
+    let feeRate = 1;
+    const senderOpts: PayJoinSenderOptions = { endpoint: endpointParam };
+    if (optionsParam && typeof optionsParam === "object") {
+      const opt = optionsParam as Record<string, unknown>;
+      if (typeof opt.fee_rate === "number" && opt.fee_rate > 0) {
+        feeRate = opt.fee_rate;
+      }
+      if (typeof opt.max_additional_fee_contribution === "number") {
+        senderOpts.maxAdditionalFeeContribution = BigInt(
+          Math.round(opt.max_additional_fee_contribution)
+        );
+      }
+      if (typeof opt.min_fee_rate === "number" && opt.min_fee_rate >= 0) {
+        senderOpts.minFeeRate = opt.min_fee_rate;
+      }
+      if (typeof opt.disable_output_substitution === "boolean") {
+        senderOpts.disableOutputSubstitution = opt.disable_output_substitution;
+      }
+      if (
+        typeof opt.additional_fee_output_index === "number" &&
+        Number.isInteger(opt.additional_fee_output_index)
+      ) {
+        senderOpts.additionalFeeOutputIndex = opt.additional_fee_output_index;
+      }
+      if (typeof opt.timeout_ms === "number" && opt.timeout_ms > 0) {
+        senderOpts.timeoutMs = opt.timeout_ms;
+      }
+    }
+
+    const wallet = this.getCurrentWallet();
+    if (wallet.isLocked()) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_UNLOCK_NEEDED,
+        "Error: Please enter the wallet passphrase with walletpassphrase first."
+      );
+    }
+
+    // Build the signed Original tx via existing wallet path. createTransaction
+    // returns a fully signed tx + records it in wallet.outgoingTxs so any
+    // bumpfee/fallback path can locate it later.
+    let signedTx: Transaction;
+    let prevOuts: TxOut[];
+    try {
+      signedTx = wallet.createTransaction(outputs, feeRate);
+      // Reconstruct prevOuts from the wallet's outgoingTxs entry that
+      // createTransaction just stashed.
+      const txidHex = getTxId(signedTx).toString("hex");
+      const outgoing = wallet.getOutgoingTx(txidHex);
+      if (!outgoing) {
+        throw new Error("createTransaction did not register outgoingTxs entry");
+      }
+      prevOuts = outgoing.inputUtxos.map((u) => {
+        const decoded = decodeAddress(u.address);
+        return {
+          value: u.amount,
+          scriptPubKey: this.buildScriptPubKeyForBumpFee(decoded.type, decoded.hash),
+        };
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(RPCErrorCodes.WALLET_ERROR, msg);
+    }
+
+    const originalPsbt = buildOriginalPsbtFromSignedTx(signedTx, prevOuts);
+
+    // Run the sender pipeline. The fallback wrapper handles G22 — on
+    // retryable failure it returns kind="fallback" rather than throwing.
+    let outcome;
+    try {
+      outcome = await sendPayJoinRequestWithFallback(originalPsbt, senderOpts);
+    } catch (e) {
+      // Only non-fallback errors reach here. Map to WALLET_ERROR.
+      if (e instanceof PayJoinSenderError) {
+        throw this.rpcError(
+          RPCErrorCodes.WALLET_ERROR,
+          `PayJoin send failed: ${e.message}`
+        );
+      }
+      throw e;
+    }
+
+    // Broadcast either the payjoin (extracted from PSBT) or the Original.
+    if (outcome.kind === "payjoin") {
+      // Extract the finalized tx from the payjoin PSBT and broadcast.
+      const payjoinTx = extractTransaction(outcome.result.payjoinPsbt);
+      const txHex = serializeTx(payjoinTx, true).toString("hex");
+      let broadcastTxid: string;
+      try {
+        broadcastTxid = await this.sendRawTransaction([txHex]);
+      } catch (e) {
+        // The payjoin tx didn't make it into mempool. Fall back to
+        // broadcasting the Original — that's the safer choice per BIP-78 §H.
+        const origHex = serializeTx(signedTx, true).toString("hex");
+        const origTxid = await this.sendRawTransaction([origHex]);
+        return {
+          kind: "fallback",
+          txid: origTxid,
+          original_psbt: outcome.result.originalBase64,
+          fallback_reason: `payjoin broadcast failed: ${(e as Error).message}`,
+        };
+      }
+      return {
+        kind: "payjoin",
+        txid: broadcastTxid,
+        original_psbt: outcome.result.originalBase64,
+        payjoin_psbt: outcome.result.payjoinBase64,
+      };
+    }
+
+    // Fallback: broadcast the Original.
+    const origHex = serializeTx(signedTx, true).toString("hex");
+    let fallbackTxid: string;
+    try {
+      fallbackTxid = await this.sendRawTransaction([origHex]);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_ERROR,
+        `PayJoin fallback broadcast failed: ${msg}`
+      );
+    }
+    return {
+      kind: "fallback",
+      txid: fallbackTxid,
+      original_psbt: outcome.originalBase64,
+      fallback_reason: outcome.reason.message,
+    };
   }
 
   /**
