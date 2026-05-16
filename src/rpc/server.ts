@@ -109,6 +109,13 @@ import {
 } from "../crypto/signmessage.js";
 import { base58CheckDecode, decodeAddress, AddressType } from "../address/encoding.js";
 import { isValidPrivateKey } from "../crypto/primitives.js";
+import {
+  handlePayJoinRequest,
+  parsePayJoinQuery,
+  createPendingPayJoinRequestsMap,
+  PayJoinError,
+  type PendingPayJoinRequestsMap,
+} from "../payjoin/receiver.js";
 
 /**
  * JSON-RPC request format.
@@ -234,6 +241,23 @@ export const MAX_BATCH_SIZE = 1000;
  * accidental fee overpayment.
  */
 export const DEFAULT_MAX_FEE_RATE = 0.1; // BTC/kvB
+
+/**
+ * Build a BIP-78 PayJoin error response. The body is JSON-encoded per the
+ * ecosystem convention (`{ errorCode, message }`) used by payjoin-cli and
+ * BTCPay's Wabisabi receiver; the BIP itself only mandates the errorCode
+ * STRING but real senders parse the JSON.
+ *
+ * Status code: 400 for any of the four error codes (sender-fixable);
+ * `unavailable` could also reasonably be 503 but BTCPay returns 400 so we
+ * match that for sender-compat.
+ */
+function payJoinErrorResponse(errorCode: string, message: string): Response {
+  return new Response(JSON.stringify({ errorCode, message }), {
+    status: 400,
+    headers: { "Content-Type": "application/json", "Connection": "close" },
+  });
+}
 
 /**
  * `JSON.stringify` replacer that converts native `bigint` values to a
@@ -450,6 +474,21 @@ export class RPCServer {
   private blockSubmissionPaused: boolean = false;
   /** Unix timestamp (seconds) when this server was constructed; used by `uptime`. */
   private readonly startedAt: number = Math.floor(Date.now() / 1000);
+
+  /**
+   * Pending BIP-78 PayJoin receiver requests, keyed by sha256 of the
+   * Original PSBT bytes (hex). Mirrors the FIX-61 wallet.outgoingTxs Map
+   * but in the OPPOSITE direction: tracks Original PSBTs we've SEEN as a
+   * receiver, with a TTL window (~60s) so repeated POSTs of the same
+   * Original PSBT are rejected (BIP-78 G18 / G30 replay protection).
+   *
+   * Lives at the RPC-server scope (rather than module-level) so that
+   * tests can spin up multiple isolated servers and each has its own
+   * pending-request map. Pruned opportunistically inside
+   * handlePayJoinRequest().
+   */
+  private readonly pendingPayJoinRequests: PendingPayJoinRequestsMap =
+    createPendingPayJoinRequestsMap();
   /**
    * BIP9 version bits cache and deployment map for computeBlockVersion.
    * Reused across getblocktemplate / generateToAddress calls to avoid redundant
@@ -675,6 +714,76 @@ export class RPCServer {
   }
 
   /**
+   * Handle a POST /payjoin request per BIP-78.
+   *
+   * Body is the base64-encoded Original PSBT (Content-Type: text/plain).
+   * Query string carries the protocol params (`v`, etc — see BIP-78 §D).
+   *
+   * Response shapes:
+   *   200 OK + text/plain body          — base64 payjoin PSBT (success).
+   *   400 + JSON { errorCode, message } — any of the four BIP-78 §G errors.
+   *
+   * Failure mode never crashes the JSON-RPC server thread: every error is
+   * caught and mapped to a BIP-78 error body. Auth is intentionally NOT
+   * applied — BIP-78 senders are arbitrary remote wallets, and the
+   * protocol-level mitigations (replay window, address ownership check,
+   * input-set collision) live inside {@link handlePayJoinRequest}.
+   */
+  private async handlePayJoinRoute(req: Request, url: URL): Promise<Response> {
+    // Pre-conditions outside the receiver-pipeline error space.
+    if (!this.wallet) {
+      return payJoinErrorResponse(
+        "unavailable",
+        "PayJoin receiver requires a wallet to be loaded"
+      );
+    }
+
+    let body: string;
+    try {
+      body = await req.text();
+    } catch (err) {
+      return payJoinErrorResponse(
+        "original-psbt-rejected",
+        `failed to read request body: ${(err as Error).message}`
+      );
+    }
+    if (body.length === 0) {
+      return payJoinErrorResponse(
+        "original-psbt-rejected",
+        "request body is empty"
+      );
+    }
+
+    try {
+      const query = parsePayJoinQuery(url.searchParams);
+      const result = await handlePayJoinRequest(body, query, {
+        wallet: this.wallet,
+        pending: this.pendingPayJoinRequests,
+      });
+      return new Response(result.base64Psbt, {
+        status: 200,
+        headers: {
+          // BIP-78 §B: receiver MUST return Content-Type: text/plain.
+          "Content-Type": "text/plain",
+          "Connection": "close",
+        },
+      });
+    } catch (err) {
+      if (err instanceof PayJoinError) {
+        return payJoinErrorResponse(err.errorCode, err.message);
+      }
+      // Unexpected internal failure — map to "unavailable" so the sender
+      // can fall back to broadcasting the Original PSBT (BIP-78 §H). Log
+      // for operator triage.
+      console.error("PayJoin receiver internal error:", err);
+      return payJoinErrorResponse(
+        "unavailable",
+        "PayJoin receiver internal error"
+      );
+    }
+  }
+
+  /**
    * Handle an incoming HTTP request.
    */
   private async handleRequest(req: Request): Promise<Response> {
@@ -693,9 +802,22 @@ export class RPCServer {
       );
     }
 
+    // BIP-78 PayJoin endpoint (FIX-65). Routed BEFORE JSON-RPC dispatch
+    // because /payjoin's body is base64-encoded text (not JSON) and its
+    // error response uses BIP-78's JSON body shape, NOT the JSON-RPC
+    // envelope. We also intentionally skip Basic-Auth on this route —
+    // BIP-78 senders are arbitrary remote wallets and have no credentials
+    // for this node. Compromise mitigations live INSIDE the handler:
+    //   - replay window (PendingPayJoinRequestsMap with TTL),
+    //   - Original PSBT MUST pay one of our wallet addresses,
+    //   - sender's inputs MUST be finalized (proof-of-funds for fallback).
+    const url = new URL(req.url);
+    if (url.pathname === "/payjoin") {
+      return this.handlePayJoinRoute(req, url);
+    }
+
     // Parse wallet name from URL path: /wallet/<name>
     // Reference: Bitcoin Core wallet-specific RPC endpoints
-    const url = new URL(req.url);
     const pathParts = url.pathname.split("/").filter((p) => p !== "");
     if (pathParts.length >= 2 && pathParts[0] === "wallet") {
       // URL has /wallet/<name> prefix - use that wallet
