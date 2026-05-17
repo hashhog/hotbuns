@@ -74,6 +74,7 @@ export const ServiceFlags = {
   NODE_NETWORK: 1n,          // Full node, can serve full blocks
   NODE_BLOOM: 4n,            // SPV bloom filter support (BIP 111)
   NODE_WITNESS: 8n,          // Segregated Witness support (BIP 144)
+  NODE_COMPACT_FILTERS: 64n, // BIP-157 compact block filter serving (1<<6)
   NODE_NETWORK_LIMITED: 1024n, // Pruned node (BIP 159)
 } as const;
 

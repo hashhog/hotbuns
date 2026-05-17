@@ -129,7 +129,14 @@ export type NetworkMessage =
   | { type: "reqsketchext"; payload: ReqSketchExtPayload }
   | { type: "reconcildiff"; payload: ReconcilDiffPayload }
   | { type: "invtx"; payload: InvTxPayload }
-  | { type: "notfound"; payload: InvPayload };
+  | { type: "notfound"; payload: InvPayload }
+  // BIP-157 compact block filter messages
+  | { type: "getcfilters"; payload: GetCFiltersPayload }
+  | { type: "cfilter"; payload: CFilterPayload }
+  | { type: "getcfheaders"; payload: GetCFHeadersPayload }
+  | { type: "cfheaders"; payload: CFHeadersPayload }
+  | { type: "getcfcheckpt"; payload: GetCFCheckPtPayload }
+  | { type: "cfcheckpt"; payload: CFCheckPtPayload };
 
 /**
  * Network address (without timestamp, used in version message).
@@ -372,6 +379,105 @@ export interface ReconcilDiffPayload {
  */
 export interface InvTxPayload {
   wtxids: Buffer[];           // Array of 32-byte wtxids
+}
+
+// ============================================================================
+// BIP-157 Compact Block Filter P2P Messages
+// ============================================================================
+
+/**
+ * BIP-157 protocol constants.
+ *
+ * Reference:
+ *   - bitcoin-core/src/net_processing.cpp:184-186 — MAX_GETCF{ILTERS,HEADERS}_SIZE
+ *   - bitcoin-core/src/index/blockfilterindex.h:31 — CFCHECKPT_INTERVAL
+ *   - bitcoin-core/src/protocol.h:323 — NODE_COMPACT_FILTERS = (1 << 6)
+ */
+/** Max blocks per `getcfilters` request (BIP-157). */
+export const MAX_GETCFILTERS_SIZE = 1000;
+/** Max blocks per `getcfheaders` request (BIP-157). */
+export const MAX_GETCFHEADERS_SIZE = 2000;
+/** Cfcheckpoint interval per Core (every 1000th block from genesis). */
+export const CFCHECKPT_INTERVAL = 1000;
+/** BIP-157 NODE_COMPACT_FILTERS service-flag bit (Core protocol.h:323). */
+export const NODE_COMPACT_FILTERS_BIT = 64n; // 1 << 6
+
+/**
+ * BIP-157 `getcfilters` message payload.
+ *
+ *   filter_type:  uint8 (0 = BASIC)
+ *   start_height: uint32 LE
+ *   stop_hash:    uint256 (32 bytes LE, the block hash to walk back from)
+ */
+export interface GetCFiltersPayload {
+  filterType: number;     // uint8
+  startHeight: number;    // uint32
+  stopHash: Buffer;       // 32 bytes
+}
+
+/**
+ * BIP-157 `cfilter` message payload.
+ *
+ *   filter_type: uint8
+ *   block_hash:  uint256
+ *   filter_bytes: varlen byte string (GCS-encoded basic filter)
+ */
+export interface CFilterPayload {
+  filterType: number;
+  blockHash: Buffer;
+  filterBytes: Buffer;
+}
+
+/**
+ * BIP-157 `getcfheaders` message payload.
+ *
+ *   filter_type:  uint8
+ *   start_height: uint32 LE
+ *   stop_hash:    uint256
+ */
+export interface GetCFHeadersPayload {
+  filterType: number;
+  startHeight: number;
+  stopHash: Buffer;
+}
+
+/**
+ * BIP-157 `cfheaders` message payload.
+ *
+ *   filter_type:        uint8
+ *   stop_hash:          uint256
+ *   previous_filter_header: uint256 (filter header for block `start_height - 1`)
+ *   filter_hashes:      varint count + count * uint256
+ */
+export interface CFHeadersPayload {
+  filterType: number;
+  stopHash: Buffer;
+  previousFilterHeader: Buffer;
+  filterHashes: Buffer[];
+}
+
+/**
+ * BIP-157 `getcfcheckpt` message payload.
+ *
+ *   filter_type: uint8
+ *   stop_hash:   uint256
+ */
+export interface GetCFCheckPtPayload {
+  filterType: number;
+  stopHash: Buffer;
+}
+
+/**
+ * BIP-157 `cfcheckpt` message payload.
+ *
+ *   filter_type:    uint8
+ *   stop_hash:      uint256
+ *   filter_headers: varint count + count * uint256 (every CFCHECKPT_INTERVAL block)
+ */
+export interface CFCheckPtPayload {
+  filterType: number;
+  stopHash: Buffer;
+  filterHeaders: Buffer[];
 }
 
 // ============================================================================
@@ -796,6 +902,142 @@ function serializeInvTxPayload(payload: InvTxPayload): Buffer {
   }
 
   return writer.toBuffer();
+}
+
+// ============================================================================
+// BIP-157 Compact Block Filter Payload Serializers / Deserializers
+// ============================================================================
+//
+// Wire format mirrors bitcoin-core/src/net_processing.cpp ProcessGetCFilters /
+// ProcessGetCFHeaders / ProcessGetCFCheckPt and the matching response sites.
+// Filter and header hashes are 32 bytes little-endian (Core's internal
+// uint256 ordering, identical to how block hashes are framed on the wire).
+
+function serializeGetCFiltersPayload(payload: GetCFiltersPayload): Buffer {
+  const writer = new BufferWriter();
+  writer.writeUInt8(payload.filterType);
+  writer.writeUInt32LE(payload.startHeight);
+  writer.writeHash(payload.stopHash);
+  return writer.toBuffer();
+}
+
+function deserializeGetCFiltersPayload(reader: BufferReader): GetCFiltersPayload {
+  const filterType = reader.readUInt8();
+  const startHeight = reader.readUInt32LE();
+  const stopHash = reader.readHash();
+  return { filterType, startHeight, stopHash };
+}
+
+function serializeCFilterPayload(payload: CFilterPayload): Buffer {
+  const writer = new BufferWriter();
+  writer.writeUInt8(payload.filterType);
+  writer.writeHash(payload.blockHash);
+  writer.writeVarBytes(payload.filterBytes);
+  return writer.toBuffer();
+}
+
+function deserializeCFilterPayload(reader: BufferReader): CFilterPayload {
+  const filterType = reader.readUInt8();
+  const blockHash = reader.readHash();
+  const filterBytes = reader.readVarBytes();
+  return { filterType, blockHash, filterBytes };
+}
+
+function serializeGetCFHeadersPayload(payload: GetCFHeadersPayload): Buffer {
+  const writer = new BufferWriter();
+  writer.writeUInt8(payload.filterType);
+  writer.writeUInt32LE(payload.startHeight);
+  writer.writeHash(payload.stopHash);
+  return writer.toBuffer();
+}
+
+function deserializeGetCFHeadersPayload(reader: BufferReader): GetCFHeadersPayload {
+  const filterType = reader.readUInt8();
+  const startHeight = reader.readUInt32LE();
+  const stopHash = reader.readHash();
+  return { filterType, startHeight, stopHash };
+}
+
+function serializeCFHeadersPayload(payload: CFHeadersPayload): Buffer {
+  const writer = new BufferWriter();
+  writer.writeUInt8(payload.filterType);
+  writer.writeHash(payload.stopHash);
+  writer.writeHash(payload.previousFilterHeader);
+  writer.writeVarInt(payload.filterHashes.length);
+  for (const h of payload.filterHashes) {
+    if (h.length !== 32) {
+      throw new Error(`Invalid filter hash length: ${h.length}, expected 32`);
+    }
+    writer.writeHash(h);
+  }
+  return writer.toBuffer();
+}
+
+function deserializeCFHeadersPayload(reader: BufferReader): CFHeadersPayload {
+  const filterType = reader.readUInt8();
+  const stopHash = reader.readHash();
+  const previousFilterHeader = reader.readHash();
+  const count = reader.readVarInt();
+  // DoS cap: filter_hashes count must be <= MAX_GETCFHEADERS_SIZE on the wire.
+  // Core caps via the request side (start..=stop range bounded). Decoder side
+  // mirrors the same bound to prevent giant allocations from adversarial peers.
+  if (count > MAX_GETCFHEADERS_SIZE) {
+    throw new Error(
+      `cfheaders.filter_hashes count exceeds MAX_GETCFHEADERS_SIZE: ` +
+        `${count} > ${MAX_GETCFHEADERS_SIZE}`
+    );
+  }
+  const filterHashes: Buffer[] = [];
+  for (let i = 0; i < count; i++) {
+    filterHashes.push(reader.readHash());
+  }
+  return { filterType, stopHash, previousFilterHeader, filterHashes };
+}
+
+function serializeGetCFCheckPtPayload(payload: GetCFCheckPtPayload): Buffer {
+  const writer = new BufferWriter();
+  writer.writeUInt8(payload.filterType);
+  writer.writeHash(payload.stopHash);
+  return writer.toBuffer();
+}
+
+function deserializeGetCFCheckPtPayload(reader: BufferReader): GetCFCheckPtPayload {
+  const filterType = reader.readUInt8();
+  const stopHash = reader.readHash();
+  return { filterType, stopHash };
+}
+
+function serializeCFCheckPtPayload(payload: CFCheckPtPayload): Buffer {
+  const writer = new BufferWriter();
+  writer.writeUInt8(payload.filterType);
+  writer.writeHash(payload.stopHash);
+  writer.writeVarInt(payload.filterHeaders.length);
+  for (const h of payload.filterHeaders) {
+    if (h.length !== 32) {
+      throw new Error(`Invalid filter header length: ${h.length}, expected 32`);
+    }
+    writer.writeHash(h);
+  }
+  return writer.toBuffer();
+}
+
+function deserializeCFCheckPtPayload(reader: BufferReader): CFCheckPtPayload {
+  const filterType = reader.readUInt8();
+  const stopHash = reader.readHash();
+  const count = reader.readVarInt();
+  // Defensive upper bound: a single getcfcheckpt covers every 1000th block from
+  // genesis to stop_hash; for foreseeable mainnet heights this stays well under
+  // ~1e5. Cap at 1e6 to bound adversarial allocations.
+  if (count > 1_000_000) {
+    throw new Error(
+      `cfcheckpt.filter_headers count exceeds defensive cap: ${count} > 1000000`
+    );
+  }
+  const filterHeaders: Buffer[] = [];
+  for (let i = 0; i < count; i++) {
+    filterHeaders.push(reader.readHash());
+  }
+  return { filterType, stopHash, filterHeaders };
 }
 
 // ============================================================================
@@ -1266,6 +1508,31 @@ export function serializeMessage(magic: number, msg: NetworkMessage): Buffer {
       command = "invtx";
       payload = serializeInvTxPayload(msg.payload);
       break;
+    // BIP-157 compact block filter messages
+    case "getcfilters":
+      command = "getcfilters";
+      payload = serializeGetCFiltersPayload(msg.payload);
+      break;
+    case "cfilter":
+      command = "cfilter";
+      payload = serializeCFilterPayload(msg.payload);
+      break;
+    case "getcfheaders":
+      command = "getcfheaders";
+      payload = serializeGetCFHeadersPayload(msg.payload);
+      break;
+    case "cfheaders":
+      command = "cfheaders";
+      payload = serializeCFHeadersPayload(msg.payload);
+      break;
+    case "getcfcheckpt":
+      command = "getcfcheckpt";
+      payload = serializeGetCFCheckPtPayload(msg.payload);
+      break;
+    case "cfcheckpt":
+      command = "cfcheckpt";
+      payload = serializeCFCheckPtPayload(msg.payload);
+      break;
     default:
       throw new Error(`Unknown message type: ${(msg as NetworkMessage).type}`);
   }
@@ -1418,6 +1685,19 @@ export function deserializeMessage(header: MessageHeader, payload: Buffer): Netw
       return { type: "invtx", payload: deserializeInvTxPayload(reader) };
     case "notfound":
       return { type: "notfound", payload: deserializeInvPayload(reader) };
+    // BIP-157 compact block filter messages
+    case "getcfilters":
+      return { type: "getcfilters", payload: deserializeGetCFiltersPayload(reader) };
+    case "cfilter":
+      return { type: "cfilter", payload: deserializeCFilterPayload(reader) };
+    case "getcfheaders":
+      return { type: "getcfheaders", payload: deserializeGetCFHeadersPayload(reader) };
+    case "cfheaders":
+      return { type: "cfheaders", payload: deserializeCFHeadersPayload(reader) };
+    case "getcfcheckpt":
+      return { type: "getcfcheckpt", payload: deserializeGetCFCheckPtPayload(reader) };
+    case "cfcheckpt":
+      return { type: "cfcheckpt", payload: deserializeCFCheckPtPayload(reader) };
     default:
       // Unknown messages should be ignored, not crash the connection.
       // Bitcoin Core regularly adds new message types and peers may send

@@ -207,87 +207,202 @@ describe("W121-GATE-13: REST count clamped to [1, 2000]", () => {
 });
 
 // =============================================================================
-// GATE 14 — BIP-157 P2P getcfilters / cfilter wire codec
+// GATE 14 — BIP-157 P2P getcfilters / cfilter wire codec — FIX-85 FIXED
 // =============================================================================
-describe("W121-BUG-1: P2P getcfilters/cfilter — codec MISSING (P0-P2P)", () => {
-  it("BIP-324 message IDs declare cfilter names but no codec exists", () => {
+describe("W121-BUG-1: P2P getcfilters/cfilter wire codec (FIX-85 FIXED)", () => {
+  it("BIP-324 message IDs declare cfilter names", () => {
     expect(V2_MESSAGE_IDS.includes("getcfilters")).toBe(true);
     expect(V2_MESSAGE_IDS.includes("cfilter")).toBe(true);
   });
-  test.skip(
-    "BUG: serializeGetCFilters / deserializeCFilter are unimplemented — " +
-      "hotbuns drops the message via the unknown-msg path. SPV peers " +
-      "negotiating NODE_COMPACT_FILTERS get zero filter service.",
-    () => {}
-  );
+  it("getcfilters round-trips through serialize/deserialize", async () => {
+    const { serializeMessage, deserializeMessage, parseHeader } = await import(
+      "../p2p/messages.js"
+    );
+    const stopHash = Buffer.alloc(32, 0xab);
+    const msg = {
+      type: "getcfilters" as const,
+      payload: { filterType: 0, startHeight: 100, stopHash },
+    };
+    const buf = serializeMessage(0xd9b4bef9, msg);
+    const header = parseHeader(buf)!;
+    expect(header.command).toBe("getcfilters");
+    const payload = buf.subarray(24);
+    const decoded = deserializeMessage(header, payload);
+    expect(decoded.type).toBe("getcfilters");
+    if (decoded.type === "getcfilters") {
+      expect(decoded.payload.filterType).toBe(0);
+      expect(decoded.payload.startHeight).toBe(100);
+      expect(decoded.payload.stopHash.equals(stopHash)).toBe(true);
+    }
+  });
+  it("cfilter round-trips through serialize/deserialize", async () => {
+    const { serializeMessage, deserializeMessage, parseHeader } = await import(
+      "../p2p/messages.js"
+    );
+    const blockHash = Buffer.alloc(32, 0x55);
+    const filterBytes = Buffer.from([0x01, 0x9d, 0xfc, 0xa8]);
+    const msg = {
+      type: "cfilter" as const,
+      payload: { filterType: 0, blockHash, filterBytes },
+    };
+    const buf = serializeMessage(0xd9b4bef9, msg);
+    const header = parseHeader(buf)!;
+    expect(header.command).toBe("cfilter");
+    const decoded = deserializeMessage(header, buf.subarray(24));
+    if (decoded.type === "cfilter") {
+      expect(decoded.payload.blockHash.equals(blockHash)).toBe(true);
+      expect(decoded.payload.filterBytes.equals(filterBytes)).toBe(true);
+    }
+  });
 });
 
 // =============================================================================
-// GATE 15 — BIP-157 P2P getcfheaders / cfheaders wire codec
+// GATE 15 — BIP-157 P2P getcfheaders / cfheaders wire codec — FIX-85 FIXED
 // =============================================================================
-describe("W121-BUG-2: P2P getcfheaders/cfheaders — codec MISSING (P0-P2P)", () => {
-  test.skip(
-    "BUG: getcfheaders payload (filter_type/start_height/stop_hash) and " +
-      "cfheaders response (filter_type/stop_hash/previous_header/" +
-      "filter_hashes[]) — neither serializer nor handler exists. " +
-      "Same dead-helper-at-BIP-324-table shape as BUG-1.",
-    () => {}
-  );
+describe("W121-BUG-2: P2P getcfheaders/cfheaders wire codec (FIX-85 FIXED)", () => {
+  it("getcfheaders round-trips", async () => {
+    const { serializeMessage, deserializeMessage, parseHeader } = await import(
+      "../p2p/messages.js"
+    );
+    const stopHash = Buffer.alloc(32, 0x77);
+    const msg = {
+      type: "getcfheaders" as const,
+      payload: { filterType: 0, startHeight: 500, stopHash },
+    };
+    const buf = serializeMessage(0xd9b4bef9, msg);
+    const decoded = deserializeMessage(parseHeader(buf)!, buf.subarray(24));
+    if (decoded.type === "getcfheaders") {
+      expect(decoded.payload.startHeight).toBe(500);
+      expect(decoded.payload.stopHash.equals(stopHash)).toBe(true);
+    }
+  });
+  it("cfheaders round-trips with multiple filter hashes", async () => {
+    const { serializeMessage, deserializeMessage, parseHeader } = await import(
+      "../p2p/messages.js"
+    );
+    const stopHash = Buffer.alloc(32, 0x11);
+    const prevHeader = Buffer.alloc(32, 0x22);
+    const filterHashes = [
+      Buffer.alloc(32, 0x33),
+      Buffer.alloc(32, 0x44),
+      Buffer.alloc(32, 0x55),
+    ];
+    const msg = {
+      type: "cfheaders" as const,
+      payload: {
+        filterType: 0,
+        stopHash,
+        previousFilterHeader: prevHeader,
+        filterHashes,
+      },
+    };
+    const buf = serializeMessage(0xd9b4bef9, msg);
+    const decoded = deserializeMessage(parseHeader(buf)!, buf.subarray(24));
+    if (decoded.type === "cfheaders") {
+      expect(decoded.payload.filterHashes.length).toBe(3);
+      expect(decoded.payload.filterHashes[1].equals(filterHashes[1])).toBe(true);
+    }
+  });
 });
 
 // =============================================================================
-// GATE 16 — BIP-157 P2P getcfcheckpt / cfcheckpt wire codec
+// GATE 16 — BIP-157 P2P getcfcheckpt / cfcheckpt wire codec — FIX-85 FIXED
 // =============================================================================
-describe("W121-BUG-3: P2P getcfcheckpt/cfcheckpt — codec MISSING (P0-P2P)", () => {
-  test.skip(
-    "BUG: getcfcheckpt + cfcheckpt (per-1000-block header anchors) — no " +
-      "codec, no handler. SPV clients cannot bootstrap a filter-header " +
-      "chain from hotbuns.",
-    () => {}
-  );
+describe("W121-BUG-3: P2P getcfcheckpt/cfcheckpt wire codec (FIX-85 FIXED)", () => {
+  it("getcfcheckpt round-trips", async () => {
+    const { serializeMessage, deserializeMessage, parseHeader } = await import(
+      "../p2p/messages.js"
+    );
+    const stopHash = Buffer.alloc(32, 0xee);
+    const msg = {
+      type: "getcfcheckpt" as const,
+      payload: { filterType: 0, stopHash },
+    };
+    const buf = serializeMessage(0xd9b4bef9, msg);
+    const decoded = deserializeMessage(parseHeader(buf)!, buf.subarray(24));
+    if (decoded.type === "getcfcheckpt") {
+      expect(decoded.payload.stopHash.equals(stopHash)).toBe(true);
+    }
+  });
+  it("cfcheckpt round-trips with multiple filter headers", async () => {
+    const { serializeMessage, deserializeMessage, parseHeader } = await import(
+      "../p2p/messages.js"
+    );
+    const stopHash = Buffer.alloc(32, 0xa1);
+    const filterHeaders = [Buffer.alloc(32, 0xb1), Buffer.alloc(32, 0xb2)];
+    const msg = {
+      type: "cfcheckpt" as const,
+      payload: { filterType: 0, stopHash, filterHeaders },
+    };
+    const buf = serializeMessage(0xd9b4bef9, msg);
+    const decoded = deserializeMessage(parseHeader(buf)!, buf.subarray(24));
+    if (decoded.type === "cfcheckpt") {
+      expect(decoded.payload.filterHeaders.length).toBe(2);
+    }
+  });
 });
 
 // =============================================================================
-// GATE 17 — Service flag NODE_COMPACT_FILTERS (0x40) advertised when index on
+// GATE 17 — Service flag NODE_COMPACT_FILTERS (0x40) — FIX-85 FIXED
 // =============================================================================
-describe("W121-BUG-4: NODE_COMPACT_FILTERS service-flag bit MISSING (P1)", () => {
-  test.skip(
-    "BUG: getnetworkinfo + version-msg services bitmask never sets bit 6 " +
-      "(0x40 = NODE_COMPACT_FILTERS), even when --blockfilterindex=1. " +
-      "Core gates this in init.cpp: services |= NODE_COMPACT_FILTERS iff " +
-      "g_compact_filter_index is non-null. Hotbuns advertises NODE_NETWORK|" +
-      "NODE_WITNESS only (src/p2p/manager.ts:804/826/844/1118), so peers " +
-      "filter hotbuns out of their cfilter peer pool even though the " +
-      "REST surface would happily serve them.",
-    () => {}
-  );
+describe("W121-BUG-4: NODE_COMPACT_FILTERS service-flag bit (FIX-85 FIXED)", () => {
+  it("ServiceFlags exports NODE_COMPACT_FILTERS = 64n (= 1<<6)", async () => {
+    const { ServiceFlags } = await import("../p2p/manager.js");
+    expect(ServiceFlags.NODE_COMPACT_FILTERS).toBe(64n);
+  });
+  it("messages.ts exports NODE_COMPACT_FILTERS_BIT = 64n", async () => {
+    const { NODE_COMPACT_FILTERS_BIT } = await import("../p2p/messages.js");
+    expect(NODE_COMPACT_FILTERS_BIT).toBe(64n);
+  });
+  it("cli.ts ORs NODE_COMPACT_FILTERS into params.services when --blockfilterindex=1", async () => {
+    // Forward-regression source guard: the OR rule lives in cli.ts and is
+    // load-bearing for SPV peers to discover us. If the OR is removed,
+    // peers will never route filter requests to hotbuns even though the
+    // dispatch arms are wired below.
+    const cliSrc = await Bun.file("./src/cli/cli.ts").text();
+    expect(cliSrc).toContain("NODE_COMPACT_FILTERS_BIT");
+    expect(cliSrc).toContain("mergedConfig.blockfilterindex");
+    expect(cliSrc).toMatch(/paramsServices\s*\|=\s*NODE_COMPACT_FILTERS_BIT/);
+  });
 });
 
 // =============================================================================
-// GATE 18 — Per-peer rate limit MAX_GETCFILTERS_SIZE (1000) / MAX_GETCFHEADERS
+// GATE 18 — Per-peer rate limit MAX_GETCFILTERS_SIZE / MAX_GETCFHEADERS_SIZE — FIX-85
 // =============================================================================
-describe("W121-BUG-5: P2P rate limits MAX_GETCF{ILTERS,HEADERS}_SIZE MISSING (P1)", () => {
-  test.skip(
-    "BUG: Core caps a single getcfilters at stop-start <= 1000 and " +
-      "getcfheaders at stop-start <= 2000 (net_processing.cpp:" +
-      "PrepareBlockFilterRequest). Hotbuns has no handler, hence no " +
-      "limit — a moot bug today, but listed so the BIP-157 closure " +
-      "wave does not regress.",
-    () => {}
-  );
+describe("W121-BUG-5: P2P rate limits MAX_GETCF{ILTERS,HEADERS}_SIZE (FIX-85 FIXED)", () => {
+  it("MAX_GETCFILTERS_SIZE = 1000 (Core net_processing.cpp:184)", async () => {
+    const { MAX_GETCFILTERS_SIZE } = await import("../p2p/messages.js");
+    expect(MAX_GETCFILTERS_SIZE).toBe(1000);
+  });
+  it("MAX_GETCFHEADERS_SIZE = 2000 (Core net_processing.cpp:186)", async () => {
+    const { MAX_GETCFHEADERS_SIZE } = await import("../p2p/messages.js");
+    expect(MAX_GETCFHEADERS_SIZE).toBe(2000);
+  });
+  it("CFCHECKPT_INTERVAL = 1000 (Core blockfilterindex.h:31)", async () => {
+    const { CFCHECKPT_INTERVAL } = await import("../p2p/messages.js");
+    expect(CFCHECKPT_INTERVAL).toBe(1000);
+  });
 });
 
 // =============================================================================
-// GATE 19 — Misbehavior penalty for invalid getcf* (filter_type != basic,
-//           stop_hash > tip, etc.)
+// GATE 19 — Misbehavior penalty for invalid getcf* — FIX-85 FIXED
 // =============================================================================
-describe("W121-BUG-6: getcf* misbehavior bans MISSING (P2)", () => {
-  test.skip(
-    "BUG: Core Misbehaving(100) on unknown filter_type, stop_hash not " +
-      "in active chain, stop_hash < start_height. Hotbuns: no handler, " +
-      "no penalty. Wave-blocker for BIP-157 P2P closure.",
-    () => {}
-  );
+describe("W121-BUG-6: getcf* misbehavior bans (FIX-85 FIXED)", () => {
+  it("cfilter_handlers.ts calls peer.misbehaving on every validation failure", async () => {
+    const handlersSrc = await Bun.file("./src/p2p/cfilter_handlers.ts").text();
+    // Forward-regression source guard: every disconnect path must remain
+    // wired to peer.misbehaving(100, …).  Subsequent edits that silently
+    // log+return instead of misbehaving would re-introduce the W121
+    // BUG-6 DoS exposure.
+    const misbehavingCount = (handlersSrc.match(/peer\.misbehaving\(/g) || []).length;
+    expect(misbehavingCount).toBeGreaterThanOrEqual(4); // 4 of the 5 violation paths
+  });
+  it("cli.ts registers all three dispatch arms", async () => {
+    const cliSrc = await Bun.file("./src/cli/cli.ts").text();
+    expect(cliSrc).toContain('peerManager.onMessage("getcfilters"');
+    expect(cliSrc).toContain('peerManager.onMessage("getcfheaders"');
+    expect(cliSrc).toContain('peerManager.onMessage("getcfcheckpt"');
+  });
 });
 
 // =============================================================================

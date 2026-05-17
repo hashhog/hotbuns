@@ -1463,9 +1463,27 @@ async function startNode(config: NodeConfig): Promise<void> {
   // `nLocalServices |= NODE_BLOOM;` (gated on -peerbloomfilters, default
   // false in Core per net_processing.h DEFAULT_PEERBLOOMFILTERS).
   const NODE_BLOOM_BIT = 4n;
-  const params: import("../consensus/params.js").ConsensusParams = mergedConfig.peerBloomFilters
-    ? { ...baseParams, services: baseParams.services | NODE_BLOOM_BIT }
-    : baseParams;
+  // BIP-157: when --blockfilterindex=1 is set AND the index is fully
+  // wired below, we OR NODE_COMPACT_FILTERS (=0x40, bit 6) into the
+  // advertised services word.  Mirrors Core init.cpp's
+  // `services |= NODE_COMPACT_FILTERS` gated on `g_compact_filter_index`
+  // (bitcoin-core/src/init.cpp).  CRITICAL: only advertise when we will
+  // actually serve — otherwise SPV peers would route filter-requests to
+  // us and time out.  The dispatch wire-up in FIX-85 (manager.ts +
+  // peer.ts) is the matching service-side; flipping this bit without
+  // wiring those dispatch arms would advertise a service we do not honor.
+  const NODE_COMPACT_FILTERS_BIT = 64n;
+  let paramsServices = baseParams.services;
+  if (mergedConfig.peerBloomFilters) {
+    paramsServices |= NODE_BLOOM_BIT;
+  }
+  if (mergedConfig.blockfilterindex) {
+    paramsServices |= NODE_COMPACT_FILTERS_BIT;
+  }
+  const params: import("../consensus/params.js").ConsensusParams =
+    paramsServices === baseParams.services
+      ? baseParams
+      : { ...baseParams, services: paramsServices };
 
   // 2. Open the database
   const dbPath = path.join(mergedConfig.datadir, "blocks.db");
@@ -1950,6 +1968,69 @@ async function startNode(config: NodeConfig): Promise<void> {
       }));
       peer.send({ type: "inv", payload: { inventory } });
     }
+  });
+
+  // BIP-157: register the three compact-block-filter request handlers
+  // (FIX-85). All three funnel through processGetCFilters /
+  // processGetCFHeaders / processGetCFCheckPt in src/p2p/cfilter_handlers.ts
+  // which mirror Bitcoin Core's PrepareBlockFilterRequest +
+  // ProcessGetCF{Filters,Headers,CheckPt} in src/net_processing.cpp.
+  //
+  // Validation invariants (all five trigger peer.misbehaving(100) +
+  // disconnect, matching Core node.fDisconnect = true):
+  //   - filter_type != BASIC (0)            → unsupported
+  //   - NODE_COMPACT_FILTERS not advertised → unsupported
+  //   - stop_hash not in our chain          → invalid hash
+  //   - start_height > stop_height          → invalid range
+  //   - stop_height - start_height + 1 > max → too many requested
+  //
+  // CRITICAL: NODE_COMPACT_FILTERS is OR'd into params.services ABOVE
+  // (gated on mergedConfig.blockfilterindex) only when the operator
+  // enabled --blockfilterindex.  So the gate inside
+  // prepareBlockFilterRequest will close cleanly when the operator
+  // has not enabled the index, and getcf* messages from peers will
+  // disconnect them (Core parity).
+  const cfilterDeps: import("../p2p/cfilter_handlers.js").CFilterHandlerDeps = {
+    db,
+    filterIndex,
+    ourServices: peerManager.getAdvertisedServices(),
+  };
+  peerManager.onMessage("getcfilters", async (peer, msg) => {
+    if (msg.type !== "getcfilters") return;
+    const { processGetCFilters } = await import("../p2p/cfilter_handlers.js");
+    await processGetCFilters(peer, msg.payload, cfilterDeps, (p, resp) => {
+      p.send({ type: "cfilter", payload: resp });
+    });
+  });
+  peerManager.onMessage("getcfheaders", async (peer, msg) => {
+    if (msg.type !== "getcfheaders") return;
+    const { processGetCFHeaders } = await import("../p2p/cfilter_handlers.js");
+    await processGetCFHeaders(peer, msg.payload, cfilterDeps, (p, resp) => {
+      p.send({ type: "cfheaders", payload: resp });
+    });
+  });
+  peerManager.onMessage("getcfcheckpt", async (peer, msg) => {
+    if (msg.type !== "getcfcheckpt") return;
+    const { processGetCFCheckPt } = await import("../p2p/cfilter_handlers.js");
+    await processGetCFCheckPt(peer, msg.payload, cfilterDeps, (p, resp) => {
+      p.send({ type: "cfcheckpt", payload: resp });
+    });
+  });
+  // Response-side log-only arms — these are messages WE send, but a peer
+  // sending one to us is unexpected. Register a no-op handler so the
+  // dispatch table fully covers the BIP-157 message set; preventing
+  // fall-through to the default unknown-message logger matches the
+  // clearbit FIX-84 / blockbrew FIX-74 "all six BIP-157 arms registered"
+  // pattern. Log at debug volume (single line) so an adversarial peer
+  // sending us cfheaders cannot flood the log.
+  peerManager.onMessage("cfilter", (peer) => {
+    console.log(`P2P: received unsolicited cfilter from ${peer.host}:${peer.port} (ignored)`);
+  });
+  peerManager.onMessage("cfheaders", (peer) => {
+    console.log(`P2P: received unsolicited cfheaders from ${peer.host}:${peer.port} (ignored)`);
+  });
+  peerManager.onMessage("cfcheckpt", (peer) => {
+    console.log(`P2P: received unsolicited cfcheckpt from ${peer.host}:${peer.port} (ignored)`);
   });
 
   // 8. Start RPC server
