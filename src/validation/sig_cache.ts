@@ -4,18 +4,31 @@
  * Caches successful script verifications to avoid redundant work when
  * a transaction is validated in the mempool and again during block connection.
  *
- * Reference: Bitcoin Core's SignatureCache (script/sigcache.h)
+ * Reference: Bitcoin Core's SignatureCache (script/sigcache.h, sigcache.cpp:39-50)
  *
- * Key design: Core uses SHA256(nonce || type_byte || 31_zeroes || sighash || pubkey || sig)
- * keyed on actual cryptographic material.  We mirror that by including a
- * per-process 32-byte random nonce (generated once at construction via
- * crypto.randomBytes) and the raw spending material (scriptSig + witness + flags)
- * so that:
- *   1. Two processes with identical txid/inputIndex cannot share cache entries
- *      (cross-restart poisoning is impossible).
- *   2. Two different signatures spending the same input position but with
- *      different sig bytes produce different keys (prevents adversarial
- *      false-positive cache hits for forged or witness-malleated inputs).
+ * Key design: Core keys each cached signature on the triple
+ *   SHA256(nonce || type_byte || 31_zeroes || sighash || pubkey || sig)
+ * where `sighash` is the actual 32-byte digest the secp256k1 verifier checked
+ * the signature against.  Including the sighash is REQUIRED for security:
+ * two different transactions can carry the SAME (sig, pubkey) witness — an
+ * attacker who observes a P2WPKH `<sig, pubkey>` on the wire can copy that
+ * exact witness into a different tx spending another UTXO previously sent to
+ * the same pubkey.  The sig is RFC-6979-bound to tx1's sighash and would fail
+ * the interpreter against tx2's sighash, but if the cache key omits the
+ * sighash the second tx gets a cache hit and bypasses verification entirely
+ * (W160 BUG-7 / fleet-wide pattern).
+ *
+ * Hotbuns caches at per-input granularity (not per-signature), so we bind the
+ * cache key to a "sighash commitment" that fully determines every per-input
+ * sighash for this tx: the spending txid, input index, prevout, prev amount,
+ * and prev scriptPubKey.  Any two different (tx, input) combinations produce
+ * a different commitment → cache miss → interpreter actually runs.  This is
+ * semantically equivalent to Core's per-signature (sighash, pubkey, sig)
+ * triple: pubkey + sig are embedded in the scriptSig/witness bytes already
+ * present in the key, and the commitment fully determines the sighash.
+ *
+ * The 32-byte per-process random nonce (generated once at construction via
+ * crypto.randomBytes) prevents cross-restart poisoning.
  */
 
 import { createHash, randomBytes } from "crypto";
@@ -76,22 +89,43 @@ export class SigCache {
   }
 
   /**
-   * Compute a cache entry key from the actual signing material.
+   * Compute a cache entry key from the actual signing material PLUS a
+   * sighash commitment that binds the entry to the specific spending
+   * transaction + input + prevout context.
    *
-   * Key = first 8 bytes of SHA256(nonce || scriptSig || witnessConcat || flagsLE4)
+   * Key = first 8 bytes of SHA256(
+   *         nonce ||
+   *         sighashCommit ||   // 32-byte binding to (tx, inputIndex, prevout, amount, scriptPubKey)
+   *         scriptSig ||
+   *         witnessConcat ||
+   *         flagsLE4)
    * returned as a 16-character hex string used as the Map key.
    *
-   * Mirrors Core: SHA256(nonce || 'E'||zeros || sighash || pubkey || sig)
-   * (sigcache.cpp:41-43).  We use scriptSig+witness as a proxy for the
-   * individual sig material because (a) it is available at the
-   * verifyInputSignature call site without threading into the interpreter,
-   * and (b) any change to sig bytes produces a different key.
+   * Mirrors Core's per-signature key SHA256(nonce || 'E'||zeros || sighash ||
+   * pubkey || sig) at sigcache.cpp:39-50.  Hotbuns caches at per-input
+   * granularity so the sighashCommit is a binding to the full set of inputs
+   * to the sighash algorithm; pubkey + sig are inside scriptSig/witness.
    *
-   * @param scriptSig   - Input scriptSig bytes (may be empty for segwit).
-   * @param witness     - Witness stack for this input (may be empty).
-   * @param flags       - ScriptFlags bitmask used for this verification.
+   * @param sighashCommit - 32-byte commitment to (txid, inputIndex, prevout,
+   *                        amount, scriptPubKey). REQUIRED — without it
+   *                        a copied witness from another tx would get a
+   *                        false-positive cache hit (W160 BUG-7).
+   * @param scriptSig     - Input scriptSig bytes (may be empty for segwit).
+   * @param witness       - Witness stack for this input (may be empty).
+   * @param flags         - ScriptFlags bitmask used for this verification.
    */
-  computeKey(scriptSig: Buffer, witness: Buffer[], flags: number): CacheKey {
+  computeKey(
+    sighashCommit: Buffer,
+    scriptSig: Buffer,
+    witness: Buffer[],
+    flags: number,
+  ): CacheKey {
+    if (sighashCommit.length !== 32) {
+      throw new Error(
+        `SigCache.computeKey: sighashCommit must be 32 bytes, got ${sighashCommit.length}`,
+      );
+    }
+
     const flagsBuf = Buffer.allocUnsafe(4);
     flagsBuf.writeUInt32LE(flags, 0);
 
@@ -104,7 +138,13 @@ export class SigCache {
       witnessParts.push(lenBuf, item);
     }
 
-    const material = Buffer.concat([this.nonce, scriptSig, ...witnessParts, flagsBuf]);
+    const material = Buffer.concat([
+      this.nonce,
+      sighashCommit,
+      scriptSig,
+      ...witnessParts,
+      flagsBuf,
+    ]);
     const digest = createHash("sha256").update(material).digest();
     const entryHex = digest.subarray(0, 8).toString("hex");
     return { entryHex };

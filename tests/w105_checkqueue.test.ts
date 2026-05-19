@@ -50,6 +50,10 @@ import type { UTXOEntry } from "../src/storage/database.js";
 /** Shared single-instance cache used by tests that need consistent nonce. */
 const _testCache = new SigCache(10_000);
 
+/** Default sighash commit for legacy w105 tests that don't vary it.
+ *  W160 BUG-7 fix added a 32-byte sighashCommit param to computeKey. */
+const _DEFAULT_COMMIT = Buffer.alloc(32, 0xee);
+
 /**
  * Build a CacheKey for a given (scriptSig, witness, flags) triple.
  * Uses _testCache so all tests in this file share one nonce.
@@ -62,7 +66,7 @@ function _makeKey(
 ): CacheKey {
   const scriptSig = Buffer.from(scriptSigHex, "hex");
   const witness = witnessHex.map((h) => Buffer.from(h, "hex"));
-  return cache.computeKey(scriptSig, witness, flags);
+  return cache.computeKey(_DEFAULT_COMMIT, scriptSig, witness, flags);
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +308,7 @@ describe("G5 — SigCache (SignatureCache equivalent) exists", () => {
     const cache = new SigCache(10);
     expect(Buffer.isBuffer(cache.nonce)).toBe(true);
     expect(cache.nonce.length).toBe(32);
-    const key = cache.computeKey(Buffer.from("aabbcc", "hex"), [], 0);
+    const key = cache.computeKey(_DEFAULT_COMMIT, Buffer.from("aabbcc", "hex"), [], 0);
     expect(cache.lookup(key)).toBe(false);
     cache.insert(key);
     expect(cache.lookup(key)).toBe(true);
@@ -335,8 +339,8 @@ describe("G6 — SigCache nonce / salted hash", () => {
 
     // Both instances see the same spending material
     const sig = Buffer.from("deadbeef", "hex");
-    const key1 = c1.computeKey(sig, [], 0);
-    const key2 = c2.computeKey(sig, [], 0);
+    const key1 = c1.computeKey(_DEFAULT_COMMIT, sig, [], 0);
+    const key2 = c2.computeKey(_DEFAULT_COMMIT, sig, [], 0);
 
     // Different nonces → different entry hashes
     expect(key1.entryHex).not.toBe(key2.entryHex);
@@ -370,11 +374,11 @@ describe("G7 — SigCache cache key should use wtxid not txid", () => {
 
     // Honest segwit input witness
     const honestWitness = ["304402" + "aa".repeat(35) + "01"]; // DER sig + SIGHASH_ALL
-    const keyHonest = cache.computeKey(Buffer.alloc(0), honestWitness.map((h) => Buffer.from(h, "hex")), 0);
+    const keyHonest = cache.computeKey(_DEFAULT_COMMIT, Buffer.alloc(0), honestWitness.map((h) => Buffer.from(h, "hex")), 0);
 
     // Malleated witness — different sig bytes at same input position
     const malleatedWitness = ["304402" + "bb".repeat(35) + "01"];
-    const keyMalleated = cache.computeKey(Buffer.alloc(0), malleatedWitness.map((h) => Buffer.from(h, "hex")), 0);
+    const keyMalleated = cache.computeKey(_DEFAULT_COMMIT, Buffer.alloc(0), malleatedWitness.map((h) => Buffer.from(h, "hex")), 0);
 
     // Different witness bytes → different keys
     expect(keyHonest.entryHex).not.toBe(keyMalleated.entryHex);
@@ -414,8 +418,8 @@ describe("G8 — Script execution cache (per-tx, not per-sig)", () => {
     const sig0 = Buffer.alloc(72, 0x01); // input 0 signature bytes
     const sig1 = Buffer.alloc(72, 0x02); // input 1 signature bytes
 
-    const keyIn0 = cache.computeKey(sig0, [], 0);
-    const keyIn1 = cache.computeKey(sig1, [], 0);
+    const keyIn0 = cache.computeKey(_DEFAULT_COMMIT, sig0, [], 0);
+    const keyIn1 = cache.computeKey(_DEFAULT_COMMIT, sig1, [], 0);
 
     // Insert both inputs
     cache.insert(keyIn0);
@@ -686,10 +690,10 @@ describe("G14 — SigCache eviction strategy (FIFO vs CuckooCache)", () => {
   test("BUG-14: FIFO eviction evicts oldest entry regardless of access recency", () => {
     const cache = new SigCache(3); // tiny cache to demonstrate eviction
 
-    const k1 = cache.computeKey(Buffer.from([0x01]), [], 0);
-    const k2 = cache.computeKey(Buffer.from([0x02]), [], 0);
-    const k3 = cache.computeKey(Buffer.from([0x03]), [], 0);
-    const k4 = cache.computeKey(Buffer.from([0x04]), [], 0);
+    const k1 = cache.computeKey(_DEFAULT_COMMIT, Buffer.from([0x01]), [], 0);
+    const k2 = cache.computeKey(_DEFAULT_COMMIT, Buffer.from([0x02]), [], 0);
+    const k3 = cache.computeKey(_DEFAULT_COMMIT, Buffer.from([0x03]), [], 0);
+    const k4 = cache.computeKey(_DEFAULT_COMMIT, Buffer.from([0x04]), [], 0);
 
     cache.insert(k1);
     cache.insert(k2);
@@ -796,7 +800,7 @@ describe("G17 — SigCache clear on reorg/disconnect", () => {
    */
   test("PASS — clear() is called on disconnect; semantics correct once BUG-10 is fixed", () => {
     const cache = new SigCache(100);
-    const key = cache.computeKey(Buffer.from("deadbeef", "hex"), [], 0);
+    const key = cache.computeKey(_DEFAULT_COMMIT, Buffer.from("deadbeef", "hex"), [], 0);
 
     cache.insert(key);
     expect(cache.size).toBe(1);
@@ -907,9 +911,9 @@ describe("G21 — SigCache key includes flags for isolation", () => {
     const cache = new SigCache(100);
     const sig = Buffer.from("aa".repeat(32), "hex");
 
-    const kP2SH     = cache.computeKey(sig, [], 0b01); // P2SH only
-    const kP2SHWit  = cache.computeKey(sig, [], 0b11); // P2SH + WITNESS
-    const kWitOnly  = cache.computeKey(sig, [], 0b10); // WITNESS only
+    const kP2SH     = cache.computeKey(_DEFAULT_COMMIT, sig, [], 0b01); // P2SH only
+    const kP2SHWit  = cache.computeKey(_DEFAULT_COMMIT, sig, [], 0b11); // P2SH + WITNESS
+    const kWitOnly  = cache.computeKey(_DEFAULT_COMMIT, sig, [], 0b10); // WITNESS only
 
     cache.insert(kP2SH);
     cache.insert(kP2SHWit);
@@ -1117,7 +1121,7 @@ describe("G29 — SigCache NOT cleared on block-connect (correct behaviour)", ()
     const cache = new SigCache(100);
     // Simulate a mempool-validated input's scriptSig bytes
     const mempoolSig = Buffer.alloc(72, 0xab);
-    const key = cache.computeKey(mempoolSig, [], 3);
+    const key = cache.computeKey(_DEFAULT_COMMIT, mempoolSig, [], 3);
 
     // Simulate mempool validation populating cache
     cache.insert(key);
@@ -1253,8 +1257,8 @@ describe("G31 — SigCache nonce + sig-material hardening (W105 BUG-9 fix)", () 
     const scriptSig = Buffer.from("304402" + "cd".repeat(35) + "01", "hex");
     const flags = ScriptFlags.VERIFY_P2SH | ScriptFlags.VERIFY_WITNESS;
 
-    const key1 = c1.computeKey(scriptSig, [], flags);
-    const key2 = c2.computeKey(scriptSig, [], flags);
+    const key1 = c1.computeKey(_DEFAULT_COMMIT, scriptSig, [], flags);
+    const key2 = c2.computeKey(_DEFAULT_COMMIT, scriptSig, [], flags);
 
     expect(key1.entryHex).not.toBe(key2.entryHex);
   });
@@ -1268,8 +1272,8 @@ describe("G31 — SigCache nonce + sig-material hardening (W105 BUG-9 fix)", () 
     const honestSig  = Buffer.alloc(71, 0x01); // honest signature
     const forgedSig  = Buffer.alloc(71, 0x02); // adversarial / forged signature
 
-    const keyHonest = cache.computeKey(honestSig, [], 7);
-    const keyForged = cache.computeKey(forgedSig, [], 7);
+    const keyHonest = cache.computeKey(_DEFAULT_COMMIT, honestSig, [], 7);
+    const keyForged = cache.computeKey(_DEFAULT_COMMIT, forgedSig, [], 7);
 
     // Keys must differ
     expect(keyHonest.entryHex).not.toBe(keyForged.entryHex);
@@ -1286,11 +1290,11 @@ describe("G31 — SigCache nonce + sig-material hardening (W105 BUG-9 fix)", () 
     // Original P2WPKH witness: [DER_sig, compressed_pubkey]
     const origSig    = Buffer.alloc(71, 0xde);
     const origPubkey = Buffer.alloc(33, 0xad);
-    const keyOrig    = cache.computeKey(Buffer.alloc(0), [origSig, origPubkey], 3);
+    const keyOrig    = cache.computeKey(_DEFAULT_COMMIT, Buffer.alloc(0), [origSig, origPubkey], 3);
 
     // Malleated P2WPKH witness: same pubkey, different (malleated) sig bytes
     const malleatedSig = Buffer.alloc(71, 0xbe);
-    const keyMalleated = cache.computeKey(Buffer.alloc(0), [malleatedSig, origPubkey], 3);
+    const keyMalleated = cache.computeKey(_DEFAULT_COMMIT, Buffer.alloc(0), [malleatedSig, origPubkey], 3);
 
     expect(keyOrig.entryHex).not.toBe(keyMalleated.entryHex);
 
@@ -1308,8 +1312,8 @@ describe("G31 — SigCache nonce + sig-material hardening (W105 BUG-9 fix)", () 
     const sig   = Buffer.from("abcd1234", "hex");
     const flags = 0x07;
 
-    const k1 = c1.computeKey(sig, [], flags);
-    const k2 = c2.computeKey(sig, [], flags);
+    const k1 = c1.computeKey(_DEFAULT_COMMIT, sig, [], flags);
+    const k2 = c2.computeKey(_DEFAULT_COMMIT, sig, [], flags);
 
     // Same nonce + same material → same key (reproducible)
     expect(k1.entryHex).toBe(k2.entryHex);
