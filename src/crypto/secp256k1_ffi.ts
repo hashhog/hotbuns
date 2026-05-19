@@ -97,6 +97,10 @@ type SymbolTable = {
     msglen: number,
     pubkey: number
   ) => number;
+  secp256k1_context_randomize: (
+    ctx: bigint,
+    seed32: number
+  ) => number;
 };
 
 let _syms: SymbolTable | null = null;
@@ -153,6 +157,10 @@ function initFFI(): boolean {
         args: [FFIType.u64, FFIType.ptr, FFIType.ptr, FFIType.u64, FFIType.ptr],
         returns: FFIType.i32,
       },
+      secp256k1_context_randomize: {
+        args: [FFIType.u64, FFIType.ptr],
+        returns: FFIType.i32,
+      },
     });
 
     _syms = lib.symbols as unknown as SymbolTable;
@@ -161,6 +169,22 @@ function initFFI(): boolean {
     _ctx = _syms.secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
     if (_ctx === 0n) {
       console.error("[secp256k1_ffi] secp256k1_context_create returned NULL");
+      return false;
+    }
+
+    // Side-channel blinding: randomize the context with 32 fresh random bytes
+    // immediately after creation. Mirrors Bitcoin Core's `ECC_Start` at
+    // bitcoin-core/src/key.cpp:578-584 ("Pass in a random blinding seed to the
+    // secp256k1 context"). Per secp256k1.h:806-841, randomization shields
+    // against side-channel observations (timing/EM/power) on operations that
+    // multiply the curve base point by a secret scalar. Hotbuns' FFI context
+    // is verify-only today, but this is the natural binding site for future
+    // sign-path symbols; randomizing now closes the W159 BUG-4 fleet pattern
+    // and removes the precondition for any later sign-side leak.
+    const seed = new Uint8Array(32);
+    crypto.getRandomValues(seed);
+    if (_syms.secp256k1_context_randomize(_ctx, ptr(seed)) !== 1) {
+      console.error("[secp256k1_ffi] secp256k1_context_randomize failed");
       return false;
     }
 
