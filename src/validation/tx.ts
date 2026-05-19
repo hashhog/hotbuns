@@ -1515,11 +1515,27 @@ export function verifyInputSignature(
 
   // Sig-cache lookup: if this input's signing material was already verified
   // successfully (e.g. during mempool ATMP), skip the secp256k1 work.
-  // Key = SHA256(nonce || scriptSig || witness_stack_with_lengths || flags_LE4)
-  // — covers the actual signature bytes so different sigs for the same
-  // (txid, inputIndex) produce distinct keys (prevents adversarial poisoning).
-  // Mirrors Core's CachingTransactionSignatureChecker / sigcache.h logic.
+  // Key includes a 32-byte "sighash commitment" binding the entry to
+  // (spending_txid, inputIndex, prevout, prev_amount, prev_scriptPubKey).
+  // This is REQUIRED to prevent cross-tx witness-replay attacks (W160 BUG-7):
+  // an attacker who observes a P2WPKH `<sig, pubkey>` witness on the wire
+  // could otherwise copy that identical witness into a tx spending a different
+  // UTXO sent to the same pubkey and get a false-positive cache hit, since
+  // the RFC-6979-deterministic sig is bound to tx1's sighash but the cache
+  // lookup would skip the interpreter entirely.  Mirrors Core's
+  // CachingTransactionSignatureChecker (sigcache.cpp:39-50) which keys on
+  // the (sighash, pubkey, sig) triple.
+  const sighashCommitWriter = new BufferWriter();
+  sighashCommitWriter.writeHash(getTxId(tx));
+  sighashCommitWriter.writeUInt32LE(inputIndex);
+  sighashCommitWriter.writeHash(input.prevOut.txid);
+  sighashCommitWriter.writeUInt32LE(input.prevOut.vout);
+  sighashCommitWriter.writeUInt64LE(utxo.amount);
+  sighashCommitWriter.writeVarBytes(utxo.scriptPubKey);
+  const sighashCommit = sha256Hash(sighashCommitWriter.toBuffer());
+
   const cacheKey = globalSigCache.computeKey(
+    sighashCommit,
     input.scriptSig,
     input.witness,
     scriptVerifyFlags,

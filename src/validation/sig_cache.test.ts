@@ -6,15 +6,21 @@ import { SigCache, globalSigCache } from "./sig_cache";
 // tests are not coupled to the internal key format.
 // ---------------------------------------------------------------------------
 
+/** Deterministic 32-byte commit so existing tests stay focused on the
+ *  scriptSig/witness/flags axes.  Cross-tx replay tests below override
+ *  this to vary the commit per call. */
+const DEFAULT_COMMIT = Buffer.alloc(32, 0xee);
+
 function makeKey(
   cache: SigCache,
   scriptSigHex: string,
   witnessHex: string[],
   flags: number,
+  commit: Buffer = DEFAULT_COMMIT,
 ) {
   const scriptSig = Buffer.from(scriptSigHex, "hex");
   const witness = witnessHex.map((h) => Buffer.from(h, "hex"));
-  return cache.computeKey(scriptSig, witness, flags);
+  return cache.computeKey(commit, scriptSig, witness, flags);
 }
 
 describe("sig_cache", () => {
@@ -264,8 +270,8 @@ describe("sig_cache", () => {
       const witness: Buffer[] = [];
       const flags = 7;
 
-      const key1 = c1.computeKey(scriptSig, witness, flags);
-      const key2 = c2.computeKey(scriptSig, witness, flags);
+      const key1 = c1.computeKey(DEFAULT_COMMIT, scriptSig, witness, flags);
+      const key2 = c2.computeKey(DEFAULT_COMMIT, scriptSig, witness, flags);
 
       // Different nonces → different entry hashes
       expect(key1.entryHex).not.toBe(key2.entryHex);
@@ -278,8 +284,8 @@ describe("sig_cache", () => {
       const sig1 = Buffer.alloc(71, 0x01); // valid sig from honest tx
       const sig2 = Buffer.alloc(71, 0x02); // forged/different sig (adversarial)
 
-      const key1 = cache.computeKey(sig1, [], 7);
-      const key2 = cache.computeKey(sig2, [], 7);
+      const key1 = cache.computeKey(DEFAULT_COMMIT, sig1, [], 7);
+      const key2 = cache.computeKey(DEFAULT_COMMIT, sig2, [], 7);
 
       expect(key1.entryHex).not.toBe(key2.entryHex);
 
@@ -293,8 +299,8 @@ describe("sig_cache", () => {
       const elem1 = Buffer.from("aabb", "hex");
       const elem2 = Buffer.from("ccdd", "hex");
 
-      const keyAB = cache.computeKey(Buffer.alloc(0), [elem1, elem2], 7);
-      const keyBA = cache.computeKey(Buffer.alloc(0), [elem2, elem1], 7);
+      const keyAB = cache.computeKey(DEFAULT_COMMIT, Buffer.alloc(0), [elem1, elem2], 7);
+      const keyBA = cache.computeKey(DEFAULT_COMMIT, Buffer.alloc(0), [elem2, elem1], 7);
 
       expect(keyAB.entryHex).not.toBe(keyBA.entryHex);
     });
@@ -305,11 +311,87 @@ describe("sig_cache", () => {
       const c2 = new SigCache(100, fixedNonce);
 
       const sig = Buffer.from("abcd", "hex");
-      const k1 = c1.computeKey(sig, [], 3);
-      const k2 = c2.computeKey(sig, [], 3);
+      const k1 = c1.computeKey(DEFAULT_COMMIT, sig, [], 3);
+      const k2 = c2.computeKey(DEFAULT_COMMIT, sig, [], 3);
 
       // Same nonce + same material → same key (deterministic)
       expect(k1.entryHex).toBe(k2.entryHex);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Cross-tx witness-replay attack (W160 BUG-7 root-cause fix)
+  // ---------------------------------------------------------------------------
+
+  describe("sighash commitment binding (W160 BUG-7)", () => {
+    test("different sighashCommit values produce different keys for identical (scriptSig, witness, flags)", () => {
+      // Attack scenario: attacker observes a P2WPKH witness `[sig, pubkey]`
+      // on the wire (tx1).  Attacker constructs tx2 spending a DIFFERENT
+      // UTXO previously sent to the same pubkey and copies the witness
+      // verbatim.  The scriptSig/witness/flags tuple is IDENTICAL across
+      // tx1 and tx2 — only the per-tx sighash commitment differs.
+      // Without the sighash in the cache key, tx2 would get a false-positive
+      // hit and skip interpreter verification entirely.
+      const sig = Buffer.from("3044deadbeef01", "hex");
+      const pubkey = Buffer.alloc(33, 0x02);
+      const scriptSig = Buffer.alloc(0);
+      const witness = [sig, pubkey];
+      const flags = 7;
+
+      const commitTx1 = Buffer.alloc(32, 0xaa); // tx1 sighash commitment
+      const commitTx2 = Buffer.alloc(32, 0xbb); // tx2 sighash commitment (different tx)
+
+      const keyTx1 = cache.computeKey(commitTx1, scriptSig, witness, flags);
+      const keyTx2 = cache.computeKey(commitTx2, scriptSig, witness, flags);
+
+      // Keys MUST differ — otherwise the cross-tx replay attack succeeds.
+      expect(keyTx1.entryHex).not.toBe(keyTx2.entryHex);
+
+      // Insert tx1 success → tx2 must still miss the cache (interpreter
+      // must run and reject the replay).
+      cache.insert(keyTx1);
+      expect(cache.lookup(keyTx1)).toBe(true);
+      expect(cache.lookup(keyTx2)).toBe(false);
+    });
+
+    test("different pubkey commitments produce different keys for identical witness", () => {
+      // Belt-and-braces: two different (sighash, pubkey) combos with the
+      // same surface witness must produce different keys.
+      const witness = [Buffer.from("304401aa", "hex"), Buffer.alloc(33, 0x02)];
+      const commit1 = Buffer.alloc(32, 0x11);
+      const commit2 = Buffer.alloc(32, 0x22);
+
+      const k1 = cache.computeKey(commit1, Buffer.alloc(0), witness, 7);
+      const k2 = cache.computeKey(commit2, Buffer.alloc(0), witness, 7);
+
+      expect(k1.entryHex).not.toBe(k2.entryHex);
+    });
+
+    test("computeKey rejects non-32-byte sighashCommit", () => {
+      // Defense-in-depth: refuse to compute a key with an under/over-sized
+      // commit since that would silently weaken the cache binding.
+      const short = Buffer.alloc(31, 0x00);
+      const long = Buffer.alloc(33, 0x00);
+      expect(() => cache.computeKey(short, Buffer.alloc(0), [], 0)).toThrow(
+        /must be 32 bytes/,
+      );
+      expect(() => cache.computeKey(long, Buffer.alloc(0), [], 0)).toThrow(
+        /must be 32 bytes/,
+      );
+    });
+
+    test("identical sighashCommit + identical witness → same key (cache HIT path still works)", () => {
+      // Sanity: the cache must STILL hit when the same (tx, input) is
+      // verified twice (mempool ATMP, then block-connect re-verify).
+      const commit = Buffer.alloc(32, 0x55);
+      const witness = [Buffer.from("304402aabb", "hex"), Buffer.alloc(33, 0x03)];
+
+      const k1 = cache.computeKey(commit, Buffer.alloc(0), witness, 7);
+      const k2 = cache.computeKey(commit, Buffer.alloc(0), witness, 7);
+
+      expect(k1.entryHex).toBe(k2.entryHex);
+      cache.insert(k1);
+      expect(cache.lookup(k2)).toBe(true);
     });
   });
 
@@ -327,7 +409,7 @@ describe("sig_cache", () => {
       globalSigCache.clear();
 
       const sig = Buffer.from("deadbeef" + Date.now().toString(16).padStart(16, "0"), "hex");
-      const key = globalSigCache.computeKey(sig, [], 0);
+      const key = globalSigCache.computeKey(DEFAULT_COMMIT, sig, [], 0);
 
       expect(globalSigCache.lookup(key)).toBe(false);
       globalSigCache.insert(key);
