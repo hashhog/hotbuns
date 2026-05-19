@@ -15,22 +15,22 @@
  *
  * 30 audit gates, classified PRESENT / PARTIAL / MISSING.
  *
- * Audit summary (see audit/w123_mining_gbt.md): 22 bugs / 30 gates,
- *   PRESENT=10, PARTIAL=7, MISSING=13.
- *   P0-CDIV=7, P0-RPC=7, P1=7, P2=1.
+ * Audit summary (see audit/w123_mining_gbt.md): originally 22 bugs / 30 gates,
+ *   PRESENT=10, PARTIAL=7, MISSING=13. P0-CDIV=7, P0-RPC=7, P1=7, P2=1.
  *
- * KEY FINDING: hotbuns has two parallel mining code paths. The
- * `BlockTemplateBuilder` helper at `src/mining/template.ts` (685 LOC,
- * 62 unit tests passing) is **correctly implemented** with all W14/W63
- * fixes. The production RPC entry points
- * (`getBlockTemplate` + `generateSingleBlock` in `src/rpc/server.ts`)
- * re-implement the logic by hand and bring the W14/W63 bugs back —
- * **classic "dead-helper at the call-site" pattern**, 33rd-consecutive
- * audit wave to find an instance of it across the fleet.
+ * 2026-05-19 UPDATE: the canonical W123 BUG-21 / W154 BUG-1 / W155 BUG-31
+ * **dead-helper-at-the-call-site** fix has landed —
+ * `src/rpc/server.ts::getBlockTemplate` and `generateSingleBlock` now route
+ * through the `BlockTemplateBuilder` helper (and the new top-level
+ * `buildCoinbaseTransaction` / `computeWitnessCommitmentHash` exports on the
+ * explicit-tx path). Tests below that previously pinned the BUG presence have
+ * been flipped to assert the FIX presence; bug numbering is preserved in the
+ * `describe`/`it` titles so the audit history stays linkable. The G19
+ * (longpoll) / G15 (mode=proposal) / G16 (submitheader) / G17
+ * (prioritisetransaction) / G18 (IBD guard) gates remain open follow-ups —
+ * they are still pinning the corresponding bug as MISSING.
  *
  * Running: bun test src/__tests__/w123_mining_gbt.test.ts
- *
- * No production code changes in this wave.
  */
 
 import { describe, it, expect } from "bun:test";
@@ -65,43 +65,48 @@ function rpcSlice(needleStart: string, lines = 220): string {
 // =============================================================================
 // G1 — tx finality enforcement in template selection (BIP-65/BIP-113/IsFinalTx)
 // =============================================================================
-describe("W123-G1: tx finality enforcement in template selection — PARTIAL (BUG-1)", () => {
+describe("W123-G1: tx finality enforcement in template selection — FIXED via helper wire-up", () => {
   it("BlockTemplateBuilder.selectTransactions HAS isFinalTx check (PRESENT in helper)", () => {
     expect(MINING_TEMPLATE_SRC).toContain("isFinalTx(entry.tx, targetHeight, this.medianTimePast)");
     expect(MINING_TEMPLATE_SRC).toContain("notFinal.add(txidHex)");
   });
 
-  it("BUG-1: getBlockTemplate RPC has NO isFinalTx check (MISSING in production path)", () => {
-    // The RPC iterates getAllTxids() and pushes everything that fits the sigops
-    // budget, regardless of locktime. Core: TestChunkTransactions
-    // (node/miner.cpp:253-258) walks every selected tx through IsFinalTx.
-    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 200);
+  it("BUG-1 FIXED: getBlockTemplate now delegates selection to the helper, which runs isFinalTx", () => {
+    // After the W123 BUG-21 / W154 BUG-1 / W155 BUG-31 wire-up, server.ts's
+    // getBlockTemplate no longer iterates `mempool.getAllTxids()` itself. The
+    // builder.createTemplate() call internally invokes selectTransactions,
+    // which gates each candidate through isFinalTx().
+    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 280);
     expect(gbt.length).toBeGreaterThan(0);
-    expect(gbt).not.toContain("isFinalTx");
-    expect(gbt).not.toContain("IsFinalTx");
+    expect(gbt).toContain("new BlockTemplateBuilder(");
+    expect(gbt).toContain("setMedianTimePast(");
+    expect(gbt).toContain("builder.createTemplate(");
   });
 });
 
 // =============================================================================
 // G2 — MAX_BLOCK_WEIGHT enforcement
 // =============================================================================
-describe("W123-G2: MAX_BLOCK_WEIGHT enforcement (>=) — PARTIAL (BUG-2)", () => {
+describe("W123-G2: MAX_BLOCK_WEIGHT enforcement (>=) — FIXED via helper wire-up (was BUG-2)", () => {
   it("BlockTemplateBuilder enforces totalWeight + entry.weight >= maxBlockWeight (PRESENT)", () => {
     expect(MINING_TEMPLATE_SRC).toContain("totalWeight + entry.weight >= maxBlockWeight");
   });
 
-  it("BUG-2: getBlockTemplate RPC has NO MAX_BLOCK_WEIGHT gate (MISSING)", () => {
-    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 200);
-    // No weight check at all; only sigops is gated.
-    expect(gbt).not.toMatch(/totalWeight\s*\+\s*entry\.weight\s*>=?\s*\w+\.maxBlockWeight/);
-    expect(gbt).not.toMatch(/totalWeight\s*\+\s*entry\.weight\s*>=?\s*MAX_BLOCK_WEIGHT/);
+  it("BUG-2 FIXED: getBlockTemplate inherits the weight gate via BlockTemplateBuilder", () => {
+    // After wire-up, server.ts's GBT path no longer hand-rolls a per-tx weight
+    // accumulator (it never had a gate before; now selection happens entirely
+    // in the helper's selectTransactions). The hand-rolled `totalWeight +=` is
+    // gone too.
+    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 280);
+    expect(gbt).toContain("new BlockTemplateBuilder(");
+    expect(gbt).not.toMatch(/totalWeight\s*\+=\s*entry\.weight/);
   });
 });
 
 // =============================================================================
 // G3 — reserved-weight (8000) + reserved-coinbase-sigops (400) budgets
 // =============================================================================
-describe("W123-G3: reserved budgets — PARTIAL (BUG-3, BUG-4)", () => {
+describe("W123-G3: reserved budgets — FIXED via BlockTemplateBuilder wire-up (was BUG-3, BUG-4)", () => {
   it("BlockTemplateBuilder starts totalWeight at BLOCK_RESERVED_WEIGHT (PRESENT)", () => {
     // Constant defined per Core policy/policy.h:27 DEFAULT_BLOCK_RESERVED_WEIGHT=8000.
     expect(MINING_TEMPLATE_SRC).toContain("const BLOCK_RESERVED_WEIGHT = 8000");
@@ -112,54 +117,67 @@ describe("W123-G3: reserved budgets — PARTIAL (BUG-3, BUG-4)", () => {
     expect(MINING_TEMPLATE_SRC).toContain("let totalSigOps = COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS");
   });
 
-  it("BUG-3: getBlockTemplate RPC starts totalWeight AND totalSigOps at 0 (MISSING)", () => {
-    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 100);
-    expect(gbt).toMatch(/let\s+totalWeight\s*=\s*0/);
-    expect(gbt).toMatch(/let\s+totalSigOps\s*=\s*0/);
-    // Specifically, no `8000` and no `400` constant near the totals init.
-    expect(gbt).not.toContain("BLOCK_RESERVED_WEIGHT");
-    expect(gbt).not.toContain("COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS");
+  it("BUG-3 FIXED: getBlockTemplate now routes selection through BlockTemplateBuilder", () => {
+    // After the W123 BUG-21 / W154 BUG-1 / W155 BUG-31 wire-up, the production
+    // RPC no longer keeps its own `let totalWeight = 0` / `let totalSigOps = 0`
+    // counters — selection is delegated to the canonical helper whose budgets
+    // start at BLOCK_RESERVED_WEIGHT and COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS.
+    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 280);
+    expect(gbt).toContain("new BlockTemplateBuilder(");
+    expect(gbt).toContain("builder.createTemplate(");
+    // The old hand-rolled counters are gone.
+    expect(gbt).not.toMatch(/let\s+totalWeight\s*=\s*0/);
+    expect(gbt).not.toMatch(/let\s+totalSigOps\s*=\s*0/);
   });
 
-  it("BUG-4: getBlockTemplate sigops gate uses `>` instead of `>=` (Core: `>=` rejects equality)", () => {
-    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 100);
-    // Core node/miner.cpp:244: `if (nBlockSigOpsCost + chunk_sigops_cost >= MAX_BLOCK_SIGOPS_COST) return false;`
-    // hotbuns: `if (totalSigOps + txSigOpCost > MAX_BLOCK_SIGOPS_COST) continue;`
-    expect(gbt).toContain("totalSigOps + txSigOpCost > MAX_BLOCK_SIGOPS_COST");
-    expect(gbt).not.toContain("totalSigOps + txSigOpCost >= MAX_BLOCK_SIGOPS_COST");
+  it("BUG-4 FIXED: sigops gate now lives inside the helper (uses `>=`)", () => {
+    // The hand-rolled `totalSigOps + txSigOpCost > MAX_BLOCK_SIGOPS_COST` gate
+    // has been removed from server.ts; selection delegates to the helper, which
+    // uses Core's `>=` semantics at template.ts:408.
+    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 280);
+    expect(gbt).not.toContain("totalSigOps + txSigOpCost > MAX_BLOCK_SIGOPS_COST");
+    expect(MINING_TEMPLATE_SRC).toContain("totalSigOps + txSigOpCost >= maxSigOps");
   });
 });
 
 // =============================================================================
 // G4 — dependency / ancestor ordering
 // =============================================================================
-describe("W123-G4: dependency / ancestor ordering in template — PARTIAL", () => {
+describe("W123-G4: dependency / ancestor ordering — FIXED via BlockTemplateBuilder wire-up", () => {
   it("BlockTemplateBuilder walks dependsOn ancestors recursively (PRESENT)", () => {
     expect(MINING_TEMPLATE_SRC).toContain("addWithAncestors");
     expect(MINING_TEMPLATE_SRC).toContain("for (const parentTxidHex of entry.dependsOn)");
   });
-  it("getBlockTemplate emits depends[] by 1-based index but uses mempool-iteration order (no topological pre-sort)", () => {
-    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 100);
-    // depends array is computed but iteration is over getAllTxids() (Map insertion order),
-    // not a fee-rate sort with parent-first dependency walk.
+  it("FIXED: getBlockTemplate now relies on helper for ordering (fee-rate + ancestor walk)", () => {
+    // After wire-up, server.ts no longer iterates `mempool.getAllTxids()` in
+    // Map insertion order. The helper's `selectTransactions` uses
+    // `getTransactionsByFeeRate()` with `addWithAncestors` so a parent always
+    // precedes its child in the BIP-22 `transactions[]` array. server.ts only
+    // re-derives the `depends[]` index numbers from the helper's already-
+    // ordered output.
+    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 280);
     expect(gbt).toContain("const depends: number[]");
-    expect(gbt).toContain("this.mempool.getAllTxids()");
-    expect(gbt).not.toContain("getTransactionsByFeeRate");
+    expect(gbt).not.toContain("this.mempool.getAllTxids()");
+    expect(gbt).toContain("template.transactions");
   });
 });
 
 // =============================================================================
 // G5 — MAX_CONSECUTIVE_FAILURES early-exit
 // =============================================================================
-describe("W123-G5: MAX_CONSECUTIVE_FAILURES early-exit (1000) — PARTIAL", () => {
+describe("W123-G5: MAX_CONSECUTIVE_FAILURES early-exit (1000) — FIXED via helper", () => {
   it("BlockTemplateBuilder has MAX_CONSECUTIVE_FAILURES=1000 + 4000 weight delta (PRESENT)", () => {
     expect(MINING_TEMPLATE_SRC).toContain("MAX_CONSECUTIVE_FAILURES = 1000");
     expect(MINING_TEMPLATE_SRC).toContain("BLOCK_FULL_ENOUGH_WEIGHT_DELTA = 4000");
   });
-  it("getBlockTemplate RPC has no early-exit (MISSING)", () => {
-    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 100);
-    expect(gbt).not.toContain("MAX_CONSECUTIVE_FAILURES");
-    expect(gbt).not.toContain("BLOCK_FULL_ENOUGH_WEIGHT_DELTA");
+  it("FIXED: getBlockTemplate inherits the early-exit via BlockTemplateBuilder", () => {
+    // After wire-up, the production GBT path delegates to
+    // BlockTemplateBuilder.createTemplate which inherits the early-exit
+    // (template.ts addWithAncestors loop). The constants do NOT appear in
+    // server.ts because the loop body lives in the helper, but the production
+    // GBT instantiates the helper.
+    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 280);
+    expect(gbt).toContain("new BlockTemplateBuilder(");
   });
 });
 
@@ -190,56 +208,68 @@ describe("W123-G6: BIP-94 timewarp clamp in mintime — MISSING (BUG-15)", () =>
 // =============================================================================
 // G7 — coinbase nSequence == MAX_SEQUENCE_NONFINAL (0xfffffffe)
 // =============================================================================
-describe("W123-G7: coinbase nSequence — PARTIAL (BUG-5)", () => {
+describe("W123-G7: coinbase nSequence — FIXED via helper (was BUG-5)", () => {
   it("BlockTemplateBuilder.buildCoinbase uses MAX_SEQUENCE_NONFINAL = 0xfffffffe (PRESENT)", () => {
     expect(MINING_TEMPLATE_SRC).toContain("const MAX_SEQUENCE_NONFINAL = 0xfffffffe");
     expect(MINING_TEMPLATE_SRC).toContain("sequence: MAX_SEQUENCE_NONFINAL");
   });
 
-  it("BUG-5: generateSingleBlock's coinbase uses sequence: 0xffffffff (SEQUENCE_FINAL — wrong)", () => {
-    // Both `buildCoinbaseTx` and `buildCoinbaseTxWithWitnessCommitment` in
-    // rpc/server.ts emit `sequence: 0xffffffff`. Core uses MAX_SEQUENCE_NONFINAL
-    // (`node/miner.cpp:171`) so the coinbase's nLockTime=height-1 is enforced.
-    const buildCb = rpcSlice("private buildCoinbaseTx(", 30);
-    const buildCbWC = rpcSlice("private buildCoinbaseTxWithWitnessCommitment(", 40);
-    expect(buildCb).toContain("sequence: 0xffffffff");
-    expect(buildCbWC).toContain("sequence: 0xffffffff");
-    expect(buildCb).not.toContain("0xfffffffe");
-    expect(buildCbWC).not.toContain("0xfffffffe");
+  it("BUG-5 FIXED: generateSingleBlock no longer hand-rolls coinbase; routes through buildCoinbaseTransaction", () => {
+    // The two old private builders (`buildCoinbaseTx` /
+    // `buildCoinbaseTxWithWitnessCommitment`) have been deleted; both call
+    // sites now use either the BlockTemplateBuilder helper (no-tx path) or
+    // the exported `buildCoinbaseTransaction(...)` helper (explicit-tx
+    // generateblock path), both of which emit `MAX_SEQUENCE_NONFINAL`.
+    expect(RPC_SERVER_SRC).not.toContain("private buildCoinbaseTx(");
+    expect(RPC_SERVER_SRC).not.toContain("private buildCoinbaseTxWithWitnessCommitment(");
+    // Production server now imports the canonical helper.
+    expect(RPC_SERVER_SRC).toContain("buildCoinbaseTransaction,");
   });
 });
 
 // =============================================================================
 // G8 — coinbase nLockTime == height - 1
 // =============================================================================
-describe("W123-G8: coinbase nLockTime == height - 1 — PARTIAL (BUG-6)", () => {
+describe("W123-G8: coinbase nLockTime == height - 1 — FIXED via helper (was BUG-6)", () => {
   it("BlockTemplateBuilder.buildCoinbase sets lockTime: height > 0 ? height - 1 : 0 (PRESENT)", () => {
     expect(MINING_TEMPLATE_SRC).toContain("lockTime: height > 0 ? height - 1 : 0");
   });
 
-  it("BUG-6: generateSingleBlock builds coinbase with lockTime: 0 (wrong)", () => {
-    const buildCb = rpcSlice("private buildCoinbaseTx(", 30);
-    const buildCbWC = rpcSlice("private buildCoinbaseTxWithWitnessCommitment(", 40);
-    expect(buildCb).toContain("lockTime: 0");
-    expect(buildCbWC).toContain("lockTime: 0");
+  it("BUG-6 FIXED: generateSingleBlock's hand-rolled coinbase is deleted; lockTime now correct via helper", () => {
+    // The two private builders that hardcoded lockTime: 0 are gone. Both
+    // production call sites route through buildCoinbaseTransaction / the
+    // BlockTemplateBuilder, both of which set lockTime = height - 1 (Core
+    // node/miner.cpp:196 parity).
+    expect(RPC_SERVER_SRC).not.toContain("private buildCoinbaseTx(");
+    expect(RPC_SERVER_SRC).not.toContain("private buildCoinbaseTxWithWitnessCommitment(");
+    // The export the production server now imports DOES set the BIP-34 lockTime.
+    expect(MINING_TEMPLATE_SRC).toContain("export function buildCoinbaseTransaction(");
+    expect(MINING_TEMPLATE_SRC).toContain("lockTime: height > 0 ? height - 1 : 0");
   });
 });
 
 // =============================================================================
 // G9 — BIP-141 witness commitment
 // =============================================================================
-describe("W123-G9: BIP-141 witness commitment — PRESENT", () => {
+describe("W123-G9: BIP-141 witness commitment — PRESENT (via helper after wire-up)", () => {
   it("BlockTemplateBuilder emits OP_RETURN(0x6a) PUSH36(0x24) marker(0xaa21a9ed)", () => {
     expect(MINING_TEMPLATE_SRC).toContain("0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed");
   });
-  it("getBlockTemplate emits default_witness_commitment hex", () => {
-    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 250);
+  it("getBlockTemplate emits default_witness_commitment by extracting from helper coinbase", () => {
+    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 280);
     expect(gbt).toContain("default_witness_commitment");
-    expect(gbt).toContain("0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed");
+    // After the wire-up the server.ts GBT path no longer inlines the marker
+    // bytes — it copies them out of the helper coinbase's last output. The
+    // marker still appears in the segwit-active sanity-check `equals(...)`.
+    expect(gbt).toContain("[0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]");
   });
-  it("generateSingleBlock emits witness commitment too", () => {
-    const wcCoinbase = rpcSlice("private buildCoinbaseTxWithWitnessCommitment(", 40);
-    expect(wcCoinbase).toContain("0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed");
+  it("explicit-tx (generateblock) path uses computeWitnessCommitmentHash + buildCoinbaseTransaction", () => {
+    const gen = rpcSlice("private async generateSingleBlock(", 280);
+    // No more private buildCoinbaseTxWithWitnessCommitment; the helper
+    // module's exports handle commitment construction.
+    expect(gen).toContain("computeWitnessCommitmentHash(");
+    expect(gen).toContain("buildCoinbaseTransaction(");
+    expect(RPC_SERVER_SRC).not.toContain("buildCoinbaseTxWithWitnessCommitment(");
   });
 });
 
@@ -292,13 +322,17 @@ describe("W123-G11: getmininginfo fields — MISSING (BUG-8, BUG-9, BUG-10)", ()
 // =============================================================================
 // G12 — generateSingleBlock timestamp via max(now, MTP+1)
 // =============================================================================
-describe("W123-G12: generateSingleBlock timestamp >= MTP+1 — MISSING (BUG-19)", () => {
-  it("BUG-19: header.timestamp is `Math.floor(Date.now() / 1000)` with NO MTP+1 floor", () => {
-    const gen = rpcSlice("private async generateSingleBlock(", 200);
-    expect(gen).toContain("timestamp: Math.floor(Date.now() / 1000)");
-    // No mintime/MTP computation present in this RPC.
-    expect(gen).not.toContain("getMedianTimePast");
-    expect(gen).not.toContain("Math.max(");
+describe("W123-G12: generateSingleBlock timestamp >= MTP+1 — FIXED (was BUG-19)", () => {
+  it("BUG-19 FIXED: header.timestamp is max(now, MTP+1) on the generateSingleBlock explicit-tx path", () => {
+    // After the wire-up, generateSingleBlock pulls parent MTP from headerSync
+    // and clamps timestamp = max(now, parentMTP + 1). The empty-tx path goes
+    // through BlockTemplateBuilder which has its own MTP+1 floor at
+    // template.ts:267, so both production miner entry points respect the
+    // MTP+1 invariant.
+    const gen = rpcSlice("private async generateSingleBlock(", 280);
+    expect(gen).toContain("getMedianTimePast(parentEntry)");
+    expect(gen).toContain("Math.max(nowSecs, parentMTP + 1)");
+    expect(gen).not.toContain("timestamp: Math.floor(Date.now() / 1000)");
   });
 });
 
@@ -397,9 +431,12 @@ describe("W123-G18: IBD / connman guards on getblocktemplate — MISSING (BUG-16
 // =============================================================================
 // G19 — BIP-22 longpoll
 // =============================================================================
-describe("W123-G19: BIP-22 longpoll — MISSING (BUG-17)", () => {
-  it("BUG-17: longpollid is emitted but never honored on subsequent calls", () => {
-    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 200);
+describe("W123-G19: BIP-22 longpoll — STILL MISSING (BUG-17)", () => {
+  it("BUG-17 STILL OPEN: longpollid is emitted but never honored on subsequent calls", () => {
+    // Longpoll wiring was NOT closed by the BlockTemplateBuilder wire-up; it
+    // remains a P1 open finding (W155 BUG-20). Slice widened to 280 lines to
+    // span the new longer GBT function after the helper wire-up.
+    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 280);
     expect(gbt).toContain("longpollid:");
     // No wait loop or tip-change subscription.
     expect(gbt).not.toContain("waitTipChanged");
@@ -427,26 +464,33 @@ describe("W123-G20: template caching (pindexPrev == tip reuse) — MISSING (BUG-
 // =============================================================================
 // G21 — BlockTemplateBuilder actually called from production RPCs
 // =============================================================================
-describe("W123-G21: BlockTemplateBuilder used by production RPCs — MISSING (BUG-21)", () => {
-  it("BUG-21: rpc/server.ts imports BlockTemplateBuilder but NEVER instantiates it (dead import)", () => {
-    // The import line exists (rpc/server.ts:44) and the symbol is referenced
-    // in one comment only — but no `new BlockTemplateBuilder(...)` exists.
-    expect(RPC_SERVER_SRC).toContain('import { BlockTemplateBuilder } from "../mining/template.js"');
-    expect(RPC_SERVER_SRC).not.toContain("new BlockTemplateBuilder");
+describe("W123-G21: BlockTemplateBuilder used by production RPCs — FIXED (was BUG-21)", () => {
+  it("BUG-21 FIXED: rpc/server.ts imports AND instantiates BlockTemplateBuilder", () => {
+    // After the W123 BUG-21 / W154 BUG-1 / W155 BUG-31 wire-up the import is
+    // multi-line (BlockTemplateBuilder, buildCoinbaseTransaction,
+    // computeWitnessCommitmentHash) — match that shape.
+    expect(RPC_SERVER_SRC).toContain('from "../mining/template.js"');
+    expect(RPC_SERVER_SRC).toContain("BlockTemplateBuilder,");
+    expect(RPC_SERVER_SRC).toContain("new BlockTemplateBuilder(");
   });
 
-  it("BUG-21: helper has zero call sites outside its own tests", () => {
+  it("BUG-21 FIXED: helper has live call sites in production server", () => {
     expect(typeof BlockTemplateBuilder).toBe("function");
-    // Strongest invariant: not a single `BlockTemplateBuilder(` call anywhere in server.ts.
-    const callSites = RPC_SERVER_SRC.match(/BlockTemplateBuilder\s*\(/g);
-    expect(callSites).toBeNull();
+    // Production callsites: getBlockTemplate + generateSingleBlock both
+    // construct the helper. Match constructor invocations specifically.
+    const callSites = RPC_SERVER_SRC.match(/new\s+BlockTemplateBuilder\s*\(/g);
+    expect(callSites).not.toBeNull();
+    expect((callSites ?? []).length).toBeGreaterThanOrEqual(2);
   });
 
-  it("33rd-consecutive dead-helper-at-call-site wave: ~685 LOC + 62 tests + zero production use", () => {
-    // Pure structural fact. Lines of mining/template.ts.
+  it("Helper unchanged in shape: ~685 LOC (delegated coinbase + standalone exports added)", () => {
+    // After the wire-up we kept BlockTemplateBuilder's public API stable and
+    // delegated its private `buildCoinbase` to a new top-level
+    // `buildCoinbaseTransaction` export. Class LOC grows slightly because of
+    // the added top-level exports; new ceiling allows up to ~900.
     const lines = MINING_TEMPLATE_SRC.split("\n").length;
     expect(lines).toBeGreaterThan(600);
-    expect(lines).toBeLessThan(800);
+    expect(lines).toBeLessThan(900);
   });
 });
 
@@ -473,7 +517,10 @@ describe("W123-G22: submitblock BIP-22 strings — PRESENT", () => {
 // =============================================================================
 describe("W123-G23: default_witness_commitment in GBT response — PRESENT", () => {
   it("getBlockTemplate emits default_witness_commitment whenever segwit active", () => {
-    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 250);
+    // Slice widened to 280 lines after the BlockTemplateBuilder wire-up grew
+    // the GBT function — the `height >= this.params.segwitHeight` gate now
+    // sits ~250 lines into the function.
+    const gbt = rpcSlice("private async getBlockTemplate(params: unknown[])", 280);
     expect(gbt).toContain("default_witness_commitment");
     expect(gbt).toContain("height >= this.params.segwitHeight");
   });
