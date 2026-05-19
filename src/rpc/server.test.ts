@@ -44,6 +44,20 @@ class MockMempool {
     return Array.from(this.entries.values()).map(e => e.txid);
   }
 
+  // Required by BlockTemplateBuilder.selectTransactions, which is now reached
+  // through the production getblocktemplate path after the W123 BUG-21 /
+  // W154 BUG-1 / W155 BUG-31 helper wire-up.
+  getTransactionsByFeeRate() {
+    const entries = Array.from(this.entries.values());
+    entries.sort((a, b) => b.feeRate - a.feeRate);
+    return entries;
+  }
+
+  // Required by Mempool.setTipHeight callers used in BlockTemplateBuilder
+  // test scaffolding (no-op for the RPC mock — block height for finality is
+  // already injected via MockChainStateManager.getBestBlock).
+  setTipHeight(_h: number) {}
+
   getTransaction(txid: Buffer) {
     return this.entries.get(txid.toString("hex")) ?? null;
   }
@@ -71,11 +85,33 @@ class MockMempool {
     return true;
   }
 
-  // Helper for tests
+  // Helper for tests.
+  //
+  // If the supplied `tx` is structurally serializable (has inputs+outputs
+  // arrays), key the entry under the REAL computed txid (`getTxId(tx)`) so
+  // the BlockTemplateBuilder-routed production GBT path (which iterates
+  // `template.transactions` and recomputes txids) finds the entry. The
+  // caller-supplied `txid` is treated as a hint only — tests that pass
+  // `Buffer.alloc(32, 2)` just want "a mempool entry to be selected", not
+  // a specific txid. Tests that pass a synthetic `tx: {}` (no inputs) keep
+  // the legacy fake-txid keying for the old hand-rolled callers.
+  //
+  // Wire-up: W123 BUG-21 / W154 BUG-1 / W155 BUG-31.
   addTestTransaction(txid: Buffer, entry: any) {
-    this.entries.set(txid.toString("hex"), {
+    let key = txid;
+    let serializable = false;
+    if (entry.tx && Array.isArray(entry.tx.inputs) && Array.isArray(entry.tx.outputs)) {
+      try {
+        key = getTxId(entry.tx) as Buffer;
+        serializable = true;
+      } catch {
+        // fall through to caller-supplied fake txid
+      }
+    }
+    void serializable;
+    const mempoolEntry = {
       tx: entry.tx ?? {},
-      txid,
+      txid: key,
       fee: entry.fee ?? 1000n,
       feeRate: entry.feeRate ?? 10,
       vsize: entry.vsize ?? 200,
@@ -84,7 +120,8 @@ class MockMempool {
       height: entry.height ?? 100,
       spentBy: entry.spentBy ?? new Set(),
       dependsOn: entry.dependsOn ?? new Set(),
-    });
+    };
+    this.entries.set(key.toString("hex"), mempoolEntry);
   }
 }
 
@@ -1208,15 +1245,20 @@ describe("RPCServer", () => {
     it("template with 3 mempool txs emits commitment over their wtxids", async () => {
       // Add 3 non-witness transactions.  For legacy txs wtxid == txid (no
       // witness field), so the commitment is sha256d(merkle([0, wtxid1, wtxid2, wtxid3]) || zeros).
+      //
+      // Post-W123-BUG-21-fix the MockMempool keys by `getTxId(tx)` so each tx
+      // must differ in its serialized bytes — otherwise all 3 collide on the
+      // same map key and only 1 makes it into the template. We perturb each
+      // tx's prevOut.vout to give it a unique txid.
       const txid1 = Buffer.alloc(32, 1);
       const txid2 = Buffer.alloc(32, 2);
       const txid3 = Buffer.alloc(32, 3);
 
-      const makeLegacyTx = (txid: Buffer) => ({
+      const makeLegacyTx = (txid: Buffer, voutSeed: number) => ({
         tx: {
           version: 2,
           inputs: [{
-            prevOut: { txid: Buffer.alloc(32, 0), vout: 0 },
+            prevOut: { txid: Buffer.alloc(32, 0), vout: voutSeed },
             scriptSig: Buffer.alloc(0),
             sequence: 0xffffffff,
             witness: [],
@@ -1229,9 +1271,9 @@ describe("RPCServer", () => {
         weight: 400,
       });
 
-      mockMempool.addTestTransaction(txid1, makeLegacyTx(txid1));
-      mockMempool.addTestTransaction(txid2, makeLegacyTx(txid2));
-      mockMempool.addTestTransaction(txid3, makeLegacyTx(txid3));
+      mockMempool.addTestTransaction(txid1, makeLegacyTx(txid1, 1));
+      mockMempool.addTestTransaction(txid2, makeLegacyTx(txid2, 2));
+      mockMempool.addTestTransaction(txid3, makeLegacyTx(txid3, 3));
 
       const result = await rpcRequest(testPort, "getblocktemplate", [
         { rules: ["segwit"] },

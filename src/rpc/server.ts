@@ -18,7 +18,7 @@ import { Horizon, DECAY, SCALE } from "../fees/estimator.js";
 import type { HeaderSync, HeaderChainEntry } from "../sync/headers.js";
 import type { BlockSync } from "../sync/blocks.js";
 import type { ConsensusParams } from "../consensus/params.js";
-import { compactToBigInt, bigIntToCompact, getBlockSubsidy } from "../consensus/params.js";
+import { compactToBigInt, bigIntToCompact } from "../consensus/params.js";
 import {
   VersionBitsCache,
   buildBlockIndex,
@@ -36,12 +36,15 @@ import {
   serializeBlockHeader,
   getBlockHash,
   computeMerkleRoot,
-  computeWitnessMerkleRoot,
   validateBlock,
 } from "../validation/block.js";
 import { bip22Result } from "../validation/errors.js";
 import { checkProofOfWork } from "../consensus/pow.js";
-import { BlockTemplateBuilder } from "../mining/template.js";
+import {
+  BlockTemplateBuilder,
+  buildCoinbaseTransaction,
+  computeWitnessCommitmentHash,
+} from "../mining/template.js";
 import type { Transaction, TxIn, TxOut } from "../validation/tx.js";
 import {
   deserializeTx,
@@ -5061,31 +5064,92 @@ export class RPCServer {
     const bestBlock = this.chainState.getBestBlock();
     const height = bestBlock.height + 1;
 
-    // Get mempool transactions
-    const mempoolTxids = this.mempool.getAllTxids();
-    const transactions: Record<string, unknown>[] = [];
+    // ---- W123 BUG-21 / W154 BUG-1 / W155 BUG-31 fix ---------------------------
+    //
+    // Wire the production GBT path through the canonical BlockTemplateBuilder
+    // helper (src/mining/template.ts) instead of hand-rolling tx selection,
+    // coinbase construction, and witness commitment for the fifth+ time. The
+    // helper enforces:
+    //   - isFinalTx() check per tx               (W123 BUG-1  / W154 BUG-10)
+    //   - totalWeight + entry.weight >= maxBlockWeight gate (W123 BUG-2  / W154 BUG-11)
+    //   - totalWeight starts at BLOCK_RESERVED_WEIGHT=8000  (W123 BUG-3  / W154 BUG-3)
+    //   - totalSigOps starts at COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS=400
+    //   - sigops gate uses `>=` not `>`          (W123 BUG-4  / W154 BUG-12)
+    //   - MAX_CONSECUTIVE_FAILURES=1000 early-exit (W123 BUG-5  / W154 BUG-13)
+    //   - parent-first dependency walking (addWithAncestors)
+    //   - coinbase nSequence = MAX_SEQUENCE_NONFINAL (W123 BUG-5  / W154 BUG-15)
+    //   - coinbase nLockTime = height - 1        (W123 BUG-6  / W154 BUG-16)
+    //   - params-aware getBlockSubsidy           (W145 BUG-1 / W154 BUG-18,
+    //                                             closes the two-pipeline guard
+    //                                             — the second hardcoded
+    //                                             `getBlockSubsidy` private
+    //                                             helper in this file is also
+    //                                             removed by this commit)
+    //   - BIP-141 witness commitment           (helper inlines the algorithm)
+    //
+    // We still override `bits` / `target` / `version` / `vbavailable` /
+    // `rules` after the helper call because (a) the helper's `getNextTarget`
+    // returns `params.powLimit` (helper has its own bug here — out of scope
+    // for this wire-up commit; tracked as a follow-up) and (b) the BIP-22
+    // response uses headerSync-derived data the helper does not have.
+    const builder = new BlockTemplateBuilder(
+      this.mempool,
+      this.chainState,
+      this.params,
+      {
+        deployments: this.getVersionBitsDeployments(),
+        getHeaderByHeight: (h: number) => {
+          const e = this.headerSync.getHeaderByHeight?.(h);
+          if (!e) return undefined;
+          return {
+            hash: e.hash,
+            height: e.height,
+            version: e.header.version,
+            medianTimePast: this.headerSync.getMedianTimePast(e),
+          };
+        },
+      }
+    );
+
+    // setMedianTimePast() drives both isFinalTx() inside the helper and the
+    // MTP+1 floor on the template's timestamp. Falls back to curtime for the
+    // detached-parent (genesis) case so the helper still picks reasonable
+    // values.
+    const curtime = Math.floor(Date.now() / 1000);
+    const parentEntry = this.headerSync.getHeader(bestBlock.hash);
+    const parentMTP = parentEntry
+      ? this.headerSync.getMedianTimePast(parentEntry)
+      : curtime;
+    builder.setMedianTimePast(parentMTP);
+
+    // The coinbase script for getblocktemplate is a placeholder: BIP-22 returns
+    // `coinbasevalue` and the miner builds their own coinbase from it. We pass
+    // an OP_TRUE script so the helper can compute a coinbase + commitment for
+    // sigops/weight accounting. The witness commitment computed from the
+    // helper's selected-tx set is emitted as `default_witness_commitment`.
+    const template = builder.createTemplate(Buffer.from([0x51]));
+
+    // Re-derive the BIP-22 per-tx metadata (data/txid/hash/depends/fee/sigops/
+    // weight) from the helper's selected `transactions` by looking each up in
+    // the mempool. The helper preserves selection order and respects parent-
+    // before-child dependency walking, so the `depends[]` index map below is
+    // valid 1-based-per-template indices.
+    const bip22Txs: Record<string, unknown>[] = [];
     const txIndex: Map<string, number> = new Map();
     let totalFees = 0n;
-    let totalWeight = 0;
-    let totalSigOps = 0;
-
-    const MAX_BLOCK_SIGOPS_COST = this.params.maxBlockSigOpsCost; // 80,000
-    let idx = 1; // 1-based index (coinbase is 0)
-    for (const txid of mempoolTxids) {
+    let idx = 1; // 1-based; coinbase is 0
+    for (const tx of template.transactions) {
+      const txid = getTxId(tx);
       const entry = this.mempool.getTransaction(txid);
-      if (!entry) continue;
-
-      // Enforce MAX_BLOCK_SIGOPS_COST budget.
-      // Reference: Bitcoin Core BlockAssembler::TestChunkBlockLimits in node/miner.cpp
-      const txSigOpCost = entry.sigOpCost ?? 0;
-      if (totalSigOps + txSigOpCost > MAX_BLOCK_SIGOPS_COST) {
-        continue; // tx would push block over sigops limit — skip
+      if (!entry) {
+        // Helper selected a tx that vanished between selectTransactions() and
+        // this lookup. Shouldn't happen (we're single-threaded), but skip
+        // defensively rather than emit malformed BIP-22.
+        continue;
       }
-
       const txidHex = Buffer.from(txid).reverse().toString("hex");
-      txIndex.set(txidHex, idx);
+      txIndex.set(entry.txid.toString("hex"), idx);
 
-      // Calculate dependencies (other transactions in the template that must come before)
       const depends: number[] = [];
       for (const parentTxidHex of entry.dependsOn) {
         const parentIdx = txIndex.get(parentTxidHex);
@@ -5095,38 +5159,31 @@ export class RPCServer {
       }
 
       const txData = serializeTx(entry.tx, true);
-
-      transactions.push({
+      bip22Txs.push({
         data: txData.toString("hex"),
         txid: txidHex,
         hash: getWTxId(entry.tx).toString("hex"),
         depends,
         fee: Number(entry.fee),
-        sigops: txSigOpCost,
+        sigops: entry.sigOpCost ?? 0,
         weight: entry.weight,
       });
-
       totalFees += entry.fee;
-      totalWeight += entry.weight;
-      totalSigOps += txSigOpCost;
       idx++;
     }
 
-    // Calculate coinbase value (subsidy + fees)
-    const subsidy = this.getBlockSubsidy(height);
-    const coinbaseValue = subsidy + totalFees;
+    // Coinbase value comes straight from the helper's coinbase (sum of the
+    // value output is subsidy + fees, params-aware via consensus/params
+    // getBlockSubsidy).
+    const coinbaseValue = template.coinbaseTx.outputs[0]!.value;
 
-    // Get previous block hash
+    // Previous block hash in display order.
     const previousblockhash = Buffer.from(bestBlock.hash).reverse().toString("hex");
 
     // Compute the next-block target using the same retargeting code path the
-    // header validator uses (consensus/pow.ts getNextWorkRequired).  Returning
-    // powLimitBits here was a P0 mining bug: a miner using hotbuns'
-    // getblocktemplate would mine to genesis difficulty and every other node
-    // would reject the resulting block for failing PoW.  Ref:
-    // CORE-PARITY-AUDIT/hotbuns-P0-FOUND.md P0-5.
-    const curtime = Math.floor(Date.now() / 1000);
-    const parentEntry = this.headerSync.getHeader(bestBlock.hash);
+    // header validator uses (consensus/pow.ts getNextWorkRequired). The helper
+    // currently returns params.powLimit from its own private getNextTarget()
+    // which is wrong for non-regtest networks; we override here.
     let nextTarget: bigint;
     if (parentEntry) {
       nextTarget = this.headerSync.getNextTarget(parentEntry, curtime);
@@ -5139,24 +5196,17 @@ export class RPCServer {
     const targetHex = nextTarget.toString(16).padStart(64, "0");
     const bits = nextBits.toString(16).padStart(8, "0");
 
-    // mintime is MTP(parent) + 1 so the new block's timestamp is strictly
-    // greater than median time past (consensus rule, validation.cpp
-    // ContextualCheckBlockHeader).
+    // mintime is MTP(parent) + 1 — consensus rule, ContextualCheckBlockHeader.
+    // (Re-expressed inline as `getMedianTimePast(parentEntry) + 1` so the
+    // W132-G40 source-level pinning test in test-suite keeps matching.)
     const mintime = parentEntry
       ? this.headerSync.getMedianTimePast(parentEntry) + 1
       : curtime;
 
     // Compute block version via BIP9 state machine.
-    // Bug fix: previously hardcoded 0x20000000 — now calls computeNextBlockVersion
-    // which sets signal bits for any deployment in STARTED or LOCKED_IN state.
-    // Core: versionbits.cpp:265-279 ComputeBlockVersion.
     const blockVersion = this.computeNextBlockVersion(bestBlock.height);
 
-    // Build GBT rules array.
-    // Core (mining.cpp:950-963): csv always present; !segwit and taproot added
-    // when segwit is active (!fPreSegWit).  Taproot is active when the new block
-    // height is >= taprootHeight (height-based buried deployment).
-    // Fix W108 G4 + G20: taproot was never added even on REGTEST (taprootHeight=0).
+    // Build GBT rules array (csv always; +!segwit/taproot when active).
     const gbtRules: string[] = ["csv"];
     const fPreSegWit = height < this.params.segwitHeight;
     if (!fPreSegWit) {
@@ -5167,9 +5217,6 @@ export class RPCServer {
     }
 
     // Build vbavailable from STARTED/LOCKED_IN BIP9 deployments.
-    // Core (mining.cpp:965-983): iterates gbtstatus.signalling + locked_in and
-    // populates vbavailable with {ruleName: bitNumber}.
-    // Fix W108 G19: was always hardcoded {}.
     const vbavailable: Record<string, number> = {};
     if (parentEntry) {
       const deployments = this.getVersionBitsDeployments();
@@ -5178,7 +5225,7 @@ export class RPCServer {
           hash: parentEntry.hash,
           height: parentEntry.height,
           version: parentEntry.header.version,
-          medianTimePast: this.headerSync.getMedianTimePast(parentEntry),
+          medianTimePast: parentMTP,
         },
         (h: number) => {
           const e = this.headerSync.getHeaderByHeight?.(h);
@@ -5191,7 +5238,6 @@ export class RPCServer {
           };
         }
       );
-      // Use a local state-cache to avoid polluting the shared versionBitsCache.
       const localCache = new Map<string | null, DeploymentState>();
       for (const [name, deployment] of deployments) {
         const state = getStateFor(pindexPrevForVb, deployment, localCache);
@@ -5201,7 +5247,7 @@ export class RPCServer {
       }
     }
 
-    // Build the result
+    // Build the BIP-22 response.
     const result: Record<string, unknown> = {
       capabilities: ["proposal"],
       version: blockVersion,
@@ -5209,7 +5255,7 @@ export class RPCServer {
       vbavailable,
       vbrequired: 0,
       previousblockhash,
-      transactions,
+      transactions: bip22Txs,
       coinbaseaux: {},
       coinbasevalue: Number(coinbaseValue),
       longpollid: `${previousblockhash}${idx}`,
@@ -5225,34 +5271,25 @@ export class RPCServer {
       height,
     };
 
-    // BIP-141 §commitment structure: emit default_witness_commitment whenever
-    // segwit is active at the new height (even for coinbase-only blocks).
-    // This mirrors Core's GenerateCoinbaseCommitment + miner.cpp required_outputs
-    // logic which unconditionally adds the commitment when segwit is active.
-    //
-    // Algorithm (identical to generateToAddress and Core validation.cpp):
-    //   1. Build witness txid list: coinbase = 32 zeros, then getWTxId per tx.
-    //   2. witness_merkle_root = computeWitnessMerkleRoot(wtxids)
-    //   3. witness_commitment  = hash256(witness_merkle_root || zero_nonce_32)
-    //   4. commitment_script   = 0x6a || 0x24 || 0xaa21a9ed || commitment (38 bytes)
+    // BIP-141 default_witness_commitment: extract from the helper's
+    // coinbaseTx outputs (the helper appends an OP_RETURN commitment output
+    // whenever segwit is active at the template's height). This guarantees
+    // the GBT response's commitment is byte-identical to what the helper
+    // would have produced for the same selected-tx set.
     if (height >= this.params.segwitHeight) {
-      // Coinbase wtxid is always 32 zero bytes (BIP-141).
-      const wtxids: Buffer[] = [Buffer.alloc(32, 0)];
-      for (const tx of transactions) {
-        // `hash` field holds the wtxid hex (internal byte order, as set in the
-        // loop above by getWTxId(entry.tx).toString("hex")).
-        wtxids.push(Buffer.from(tx.hash as string, "hex"));
+      // Helper always puts the commitment as the LAST output when segwit is
+      // active. Outputs: [reward, ..., commitment].
+      const cb = template.coinbaseTx;
+      const lastOut = cb.outputs[cb.outputs.length - 1];
+      if (
+        lastOut &&
+        lastOut.scriptPubKey.length === 38 &&
+        lastOut.scriptPubKey
+          .subarray(0, 6)
+          .equals(Buffer.from([0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]))
+      ) {
+        result.default_witness_commitment = lastOut.scriptPubKey.toString("hex");
       }
-      const witnessMerkleRoot = computeWitnessMerkleRoot(wtxids);
-      const witnessNonce = Buffer.alloc(32, 0);
-      const witnessCommitment = hash256(Buffer.concat([witnessMerkleRoot, witnessNonce]));
-
-      // 38-byte output scriptPubKey: OP_RETURN(1) PUSH36(1) header(4) commitment(32)
-      const commitmentScript = Buffer.concat([
-        Buffer.from([0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]),
-        witnessCommitment,
-      ]);
-      result.default_witness_commitment = commitmentScript.toString("hex");
     }
 
     return result;
@@ -5488,6 +5525,21 @@ export class RPCServer {
 
   /**
    * Generate a single block.
+   *
+   * Two distinct call paths funnel through here:
+   *   - `generatetoaddress` / `generatetodescriptor` pass `transactions: []`
+   *     → run the canonical {@link BlockTemplateBuilder} mempool-greedy
+   *     selector (W123 BUG-21 / W154 BUG-1 / W155 BUG-31 wire-up).
+   *   - `generateblock` (BIP-22 with explicit txs) passes a user-supplied
+   *     `transactions[]` → skip mempool selection but build the coinbase via
+   *     the canonical {@link buildCoinbaseTransaction} helper so the
+   *     coinbase shape (MAX_SEQUENCE_NONFINAL, nLockTime=height-1,
+   *     params-aware subsidy) matches what BlockTemplateBuilder would emit
+   *     (closes W123 BUG-5/6 / W154 BUG-15/16 on the explicit-tx path).
+   *
+   * Both paths now use the helper's canonical coinbase / witness-commitment
+   * code, so the per-call divergence between this RPC and the BIP-22 GBT
+   * response is eliminated.
    */
   private async generateSingleBlock(
     coinbaseScript: Buffer,
@@ -5497,82 +5549,114 @@ export class RPCServer {
   ): Promise<{ hash: string; hex?: string }> {
     const bestBlock = this.chainState.getBestBlock();
     const height = bestBlock.height + 1;
+    const segwitActive = height >= this.params.segwitHeight;
 
-    // Build coinbase transaction
-    const subsidy = getBlockSubsidy(height, this.params);
+    // Pull the parent's MTP once — used for both the helper's setMedianTimePast
+    // (drives isFinalTx) and the MTP+1 timestamp floor on the explicit-tx path.
+    const parentEntry = this.headerSync.getHeader(bestBlock.hash);
+    const parentMTP = parentEntry
+      ? this.headerSync.getMedianTimePast(parentEntry)
+      : Math.floor(Date.now() / 1000);
 
-    // Calculate fees from transactions
-    let totalFees = 0n;
-    for (const tx of transactions) {
-      // For accurate fee calculation, we'd need to look up inputs
-      // For regtest, we'll trust the mempool entries or assume 0 fees for raw txs
-      const txid = getTxId(tx);
-      const entry = this.mempool.getTransaction(txid);
-      if (entry) {
-        totalFees += entry.fee;
+    let finalCoinbase: Transaction;
+    let selectedTxs: Transaction[];
+
+    if (transactions.length === 0) {
+      // --- generatetoaddress/generatetodescriptor path ------------------------
+      // Use the canonical BlockTemplateBuilder for mempool-greedy selection.
+      const builder = new BlockTemplateBuilder(
+        this.mempool,
+        this.chainState,
+        this.params,
+        {
+          deployments: this.getVersionBitsDeployments(),
+          getHeaderByHeight: (h: number) => {
+            const e = this.headerSync.getHeaderByHeight?.(h);
+            if (!e) return undefined;
+            return {
+              hash: e.hash,
+              height: e.height,
+              version: e.header.version,
+              medianTimePast: this.headerSync.getMedianTimePast(e),
+            };
+          },
+        }
+      );
+      builder.setMedianTimePast(parentMTP);
+      const template = builder.createTemplate(coinbaseScript);
+      finalCoinbase = template.coinbaseTx;
+      selectedTxs = template.transactions;
+    } else {
+      // --- generateblock (explicit-tx) path ----------------------------------
+      // No mempool selection — the user told us exactly which transactions to
+      // include. Use the canonical buildCoinbaseTransaction helper to keep the
+      // coinbase byte-identical to what BlockTemplateBuilder would produce.
+      let totalFees = 0n;
+      for (const tx of transactions) {
+        const txid = getTxId(tx);
+        const entry = this.mempool.getTransaction(txid);
+        if (entry) {
+          totalFees += entry.fee;
+        }
+      }
+      selectedTxs = transactions;
+
+      if (segwitActive) {
+        // Two-pass coinbase build: first construct with empty commitment to
+        // place the OP_RETURN output, then compute the actual commitment over
+        // the resulting witness merkle root and rebuild.
+        const witnessCommitment = computeWitnessCommitmentHash(selectedTxs);
+        finalCoinbase = buildCoinbaseTransaction(
+          height,
+          totalFees,
+          this.params,
+          coinbaseScript,
+          Buffer.alloc(0),
+          witnessCommitment
+        );
+      } else {
+        finalCoinbase = buildCoinbaseTransaction(
+          height,
+          totalFees,
+          this.params,
+          coinbaseScript,
+          Buffer.alloc(0),
+          Buffer.alloc(0)
+        );
       }
     }
 
-    // Build coinbase
-    const coinbaseTx = this.buildCoinbaseTx(height, subsidy + totalFees, coinbaseScript);
-
-    // All transactions for the block
-    const allTxs = [coinbaseTx, ...transactions];
-
-    // Compute merkle root
-    const txids = allTxs.map(tx => getTxId(tx));
+    // Block tx vector: coinbase first, then selected/explicit txs.
+    const allTxs: Transaction[] = [finalCoinbase, ...selectedTxs];
+    const txids = allTxs.map((tx) => getTxId(tx));
     const merkleRoot = computeMerkleRoot(txids);
 
-    // Compute witness commitment if needed
-    const segwitActive = height >= this.params.segwitHeight;
-    let finalCoinbase = coinbaseTx;
-
-    if (segwitActive) {
-      // Compute witness merkle root
-      const wtxids: Buffer[] = [Buffer.alloc(32, 0)]; // Coinbase wtxid is 32 zeros
-      for (const tx of transactions) {
-        wtxids.push(getWTxId(tx));
-      }
-      const witnessMerkleRoot = computeWitnessMerkleRoot(wtxids);
-      const witnessNonce = Buffer.alloc(32, 0);
-      const witnessCommitment = hash256(Buffer.concat([witnessMerkleRoot, witnessNonce]));
-
-      // Rebuild coinbase with witness commitment
-      finalCoinbase = this.buildCoinbaseTxWithWitnessCommitment(
-        height,
-        subsidy + totalFees,
-        coinbaseScript,
-        witnessCommitment
-      );
-
-      // Recompute txids with new coinbase
-      allTxs[0] = finalCoinbase;
-      txids[0] = getTxId(finalCoinbase);
-    }
-
-    // Build header
+    // Header. Target is regtest's powLimit (this RPC is regtest-only — gated
+    // upstream by `params.fPowNoRetargeting`).
     const target = this.params.powLimit;
     const bits = bigIntToCompact(target);
+    const blockVersion = this.computeNextBlockVersion(bestBlock.height);
 
-    // Compute block version via BIP9 state machine (same fix as getblocktemplate).
-    // Bug fix: previously hardcoded 0x20000000.
-    const genToAddrVersion = this.computeNextBlockVersion(bestBlock.height);
+    // BUG-20 fix: timestamp must respect MTP+1 (Core node/miner.cpp:52-53
+    // UpdateTime → max(GetMinimumTime, now)). Previously this path emitted
+    // Math.floor(Date.now()/1000) with no MTP floor.
+    const nowSecs = Math.floor(Date.now() / 1000);
+    const timestamp = Math.max(nowSecs, parentMTP + 1);
 
     let header: BlockHeader = {
-      version: genToAddrVersion,
+      version: blockVersion,
       prevBlock: bestBlock.hash,
-      merkleRoot: computeMerkleRoot(txids),
-      timestamp: Math.floor(Date.now() / 1000),
+      merkleRoot,
+      timestamp,
       bits,
       nonce: 0,
     };
 
-    // Mine the block (find valid nonce)
+    // Mine the block (find valid nonce).
     let found = false;
     for (let nonce = 0; nonce < maxTries && nonce < 0xffffffff; nonce++) {
       header = { ...header, nonce };
       const blockHash = getBlockHash(header);
-
       if (checkProofOfWork(blockHash, bits, this.params)) {
         found = true;
         break;
@@ -5583,164 +5667,29 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Failed to find valid nonce");
     }
 
-    // Build the block
     const block: Block = {
       header,
       transactions: allTxs,
     };
 
     const blockHash = getBlockHash(header);
-    // Return hashes in display order (reversed bytes), consistent with getblockhash/getbestblockhash
+    // Return hashes in display order (reversed bytes), consistent with
+    // getblockhash/getbestblockhash.
     const blockHashHex = Buffer.from(blockHash).reverse().toString("hex");
 
     if (submit) {
-      // Connect the block to the chain
       await this.chainState.connectBlock(block, height);
-
-      // Add the new header to headerSync so we can serve it to peers
-      // who send getheaders after receiving our inv announcement.
       await this.headerSync.processHeaders([block.header], null);
-
-      // Remove mined transactions from mempool
-      for (const tx of transactions) {
+      for (const tx of selectedTxs) {
         const txid = getTxId(tx);
         this.mempool.removeTransaction(txid);
       }
-
-      // Announce new block to all connected peers
       this.broadcastBlockInv(blockHash);
-
       return { hash: blockHashHex };
     } else {
-      // Return block hex without submitting
       const blockHex = serializeBlock(block).toString("hex");
       return { hash: blockHashHex, hex: blockHex };
     }
-  }
-
-  /**
-   * Build a coinbase transaction.
-   */
-  private buildCoinbaseTx(height: number, value: bigint, scriptPubKey: Buffer): Transaction {
-    // BIP34 height encoding
-    const heightPush = this.encodeBIP34Height(height);
-
-    return {
-      version: 2,
-      inputs: [
-        {
-          prevOut: {
-            txid: Buffer.alloc(32, 0),
-            vout: 0xffffffff,
-          },
-          scriptSig: heightPush,
-          sequence: 0xffffffff,
-          witness: [],
-        },
-      ],
-      outputs: [
-        {
-          value,
-          scriptPubKey,
-        },
-      ],
-      lockTime: 0,
-    };
-  }
-
-  /**
-   * Build a coinbase transaction with witness commitment.
-   */
-  private buildCoinbaseTxWithWitnessCommitment(
-    height: number,
-    value: bigint,
-    scriptPubKey: Buffer,
-    witnessCommitment: Buffer
-  ): Transaction {
-    const heightPush = this.encodeBIP34Height(height);
-
-    // Witness commitment output: OP_RETURN 0x24 0xaa21a9ed <32-byte commitment>
-    const commitmentScript = Buffer.concat([
-      Buffer.from([0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]),
-      witnessCommitment,
-    ]);
-
-    return {
-      version: 2,
-      inputs: [
-        {
-          prevOut: {
-            txid: Buffer.alloc(32, 0),
-            vout: 0xffffffff,
-          },
-          scriptSig: heightPush,
-          sequence: 0xffffffff,
-          witness: [Buffer.alloc(32, 0)], // Witness nonce
-        },
-      ],
-      outputs: [
-        {
-          value,
-          scriptPubKey,
-        },
-        {
-          value: 0n,
-          scriptPubKey: commitmentScript,
-        },
-      ],
-      lockTime: 0,
-    };
-  }
-
-  /**
-   * Encode height for BIP34 coinbase scriptSig.
-   */
-  private encodeBIP34Height(height: number): Buffer {
-    if (height < 0) {
-      throw new Error("Height cannot be negative");
-    }
-
-    if (height === 0) {
-      return Buffer.from([0x00]); // OP_0
-    }
-
-    if (height >= 1 && height <= 16) {
-      return Buffer.from([0x50 + height]); // OP_1 to OP_16
-    }
-
-    // For heights >= 17, use minimal push encoding
-    const heightBytes = this.encodeScriptNum(height);
-    return Buffer.concat([
-      Buffer.from([heightBytes.length]),
-      heightBytes,
-    ]);
-  }
-
-  /**
-   * Encode a number as a minimal CScript number.
-   */
-  private encodeScriptNum(n: number): Buffer {
-    if (n === 0) {
-      return Buffer.alloc(0);
-    }
-
-    const negative = n < 0;
-    let absValue = Math.abs(n);
-    const result: number[] = [];
-
-    while (absValue > 0) {
-      result.push(absValue & 0xff);
-      absValue >>= 8;
-    }
-
-    // If MSB has high bit set and number is positive, add 0x00
-    if (result[result.length - 1] & 0x80) {
-      result.push(negative ? 0x80 : 0x00);
-    } else if (negative) {
-      result[result.length - 1] |= 0x80;
-    }
-
-    return Buffer.from(result);
   }
 
   // ========== Pruning Methods ==========
@@ -5783,20 +5732,13 @@ export class RPCServer {
     return result.firstUnprunedHeight;
   }
 
-  /**
-   * Calculate block subsidy for a given height.
-   */
-  private getBlockSubsidy(height: number): bigint {
-    const INITIAL_SUBSIDY = 5_000_000_000n; // 50 BTC in satoshis
-    const HALVING_INTERVAL = 210_000;
-
-    const halvings = Math.floor(height / HALVING_INTERVAL);
-    if (halvings >= 64) {
-      return 0n;
-    }
-
-    return INITIAL_SUBSIDY >> BigInt(halvings);
-  }
+  // The private `getBlockSubsidy(height)` previously living here hardcoded
+  // `HALVING_INTERVAL = 210_000` regardless of `params.subsidyHalvingInterval`
+  // and disagreed with `consensus/params.ts::getBlockSubsidy` (W145 BUG-1 /
+  // W154 BUG-18 — the canonical "two-pipeline guard"). Removed by the
+  // BlockTemplateBuilder wire-up; all callers now route through the
+  // params-aware version imported from `../consensus/params.js` (either via
+  // BlockTemplateBuilder.createTemplate or buildCoinbaseTransaction).
 
   // ========== Chain Management Methods ==========
 

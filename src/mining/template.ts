@@ -145,6 +145,170 @@ const MAX_SEQUENCE_NONFINAL = 0xfffffffe;
 const WITNESS_COMMITMENT_HEADER = Buffer.from([0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]);
 
 /**
+ * Encode a number as a minimal CScript number (little-endian with sign handling).
+ *
+ * Exported standalone so `generateblock` (which builds blocks with arbitrary
+ * user-supplied transactions, not mempool selection, and therefore cannot use
+ * `BlockTemplateBuilder.createTemplate` directly) can reuse the same encoding
+ * as the canonical helper.
+ */
+export function encodeScriptNum(n: number): Buffer {
+  if (n === 0) {
+    return Buffer.alloc(0);
+  }
+
+  const negative = n < 0;
+  let absValue = Math.abs(n);
+  const result: number[] = [];
+
+  while (absValue > 0) {
+    result.push(absValue & 0xff);
+    absValue >>= 8;
+  }
+
+  // If the most significant byte has the high bit set and the number is positive,
+  // add a 0x00 byte to avoid it being interpreted as negative
+  if (result[result.length - 1] & 0x80) {
+    result.push(negative ? 0x80 : 0x00);
+  } else if (negative) {
+    result[result.length - 1] |= 0x80;
+  }
+
+  return Buffer.from(result);
+}
+
+/**
+ * Encode height as BIP34 push data for coinbase scriptSig.
+ *
+ * BIP34 requires the height to be pushed using minimal CScript encoding:
+ * - Heights 0: OP_0 (0x00)
+ * - Heights 1-16: OP_1 to OP_16 (0x51-0x60)
+ * - Heights 17+: [length byte] [height in little-endian]
+ *
+ * Exported alongside {@link encodeScriptNum} so `generateblock` and the
+ * production RPC layer can share the canonical encoder used by
+ * {@link BlockTemplateBuilder.createTemplate}.
+ */
+export function encodeBIP34Height(height: number): Buffer {
+  if (height < 0) {
+    throw new Error("Height cannot be negative");
+  }
+
+  if (height === 0) {
+    return Buffer.from([0x00]); // OP_0
+  }
+
+  if (height >= 1 && height <= 16) {
+    return Buffer.from([0x50 + height]); // OP_1 to OP_16
+  }
+
+  // For heights >= 17, use minimal push encoding
+  const heightBytes = encodeScriptNum(height);
+  return Buffer.concat([
+    Buffer.from([heightBytes.length]),
+    heightBytes,
+  ]);
+}
+
+/**
+ * Build a coinbase transaction outside the BlockTemplateBuilder instance.
+ *
+ * Mirrors the private `BlockTemplateBuilder.buildCoinbase` method byte-for-byte
+ * so the `generateblock` RPC (which selects user-supplied transactions instead
+ * of mempool-greedy selection) emits a coinbase that is consensus-identical to
+ * the one BlockTemplateBuilder produces — fixing W123 BUG-5 (sequence) and
+ * BUG-6 (lockTime) on the explicit-tx mining path without requiring a full
+ * BlockTemplateBuilder call.
+ *
+ * Reference: Bitcoin Core `node/miner.cpp::CreateNewBlock` (lines 162-199):
+ *   - `vin[0].nSequence = CTxIn::MAX_SEQUENCE_NONFINAL` (L171)
+ *   - `vin[0].scriptSig = CScript() << nHeight` + optional extranonce
+ *   - `vout[0].nValue = nFees + GetBlockSubsidy(nHeight, params)`
+ *   - `nLockTime = static_cast<uint32_t>(nHeight - 1)` (L196)
+ *
+ * @param height - Height of the block being assembled (parent.height + 1)
+ * @param fees - Total fees collected from selected transactions
+ * @param params - Consensus params (drives `getBlockSubsidy`)
+ * @param coinbaseScript - scriptPubKey for the miner's reward output
+ * @param extraNonce - Optional bytes appended to scriptSig after the height push
+ * @param witnessCommitment - 32-byte witness commitment (segwit); pass `Buffer.alloc(0)` pre-segwit
+ */
+export function buildCoinbaseTransaction(
+  height: number,
+  fees: bigint,
+  params: ConsensusParams,
+  coinbaseScript: Buffer,
+  extraNonce: Buffer = Buffer.alloc(0),
+  witnessCommitment: Buffer = Buffer.alloc(0)
+): Transaction {
+  const subsidy = getBlockSubsidy(height, params);
+  const totalReward = subsidy + fees;
+
+  const heightPush = encodeBIP34Height(height);
+  const scriptSig = Buffer.concat([heightPush, extraNonce]);
+
+  const inputs: TxIn[] = [
+    {
+      prevOut: {
+        txid: Buffer.alloc(32, 0),
+        vout: 0xffffffff,
+      },
+      scriptSig,
+      sequence: MAX_SEQUENCE_NONFINAL,
+      witness: witnessCommitment.length > 0 ? [Buffer.alloc(32, 0)] : [],
+    },
+  ];
+
+  const outputs: TxOut[] = [
+    {
+      value: totalReward,
+      scriptPubKey: coinbaseScript,
+    },
+  ];
+
+  if (witnessCommitment.length === 32) {
+    const commitmentScript = Buffer.concat([
+      WITNESS_COMMITMENT_HEADER,
+      witnessCommitment,
+    ]);
+    outputs.push({
+      value: 0n,
+      scriptPubKey: commitmentScript,
+    });
+  }
+
+  return {
+    version: 2,
+    inputs,
+    outputs,
+    lockTime: height > 0 ? height - 1 : 0,
+  };
+}
+
+/**
+ * Compute the BIP-141 witness commitment for a list of non-coinbase transactions.
+ *
+ * commitment = hash256(witness_merkle_root || witness_nonce)
+ *
+ * The witness merkle root uses wtxids, with the coinbase wtxid forced to 32
+ * zero bytes per BIP-141. The witness nonce in the coinbase input witness is
+ * always 32 zero bytes — Core supports operator-chosen nonces but the
+ * canonical empty-nonce form is what every other production miner emits.
+ *
+ * Exported alongside {@link buildCoinbaseTransaction} so the production RPC
+ * layer can compute the commitment exactly the way BlockTemplateBuilder does.
+ */
+export function computeWitnessCommitmentHash(txs: Transaction[]): Buffer {
+  const wtxids: Buffer[] = [Buffer.alloc(32, 0)]; // Coinbase wtxid placeholder
+  for (const tx of txs) {
+    wtxids.push(getWTxId(tx));
+  }
+  const witnessMerkleRoot = computeWitnessMerkleRoot(wtxids);
+  const witnessNonce = Buffer.alloc(32, 0);
+  return hash256(Buffer.concat([witnessMerkleRoot, witnessNonce]));
+}
+
+/**
  * Block template builder.
  *
  * Constructs valid block templates by selecting transactions from the mempool,
@@ -474,130 +638,18 @@ export class BlockTemplateBuilder {
     extraNonce: Buffer,
     witnessCommitment: Buffer
   ): Transaction {
-    // Calculate subsidy
-    const subsidy = getBlockSubsidy(height, this.params);
-    const totalReward = subsidy + fees;
-
-    // Build BIP34 height push for scriptSig
-    const heightPush = this.encodeBIP34Height(height);
-
-    // Build scriptSig: height push + extraNonce
-    const scriptSig = Buffer.concat([heightPush, extraNonce]);
-
-    // Build inputs
-    const inputs: TxIn[] = [
-      {
-        prevOut: {
-          txid: Buffer.alloc(32, 0),
-          vout: 0xffffffff,
-        },
-        scriptSig,
-        // Bug fix 6: use MAX_SEQUENCE_NONFINAL (0xFFFFFFFE), not SEQUENCE_FINAL
-        // (0xFFFFFFFF). With SEQUENCE_FINAL, IsFinalTx ignores nLockTime entirely
-        // and the coinbase's height-minus-one timelock has no effect.
-        // Core comment: "Make sure timelock is enforced." (node/miner.cpp:171)
-        sequence: MAX_SEQUENCE_NONFINAL,
-        witness: witnessCommitment.length > 0 ? [Buffer.alloc(32, 0)] : [], // Witness nonce if segwit
-      },
-    ];
-
-    // Build outputs
-    const outputs: TxOut[] = [
-      {
-        value: totalReward,
-        scriptPubKey: coinbaseScript,
-      },
-    ];
-
-    // Add witness commitment output if needed
-    if (witnessCommitment.length === 32) {
-      const commitmentScript = Buffer.concat([
-        WITNESS_COMMITMENT_HEADER,
-        witnessCommitment,
-      ]);
-      outputs.push({
-        value: 0n,
-        scriptPubKey: commitmentScript,
-      });
-    }
-
-    return {
-      version: 2,
-      inputs,
-      outputs,
-      // Bug fix 5: coinbase lockTime must be nHeight - 1, not 0.
-      // This is the "height timelock" that ensures the coinbase can't be replayed
-      // at a lower height. Enforced because sequence = MAX_SEQUENCE_NONFINAL.
-      // Reference: node/miner.cpp:196 "coinbaseTx.nLockTime = static_cast<uint32_t>(nHeight - 1)"
-      lockTime: height > 0 ? height - 1 : 0,
-    };
-  }
-
-  /**
-   * Encode height as BIP34 push data for coinbase scriptSig.
-   *
-   * BIP34 requires the height to be pushed using minimal CScript encoding:
-   * - Heights 0: OP_0 (0x00)
-   * - Heights 1-16: OP_1 to OP_16 (0x51-0x60)
-   * - Heights 17+: [length byte] [height in little-endian]
-   *
-   * For heights >= 17, we use the minimal encoding which is:
-   * - 1 byte for heights 17-127 (since 0x00 prefix needed for >= 128 to avoid negative)
-   * - 2 bytes for heights 128-32767
-   * - etc.
-   */
-  private encodeBIP34Height(height: number): Buffer {
-    if (height < 0) {
-      throw new Error("Height cannot be negative");
-    }
-
-    if (height === 0) {
-      // OP_0
-      return Buffer.from([0x00]);
-    }
-
-    if (height >= 1 && height <= 16) {
-      // OP_1 to OP_16 (0x51 to 0x60)
-      return Buffer.from([0x50 + height]);
-    }
-
-    // For heights >= 17, use minimal push encoding
-    // Convert height to little-endian bytes, with minimal encoding
-    const heightBytes = this.encodeScriptNum(height);
-
-    // Push opcode + height bytes
-    return Buffer.concat([
-      Buffer.from([heightBytes.length]), // Push length (will be 1-4 for reasonable heights)
-      heightBytes,
-    ]);
-  }
-
-  /**
-   * Encode a number as a minimal CScript number (little-endian with sign handling).
-   */
-  private encodeScriptNum(n: number): Buffer {
-    if (n === 0) {
-      return Buffer.alloc(0);
-    }
-
-    const negative = n < 0;
-    let absValue = Math.abs(n);
-    const result: number[] = [];
-
-    while (absValue > 0) {
-      result.push(absValue & 0xff);
-      absValue >>= 8;
-    }
-
-    // If the most significant byte has the high bit set and the number is positive,
-    // add a 0x00 byte to avoid it being interpreted as negative
-    if (result[result.length - 1] & 0x80) {
-      result.push(negative ? 0x80 : 0x00);
-    } else if (negative) {
-      result[result.length - 1] |= 0x80;
-    }
-
-    return Buffer.from(result);
+    // Delegates to the top-level {@link buildCoinbaseTransaction} so the
+    // standalone export (used by `generateblock` and other RPC entry points)
+    // and this instance method stay byte-identical. Keeps a one-pipeline
+    // contract for sequence / lockTime / subsidy / commitment output.
+    return buildCoinbaseTransaction(
+      height,
+      fees,
+      this.params,
+      coinbaseScript,
+      extraNonce,
+      witnessCommitment
+    );
   }
 
   /**
