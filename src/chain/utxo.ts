@@ -1248,10 +1248,89 @@ export class UTXOManager implements UTXOSet {
 
   /**
    * Clear the in-memory cache.
+   *
+   * Discards every dirty + clean entry by replacing the {@link CoinsViewCache}
+   * with a fresh one.  Used by the connectBlock failure path
+   * (`sync/blocks.ts`) to throw away partially-applied UTXO mutations from a
+   * block that failed mid-validation.
+   *
+   * IMPORTANT — view-best-block reconciliation:
+   * Replacing the cache does NOT by itself reset the *view's best-block
+   * pointer*.  The `hashBlock` lives in two places: the new `CoinsViewCache`
+   * (starts all-zero, lazy-loads from the base) and the long-lived
+   * {@link CoinsViewDB} (`this.viewDB.bestBlockHash`).  `connectBlock`
+   * advances both via {@link setBestBlock} *before* the chain-state flush,
+   * so a block that connects-in-memory but fails the very next block leaves
+   * `viewDB.bestBlockHash` pointing one (or more) block(s) ahead of the
+   * persisted `CHAIN_STATE` tip.  A subsequent retry then re-reads that
+   * stale pointer through the fresh cache's lazy-load and trips the
+   * `view-out-of-sync` gate in `coreConnectBlockChecks` (validation.cpp:2333)
+   * — a permanent wedge, because every retry repeats the same clear.
+   *
+   * To make `clearCache` a true "rewind to a known-good state", callers
+   * SHOULD pass `bestBlockAfterClear` — the hash of the chain tip the
+   * UTXO set on disk actually reflects (i.e. the last *flushed* block, or
+   * genesis).  When supplied, both the fresh cache AND the `CoinsViewDB`
+   * are re-pointed at it, so the in-memory view is consistent with disk.
+   *
+   * Backwards-compatible: when the argument is omitted the old behaviour
+   * is preserved (cache replaced, `viewDB.bestBlockHash` untouched).
+   *
+   * @param bestBlockAfterClear - Internal-byte-order (32-byte) hash of the
+   *   block the persisted UTXO set reflects.  Omit only when the caller is
+   *   certain the view pointer is already correct (e.g. cache cleared
+   *   before any block was connected).
    */
-  clearCache(): void {
+  clearCache(bestBlockAfterClear?: Buffer): void {
     // Create a new cache
     this.cache = new CoinsViewCache(this.viewDB, this.maxCacheBytes);
+    if (bestBlockAfterClear !== undefined) {
+      // Re-point BOTH the new cache and the long-lived CoinsViewDB at the
+      // on-disk tip so the view-best-block invariant holds again.
+      this.setBestBlock(bestBlockAfterClear);
+    }
+  }
+
+  /**
+   * Reconcile the UTXO view's in-memory best-block pointer with the
+   * authoritative persisted chain tip.
+   *
+   * This is hotbuns' analogue of Bitcoin Core's startup chainstate
+   * reconciliation (`Chainstate::LoadChainTip` + `ReplayBlocks`,
+   * validation.cpp:4546 / :4773).  Core persists the coins-DB best block
+   * (`DB_BEST_BLOCK`) separately from the block index and, on startup,
+   * rewinds/rolls-forward whichever is ahead so the two agree.
+   *
+   * hotbuns' on-disk model is simpler: the UTXO set and the chain tip
+   * (`CHAIN_STATE` record) are committed in ONE atomic LevelDB batch
+   * (see `CoinsViewDB.batchWrite` `extraOps` + `sync/blocks.ts` flush),
+   * so on disk they can never truly diverge.  The divergence that *does*
+   * happen is purely in-memory: `CoinsViewDB.bestBlockHash` is mutated by
+   * `setBestBlock`/`batchWrite` on every connected block, but the
+   * `CHAIN_STATE` record is only rewritten on a flush.  A connectBlock
+   * failure between a non-flushed connect and the next block then leaves
+   * the in-memory view pointer ahead of disk.
+   *
+   * Calling this with the persisted `CHAIN_STATE` tip (a) at startup and
+   * (b) after a failed connect makes the in-memory view authoritative-
+   * consistent again, closing the `view-out-of-sync` wedge.
+   *
+   * It deliberately does NOT touch the UTXO *coins* — those are already
+   * correct on disk (atomic batch); only the best-block *pointer* is
+   * realigned.  A no-op when the pointer already matches.
+   *
+   * @param persistedTipHash - Internal-byte-order (32-byte) hash of the
+   *   block recorded in the persisted `CHAIN_STATE` record.
+   * @returns `true` if the pointer had drifted and was corrected,
+   *   `false` if it already matched (or the cache hadn't loaded a
+   *   pointer yet, in which case it is simply seeded).
+   */
+  async reconcileBestBlock(persistedTipHash: Buffer): Promise<boolean> {
+    const current = await this.cache.getBestBlock();
+    const drifted = !current.equals(persistedTipHash);
+    // Seed/realign both the cache and the backing CoinsViewDB.
+    this.setBestBlock(persistedTipHash);
+    return drifted;
   }
 
   /**

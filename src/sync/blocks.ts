@@ -1472,8 +1472,51 @@ export class BlockSync {
         this.state.downloadedBlocks.delete(hashHex);
         this.downloadedBlockPeers.delete(hashHex);
 
-        // Reset the UTXO cache to avoid corrupt state from partial processing
-        this.utxoManager.clearCache();
+        // Reset the UTXO cache to avoid corrupt state from partial processing.
+        //
+        // CRITICAL — view-best-block reconciliation on failure:
+        // `coreConnectBlockChecks` advances the UTXO view's best-block
+        // pointer (`utxoManager.setBestBlock`) for a block that passes its
+        // in-memory checks *before* the chain-state flush.  IBD only flushes
+        // at the tip or every FLUSH_INTERVAL blocks, so a block can connect
+        // in-memory (view pointer advanced) without the persisted
+        // `CHAIN_STATE` record advancing.  If the very next block then fails
+        // validation, a bare `clearCache()` discards the cache but leaves
+        // `CoinsViewDB.bestBlockHash` pointing AHEAD of the on-disk tip.
+        // The retry re-reads that stale pointer through the fresh cache's
+        // lazy-load and trips the `view-out-of-sync` gate
+        // (validation.cpp:2333) — a permanent wedge, since every retry
+        // repeats the same clear.  This was the May 2026 mainnet h=950148
+        // stall: block 950149 failed a consensus check, the view pointer
+        // was stuck at 950148, and 950148 could never reconnect.
+        //
+        // Fix: re-point the view at the block the UTXO set on disk actually
+        // reflects — the last *flushed* block (`lastFlushedHeight`).  The
+        // retry then sees a consistent view and re-processes from
+        // `lastFlushedHeight + 1` correctly.  Falls back to a bare clear
+        // (old behaviour) only if that header can't be resolved.
+        const flushedTipEntry = this.headerSync.getHeaderByHeight(
+          this.lastFlushedHeight
+        );
+        if (flushedTipEntry && this.lastFlushedHeight > 0) {
+          this.utxoManager.clearCache(flushedTipEntry.hash);
+        } else if (this.lastFlushedHeight === 0) {
+          // Pre-first-flush: the on-disk UTXO set is the genesis state.
+          // The all-zero "fresh view" sentinel is correct here, so a bare
+          // clear (which leaves the pointer untouched / re-seeds all-zero
+          // on next lazy-load) is exactly right.
+          this.utxoManager.clearCache();
+        } else {
+          // lastFlushedHeight > 0 but its header is missing — should not
+          // happen (headers are synced before blocks).  Bare clear keeps
+          // the old behaviour; the consecutive-failure banner below will
+          // still surface the stall to the operator.
+          console.warn(
+            `[connect-fail] could not resolve header for lastFlushedHeight=` +
+              `${this.lastFlushedHeight}; UTXO view best-block left unreconciled`
+          );
+          this.utxoManager.clearCache();
+        }
 
         if (this.consecutiveFailures >= 3) {
           // 2026-05-02 diagnostic split (mirrors lunarblock d9d9af4): classify
