@@ -1610,8 +1610,21 @@ export function verifyInputSignature(
     // blocks are not validated with rules that were not yet active.
     const flags = interp.scriptFlagsFromBitmask(scriptVerifyFlags);
 
+    // Spending-tx context for tapscript OP_CHECKLOCKTIMEVERIFY /
+    // OP_CHECKSEQUENCEVERIFY (BIP-342). Without it, executeTapscript's CLTV/CSV
+    // handlers see txLockTime/txSequence === undefined and fail-safe with
+    // SCRIPT_ERR_UNSATISFIED_LOCKTIME — wrongly rejecting every valid tapscript
+    // timelock spend (e.g. mainnet block 950149 tx 1b0d64e4…f54d input 0).
+    // The catch-all `verifyScript` branch below already threads this; the P2TR
+    // branch was the one omission.
+    const txContext = {
+      txVersion: tx.version,
+      txLockTime: tx.lockTime,
+      txSequence: input.sequence,
+    };
+
     try {
-      const ok = interp.verifyTaproot(scriptPubKey, input.witness, flags, taprootCtx);
+      const ok = interp.verifyTaproot(scriptPubKey, input.witness, flags, taprootCtx, txContext);
       if (!ok) {
         return { valid: false, inputIndex, error: "Taproot verify returned false" };
       }
