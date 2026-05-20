@@ -1021,6 +1021,26 @@ export class ChainStateManager {
 
   /**
    * Load chain state from database.
+   *
+   * Startup chainstate reconciliation
+   * ---------------------------------
+   * After reading the persisted `CHAIN_STATE` record (the single
+   * authoritative tip pointer — hotbuns commits the UTXO set and this
+   * record in ONE atomic LevelDB batch, so on disk they cannot diverge),
+   * we seed the UTXO view's in-memory best-block pointer to match via
+   * {@link UTXOManager.reconcileBestBlock}.
+   *
+   * This is hotbuns' analogue of Bitcoin Core's `Chainstate::LoadChainTip`
+   * (validation.cpp:4546): Core makes the in-memory chain tip agree with
+   * the coins-view best block on startup.  Pre-fix, hotbuns' `load()`
+   * populated `this.bestBlock` but left the `CoinsViewDB.bestBlockHash`
+   * at its constructor default (all-zero).  That was *masked* at startup
+   * — `coreConnectBlockChecks` treats an all-zero view pointer as the
+   * "fresh start" sentinel and skips the `view-out-of-sync` gate — but
+   * it meant the gate gave no protection on the first post-restart
+   * block, and any later in-memory drift had no startup baseline to be
+   * reconciled against.  Seeding it here closes that gap and gives the
+   * gate a correct baseline from block 1.
    */
   async load(): Promise<void> {
     const state = await this.db.getChainState();
@@ -1031,6 +1051,18 @@ export class ChainStateManager {
         height: state.bestHeight,
         chainWork: state.totalWork,
       };
+      // Reconcile the UTXO view's in-memory best-block pointer with the
+      // persisted chain tip (Core: LoadChainTip).  drifted=true here would
+      // indicate the view pointer had a non-genesis stale value at startup
+      // (only possible via an in-process code path, since the constructor
+      // default is all-zero); we log it for forensic visibility.
+      const drifted = await this.utxo.reconcileBestBlock(this.bestBlock.hash);
+      if (drifted) {
+        console.log(
+          `[chainstate] reconciled UTXO view best-block to persisted tip ` +
+            `${this.bestBlock.hash.toString("hex")} at height ${this.bestBlock.height}`
+        );
+      }
     } else {
       // Initialize with genesis block
       const genesisWork = this.calculateWork(this.params.powLimitBits);
