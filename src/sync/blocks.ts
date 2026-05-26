@@ -615,6 +615,7 @@ export class BlockSync {
             if (pending && pending.peer === peerKey) {
               console.log(`NOTFOUND: block hash=${hashHex.slice(0, 16)} from=${peerKey}, clearing pending`);
               this.state.pendingBlocks.delete(hashHex);
+              peer.removeBlockInFlight(hashHex);
               const peerInfo = this.peerInFlight.get(peerKey);
               if (peerInfo) {
                 peerInfo.count = Math.max(0, peerInfo.count - 1);
@@ -793,6 +794,7 @@ export class BlockSync {
 
     // Remove from pending
     this.state.pendingBlocks.delete(hashHex);
+    peer.removeBlockInFlight(hashHex);
 
     // Update peer tracking
     const peerInfo = this.peerInFlight.get(peerKey);
@@ -1297,6 +1299,17 @@ export class BlockSync {
    * Send a getdata message requesting blocks.
    */
   private sendGetData(peer: Peer, hashes: Buffer[]): void {
+    // Register each requested block with the peer's in-flight tracker so
+    // PeerManager.evictStaleOutboundPeers() can see this peer is actively
+    // serving a download and won't drop it before delivery. Without this,
+    // hasBlocksInFlight() always returns false in production (only the
+    // BlockSync-local pendingBlocks map was tracking requests), peers got
+    // evicted after STALE_TIP_THRESHOLD_MS (30 min) of "no blocks", and
+    // pend grew to capacity while dl stayed at 0 — see bug #132.
+    for (const hash of hashes) {
+      peer.addBlockInFlight(hash.toString("hex"));
+    }
+
     // Batch into multiple messages if needed
     for (let i = 0; i < hashes.length; i += MAX_GETDATA_ITEMS) {
       const batch = hashes.slice(i, i + MAX_GETDATA_ITEMS);
@@ -3128,12 +3141,22 @@ export class BlockSync {
     }
 
     // Re-request stalled blocks
+    const stalledPeerLookup = new Map<string, Peer>();
+    if (this.peerManager) {
+      for (const p of this.peerManager.getConnectedPeers()) {
+        stalledPeerLookup.set(`${p.host}:${p.port}`, p);
+      }
+    }
     for (const hashHex of stalledBlocks) {
       const pending = this.state.pendingBlocks.get(hashHex);
       if (!pending) continue;
 
-      // Remove from pending
+      // Remove from pending (both local map and peer's in-flight tracker)
       this.state.pendingBlocks.delete(hashHex);
+      const stalledPeer = stalledPeerLookup.get(pending.peer);
+      if (stalledPeer) {
+        stalledPeer.removeBlockInFlight(hashHex);
+      }
 
       // Decrease peer in-flight count
       const peerInfo = this.peerInFlight.get(pending.peer);
