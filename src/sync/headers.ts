@@ -237,6 +237,31 @@ export class HeaderSync {
       this.requestHeaders(peer);
     });
 
+    // On peer disconnect, clear per-peer header-sync state so a future peer
+    // reusing the same `host:port` (which happens constantly for mainnet
+    // peers since outbound dest port is always 8333) can re-enter sync.
+    //
+    // BUG #139: without this, `syncingPeers` accumulates stale entries.
+    // When the peer at h:p disconnects mid-getheaders, the entry persists,
+    // and the next peer that connects at h:p hits the early-out at
+    // requestHeaders():766 — `if (this.syncingPeers.has(peerKey)) return;` —
+    // and never sends a getheaders. With high peer churn (mainnet) the
+    // entire fleet eventually winds up in this stale set, header sync
+    // wedges, bestHeader stops advancing, and requestBlocks() bails at
+    // blocks.ts:1101 because `nextHeightToRequest > bestHeader.height`.
+    // Symptom: `pend=0 dl=0 hdrs=<frozen>` for hours despite N peers.
+    //
+    // We also drop `peerSyncStates` (stale PRESYNC/REDOWNLOAD machine
+    // anchored at the OLD bestHeader) and `unconnectingHeadersCount`
+    // (stale ban-score against an IP that is now a fresh peer) so the
+    // fresh peer gets a fresh state machine.
+    peerManager.onMessage("__disconnect__", (peer) => {
+      const peerKey = `${peer.host}:${peer.port}`;
+      this.syncingPeers.delete(peerKey);
+      this.peerSyncStates.delete(peerKey);
+      this.unconnectingHeadersCount.delete(peerKey);
+    });
+
     // Handle incoming getheaders requests from peers (serve headers)
     peerManager.onMessage("getheaders", (peer, msg) => {
       if (msg.type === "getheaders") {
@@ -762,8 +787,12 @@ export class HeaderSync {
       return;
     }
 
-    // Avoid requesting from same peer multiple times
-    if (this.syncingPeers.has(peerKey)) {
+    // Avoid requesting from same peer multiple times.
+    // force=true callers (e.g. block-sync's inv-for-unknown-header path)
+    // explicitly want a fresh request even if one is supposedly already in
+    // flight — the prior request may have silently died, and `syncingPeers`
+    // is best-effort (only cleared on a successful response or on disconnect).
+    if (!force && this.syncingPeers.has(peerKey)) {
       return;
     }
 
