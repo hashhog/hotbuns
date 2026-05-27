@@ -542,9 +542,27 @@ export class BlockSync {
     // points *before* that block, so we'd try to spend the coin again — but
     // it's already gone from the DB → permanent "Missing UTXO" stall.
     //
-    // Fix: discard the dirty cache when a block is in flight.  We'll
-    // re-derive those entries on the next startup from lastFlushedHeight.
+    // Bug #132 (2026-05-26): the prior fix discarded the dirty cache with
+    // a bare clearCache() and let the caller's final flush() write
+    // chain-state separately. That left the disk with a chain-state
+    // pointer advanced past the actual UTXO content for blocks the cache
+    // had absorbed but not yet flushed (observed at h=950371 — 65 blocks
+    // of dirty UTXOs silently dropped, then `bad-txns-inputs-missingorspent`
+    // on the first connect after restart).
+    //
+    // Fix: wait up to 5s for the in-flight processOrderedBlocksInner loop
+    // to reach an iteration boundary (which respects `running=false` and
+    // exits naturally), then ALWAYS take the flush-with-chain-state path
+    // so the disk is consistent. If the loop hasn't drained in 5s, fall
+    // back to the old clearCache() — at that point the worst case is the
+    // historical bug, not worse than the prior behavior.
+    const drainDeadline = Date.now() + 5000;
+    while (this.processing && Date.now() < drainDeadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
     if (this.processing) {
+      // Drain timed out — fall back to the old destructive behavior.
+      // This is no worse than what the original code did unconditionally.
       this.utxoManager.clearCache();
     } else {
       // Flush any pending UTXO updates WITH chain state so shutdown is
