@@ -749,6 +749,82 @@ export class BlockSync {
       }
     });
 
+    // On peer disconnect, eagerly clean per-peer block-sync state.  Mirrors
+    // Bitcoin Core PeerManagerImpl::FinalizeNode (net_processing.cpp:1675-1730)
+    // which erases vBlocksInFlight + m_node_states[nodeid] when a peer is
+    // dropped.  Without this, three classes of bug ride on the 1 s
+    // `handleStalled` poll:
+    //
+    //   1. `peerInFlight[peerKey].count` leaks — the only paths that
+    //      decrement are handleBlock-on-delivery, the in-band stall handler
+    //      (lines 3180-3183), and the deadlock-fix path (lines 3267-3270).
+    //      The disconnect-cleanup loop (lines 3206-3214) used to delete the
+    //      pending entries but not touch the per-peer count.  If the same
+    //      host:port reconnected (common on mainnet, outbound dest port is
+    //      always 8333), the new peer inherited a stuck count > 0.  Over an
+    //      hour of churn this saturates every entry above
+    //      MAX_IN_FLIGHT_PER_PEER (=16) and `requestBlocks()` silently
+    //      refuses to assign anything.
+    //
+    //   2. Bug #139 fixed the headers side (header-sync state cleared on
+    //      disconnect — see headers.ts:258); but blocks had no equivalent.
+    //      Symptom: `pend=0 dl=1` (one out-of-order future block in the
+    //      buffer, zero outstanding requests) for hours, even with 10
+    //      connected peers, because the only catch-all path
+    //      (handleStalled lines 3199-3217) bails when pendingBlocks.size==0.
+    //      Observed live on mainnet 2026-05-27 at h=76051 — 14 hours stuck
+    //      after a peer-churn burst left zero pendings and no recovery
+    //      trigger fired.
+    //
+    //   3. peerInFlight + downloadedBlockPeers Maps grew without bound,
+    //      one stale entry per ever-seen host:port.  Not user-visible but
+    //      a slow memory leak over multi-day uptime.
+    //
+    // The fix here removes pending entries for this peer, decrements the
+    // count (so a reconnect doesn't inherit the stale value), purges the
+    // peerInFlight entry, prunes downloadedBlockPeers references, and
+    // forces a fresh requestBlocks() — the new peer (or any survivor) can
+    // now pick up the gap immediately rather than waiting for the next
+    // poll tick.
+    peerManager.onMessage("__disconnect__", (peer) => {
+      if (!this.running) return;
+      const peerKey = `${peer.host}:${peer.port}`;
+      let cleared = 0;
+      for (const [hashHex, pending] of this.state.pendingBlocks) {
+        if (pending.peer === peerKey) {
+          this.state.pendingBlocks.delete(hashHex);
+          if (pending.height < this.state.nextHeightToRequest) {
+            this.state.nextHeightToRequest = pending.height;
+          }
+          cleared++;
+        }
+      }
+      // Drop the per-peer in-flight tracker so a reconnect starts fresh.
+      // This is the core leak fix — without it, a reconnect at the same
+      // host:port carries forward a stuck count.
+      this.peerInFlight.delete(peerKey);
+      // Erase downloadedBlockPeers references — these are advisory (used to
+      // misbehavior-score the deliverer if validation later fails), and a
+      // stale ref to a disconnected peer is useless.
+      for (const [hashHex, key] of this.downloadedBlockPeers) {
+        if (key === peerKey) {
+          this.downloadedBlockPeers.delete(hashHex);
+        }
+      }
+      // Whether or not we cleared pendings, the topology changed — re-run
+      // requestBlocks so a surviving / freshly-connected peer can fill the
+      // gap immediately rather than waiting for the next 1 s stall tick.
+      // This is what closes the `pend=0 dl=1` deadlock above.
+      if (!this.ibdComplete) {
+        this.requestBlocks();
+      }
+      if (cleared > 0) {
+        console.log(
+          `[disconnect-cleanup] cleared ${cleared} pending blocks from ${peerKey}`
+        );
+      }
+    });
+
     // When new headers are fully processed (callback fires AFTER headerSync
     // has updated bestHeader), re-enter IBD if we have blocks to download.
     // This replaces the old "headers" message handler which suffered from a
@@ -3196,6 +3272,13 @@ export class BlockSync {
     // Clean up pending requests for peers that have disconnected.
     // Without this, requests to dead peers linger for the full stall
     // timeout, blocking progress when the buffer fills.
+    //
+    // The `__disconnect__` handler in registerWithPeerManager normally
+    // does this synchronously; this loop is the safety net for the rare
+    // case where a peer is dropped before the message handler can run
+    // (e.g. a hard socket error path that bypasses the disconnect event).
+    // Also decrements peerInfo.count and purges the stale peerInFlight
+    // entry — same leak-fix rationale as the disconnect handler.
     if (this.peerManager && this.state.pendingBlocks.size > 0) {
       const connectedPeers = new Set(
         this.peerManager
@@ -3203,14 +3286,28 @@ export class BlockSync {
           .map((p) => `${p.host}:${p.port}`)
       );
       let cleaned = 0;
+      const deadPeers = new Set<string>();
       for (const [hashHex, pending] of this.state.pendingBlocks) {
         if (!connectedPeers.has(pending.peer)) {
           this.state.pendingBlocks.delete(hashHex);
+          // Decrement the per-peer in-flight count so a reconnect doesn't
+          // inherit a stuck value above MAX_IN_FLIGHT_PER_PEER.
+          const peerInfo = this.peerInFlight.get(pending.peer);
+          if (peerInfo) {
+            peerInfo.count = Math.max(0, peerInfo.count - 1);
+          }
           if (pending.height < this.state.nextHeightToRequest) {
             this.state.nextHeightToRequest = pending.height;
           }
+          deadPeers.add(pending.peer);
           cleaned++;
         }
+      }
+      // Purge stale peerInFlight entries for the peers we just cleaned.
+      // Same rationale as the __disconnect__ handler: a reconnect at the
+      // same host:port should start fresh.
+      for (const dead of deadPeers) {
+        this.peerInFlight.delete(dead);
       }
       if (cleaned > 0) {
         this.requestBlocks();
@@ -3282,6 +3379,57 @@ export class BlockSync {
           }
         }
       }
+    }
+
+    // ── Catch-all: idle-with-headroom recovery ──
+    //
+    // The block-download pipeline must never go idle while there are headers
+    // ahead of the processing frontier.  Every other path in this function
+    // calls `requestBlocks()` only conditionally (cleared stalls, cleared
+    // disconnects, evicted deadlock).  An adversarial timing window slips
+    // through all of them:
+    //
+    //   1. We previously assigned N requests, advancing
+    //      `nextHeightToRequest` to N + previously-processed.
+    //   2. All N pendings either delivered (advancing nextHeightToProcess by
+    //      M < N) or got cleared by the disconnect cleanup above (which
+    //      rolls nextHeightToRequest back only to the lowest cleared
+    //      pending.height — which can still leave it above
+    //      `nextHeightToProcess + MAX_DOWNLOADED_BUFFER * 2`).
+    //   3. One out-of-order future block ends up in `downloadedBlocks`
+    //      (e.g. a cmpctblock-fallback fetch, or a delivery from an old
+    //      assignment that races a cleanup), so `dl > 0` but `pend == 0`.
+    //   4. `requestBlocks()` is called but the inner while-loop bails
+    //      immediately because `nextHeightToRequest > maxRequestHeight`
+    //      (the cap is nextHeightToProcess + 64, which the request pointer
+    //      already overshot in step 1).  No assignment happens.
+    //   5. No further trigger fires: handleBlock isn't called (nothing
+    //      arrives), the in-band stall path skips (pend == 0), the
+    //      disconnect path skips (no new disconnect), and the deadlock-fix
+    //      skips (dl < MAX_DOWNLOADED_BUFFER).  Stuck.
+    //
+    // Observed live on mainnet 2026-05-27 at h=76051 — `pend=0 dl=1 hdrs=
+    // 250783` for 14 hours, 10 healthy peers, 0 blocks in flight per
+    // `getpeerinfo`.  The dl=1 was a future block from a cmpctblock fetch.
+    //
+    // Fix: if we have headroom (process pointer < best-header AND
+    // outstanding work < window) AND no pendings, roll the request pointer
+    // back to nextHeightToProcess and retry.  This is the safety net for
+    // the entire request pipeline.  Cheap (one comparison + one Map.size
+    // read + at most one requestBlocks call per second), and guaranteed to
+    // be a no-op in the steady-state happy path because requestBlocks
+    // returns immediately when there's nothing to do.
+    const bestHeader = this.headerSync.getBestHeader();
+    if (
+      bestHeader &&
+      this.state.nextHeightToProcess <= bestHeader.height &&
+      this.state.pendingBlocks.size === 0 &&
+      this.state.downloadedBlocks.size < MAX_DOWNLOADED_BUFFER
+    ) {
+      if (this.state.nextHeightToRequest > this.state.nextHeightToProcess) {
+        this.state.nextHeightToRequest = this.state.nextHeightToProcess;
+      }
+      this.requestBlocks();
     }
   }
 

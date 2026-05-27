@@ -35,6 +35,13 @@ function createMockPeer(host = "127.0.0.1", port = 8333): any {
     state: "connected",
     versionPayload: { startHeight: 1000, services: 0x409n },
     send: mock(() => {}),
+    // sendGetData (blocks.ts) calls these on every requested block to
+    // mirror Bitcoin Core's per-peer block-in-flight tracking that
+    // prevents stale-tip eviction (see comment at sync/blocks.ts:1323
+    // re bug #132).  Stub so production code paths run cleanly in tests.
+    addBlockInFlight: mock(() => {}),
+    removeBlockInFlight: mock(() => {}),
+    misbehaving: mock(() => {}),
   };
 }
 
@@ -759,6 +766,177 @@ describe("BlockSync", () => {
       // would still resolve, surfacing as the audit's Pattern C
       // stale-confirmations bug once the read path is exercised.
       expect(await txDb.getTxIndex(coinbaseTxid)).toBeNull();
+    });
+  });
+
+  describe("peer disconnect cleanup", () => {
+    // Mainnet 2026-05-27 h=76051 stuck-at-pend=0-dl=1 incident.  After
+    // bug #139 (header-sync per-peer state leak) was fixed, an analogous
+    // leak persisted on the block-sync side: a disconnected peer's pending
+    // entries were cleared by the 1 s `handleStalled` poll, but
+    // `peerInFlight[peerKey].count` was never decremented.  A reconnect at
+    // the same host:port (common on mainnet — outbound dest port is always
+    // 8333) inherited the stuck count.  Once enough churn accumulated, all
+    // peerInFlight entries hit MAX_IN_FLIGHT_PER_PEER=16 and
+    // requestBlocks() silently refused to assign anything.  Symptom:
+    // `pend=0 dl=1` for 14 hours despite 10 healthy peers, zero blocks in
+    // flight per getpeerinfo.
+    test("decrements peerInfo.count when peer disconnects with pending blocks", async () => {
+      const peer = createMockPeer("10.0.0.1", 8333);
+      // Empty peerManager — peer is "disconnected" from handleStalled's POV
+      const peerManager = createMockPeerManager([]);
+
+      const genesis = headerSync.getBestHeader()!;
+      const block1 = createValidBlock(
+        genesis.hash,
+        genesis.header.timestamp + 600,
+        1
+      );
+      await headerSync.processHeaders([block1.header], peer);
+
+      const bs = new BlockSync(db, REGTEST, headerSync, peerManager);
+      (bs as any).running = true;
+      const peerKey = `${peer.host}:${peer.port}`;
+      (bs as any).peerInFlight.set(peerKey, {
+        count: 5,
+        lastResponse: Date.now(),
+        stallTimeout: 5000,
+        blocksDelivered: 0,
+        cooldownUntil: 0,
+      });
+      const hash = getBlockHash(block1.header);
+      bs.getState().pendingBlocks.set(hash.toString("hex"), {
+        height: 1,
+        peer: peerKey,
+        requestedAt: Date.now(),
+        timeout: 5000,
+      });
+
+      bs.handleStalled();
+
+      // Pending block cleared
+      expect(bs.getState().pendingBlocks.has(hash.toString("hex"))).toBe(
+        false
+      );
+      // peerInFlight entry purged so a reconnect starts fresh
+      expect((bs as any).peerInFlight.has(peerKey)).toBe(false);
+
+      await bs.stop();
+    });
+
+    test("__disconnect__ event clears per-peer state synchronously", async () => {
+      const peer = createMockPeer("10.0.0.2", 8333);
+      // Production-faithful: by the time PeerManager emits __disconnect__,
+      // the peer has already been removed from outboundPeers (see
+      // p2p/manager.ts:1843).  getConnectedPeers() must NOT include it,
+      // otherwise the post-disconnect requestBlocks() call would re-assign
+      // pending to the same dead peer.  An empty list mimics
+      // "peer is the only one and it just disconnected".
+      const peerManager = createMockPeerManager([]);
+
+      const genesis = headerSync.getBestHeader()!;
+      const block1 = createValidBlock(
+        genesis.hash,
+        genesis.header.timestamp + 600,
+        1
+      );
+      await headerSync.processHeaders([block1.header], peer);
+
+      const bs = new BlockSync(db, REGTEST, headerSync, peerManager);
+      bs.registerWithPeerManager(peerManager);
+      (bs as any).running = true;
+      const peerKey = `${peer.host}:${peer.port}`;
+      (bs as any).peerInFlight.set(peerKey, {
+        count: 3,
+        lastResponse: Date.now(),
+        stallTimeout: 5000,
+        blocksDelivered: 0,
+        cooldownUntil: 0,
+      });
+      const hash = getBlockHash(block1.header);
+      bs.getState().pendingBlocks.set(hash.toString("hex"), {
+        height: 1,
+        peer: peerKey,
+        requestedAt: Date.now(),
+        timeout: 5000,
+      });
+      (bs as any).downloadedBlockPeers.set(hash.toString("hex"), peerKey);
+      bs.getState().nextHeightToRequest = 2; // assume previously advanced
+
+      // Fire the disconnect event
+      (peerManager as any)._triggerMessage("__disconnect__", peer, {
+        type: "verack",
+        payload: null,
+      });
+
+      // All per-peer state purged
+      expect(bs.getState().pendingBlocks.has(hash.toString("hex"))).toBe(
+        false
+      );
+      expect((bs as any).peerInFlight.has(peerKey)).toBe(false);
+      expect(
+        (bs as any).downloadedBlockPeers.has(hash.toString("hex"))
+      ).toBe(false);
+      // nextHeightToRequest rolled back so requestBlocks can refill the gap
+      expect(bs.getState().nextHeightToRequest).toBeLessThanOrEqual(1);
+
+      await bs.stop();
+    });
+
+    // The 2026-05-27 deadlock: pend=0 dl=1 with no recovery path.
+    // After peer churn dropped all pendings and one out-of-order future
+    // block landed in downloadedBlocks (e.g. via cmpctblock fallback fetch),
+    // handleStalled bailed at every gate (no stalls to clear, no
+    // disconnects to clean, dl<MAX_DOWNLOADED_BUFFER so no deadlock-fix).
+    // The catch-all at the end of handleStalled rolls the request pointer
+    // back and re-runs requestBlocks so a surviving peer can fill the gap.
+    test("recovers from pend=0 dl=1 stuck state via catch-all", async () => {
+      const peer = createMockPeer("10.0.0.3", 8333);
+      const peerManager = createMockPeerManager([peer]);
+
+      const genesis = headerSync.getBestHeader()!;
+      const blocks: Block[] = [];
+      let prevBlock = genesis.hash;
+      let timestamp = genesis.header.timestamp + 600;
+      for (let i = 0; i < 5; i++) {
+        const block = createValidBlock(prevBlock, timestamp, i + 1);
+        blocks.push(block);
+        prevBlock = getBlockHash(block.header);
+        timestamp += 600;
+      }
+      await headerSync.processHeaders(
+        blocks.map((b) => b.header),
+        peer
+      );
+
+      const bs = new BlockSync(db, REGTEST, headerSync, peerManager);
+      (bs as any).running = true;
+      // Simulate the deadlock: a future block is in the buffer, no
+      // pendings outstanding, and nextHeightToRequest overshot the
+      // processing window (a previous request cycle ran ahead before the
+      // pendings were all cleared).
+      const futureHash = getBlockHash(blocks[3].header).toString("hex");
+      bs.getState().downloadedBlocks.set(futureHash, blocks[3]);
+      bs.getState().nextHeightToProcess = 1;
+      bs.getState().nextHeightToRequest = 100; // overshot
+
+      // Pre-seed the peerInFlight so requestBlocks can assign to it
+      (bs as any).peerInFlight.set(`${peer.host}:${peer.port}`, {
+        count: 0,
+        lastResponse: Date.now(),
+        stallTimeout: 5000,
+        blocksDelivered: 1,
+        cooldownUntil: 0,
+      });
+
+      bs.handleStalled();
+
+      // Catch-all rolled nextHeightToRequest back to nextHeightToProcess
+      // and called requestBlocks, which assigned the gap blocks.
+      expect(bs.getState().nextHeightToRequest).toBeGreaterThan(1);
+      expect(bs.getState().pendingBlocks.size).toBeGreaterThan(0);
+
+      await bs.stop();
     });
   });
 
