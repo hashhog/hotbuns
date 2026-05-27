@@ -505,7 +505,8 @@ export async function coreConnectBlockChecks(
     if (!isCoinbaseTx) {
       // Ensure all inputs are in cache (may need individual load for intra-block
       // chaining where a tx spends outputs of an earlier tx in the same block).
-      for (const input of tx.inputs) {
+      for (let inputIdx = 0; inputIdx < tx.inputs.length; inputIdx++) {
+        const input = tx.inputs[inputIdx];
         if (!utxoManager.hasUTXO(input.prevOut)) {
           const loaded = await utxoManager.preloadUTXO(input.prevOut);
           if (!loaded) {
@@ -513,9 +514,13 @@ export async function coreConnectBlockChecks(
             // (consensus/tx_verify.cpp:168 — bad-txns-inputs-missingorspent).
             // This is the HaveInputs() precondition gate at the entry to
             // Consensus::CheckTxInputs.
+            // Bug #132 (2026-05-26): prior message labelled `input.prevOut.vout`
+            // as "input N" — that's the prevout's vout, NOT the vin-index.
+            // Now logs both: `vin[i]` is the input index, `prevout txid:vout`
+            // is the spent coin's identity.
             return {
               ok: false,
-              error: `bad-txns-inputs-missingorspent: input ${input.prevOut.vout} of tx ${txidHex.slice(0, 16)} (${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout}) at height ${height}`,
+              error: `bad-txns-inputs-missingorspent: vin[${inputIdx}] of tx ${txidHex.slice(0, 16)} spends prevout ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout} at height ${height}`,
             };
           }
         }
