@@ -367,6 +367,11 @@ export class Wallet {
    * Create a new wallet from a BIP-39 mnemonic or random seed.
    * If no mnemonic is provided, generates a random 32-byte seed.
    *
+   * The optional BIP-39 `passphrase` is the "25th word" / plausible-deniability
+   * passphrase: a different passphrase against the same mnemonic yields a
+   * different but equally-valid wallet. This restores parity with
+   * Trezor / Ledger / Coldcard and the rest of the hashhog fleet (W161 BUG-12).
+   *
    * NOTE: Per BIP-39 spec, `mnemonicToSeed` (the PBKDF2-SHA512 call below)
    * does NOT validate — any UTF-8 string produces *some* seed. The checksum
    * gate must be applied at the user-input boundary so that a typo'd
@@ -374,7 +379,11 @@ export class Wallet {
    * but plausible-looking wallet. (Same UX hazard the W21 ouroboros agent
    * flagged for `WalletManager.create_wallet`.)
    */
-  static create(config: WalletConfig, mnemonic?: string): Wallet {
+  static create(
+    config: WalletConfig,
+    mnemonic?: string,
+    passphrase: string = ""
+  ): Wallet {
     const wallet = new Wallet(config);
 
     if (mnemonic) {
@@ -383,11 +392,16 @@ export class Wallet {
       const words = bip39ParseMnemonicString(mnemonic);
       bip39ValidateMnemonic(words);
 
-      // BIP-39: Convert mnemonic to seed using PBKDF2.
-      // Password is "mnemonic" + optional passphrase (empty here).
-      // We feed the normalized space-joined sentence (NFKD per spec).
+      // BIP-39 §"From mnemonic to seed": PBKDF2-HMAC-SHA512 with
+      //   Password = NFKD(mnemonic sentence)
+      //   Salt     = NFKD("mnemonic" + passphrase)
+      //   c = 2048, dkLen = 64
+      // The salt MUST be NFKD-normalised (BUG-13 fix): a passphrase
+      // containing NFK-decomposable characters (Hangul jamo, diacritics)
+      // would otherwise produce a different seed than every other BIP-39
+      // wallet on earth. ASCII passphrases are NFKD-invariant.
       const mnemonicBuffer = Buffer.from(words.join(" ").normalize("NFKD"), "utf-8");
-      const salt = Buffer.from("mnemonic", "utf-8");
+      const salt = Buffer.from(("mnemonic" + passphrase).normalize("NFKD"), "utf-8");
       wallet.seed = Buffer.from(
         pbkdf2(sha512, mnemonicBuffer, salt, { c: 2048, dkLen: 64 })
       );
