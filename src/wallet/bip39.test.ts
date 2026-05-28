@@ -304,3 +304,93 @@ describe("Wallet.create checksum gate at the user-input boundary", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// W161 BUG-12 + BUG-13 regression: Wallet.create must wire the BIP-39
+// passphrase ("25th word") through to PBKDF2, with NFKD-normalised salt.
+//
+// Before the fix the salt was hardcoded to ASCII "mnemonic" and the
+// `Wallet.create` signature had no passphrase parameter — a user restoring a
+// Trezor/Ledger wallet that was generated WITH a passphrase would silently
+// land in the wrong (empty) wallet.
+// ---------------------------------------------------------------------------
+describe("W161 BUG-12 + BUG-13: BIP-39 passphrase end-to-end through Wallet.create", () => {
+  beforeEach(() => {
+    try {
+      rmSync(TEST_DATADIR, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+    mkdirSync(TEST_DATADIR, { recursive: true });
+  });
+
+  afterEach(() => {
+    try {
+      rmSync(TEST_DATADIR, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  });
+
+  test("Trezor vector 1 (abandon-words, passphrase='TREZOR') seed matches byte-for-byte", () => {
+    const v = TREZOR_VECTORS[0]!; // 12 abandon-words
+    const config: WalletConfig = { datadir: TEST_DATADIR, network: "mainnet" };
+    const wallet = Wallet.create(config, v.mnemonic, "TREZOR");
+    expect(bytesToHex(wallet.getSeed())).toBe(v.seed);
+  });
+
+  test("Trezor vector 2 (legal-winner, passphrase='TREZOR') seed matches byte-for-byte", () => {
+    const v = TREZOR_VECTORS[1]!;
+    const config: WalletConfig = { datadir: TEST_DATADIR, network: "mainnet" };
+    const wallet = Wallet.create(config, v.mnemonic, "TREZOR");
+    expect(bytesToHex(wallet.getSeed())).toBe(v.seed);
+  });
+
+  test("Trezor vector 11 (24-word zoo-vote, passphrase='TREZOR') seed matches byte-for-byte", () => {
+    const v = TREZOR_VECTORS[2]!;
+    const config: WalletConfig = { datadir: TEST_DATADIR, network: "mainnet" };
+    const wallet = Wallet.create(config, v.mnemonic, "TREZOR");
+    expect(bytesToHex(wallet.getSeed())).toBe(v.seed);
+  });
+
+  test("omitting passphrase preserves legacy behavior (salt = 'mnemonic' only)", () => {
+    // Hand-verified against the BIP-39 spec for the abandon-words vector with
+    // passphrase="" (the seed value used by every BIP-39 reference impl).
+    const mnemonic =
+      "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const expectedSeedEmptyPassphrase =
+      "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4";
+    const config: WalletConfig = { datadir: TEST_DATADIR, network: "mainnet" };
+    const wallet = Wallet.create(config, mnemonic); // no passphrase
+    expect(bytesToHex(wallet.getSeed())).toBe(expectedSeedEmptyPassphrase);
+  });
+
+  test("different passphrases against the same mnemonic produce different seeds", () => {
+    // The "plausible-deniability" property: the wallet behind passphrase
+    // "alice" must be DIFFERENT from the wallet behind passphrase "bob".
+    const mnemonic = TREZOR_VECTORS[0]!.mnemonic;
+    const config: WalletConfig = { datadir: TEST_DATADIR, network: "mainnet" };
+    const walletAlice = Wallet.create(config, mnemonic, "alice");
+    rmSync(TEST_DATADIR, { recursive: true, force: true });
+    mkdirSync(TEST_DATADIR, { recursive: true });
+    const walletBob = Wallet.create(config, mnemonic, "bob");
+    expect(bytesToHex(walletAlice.getSeed())).not.toBe(bytesToHex(walletBob.getSeed()));
+  });
+
+  test("NFKD-asymmetric passphrase: NFC vs NFD inputs produce the SAME seed (BUG-13)", () => {
+    // U+00E9 (composed é) and U+0065 U+0301 (decomposed e + combining acute)
+    // are different code points but NFKD-equivalent. After normalisation both
+    // forms MUST hash identically — otherwise a passphrase typed in one
+    // normalisation form on one device fails to restore on another.
+    const mnemonic = TREZOR_VECTORS[0]!.mnemonic;
+    const passphraseNFC = "café"; // "café" composed
+    const passphraseNFD = "café"; // "café" decomposed
+    expect(passphraseNFC).not.toBe(passphraseNFD); // different bytes on input
+    const config: WalletConfig = { datadir: TEST_DATADIR, network: "mainnet" };
+    const walletNFC = Wallet.create(config, mnemonic, passphraseNFC);
+    rmSync(TEST_DATADIR, { recursive: true, force: true });
+    mkdirSync(TEST_DATADIR, { recursive: true });
+    const walletNFD = Wallet.create(config, mnemonic, passphraseNFD);
+    expect(bytesToHex(walletNFC.getSeed())).toBe(bytesToHex(walletNFD.getSeed()));
+  });
+});
+
