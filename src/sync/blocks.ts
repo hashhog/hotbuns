@@ -185,8 +185,35 @@ const DEFAULT_WINDOW_SIZE = 512;
 /** Flush UTXO cache to disk every N blocks during IBD. */
 const FLUSH_INTERVAL = 2000;
 
-/** Maximum blocks in-flight per peer. */
-const MAX_IN_FLIGHT_PER_PEER = 16;
+/** Maximum blocks in-flight per peer.
+ *
+ *  Lowered from 16 → 4 on 2026-05-27 to fix the IBD pace cap observed at
+ *  ~0.4 blk/min (mainnet h=76133 stuck 5 min, h=76134 stuck 1 min, etc.).
+ *
+ *  Root cause: Bitcoin Core serves blocks SERIALLY (one block per
+ *  ProcessGetData call).  With 16 blocks queued at a peer, each block waits
+ *  ~5-30 s behind the head of the queue.  For the *critical* block (the one
+ *  at nextHeightToProcess), this serial delay STALLS the entire pipeline —
+ *  no other block can be processed until the critical one arrives, and the
+ *  DUP-REQ fallback only fires every ~30 s.
+ *
+ *  Worse, while a peer is busy serving its 16-block queue, its
+ *  `lastResponse` stays old (> 120 s often), so the DUP-REQ peer-eligibility
+ *  filter (`lastResponse > 0 && (now - lastResponse) < 120000`) excludes it
+ *  as a duplicate target.  Most peers being saturated → DUP-REQ logs
+ *  "sent to 0 extra peers" silently → only one peer is actually racing.
+ *
+ *  Setting the cap to 4 keeps peers cycling responses every ~1-5 s, which:
+ *    1. Keeps `lastResponse` recent across the fleet so DUP-REQ has more
+ *       eligible duplicate targets.
+ *    2. Bounds the head-of-line blocking on the critical block to at most
+ *       ~4 sequential serves (≈ 4-20 s) instead of 16 (≈ 16-80 s).
+ *    3. Bitcoin Core itself uses MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16, but
+ *       Core also uses parallel script verification + a much shorter
+ *       per-block serve loop.  Hotbuns' Bun-JS script verify is slower
+ *       than Core's libsecp256k1 batch, so the queue clears slower per peer.
+ */
+const MAX_IN_FLIGHT_PER_PEER = 4;
 
 /** Base timeout for stall detection (milliseconds).
  *  Must be long enough for large blocks (~1 MB pre-SegWit, 1-4 MB post-SegWit)
@@ -1508,15 +1535,42 @@ export class BlockSync {
           // peer's delivery if it's just slow (queued behind other blocks).
           if (this.peerManager) {
             const connPeers = this.peerManager.getConnectedPeers();
-            // Send duplicate getdata to up to 3 other peers
+            // Send duplicate getdata to up to 3 other peers.
+            //
+            // Two-pass selection: prefer recently-active peers (< 120 s since
+            // last response), but if fewer than 3 qualify (the common case
+            // during IBD when every peer is busy serving its own queue),
+            // fall back to ANY non-original connected peer.
+            //
+            // Pre-fix the "active peer" filter silently rejected every
+            // candidate during a fleet-wide stall — `lastResponse` for ALL
+            // peers was > 120 s old because they were all queue-blocked —
+            // so `duplicatesSent` stayed 0 and the only racer was the
+            // original (already-slow) peer.  Observed on mainnet 2026-05-27
+            // as ~5-min stalls at h=76133 with `pend=42 dl=23` and 10
+            // connected peers, but the DUP-REQ "sent to N extra peers" log
+            // line was missing for the duration (N=0 → not logged).
             let duplicatesSent = 0;
+            // Pass 1: recently-active peers (preferred).
             for (const p of connPeers) {
               if (duplicatesSent >= 3) break;
               const pk = `${p.host}:${p.port}`;
               if (pk === pending.peer) continue;
               const pi = this.peerInFlight.get(pk);
-              // Prefer peers that have responded recently
               if (pi && pi.lastResponse > 0 && (Date.now() - pi.lastResponse) < 120000) {
+                this.sendGetData(p, [headerEntry.hash]);
+                duplicatesSent++;
+              }
+            }
+            // Pass 2: fall back to any non-original peer if Pass 1 came up
+            // empty (all peers saturated / no recent responses).  Better to
+            // ask a "stale" peer than to wait another 30 s for the next
+            // DUP-REQ cycle.
+            if (duplicatesSent === 0) {
+              for (const p of connPeers) {
+                if (duplicatesSent >= 3) break;
+                const pk = `${p.host}:${p.port}`;
+                if (pk === pending.peer) continue;
                 this.sendGetData(p, [headerEntry.hash]);
                 duplicatesSent++;
               }
@@ -3429,6 +3483,37 @@ export class BlockSync {
       if (this.state.nextHeightToRequest > this.state.nextHeightToProcess) {
         this.state.nextHeightToRequest = this.state.nextHeightToProcess;
       }
+      this.requestBlocks();
+    }
+
+    // ── Critical-block parallel-blast trigger ──
+    //
+    // `requestBlocks()` contains a "blast the critical block to ALL peers
+    // after 30 s" path (lines ~1158-1174).  Pre-fix that path only ran when
+    // requestBlocks() itself was invoked — which during a slow-peer cascade
+    // (pend > 0 but no new arrivals) NEVER happened: handleBlock didn't
+    // fire (nothing arriving), the other handleStalled triggers all
+    // require either a stall-timeout firing or a disconnect, and the
+    // idle-with-headroom catch-all above requires `pendingBlocks.size == 0`.
+    //
+    // Result: a peer stalled for the full 120 s BASE_STALL_TIMEOUT before
+    // the critical block was re-requested, even when there were 9 other
+    // peers idle and ready to serve.  Symptom on mainnet 2026-05-27:
+    // bursty 2-5 blocks zip through, then 5 min stuck, then repeat —
+    // ~0.35 blk/min effective IBD rate.
+    //
+    // Fix: call requestBlocks() unconditionally on every poll tick (1 Hz).
+    // It's cheap (early-return if the downloaded buffer is full or there
+    // are no peers), and it gives the critical-block blast a chance to run
+    // every second instead of only when something else triggers a request
+    // cycle.  Combined with the lower MAX_IN_FLIGHT_PER_PEER (4) and the
+    // DUP-REQ fall-back-to-any-peer fix above, this should restore IBD
+    // throughput to the ~10+ blk/min range observed at smaller heights.
+    if (
+      bestHeader &&
+      this.state.nextHeightToProcess <= bestHeader.height &&
+      this.state.pendingBlocks.size > 0
+    ) {
       this.requestBlocks();
     }
   }
