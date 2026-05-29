@@ -1583,11 +1583,15 @@ async function startNode(config: NodeConfig): Promise<void> {
   }
 
   // 4c. UTXO snapshot load mode (--load-snapshot=<core-format-file>)
+  // Bitcoin Core's assumeUTXO loads the snapshot and KEEPS RUNNING: it
+  // forward-syncs the snapshot tip to the network tip (and background-validates
+  // from genesis).  Treating --load-snapshot as load-and-exit left the node
+  // stuck at the snapshot height — the Phase B re-validation FAIL.  Fall through
+  // to header sync (section 5) + peer manager (section 6) so the node validates
+  // forward to the chain tip instead of closing the DB and exiting.
   if (mergedConfig.loadSnapshot) {
     await runSnapshotLoad(mergedConfig.loadSnapshot, db, chainState, params);
-    await db.close();
-    console.log("Database closed. Snapshot load finished.");
-    return;
+    console.log("Snapshot loaded — continuing into forward-sync.");
   }
 
   // 5. Initialize header sync
