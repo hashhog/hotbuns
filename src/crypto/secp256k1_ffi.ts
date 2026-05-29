@@ -220,6 +220,11 @@ if (FFI_AVAILABLE) {
  * Returns true on success.
  */
 function _parsePubkey(pubkeyBytes: Uint8Array): boolean {
+  // An empty pubkey (e.g. OP_0 on the stack feeding OP_CHECKSIG without
+  // STRICTENC) is never a valid encoding — return false rather than letting
+  // Bun's ptr() throw on a zero-length buffer. Mirrors Core, where a bad
+  // pubkey simply yields a failed signature check (false), not an error.
+  if (pubkeyBytes.length === 0) return false;
   const inputPtr = ptr(pubkeyBytes);
   return _syms!.secp256k1_ec_pubkey_parse(
     _ctx,

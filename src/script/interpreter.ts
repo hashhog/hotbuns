@@ -2895,8 +2895,11 @@ function verifyWitnessV0(
     // and last index is stack top. No reversal needed.
     const witnessStack = [...witness];
 
-    // Per BIP 141, MINIMALIF is enforced unconditionally in witness v0 (P2WSH)
-    const witnessFlags: ScriptFlags = { ...flags, verifyMinimalIf: true };
+    // Per Core interpreter.cpp:621-622, MINIMALIF under witness v0 is a policy
+    // rule enabled ONLY through SCRIPT_VERIFY_MINIMALIF — it is NOT enforced
+    // unconditionally. Pass the caller's flags straight through (the IF/NOTIF
+    // handler already gates on flags.verifyMinimalIf for WITNESS_V0).
+    const witnessFlags: ScriptFlags = flags;
 
     // W81 fix: thread txContext so CLTV/CSV in P2WPKH redeem scripts can
     // access nLockTime and nSequence.  Pre-fix: ctx had no txVersion/txLockTime/
@@ -2970,8 +2973,11 @@ function verifyWitnessV0(
       }
     }
 
-    // Per BIP 141, MINIMALIF is enforced unconditionally in witness v0 (P2WSH)
-    const witnessFlags: ScriptFlags = { ...flags, verifyMinimalIf: true };
+    // Per Core interpreter.cpp:621-622, MINIMALIF under witness v0 is a policy
+    // rule enabled ONLY through SCRIPT_VERIFY_MINIMALIF — it is NOT enforced
+    // unconditionally. Pass the caller's flags straight through (the IF/NOTIF
+    // handler already gates on flags.verifyMinimalIf for WITNESS_V0).
+    const witnessFlags: ScriptFlags = flags;
 
     // W81 fix: thread txContext so CLTV/CSV in P2WSH redeem scripts can
     // access nLockTime and nSequence.  Pre-fix: ctx had no txVersion/txLockTime/
