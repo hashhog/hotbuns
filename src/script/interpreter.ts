@@ -251,6 +251,7 @@ export interface ScriptFlags {
   verifyDiscourageUpgradablePubkeyType?: boolean; // BIP 342 - policy - unknown tapscript pubkey types must error
   verifyDiscourageOpSuccess?: boolean; // BIP 342 - policy - OP_SUCCESSx must error
   verifyDiscourageUpgradableTaprootVersion?: boolean; // BIP 341 - policy - unknown leaf versions must error
+  verifyConstScriptCode?: boolean; // SCRIPT_VERIFY_CONST_SCRIPTCODE - policy - OP_CODESEPARATOR / FindAndDelete in pre-segwit script must error
 }
 
 /**
@@ -937,10 +938,17 @@ export function serializeScript(script: Script): Buffer {
 /**
  * Remove all occurrences of a signature from scriptCode (FindAndDelete).
  * ONLY for legacy (BASE) signature version.
+ *
+ * Returns both the rewritten script AND the number of occurrences removed.
+ * Core's FindAndDelete (interpreter.cpp:229) returns the match count so the
+ * caller can enforce SCRIPT_VERIFY_CONST_SCRIPTCODE — if a signature push was
+ * actually deleted from the scriptCode while that flag is set, the script is
+ * rejected with SCRIPT_ERR_SIG_FINDANDDELETE (interpreter.cpp:330-332 for
+ * CHECKSIG, :1146-1148 for CHECKMULTISIG).
  */
-function findAndDelete(script: Buffer, sig: Buffer): Buffer {
+function findAndDelete(script: Buffer, sig: Buffer): { result: Buffer; found: number } {
   if (sig.length === 0) {
-    return script;
+    return { result: script, found: 0 };
   }
 
   // Build the push-encoded signature to search for
@@ -958,19 +966,21 @@ function findAndDelete(script: Buffer, sig: Buffer): Buffer {
 
   // Find and remove all occurrences
   const parts: Buffer[] = [];
+  let found = 0;
   let i = 0;
   while (i < script.length) {
     // Check if pushSig appears at position i
     if (i + pushSig.length <= script.length && script.subarray(i, i + pushSig.length).equals(pushSig)) {
       // Skip this occurrence
       i += pushSig.length;
+      found++;
     } else {
       parts.push(script.subarray(i, i + 1));
       i++;
     }
   }
 
-  return Buffer.concat(parts);
+  return { result: Buffer.concat(parts), found };
 }
 
 /**
@@ -1004,6 +1014,18 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
     // OP_VERIF and OP_VERNOTIF are always invalid
     if (opcode === Opcode.OP_VERIF || opcode === Opcode.OP_VERNOTIF) {
       return false;
+    }
+
+    // SCRIPT_VERIFY_CONST_SCRIPTCODE: OP_CODESEPARATOR in a pre-segwit (BASE)
+    // script is rejected even in an unexecuted branch (Core interpreter.cpp:
+    // 474-476, SCRIPT_ERR_OP_CODESEPARATOR). Checked here — above the executing
+    // guard — to match Core's placement above the opcode-case dispatch.
+    if (
+      opcode === Opcode.OP_CODESEPARATOR &&
+      sigVersion === SigVersion.BASE &&
+      flags.verifyConstScriptCode
+    ) {
+      throw new ScriptError("OP_CODESEPARATOR");
     }
 
     // Count non-push opcodes.
@@ -1217,8 +1239,14 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
         if ((sequence >>> 0) & 0x80000000) break;
 
         // CSV requires spending tx version >= 2 (BIP-68 activation)
-        // Core: if (txTo->version < 2) return false;  — unconditional
-        if (ctx.txVersion === undefined || ctx.txVersion < 2) {
+        // Core: if (txTo->version < 2) return false;  — unconditional.
+        // Core's `txTo->version` is uint32_t (primitives/transaction.h), so the
+        // `< 2` comparison is UNSIGNED. hotbuns deserializeTx reads the version
+        // with readInt32LE (signed), so a wire version of 0xffffffff arrives as
+        // -1 and would spuriously fail the gate (false-reject; tx_valid.json
+        // vector 165). Coerce to unsigned (>>> 0) to match Core's uint32_t
+        // semantics. Core ref: interpreter.cpp:1790 CheckSequence().
+        if (ctx.txVersion === undefined || (ctx.txVersion >>> 0) < 2) {
           throw new ScriptError("UNSATISFIED_LOCKTIME");
         }
 
@@ -1667,7 +1695,13 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
             if (sigVersion === SigVersion.BASE) {
               // For legacy, we need to remove the signature from the scriptCode
               const scriptCode = serializeScript(script.slice(codeSepPos === 0xffffffff ? 0 : codeSepPos + 1));
-              subscript = findAndDelete(scriptCode, sig);
+              const fad = findAndDelete(scriptCode, sig);
+              // SCRIPT_VERIFY_CONST_SCRIPTCODE: if a signature push was actually
+              // deleted from the scriptCode, reject (Core interpreter.cpp:330-332).
+              if (fad.found > 0 && flags.verifyConstScriptCode) {
+                throw new ScriptError("SIG_FINDANDDELETE");
+              }
+              subscript = fad.result;
             } else {
               // For segwit, just use the scriptCode without FindAndDelete
               subscript = serializeScript(script.slice(codeSepPos === 0xffffffff ? 0 : codeSepPos + 1));
@@ -1798,7 +1832,13 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
           subscript = serializeScript(script.slice(codeSepPos === 0xffffffff ? 0 : codeSepPos + 1));
           // Remove all signatures from scriptCode
           for (const sig of sigs) {
-            subscript = findAndDelete(subscript, sig);
+            const fad = findAndDelete(subscript, sig);
+            // SCRIPT_VERIFY_CONST_SCRIPTCODE: reject if a signature push was
+            // actually deleted (Core interpreter.cpp:1146-1148).
+            if (fad.found > 0 && flags.verifyConstScriptCode) {
+              throw new ScriptError("SIG_FINDANDDELETE");
+            }
+            subscript = fad.result;
           }
         } else {
           subscript = serializeScript(script.slice(codeSepPos === 0xffffffff ? 0 : codeSepPos + 1));
