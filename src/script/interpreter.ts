@@ -2326,8 +2326,22 @@ export function verifyScript(
       return false;
     }
 
-    // CLEANSTACK: after P2SH evaluation, stack must have exactly one element
-    if (flags.verifyCleanStack && p2shStack.length !== 1) {
+    // CLEANSTACK: after P2SH evaluation, stack must have exactly one element.
+    //
+    // Same Core resize-to-1 bypass as the native path (interpreter.cpp
+    // ~2087-2107): when the redeemScript is itself a witness program, a
+    // SUCCESSFUL VerifyWitnessProgram is followed by `stack.resize(1)` BEFORE
+    // the SCRIPT_VERIFY_CLEANSTACK `stack.size() != 1` check. The P2SH-wrapped
+    // witness program (OP_0/OP_1..OP_16 + push) leaves TWO elements on
+    // p2shStack after EvalScript, so checking the pre-resize p2shStack here
+    // would FALSE-REJECT every P2SH-wrapped witness spend (SCRIPT_ERR_CLEANSTACK).
+    // The witness program is verified just below and enforces its own internal
+    // cleanstack rule, so skip the main-stack check for a witness redeemScript.
+    if (
+      flags.verifyCleanStack &&
+      p2shStack.length !== 1 &&
+      !(flags.verifyWitness && isWitnessProgram(redeemScript))
+    ) {
       throw new ScriptError("CLEANSTACK");
     }
 
@@ -2360,8 +2374,26 @@ export function verifyScript(
     return true;
   }
 
-  // CLEANSTACK: after non-P2SH evaluation, stack must have exactly one element
-  if (flags.verifyCleanStack && stack.length !== 1) {
+  // CLEANSTACK: after non-P2SH evaluation, stack must have exactly one element.
+  //
+  // Mirror Core VerifyScript (interpreter.cpp ~2042-2107): after a SUCCESSFUL
+  // bare witness-program evaluation Core does `stack.resize(1)` ("Bypass the
+  // cleanstack check at the end. The actual stack is obviously not clean for
+  // witness programs.") BEFORE enforcing SCRIPT_VERIFY_CLEANSTACK as
+  // `stack.size() != 1`. A native-segwit scriptPubKey (OP_0/OP_1..OP_16 +
+  // push) leaves TWO elements on the main stack after EvalScript
+  // (`[<empty>, <program>]`), so running the cleanstack predicate against
+  // that pre-resize main stack here would FALSE-REJECT every native witness
+  // spend (SCRIPT_ERR_CLEANSTACK). The witness program is verified below in
+  // Step 4 (verifyWitnessV0 / verifyTaproot), which implicitly enforces the
+  // witness-internal cleanstack rule (interpreter.cpp:1866-1867). So skip the
+  // main-stack cleanstack check when the scriptPubKey is a witness program
+  // under WITNESS — equivalent to Core's resize-to-1 bypass.
+  if (
+    flags.verifyCleanStack &&
+    stack.length !== 1 &&
+    !(flags.verifyWitness && isWitnessProgram(scriptPubKey))
+  ) {
     throw new ScriptError("CLEANSTACK");
   }
 
