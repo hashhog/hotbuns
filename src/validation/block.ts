@@ -167,14 +167,45 @@ export function getBlockHash(header: BlockHeader): Buffer {
 }
 
 /**
+ * Out-parameter carrier for the CVE-2012-2459 mutation flag, mirroring
+ * Bitcoin Core's `bool* mutated` out-parameter on ComputeMerkleRoot
+ * (consensus/merkle.cpp:46). Pass an object with `mutated` to receive the
+ * detection result; computeMerkleRoot sets `.mutated = true` iff it would
+ * hash two identical adjacent hashes together at any level.
+ */
+export interface MerkleMutationFlag {
+  mutated: boolean;
+}
+
+/**
  * Compute the merkle root from a list of transaction IDs.
  * If the list is empty, returns 32 zero bytes.
  *
  * Merkle tree construction:
  * - Hash pairs: hash256(left || right)
  * - If odd number of nodes, duplicate the last one
+ *
+ * CVE-2012-2459 detection (port of bitcoin-core/src/consensus/merkle.cpp:46-63
+ * ComputeMerkleRoot with `bool* mutated`): when `out` is supplied, at the TOP
+ * of each level-collapse iteration — BEFORE the odd-tail duplication and the
+ * pairwise hashing — we scan COMPLETE adjacent pairs (`pos + 1 < size`) and
+ * set `out.mutated = true` if any pair holds two identical hashes. This is
+ * exactly the case where the tree would hash two identical hashes together,
+ * which is how a duplicate-txid attacker preserves the merkle root. The lone
+ * trailing element at an odd level is NOT compared at this level (the
+ * `pos + 1 < size` bound excludes it), but once it is duplicated it becomes an
+ * identical adjacent pair caught on the NEXT level's scan — so honest odd-N
+ * blocks are never false-flagged. CheckBlock treats `mutated` identically to a
+ * bad merkle root (bad-txns-duplicate), per validation.cpp CheckMerkleRoot.
  */
-export function computeMerkleRoot(txids: Buffer[]): Buffer {
+export function computeMerkleRoot(
+  txids: Buffer[],
+  out?: MerkleMutationFlag
+): Buffer {
+  if (out) {
+    out.mutated = false;
+  }
+
   if (txids.length === 0) {
     return Buffer.alloc(32, 0);
   }
@@ -183,6 +214,18 @@ export function computeMerkleRoot(txids: Buffer[]): Buffer {
   let level: Buffer[] = txids.map((txid) => Buffer.from(txid));
 
   while (level.length > 1) {
+    // CVE-2012-2459: scan COMPLETE adjacent pairs at the TOP of the level,
+    // BEFORE the odd-tail duplication below, exactly like Core
+    // (merkle.cpp:49-52). A trailing lone element (pos+1 == size) is excluded
+    // here and only caught after duplication on the next level.
+    if (out) {
+      for (let pos = 0; pos + 1 < level.length; pos += 2) {
+        if (level[pos].equals(level[pos + 1])) {
+          out.mutated = true;
+        }
+      }
+    }
+
     const nextLevel: Buffer[] = [];
 
     for (let i = 0; i < level.length; i += 2) {
@@ -545,9 +588,21 @@ export function validateBlock(
     }
   }
 
-  // Verify merkle root
+  // Verify merkle root + CVE-2012-2459 mutation detection.
+  // Reference: bitcoin-core/src/validation.cpp CheckBlock/CheckMerkleRoot
+  // (3850-3858): the computed root must match the header's merkleRoot, AND the
+  // `mutated` out-parameter must be false. A mutated block (two identical
+  // adjacent hashes hashed together at some level, the CVE-2012-2459
+  // duplicate-txid malleation) is rejected with bad-txns-duplicate even though
+  // its computed root equals the header root — that is the whole point of the
+  // attack. We check `mutated` FIRST so the more specific error wins.
   const txids = block.transactions.map((tx) => getTxId(tx));
-  const computedMerkleRoot = computeMerkleRoot(txids);
+  const merkleFlag: MerkleMutationFlag = { mutated: false };
+  const computedMerkleRoot = computeMerkleRoot(txids, merkleFlag);
+
+  if (merkleFlag.mutated) {
+    return { valid: false, error: "bad-txns-duplicate" };
+  }
 
   if (!computedMerkleRoot.equals(block.header.merkleRoot)) {
     return { valid: false, error: "Merkle root mismatch" };
