@@ -89,8 +89,27 @@ export interface PeerManagerConfig {
   maxOutboundFullRelay?: number;
   /** Maximum block-relay-only outbound connections (default: 2) */
   maxOutboundBlockRelay?: number;
-  /** Explicit peer addresses to connect to (from --connect flag) */
+  /**
+   * Explicit peer addresses to connect to (from `-connect` flag).
+   *
+   * Bitcoin Core semantics (net.cpp `CConnman::ThreadOpenConnections`):
+   * when non-empty the node connects to ONLY these peers and disables
+   * DNS-seed resolution + addrman/auto-outbound dialing (Core also implies
+   * `-dnsseed=0` and turns `-listen` off). hotbuns mirrors the connect-only
+   * gate (no DNS, no fallbacks, no candidate fill) but leaves `-listen`
+   * under operator control. See {@link isConnectOnly}.
+   */
   connect?: string[];
+  /**
+   * Mirrors Bitcoin Core's `-dnsseed` (default on). When false
+   * (`-nodnsseed` / `-dnsseed=0`) DNS-seed resolution is skipped at
+   * startup; addrman/anchors/auto-outbound dialing are unaffected. This is
+   * independent of {@link connect}: a connect-only run skips DNS regardless
+   * of this flag, but `-nodnsseed` alone suppresses just the DNS lookups.
+   * Mirrors clearbit `config.dns_seed` (main.zig:52, set false by
+   * `--nodnsseed` / `dnsseed=0`).
+   */
+  dnsSeed?: boolean;
   /** Whether to listen for inbound connections (default: true) */
   listen?: boolean;
   /** P2P port to listen on (default: network default port) */
@@ -453,6 +472,22 @@ export class PeerManager {
   /** Mirrors `-cjdnsreachable`. See {@link PeerManagerConfig.cjdnsReachable}. */
   private cjdnsReachable: boolean;
 
+  /**
+   * Mirrors `-dnsseed` (default true). When false, DNS-seed resolution is
+   * skipped at startup. See {@link PeerManagerConfig.dnsSeed}.
+   */
+  private dnsSeed: boolean;
+
+  /**
+   * Parsed, pinned `-connect` peers (host + port). Non-empty iff the
+   * operator passed one or more `-connect=<ip:port>` flags. When non-empty
+   * the node is in connect-only mode: DNS seeding, fallback peers, anchors,
+   * and addrman candidate fill are all suppressed; the maintenance loop
+   * only (re)dials these addresses. Mirrors clearbit `connect_address`
+   * (peer.zig:7009 / 7050) but supports a list rather than a single peer.
+   */
+  private readonly connectPeers: ReadonlyArray<{ host: string; port: number }>;
+
   constructor(config: PeerManagerConfig) {
     this.config = {
       maxOutbound: config.maxOutbound ?? MAX_OUTBOUND_FULL_RELAY + MAX_OUTBOUND_BLOCK_RELAY,
@@ -519,6 +554,36 @@ export class PeerManager {
     // clearnet-only behavior.
     this.proxyManager = config.proxyManager ?? null;
     this.cjdnsReachable = config.cjdnsReachable ?? false;
+    this.dnsSeed = config.dnsSeed ?? true;
+
+    // Parse the pinned -connect addresses once. host:port split mirrors the
+    // start()-path parsing below (lastIndexOf(":") so IPv6 literals survive),
+    // defaulting to the network's default P2P port when no port is given.
+    const parsedConnect: Array<{ host: string; port: number }> = [];
+    for (const addr of config.connect ?? []) {
+      const [host, portStr] = addr.includes(":")
+        ? [addr.slice(0, addr.lastIndexOf(":")), addr.slice(addr.lastIndexOf(":") + 1)]
+        : [addr, String(this.config.params.defaultPort)];
+      const port = parseInt(portStr, 10);
+      if (host && !Number.isNaN(port)) {
+        parsedConnect.push({ host, port });
+      }
+    }
+    this.connectPeers = parsedConnect;
+  }
+
+  /**
+   * Returns true iff the node is in Bitcoin Core `-connect` mode: one or
+   * more `-connect=<ip:port>` peers were pinned. In this mode the node
+   * connects to ONLY those peers and suppresses DNS seeding, fallback
+   * peers, anchors, and addrman candidate fill.
+   *
+   * Reference: bitcoin-core/src/net.cpp `CConnman::ThreadOpenConnections`
+   * (the `connect.size()` branch); clearbit peer.zig:7009/7050
+   * (`connect_address` gate).
+   */
+  isConnectOnly(): boolean {
+    return this.connectPeers.length > 0;
   }
 
   /**
@@ -811,43 +876,65 @@ export class PeerManager {
       }
     }
 
-    // Resolve DNS seeds
-    const addresses = await this.resolveDNSSeeds();
-    const now = Date.now();
+    // Connect-only (`-connect`) and `-nodnsseed`/`-dnsseed=0` gates.
+    //
+    // Bitcoin Core: when `-connect` is set the node connects to ONLY those
+    // peers and does NOT resolve DNS seeds nor auto-dial via addrman
+    // (net.cpp ThreadOpenConnections); `-connect` also implies `-dnsseed=0`.
+    // `-nodnsseed` independently suppresses just the DNS lookups.
+    // clearbit mirrors this: peer.zig:7009 takes a dedicated connect branch
+    // that skips dnsSeeds(), and the outbound-fill loop is gated on
+    // connect_address==null (peer.zig:7050).
+    //
+    // So we resolve DNS + seed the known-address pool only when NOT in
+    // connect-only mode AND DNS seeding is enabled. In connect-only mode the
+    // only known addresses are the pinned `-connect` peers added above.
+    if (!this.isConnectOnly() && this.dnsSeed) {
+      // Resolve DNS seeds
+      const addresses = await this.resolveDNSSeeds();
+      const now = Date.now();
 
-    // Add discovered addresses to known pool
-    for (const ip of addresses) {
-      const key = `${ip}:${this.config.params.defaultPort}`;
-      if (!this.knownAddresses.has(key)) {
-        this.knownAddresses.set(key, {
-          host: ip,
-          port: this.config.params.defaultPort,
-          // Conservative baseline: assume full-node + segwit only.
-          // Real services are learned during version handshake.
-          services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS,
-          lastSeen: now,
-          banScore: 0,
-          lastConnected: 0,
-        });
+      // Add discovered addresses to known pool
+      for (const ip of addresses) {
+        const key = `${ip}:${this.config.params.defaultPort}`;
+        if (!this.knownAddresses.has(key)) {
+          this.knownAddresses.set(key, {
+            host: ip,
+            port: this.config.params.defaultPort,
+            // Conservative baseline: assume full-node + segwit only.
+            // Real services are learned during version handshake.
+            services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS,
+            lastSeen: now,
+            banScore: 0,
+            lastConnected: 0,
+          });
+        }
       }
-    }
 
-    // Add fallback peers if we don't have enough addresses
-    const fallbacks = FALLBACK_PEERS[this.config.params.networkMagic] ?? [];
-    for (const { host, port } of fallbacks) {
-      const key = `${host}:${port}`;
-      if (!this.knownAddresses.has(key)) {
-        this.knownAddresses.set(key, {
-          host,
-          port,
-          // Conservative baseline: assume full-node + segwit only.
-          // Real services are learned during version handshake.
-          services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS,
-          lastSeen: now,
-          banScore: 0,
-          lastConnected: 0,
-        });
+      // Add fallback peers if we don't have enough addresses
+      const fallbacks = FALLBACK_PEERS[this.config.params.networkMagic] ?? [];
+      for (const { host, port } of fallbacks) {
+        const key = `${host}:${port}`;
+        if (!this.knownAddresses.has(key)) {
+          this.knownAddresses.set(key, {
+            host,
+            port,
+            // Conservative baseline: assume full-node + segwit only.
+            // Real services are learned during version handshake.
+            services: ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS,
+            lastSeen: now,
+            banScore: 0,
+            lastConnected: 0,
+          });
+        }
       }
+    } else if (this.isConnectOnly()) {
+      console.log(
+        `P2P: -connect mode — pinned to ${this.connectPeers.length} peer(s); ` +
+        `DNS seeding, fallback peers, anchors, and auto-outbound fill disabled`
+      );
+    } else {
+      console.log("P2P: -nodnsseed — skipping DNS seed resolution");
     }
 
     // Fill initial connections
@@ -1619,6 +1706,26 @@ export class PeerManager {
    */
   private async fillConnections(): Promise<void> {
     if (!this.running) return;
+
+    // Connect-only mode (`-connect`): dial ONLY the pinned peers and never
+    // touch anchors / addrman candidates / DNS-derived addresses. Mirrors
+    // clearbit peer.zig:7050 (maintainOutbound gated on connect_address==null)
+    // and Core net.cpp ThreadOpenConnections's connect.size() branch.
+    // connectPeer() already no-ops when the peer is connected or connecting,
+    // so this naturally (re)dials only dropped pins each maintenance tick.
+    if (this.isConnectOnly()) {
+      for (const { host, port } of this.connectPeers) {
+        const key = `${host}:${port}`;
+        if (this.peers.has(key) || this.connectingPeers.has(key)) continue;
+        try {
+          await this.connectPeer(host, port, "full_relay");
+        } catch {
+          // Pinned peer unreachable this tick; retry on the next maintenance
+          // pass. We do NOT fall back to DNS / addrman peers.
+        }
+      }
+      return;
+    }
 
     // Count current outbound connections by type
     let fullRelayCount = 0;

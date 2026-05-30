@@ -54,6 +54,13 @@ export interface NodeConfig {
   metricsPort: number;
   logLevel: "debug" | "info" | "warn" | "error";
   connect?: string[];
+  /**
+   * Mirrors Bitcoin Core's `-dnsseed` (default on). Set false by
+   * `--nodnsseed` or `--dnsseed=0` to suppress DNS-seed resolution at
+   * startup. Independent of `--connect` (which forces connect-only mode and
+   * skips DNS regardless). Plumbed into PeerManager as `dnsSeed`.
+   */
+  dnsSeed?: boolean;
   addnode?: string[];
   /** Prune target in MiB (0 = disabled, minimum 550 MiB if enabled). */
   prune?: number;
@@ -380,6 +387,16 @@ export function parseArgs(argv: string[]): ParsedArgs {
             config.connect.push(value);
           }
           break;
+        case "dnsseed":
+          // Mirrors Bitcoin Core `-dnsseed=0/1`. Default is on; explicit
+          // "0"/"false" disables DNS seeding.
+          config.dnsSeed = !(value === "0" || value === "false");
+          break;
+        case "nodnsseed":
+          // Mirrors Bitcoin Core `-nodnsseed` (bare flag). clearbit
+          // main.zig:267 sets config.dns_seed=false.
+          config.dnsSeed = false;
+          break;
         case "addnode":
           if (value) {
             config.addnode = config.addnode || [];
@@ -693,6 +710,9 @@ export async function loadConfig(
           break;
         case "listen":
           config.listen = value === "1" || value === "true";
+          break;
+        case "dnsseed":
+          config.dnsSeed = !(value === "0" || value === "false");
           break;
         case "port":
           config.port = parseInt(value, 10);
@@ -1726,6 +1746,10 @@ async function startNode(config: NodeConfig): Promise<void> {
     bestHeight: bestBlock.height,
     datadir: mergedConfig.datadir,
     connect: config.connect,
+    // `-nodnsseed` / `-dnsseed=0`. Defaults to true (DNS seeding on) when
+    // unset. `-connect` forces connect-only mode independently (manager.ts
+    // isConnectOnly), which skips DNS regardless of this flag.
+    dnsSeed: mergedConfig.dnsSeed,
     listen: mergedConfig.listen,
     port: mergedConfig.port,
     pruneMode: pruneManager !== undefined,
@@ -2729,7 +2753,8 @@ OPTIONS:
   --log-level=<level>   Log level: debug, info, warn, error (default: info)
   --debug=<cat>         Enable debug logging for category (repeatable; 'all'/'1' = every category, 'none'/'0' = off)
   --printtoconsole      Force log output to stdout/stderr
-  --connect=<host:port> Connect to specific peer
+  --connect=<host:port> Connect ONLY to this peer (repeatable); disables DNS seeding + auto-outbound dialing
+  --nodnsseed           Disable DNS seed resolution (alias: --dnsseed=0)
   --proxy=<host:port>   Route outbound connections through SOCKS5 proxy
   --onion=<host:port>   Dedicated SOCKS5 proxy for .onion (overrides --proxy)
   --i2psam=<host:port>  I2P SAM v3.1 bridge endpoint
