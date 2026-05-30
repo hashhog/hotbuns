@@ -2395,6 +2395,14 @@ export class BlockSync {
           scriptThreads: this.scriptThreads,
           verifyP2SH: intermediate.height >= this.params.bip16Height,
           verifyWitness: intermediate.height >= this.params.segwitHeight,
+          // MANDATORY height-gated consensus flags (Core GetBlockScriptFlags).
+          // Side-branch blocks are connected through the SAME full-validation
+          // connect path the main chain uses, so reorg revalidates scripts
+          // under the correct per-height flag set (no under-flag on reorg).
+          verifyDERSig: intermediate.height >= this.params.bip66Height,
+          verifyCLTV: intermediate.height >= this.params.bip65Height,
+          verifyCSV: intermediate.height >= this.params.csvHeight,
+          verifyNullDummy: intermediate.height >= this.params.segwitHeight,
         }
       );
       if (!intermResult.ok) {
@@ -2779,6 +2787,11 @@ export class BlockSync {
         scriptThreads: this.scriptThreads,
         verifyP2SH: height >= this.params.bip16Height,
         verifyWitness: height >= this.params.segwitHeight,
+        // MANDATORY height-gated consensus flags (Core GetBlockScriptFlags).
+        verifyDERSig: height >= this.params.bip66Height,
+        verifyCLTV: height >= this.params.bip65Height,
+        verifyCSV: height >= this.params.csvHeight,
+        verifyNullDummy: height >= this.params.segwitHeight,
         genesisHashHex: genesisHashHexLE,
         utxoBestBlockHashHex: utxoBestBlockHashHexLE,
         // Per-coin MTP for accurate BIP-68 time-based sequence lock enforcement.

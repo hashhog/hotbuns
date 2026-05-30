@@ -171,6 +171,41 @@ export interface ConnectBlockOpts {
   verifyTaproot?: boolean;
 
   /**
+   * Whether to enforce strict-DER signatures (BIP-66 / DERSIG).
+   * True when height >= params.bip66Height.
+   *
+   * Core validation.cpp GetBlockScriptFlags:2268-2271 gates SCRIPT_VERIFY_DERSIG
+   * on DeploymentActiveAt(DEPLOYMENT_DERSIG).  This is one of the four MANDATORY
+   * height-gated consensus flags that block-connect must apply (the prior code
+   * only set P2SH|WITNESS|TAPROOT, under-flagging every pre-segwit-but-post-BIP66
+   * block and leaving DERSIG enforcement to the WITNESS-implies-DERSIG fallback
+   * in scriptFlagsFromBitmask — which is wrong below segwitHeight).
+   */
+  verifyDERSig?: boolean;
+
+  /**
+   * Whether to enforce OP_CHECKLOCKTIMEVERIFY (BIP-65 / CLTV).
+   * True when height >= params.bip65Height.
+   * Core validation.cpp:2273-2276 (DEPLOYMENT_CLTV).
+   */
+  verifyCLTV?: boolean;
+
+  /**
+   * Whether to enforce OP_CHECKSEQUENCEVERIFY (BIP-112 / CSV).
+   * True when height >= params.csvHeight.
+   * Core validation.cpp:2278-2281 (DEPLOYMENT_CSV).
+   */
+  verifyCSV?: boolean;
+
+  /**
+   * Whether to enforce NULLDUMMY (BIP-147).
+   * True when height >= params.segwitHeight — Core activates BIP-147
+   * simultaneously with segwit (validation.cpp:2283-2286 gates NULLDUMMY on
+   * DEPLOYMENT_SEGWIT).
+   */
+  verifyNullDummy?: boolean;
+
+  /**
    * Optional per-coin MTP provider for BIP-68 time-based sequence locks.
    *
    * Called with the block height at which a UTXO was created; should return
@@ -254,6 +289,13 @@ export async function coreConnectBlockChecks(
     verifyP2SH = height >= params.bip16Height,
     verifyWitness = height >= params.segwitHeight,
     verifyTaproot = height >= params.taprootHeight,
+    // MANDATORY height-gated consensus flags (Core GetBlockScriptFlags).
+    // Default each from its own activation height in chainparams, exactly as
+    // Core's GetBlockScriptFlags gates on the per-deployment activation.
+    verifyDERSig = height >= params.bip66Height,
+    verifyCLTV = height >= params.bip65Height,
+    verifyCSV = height >= params.csvHeight,
+    verifyNullDummy = height >= params.segwitHeight,
     getUTXOMTP,
     genesisHashHex,
     utxoBestBlockHashHex,
@@ -576,10 +618,23 @@ export async function coreConnectBlockChecks(
 
       // ── Script verification (skipped when skipScripts=true).
       if (!skipScripts) {
+        // Assemble the per-block consensus script-verify bitmask to match
+        // Bitcoin Core validation.cpp GetBlockScriptFlags (2250-2289):
+        //   P2SH | WITNESS | TAPROOT  — always on (modulo 2 historical
+        //     script_flag_exceptions blocks, which hotbuns does not need to
+        //     model: those are the BIP16 violator and the TAPROOT violator,
+        //     and they predate / are off the chains hotbuns validates).
+        //   DERSIG (BIP66), CLTV (BIP65), CSV (BIP112), NULLDUMMY (BIP147)
+        //     — each gated by its own activation height in chainparams.
+        // NO STANDARD/policy flags are ever set here (consensus only).
         const scriptFlags =
-          (verifyP2SH    ? ScriptFlags.VERIFY_P2SH    : ScriptFlags.VERIFY_NONE) |
-          (verifyWitness ? ScriptFlags.VERIFY_WITNESS  : ScriptFlags.VERIFY_NONE) |
-          (verifyTaproot ? ScriptFlags.VERIFY_TAPROOT  : ScriptFlags.VERIFY_NONE);
+          (verifyP2SH      ? ScriptFlags.VERIFY_P2SH                  : ScriptFlags.VERIFY_NONE) |
+          (verifyWitness   ? ScriptFlags.VERIFY_WITNESS              : ScriptFlags.VERIFY_NONE) |
+          (verifyTaproot   ? ScriptFlags.VERIFY_TAPROOT             : ScriptFlags.VERIFY_NONE) |
+          (verifyDERSig    ? ScriptFlags.VERIFY_DERSIG              : ScriptFlags.VERIFY_NONE) |
+          (verifyCLTV      ? ScriptFlags.VERIFY_CHECKLOCKTIMEVERIFY : ScriptFlags.VERIFY_NONE) |
+          (verifyCSV       ? ScriptFlags.VERIFY_CHECKSEQUENCEVERIFY : ScriptFlags.VERIFY_NONE) |
+          (verifyNullDummy ? ScriptFlags.VERIFY_NULLDUMMY          : ScriptFlags.VERIFY_NONE);
 
         let scriptResult;
         if (scriptThreads === 1) {
