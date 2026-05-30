@@ -3124,23 +3124,43 @@ export function getConsensusFlags(height: number): ScriptFlags {
  *
  * Bitmask bit definitions (must mirror validation/tx.ts ScriptFlags enum;
  * kept as literals here to avoid a circular import):
- *   VERIFY_P2SH   = 1 << 0
- *   VERIFY_WITNESS = 1 << 1
- *   VERIFY_TAPROOT = 1 << 9
+ *   VERIFY_P2SH                = 1 << 0
+ *   VERIFY_WITNESS             = 1 << 1
+ *   VERIFY_DERSIG              = 1 << 3
+ *   VERIFY_NULLDUMMY           = 1 << 4
+ *   VERIFY_CHECKLOCKTIMEVERIFY = 1 << 5
+ *   VERIFY_CHECKSEQUENCEVERIFY = 1 << 6
+ *   VERIFY_TAPROOT             = 1 << 9
+ *
+ * DERSIG/CLTV/CSV/NULLDUMMY are honoured from their OWN bits (set by
+ * coreConnectBlockChecks from each rule's activation height, matching Core
+ * GetBlockScriptFlags).  They are additionally OR'd with `verifyWitness`
+ * because on every Bitcoin network segwit activates strictly after BIP66/65/112
+ * and simultaneously with BIP147 — so SegWit being active implies all four are
+ * active.  Keeping the OR preserves the historical behaviour for callers that
+ * pass only the P2SH|WITNESS|TAPROOT bitmask (e.g. wallet/standalone defaults),
+ * while the explicit bits close the pre-segwit under-flag window
+ * (heights [bip66Height, segwitHeight) where DERSIG/CLTV/CSV are active but
+ * SegWit is not).
  */
 export function scriptFlagsFromBitmask(bitmask: number): ScriptFlags {
   const verifyP2SH    = (bitmask & (1 << 0)) !== 0;
   const verifyWitness = (bitmask & (1 << 1)) !== 0;
   const verifyTaproot = (bitmask & (1 << 9)) !== 0;
+  const verifyDERSig    = (bitmask & (1 << 3)) !== 0;
+  const verifyNullDummy = (bitmask & (1 << 4)) !== 0;
+  const verifyCLTV      = (bitmask & (1 << 5)) !== 0;
+  const verifyCSV       = (bitmask & (1 << 6)) !== 0;
   return {
     verifyP2SH,
     verifyWitness,
     verifyTaproot,
-    // When SegWit (BIP-141) is active the accompanying consensus flags are also active.
-    verifyDERSignatures:       verifyWitness,  // BIP-66, active since SegWit era
-    verifyCheckLockTimeVerify: verifyWitness,  // BIP-65
-    verifyCheckSequenceVerify: verifyWitness,  // BIP-112
-    verifyNullDummy:           verifyWitness,  // BIP-147
+    // Honour each rule's own bit; OR with verifyWitness since SegWit-active
+    // implies BIP66/65/112/147 active (segwit activates after all of them).
+    verifyDERSignatures:       verifyDERSig    || verifyWitness, // BIP-66
+    verifyCheckLockTimeVerify: verifyCLTV      || verifyWitness, // BIP-65
+    verifyCheckSequenceVerify: verifyCSV       || verifyWitness, // BIP-112
+    verifyNullDummy:           verifyNullDummy || verifyWitness, // BIP-147
     // Policy flags are never set during block validation.
     verifyNullFail:            false,
     verifyWitnessPubkeyType:   false,
