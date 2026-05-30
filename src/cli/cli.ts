@@ -1199,10 +1199,19 @@ async function runSnapshotLoad(
   // Stitch chain tip + minimal block index so subsequent startup uses the
   // snapshot baseline as the active tip. The real header will arrive via
   // the network during follow-on IBD.
+  //
+  // chainWork is seeded to nMinimumChainWork (NOT 0): the assumeUTXO base is,
+  // by construction, on a chain whose accumulated work is at least the
+  // hardcoded minimum, and a 0 here would make the snapshot tip lose every
+  // reorg comparison and keep the node permanently in initial-block-download
+  // mode.  This mirrors rustoshi's `chain_work=minimum_chain_work` snapshot
+  // activation (rustoshi/src/main.rs:1978) and Bitcoin Core's
+  // PopulateAndValidateSnapshot, which records nChainWork on the snapshot base
+  // pindex.  The exact value is refined upward as real headers/blocks connect.
   await db.putChainState({
     bestBlockHash: result.baseBlockHash,
     bestHeight: result.baseHeight,
-    totalWork: 0n,
+    totalWork: params.nMinimumChainWork,
   });
 
   const dummyHeader = Buffer.alloc(80);
@@ -1551,8 +1560,14 @@ async function startNode(config: NodeConfig): Promise<void> {
     // No saved state or invalid data, use defaults
   }
 
-  // Set tip height
-  const bestBlock = chainState.getBestBlock();
+  // Set tip height.  NOTE: `bestBlock` and the mempool tip height are
+  // (re-)assigned AFTER the optional `--load-snapshot` block below, because
+  // a snapshot bootstrap moves the chain tip from genesis to the snapshot
+  // base height (944183 for the mainnet assumeUTXO snapshot) and every
+  // downstream consumer — peerManager's advertised bestHeight, the mempool
+  // tip, and the RPC's getblockcount — must observe the post-snapshot tip,
+  // not the genesis tip loaded by `chainState.load()` above.
+  let bestBlock = chainState.getBestBlock();
   mempool.setTipHeight(bestBlock.height);
 
   // 4a-bis. Restore persisted mempool from <datadir>/mempool.dat (if any).
@@ -1591,7 +1606,41 @@ async function startNode(config: NodeConfig): Promise<void> {
   // forward to the chain tip instead of closing the DB and exiting.
   if (mergedConfig.loadSnapshot) {
     await runSnapshotLoad(mergedConfig.loadSnapshot, db, chainState, params);
-    console.log("Snapshot loaded — continuing into forward-sync.");
+
+    // ── Adopt the snapshot base as the active chain tip ──
+    //
+    // `runSnapshotLoad` writes the snapshot UTXO set + the snapshot-base tip
+    // into the DB (`db.putChainState`), but the in-memory `chainState` that
+    // the whole node runs against was already initialised from the (fresh,
+    // genesis) DB at `chainState.load()` above.  Without re-loading it here,
+    // the node keeps an in-memory tip of height 0: RPC `getblockcount`
+    // returns 0, the peer manager advertises bestHeight 0, and the
+    // BlockSync reorg gate (sync/blocks.ts: `getBestBlock().height > 0`)
+    // misfires on the first forward-sync block — the exact "imports the
+    // snapshot but comes up at height 0" failure.
+    //
+    // Re-loading from the DB makes the in-memory chainstate authoritative-
+    // consistent with the just-written snapshot tip and, via
+    // UTXOManager.reconcileBestBlock (invoked inside load()), re-points the
+    // UTXO view's best-block pointer to the snapshot base so the
+    // `view-out-of-sync` gate has the correct baseline for block 944184+.
+    //
+    // This mirrors the working references: blockbrew loads the snapshot
+    // BEFORE constructing its ChainManager so the manager reads the
+    // snapshot tip from the DB (cmd/blockbrew/main.go:785 → 802), and
+    // rustoshi re-points its local best_hash/best_height after snapshot
+    // activation so the post-snapshot ChainState/HeaderSync/BlockDownloader
+    // constructors observe the snapshot tip rather than genesis
+    // (rustoshi/src/main.rs:1971-1975).
+    await chainState.load();
+    bestBlock = chainState.getBestBlock();
+    mempool.setTipHeight(bestBlock.height);
+
+    console.log(
+      `Snapshot adopted as chain tip: height ${bestBlock.height}, hash ` +
+        `${Buffer.from(bestBlock.hash).reverse().toString("hex")} — ` +
+        `header-syncing from genesis, then forward-syncing block bodies ${bestBlock.height + 1}+.`
+    );
   }
 
   // 5. Initialize header sync
