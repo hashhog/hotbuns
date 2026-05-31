@@ -532,11 +532,23 @@ export class HeaderSync {
   /**
    * Validate a single header against its parent.
    *
-   * Mirrors Bitcoin Core's ContextualCheckBlockHeader (validation.cpp:4080-4121).
+   * Mirrors Bitcoin Core's ContextualCheckBlockHeader (validation.cpp:4080-4121)
+   * plus CheckBlockHeader's CheckProofOfWork (validation.cpp:3831).
+   *
+   * `opts` is OPTIONAL and DEFAULT-PRESERVING — production callers pass no opts
+   * and get byte-identical behavior:
+   *   - opts.now: override the wall-clock used for the time-too-new gate
+   *     (Core's NodeClock::now()).  When omitted, `Date.now()` is used exactly
+   *     as before.  This exists ONLY so a deterministic differential harness can
+   *     inject a fixed "now" — no production path sets it.
+   *   - opts.skipPow: bypass the CheckProofOfWork (high-hash) gate, mirroring
+   *     Core's fCheckPOW=false in CheckBlockHeader.  Defaults to false (PoW is
+   *     always checked) so production behavior is unchanged.
    */
   validateHeader(
     header: BlockHeader,
-    parent: HeaderChainEntry
+    parent: HeaderChainEntry,
+    opts?: { now?: number; skipPow?: boolean }
   ): { valid: boolean; error?: string } {
     const height = parent.height + 1;
 
@@ -612,27 +624,45 @@ export class HeaderSync {
     //   if (block.Time() > NodeClock::now() + std::chrono::seconds{MAX_FUTURE_BLOCK_TIME})
     //     return state.Invalid(..., "time-too-new", ...);
     const MAX_FUTURE_BLOCK_TIME = 2 * 60 * 60;
-    const maxFutureTime = Math.floor(Date.now() / 1000) + MAX_FUTURE_BLOCK_TIME;
+    // Core uses NodeClock::now() (wall clock).  `opts.now` (seconds) lets a
+    // deterministic differential harness pin it; absent it, Date.now() is used
+    // exactly as before (production behavior unchanged).
+    const nowSeconds = opts?.now ?? Math.floor(Date.now() / 1000);
+    const maxFutureTime = nowSeconds + MAX_FUTURE_BLOCK_TIME;
     if (header.timestamp > maxFutureTime) {
       return { valid: false, error: "time-too-new: block timestamp too far in the future" };
     }
 
-    // 5. Proof-of-work: blockHash <= target (high-hash check).
-    // Core CheckProofOfWork (pow.cpp): hash must be <= claimed target.
+    // 5. Proof-of-work: CheckProofOfWork (pow.cpp:161 CheckProofOfWorkImpl).
+    // Core derives the target from nBits and rejects with the SINGLE high-hash
+    // token if EITHER the target is malformed / out of range (DeriveTarget:
+    // fNegative || bnTarget==0 || fOverflow || bnTarget > powLimit, pow.cpp:155)
+    // OR the hash exceeds the target (pow.cpp:167).  CheckBlockHeader
+    // (validation.cpp:3831) maps this one CheckProofOfWork failure to
+    // "high-hash".  We therefore fold the powLimit-range check INTO the
+    // high-hash gate and run it BEFORE the hash comparison, matching Core's
+    // ordering and token (previously the range check was a separate step 6 that
+    // reported "bad-diffbits", diverging from Core — a header encoding a target
+    // above powLimit was rejected either way, so this is a token/ordering
+    // Core-parity fix, NOT a change to the accept/reject decision).
+    // Gated by opts.skipPow (Core fCheckPOW=false); default false => always run.
     const target = compactToBigInt(header.bits);
-    const blockHash = getBlockHash(header);
+    if (!opts?.skipPow) {
+      // DeriveTarget range check: target must be in (0, powLimit].
+      // compactToBigInt returns 0 for a malformed/negative compact; treat
+      // target==0 or target>powLimit as the high-hash range failure.
+      if (target === 0n || target > this.params.powLimit) {
+        return { valid: false, error: "high-hash: proof of work failed (target out of range)" };
+      }
 
-    // Convert hash to big-endian number for comparison
-    const hashReversed = Buffer.from(blockHash).reverse();
-    const hashValue = BigInt("0x" + hashReversed.toString("hex"));
+      const blockHash = getBlockHash(header);
+      // Convert hash to big-endian number for comparison
+      const hashReversed = Buffer.from(blockHash).reverse();
+      const hashValue = BigInt("0x" + hashReversed.toString("hex"));
 
-    if (hashValue > target) {
-      return { valid: false, error: "high-hash: proof of work failed" };
-    }
-
-    // 6. Target must not exceed powLimit.
-    if (target > this.params.powLimit) {
-      return { valid: false, error: "bad-diffbits: target exceeds powLimit" };
+      if (hashValue > target) {
+        return { valid: false, error: "high-hash: proof of work failed" };
+      }
     }
 
     // 7. Difficulty (nBits) must exactly match GetNextWorkRequired.
