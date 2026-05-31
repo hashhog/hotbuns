@@ -609,9 +609,18 @@ export async function coreConnectBlockChecks(
           utxoConfirmations
         );
         if (!seqLockValid) {
+          // Core ConnectBlock emits the SAME reject reason for a BIP-68
+          // SequenceLocks failure as for an IsFinalTx failure:
+          // state.Invalid(BLOCK_CONSENSUS, "bad-txns-nonfinal",
+          //   "contains a non-BIP68-final transaction ...")
+          // (validation.cpp:2557-2559). Carry the canonical `bad-txns-nonfinal`
+          // token in the error string so the BIP-22 reason mapper
+          // (ConsensusErrorCode.SEQUENCE_LOCK_NOT_SATISFIED -> "bad-txns-nonfinal")
+          // and any token-matching consumer surface the correct Core reason —
+          // matching the sibling IsFinalTx message above and rustoshi.
           return {
             ok: false,
-            error: `Sequence locks not satisfied for tx ${txidHex.slice(0, 16)} at height ${height}`,
+            error: `Sequence locks not satisfied (bad-txns-nonfinal): non-BIP68-final tx ${txidHex.slice(0, 16)} at height ${height}`,
           };
         }
       }
