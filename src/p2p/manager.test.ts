@@ -638,9 +638,11 @@ describe("PeerManager addr message handling", () => {
         addrs: [
           {
             timestamp: now,
+            // Use publicly-routable IPs: handleAddrMessage drops non-routable
+            // (RFC1918) addresses via isRoutable(), mirroring Core addrman.
             addr: {
               services: BigInt(ServiceFlags.NODE_NETWORK) | BigInt(ServiceFlags.NODE_WITNESS),
-              ip: ipv4ToBuffer("192.168.1.1"),
+              ip: ipv4ToBuffer("8.8.8.1"),
               port: 8333,
             },
           },
@@ -648,7 +650,7 @@ describe("PeerManager addr message handling", () => {
             timestamp: now,
             addr: {
               services: BigInt(ServiceFlags.NODE_NETWORK),
-              ip: ipv4ToBuffer("10.0.0.1"),
+              ip: ipv4ToBuffer("9.9.9.1"),
               port: 8333,
             },
           },
@@ -659,12 +661,12 @@ describe("PeerManager addr message handling", () => {
     // Wait for addresses to be processed
     await waitFor(() => {
       const addresses = manager.getKnownAddresses();
-      return addresses.has("192.168.1.1:8333") && addresses.has("10.0.0.1:8333");
+      return addresses.has("8.8.8.1:8333") && addresses.has("9.9.9.1:8333");
     });
 
     const addresses = manager.getKnownAddresses();
-    expect(addresses.has("192.168.1.1:8333")).toBe(true);
-    expect(addresses.has("10.0.0.1:8333")).toBe(true);
+    expect(addresses.has("8.8.8.1:8333")).toBe(true);
+    expect(addresses.has("9.9.9.1:8333")).toBe(true);
 
     await manager.stop();
   }, TEST_TIMEOUT);

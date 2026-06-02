@@ -56,6 +56,19 @@ import type { ProxyManager, NetworkType } from "./proxy.js";
 export const V1_ONLY_CACHE_MAX = 256;
 
 /**
+ * Hard cap on the number of entries retained in {@link PeerManager.knownAddresses}
+ * (the addrman). Mirrors Bitcoin Core's ADDRMAN ceiling
+ * (`ADDRMAN_NEW_BUCKET_COUNT * ADDRMAN_TRIED_BUCKET_COUNT * ...`,
+ * addrman_impl.h:26-33 → ~81,920 addresses). Without this, every routable
+ * address gossiped in an `addr`/`addrv2` flood is retained forever (zero
+ * delete/clear) and re-persisted/reloaded across restarts, so peers.dat — and
+ * RSS — grow monotonically. On overflow we evict the oldest-`lastSeen` entry
+ * (a faithful approximation of Core's bucket-collision eviction; addr gossip is
+ * advisory, so dropping the stalest address changes no consensus behaviour).
+ */
+export const KNOWN_ADDRESSES_MAX = 81920;
+
+/**
  * Time-to-live (ms) for v1-only fallback cache entries.  After this
  * window we re-probe the address for v2 — a peer that was v1-only at
  * t=0 may have been upgraded.  1h matches the order of magnitude of
@@ -2045,6 +2058,44 @@ export class PeerManager {
   }
 
   /**
+   * Insert a freshly-learned address into {@link knownAddresses}, enforcing
+   * the {@link KNOWN_ADDRESSES_MAX} cap. When the map is already at the cap we
+   * evict the entry with the oldest `lastSeen` before inserting, so the working
+   * set tracks the most-recently-advertised addresses (Core addrman bucket
+   * eviction analogue). Callers must only pass NEW keys — existing entries are
+   * updated in place by the addr handlers, so they never grow the map.
+   *
+   * Mirrors the {@link markV1Only} cap pattern (drop-on-overflow) already used
+   * for `v1OnlyCache`.
+   */
+  private addKnownAddress(key: string, info: PeerInfo): void {
+    if (this.knownAddresses.size >= KNOWN_ADDRESSES_MAX) {
+      this.evictOldestKnownAddress();
+    }
+    this.knownAddresses.set(key, info);
+  }
+
+  /**
+   * Evict the single known address with the oldest `lastSeen` timestamp.
+   * Linear scan — only runs on the rare overflow path (once the addrman is
+   * already saturated at {@link KNOWN_ADDRESSES_MAX}), so the cost is bounded
+   * and amortised. No-op if the map is empty.
+   */
+  private evictOldestKnownAddress(): void {
+    let oldestKey: string | undefined;
+    let oldestSeen = Infinity;
+    for (const [k, v] of this.knownAddresses) {
+      if (v.lastSeen < oldestSeen) {
+        oldestSeen = v.lastSeen;
+        oldestKey = k;
+      }
+    }
+    if (oldestKey !== undefined) {
+      this.knownAddresses.delete(oldestKey);
+    }
+  }
+
+  /**
    * Process addr message and add new addresses to known pool.
    */
   private handleAddrMessage(_peer: Peer, payload: AddrPayload): void {
@@ -2074,7 +2125,7 @@ export class PeerManager {
           existing.services = entry.addr.services;
         }
       } else {
-        this.knownAddresses.set(key, {
+        this.addKnownAddress(key, {
           host: ip,
           port: entry.addr.port,
           services: entry.addr.services,
@@ -2122,7 +2173,7 @@ export class PeerManager {
       } else {
         const peerInfo = this.addrV2ToPeerInfo(entry.addr, entry.timestamp);
         if (peerInfo) {
-          this.knownAddresses.set(key, peerInfo);
+          this.addKnownAddress(key, peerInfo);
         }
       }
     }
@@ -2289,7 +2340,12 @@ export class PeerManager {
         const data = await file.arrayBuffer();
         const buffer = Buffer.from(data);
         const addresses = deserializePeerAddresses(buffer);
+        // A peers.dat written before the cap existed (or by an older build)
+        // may hold more than KNOWN_ADDRESSES_MAX entries. Keep the newest by
+        // lastSeen so a stale oversized file can't reload the map uncapped.
+        addresses.sort((a, b) => b.lastSeen - a.lastSeen);
         for (const info of addresses) {
+          if (this.knownAddresses.size >= KNOWN_ADDRESSES_MAX) break;
           const key = `${info.host}:${info.port}`;
           this.knownAddresses.set(key, info);
         }
@@ -2305,7 +2361,14 @@ export class PeerManager {
   private async saveAddresses(): Promise<void> {
     const path = `${this.config.datadir}/peers.dat`;
     try {
-      const addresses = Array.from(this.knownAddresses.values());
+      let addresses = Array.from(this.knownAddresses.values());
+      // Hard-cap what we persist so peers.dat can't grow monotonically across
+      // restarts. The in-memory map is already capped at KNOWN_ADDRESSES_MAX,
+      // so this is a belt-and-braces ceiling: keep the freshest by lastSeen.
+      if (addresses.length > KNOWN_ADDRESSES_MAX) {
+        addresses.sort((a, b) => b.lastSeen - a.lastSeen);
+        addresses = addresses.slice(0, KNOWN_ADDRESSES_MAX);
+      }
       const buffer = serializePeerAddresses(addresses);
       await Bun.write(path, buffer);
     } catch {

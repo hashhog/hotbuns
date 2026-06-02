@@ -483,6 +483,7 @@ export class Peer {
         },
         close: (_socket) => {
           this.cleanupHandshakeTimer();
+          this.releaseNonce();
           if (this.state !== "disconnected") {
             this.state = "disconnected";
             this.events.onDisconnect(this);
@@ -490,6 +491,7 @@ export class Peer {
         },
         error: (_socket, error) => {
           this.cleanupHandshakeTimer();
+          this.releaseNonce();
           if (this.state !== "disconnected") {
             this.state = "disconnected";
             this.events.onDisconnect(this, error);
@@ -497,6 +499,7 @@ export class Peer {
         },
         connectError: (_socket, error) => {
           this.cleanupHandshakeTimer();
+          this.releaseNonce();
           this.state = "disconnected";
           this.events.onDisconnect(this, error);
         },
@@ -511,6 +514,9 @@ export class Peer {
     try {
       this.socket = await Promise.race([connectPromise, timeoutPromise]);
     } catch (error) {
+      // Dial timed out / refused before any socket handler fired — release the
+      // nonce here so a failed outbound dial doesn't leak one bigint.
+      this.releaseNonce();
       this.state = "disconnected";
       throw error;
     }
@@ -549,6 +555,7 @@ export class Peer {
           data: (_s, data) => this.onData(Buffer.from(data)),
           close: () => {
             this.cleanupHandshakeTimer();
+            this.releaseNonce();
             if (this.state !== "disconnected") {
               this.state = "disconnected";
               this.events.onDisconnect(this);
@@ -556,6 +563,7 @@ export class Peer {
           },
           error: (_s, error) => {
             this.cleanupHandshakeTimer();
+            this.releaseNonce();
             if (this.state !== "disconnected") {
               this.state = "disconnected";
               this.events.onDisconnect(this, error);
@@ -579,6 +587,9 @@ export class Peer {
     try {
       socket = await Promise.race([connectPromise, timeoutPromise]);
     } catch (error) {
+      // Proxy dial failed before any socket handler fired — release the nonce
+      // so a failed proxied dial doesn't leak one bigint.
+      this.releaseNonce();
       this.state = "disconnected";
       throw error;
     }
@@ -739,13 +750,27 @@ export class Peer {
     }
     this.cleanupHandshakeTimer();
     // Clean up our nonce from local nonces
-    Peer.localNonces.delete(this.ourNonce);
+    this.releaseNonce();
     this.state = "disconnected";
     if (this.socket) {
       this.socket.end();
       this.socket = null;
     }
     this.events.onDisconnect(this);
+  }
+
+  /**
+   * Release this peer's self-connection nonce from the static
+   * {@link localNonces} set. Idempotent (Set.delete is a no-op for an absent
+   * key), so it is safe to call from every disconnect/teardown path. The
+   * socket `close`/`error`/`connectError` handlers and the connect-failure
+   * catch blocks do NOT route through {@link disconnect} — they set
+   * `state="disconnected"` and emit `onDisconnect` directly — so each of those
+   * paths must call this to avoid leaking one `bigint` per dropped/failed peer.
+   * Mirrors the nonce cleanup Bitcoin Core does in `FinalizeNode`.
+   */
+  private releaseNonce(): void {
+    Peer.localNonces.delete(this.ourNonce);
   }
 
   /**
@@ -772,6 +797,16 @@ export class Peer {
    */
   static clearLocalNonces(): void {
     Peer.localNonces.clear();
+  }
+
+  /**
+   * Number of live self-connection nonces currently tracked (for testing /
+   * the structure-size metric in the leak instrumentation plan). Each connected
+   * or in-flight Peer registers exactly one nonce in its constructor and must
+   * release it on every disconnect path.
+   */
+  static localNoncesSize(): number {
+    return Peer.localNonces.size;
   }
 
   /**
