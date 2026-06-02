@@ -40,6 +40,19 @@ export const INVENTORY_BROADCAST_MAX = 1000;
 export const INVENTORY_BATCH_SIZE = 7;
 
 /**
+ * Hard cap on the number of pending transaction announcements queued per peer.
+ * Mirrors Bitcoin Core's `MAX_PEER_TX_ANNOUNCEMENTS` (net_processing.cpp).
+ * The flush only drains {@link INVENTORY_BATCH_SIZE} (7) txids per Poisson
+ * tick, so a peer that floods us with invs (or a stuck/slow peer whose queue
+ * never drains) would otherwise let `pendingTxs` grow without bound. This is an
+ * at-tip-only concern (the tx handler early-returns during IBD), but it is a
+ * real bound: announcements past the cap are dropped/ignored. Dropping an
+ * advisory inv announcement changes no consensus behaviour — the peer can
+ * always re-announce, and we still serve the tx on `getdata`.
+ */
+export const MAX_PEER_TX_ANNOUNCEMENTS = 5000;
+
+/**
  * Per-peer relay queue tracking pending transaction announcements.
  */
 interface PeerRelayQueue {
@@ -135,6 +148,26 @@ export class InventoryRelay {
   }
 
   /**
+   * Add a txid to a peer's pending-announcement set, enforcing the
+   * {@link MAX_PEER_TX_ANNOUNCEMENTS} per-peer cap. Re-announcing an
+   * already-queued txid is always allowed (Set.add is idempotent and does not
+   * grow the set); only genuinely-new txids past the cap are dropped.
+   * @returns true if the txid is now queued, false if dropped at the cap.
+   */
+  private enqueueTx(queue: PeerRelayQueue, txid: string): boolean {
+    if (queue.pendingTxs.has(txid)) {
+      return true;
+    }
+    if (queue.pendingTxs.size >= MAX_PEER_TX_ANNOUNCEMENTS) {
+      // Queue is full (peer flood / stuck drain). Drop the announcement; the
+      // tx is still served on getdata and can be re-announced later.
+      return false;
+    }
+    queue.pendingTxs.add(txid);
+    return true;
+  }
+
+  /**
    * Queue a transaction for announcement to a specific peer.
    * The transaction will be announced on the next scheduled flush.
    *
@@ -146,7 +179,7 @@ export class InventoryRelay {
     const queue = this.queues.get(key);
 
     if (queue) {
-      queue.pendingTxs.add(txid);
+      this.enqueueTx(queue, txid);
     }
   }
 
@@ -169,8 +202,7 @@ export class InventoryRelay {
     const queue = this.queues.get(key);
 
     if (queue) {
-      queue.pendingTxs.add(txid);
-      return true;
+      return this.enqueueTx(queue, txid);
     }
     return false;
   }
@@ -182,7 +214,7 @@ export class InventoryRelay {
    */
   queueTxToAll(txid: string): void {
     for (const queue of this.queues.values()) {
-      queue.pendingTxs.add(txid);
+      this.enqueueTx(queue, txid);
     }
   }
 
@@ -199,8 +231,9 @@ export class InventoryRelay {
     for (const queue of this.queues.values()) {
       // Check feefilter before queueing
       if (meetsFeeFilter(txFeeRate, queue.peer.feeFilterReceived)) {
-        queue.pendingTxs.add(txid);
-        count++;
+        if (this.enqueueTx(queue, txid)) {
+          count++;
+        }
       }
     }
     return count;

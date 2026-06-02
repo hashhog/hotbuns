@@ -986,7 +986,13 @@ describe("Structural summary: TxRequestTracker pattern entirely absent", () => {
     // This test documents the structural gap in one place.
     const relayExports = require("../p2p/relay.js");
     expect(relayExports.GETDATA_TX_INTERVAL_MS).toBeUndefined();
-    expect(relayExports.MAX_PEER_TX_ANNOUNCEMENTS).toBeUndefined();
+    // NOTE: MAX_PEER_TX_ANNOUNCEMENTS now EXISTS — the per-peer pending-tx
+    // announcement cap (Core net_processing.cpp parity) was added as a Tier-A
+    // leak-bound fix (see _hotbuns-rss-leak-rootcause-2026-06-02.md). It is the
+    // outbound-announcement queue ceiling; it does NOT supply the full inbound
+    // TxRequestTracker (request scheduling / in-flight tracking), which is the
+    // structural gap this test still documents via the constants below.
+    expect(relayExports.MAX_PEER_TX_ANNOUNCEMENTS).toBe(5000);
     expect(relayExports.MAX_PEER_TX_REQUEST_IN_FLIGHT).toBeUndefined();
     expect(relayExports.NONPREF_PEER_TX_DELAY_MS).toBeUndefined();
     expect(relayExports.TXID_RELAY_DELAY_MS).toBeUndefined();
