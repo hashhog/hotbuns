@@ -8,6 +8,7 @@
 import * as path from "path";
 import type { ChainStateManager } from "../chain/state.js";
 import type { ChainDB } from "../storage/database.js";
+import { DBPrefix } from "../storage/database.js";
 import type { Mempool, MempoolEntry } from "../mempool/mempool.js";
 import { PackageValidationResult, MAX_PACKAGE_COUNT } from "../mempool/mempool.js";
 import { dumpMempool, loadMempool, mempoolDumpExists } from "../mempool/persist.js";
@@ -56,7 +57,7 @@ import {
   hasWitness,
   isCoinbase,
 } from "../validation/tx.js";
-import { hash256 } from "../crypto/primitives.js";
+import { hash256, hash160 } from "../crypto/primitives.js";
 import { BufferReader } from "../wire/serialization.js";
 import type { InvPayload, NetworkMessage } from "../p2p/messages.js";
 import { InvType } from "../p2p/messages.js";
@@ -1246,6 +1247,7 @@ export class RPCServer {
 
     // Wave-47b methods
     this.registerMethod("gettxoutsetinfo", (params) => this.getTxOutSetInfo(params));
+    this.registerMethod("scantxoutset", (params) => this.scanTxOutSet(params));
     this.registerMethod("getnetworkhashps", (params) => this.getNetworkHashPS(params));
     this.registerMethod("gettxoutproof", (params) => this.getTxOutProof(params));
     this.registerMethod("verifytxoutproof", (params) => this.verifyTxOutProof(params));
@@ -8821,6 +8823,223 @@ export class RPCServer {
       hash_serialized_3: hash.reverse().toString("hex"),
       total_amount: 0,
     };
+  }
+
+  /**
+   * scantxoutset "action" [ scanobjects ]
+   *
+   * Scans the CURRENT UTXO set for outputs whose scriptPubKey matches one of
+   * the supplied scan objects. Mirrors Bitcoin Core
+   * (src/rpc/blockchain.cpp::scantxoutset) for the result shape; supports the
+   * two simplest scan-object forms plus the single-key pkh()/wpkh()/tr()
+   * descriptors:
+   *
+   *   "addr(<address>)"          — outputs paying to <address>'s scriptPubKey
+   *   "raw(<scriptPubKey-hex>)"  — outputs with exactly this scriptPubKey
+   *   "pkh(<pubkey-hex>)"        — P2PKH for the given pubkey
+   *   "wpkh(<pubkey-hex>)"       — P2WPKH for the given pubkey
+   *   "tr(<xonly-pubkey-hex>)"   — P2TR for the given 32-byte x-only key
+   *
+   * xpub/range descriptors are out of scope (a follow-up). Only the "start"
+   * action does real work; "status"/"abort" return a benign success stub since
+   * the scan here is synchronous (no background scan to track or cancel).
+   */
+  private async scanTxOutSet(params: unknown[]): Promise<unknown> {
+    const action = typeof params[0] === "string" ? params[0] : undefined;
+    if (action === "status") {
+      // No background scan is ever in progress (this scan is synchronous).
+      return null;
+    }
+    if (action === "abort") {
+      // Nothing to abort.
+      return false;
+    }
+    if (action !== "start") {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `Invalid action '${String(action)}'`,
+      );
+    }
+
+    const scanobjects = params[1];
+    if (!Array.isArray(scanobjects)) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        "scanobjects argument is required for the start action",
+      );
+    }
+
+    // Resolve each scan object to a concrete scriptPubKey (the "needle").
+    // We key by hex so duplicate scan objects collapse and lookups are O(1).
+    const needles = new Map<string, Buffer>();
+    for (const obj of scanobjects) {
+      // Core accepts either a bare descriptor string or {desc, range} objects;
+      // we support the bare string form (range descriptors are out of scope).
+      const desc = typeof obj === "string" ? obj : (obj as { desc?: unknown })?.desc;
+      if (typeof desc !== "string") {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "Scan object must be either a string or an object",
+        );
+      }
+      const spk = this.scanObjectToScriptPubKey(desc);
+      needles.set(spk.toString("hex"), spk);
+    }
+
+    const bestBlock = this.chainState.getBestBlock();
+    const bestBlockHashHex = Buffer.from(bestBlock.hash).reverse().toString("hex");
+
+    // Iterate the full UTXO set. Mirrors the LevelDB iteration in
+    // computeUTXOSetHash (chain/snapshot.ts): prefix-scan the 0x75 ('u')
+    // keyspace, key = prefix(1) + txid(32) + vout(4 LE), value = serialized
+    // UTXOEntry (height u32 LE, coinbase u8, amount u64 LE, scriptPubKey
+    // varbytes).
+    const utxoPrefix = Buffer.from([DBPrefix.UTXO]);
+    const iterator = (this.db as unknown as { db: { iterator(opts: unknown): AsyncIterable<[Buffer, Buffer]> & { close(): Promise<void> } } }).db.iterator({
+      gte: utxoPrefix,
+      lt: Buffer.from([DBPrefix.UTXO + 1]),
+    });
+
+    const unspents: Array<Record<string, unknown>> = [];
+    let totalAmount = 0n;
+    let count = 0n;
+
+    try {
+      for await (const [key, value] of iterator) {
+        if (key.length !== 37) continue;
+        count++;
+
+        const reader = new BufferReader(value);
+        const height = reader.readUInt32LE();
+        const coinbase = reader.readUInt8() === 1;
+        const amount = reader.readUInt64LE();
+        const scriptPubKey = reader.readVarBytes();
+
+        const match = needles.get(scriptPubKey.toString("hex"));
+        if (!match) continue;
+
+        // Key buffer may be reused by the iterator; copy out the txid.
+        const txidInternal = Buffer.from(key.subarray(1, 33));
+        const vout = key.readUInt32LE(33);
+        totalAmount += amount;
+
+        unspents.push({
+          txid: Buffer.from(txidInternal).reverse().toString("hex"),
+          vout,
+          scriptPubKey: scriptPubKey.toString("hex"),
+          amount: formatBtcAmount(amount),
+          coinbase,
+          height,
+        });
+      }
+    } finally {
+      await iterator.close();
+    }
+
+    return {
+      success: true,
+      txouts: Number(count),
+      height: bestBlock.height,
+      bestblock: bestBlockHashHex,
+      unspents,
+      total_amount: formatBtcAmount(totalAmount),
+    };
+  }
+
+  /**
+   * Resolve a single scantxoutset scan-object descriptor string to the
+   * scriptPubKey it matches. Supports addr()/raw() plus the single-key
+   * pkh()/wpkh()/tr() forms. Throws an RPC error on anything unsupported.
+   */
+  private scanObjectToScriptPubKey(desc: string): Buffer {
+    // Strip an optional "#checksum" suffix (Core descriptor checksums).
+    const hashIdx = desc.indexOf("#");
+    const body = hashIdx === -1 ? desc : desc.slice(0, hashIdx);
+
+    const open = body.indexOf("(");
+    const close = body.lastIndexOf(")");
+    if (open === -1 || close === -1 || close < open) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `Invalid descriptor '${desc}'`,
+      );
+    }
+    const fn = body.slice(0, open).trim().toLowerCase();
+    const arg = body.slice(open + 1, close).trim();
+
+    switch (fn) {
+      case "addr": {
+        const decoded = this.decodeAddress(arg);
+        if (!decoded.valid || !decoded.scriptPubKey) {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+            `Address is not valid: ${arg}`,
+          );
+        }
+        return decoded.scriptPubKey;
+      }
+      case "raw": {
+        if (!/^[0-9a-fA-F]*$/.test(arg) || arg.length % 2 !== 0) {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_PARAMS,
+            `Raw script '${arg}' must be hex`,
+          );
+        }
+        return Buffer.from(arg, "hex");
+      }
+      case "pkh": {
+        // P2PKH: OP_DUP OP_HASH160 <20-byte pkh> OP_EQUALVERIFY OP_CHECKSIG
+        const pubkey = this.parsePubkeyArg(arg, desc);
+        const pkh = hash160(pubkey);
+        return Buffer.concat([
+          Buffer.from([0x76, 0xa9, 0x14]),
+          pkh,
+          Buffer.from([0x88, 0xac]),
+        ]);
+      }
+      case "wpkh": {
+        // P2WPKH: OP_0 <20-byte pkh>
+        const pubkey = this.parsePubkeyArg(arg, desc);
+        const pkh = hash160(pubkey);
+        return Buffer.concat([Buffer.from([0x00, 0x14]), pkh]);
+      }
+      case "tr": {
+        // P2TR (key-path only, no script tree): OP_1 <32-byte output key>.
+        // We treat the supplied key as the final 32-byte x-only output key
+        // (rawtr semantics). BIP-341 tweaking of an inner key is out of scope.
+        const key = Buffer.from(arg, "hex");
+        if (!/^[0-9a-fA-F]{64}$/.test(arg) || key.length !== 32) {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_PARAMS,
+            `tr() expects a 32-byte x-only pubkey hex: ${arg}`,
+          );
+        }
+        return Buffer.concat([Buffer.from([0x51, 0x20]), key]);
+      }
+      default:
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          `Unsupported descriptor function '${fn}()' (scantxoutset supports addr(), raw(), pkh(), wpkh(), tr())`,
+        );
+    }
+  }
+
+  /** Parse a 33-byte compressed (or 65-byte uncompressed) pubkey hex arg. */
+  private parsePubkeyArg(arg: string, desc: string): Buffer {
+    if (!/^[0-9a-fA-F]+$/.test(arg) || arg.length % 2 !== 0) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `Pubkey '${arg}' in '${desc}' must be hex`,
+      );
+    }
+    const pubkey = Buffer.from(arg, "hex");
+    if (pubkey.length !== 33 && pubkey.length !== 65) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `Pubkey '${arg}' must be 33 (compressed) or 65 (uncompressed) bytes`,
+      );
+    }
+    return pubkey;
   }
 
   /**
