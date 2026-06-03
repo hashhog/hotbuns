@@ -34,7 +34,7 @@ import { BlockFilterIndex } from "../storage/indexes.js";
 import { InventoryRelay } from "../p2p/relay.js";
 import { getTxId, getTxVSize } from "../validation/tx.js";
 import { InvType, type NetworkMessage, type InvVector } from "../p2p/messages.js";
-import { Wallet } from "../wallet/wallet.js";
+import { Wallet, WalletManager } from "../wallet/wallet.js";
 import { MAINNET, TESTNET, TESTNET4, REGTEST, type ConsensusParams } from "../consensus/params.js";
 import { Logger, setLogger } from "../logger/logger.js";
 
@@ -2121,6 +2121,20 @@ async function startNode(config: NodeConfig): Promise<void> {
     tlsKeyPath: mergedConfig.rpcTlsKey,
   };
 
+  // Multi-wallet manager: required for the wallet RPC surface
+  // (createwallet/loadwallet/getnewaddress/...). Without it the RPC server
+  // skips registering every wallet method (server.ts gates them on
+  // `this.walletManager`), so they 404 with -32601. WalletManager only
+  // accepts mainnet/testnet/regtest; testnet4 maps to the testnet wallet
+  // namespace (same convention as the single-wallet path in this file).
+  const walletNetwork: "mainnet" | "testnet" | "regtest" =
+    mergedConfig.network === "regtest"
+      ? "regtest"
+      : mergedConfig.network === "mainnet"
+        ? "mainnet"
+        : "testnet";
+  const walletManager = new WalletManager(mergedConfig.datadir, walletNetwork);
+
   const rpcDeps: RPCServerDeps = {
     chainState,
     mempool,
@@ -2131,6 +2145,7 @@ async function startNode(config: NodeConfig): Promise<void> {
     params,
     blockSync,
     pruneManager,
+    walletManager,
   };
 
   const rpcServer = new RPCServer(rpcConfig, rpcDeps);
