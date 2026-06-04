@@ -7546,8 +7546,19 @@ export class RPCServer {
 
   private async getBalance(_params: unknown[]): Promise<number> {
     const wallet = this.getCurrentWallet();
-    const balance = wallet.getBalance();
-    return Number(balance.total) / 100_000_000;
+    // Core's `getbalance` reports the *available* (spendable) balance: confirmed
+    // coins, with immature coinbase (under COINBASE_MATURITY=100 confirmations)
+    // EXCLUDED. `Wallet.getBalance().total` sums every credited UTXO regardless
+    // of maturity, which would over-report the balance right after mining (each
+    // freshly-mined coinbase is immature). Sum the maturity-filtered spendable
+    // set instead so the reported balance is the amount actually sendable.
+    // Reference: bitcoin-core/src/wallet/rpc/coins.cpp::getbalance ->
+    // CWallet::GetBalance().m_mine_trusted (AvailableCoins skips immature cb).
+    let spendable = 0n;
+    for (const utxo of wallet.getSpendableUTXOs()) {
+      spendable += utxo.amount;
+    }
+    return Number(spendable) / 100_000_000;
   }
 
   /**

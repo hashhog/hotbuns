@@ -2150,6 +2150,75 @@ async function startNode(config: NodeConfig): Promise<void> {
 
   const rpcServer = new RPCServer(rpcConfig, rpcDeps);
 
+  // Wallet UTXO ledger: scan every block that connects to the active tip for
+  // outputs paying wallet addresses (credit) and inputs spending wallet coins
+  // (debit). Mirrors Bitcoin Core's CWallet::blockConnected notification
+  // (src/wallet/wallet.cpp). Without this hook WalletManager.processBlock has
+  // no caller outside the unit tests, so the ledger stays empty and
+  // getbalance/listunspent are always 0/[] and sendtoaddress fails with
+  // "Insufficient funds". This is the one missing wire to a wallet-native spend.
+  //
+  // Registered on the same shared `chainEvents` bus the orphan pool + fee
+  // estimator already listen on (set on chainState above). `walletManager` is
+  // captured by closure; the listener only fires asynchronously after
+  // blockSync.start(), well past this const's initialization, so there is no
+  // temporal-dead-zone hazard. Best-effort — a wallet bookkeeping failure must
+  // never roll back a fully-validated block (the ledger is reconstructible via
+  // rescan / scantxoutset, which reads the authoritative on-chain UTXO set).
+  chainEvents.on("blockConnected", (block: import("../validation/block.js").Block) => {
+    const blockHeight = chainState.getBestBlock().height;
+    // Keep the mempool's notion of the chain tip current. The mempool uses
+    // tipHeight for coinbase-maturity checks (depth = tipHeight - utxo.height)
+    // and BIP-113. The IBD/P2P connect path updates it (sync/blocks.ts:3094),
+    // but the RPC-mined connect path (generatetoaddress -> chainState.connectBlock)
+    // does NOT, so without this a wallet-native sendtoaddress that spends a mined
+    // coinbase is rejected with "premature-spend-of-coinbase: depth -1" (the
+    // exact stale-tipHeight failure documented at sync/blocks.ts:3088). Set it
+    // here so BOTH connect paths converge through the shared notification bus.
+    try {
+      mempool.setTipHeight(blockHeight);
+    } catch (err) {
+      console.warn(
+        `[mempool] setTipHeight failure on block-connect: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+    try {
+      walletManager.processBlock(block, blockHeight);
+    } catch (err) {
+      console.warn(
+        `[wallet] processBlock failure on block-connect: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  });
+  // Symmetric reorg safety: reverse a block's wallet credits when the tip is
+  // disconnected so the ledger does not over-count coins that no longer exist
+  // on the active chain. chainState emits `blockDisconnected` from
+  // disconnectBlock (state.ts:772). Best-effort, mirrors the connect side.
+  // `walletManager.disconnectBlock` only removes outputs this block created
+  // (the conservative, lossless half of a reorg) — it does NOT attempt to
+  // restore inputs the block spent, because the wallet retains no per-block
+  // undo data for the prior coin amounts. The lossless credit-reversal keeps
+  // the ledger from over-counting; the rare spent-input case is recoverable via
+  // a future rescan / scantxoutset reconciliation.
+  chainEvents.on(
+    "blockDisconnected",
+    (block: import("../validation/block.js").Block) => {
+      try {
+        walletManager.disconnectBlock(block);
+      } catch (err) {
+        console.warn(
+          `[wallet] disconnectBlock failure on block-disconnect: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
+    }
+  );
+
   // 8a. Optional REST server (Core-parity `-rest`).
   //
   // Bitcoin Core registers REST handlers on the same HTTPServer as the

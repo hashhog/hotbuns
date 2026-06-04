@@ -196,8 +196,21 @@ export interface WalletUTXO {
   isCoinbase: boolean;
 }
 
-// Consensus constant: coinbase outputs require 100 confirmations before spending
+// Consensus constant: coinbase outputs require 100 blocks to be buried beneath
+// them before spending (bitcoin-core/src/consensus/consensus.h:19).
 export const COINBASE_MATURITY = 100;
+
+// Wallet-layer spendability threshold for a coinbase, expressed in *wallet
+// confirmations* (depth = tipHeight - txHeight + 1, so a coin in the tip block
+// has 1 confirmation). Core's wallet matures a coinbase when
+// GetBlocksToMaturity() == 0, i.e. chain_depth >= COINBASE_MATURITY + 1
+// (bitcoin-core/src/wallet/wallet.cpp:3342). This is exactly one greater than
+// the bare COINBASE_MATURITY so the wallet never coin-selects a coinbase the
+// mempool would then reject with bad-txns-premature-spend-of-coinbase (the
+// mempool uses depth = tipHeight - utxoHeight, one less than wallet depth — see
+// src/mempool/mempool.ts coinbase-maturity gate). At tip 101 only the height-1
+// coinbase (101 confirmations) is mature; the height-2 coinbase (100) is not.
+export const COINBASE_SPENDABLE_DEPTH = COINBASE_MATURITY + 1;
 
 // Coin selection result
 export interface CoinSelectionResult {
@@ -1734,8 +1747,9 @@ export class Wallet {
       if (utxo.confirmations < 1) {
         continue; // Unconfirmed
       }
-      // Coinbase outputs require COINBASE_MATURITY (100) confirmations
-      if (utxo.isCoinbase && utxo.confirmations < COINBASE_MATURITY) {
+      // Coinbase outputs are spendable only once buried COINBASE_MATURITY deep
+      // (wallet depth >= COINBASE_MATURITY + 1); see COINBASE_SPENDABLE_DEPTH.
+      if (utxo.isCoinbase && utxo.confirmations < COINBASE_SPENDABLE_DEPTH) {
         continue; // Immature coinbase
       }
       available.push(utxo);
@@ -2208,6 +2222,16 @@ export class Wallet {
       addressToType.set(key.address, key.addressType);
     }
 
+    // Track the outpoints credited in THIS block so the per-block confirmation
+    // bump below does not double-count their creating block. A coin included in
+    // the current tip block has exactly 1 confirmation (Core: GetDepthInMainChain
+    // == 1 for a tx in the tip), so a freshly-credited UTXO must stay at 1 — it
+    // is the increment loop's job to age only the coins that existed BEFORE this
+    // block. (Pre-fix the new UTXO was created at conf=1 and then immediately
+    // bumped in the same call, leaving it at conf=2 and over-stating depth by 1,
+    // which prematurely matured coinbase by one block.)
+    const createdThisBlock = new Set<string>();
+
     // Process each transaction
     for (const tx of block.transactions) {
       const txid = getTxId(tx);
@@ -2241,6 +2265,7 @@ export class Wallet {
             addressType: addrType,
             isCoinbase: txIsCoinbase,
           });
+          createdThisBlock.add(outpointKey);
         }
       }
 
@@ -2253,9 +2278,49 @@ export class Wallet {
       }
     }
 
-    // Increment confirmation count for all UTXOs
+    // Age every UTXO that existed before this block by one confirmation. Coins
+    // credited in this block keep confirmations == 1 (they were just set above).
+    for (const [outpointKey, utxo] of this.utxos.entries()) {
+      if (!createdThisBlock.has(outpointKey)) {
+        utxo.confirmations++;
+      }
+    }
+  }
+
+  /**
+   * Reverse the wallet-ledger effects of a block being disconnected from the
+   * active tip (reorg). Conservative + lossless: remove only the UTXOs this
+   * block *created* for our addresses (those outpoints no longer exist on the
+   * active chain) and roll back the per-block confirmation increment. We do
+   * NOT attempt to restore coins this block *spent*, because the wallet retains
+   * no undo data for the prior coin amounts; that rare case is reconcilable via
+   * a future rescan. Symmetric to `processBlock`'s credit half.
+   *
+   * Reference: bitcoin-core/src/wallet/wallet.cpp CWallet::blockDisconnected.
+   */
+  disconnectBlock(block: Block): void {
+    // Remove outputs this block created that we had credited.
+    for (const tx of block.transactions) {
+      const txid = getTxId(tx);
+      const txidHex = txid.toString("hex");
+      for (let vout = 0; vout < tx.outputs.length; vout++) {
+        const outpointKey = `${txidHex}:${vout}`;
+        if (this.utxos.has(outpointKey)) {
+          this.utxos.delete(outpointKey);
+        }
+      }
+      // An outgoing tx that was confirmed in this block is unconfirmed again.
+      const out = this.outgoingTxs.get(txidHex);
+      if (out) {
+        out.confirmed = false;
+      }
+    }
+
+    // Roll back the per-block confirmation increment applied in processBlock.
     for (const utxo of this.utxos.values()) {
-      utxo.confirmations++;
+      if (utxo.confirmations > 0) {
+        utxo.confirmations--;
+      }
     }
   }
 
@@ -2395,7 +2460,7 @@ export class Wallet {
       if (utxo.confirmations < 1) {
         continue; // Unconfirmed
       }
-      if (utxo.isCoinbase && utxo.confirmations < COINBASE_MATURITY) {
+      if (utxo.isCoinbase && utxo.confirmations < COINBASE_SPENDABLE_DEPTH) {
         continue; // Immature coinbase
       }
       spendable.push(utxo);
@@ -2410,7 +2475,7 @@ export class Wallet {
     if (utxo.confirmations < 1) {
       return false;
     }
-    if (utxo.isCoinbase && utxo.confirmations < COINBASE_MATURITY) {
+    if (utxo.isCoinbase && utxo.confirmations < COINBASE_SPENDABLE_DEPTH) {
       return false;
     }
     return true;
@@ -3258,6 +3323,16 @@ export class WalletManager {
   processBlock(block: Block, height: number): void {
     for (const wallet of this.wallets.values()) {
       wallet.processBlock(block, height);
+    }
+  }
+
+  /**
+   * Reverse a disconnected block's wallet-ledger effects across all loaded
+   * wallets (reorg). Mirrors `processBlock` on the disconnect side.
+   */
+  disconnectBlock(block: Block): void {
+    for (const wallet of this.wallets.values()) {
+      wallet.disconnectBlock(block);
     }
   }
 }
