@@ -61,7 +61,14 @@ import { hash256, hash160 } from "../crypto/primitives.js";
 import { BufferReader } from "../wire/serialization.js";
 import type { InvPayload, NetworkMessage } from "../p2p/messages.js";
 import { InvType } from "../p2p/messages.js";
-import type { Wallet, WalletManager, CreateWalletOptions } from "../wallet/wallet.js";
+import type {
+  Wallet,
+  WalletManager,
+  CreateWalletOptions,
+  WalletTxRecord,
+  WalletTxDetail,
+} from "../wallet/wallet.js";
+import { COINBASE_SPENDABLE_DEPTH } from "../wallet/wallet.js";
 import {
   parseDescriptor,
   getDescriptorInfo,
@@ -1189,6 +1196,7 @@ export class RPCServer {
       this.registerMethod("setlabel", (params) => this.setLabel(params));
       this.registerMethod("listreceivedbyaddress", (params) => this.listReceivedByAddress(params));
       this.registerMethod("listtransactions", (params) => this.listTransactions(params));
+      this.registerMethod("gettransaction", (params) => this.getTransaction(params));
       this.registerMethod("getwalletinfo", () => this.getWalletInfo());
       this.registerMethod("getnewaddress", (params) => this.getNewAddress(params));
       this.registerMethod("getbalance", (params) => this.getBalance(params));
@@ -6635,10 +6643,99 @@ export class RPCServer {
   }
 
   /**
-   * listtransactions: List transactions for the wallet.
+   * Resolve the category of a single received detail of a wallet tx record.
+   * Mirrors Core's ListTransactions coinbase branch (rpc/transactions.cpp:354):
+   * a coinbase credit is "immature" until it has matured (depth >=
+   * COINBASE_SPENDABLE_DEPTH), then "generate"; a non-coinbase credit is
+   * "receive". Send details carry their own "send" category verbatim.
+   */
+  private historyCategory(
+    detail: WalletTxDetail,
+    isCoinbase: boolean,
+    confirmations: number
+  ): string {
+    if (detail.category === "send") return "send";
+    if (isCoinbase) {
+      return confirmations >= COINBASE_SPENDABLE_DEPTH ? "generate" : "immature";
+    }
+    return "receive";
+  }
+
+  /**
+   * Expand one wallet-history record into the per-output listtransactions
+   * entries Core emits, in Core's order: sent line items first, then received
+   * (rpc/transactions.cpp ListTransactions). Send amounts are NEGATIVE and
+   * carry a negative fee; received amounts are positive. Each entry is
+   * decorated with the WalletTxToJSON common fields (confirmations, generated,
+   * blockhash/height/time, txid, wtxid, time).
+   */
+  private historyRecordToEntries(
+    rec: WalletTxRecord,
+    tipHeight: number,
+    labelLookup: (address: string) => string
+  ): Array<Record<string, unknown>> {
+    const confirmations = rec.blockHeight > 0 ? tipHeight - rec.blockHeight + 1 : 0;
+    const feeBtc = -(Number(rec.fee) / 100_000_000); // negative, send only
+
+    const common = (entry: Record<string, unknown>): Record<string, unknown> => {
+      entry.confirmations = confirmations;
+      if (rec.isCoinbase) entry.generated = true;
+      entry.blockhash = rec.blockHash;
+      entry.blockheight = rec.blockHeight;
+      entry.blockindex = rec.blockIndex;
+      entry.blocktime = rec.blockTime;
+      entry.txid = rec.txid;
+      entry.wtxid = rec.wtxid;
+      entry.walletconflicts = [];
+      entry.time = rec.time;
+      entry.timereceived = rec.time;
+      entry["bip125-replaceable"] = "no";
+      return entry;
+    };
+
+    const sent: Array<Record<string, unknown>> = [];
+    const received: Array<Record<string, unknown>> = [];
+
+    for (const d of rec.details) {
+      if (d.category === "send") {
+        const entry: Record<string, unknown> = {
+          address: d.address,
+          category: "send",
+          amount: -(Number(d.amount) / 100_000_000),
+          label: labelLookup(d.address),
+          vout: d.vout,
+          fee: feeBtc,
+          abandoned: false,
+        };
+        sent.push(common(entry));
+      } else {
+        const cat = this.historyCategory(d, rec.isCoinbase, confirmations);
+        const entry: Record<string, unknown> = {
+          address: d.address,
+          category: cat,
+          amount: Number(d.amount) / 100_000_000,
+          label: labelLookup(d.address),
+          vout: d.vout,
+          abandoned: false,
+        };
+        received.push(common(entry));
+      }
+    }
+
+    // Core order within a tx: all sent entries, then all received entries.
+    return [...sent, ...received];
+  }
+
+  /**
+   * listtransactions: List the wallet's own transactions (receive / send /
+   * coinbase), Core-shaped, newest-last. Backed by the wallet transaction
+   * history ledger that processBlock records as blocks connect — NOT by the
+   * live UTXO set (the prior implementation derived entries from UTXOs, so it
+   * could never show a spend and returned [] once a coinbase was spent).
    *
-   * Note: This is a simplified version that returns UTXO-based entries.
-   * A full implementation would track spent transactions separately.
+   * Reference: bitcoin-core/src/wallet/rpc/transactions.cpp listtransactions:
+   * walk wallet txs newest-first, expand each into per-output entries until
+   * count+skip are collected, then reverse to oldest-to-newest and slice.
    *
    * @param params [label, count, skip, include_watchonly]
    */
@@ -6650,37 +6747,131 @@ export class RPCServer {
     const count = typeof countParam === "number" ? Math.min(countParam, 1000) : 10;
     const skip = typeof skipParam === "number" ? skipParam : 0;
 
-    const utxos = wallet.getUTXOs();
-    const transactions: Array<{
-      address: string;
-      category: string;
-      amount: number;
-      label: string;
-      confirmations: number;
-    }> = [];
-
-    for (const utxo of utxos) {
-      const label = wallet.getLabel(utxo.address);
-
-      // Filter by label if specified
-      if (labelFilter !== "*" && label !== labelFilter) {
-        continue;
-      }
-
-      transactions.push({
-        address: utxo.address,
-        category: "receive",
-        amount: Number(utxo.amount) / 100_000_000,
-        label,
-        confirmations: utxo.confirmations,
-      });
+    if (count < 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Negative count");
+    }
+    if (skip < 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Negative from");
     }
 
-    // Sort by confirmations (newest first)
-    transactions.sort((a, b) => a.confirmations - b.confirmations);
+    const tipHeight = this.chainState.getBestBlock().height;
+    const labelLookup = (address: string): string => wallet.getLabel(address);
 
-    // Apply skip and count
-    return transactions.slice(skip, skip + count);
+    // getTxHistory() returns records newest-first (descending ordinal). Expand
+    // each into per-output entries (newest-first), collecting until we have
+    // count+skip, mirroring Core's reverse iterate-until-enough.
+    const newestFirst: Array<Record<string, unknown>> = [];
+    for (const rec of wallet.getTxHistory()) {
+      const entries = this.historyRecordToEntries(rec, tipHeight, labelLookup);
+      for (const e of entries) {
+        // Optional label filter applies to received entries only (Core skips
+        // sent entries entirely when a label filter is set).
+        if (labelFilter !== "*") {
+          if (e.category === "send") continue;
+          if (e.label !== labelFilter) continue;
+        }
+        newestFirst.push(e);
+      }
+      if (newestFirst.length >= count + skip) break;
+    }
+
+    // newestFirst is newest-to-oldest. Core returns oldest-to-newest after
+    // applying skip (nFrom) from the newest end. Reverse, then slice.
+    const oldestFirst = newestFirst.slice().reverse();
+    // Slice the window [len-skip-count, len-skip) so skip counts from newest.
+    const len = oldestFirst.length;
+    let from = skip;
+    if (from > len) from = len;
+    let n = count;
+    if (from + n > len) n = len - from;
+    return oldestFirst.slice(len - from - n, len - from);
+  }
+
+  /**
+   * gettransaction: Return a single wallet transaction, Core-shaped:
+   *   {amount, fee (send only, negative), confirmations, generated (coinbase),
+   *    blockhash, blockheight, blockindex, blocktime, txid, wtxid, time,
+   *    details:[{address, category, amount, vout, fee}], hex}
+   *
+   * amount = net (credit - debit) - fee, matching Core gettransaction
+   * (rpc/transactions.cpp:746 nNet - nFee). fee present only when the wallet
+   * funded the tx (isFromMe), and is negative.
+   *
+   * @param params [txid, include_watchonly, verbose]
+   */
+  private async getTransaction(params: unknown[]): Promise<Record<string, unknown>> {
+    const wallet = this.getCurrentWallet();
+
+    const [txidParam] = params;
+    if (typeof txidParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "txid must be a string");
+    }
+
+    const rec = wallet.getTxRecord(txidParam);
+    if (!rec) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "Invalid or non-wallet transaction id"
+      );
+    }
+
+    const tipHeight = this.chainState.getBestBlock().height;
+    const confirmations = rec.blockHeight > 0 ? tipHeight - rec.blockHeight + 1 : 0;
+
+    // Core: nNet = credit - debit; nFee = isFromMe ? -fee : 0;
+    // amount = nNet - nFee. With our sign convention (fee stored positive),
+    // amount = (credit - debit) + fee  when isFromMe, else credit - debit.
+    const netSats = rec.credit - rec.debit;
+    const feeBtc = -(Number(rec.fee) / 100_000_000); // negative, send only
+    const amountSats = rec.isFromMe ? netSats + rec.fee : netSats;
+
+    const labelLookup = (address: string): string => wallet.getLabel(address);
+
+    // details: per-output line items, NOT decorated with the common block
+    // fields (Core calls ListTransactions with fLong=false for details).
+    const details: Array<Record<string, unknown>> = [];
+    for (const d of rec.details) {
+      if (d.category === "send") {
+        details.push({
+          address: d.address,
+          category: "send",
+          amount: -(Number(d.amount) / 100_000_000),
+          label: labelLookup(d.address),
+          vout: d.vout,
+          fee: feeBtc,
+          abandoned: false,
+        });
+      } else {
+        details.push({
+          address: d.address,
+          category: this.historyCategory(d, rec.isCoinbase, confirmations),
+          amount: Number(d.amount) / 100_000_000,
+          label: labelLookup(d.address),
+          vout: d.vout,
+        });
+      }
+    }
+
+    const entry: Record<string, unknown> = {
+      amount: Number(amountSats) / 100_000_000,
+    };
+    if (rec.isFromMe) entry.fee = feeBtc;
+    entry.confirmations = confirmations;
+    if (rec.isCoinbase) entry.generated = true;
+    entry.blockhash = rec.blockHash;
+    entry.blockheight = rec.blockHeight;
+    entry.blockindex = rec.blockIndex;
+    entry.blocktime = rec.blockTime;
+    entry.txid = rec.txid;
+    entry.wtxid = rec.wtxid;
+    entry.walletconflicts = [];
+    entry.time = rec.time;
+    entry.timereceived = rec.time;
+    entry["bip125-replaceable"] = "no";
+    entry.details = details;
+    entry.hex = rec.hex;
+
+    return entry;
   }
 
   /**

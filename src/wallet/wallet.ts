@@ -49,12 +49,14 @@ import {
   type TaprootSigHashCache,
   serializeTx,
   getTxId,
+  getWTxId,
   sigHashWitnessV0,
   sigHashTaproot,
   SIGHASH_ALL,
   isCoinbase,
 } from "../validation/tx.js";
 import type { Block } from "../validation/block.js";
+import { getBlockHash } from "../validation/block.js";
 
 // Import secp256k1 for Taproot key tweaking
 import { secp256k1, schnorr } from "@noble/curves/secp256k1.js";
@@ -243,6 +245,71 @@ export interface OutgoingTx {
 }
 
 /**
+ * A per-output line item of a wallet transaction, mirroring Core's
+ * COutputEntry (wallet/types.h) as surfaced by ListTransactions /
+ * gettransaction details. `category` is one of:
+ *   "send"      — the wallet funded this tx and this output paid a non-change
+ *                 destination (amount is reported NEGATIVE by the RPC layer).
+ *   "receive"   — a non-coinbase output paying one of the wallet's addresses.
+ *   "generate"  — a coinbase output paying the wallet that is now MATURE.
+ *   "immature"  — a coinbase output paying the wallet still below maturity.
+ * (generate/immature is decided at read time from the current depth, so a
+ *  single stored record ages from immature -> generate without rewrites.)
+ */
+export interface WalletTxDetail {
+  /** Destination address of the output (best-effort; "" if unparseable). */
+  address: string;
+  /** "send" | "receive". generate/immature is derived from isCoinbase+depth. */
+  category: "send" | "receive";
+  /** Absolute output value in satoshis (sign applied by the RPC layer). */
+  amount: bigint;
+  /** The vout index of this output in the transaction. */
+  vout: number;
+}
+
+/**
+ * Wallet transaction history record. One per wallet-relevant transaction
+ * (a tx that credits at least one wallet output and/or debits at least one
+ * wallet UTXO). Recorded at block-connect scan time in processBlock and
+ * removed symmetrically in disconnectBlock (reorg safety). This is the
+ * wallet's own bookkeeping ledger — the source of truth behind
+ * listtransactions / gettransaction. Mirrors the subset of Core's CWalletTx
+ * those two RPCs consume (wallet/transaction.h + rpc/transactions.cpp).
+ */
+export interface WalletTxRecord {
+  /** Transaction id, big-endian display hex (reversed internal byte order). */
+  txid: string;
+  /** Witness transaction id, big-endian display hex. */
+  wtxid: string;
+  /** Whether this transaction is a coinbase. */
+  isCoinbase: boolean;
+  /** True if the wallet funded inputs of this tx (we "sent" it). */
+  isFromMe: boolean;
+  /** Total value of the wallet's OWN inputs spent by this tx (sat). */
+  debit: bigint;
+  /** Total value of outputs paying the wallet (sat). */
+  credit: bigint;
+  /** Fee paid (sat), only meaningful when isFromMe (debit - sum(all outs)). */
+  fee: bigint;
+  /** Confirming block hash, big-endian display hex. */
+  blockHash: string;
+  /** Height of the confirming block. */
+  blockHeight: number;
+  /** Index of this tx within its block (position_in_block). */
+  blockIndex: number;
+  /** Confirming block header timestamp (unix seconds). */
+  blockTime: number;
+  /** Wallet-local time the tx was first seen (we use blockTime at connect). */
+  time: number;
+  /** Monotonic insertion ordinal for a stable newest-first ordering. */
+  ordinal: number;
+  /** Per-output line items (send + receive), in vout order. */
+  details: WalletTxDetail[];
+  /** Full transaction serialization, hex (witness-serialized). */
+  hex: string;
+}
+
+/**
  * Result of a bumpfee operation — mirrors Core's bumpfee RPC result.
  */
 export interface BumpFeeResult {
@@ -342,6 +409,19 @@ export class Wallet {
   // bump unconfirmed txs).
   private outgoingTxs: Map<string, OutgoingTx>;
 
+  // Wallet transaction history, keyed by txid (display hex). Populated by
+  // processBlock for every wallet-relevant tx as blocks connect, and removed
+  // by disconnectBlock on reorg. Source of truth behind listtransactions /
+  // gettransaction. Confirmations are NOT stored (they would have to be aged
+  // every block, like utxos); instead each record stores its absolute
+  // blockHeight and the RPC layer derives depth = tipHeight - blockHeight + 1.
+  private txHistory: Map<string, WalletTxRecord>;
+
+  // Monotonic counter assigning each history record a stable insertion order
+  // (Core orders by wtxOrdered: insertion sequence). Ensures listtransactions
+  // returns oldest-to-newest deterministically even within a single block.
+  private nextTxOrdinal: number;
+
   constructor(config: WalletConfig) {
     this.config = config;
     this.keys = new Map();
@@ -350,6 +430,8 @@ export class Wallet {
     this.masterKey = { key: Buffer.alloc(0), chainCode: Buffer.alloc(0) };
     this.labels = new Map();
     this.outgoingTxs = new Map();
+    this.txHistory = new Map();
+    this.nextTxOrdinal = 0;
 
     // Initialize encryption state
     this.encryption = {
@@ -2232,8 +2314,17 @@ export class Wallet {
     // which prematurely matured coinbase by one block.)
     const createdThisBlock = new Set<string>();
 
+    // Block-level metadata shared by every history record minted from this
+    // block (display hex = reversed internal byte order, matching the
+    // getbestblockhash / getblockhash RPCs).
+    const blockHashDisplay = Buffer.from(getBlockHash(block.header))
+      .reverse()
+      .toString("hex");
+    const blockTime = block.header.timestamp;
+
     // Process each transaction
-    for (const tx of block.transactions) {
+    for (let blockIndex = 0; blockIndex < block.transactions.length; blockIndex++) {
+      const tx = block.transactions[blockIndex];
       const txid = getTxId(tx);
       const txIsCoinbase = isCoinbase(tx);
       const txidHex = txid.toString("hex");
@@ -2246,12 +2337,30 @@ export class Wallet {
         out.confirmed = true;
       }
 
+      // ── History accumulators for THIS tx ──────────────────────────────────
+      // credit  = total value of outputs paying us (BIP "received")
+      // debit   = total value of OUR inputs spent (computed from utxos BEFORE
+      //           we delete them below — mirrors CachedTxGetDebit)
+      // details = per-output line items. An output paying a wallet address is a
+      //           "receive"; once we know the tx debits us (isFromMe) every
+      //           output that is NOT ours is a "send" (Core CachedTxGetAmounts:
+      //           listSent gets all non-change outs when nDebit>0). We treat an
+      //           output paying one of our own addresses as change/self → it is
+      //           a receive, never a send, matching the spend cell's change
+      //           handling (change returns to a wallet address).
+      let credit = 0n;
+      let totalOut = 0n;
+      const recvDetails: WalletTxDetail[] = [];
+      const nonWalletOuts: WalletTxDetail[] = [];
+
       // Check outputs for incoming payments
       for (let vout = 0; vout < tx.outputs.length; vout++) {
         const output = tx.outputs[vout];
+        totalOut += output.value;
         const addressInfo = this.scriptPubKeyToAddressInfo(output.scriptPubKey);
+        const isOurs = addressInfo !== null && ourAddresses.has(addressInfo.address);
 
-        if (addressInfo && ourAddresses.has(addressInfo.address)) {
+        if (isOurs && addressInfo) {
           const outpointKey = `${txid.toString("hex")}:${vout}`;
           const keyPath = addressToPath.get(addressInfo.address) ?? "";
           const addrType = addressToType.get(addressInfo.address) ?? addressInfo.type;
@@ -2266,15 +2375,69 @@ export class Wallet {
             isCoinbase: txIsCoinbase,
           });
           createdThisBlock.add(outpointKey);
+
+          credit += output.value;
+          recvDetails.push({
+            address: addressInfo.address,
+            category: "receive",
+            amount: output.value,
+            vout,
+          });
+        } else {
+          // Not ours — candidate "send" line if this tx turns out to debit us.
+          nonWalletOuts.push({
+            address: addressInfo ? addressInfo.address : "",
+            category: "send",
+            amount: output.value,
+            vout,
+          });
         }
       }
 
-      // Check inputs for outgoing spends
+      // Check inputs for outgoing spends — accumulate debit BEFORE deleting.
+      let debit = 0n;
       for (const input of tx.inputs) {
         const spentKey = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
-        if (this.utxos.has(spentKey)) {
+        const spent = this.utxos.get(spentKey);
+        if (spent) {
+          debit += spent.amount;
           this.utxos.delete(spentKey);
         }
+      }
+
+      // ── Record the wallet-history entry if this tx touched the wallet ──────
+      const isFromMe = debit > 0n;
+      if (isFromMe || credit > 0n) {
+        // Send entries only exist when the tx debits us (Core: listSent is
+        // populated only when nDebit>0). Fee = our inputs - all outputs, but
+        // only meaningful when we funded the whole tx; clamp to >= 0.
+        const details: WalletTxDetail[] = [];
+        let fee = 0n;
+        if (isFromMe) {
+          for (const d of nonWalletOuts) details.push(d);
+          const rawFee = debit - totalOut;
+          fee = rawFee > 0n ? rawFee : 0n;
+        }
+        for (const d of recvDetails) details.push(d);
+        details.sort((a, b) => a.vout - b.vout);
+
+        this.txHistory.set(txidHex, {
+          txid: Buffer.from(txid).reverse().toString("hex"),
+          wtxid: Buffer.from(getWTxId(tx)).reverse().toString("hex"),
+          isCoinbase: txIsCoinbase,
+          isFromMe,
+          debit,
+          credit,
+          fee,
+          blockHash: blockHashDisplay,
+          blockHeight: height,
+          blockIndex,
+          blockTime,
+          time: blockTime,
+          ordinal: this.nextTxOrdinal++,
+          details,
+          hex: serializeTx(tx, true).toString("hex"),
+        });
       }
     }
 
@@ -2314,6 +2477,13 @@ export class Wallet {
       if (out) {
         out.confirmed = false;
       }
+
+      // Remove the wallet-history record minted for this tx at connect time.
+      // Symmetric to processBlock's recording half: a tx confirmed only in a
+      // now-disconnected block is no longer part of the active-chain history.
+      // (Conservative + lossless, mirroring the UTXO unscan above; a rescan
+      // re-derives anything reachable on the new active chain.)
+      this.txHistory.delete(txidHex);
     }
 
     // Roll back the per-block confirmation increment applied in processBlock.
@@ -2322,6 +2492,32 @@ export class Wallet {
         utxo.confirmations--;
       }
     }
+  }
+
+  /**
+   * Return every wallet-history record, newest-first (descending ordinal —
+   * the order Core's wtxOrdered.rbegin() walk produces). Each record is one
+   * wallet-relevant transaction; the RPC layer expands a record into the
+   * per-output entries listtransactions returns and derives confirmations from
+   * the supplied tip height.
+   */
+  getTxHistory(): WalletTxRecord[] {
+    return Array.from(this.txHistory.values()).sort((a, b) => b.ordinal - a.ordinal);
+  }
+
+  /**
+   * Look up a single wallet-history record by txid (display hex, big-endian).
+   * Accepts either display (reversed) or internal byte order for robustness.
+   * Returns undefined if the tx is not a wallet transaction.
+   */
+  getTxRecord(txidDisplayHex: string): WalletTxRecord | undefined {
+    // txHistory is keyed by INTERNAL (un-reversed) txid hex; callers pass the
+    // big-endian display hex. Reverse it back to the internal key.
+    const internal = Buffer.from(txidDisplayHex, "hex").reverse().toString("hex");
+    const byInternal = this.txHistory.get(internal);
+    if (byInternal) return byInternal;
+    // Fall back: caller may have passed the internal key directly.
+    return this.txHistory.get(txidDisplayHex);
   }
 
   /**
