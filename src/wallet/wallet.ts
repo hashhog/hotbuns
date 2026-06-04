@@ -196,6 +196,11 @@ export interface WalletUTXO {
   confirmations: number;
   addressType: AddressType;
   isCoinbase: boolean;
+  // Absolute block height at which this output was created. Used by rescan()
+  // to bound the span-reset precisely (clear only coins created at/above the
+  // rescan floor). Optional for backward compatibility with any UTXO minted
+  // before this field existed (treated as in-span by rescan's reset).
+  height?: number;
 }
 
 // Consensus constant: coinbase outputs require 100 blocks to be buried beneath
@@ -2373,6 +2378,7 @@ export class Wallet {
             confirmations: 1,
             addressType: addrType,
             isCoinbase: txIsCoinbase,
+            height,
           });
           createdThisBlock.add(outpointKey);
 
@@ -2645,6 +2651,131 @@ export class Wallet {
    */
   getUTXOs(): WalletUTXO[] {
     return Array.from(this.utxos.values());
+  }
+
+  /**
+   * Rescan a range of EXISTING active-chain blocks for outputs paying
+   * wallet-owned scripts, crediting them into the wallet UTXO set + history
+   * and debiting any wallet coins those blocks spent. This is the BACKWARD
+   * counterpart of the block-connect scan (processBlock, wired at
+   * cli.ts:2188) — that pass only sees blocks as they connect to the tip, so a
+   * wallet restored from a seed AFTER the chain was built (createwallet with a
+   * mnemonic, then nothing) has its keys derived but its ledger empty: no
+   * processBlock ever fired for the pre-existing blocks. rescan replays those
+   * blocks through the very same credit/debit/history machinery.
+   *
+   * Mirrors Bitcoin Core CWallet::ScanForWalletTransactions
+   * (src/wallet/wallet.cpp): walk the active chain from start_height to
+   * stop_height in ascending order, applying each block's wallet effects.
+   * Because processBlock is a pure function of (block, height) over the
+   * current ledger AND it ages confirmations one block per call, a from-empty
+   * ascending replay produces byte-identical confirmation depths to the
+   * incremental connect path (the height-1 coinbase ends at tip-1+1
+   * confirmations, etc.).
+   *
+   * Idempotence + correctness: we CLEAR the UTXO set, the tx history, and the
+   * ordinal counter for the rescanned span before replaying so a second
+   * rescan (or a rescan over a wallet that was partially populated by the
+   * connect path) does not double-credit or mis-age. The reset is bounded to
+   * the [startHeight, stopHeight] span: UTXOs/history created strictly below
+   * startHeight survive (Core preserves earlier scan results), and the
+   * surviving coins are NOT re-aged here — the replay's per-block increment
+   * does that for them as it walks the span. For the common full rescan
+   * (startHeight == 0) the wallet starts empty and the replay rebuilds the
+   * whole ledger.
+   *
+   * @param getBlockAt  resolves an active-chain block by height, or null if
+   *                    the height has no block data (pruned / out of range).
+   * @param startHeight first height to scan (inclusive, >= 0).
+   * @param stopHeight  last height to scan (inclusive).
+   * @returns the actual range scanned { startHeight, stopHeight }.
+   */
+  async rescan(
+    getBlockAt: (height: number) => Promise<Block | null>,
+    startHeight: number,
+    stopHeight: number
+  ): Promise<{ startHeight: number; stopHeight: number }> {
+    const lo = Math.max(0, startHeight | 0);
+    const hi = stopHeight | 0;
+    if (hi < lo) {
+      return { startHeight: lo, stopHeight: lo };
+    }
+
+    // Drop any ledger state at or above the rescan floor so the replay is the
+    // sole source of truth for the span. We compare against blockHeight, which
+    // every UTXO and history record carries. UTXOs predate the WalletUTXO
+    // height field? No — processBlock always sets it via createdThisBlock; but
+    // to be safe we treat a UTXO with no recorded height as in-span (clear it).
+    for (const [key, utxo] of this.utxos.entries()) {
+      if (utxo.height === undefined || utxo.height >= lo) {
+        this.utxos.delete(key);
+      }
+    }
+    for (const [key, rec] of this.txHistory.entries()) {
+      if (rec.blockHeight >= lo) {
+        this.txHistory.delete(key);
+      }
+    }
+
+    // Replay every block in the span through the same credit/debit/history
+    // pass the connect path uses. Ascending order is required for the
+    // confirmation aging to land correctly (each processBlock bumps all
+    // pre-existing coins by one).
+    let lastScanned = lo;
+    for (let h = lo; h <= hi; h++) {
+      const block = await getBlockAt(h);
+      if (!block) {
+        // Missing block data (pruned or beyond tip): stop here, Core returns
+        // the last height it actually scanned.
+        break;
+      }
+      this.processBlock(block, h);
+      lastScanned = h;
+    }
+
+    return { startHeight: lo, stopHeight: lastScanned };
+  }
+
+  /**
+   * Add an externally-supplied private key to the wallet as a standalone
+   * (non-HD, watch-and-spend) key, deriving the address for the given type so
+   * the block scan (processBlock / rescan) credits any output paying it.
+   *
+   * Mirrors the wallet side of Bitcoin Core's importprivkey
+   * (src/wallet/rpc/backup.cpp -> CWallet::ImportPrivKeys ->
+   * FillableSigningProvider::AddKeyPubKey): the key is added to the wallet
+   * keyring so future block-connect and rescan passes recognise its scripts.
+   * Core imports all standard scripts for the key; we register the single
+   * address type the caller requests (defaulting to P2WPKH, hotbuns's
+   * native-segwit-first form), which is sufficient for the single-key import
+   * path the importprivkey RPC drives.
+   *
+   * The imported key is marked with path "imported" so it is never confused
+   * with an HD-derived key (it must not advance nextReceiveIndex / the gap
+   * limit). Returns the derived address.
+   */
+  addImportedKey(
+    privateKey: Buffer,
+    addressType: AddressType = AddressType.P2WPKH,
+    label?: string
+  ): string {
+    if (privateKey.length !== 32) {
+      throw new Error(`importprivkey: private key must be 32 bytes, got ${privateKey.length}`);
+    }
+    const publicKey = privateKeyToPublicKey(privateKey, true);
+    const address = this.pubkeyToAddress(publicKey, addressType);
+    const key: WalletKey = {
+      privateKey: Buffer.from(privateKey),
+      publicKey,
+      address,
+      path: "imported",
+      addressType,
+    };
+    this.keys.set(address, key);
+    if (label !== undefined) {
+      this.labels.set(address, label);
+    }
+    return address;
   }
 
   /**

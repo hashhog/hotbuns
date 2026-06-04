@@ -1208,6 +1208,21 @@ export class RPCServer {
       this.registerMethod("importdescriptors", (params) =>
         this.importDescriptors(params)
       );
+      // Wallet rescan: scan EXISTING active-chain blocks for outputs paying
+      // wallet-owned scripts and credit them into the wallet ledger (the
+      // backward counterpart of the block-connect scan). REQUIRED so a wallet
+      // restored from a seed after the chain was built rediscovers its funds.
+      this.registerMethod("rescanblockchain", (params) =>
+        this.rescanBlockchain(params)
+      );
+      // Import a foreign private key (WIF) into the wallet and, by default,
+      // rescan the chain to credit that key's funds.
+      this.registerMethod("importprivkey", (params) =>
+        this.importPrivKey(params)
+      );
+      // Export a wallet key as WIF (the foreign-key source for importprivkey
+      // round-trips, and Core's dumpprivkey).
+      this.registerMethod("dumpprivkey", (params) => this.dumpPrivKey(params));
       this.registerMethod("signmessage", (params) => this.signMessage(params));
       this.registerMethod("walletcreatefundedpsbt", (params) =>
         this.walletCreateFundedPSBT(params)
@@ -3003,6 +3018,21 @@ export class RPCServer {
   }
 
   /**
+   * Get the WIF (Wallet Import Format) private-key version byte for the
+   * active network. Mainnet 0x80, everything else (testnet/testnet4/regtest)
+   * 0xef — mirrors Bitcoin Core CChainParams base58Prefixes[SECRET_KEY]
+   * (chainparams.cpp) and the existing signmessagewithprivkey decode path.
+   */
+  private getWIFVersion(): number {
+    switch (this.params.networkMagic) {
+      case 0xd9b4bef9: // mainnet
+        return 0x80;
+      default:
+        return 0xef;
+    }
+  }
+
+  /**
    * Get P2SH version byte based on network.
    */
   private getP2SHVersion(): number {
@@ -4251,6 +4281,192 @@ export class RPCServer {
       case MessageVerificationResult.ERR_NOT_SIGNED:
         return false;
     }
+  }
+
+  /**
+   * Resolve an active-chain block by height to a deserialized Block, or null
+   * if the height has no block data (out of range / pruned). Used as the
+   * block-source callback for wallet rescans. Reads the canonical
+   * height -> hash mapping then the raw block bytes (storage/database.ts).
+   */
+  private async getActiveChainBlock(height: number): Promise<Block | null> {
+    const hash = await this.db.getBlockHashByHeight(height).catch(() => null);
+    if (!hash) return null;
+    const raw = await this.db.getBlock(hash).catch(() => null);
+    if (!raw) return null;
+    try {
+      return deserializeBlock(new BufferReader(raw));
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * rescanblockchain ( start_height stop_height )
+   *
+   * Scan EXISTING active-chain blocks in [start_height, stop_height] for
+   * outputs paying wallet-owned scripts and credit them into the wallet
+   * ledger (debiting any wallet coins those blocks spent). This is the
+   * BACKWARD counterpart of the block-connect scan (Wallet.processBlock,
+   * wired at cli.ts:2188): the connect pass only fires for blocks as they
+   * attach to the tip, so a wallet restored from a seed AFTER the chain was
+   * already built has its keys derived but its ledger empty — no rescan, no
+   * funds. This RPC replays the pre-existing blocks through the same
+   * credit/debit machinery.
+   *
+   * Mirrors Bitcoin Core rescanblockchain (src/wallet/rpc/transactions.cpp ->
+   * CWallet::ScanForWalletTransactions): default start_height 0, stop_height
+   * defaults to the current tip, range-validated against the tip, and the
+   * result is { start_height, stop_height } reporting the actual span
+   * scanned.
+   *
+   * @param params [start_height?, stop_height?]
+   */
+  private async rescanBlockchain(params: unknown[]): Promise<unknown> {
+    // Resolve the wallet first (throws WALLET_NOT_FOUND if none loaded).
+    const wallet = this.getCurrentWallet();
+
+    const tipHeight = this.chainState.getBestBlock().height;
+
+    let startHeight = 0;
+    if (params[0] !== undefined && params[0] !== null) {
+      if (typeof params[0] !== "number" || !Number.isInteger(params[0])) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid start_height");
+      }
+      startHeight = params[0];
+      if (startHeight < 0 || startHeight > tipHeight) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid start_height");
+      }
+    }
+
+    let stopHeight = tipHeight;
+    if (params[1] !== undefined && params[1] !== null) {
+      if (typeof params[1] !== "number" || !Number.isInteger(params[1])) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid stop_height");
+      }
+      stopHeight = params[1];
+      if (stopHeight < 0 || stopHeight > tipHeight) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid stop_height");
+      }
+      if (stopHeight < startHeight) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "stop_height must be greater than start_height"
+        );
+      }
+    }
+
+    const result = await wallet.rescan(
+      (h) => this.getActiveChainBlock(h),
+      startHeight,
+      stopHeight
+    );
+
+    return {
+      start_height: result.startHeight,
+      stop_height: result.stopHeight,
+    };
+  }
+
+  /**
+   * importprivkey "privkey" ( "label" rescan )
+   *
+   * Decode a WIF private key, add it (and its address) to the wallet, and —
+   * unless rescan is false — rescan the chain so any funds already paid to
+   * that key are credited. Mirrors Bitcoin Core importprivkey
+   * (src/wallet/rpc/backup.cpp -> CWallet::ImportPrivKeys + RescanWallet).
+   *
+   * hotbuns wallets are native-segwit-first, so the imported key is given a
+   * P2WPKH address (the form the foreign-key funding path uses); this matches
+   * how dumpprivkey + getnewaddress operate in this wallet. The decode path
+   * reuses the exact WIF format the existing signmessagewithprivkey handler
+   * accepts (0x80 mainnet / 0xef otherwise, optional 0x01 compression flag).
+   *
+   * @param params [privkey(WIF), label?, rescan?]
+   */
+  private async importPrivKey(params: unknown[]): Promise<unknown> {
+    const wallet = this.getCurrentWallet();
+
+    const wif = params[0];
+    if (typeof wif !== "string") {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "importprivkey requires a WIF private key string"
+      );
+    }
+    const label = typeof params[1] === "string" ? params[1] : undefined;
+    // Default rescan true (Core). Accept boolean or omitted.
+    const rescan = params[2] === undefined || params[2] === null ? true : params[2] === true;
+
+    // Decode the WIF (mirrors signMessageWithPrivKey).
+    let decoded: { version: number; hash: Buffer };
+    try {
+      decoded = base58CheckDecode(wif);
+    } catch {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Invalid private key encoding");
+    }
+    if (decoded.version !== 0x80 && decoded.version !== 0xef) {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Invalid private key");
+    }
+    let privkey: Buffer;
+    if (decoded.hash.length === 33 && decoded.hash[32] === 0x01) {
+      privkey = decoded.hash.subarray(0, 32) as Buffer;
+    } else if (decoded.hash.length === 32) {
+      privkey = decoded.hash;
+    } else {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Invalid private key");
+    }
+    if (!isValidPrivateKey(privkey)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Invalid private key");
+    }
+
+    // Add the key + its P2WPKH address to the wallet keyring.
+    try {
+      wallet.addImportedKey(privkey, AddressType.P2WPKH, label);
+    } catch (err) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_ERROR,
+        `importprivkey failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+
+    // Rescan so the freshly-imported key's pre-existing funds are credited.
+    if (rescan) {
+      const tipHeight = this.chainState.getBestBlock().height;
+      await wallet.rescan((h) => this.getActiveChainBlock(h), 0, tipHeight);
+    }
+
+    // Core returns null.
+    return null;
+  }
+
+  /**
+   * dumpprivkey "address"
+   *
+   * Reveal the WIF private key for a wallet-owned address. Mirrors Bitcoin
+   * Core dumpprivkey (src/wallet/rpc/backup.cpp). The exported key is the
+   * compressed WIF (0x01 flag) since hotbuns wallets store compressed keys.
+   * Also the natural foreign-key source for testing importprivkey round-trips.
+   *
+   * @param params [address]
+   */
+  private async dumpPrivKey(params: unknown[]): Promise<string> {
+    const wallet = this.getCurrentWallet();
+    const address = params[0];
+    if (typeof address !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "dumpprivkey requires an address");
+    }
+    const key = wallet.getKey(address);
+    if (!key || key.privateKey.length !== 32) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "Private key for address is not known"
+      );
+    }
+    // WIF: version(1) + privkey(32) + 0x01(compressed). base58CheckEncode
+    // here takes (payload, version): payload = privkey||0x01.
+    const payload = Buffer.concat([key.privateKey, Buffer.from([0x01])]);
+    return this.base58CheckEncode(payload, this.getWIFVersion());
   }
 
   /**
