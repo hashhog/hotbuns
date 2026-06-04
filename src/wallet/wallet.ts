@@ -2862,6 +2862,15 @@ export interface CreateWalletOptions {
   descriptors?: boolean;
   /** Save wallet name to settings for auto-load on startup. */
   loadOnStartup?: boolean;
+  /**
+   * BIP-39 mnemonic to deterministically restore an existing wallet's keys.
+   * When omitted, a fresh random 64-byte seed is generated (Core default).
+   * When supplied, the same mnemonic always re-derives byte-identical
+   * addresses — this is hotbuns' seed-only wallet-recovery path.
+   */
+  mnemonic?: string;
+  /** Optional BIP-39 "25th word" passphrase paired with `mnemonic`. */
+  mnemonicPassphrase?: string;
 }
 
 /**
@@ -2998,7 +3007,12 @@ export class WalletManager {
       network: this.network,
     };
 
-    const wallet = Wallet.create(config);
+    // Seed-only restore: when a BIP-39 mnemonic is supplied, derive the seed
+    // deterministically so the SAME mnemonic re-creates byte-identical keys
+    // (wallet recovery after disk loss). Otherwise generate a random seed.
+    const wallet = options.mnemonic
+      ? Wallet.create(config, options.mnemonic, options.mnemonicPassphrase ?? "")
+      : Wallet.create(config);
 
     // If passphrase provided in options, encrypt the wallet
     if (encryptionPassphrase) {

@@ -6131,7 +6131,13 @@ export class RPCServer {
    *
    * Reference: Bitcoin Core's createwallet in wallet/rpc/wallet.cpp
    *
-   * @param params [wallet_name, disable_private_keys, blank, passphrase, avoid_reuse, descriptors, load_on_startup]
+   * @param params [wallet_name, disable_private_keys, blank, passphrase, avoid_reuse, descriptors, load_on_startup, mnemonic, mnemonic_passphrase]
+   *
+   * Params 8/9 (`mnemonic`, `mnemonic_passphrase`) are a hotbuns extension for
+   * seed-only wallet recovery: supplying the same BIP-39 mnemonic on a fresh
+   * wallet deterministically re-derives byte-identical keys (the underlying
+   * `Wallet.create(config, mnemonic, passphrase)` is the same primitive the
+   * wallet unit tests exercise). Omitting them keeps Core's random-seed default.
    */
   private async createWallet(params: unknown[]): Promise<Record<string, unknown>> {
     if (!this.walletManager) {
@@ -6149,6 +6155,8 @@ export class RPCServer {
       avoidReuse,
       descriptors,
       loadOnStartup,
+      mnemonic,
+      mnemonicPassphrase,
     ] = params;
 
     if (typeof walletName !== "string") {
@@ -6220,6 +6228,27 @@ export class RPCServer {
         };
       }
       options.loadOnStartup = loadOnStartup;
+    }
+    // Seed-only recovery extension: an optional BIP-39 mnemonic (+ passphrase)
+    // makes the new wallet deterministic. The mnemonic is checksum-validated
+    // inside Wallet.create; an invalid one surfaces as a WALLET_ERROR below.
+    if (mnemonic !== undefined && mnemonic !== null) {
+      if (typeof mnemonic !== "string") {
+        throw {
+          code: RPCErrorCodes.INVALID_PARAMS,
+          message: "mnemonic must be a string",
+        };
+      }
+      options.mnemonic = mnemonic;
+    }
+    if (mnemonicPassphrase !== undefined && mnemonicPassphrase !== null) {
+      if (typeof mnemonicPassphrase !== "string") {
+        throw {
+          code: RPCErrorCodes.INVALID_PARAMS,
+          message: "mnemonic_passphrase must be a string",
+        };
+      }
+      options.mnemonicPassphrase = mnemonicPassphrase;
     }
 
     try {
