@@ -1,9 +1,17 @@
 /**
  * Tests for coinbase maturity enforcement.
  *
- * Coinbase outputs require 100 confirmations before they can be spent.
- * This prevents miners from spending their rewards before the chain has
- * sufficient depth to prevent reorganization attacks.
+ * Coinbase outputs require COINBASE_MATURITY (100) blocks to be buried beneath
+ * them before they can be spent — i.e. the wallet treats a coinbase as
+ * spendable once its chain depth (confirmations) reaches COINBASE_MATURITY + 1
+ * (a coin in the tip block has 1 confirmation; it needs 100 blocks on top, so
+ * 101 confirmations). This matches Core's CWallet::GetBlocksToMaturity ==
+ * max(0, (COINBASE_MATURITY+1) - depth) (bitcoin-core/src/wallet/wallet.cpp:3342)
+ * and the well-known regtest rule that the first coinbase becomes spendable only
+ * after mining 101 blocks (getbalance == 50 BTC at tip 101, not 150). It also
+ * keeps the wallet from coin-selecting a coinbase the mempool would reject with
+ * bad-txns-premature-spend-of-coinbase. This prevents miners from spending their
+ * rewards before the chain has sufficient depth to deter reorg attacks.
  */
 
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
@@ -74,7 +82,8 @@ describe("Coinbase Maturity", () => {
     const wallet = Wallet.create(config, TEST_MNEMONIC);
     const address = wallet.getNewAddress();
 
-    // Add a mature coinbase UTXO (100+ confirmations)
+    // Add a mature coinbase UTXO (COINBASE_MATURITY + 1 = 101 confirmations:
+    // 100 blocks buried beneath the coinbase block).
     const matureCoinbase: WalletUTXO = {
       outpoint: {
         txid: Buffer.alloc(32, 2),
@@ -83,7 +92,7 @@ describe("Coinbase Maturity", () => {
       amount: 5000000000n,
       address,
       keyPath: "m/84'/0'/0'/0/0",
-      confirmations: 100, // Exactly 100
+      confirmations: COINBASE_MATURITY + 1, // exactly mature
       addressType: AddressType.P2WPKH,
       isCoinbase: true,
     };
@@ -98,7 +107,7 @@ describe("Coinbase Maturity", () => {
     expect(spendable.length).toBe(1);
   });
 
-  test("coinbase at exactly 99 confirmations is not spendable", () => {
+  test("coinbase at exactly COINBASE_MATURITY confirmations is not yet spendable", () => {
     const config = createTestConfig();
     const wallet = Wallet.create(config, TEST_MNEMONIC);
     const address = wallet.getNewAddress();
@@ -111,7 +120,9 @@ describe("Coinbase Maturity", () => {
       amount: 5000000000n,
       address,
       keyPath: "m/84'/0'/0'/0/0",
-      confirmations: 99, // One less than required
+      // Depth COINBASE_MATURITY (100) == only 99 blocks buried beneath the
+      // coinbase block — one short of maturity (needs COINBASE_MATURITY + 1).
+      confirmations: COINBASE_MATURITY,
       addressType: AddressType.P2WPKH,
       isCoinbase: true,
     };
@@ -211,13 +222,13 @@ describe("Coinbase Maturity", () => {
     const wallet = Wallet.create(config, TEST_MNEMONIC);
     const address = wallet.getNewAddress();
 
-    // Add a mature coinbase
+    // Add a mature coinbase (depth COINBASE_MATURITY + 1).
     wallet.addUTXO({
       outpoint: { txid: Buffer.alloc(32, 1), vout: 0 },
       amount: 5000000000n, // 50 BTC
       address,
       keyPath: "m/84'/0'/0'/0/0",
-      confirmations: 100,
+      confirmations: COINBASE_MATURITY + 1,
       addressType: AddressType.P2WPKH,
       isCoinbase: true,
     });
