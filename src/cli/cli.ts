@@ -2146,6 +2146,11 @@ async function startNode(config: NodeConfig): Promise<void> {
     blockSync,
     pruneManager,
     walletManager,
+    // Present only when --blockfilterindex=1 (undefined otherwise). Lets
+    // getindexinfo report the running "basic block filter index" entry,
+    // matching Core's ForEachBlockFilterIndex guard (only running indexes
+    // are listed).
+    filterIndex,
   };
 
   const rpcServer = new RPCServer(rpcConfig, rpcDeps);

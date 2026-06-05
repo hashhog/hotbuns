@@ -212,6 +212,17 @@ export interface RPCServerDeps {
   chainstateManager?: ChainstateManager;
   zmqInterface?: import("./zmq.js").ZMQNotificationInterface;
   blockSync?: BlockSync;
+  /**
+   * The BIP-157/158 basic block filter index, present only when the
+   * operator started the node with `--blockfilterindex=1` (cli.ts
+   * constructs and wires it in that case). Used by `getindexinfo` to
+   * report the index's sync status. When absent, the node is not running
+   * the filter index and `getindexinfo` omits the
+   * "basic block filter index" key — matching Bitcoin Core's
+   * `ForEachBlockFilterIndex` guard (rpc/node.cpp:405-407), which only
+   * lists indexes that are actually running.
+   */
+  filterIndex?: import("../storage/indexes.js").BlockFilterIndex;
 }
 
 /** RPC error codes. */
@@ -471,6 +482,8 @@ export class RPCServer {
   private chainstateManager?: ChainstateManager;
   private zmqInterface?: import("./zmq.js").ZMQNotificationInterface;
   private blockSync?: BlockSync;
+  /** BIP-157/158 basic block filter index (present iff --blockfilterindex). */
+  private filterIndex?: import("../storage/indexes.js").BlockFilterIndex;
   private shutdownCallback: (() => void) | null = null;
   /** Current wallet name for request context (set from URL path). */
   private currentWalletName: string | null = null;
@@ -554,6 +567,7 @@ export class RPCServer {
     this.chainstateManager = deps.chainstateManager;
     this.zmqInterface = deps.zmqInterface;
     this.blockSync = deps.blockSync;
+    this.filterIndex = deps.filterIndex;
     this.methods = new Map();
 
     this.registerBuiltinMethods();
@@ -1177,6 +1191,9 @@ export class RPCServer {
 
     // UTXO query
     this.registerMethod("gettxout", (params) => this.getTxOut(params));
+
+    // Index status (util category in Core — rpc/node.cpp getindexinfo)
+    this.registerMethod("getindexinfo", (params) => this.getIndexInfo(params));
 
     // Control methods
     this.registerMethod("stop", () => this.stopNode());
@@ -2156,6 +2173,99 @@ export class RPCServer {
    */
   private async getBlockCount(): Promise<number> {
     return this.chainState.getBestBlock().height;
+  }
+
+  /**
+   * getindexinfo ( "index_name" )
+   *
+   * Returns the status of one or all available indices currently running
+   * in the node. Mirrors Bitcoin Core's `getindexinfo` exactly
+   * (bitcoin-core/src/rpc/node.cpp:363-410 + SummaryToJSON:351-361).
+   *
+   * SHAPE: a dynamic JSON object keyed BY INDEX NAME. For each *running*
+   * index, the value object has EXACTLY two fields in THIS ORDER:
+   *   { "<index name>": { "synced": <bool>, "best_block_height": <int> } }
+   * SummaryToJSON pushes `synced` then `best_block_height` and nothing
+   * else — no best_hash, no best_block_hash, no name-in-value. (Core's
+   * IndexSummary carries best_block_hash internally but getindexinfo
+   * never emits it.)
+   *
+   * RUNNING INDEXES IN HOTBUNS:
+   *  - "txindex" — ALWAYS running. hotbuns writes a (txid -> block) entry
+   *    for every tx of every connected block, inline in the connect path
+   *    (sync/blocks.ts::writeTxIndexForBlock, ungated). So the txindex is
+   *    always at the active chain tip; its best_block_height == the tip
+   *    height and it is synced whenever the block tip has caught up to the
+   *    header tip (i.e. IBD is complete).
+   *  - "basic block filter index" — running ONLY when the operator passed
+   *    `--blockfilterindex=1` (cli.ts constructs the BlockFilterIndex and
+   *    hands it to the RPC server via deps.filterIndex). When absent the
+   *    key is omitted, matching Core's `ForEachBlockFilterIndex` guard
+   *    that lists only running filter indexes. Its best_block_height comes
+   *    from BlockFilterIndex.getHeight() (the height it has indexed to;
+   *    -1 → 0 if it has no best block yet), synced iff that height has
+   *    reached the active chain tip.
+   *
+   * ARG `index_name` (optional positional 0): filters to a single index.
+   * SummaryToJSON drops the entry when index_name is non-empty AND !=
+   * the index name. So getindexinfo "txindex" returns ONLY the txindex
+   * key, and getindexinfo "no-such-index" returns {} (an empty object,
+   * NOT an error). Empty/omitted arg = all running indexes.
+   *
+   * Reference: bitcoin-core/src/rpc/node.cpp:351-410,
+   *            src/index/base.{h,cpp} (IndexSummary / GetSummary).
+   */
+  private async getIndexInfo(params: unknown[]): Promise<Record<string, unknown>> {
+    const indexNameParam = params[0];
+    if (
+      indexNameParam !== undefined &&
+      indexNameParam !== null &&
+      typeof indexNameParam !== "string"
+    ) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "index_name must be a string"
+      );
+    }
+    // Empty string and omitted both mean "all running indexes".
+    const indexName: string =
+      typeof indexNameParam === "string" ? indexNameParam : "";
+
+    const tipHeight = this.chainState.getBestBlock().height;
+    // The header tip: when blocks have caught up to the best known header,
+    // IBD is done and a tip-tracking index is "synced". Falls back to the
+    // block tip on minimal mocks that don't expose a best header.
+    const bestHeader = this.headerSync.getBestHeader?.();
+    const headerHeight = bestHeader?.height ?? tipHeight;
+
+    const result: Record<string, unknown> = {};
+
+    // SummaryToJSON: push an entry only when index_name is empty OR equals
+    // the index's name. Value object: EXACTLY { synced, best_block_height }
+    // in that order.
+    const pushIndex = (
+      name: string,
+      synced: boolean,
+      bestBlockHeight: number
+    ): void => {
+      if (indexName !== "" && indexName !== name) return;
+      result[name] = { synced, best_block_height: bestBlockHeight };
+    };
+
+    // txindex — always running in hotbuns; tracks the active chain tip.
+    pushIndex("txindex", tipHeight >= headerHeight, tipHeight);
+
+    // basic block filter index — running only when --blockfilterindex set.
+    if (this.filterIndex && this.filterIndex.isEnabled()) {
+      const filterHeight = this.filterIndex.getHeight();
+      // GetSummary: best_block_height is the indexed height, or 0 when the
+      // index has no best block yet (hotbuns uses -1 as the no-tip sentinel).
+      const bestBlockHeight = filterHeight < 0 ? 0 : filterHeight;
+      const synced = filterHeight >= 0 && filterHeight >= headerHeight;
+      pushIndex("basic block filter index", synced, bestBlockHeight);
+    }
+
+    return result;
   }
 
   /**

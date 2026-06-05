@@ -424,6 +424,37 @@ export class ChainStateManager {
       );
     }
 
+    // ── BIP-157/158: advance the block filter index on connect ──
+    //
+    // Connect-side counterpart to the `filterIndex.removeBlock(...)` call in
+    // disconnectBlock (state.ts:754). Previously this path (generateblock /
+    // regtest mining / dumptxoutset re-apply / reorganize) only ever
+    // *removed* filter entries on disconnect and never *appended* on
+    // connect, so the filter index's height never advanced when blocks were
+    // mined through chain/state instead of network IBD (BlockSync.connectBlock
+    // already calls indexBlock at blocks.ts:2958). That left the filter index
+    // permanently at "no best block" (height -1) on a regtest-mined chain, so
+    // getindexinfo reported it un-synced even after the chain reached the tip.
+    //
+    // Mirrors Bitcoin Core's CValidationInterface BlockConnected fan-out:
+    // BaseIndex::BlockConnected → CustomAppend for every connected block,
+    // regardless of whether it arrived via net sync or RPC mining
+    // (src/index/base.cpp, src/index/blockfilterindex.cpp::CustomAppend).
+    // Best-effort: a failure is logged and ignored — the filter index is an
+    // optional secondary index and must never abort the chain advance.
+    if (this.filterIndex && this.filterIndex.isEnabled()) {
+      try {
+        await this.filterIndex.indexBlock(block, height, spentOutputs);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[blockfilterindex] failed to index block ${blockHash
+            .toString("hex")
+            .slice(0, 16)} at h=${height}: ${msg} (continuing)`
+        );
+      }
+    }
+
     // Calculate chain work (approximate - should come from header chain)
     // Work = 2^256 / (target + 1), but we use a simplified version here
     const work = this.calculateWork(block.header.bits);
