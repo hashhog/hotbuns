@@ -519,6 +519,169 @@ export async function computeUTXOSetMuHash(
 }
 
 /**
+ * Database-independent UTXO "bogosize" of one coin, byte-for-byte mirroring
+ * `kernel/coinstats.cpp::GetBogoSize`:
+ *
+ *   32  txid
+ * +  4  vout index
+ * +  4  height + coinbase
+ * +  8  amount
+ * +  2  scriptPubKey length field (Core uses a fixed 2, NOT the CompactSize len)
+ * +  scriptPubKey.size()
+ *
+ * The metric is intentionally "meaningless" (Core's own wording) — it is a
+ * database-independent proxy for UTXO-set size, so it must be computed with
+ * Core's exact constants to match `gettxoutsetinfo`'s `bogosize` field.
+ */
+function getBogoSize(scriptPubKeyLen: number): bigint {
+  return 32n + 4n + 4n + 8n + 2n + BigInt(scriptPubKeyLen);
+}
+
+/**
+ * Full `gettxoutsetinfo` statistics over the chainstate UTXO set in ONE pass.
+ *
+ * Mirrors `kernel/coinstats.cpp::ComputeUTXOStats` +
+ * `ApplyStats` (coinstats.cpp:96-107): a single coin-cursor walk that
+ * simultaneously accumulates
+ *
+ *   - nTransactionOutputs (`txouts`)  — one per coin,
+ *   - nTransactions (`transactions`)  — one per distinct txid group,
+ *   - nBogoSize (`bogosize`)          — sum of per-coin `GetBogoSize`,
+ *   - total_amount                    — sum of all unspent output values,
+ *   - the set hash for `hash_type`    — HASH_SERIALIZED (default), MUHASH,
+ *                                       or NONE (no hash).
+ *
+ * Coin-cursor order parity: Core iterates `std::map<uint32_t, Coin>` so within
+ * a txid the vouts are numerically ordered; LevelDB hands them back in
+ * LE-byte order on the [prefix][txid][vout-u32-LE] key, which differs for any
+ * vout >= 256. We buffer each txid group and sort numerically before ingest —
+ * identical to the fix already proven in `computeUTXOSetHash`. The grouping is
+ * also what lets us count distinct-txid `transactions` correctly.
+ *
+ * For HASH_SERIALIZED the digest is `HashWriter::GetHash()` = SHA256(SHA256(
+ * stream)); the streaming hasher produces the inner SHA256, so ONE more SHA256
+ * finalizes the double-SHA256 (see `computeUTXOSetHash` for the cautionary
+ * note about not using `hash256()` here). For MUHASH the digest is the
+ * order-independent MuHash3072 finalize.
+ */
+export type UTXOSetHashType = "hash_serialized_3" | "muhash" | "none";
+
+export interface UTXOSetStats {
+  /** Number of unspent transaction outputs (`txouts`). */
+  txouts: bigint;
+  /** Number of distinct txids with at least one unspent output (`transactions`). */
+  transactions: bigint;
+  /** Database-independent UTXO-set-size proxy (`bogosize`). */
+  bogosize: bigint;
+  /** Sum of all unspent output values, in satoshis. */
+  totalAmount: bigint;
+  /**
+   * 32-byte set hash for the requested `hashType`, or null when
+   * `hashType === "none"`. Returned in INTERNAL byte order (the caller
+   * reverses for hex display, matching Core's `uint256::GetHex`).
+   */
+  hash: Buffer | null;
+}
+
+export async function computeUTXOSetStats(
+  db: ChainDB,
+  hashType: UTXOSetHashType,
+  interruptCheck?: () => boolean,
+): Promise<UTXOSetStats> {
+  // Hash accumulators — only the one for `hashType` is fed.
+  const hasher =
+    hashType === "hash_serialized_3" ? new Bun.CryptoHasher("sha256") : null;
+  const muhash = hashType === "muhash" ? new MuHash3072() : null;
+
+  let txouts = 0n;
+  let transactions = 0n;
+  let bogosize = 0n;
+  let totalAmount = 0n;
+
+  const utxoPrefix = Buffer.from([DBPrefix.UTXO]);
+  const iterator = (db as any).db.iterator({
+    gte: utxoPrefix,
+    lt: Buffer.concat([Buffer.from([DBPrefix.UTXO + 1])]),
+  });
+
+  let prevTxid: Buffer | null = null;
+  let group: Array<{
+    vout: number;
+    height: number;
+    coinbase: boolean;
+    amount: bigint;
+    scriptPubKey: Buffer;
+  }> = [];
+
+  // Ingest one finished txid group: count it as one transaction, and for each
+  // coin (vouts sorted numerically) update stats + feed the chosen hash.
+  const flush = () => {
+    if (!prevTxid || group.length === 0) return;
+    transactions++;
+    if (group.length > 1) {
+      group.sort((a, b) => a.vout - b.vout);
+    }
+    for (const c of group) {
+      txouts++;
+      totalAmount += c.amount;
+      bogosize += getBogoSize(c.scriptPubKey.length);
+      if (hasher || muhash) {
+        const bytes = txOutSerBytes(
+          prevTxid,
+          c.vout,
+          c.height,
+          c.coinbase,
+          c.amount,
+          c.scriptPubKey,
+        );
+        if (hasher) hasher.update(bytes);
+        if (muhash) muhash.add(bytes);
+      }
+    }
+    group = [];
+  };
+
+  try {
+    for await (const [key, value] of iterator) {
+      if (interruptCheck?.()) {
+        throw new Error("Interrupted");
+      }
+      // Key format: prefix (1) + txid (32) + vout (4 LE).
+      if (key.length !== 37) continue;
+
+      const txid = key.subarray(1, 33);
+      const vout = key.readUInt32LE(33);
+
+      const reader = new BufferReader(value);
+      const height = reader.readUInt32LE();
+      const coinbase = reader.readUInt8() === 1;
+      const amount = reader.readUInt64LE();
+      const scriptPubKey = reader.readVarBytes();
+
+      if (!prevTxid || !txid.equals(prevTxid)) {
+        flush();
+        // The iterator key buffer may be reused — copy the txid.
+        prevTxid = Buffer.from(txid);
+      }
+      group.push({ vout, height, coinbase, amount, scriptPubKey });
+    }
+    flush();
+  } finally {
+    await iterator.close();
+  }
+
+  let hash: Buffer | null = null;
+  if (hasher) {
+    // SHA256(SHA256(stream)) — one more SHA256 over the streamed inner digest.
+    hash = sha256Hash(Buffer.from(hasher.digest()));
+  } else if (muhash) {
+    hash = muhash.finalize();
+  }
+
+  return { txouts, transactions, bogosize, totalAmount, hash };
+}
+
+/**
  * Chainstate wrapper for assumeUTXO.
  *
  * Manages the dual chainstate model:
