@@ -20,7 +20,7 @@ import { Horizon, DECAY, SCALE } from "../fees/estimator.js";
 import type { HeaderSync, HeaderChainEntry } from "../sync/headers.js";
 import type { BlockSync } from "../sync/blocks.js";
 import type { ConsensusParams } from "../consensus/params.js";
-import { compactToBigInt, bigIntToCompact } from "../consensus/params.js";
+import { compactToBigInt, bigIntToCompact, getGenesisBlock } from "../consensus/params.js";
 import {
   VersionBitsCache,
   buildBlockIndex,
@@ -530,6 +530,15 @@ export class RPCServer {
    */
   private readonly versionBitsCache: VersionBitsCache = new VersionBitsCache();
   private versionBitsDeployments: Map<string, DeploymentParams> | null = null;
+
+  /**
+   * Memoised genesis-block coinbase txid (== genesis merkle root), in
+   * INTERNAL wire / little-endian byte order — the same order the
+   * getrawtransaction handler works in after reversing the display-hex
+   * argument.  Mirrors Bitcoin Core rawtransaction.cpp:290, which special-
+   * cases `txid == GenesisBlock().hashMerkleRoot` and refuses to return it.
+   */
+  private genesisCoinbaseTxidLE: Buffer | null = null;
 
   constructor(config: RPCServerConfig, deps: RPCServerDeps) {
     // TLS pair validation: both or neither. Failing fast at construct
@@ -2578,22 +2587,55 @@ export class RPCServer {
     // sync/blocks.ts::writeTxIndexForBlock (Pattern C0 wiring).
     // Surfaced by the txindex-revert-on-reorg corpus entry against
     // the cross-impl reference txid `ec14e5fbd6a0...` (display order).
+    //
+    // Validate strict 64-char hex first (Core ParseHashV rejects bad hex /
+    // wrong length before doing anything else).
+    if (!/^[0-9a-fA-F]{64}$/.test(txidParam)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        txidParam.length !== 64 ? "Invalid txid length" : "txid must be hexadecimal string"
+      );
+    }
     const txid = Buffer.from(txidParam, "hex").reverse();
     if (txid.length !== 32) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid txid length");
     }
 
+    // Special exception for the genesis-block coinbase transaction.  Core
+    // refuses to retrieve it because the genesis coinbase is never stored
+    // in any txindex/UTXO set (rawtransaction.cpp:290-293).  Checked BEFORE
+    // verbosity parsing, exactly as Core does.
+    if (txid.equals(this.getGenesisCoinbaseTxidLE())) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved"
+      );
+    }
+
     // Parse verbose param: boolean or number (0/1/2 like Bitcoin Core).
+    //   - false / 0 / omitted -> 0 (raw hex)
+    //   - true  / 1           -> 1 (decoded JSON object)
+    //   - 2                   -> 2 (decoded + fee + per-vin prevout)
     // verbosity=2 adds in_active_chain, fee, and per-input prevout enrichment.
     let verbosityLevel = 0;
     if (verboseParam === true || verboseParam === 1) {
       verbosityLevel = 1;
     } else if (verboseParam === 2) {
       verbosityLevel = 2;
+    } else if (verboseParam === false || verboseParam === 0 || verboseParam === undefined || verboseParam === null) {
+      verbosityLevel = 0;
+    } else if (typeof verboseParam === "number") {
+      // Any other numeric verbosity clamps the way Core's ParseVerbosity does
+      // not, but keeps us within the {0,1,2} surface: <=0 -> 0, >=2 -> 2.
+      verbosityLevel = verboseParam <= 0 ? 0 : verboseParam >= 2 ? 2 : 1;
     }
 
-    // Check mempool first (unless specific blockhash provided)
-    if (blockhashParam === undefined || blockhashParam === null) {
+    // A blockhash arg constrains the lookup to that single block and (per
+    // Core) means in_active_chain is reported in verbosity>=1 output.
+    const haveBlockhashArg = blockhashParam !== undefined && blockhashParam !== null;
+
+    // Check mempool first (unless a specific blockhash was provided).
+    if (!haveBlockhashArg) {
       const mempoolEntry = this.mempool.getTransaction(txid);
       if (mempoolEntry) {
         const rawHex = serializeTx(mempoolEntry.tx, true).toString("hex");
@@ -2602,17 +2644,22 @@ export class RPCServer {
           return rawHex;
         }
 
-        return {
-          ...this.formatTransaction(mempoolEntry.tx, null, -1, 0),
-          hex: rawHex,
-        };
+        // Mempool tx: no blockhash / confirmations / time / blocktime
+        // (Core TxToJSON only adds those when hashBlock is non-null).
+        // formatTxDecodedV1 emits the full TxToUniv shape (txid, hash,
+        // version, size, vsize, weight, locktime, vin, vout w/ value+desc,
+        // network-correct address, hex).
+        return this.formatTxDecodedV1(mempoolEntry.tx);
       }
     }
 
-    // If blockhash provided, look in specific block
-    if (blockhashParam !== undefined && blockhashParam !== null) {
+    // If blockhash provided, look in that specific block only.
+    if (haveBlockhashArg) {
       if (typeof blockhashParam !== "string") {
         throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
+      }
+      if (!/^[0-9a-fA-F]{64}$/.test(blockhashParam)) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
       }
 
       // Hashes in Bitcoin RPC are display-order (reversed bytes); reverse to get internal key
@@ -2621,8 +2668,16 @@ export class RPCServer {
         throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
       }
 
-      const result = await this.findTxInBlock(txid, blockhash, verbosityLevel);
-      if (result) {
+      // Core distinguishes "block hash not found" (-5) from "tx not in
+      // block" (-5, different message).  Resolve the block index first so
+      // we can emit the right message.
+      const blockIndex = await this.db.getBlockIndex(blockhash);
+      if (!blockIndex) {
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block hash not found");
+      }
+
+      const result = await this.findTxInBlock(txid, blockhash, verbosityLevel, true);
+      if (result !== null) {
         return result;
       }
 
@@ -2632,11 +2687,11 @@ export class RPCServer {
       );
     }
 
-    // Try txindex lookup
+    // Try txindex lookup (only reached when no blockhash arg and not in mempool).
     const txIndexEntry = await this.db.getTxIndex(txid);
     if (txIndexEntry) {
-      const result = await this.findTxInBlock(txid, txIndexEntry.blockHash, verbosityLevel);
-      if (result) {
+      const result = await this.findTxInBlock(txid, txIndexEntry.blockHash, verbosityLevel, false);
+      if (result !== null) {
         return result;
       }
     }
@@ -2649,6 +2704,23 @@ export class RPCServer {
   }
 
   /**
+   * Lazily compute and memoise the genesis-block coinbase txid (== genesis
+   * merkle root) in INTERNAL wire / little-endian byte order, matching the
+   * order the getrawtransaction handler works in after reversing the
+   * display-hex argument.  Mirrors Bitcoin Core rawtransaction.cpp:290
+   * (`txid.ToUint256() == GenesisBlock().hashMerkleRoot`).
+   */
+  private getGenesisCoinbaseTxidLE(): Buffer {
+    if (this.genesisCoinbaseTxidLE === null) {
+      // getGenesisBlock returns merkleRoot already in little-endian wire
+      // order (params.ts:1154 readHash()), which is exactly the wire-order
+      // txid of the single genesis coinbase.
+      this.genesisCoinbaseTxidLE = getGenesisBlock(this.params).header.merkleRoot;
+    }
+    return this.genesisCoinbaseTxidLE;
+  }
+
+  /**
    * Find a transaction in a specific block and format the result.
    *
    * verbosityLevel: 0 = hex string, 1 = verbose JSON, 2 = verbose + prevout enrichment.
@@ -2656,7 +2728,8 @@ export class RPCServer {
   private async findTxInBlock(
     txid: Buffer,
     blockhash: Buffer,
-    verbosityLevel: number
+    verbosityLevel: number,
+    haveBlockhashArg: boolean
   ): Promise<unknown | null> {
     // Get block data
     const blockData = await this.db.getBlock(blockhash);
@@ -2668,6 +2741,26 @@ export class RPCServer {
     const blockIndex = await this.db.getBlockIndex(blockhash);
     if (!blockIndex) {
       return null;
+    }
+
+    // Determine whether this block is part of the active chain.  Core uses
+    // ActiveChain().Contains(blockindex) for both in_active_chain (when a
+    // blockhash arg is present) and for whether to emit confirmations/time/
+    // blocktime at all (TxToJSON: present only when the block is in the
+    // active chain, else confirmations:0).  We approximate Contains() by
+    // checking that the canonical hash at this height matches.
+    let inActiveChain = true;
+    try {
+      const canonical = await this.db.getBlockHashByHeight(blockIndex.height);
+      if (canonical !== null) {
+        // Height→hash map answered: definitive Contains() result.
+        inActiveChain = canonical.equals(blockhash);
+      }
+      // canonical === null -> height not in the active height index; assume
+      // active (best-effort; matches the common case where the block was
+      // just resolved via the active txindex / a freshly mined tip).
+    } catch {
+      inActiveChain = true;
     }
 
     // Parse block and find transaction
@@ -2688,6 +2781,21 @@ export class RPCServer {
         // Get block time from header
         const blocktime = block.header.timestamp;
         const confirmations = this.chainState.getBestBlock().height - blockIndex.height + 1;
+
+        // Core TxToJSON adds blockhash/confirmations/time/blocktime; when the
+        // block is in the active chain it uses real confirmations + time,
+        // otherwise confirmations:0 and no time fields.  in_active_chain is
+        // only emitted when an explicit blockhash arg was supplied.
+        const chainFields: Record<string, unknown> = {
+          blockhash: Buffer.from(blockhash).reverse().toString("hex"),
+        };
+        if (inActiveChain) {
+          chainFields.confirmations = confirmations;
+          chainFields.time = blocktime;
+          chainFields.blocktime = blocktime;
+        } else {
+          chainFields.confirmations = 0;
+        }
 
         if (verbosityLevel === 2) {
           // verbosity=2: adds in_active_chain, fee, and per-vin prevout enrichment.
@@ -2717,29 +2825,98 @@ export class RPCServer {
           }
 
           const txObj = this.formatTxForGetRawTxV2(tx, richPrevouts.size > 0 ? richPrevouts : null);
+          // Field order mirrors Core rawtransaction.cpp: in_active_chain
+          // (only when an explicit blockhash arg was given) -> TxToUniv body
+          // (incl. hex) -> blockhash/confirmations/time/blocktime.
           return {
-            in_active_chain: true,
+            ...(haveBlockhashArg ? { in_active_chain: inActiveChain } : {}),
             ...txObj,
-            blockhash: Buffer.from(blockhash).reverse().toString("hex"),
-            confirmations,
-            time: blocktime,
-            blocktime,
             hex: rawHex,
+            ...chainFields,
           };
         }
 
+        // verbosity = 1: decoded object (TxToUniv shape — correct fixed-8dp
+        // value + scriptPubKey.desc + network-correct address + top-level
+        // hex), with NO fee (Core verbosity=1 never has undo data).
         return {
-          ...this.formatTransactionVerbose(tx, blockhash, blockIndex.height, i),
-          blockhash: Buffer.from(blockhash).reverse().toString("hex"),
-          confirmations,
-          time: blocktime,
-          blocktime,
-          hex: rawHex,
+          ...(haveBlockhashArg ? { in_active_chain: inActiveChain } : {}),
+          ...this.formatTxDecodedV1(tx),
+          ...chainFields,
         };
       }
     }
 
     return null;
+  }
+
+  /**
+   * Format a transaction for getrawtransaction verbosity=1 (the decoded
+   * object body, WITHOUT the contextual blockhash/confirmations/time/
+   * blocktime/in_active_chain fields, which the caller appends).
+   *
+   * Mirrors Core's TxToUniv(tx, uint256(), entry, include_hex=true, nullptr,
+   * SHOW_DETAILS) — core_io.cpp:430.  Emits, in order:
+   *   txid, hash (wtxid), version, size, vsize, weight, locktime,
+   *   vin[]  — coinbase input: {coinbase, txinwitness?, sequence};
+   *            normal input:   {txid, vout, scriptSig:{asm,hex},
+   *                             txinwitness?, sequence}
+   *   vout[] — {value (BTC, 8dp), n, scriptPubKey:{asm, desc, hex,
+   *             address?, type}}
+   *   hex
+   * No fee (verbosity=1 has no undo data).  value uses formatBtcAmount (the
+   * RPC serializer post-processes the sentinel into a raw fixed-8dp JSON
+   * number, matching ValueFromAmount).  vout scriptPubKey is network-aware.
+   */
+  private formatTxDecodedV1(tx: Transaction): Record<string, unknown> {
+    const txid = getTxId(tx);
+    const wtxid = getWTxId(tx);
+    const isCb = isCoinbase(tx);
+
+    const result: Record<string, unknown> = {
+      txid: Buffer.from(txid).reverse().toString("hex"),
+      hash: Buffer.from(wtxid).reverse().toString("hex"),
+      version: tx.version,
+      size: serializeTx(tx, true).length,
+      vsize: getTxVSize(tx),
+      weight: getTxWeight(tx),
+      locktime: tx.lockTime,
+      vin: tx.inputs.map((input, i) => {
+        const vin: Record<string, unknown> = {};
+
+        if (isCb && i === 0) {
+          vin.coinbase = input.scriptSig.toString("hex");
+          // txinwitness comes between coinbase and sequence in Core order.
+          if (input.witness.length > 0) {
+            vin.txinwitness = input.witness.map((w) => w.toString("hex"));
+          }
+          vin.sequence = input.sequence;
+        } else {
+          vin.txid = Buffer.from(input.prevOut.txid).reverse().toString("hex");
+          vin.vout = input.prevOut.vout;
+          vin.scriptSig = {
+            asm: disassembleScriptSigHashDecode(input.scriptSig),
+            hex: input.scriptSig.toString("hex"),
+          };
+          if (input.witness.length > 0) {
+            vin.txinwitness = input.witness.map((w) => w.toString("hex"));
+          }
+          vin.sequence = input.sequence;
+        }
+
+        return vin;
+      }),
+      vout: tx.outputs.map((output, i) => ({
+        value: formatBtcAmount(output.value),
+        n: i,
+        scriptPubKey: this.buildScriptPubKeyObjNetworkAware(output.scriptPubKey),
+      })),
+    };
+
+    // hex: always included for verbosity>=1 (Core: TxToUniv include_hex=true).
+    result.hex = serializeTx(tx, hasWitness(tx)).toString("hex");
+
+    return result;
   }
 
   /**
@@ -3132,6 +3309,33 @@ export class RPCServer {
       result.address = address;
     }
 
+    return result;
+  }
+
+  /**
+   * Build a Core-shaped scriptPubKey object for a vout: {asm, desc, hex,
+   * address?, type}.  Combines the BIP-380 descriptor inference from
+   * buildScriptPubKeyObj (psbt.ts) with the NETWORK-AWARE address encoding
+   * from this.scriptPubKeyToAddress.
+   *
+   * buildScriptPubKeyObj alone hardcodes mainnet prefixes (bc / 0x00) in its
+   * address field, which is wrong on regtest/testnet; we therefore take its
+   * asm/desc/hex/type and override the address with the network-correct one.
+   * Mirrors Core's ScriptToUniv(include_hex=true, include_address=true) which
+   * always uses the active CChainParams for EncodeDestination.
+   */
+  private buildScriptPubKeyObjNetworkAware(scriptPubKey: Buffer): Record<string, unknown> {
+    const base = buildScriptPubKeyObj(scriptPubKey);
+    const result: Record<string, unknown> = {
+      asm: base.asm,
+      desc: base.desc,
+      hex: base.hex,
+      type: base.type,
+    };
+    const address = this.scriptPubKeyToAddress(scriptPubKey);
+    if (address) {
+      result.address = address;
+    }
     return result;
   }
 

@@ -428,10 +428,12 @@ describe("getrawtransaction", () => {
       });
       mockChainState.setBestBlock(blockHash, 100, 1000n);
 
+      // RPC convention: txid + blockhash are passed in display order
+      // (reversed wire bytes), same as the mempool tests above.
       const res = await rpcRequest(testPort, "getrawtransaction", [
-        coinbaseTxid.toString("hex"),
+        Buffer.from(coinbaseTxid).reverse().toString("hex"),
         true,
-        blockHash.toString("hex"),
+        Buffer.from(blockHash).reverse().toString("hex"),
       ]);
 
       expect(res.error).toBeUndefined();
@@ -441,6 +443,8 @@ describe("getrawtransaction", () => {
       expect(result.blockhash).toBe(Buffer.from(blockHash).reverse().toString("hex"));
       expect(result.confirmations).toBe(51); // 100 - 50 + 1
       expect(result.blocktime).toBe(block.header.timestamp);
+      // blockhash arg present -> in_active_chain reported (Core parity).
+      expect(result.in_active_chain).toBe(true);
     });
 
     it("should return raw hex when verbose=false with blockhash", async () => {
@@ -460,9 +464,9 @@ describe("getrawtransaction", () => {
       });
 
       const res = await rpcRequest(testPort, "getrawtransaction", [
-        coinbaseTxid.toString("hex"),
+        Buffer.from(coinbaseTxid).reverse().toString("hex"),
         false,
-        blockHash.toString("hex"),
+        Buffer.from(blockHash).reverse().toString("hex"),
       ]);
 
       expect(res.error).toBeUndefined();
@@ -484,13 +488,13 @@ describe("getrawtransaction", () => {
         dataPos: 0,
       });
 
-      // Try to find a different txid
+      // Try to find a different txid (display order, like Core).
       const fakeTxid = Buffer.alloc(32, 0xff);
 
       const res = await rpcRequest(testPort, "getrawtransaction", [
-        fakeTxid.toString("hex"),
+        Buffer.from(fakeTxid).reverse().toString("hex"),
         true,
-        blockHash.toString("hex"),
+        Buffer.from(blockHash).reverse().toString("hex"),
       ]);
 
       expect(res.error).toBeDefined();
@@ -515,9 +519,9 @@ describe("getrawtransaction", () => {
       });
 
       const res = await rpcRequest(testPort, "getrawtransaction", [
-        coinbaseTxid.toString("hex"),
+        Buffer.from(coinbaseTxid).reverse().toString("hex"),
         true,
-        blockHash.toString("hex"),
+        Buffer.from(blockHash).reverse().toString("hex"),
       ]);
 
       expect(res.error).toBeUndefined();
@@ -611,6 +615,38 @@ describe("getrawtransaction", () => {
       expect(res.error).toBeDefined();
       expect(res.error?.code).toBe(RPCErrorCodes.INVALID_ADDRESS_OR_KEY);
       expect(res.error?.message).toContain("No such mempool or blockchain transaction");
+    });
+
+    it("should error -5 for the genesis-block coinbase txid", async () => {
+      // The genesis coinbase txid == genesis merkle root.  Core refuses to
+      // return it (rawtransaction.cpp:290).  Use the REGTEST genesis merkle
+      // root in display order.
+      const { getGenesisBlock } = await import("../consensus/params.js");
+      const genesisMerkleLE = getGenesisBlock(REGTEST).header.merkleRoot;
+      const genesisTxidDisplay = Buffer.from(genesisMerkleLE).reverse().toString("hex");
+
+      const res = await rpcRequest(testPort, "getrawtransaction", [
+        genesisTxidDisplay,
+      ]);
+
+      expect(res.error).toBeDefined();
+      expect(res.error?.code).toBe(RPCErrorCodes.INVALID_ADDRESS_OR_KEY);
+      expect(res.error?.message).toContain("genesis block coinbase");
+    });
+
+    it("should error -5 'Block hash not found' for an unknown blockhash arg", async () => {
+      const someTxid = Buffer.alloc(32, 0x07);
+      const unknownBlock = Buffer.alloc(32, 0x09);
+
+      const res = await rpcRequest(testPort, "getrawtransaction", [
+        Buffer.from(someTxid).reverse().toString("hex"),
+        true,
+        Buffer.from(unknownBlock).reverse().toString("hex"),
+      ]);
+
+      expect(res.error).toBeDefined();
+      expect(res.error?.code).toBe(RPCErrorCodes.INVALID_ADDRESS_OR_KEY);
+      expect(res.error?.message).toContain("Block hash not found");
     });
   });
 
