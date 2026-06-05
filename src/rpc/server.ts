@@ -3606,8 +3606,8 @@ export class RPCServer {
       total_fee: totalFee / 100_000_000, // BTC
       maxmempool: 300_000_000, // Default max mempool size
       mempoolminfee: info.minFeeRate / 100_000, // Convert sat/vB to BTC/kvB
-      minrelaytxfee: 0.00001, // 1 sat/vB
-      incrementalrelayfee: 0.00001,
+      minrelaytxfee: 0.000001, // 0.1 sat/vB = Core's minrelaytxfee default (0.00000100 BTC/kvB)
+      incrementalrelayfee: 0.000001, // 0.1 sat/vB = Core's DEFAULT_INCREMENTAL_RELAY_FEE{100} (0.00000100 BTC/kvB)
       unbroadcastcount: 0,
       fullrbf: true,
     };

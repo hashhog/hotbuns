@@ -568,19 +568,28 @@ const ROLLING_FEE_HALFLIFE = 60 * 60 * 12; // 43_200 seconds
  * paying below it is rejected with "min relay fee not met". It is the initial
  * admission floor; the dynamic floor rises above it during TrimToSize eviction.
  *
- * Value: 1 sat/vB = 1000 sat/kvB = 0.00001 BTC/kvB. This is the effective
- * min-relay floor the rest of the hashhog fleet enforces (e.g. camlcoin
- * `min_relay_fee = 1000L`) and matches a default Bitcoin Core node, which
- * rejects a zero-/below-floor-fee tx out of the box.
+ * Value: 0.1 sat/vB = 100 sat/kvB = 0.00000100 BTC/kvB. This is Core's actual
+ * default — `DEFAULT_MIN_RELAY_TX_FEE{100}` in policy.h is 100 sat/kvB, and a
+ * default-config Core node reports `minrelaytxfee: 0.00000100` /
+ * `mempoolminfee: 0.00000100` from getmempoolinfo (confirmed against the box's
+ * live v31.99 node). A zero-/below-floor-fee tx is still rejected with
+ * "min relay fee not met"; a paying tx at >= 0.1 sat/vB is accepted.
  *
- * Reference: bitcoin-core/src/policy/policy.h DEFAULT_MIN_RELAY_TX_FEE and the
- * CFeeRate(minrelaytxfee) floor applied in validation.cpp's fee gate.
+ * Reference: bitcoin-core/src/policy/policy.h:70 DEFAULT_MIN_RELAY_TX_FEE{100}
+ * (sat/kvB) and the CFeeRate(minrelaytxfee) floor applied in validation.cpp's
+ * fee gate.
  *
- * Previously 0, which made the static floor a no-op: a zero-fee tx passed the
- * `feeRate < this.minFeeRate` gate (0 < 0 is false) and was accepted, a policy
- * hole relative to default Core. (fix(policy): genuine min-relay floor.)
+ * Previously 1 sat/vB — 10x Core's real default. That value still rejected
+ * zero-fee txs (good) but over-rejected at the floor relative to default Core,
+ * and it tripped a wallet cross-regression: the wallet's effective send rate
+ * (~0.993 sat/vB on a 1-in/2-out P2WPKH, where the crude vsize estimate
+ * undershoots the real serialized vsize) fell just below the 1 sat/vB floor and
+ * sendtoaddress self-rejected with "min relay fee not met". Aligning to Core's
+ * 0.1 sat/vB restores wallet-send-feerate >= min-relay-floor == Core's value.
+ * (The wallet send path now also pads its effective rate to >= the floor; see
+ * Wallet.createTransaction.)
  */
-const DEFAULT_MIN_FEE_RATE = 1;
+export const DEFAULT_MIN_FEE_RATE = 0.1;
 
 /**
  * Default incremental relay fee rate (sat/vB).
