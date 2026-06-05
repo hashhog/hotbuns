@@ -1398,6 +1398,144 @@ export class PeerManager {
   }
 
   /**
+   * Map a {@link PeerInfo}'s {@link PeerInfo.networkId} (BIP-155 id) to the
+   * Bitcoin Core network NAME string emitted by `getnodeaddresses`
+   * (Core: netbase.cpp GetNetworkName, via CAddress::GetNetClass()).
+   *
+   * Returns one of `ipv4 | ipv6 | onion | i2p | cjdns`. Entries with a
+   * missing / legacy networkId default to `ipv4` (matching the addr-handler
+   * fallback that stamps legacy 16-byte addresses as IPV4). Unknown BIP-155
+   * ids (forward-compat) map to `not_publicly_routable` — the same string
+   * Core renders for NET_UNROUTABLE.
+   */
+  static networkIdToCoreName(networkId: number | undefined): string {
+    switch (networkId ?? BIP155Network.IPV4) {
+      case BIP155Network.IPV4:
+        return "ipv4";
+      case BIP155Network.IPV6:
+        return "ipv6";
+      case BIP155Network.TORV3:
+        return "onion";
+      case BIP155Network.I2P:
+        return "i2p";
+      case BIP155Network.CJDNS:
+        return "cjdns";
+      default:
+        return "not_publicly_routable";
+    }
+  }
+
+  /**
+   * Dump the addrman (known-address pool) for the `getnodeaddresses` RPC,
+   * already shaped EXACTLY as Bitcoin Core emits each entry (rpc/net.cpp:
+   * 959-965): five keys in this order — `time` (UNIX seconds, INTEGER),
+   * `services` (raw bitfield, INTEGER), `address` (host literal, no port),
+   * `port` (INTEGER), `network` (Core network NAME string).
+   *
+   * Mirrors Core's `CConnman::GetAddressesUnsafe(count, max_pct=0, network)`
+   * (rpc/net.cpp:955): returns a SHUFFLED snapshot, optionally filtered to a
+   * single network, then truncated to at most `count` entries (`count == 0`
+   * → no cap / return all). The shuffle uses the same CSPRNG Fisher–Yates as
+   * the rest of this manager, so order is intentionally non-deterministic
+   * (callers / tests must match by content, never by index).
+   *
+   * `services` is returned as a `number` so the RPC layer emits a JSON
+   * INTEGER (not a hex string, unlike `getpeerinfo`). The internal
+   * `lastSeen` is stored in milliseconds; we convert to integer seconds.
+   *
+   * @param count   max entries to return; `0` means "all known".
+   * @param network optional Core network NAME filter
+   *                (`ipv4|ipv6|onion|i2p|cjdns`); when set, only addresses
+   *                whose {@link networkIdToCoreName} equals it are returned.
+   */
+  dumpAddrmanForRpc(
+    count: number,
+    network?: string,
+  ): Array<{
+    time: number;
+    services: number;
+    address: string;
+    port: number;
+    network: string;
+  }> {
+    const selected: PeerInfo[] = [];
+    for (const info of this.knownAddresses.values()) {
+      if (
+        network !== undefined &&
+        PeerManager.networkIdToCoreName(info.networkId) !== network
+      ) {
+        continue;
+      }
+      selected.push(info);
+    }
+
+    // Shuffle (Fisher–Yates, CSPRNG) — Core returns a shuffled vector so the
+    // order leaks nothing about addrman bucket layout.
+    for (let i = selected.length - 1; i > 0; i--) {
+      const j = this.secureRandInt(i + 1);
+      [selected[i], selected[j]] = [selected[j], selected[i]];
+    }
+
+    const capped =
+      count > 0 && selected.length > count
+        ? selected.slice(0, count)
+        : selected;
+
+    return capped.map((info) => ({
+      time: Math.floor(info.lastSeen / 1000),
+      services: Number(info.services),
+      address: info.host,
+      port: info.port,
+      network: PeerManager.networkIdToCoreName(info.networkId),
+    }));
+  }
+
+  /**
+   * Insert (or refresh) a single address into the addrman — the substrate for
+   * the `addpeeraddress` test-only RPC (Core: rpc/net.cpp:972).
+   *
+   * Validation mirrors Core's path loosely: only routable IPv4 literals are
+   * accepted here (the only network the legacy `knownAddresses` map keys by
+   * `ip:port`). Non-routable / malformed inputs return `false` (Core returns
+   * `{success:false}`); a valid insert returns `true`. An existing key is
+   * refreshed in place (services + lastSeen) rather than duplicated.
+   *
+   * @param host     IPv4 literal.
+   * @param port     TCP port.
+   * @param services raw services bitfield.
+   * @param timeSecs last-seen UNIX time in SECONDS (stored internally as ms,
+   *                 matching the rest of {@link PeerInfo.lastSeen}).
+   */
+  injectKnownAddress(
+    host: string,
+    port: number,
+    services: bigint,
+    timeSecs: number,
+  ): boolean {
+    if (!isRoutable(host)) return false;
+    if (!Number.isInteger(port) || port <= 0 || port > 0xffff) return false;
+
+    const key = `${host}:${port}`;
+    const lastSeenMs = timeSecs * 1000;
+    const existing = this.knownAddresses.get(key);
+    if (existing) {
+      existing.services = services;
+      if (lastSeenMs > existing.lastSeen) existing.lastSeen = lastSeenMs;
+      return true;
+    }
+    this.addKnownAddress(key, {
+      host,
+      port,
+      services,
+      lastSeen: lastSeenMs,
+      banScore: 0,
+      lastConnected: 0,
+      networkId: BIP155Network.IPV4,
+    });
+    return true;
+  }
+
+  /**
    * Periodic maintenance: evict bad peers, refill connections.
    */
   private async maintain(): Promise<void> {

@@ -14,6 +14,7 @@ import { PackageValidationResult, MAX_PACKAGE_COUNT } from "../mempool/mempool.j
 import { dumpMempool, loadMempool, mempoolDumpExists } from "../mempool/persist.js";
 import { RBFTransactionState } from "../mempool/rbf.js";
 import type { PeerManager } from "../p2p/manager.js";
+import { ServiceFlags } from "../p2p/manager.js";
 import type { FeeEstimator } from "../fees/estimator.js";
 import { Horizon, DECAY, SCALE } from "../fees/estimator.js";
 import type { HeaderSync, HeaderChainEntry } from "../sync/headers.js";
@@ -1162,6 +1163,8 @@ export class RPCServer {
     this.registerMethod("getpeerinfo", () => this.getPeerInfo());
     this.registerMethod("getnetworkinfo", () => this.getNetworkInfo());
     this.registerMethod("getconnectioncount", async () => this.getConnectionCount());
+    this.registerMethod("getnodeaddresses", (params) => this.getNodeAddresses(params));
+    this.registerMethod("addpeeraddress", (params) => this.addPeerAddress(params));
     this.registerMethod("addnode", (params) => this.addNode(params));
     this.registerMethod("disconnectnode", (params) => this.disconnectNode(params));
 
@@ -4945,6 +4948,154 @@ export class RPCServer {
 
       return entry;
     });
+  }
+
+  /**
+   * getnodeaddresses ( count "network" )
+   *
+   * Return known addresses from the addrman, after filtering. Read-only.
+   * Core ref: rpc/net.cpp:911-970, netbase.cpp:100-128 (ParseNetwork /
+   * GetNetworkName).
+   *
+   * SHAPE: a JSON ARRAY of objects, each with EXACTLY 5 keys in this order —
+   * `time` (UNIX seconds INT), `services` (raw bitfield INT, NOT hex),
+   * `address` (host literal, no port), `port` (INT), `network` (one of
+   * ipv4/ipv6/onion/i2p/cjdns/not_publicly_routable/internal).
+   *
+   * PARAMS:
+   *   count   (positional 0, default 1): max to return; `0` = all known;
+   *           `count < 0` → error -8 "Address count out of range".
+   *   network (positional 1, optional): filter to a single network. Only
+   *           ipv4|ipv6|onion|i2p|cjdns are valid input filters; anything
+   *           else → error -8 "Network not recognized: <raw>".
+   *
+   * The addrman is shuffled (order non-deterministic); a fresh/empty pool
+   * returns `[]` (NOT an error).
+   */
+  private async getNodeAddresses(
+    params: unknown[],
+  ): Promise<Array<Record<string, unknown>>> {
+    // ── count (positional 0, default 1) ────────────────────────────────
+    const countParam = params[0];
+    let count: number;
+    if (countParam === undefined || countParam === null) {
+      count = 1;
+    } else if (typeof countParam === "number" && Number.isInteger(countParam)) {
+      count = countParam;
+    } else {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "JSON value of type " + typeof countParam + " is not of expected type number",
+      );
+    }
+    if (count < 0) {
+      // Core: rpc/net.cpp:947 — RPC_INVALID_PARAMETER, exact message.
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Address count out of range",
+      );
+    }
+
+    // ── network (positional 1, optional; ParseNetwork) ─────────────────
+    let networkFilter: string | undefined;
+    const networkParam = params[1];
+    if (networkParam !== undefined && networkParam !== null) {
+      if (typeof networkParam !== "string") {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "JSON value of type " + typeof networkParam + " is not of expected type string",
+        );
+      }
+      // ParseNetwork lowercases and accepts ONLY these (netbase.cpp:100-112).
+      const lowered = networkParam.toLowerCase();
+      const valid = ["ipv4", "ipv6", "onion", "i2p", "cjdns"];
+      if (!valid.includes(lowered)) {
+        // Core: rpc/net.cpp:950-952 — NET_UNROUTABLE → RPC_INVALID_PARAMETER,
+        // message uses the RAW (un-lowercased) arg.
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          "Network not recognized: " + networkParam,
+        );
+      }
+      networkFilter = lowered;
+    }
+
+    // dumpAddrmanForRpc already returns Core-shaped objects (5 ordered keys,
+    // services as INTEGER, time as integer seconds), shuffled + capped.
+    return this.peerManager.dumpAddrmanForRpc(count, networkFilter);
+  }
+
+  /**
+   * addpeeraddress "address" port ( tried )
+   *
+   * Add the address of a potential peer to the addrman. Test-only companion
+   * to getnodeaddresses (Core: rpc/net.cpp:972). Returns `{ "success": bool }`
+   * (Core also emits an optional `error` string on failure; we omit it on the
+   * success path, matching Core which only adds `error` when set).
+   *
+   * hotbuns' legacy addrman keys by `ip:port` for routable IPv4, so a valid
+   * routable IPv4 literal succeeds; a non-routable / malformed address fails
+   * (`{success:false}`). The `tried` flag is accepted for Core-compat but the
+   * legacy pool has no separate tried table, so it is a no-op here.
+   */
+  private async addPeerAddress(
+    params: unknown[],
+  ): Promise<Record<string, unknown>> {
+    const addrParam = params[0];
+    if (typeof addrParam !== "string") {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "address must be a string",
+      );
+    }
+    const portParam = params[1];
+    if (typeof portParam !== "number" || !Number.isInteger(portParam)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "port must be an integer",
+      );
+    }
+    // `tried` (positional 2, default false) — accepted, no separate table.
+    const triedParam = params[2];
+    if (
+      triedParam !== undefined &&
+      triedParam !== null &&
+      typeof triedParam !== "boolean"
+    ) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "tried must be a boolean",
+      );
+    }
+    // Optional `services` (positional 3) — Core's addpeeraddress hardcodes
+    // NODE_NETWORK|NODE_WITNESS; we accept an explicit bitfield as a test
+    // convenience but default to the same Core value when omitted.
+    const servicesParam = params[3];
+    let services: bigint;
+    if (servicesParam === undefined || servicesParam === null) {
+      services = ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS;
+    } else if (typeof servicesParam === "number" && Number.isInteger(servicesParam)) {
+      services = BigInt(servicesParam);
+    } else {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "services must be an integer",
+      );
+    }
+
+    const nowSecs = Math.floor(Date.now() / 1000);
+    const success = this.peerManager.injectKnownAddress(
+      addrParam,
+      portParam,
+      services,
+      nowSecs,
+    );
+
+    const result: Record<string, unknown> = { success };
+    if (!success) {
+      result.error = "failed to add address to address manager table";
+    }
+    return result;
   }
 
   /**
