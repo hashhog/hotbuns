@@ -240,8 +240,11 @@ describe("Mempool eviction — W86 audit", () => {
       expect(mempool.getMinFee()).toBe(0);
     });
 
-    test("getMinFeeRateKvB() returns 0 when nothing has been evicted", () => {
-      expect(mempool.getMinFeeRateKvB()).toBe(0n);
+    test("getMinFeeRateKvB() returns the static min-relay floor when nothing has been evicted", () => {
+      // The feefilter floor is max(rolling, static min-relay). With no eviction
+      // the rolling rate is 0, so the floor is the static min-relay: 1 sat/vB =
+      // 1000 sat/kvB (Core advertises minRelayTxFee in BIP133 feefilter).
+      expect(mempool.getMinFeeRateKvB()).toBe(1000n);
     });
 
     test("getMinFee() decays rolling rate after blockSinceLastRollingFeeBump=true", () => {
@@ -388,19 +391,22 @@ describe("Mempool eviction — W86 audit", () => {
     });
 
     test("chunk-based eviction: CPFP parent+child evicted together when chunk spans both", async () => {
-      // Create a parent with 0 fee and a child with fee — they form one chunk via CPFP.
+      // Create a low-fee parent and a high-fee child — they form one chunk via CPFP.
       // When evicted, the whole chunk (parent + child) should be removed atomically.
       const parentUtxoId = Buffer.alloc(32, 0x50);
       await setupUTXO(parentUtxoId, 0, 1_000_000n);
 
-      // Parent: zero fee (so it's in the same chunk as child via CPFP linearization)
-      const parent = makeTx([{ txid: parentUtxoId, vout: 0 }], [{ value: 1_000_000n }]);
+      // Parent: a tiny fee just over the static min-relay floor (1 sat/vB) so it
+      // is admissible on its own; the child still raises the chunk's fee rate via
+      // CPFP linearization. (A *zero*-fee parent submitted alone is now correctly
+      // rejected by the min-relay floor — it would need package relay.)
+      const parent = makeTx([{ txid: parentUtxoId, vout: 0 }], [{ value: 999_000n }]);
       const resultP = await mempool.addTransaction(parent);
       expect(resultP.accepted).toBe(true);
       const parentTxid = getTxId(parent);
 
-      // Child: pays all the fee
-      const child = makeTx([{ txid: parentTxid, vout: 0 }], [{ value: 999_000n }]);
+      // Child: pays the bulk of the fee (raises the CPFP chunk fee rate)
+      const child = makeTx([{ txid: parentTxid, vout: 0 }], [{ value: 990_000n }]);
       const resultC = await mempool.addTransaction(child);
       expect(resultC.accepted).toBe(true);
 
@@ -427,9 +433,10 @@ describe("Mempool eviction — W86 audit", () => {
       await mempool.addTransaction(tx);
       mempool.clear();
 
-      // After clear, rolling fee should be reset.
+      // After clear, the rolling fee resets to 0; the feefilter floor falls back
+      // to the static min-relay (1000 sat/kvB).
       expect(mempool.getMinFee()).toBe(0);
-      expect(mempool.getMinFeeRateKvB()).toBe(0n);
+      expect(mempool.getMinFeeRateKvB()).toBe(1000n);
     });
   });
 
@@ -437,8 +444,9 @@ describe("Mempool eviction — W86 audit", () => {
   // Regression — getMinFeeRateKvB() returns bigint, never NaN or negative
   // ==========================================================================
   describe("getMinFeeRateKvB() always valid", () => {
-    test("returns bigint 0 by default", () => {
-      expect(mempool.getMinFeeRateKvB()).toBe(0n);
+    test("returns the static min-relay floor (bigint) by default", () => {
+      // Default feefilter floor is the static min-relay: 1000 sat/kvB (1 sat/vB).
+      expect(mempool.getMinFeeRateKvB()).toBe(1000n);
     });
 
     test("returns non-negative bigint after addTransaction", async () => {
