@@ -1802,6 +1802,24 @@ async function startNode(config: NodeConfig): Promise<void> {
   if (mergedConfig.blockfilterindex) {
     filterIndex = new BlockFilterIndex(db, true);
     await filterIndex.init();
+    // Seed the filter-header chain with the genesis block (height 0) so it
+    // chains from the genesis filter header — exactly like Bitcoin Core's
+    // BaseIndex, which begins at genesis. The genesis block is connected by
+    // chainState.load() before this point but NEVER passes through the
+    // per-block connect path that calls filterIndex.indexBlock, so without
+    // this seed the block-1 filter header would chain from 0^256 and every
+    // subsequent filter header would diverge from Core by the genesis link.
+    // No-op on restart (currentHeight already >= 0). BIP-157 §"Filter Headers".
+    try {
+      const genesisBlock = deserializeBlock(new BufferReader(params.genesisBlock));
+      await filterIndex.ensureGenesisIndexed(genesisBlock);
+    } catch (err) {
+      console.warn(
+        `[blockfilterindex] could not seed genesis filter header: ${
+          err instanceof Error ? err.message : String(err)
+        } (filter-header chain may diverge from Core)`
+      );
+    }
     blockSync.setBlockFilterIndex(filterIndex);
     // BIP-157 Phase 2: wire the same filterIndex into ChainStateManager so
     // the dumptxoutset rollback dance and generateblock reorg path also

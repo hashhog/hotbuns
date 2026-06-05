@@ -1118,6 +1118,7 @@ export class RPCServer {
     this.registerMethod("getblock", (params) => this.getBlock(params));
     this.registerMethod("getblockhash", (params) => this.getBlockHash(params));
     this.registerMethod("getblockheader", (params) => this.getBlockHeader(params));
+    this.registerMethod("getblockfilter", (params) => this.getBlockFilter(params));
     this.registerMethod("getblockcount", () => this.getBlockCount());
     this.registerMethod("getbestblockhash", () => this.getBestBlockHash());
     this.registerMethod("getsyncstate", () => this.getSyncState());
@@ -2205,6 +2206,94 @@ export class RPCServer {
     }
 
     return result;
+  }
+
+  /**
+   * getblockfilter "blockhash" ( "filtertype" )
+   *
+   * Retrieve a BIP-157 content filter (BIP-158 GCS basic block filter) for a
+   * particular block. Mirrors Bitcoin Core's `getblockfilter`
+   * (bitcoin-core/src/rpc/blockchain.cpp:2956-3031).
+   *
+   * Returns { "filter": <hex GCS>, "header": <hex 32-byte> } where:
+   *   - "filter" is the hex-encoded BIP-158 GCS filter bytes:
+   *       CompactSize(N) || Golomb-Rice bitstream
+   *     (== Core's BlockFilter::GetEncodedFilter()).
+   *   - "header" is the hex of the 32-byte BIP-157 filter header:
+   *       SHA256d( SHA256d(rawFilterBytes) || prevBlockFilterHeader )
+   *     chained from the parent block's filter header (all-zero for the
+   *     genesis predecessor) (== Core's filter_header.GetHex(), big-endian
+   *     display order like all uint256 hashes).
+   *
+   * Errors (exact Core parity):
+   *   - unknown filtertype       -> RPC_INVALID_ADDRESS_OR_KEY (-5) "Unknown filtertype"
+   *   - filter index not enabled -> RPC_MISC_ERROR (-1) "Index is not enabled for filtertype basic"
+   *   - block not found          -> RPC_INVALID_ADDRESS_OR_KEY (-5) "Block not found"
+   *   - filter not built yet     -> RPC_MISC_ERROR (-1) "Filter not found. ..."
+   *
+   * @param params [blockhash, filtertype="basic"]
+   */
+  private async getBlockFilter(params: unknown[]): Promise<unknown> {
+    const [blockhashParam, filtertypeParam] = params;
+
+    if (typeof blockhashParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
+    }
+
+    // filtertype defaults to "basic"; Core only ships BlockFilterType::BASIC.
+    let filtertypeName = "basic";
+    if (filtertypeParam !== undefined && filtertypeParam !== null) {
+      if (typeof filtertypeParam !== "string") {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "filtertype must be a string");
+      }
+      filtertypeName = filtertypeParam;
+    }
+
+    // BlockFilterTypeByName: unknown filter type -> RPC_INVALID_ADDRESS_OR_KEY.
+    if (filtertypeName !== "basic") {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Unknown filtertype");
+    }
+
+    // GetBlockFilterIndex(filtertype): if the index is not running,
+    // RPC_MISC_ERROR (-1) "Index is not enabled for filtertype <name>".
+    if (!this.filterIndex || !this.filterIndex.isEnabled()) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        `Index is not enabled for filtertype ${filtertypeName}`
+      );
+    }
+
+    // Parse the display-order (reversed) hash into the internal key.
+    const blockhash = Buffer.from(blockhashParam, "hex").reverse();
+    if (blockhash.length !== 32) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
+    }
+
+    // LookupBlockIndex: unknown hash -> RPC_INVALID_ADDRESS_OR_KEY "Block not found".
+    const blockIndex = await this.db.getBlockIndex(blockhash);
+    if (!blockIndex) {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found");
+    }
+
+    // LookupFilter + LookupFilterHeader. If either is missing the filter
+    // hasn't been built yet (still indexing) -> RPC_MISC_ERROR, matching
+    // Core's index_ready branch message.
+    const filter = await this.filterIndex.getFilter(blockhash);
+    const filterHeader = await this.filterIndex.getFilterHeader(blockhash);
+    if (!filter || !filterHeader) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        "Filter not found. Block filters are still in the process of being indexed."
+      );
+    }
+
+    return {
+      // GetEncodedFilter() == CompactSize(N) || GCS bitstream, hex-encoded.
+      filter: filter.toString("hex"),
+      // filter_header.GetHex(): uint256 display order is big-endian
+      // (reverse of the internal little-endian storage).
+      header: Buffer.from(filterHeader).reverse().toString("hex"),
+    };
   }
 
   /**
