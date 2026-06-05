@@ -528,10 +528,13 @@ describe("CPFP (Child-Pays-For-Parent)", () => {
     );
     const parentTxid = getTxId(parent);
 
-    // Parent alone should be rejected (fee rate too low)
+    // Parent alone should be rejected: its 0.15 sat/vB is below the static
+    // min-relay floor (1 sat/vB), so addTransaction rejects it with
+    // "min relay fee not met". (It only becomes admissible inside a CPFP
+    // package where the child raises the package fee rate — proven below.)
     const parentResult = await mempool.addTransaction(parent);
     expect(parentResult.accepted).toBe(false);
-    expect(parentResult.error).toContain("Fee rate");
+    expect(parentResult.error?.toLowerCase()).toMatch(/fee rate|min relay fee not met/);
 
     // Now create child with high fee that pays for both
     // Child input: 199990 (from parent), output: 195000 -> fee = 4990 sat

@@ -153,34 +153,24 @@ describe("Mempool", () => {
       expect(result.error).toContain("bad-txns-inputs-missingorspent");
     });
 
-    test("rejects transaction below explicit min fee rate", async () => {
-      // W86: DEFAULT_MIN_FEE_RATE is now 0 (rises only after TrimToSize eviction,
-      // matching Core: rollingMinimumFeeRate starts at 0).
-      // To test fee-rate rejection, explicitly raise the minimum by calling
-      // setIncrementalRelayFee and adding a high-fee tx that triggers eviction,
-      // OR just verify that a zero-fee transaction is accepted (since minFeeRate=0).
-      //
-      // We test that the fee-rate gate works when explicitly set: if we manually
-      // call setIncrementalRelayFee to simulate a post-eviction state where
-      // the incremental relay fee is large, a tx below it is rejected.
-      //
-      // Actually the correct test is: zero-value fee is 0 sat/vB which is ≥
-      // minFeeRate(0), so it should be accepted. But totalInput < totalOutput
-      // yields rejection via the "Insufficient input value" path.
-      //
-      // The fee-rate gate (`feeRate < this.minFeeRate`) only fires when minFeeRate > 0.
-      // This is correct Core behavior: when the pool is empty / not full, any fee is ok.
+    test("rejects transaction below min relay fee", async () => {
+      // The static min-relay floor (DEFAULT_MIN_FEE_RATE = 1 sat/vB = 1000
+      // sat/kvB = Core's -minrelaytxfee default) is enforced at admission:
+      // a zero-fee tx pays 0 sat/vB < 1 sat/vB and is rejected with
+      // "min relay fee not met", matching a default Bitcoin Core node.
+      // Reference: bitcoin-core/src/policy/policy.h DEFAULT_MIN_RELAY_TX_FEE
+      // and the CFeeRate(minrelaytxfee) gate in validation.cpp.
       const inputTxid = Buffer.alloc(32, 0xcc);
       await setupUTXO(inputTxid, 0, 10000n);
 
-      // tx with 0 fee — should be accepted (minFeeRate=0 in empty pool)
+      // tx with 0 fee — rejected by the min-relay floor.
       const txZeroFee = createTestTx(
         [{ txid: inputTxid, vout: 0 }],
-        [{ value: 10000n }] // 0 sat fee
+        [{ value: 10000n }] // 0 sat fee → 0 sat/vB
       );
       const resultZero = await mempool.addTransaction(txZeroFee);
-      // With DEFAULT_MIN_FEE_RATE=0, a zero-fee tx is accepted.
-      expect(resultZero.accepted).toBe(true);
+      expect(resultZero.accepted).toBe(false);
+      expect(resultZero.error).toContain("min relay fee not met");
     });
 
     test("rejects transaction spending immature coinbase", async () => {
@@ -711,10 +701,11 @@ describe("Mempool", () => {
 
       expect(info.size).toBe(1);
       expect(info.bytes).toBeGreaterThan(0);
-      // W86: DEFAULT_MIN_FEE_RATE is now 0 (rises only after TrimToSize eviction).
-      // Core: rollingMinimumFeeRate starts at 0; static floor starts at 0.
-      // Reference: bitcoin-core/src/txmempool.h:197
-      expect(info.minFeeRate).toBeGreaterThanOrEqual(0);
+      // The static min-relay floor (DEFAULT_MIN_FEE_RATE = 1 sat/vB) is the
+      // admission minimum; the rolling minimum rises above it only after
+      // TrimToSize eviction. getInfo() reports max(static, rolling).
+      // Reference: bitcoin-core/src/policy/policy.h DEFAULT_MIN_RELAY_TX_FEE.
+      expect(info.minFeeRate).toBeGreaterThanOrEqual(1);
     });
   });
 

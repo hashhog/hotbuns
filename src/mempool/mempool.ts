@@ -562,10 +562,25 @@ export const MEMPOOL_EXPIRY_SECONDS = 336 * 60 * 60; // 1_209_600 seconds
 const ROLLING_FEE_HALFLIFE = 60 * 60 * 12; // 43_200 seconds
 
 /**
- * Default minimum fee rate (sat/vB).
- * This is the initial floor; the dynamic floor rises during TrimToSize eviction.
+ * Default minimum relay fee rate (sat/vB).
+ *
+ * This is the static min-relay floor (Core's `-minrelaytxfee`): a transaction
+ * paying below it is rejected with "min relay fee not met". It is the initial
+ * admission floor; the dynamic floor rises above it during TrimToSize eviction.
+ *
+ * Value: 1 sat/vB = 1000 sat/kvB = 0.00001 BTC/kvB. This is the effective
+ * min-relay floor the rest of the hashhog fleet enforces (e.g. camlcoin
+ * `min_relay_fee = 1000L`) and matches a default Bitcoin Core node, which
+ * rejects a zero-/below-floor-fee tx out of the box.
+ *
+ * Reference: bitcoin-core/src/policy/policy.h DEFAULT_MIN_RELAY_TX_FEE and the
+ * CFeeRate(minrelaytxfee) floor applied in validation.cpp's fee gate.
+ *
+ * Previously 0, which made the static floor a no-op: a zero-fee tx passed the
+ * `feeRate < this.minFeeRate` gate (0 < 0 is false) and was accepted, a policy
+ * hole relative to default Core. (fix(policy): genuine min-relay floor.)
  */
-const DEFAULT_MIN_FEE_RATE = 0;
+const DEFAULT_MIN_FEE_RATE = 1;
 
 /**
  * Default incremental relay fee rate (sat/vB).
