@@ -50,6 +50,7 @@ import {
   serializeTx,
   getTxId,
   getWTxId,
+  getTxVSize,
   sigHashWitnessV0,
   sigHashTaproot,
   SIGHASH_ALL,
@@ -86,6 +87,28 @@ const CURVE_ORDER = BigInt(
  * This is the worst-case BIP-125 violation in the W118 fleet audit.
  */
 export const BIP125_RBF_SEQUENCE = 0xfffffffd;
+
+/**
+ * Static min-relay fee floor the wallet must meet, in sat/vB.
+ *
+ * Mirrors the mempool's `DEFAULT_MIN_FEE_RATE` (= Core's `minrelaytxfee`
+ * default of 100 sat/kvB = 0.1 sat/vB; bitcoin-core/src/policy/policy.h:70
+ * DEFAULT_MIN_RELAY_TX_FEE{100}). A wallet must never build a transaction whose
+ * EFFECTIVE fee rate (actualFee / real-vsize) is below the relay floor, or its
+ * own sendtoaddress self-rejects with "min relay fee not met".
+ *
+ * Core's CWallet uses an effective feerate of max(target_feerate,
+ * min_relay_feerate) and CFeeRate::GetFee rounds the fee UP, so the resulting
+ * transaction always pays >= the floor. We mirror that: the send fee-rate is
+ * clamped to >= this floor, and the fee is padded up against the REAL signed
+ * vsize so the effective rate is >= the floor (the crude pre-sign vsize
+ * estimate undershoots, which is what produced the ~0.993 sat/vB undershoot).
+ *
+ * Duplicated here (rather than imported from ../mempool/mempool.js) to avoid
+ * pulling the heavy mempool module graph into the wallet; the two values MUST
+ * stay in lockstep with Core's minrelaytxfee default.
+ */
+export const WALLET_MIN_RELAY_FEERATE = 0.1;
 
 /**
  * Recoverable error signalling that BIP-32 CKD landed on the spec-mandated
@@ -1135,6 +1158,14 @@ export class Wallet {
     outputs: { address: string; amount: bigint }[],
     feeRate: number
   ): Transaction {
+    // Effective send fee-rate. Mirror Core's CWallet, which uses
+    // max(target_feerate, min_relay_feerate) so a wallet never builds a tx
+    // below its own relay floor. Clamping here guarantees the (later) effective
+    // rate target is >= the mempool's static min-relay floor.
+    // Reference: bitcoin-core/src/wallet/spend.cpp (GetMinimumFeeRate ->
+    // std::max(..., m_min_relay_feerate)).
+    const effFeeRate = Math.max(feeRate, WALLET_MIN_RELAY_FEERATE);
+
     // Calculate total output amount
     let totalOutput = 0n;
     for (const output of outputs) {
@@ -1145,7 +1176,7 @@ export class Wallet {
     }
 
     // Select coins
-    const selectedUtxos = this.selectCoins(totalOutput, feeRate);
+    const selectedUtxos = this.selectCoins(totalOutput, effFeeRate);
 
     // Calculate total input amount
     let totalInput = 0n;
@@ -1158,7 +1189,7 @@ export class Wallet {
     const numOutputs = outputs.length + 1; // +1 for potential change
     const estimatedVSize =
       10 + 68 * selectedUtxos.length + 31 * numOutputs;
-    const estimatedFee = BigInt(Math.ceil(estimatedVSize * feeRate));
+    const estimatedFee = BigInt(Math.ceil(estimatedVSize * effFeeRate));
 
     // Calculate change
     const change = totalInput - totalOutput - estimatedFee;
@@ -1223,13 +1254,53 @@ export class Wallet {
         value: u.amount,
       };
     });
-    for (let i = 0; i < txInputs.length; i++) {
-      const utxo = selectedUtxos[i];
-      const key = this.keys.get(utxo.address);
-      if (!key) {
-        throw new Error(`No key found for address: ${utxo.address}`);
+    const signAllInputs = () => {
+      for (let i = 0; i < txInputs.length; i++) {
+        const utxo = selectedUtxos[i];
+        const key = this.keys.get(utxo.address);
+        if (!key) {
+          throw new Error(`No key found for address: ${utxo.address}`);
+        }
+        this.signInput(tx, i, key, utxo, prevOuts);
       }
-      this.signInput(tx, i, key, utxo, prevOuts);
+    };
+    signAllInputs();
+
+    // Pad the fee so the EFFECTIVE rate meets the relay floor.
+    //
+    // The crude pre-sign vsize estimate (10 + 68*in + 31*out) undershoots the
+    // real serialized vsize, so actualFee/realVsize can land just below the
+    // target rate (this is what produced the ~0.993 sat/vB < 1 sat/vB
+    // self-reject). Mirror Core's CFeeRate::GetFee, which rounds the fee UP
+    // against the real size: measure the signed vsize and, if the fee is short,
+    // top it up out of the change output and re-sign.
+    //
+    // Note: for segwit (BIP-143) the sighash commits to every output value, so
+    // mutating the change value requires re-signing every input.
+    if (changeIndex >= 0) {
+      // +1 vbyte margin absorbs the ±1-byte signature-length wobble that
+      // re-signing can introduce (low-S DER sigs vary by a byte), so the
+      // effective rate stays >= the floor even if the final vsize ticks up.
+      const realVsize = getTxVSize(tx) + 1;
+      const requiredFee = BigInt(Math.ceil(realVsize * effFeeRate));
+      let totalOutNow = 0n;
+      for (const out of tx.outputs) totalOutNow += out.value;
+      const feeNow = totalInput - totalOutNow;
+      if (feeNow < requiredFee) {
+        const shortfall = requiredFee - feeNow;
+        const newChange = tx.outputs[changeIndex].value - shortfall;
+        // Only shrink change if it stays a usable (non-dust) output; otherwise
+        // leave the fee as-is rather than create dust. With the floor at
+        // 0.1 sat/vB the shortfall is a handful of sats, so change stays well
+        // above dust in practice.
+        if (newChange > DUST_THRESHOLD) {
+          tx.outputs[changeIndex] = {
+            value: newChange,
+            scriptPubKey: tx.outputs[changeIndex].scriptPubKey,
+          };
+          signAllInputs(); // re-sign: BIP-143 sighash commits to output values
+        }
+      }
     }
 
     // Compute the actual fee (which may differ from estimatedFee since the

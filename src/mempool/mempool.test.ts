@@ -154,11 +154,11 @@ describe("Mempool", () => {
     });
 
     test("rejects transaction below min relay fee", async () => {
-      // The static min-relay floor (DEFAULT_MIN_FEE_RATE = 1 sat/vB = 1000
+      // The static min-relay floor (DEFAULT_MIN_FEE_RATE = 0.1 sat/vB = 100
       // sat/kvB = Core's -minrelaytxfee default) is enforced at admission:
-      // a zero-fee tx pays 0 sat/vB < 1 sat/vB and is rejected with
+      // a zero-fee tx pays 0 sat/vB < 0.1 sat/vB and is rejected with
       // "min relay fee not met", matching a default Bitcoin Core node.
-      // Reference: bitcoin-core/src/policy/policy.h DEFAULT_MIN_RELAY_TX_FEE
+      // Reference: bitcoin-core/src/policy/policy.h:70 DEFAULT_MIN_RELAY_TX_FEE
       // and the CFeeRate(minrelaytxfee) gate in validation.cpp.
       const inputTxid = Buffer.alloc(32, 0xcc);
       await setupUTXO(inputTxid, 0, 10000n);
@@ -701,11 +701,14 @@ describe("Mempool", () => {
 
       expect(info.size).toBe(1);
       expect(info.bytes).toBeGreaterThan(0);
-      // The static min-relay floor (DEFAULT_MIN_FEE_RATE = 1 sat/vB) is the
+      // The static min-relay floor (DEFAULT_MIN_FEE_RATE = 0.1 sat/vB) is the
       // admission minimum; the rolling minimum rises above it only after
       // TrimToSize eviction. getInfo() reports max(static, rolling).
-      // Reference: bitcoin-core/src/policy/policy.h DEFAULT_MIN_RELAY_TX_FEE.
-      expect(info.minFeeRate).toBeGreaterThanOrEqual(1);
+      // 0.1 sat/vB = 100 sat/kvB = Core's actual minrelaytxfee default
+      // (DEFAULT_MIN_RELAY_TX_FEE{100} in policy.h; a default v31.99 node
+      // reports minrelaytxfee/mempoolminfee = 0.00000100 BTC/kvB).
+      // Reference: bitcoin-core/src/policy/policy.h:70 DEFAULT_MIN_RELAY_TX_FEE.
+      expect(info.minFeeRate).toBeGreaterThanOrEqual(0.1);
     });
   });
 

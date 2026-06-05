@@ -825,7 +825,7 @@ export class RESTServer {
         usage: info.bytes, // Approximate memory usage
         maxmempool: 300000000, // Default 300MB
         mempoolminfee: info.minFeeRate / 100000, // Convert to BTC/kvB
-        minrelaytxfee: 0.00001, // 1 sat/vB
+        minrelaytxfee: 0.000001, // 0.1 sat/vB = Core's minrelaytxfee default (0.00000100 BTC/kvB)
       };
       return this.formatResponse(json, format);
     }
