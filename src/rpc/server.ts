@@ -104,6 +104,8 @@ import {
 import {
   ChainstateManager,
   computeUTXOSetHash,
+  computeUTXOSetStats,
+  type UTXOSetHashType,
   serializeSnapshotMetadata,
   deserializeSnapshotMetadata,
   deserializeCoinFromSnapshot,
@@ -10241,9 +10243,70 @@ export class RPCServer {
   // ========== Wave-47b Methods ==========
 
   /**
-   * gettxoutsetinfo: Returns statistics about the unspent transaction output set.
+   * gettxoutsetinfo ( "hash_type" hash_or_height use_index )
+   *
+   * Returns statistics about the unspent transaction output set, mirroring
+   * Bitcoin Core (`src/rpc/blockchain.cpp::gettxoutsetinfo` +
+   * `src/kernel/coinstats.cpp`). Base chainstate stats at the tip only —
+   * coinstatsindex (querying a specific height) is out of scope here.
+   *
+   *   hash_type  : "hash_serialized_3" (default) | "muhash" | "none".
+   *   hash_or_height / use_index : require coinstatsindex; supplying a specific
+   *     block with hash_serialized_3 -> RPC_INVALID_PARAMETER (-8).
+   *
+   * Output (base, no coinstatsindex):
+   *   height, bestblock, txouts, bogosize, transactions, disk_size,
+   *   total_amount, and (only for the matching hash_type) hash_serialized_3
+   *   or muhash. The set hash is computed over the coin-cursor-ordered
+   *   per-coin serialization (txid, vout, height<<1|coinbase, txout), so a
+   *   byte-match proves the whole UTXO set is identical to Core's.
    */
   private async getTxOutSetInfo(params: unknown[]): Promise<Record<string, unknown>> {
+    // ── Parse + validate hash_type. ──────────────────────────────────────
+    const hashTypeArg = params[0];
+    let hashType: UTXOSetHashType;
+    if (hashTypeArg === undefined || hashTypeArg === null) {
+      hashType = "hash_serialized_3";
+    } else if (typeof hashTypeArg === "string") {
+      if (
+        hashTypeArg === "hash_serialized_3" ||
+        hashTypeArg === "muhash" ||
+        hashTypeArg === "none"
+      ) {
+        hashType = hashTypeArg;
+      } else {
+        // Core: ParseHashType -> JSONRPCError(RPC_INVALID_PARAMETER, "<x> is
+        // not a valid hash_type") (rpc/blockchain.cpp).
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          `${hashTypeArg} is not a valid hash_type`,
+        );
+      }
+    } else {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "hash_type must be a string",
+      );
+    }
+
+    // ── hash_or_height / use_index require coinstatsindex (out of scope). ──
+    // A specific block requested with hash_serialized_3 is the explicit Core
+    // error path we mirror (-8); any specific-block request otherwise also
+    // needs coinstatsindex, which hotbuns does not run here.
+    const hashOrHeight = params[1];
+    if (hashOrHeight !== undefined && hashOrHeight !== null) {
+      if (hashType === "hash_serialized_3") {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          "hash_serialized_3 hash type cannot be queried for a specific block",
+        );
+      }
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Querying specific block heights requires coinstatsindex",
+      );
+    }
+
     const chainState = await this.db.getChainState();
     if (!chainState) {
       throw this.rpcError(RPCErrorCodes.MISC_ERROR, "No chain state available");
@@ -10251,17 +10314,35 @@ export class RPCServer {
     const bestBlock = this.chainState.getBestBlock();
     const bestBlockHashHex = Buffer.from(bestBlock.hash).reverse().toString("hex");
 
-    // Compute hash_serialized_3 via the shared helper
-    const { hash, coinsCount } = await computeUTXOSetHash(this.db);
-    return {
+    // ── Single coin-cursor pass: stats + (optional) set hash. ────────────
+    const stats = await computeUTXOSetStats(this.db, hashType);
+
+    const result: Record<string, unknown> = {
       height: bestBlock.height,
       bestblock: bestBlockHashHex,
-      txouts: Number(coinsCount),
-      transactions: Number(coinsCount),
-      bogosize: 0,
-      hash_serialized_3: hash.reverse().toString("hex"),
-      total_amount: 0,
+      txouts: Number(stats.txouts),
+      bogosize: Number(stats.bogosize),
+      // hash_serialized_3 / muhash inserted below, between bogosize and
+      // total_amount, matching Core's field order.
+      total_amount: formatBtcAmount(stats.totalAmount),
+      // Not available when coinstatsindex is used; always present here.
+      transactions: Number(stats.transactions),
+      // Impl-specific: hotbuns is LevelDB-backed; report the database-
+      // independent bogosize as a stable on-disk-size proxy (Core reports a
+      // backend EstimateSize() that is likewise not portable).
+      disk_size: Number(stats.bogosize),
     };
+
+    if (hashType === "hash_serialized_3" && stats.hash) {
+      result.hash_serialized_3 = Buffer.from(stats.hash).reverse().toString("hex");
+    } else if (hashType === "muhash" && stats.hash) {
+      // MuHash3072.finalize() already yields the display-order digest
+      // (SHA256(LE_384(num/den))); Core prints it verbatim via uint256.GetHex
+      // over the same bytes, so reverse for the standard hex display.
+      result.muhash = Buffer.from(stats.hash).reverse().toString("hex");
+    }
+
+    return result;
   }
 
   /**
