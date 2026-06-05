@@ -632,6 +632,40 @@ export class BlockFilterIndex {
   }
 
   /**
+   * Index the genesis block (height 0) so the filter-header chain starts at
+   * the genesis filter header — NOT at the all-zero predecessor.
+   *
+   * Bitcoin Core's BaseIndex (src/index/base.cpp) begins indexing at the
+   * genesis block: `CustomAppend` runs for height 0, so the genesis block
+   * gets its own basic filter and a filter header
+   *   genesis_header = SHA256d( SHA256d(genesis_filter) || 0^256 )
+   * which then becomes the prev-header link for the block-1 filter header.
+   *
+   * hotbuns connects the genesis block at chainState.load() time BEFORE the
+   * filter index is wired (cli.ts), and the per-block connect path
+   * (BlockSync.connectBlock / ChainStateManager) only fires for blocks that
+   * connect AFTER startup. Without this call the index's first appended block
+   * (height 1) would chain from the all-zero header, diverging from Core's
+   * filter-header chain by exactly the genesis link at EVERY height.
+   *
+   * Idempotent: only runs when the index has no tip yet (currentHeight < 0,
+   * i.e. a fresh index). On a restart the FILTER_TIP singleton already holds
+   * the chained currentHeader, so this is a no-op. Genesis has no spent
+   * prevouts, so the element set is just the genesis coinbase outputs (which
+   * on most networks is an OP_RETURN-free P2PK output → 1 element; regtest's
+   * genesis coinbase scriptPubKey is the standard 0x41…ac P2PK, included).
+   *
+   * @param genesisBlock - The deserialized genesis Block (height 0).
+   */
+  async ensureGenesisIndexed(genesisBlock: Block): Promise<void> {
+    if (!this.enabled) return;
+    // Only seed the chain when the index is brand new. A non-fresh index has
+    // already chained past genesis; re-seeding would corrupt currentHeader.
+    if (this.currentHeight >= 0) return;
+    await this.indexBlock(genesisBlock, 0, []);
+  }
+
+  /**
    * Build a filter for a block.
    *
    * @param block - The block to filter
