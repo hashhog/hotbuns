@@ -2095,7 +2095,9 @@ export class RPCServer {
     // Get block index record (contains the 80-byte header)
     const blockIndex = await this.db.getBlockIndex(blockhash);
     if (!blockIndex) {
-      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block header not found");
+      // Core: getblockheader throws RPC_INVALID_ADDRESS_OR_KEY (-5)
+      // "Block not found" for any hash absent from the block index.
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found");
     }
 
     // If not verbose, return hex-encoded header
@@ -2151,12 +2153,25 @@ export class RPCServer {
       }
     }
 
+    // Confirmations + next/previous link, mirroring Core's
+    // ComputeNextBlockAndDepth / blockheaderToJSON (blockchain.cpp:116-124,
+    // 160-180). A block is "on the active chain" iff the canonical hash stored
+    // at its height equals this block's hash. In-chain → confirmations =
+    // tipHeight - height + 1 and nextblockhash present when a successor exists;
+    // off-chain (side branch) → confirmations = -1 and no nextblockhash.
+    const tipHeight = this.chainState.getBestBlock().height;
+    const activeHashAtHeight = await this.db.getBlockHashByHeight(blockIndex.height);
+    const inActiveChain =
+      activeHashAtHeight !== null && activeHashAtHeight.equals(blockhash);
+
+    const confirmations = inActiveChain ? tipHeight - blockIndex.height + 1 : -1;
+
     const result: Record<string, unknown> = {
       hash: blockhashParam,
-      confirmations: this.chainState.getBestBlock().height - blockIndex.height + 1,
+      confirmations,
       height: blockIndex.height,
       version: header.version,
-      versionHex: header.version.toString(16).padStart(8, "0"),
+      versionHex: (header.version >>> 0).toString(16).padStart(8, "0"),
       merkleroot: Buffer.from(header.merkleRoot).reverse().toString("hex"),
       time: header.timestamp,
       mediantime: headerEntry
@@ -2168,13 +2183,25 @@ export class RPCServer {
       difficulty: this.calculateDifficultyFromBits(header.bits),
       chainwork: chainWorkHex,
       nTx,
-      previousblockhash: Buffer.from(header.prevBlock).reverse().toString("hex"),
     };
 
-    // Add next block hash if available
-    const nextHash = await this.db.getBlockHashByHeight(blockIndex.height + 1);
-    if (nextHash) {
-      result.nextblockhash = Buffer.from(nextHash).reverse().toString("hex");
+    // previousblockhash: present ONLY when the block has a parent. Core gates on
+    // blockindex.pprev; the genesis block (height 0) has none, so the key is
+    // omitted entirely (not emitted as the all-zero hash).
+    if (blockIndex.height > 0) {
+      result.previousblockhash = Buffer.from(header.prevBlock)
+        .reverse()
+        .toString("hex");
+    }
+
+    // nextblockhash: present ONLY when this block is on the active chain AND has
+    // an active-chain successor (i.e. it is not the tip). Core sets `next` from
+    // tip.GetAncestor(height+1) and only emits the key when `next` is non-null.
+    if (inActiveChain) {
+      const nextHash = await this.db.getBlockHashByHeight(blockIndex.height + 1);
+      if (nextHash) {
+        result.nextblockhash = Buffer.from(nextHash).reverse().toString("hex");
+      }
     }
 
     return result;

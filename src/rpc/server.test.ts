@@ -1412,7 +1412,9 @@ describe("RPCServer", () => {
       // DB fallback chainwork must equal what was stored by connectBlock
       expect(h.chainwork).toBe(genesisChainWork.toString(16).padStart(64, "0"));
       expect(h.nTx).toBe(1);
-      expect(h.previousblockhash).toBe(Buffer.from(prevBlock).reverse().toString("hex"));
+      // Genesis has no parent — Core gates previousblockhash on blockindex.pprev
+      // (blockchain.cpp:177), so the key is OMITTED entirely for height 0.
+      expect(h.previousblockhash).toBeUndefined();
       // nextblockhash is absent at genesis (no successor stored)
       expect(h.nextblockhash).toBeUndefined();
     });
@@ -1488,14 +1490,14 @@ describe("RPCServer", () => {
       //   time:          1296688602
       //   bits:          207fffff
       //   nonce:         2
-      //   previousblockhash (all zeros, displayed reversed = same): 0000...0000
+      //   previousblockhash: OMITTED — Core does not emit it for the genesis
+      //     block (gated on blockindex.pprev, blockchain.cpp:177).
       const GENESIS_DISPLAY_HASH = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206";
       const GENESIS_MERKLEROOT   = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
       const GENESIS_TIME         = 1296688602;
       const GENESIS_BITS         = "207fffff";
       const GENESIS_NONCE        = 2;
       const GENESIS_VERSION      = 1;
-      const GENESIS_PREV         = "0000000000000000000000000000000000000000000000000000000000000000";
 
       const genesisHashInternal = REGTEST.genesisBlockHash;
       const genesisRaw          = REGTEST.genesisBlock;
@@ -1529,7 +1531,8 @@ describe("RPCServer", () => {
       expect(h.mediantime).toBe(GENESIS_TIME);
       expect(h.nonce).toBe(GENESIS_NONCE);
       expect(h.bits).toBe(GENESIS_BITS);
-      expect(h.previousblockhash).toBe(GENESIS_PREV);
+      // Core omits previousblockhash for the genesis block (no parent).
+      expect(h.previousblockhash).toBeUndefined();
       // nextblockhash absent at genesis
       expect(h.nextblockhash).toBeUndefined();
       // chainwork comes from DB fallback → must match what connectBlock stored
