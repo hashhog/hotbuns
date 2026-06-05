@@ -8493,8 +8493,240 @@ export class RPCServer {
     return decodeScriptRPC(script);
   }
 
+  /**
+   * Build a scriptPubKey from a decoded address.
+   *
+   * Mirrors Bitcoin Core's GetScriptForDestination (key_io / standard.cpp).
+   * Supports the standard output types hotbuns can spend/relay:
+   *   P2PKH  → OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+   *   P2SH   → OP_HASH160 <20> OP_EQUAL
+   *   P2WPKH → OP_0 <20>
+   *   P2WSH  → OP_0 <32>
+   *   P2TR   → OP_1 <32>
+   */
+  private scriptPubKeyForAddress(address: string): Buffer {
+    const decoded = decodeAddress(address);
+    switch (decoded.type) {
+      case AddressType.P2PKH:
+        return Buffer.concat([
+          Buffer.from([0x76, 0xa9, 0x14]),
+          decoded.hash,
+          Buffer.from([0x88, 0xac]),
+        ]);
+      case AddressType.P2SH:
+        return Buffer.concat([
+          Buffer.from([0xa9, 0x14]),
+          decoded.hash,
+          Buffer.from([0x87]),
+        ]);
+      case AddressType.P2WPKH:
+        return Buffer.concat([Buffer.from([0x00, 0x14]), decoded.hash]);
+      case AddressType.P2WSH:
+        return Buffer.concat([Buffer.from([0x00, 0x20]), decoded.hash]);
+      case AddressType.P2TR:
+        return Buffer.concat([Buffer.from([0x51, 0x20]), decoded.hash]);
+      default:
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          `Invalid address (unsupported type): ${address}`
+        );
+    }
+  }
+
+  /**
+   * createrawtransaction: build an unsigned raw transaction hex from a list of
+   * inputs and a set of outputs.
+   *
+   * Mirrors Bitcoin Core's createrawtransaction / ConstructTransaction
+   * (rpc/rawtransaction.cpp + rpc/rawtransaction_util.cpp):
+   *
+   *   params[0] inputs  : array of { "txid": hex, "vout": n, "sequence"?: n }
+   *   params[1] outputs : object { address: amountBTC, ... } and/or { "data": hex },
+   *                       OR an array of single-key objects (preserves order /
+   *                       allows duplicate addresses, matching Core).
+   *   params[2] locktime: optional nLockTime (default 0).
+   *   params[3] replaceable: optional bool (BIP-125 opt-in). Default behavior
+   *                       matches Core's AddInputs:
+   *                         replaceable === true  → sequence 0xfffffffd
+   *                         replaceable === false → sequence 0xfffffffe
+   *                         replaceable absent    → sequence 0xffffffff
+   *                       A per-input explicit "sequence" always overrides.
+   *
+   * The txid in each input is in display (big-endian) hex; hotbuns stores
+   * OutPoint.txid in internal little-endian form, so we reverse on the way in.
+   *
+   * Returns the serialized (non-witness; the tx is unsigned) transaction hex.
+   */
   private async createRawTransaction(params: unknown[]): Promise<string> {
-    throw this.rpcError(-1, "createrawtransaction not yet implemented");
+    const [inputsParam, outputsParam, locktimeParam, replaceableParam] = params;
+
+    if (!Array.isArray(inputsParam)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "Invalid parameter, inputs must be an array"
+      );
+    }
+    if (
+      outputsParam === undefined ||
+      outputsParam === null ||
+      typeof outputsParam !== "object"
+    ) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "Invalid parameter, outputs must be an object or array"
+      );
+    }
+
+    // Default per-input sequence based on the replaceable flag (Core AddInputs).
+    const MAX_BIP125_RBF_SEQUENCE = 0xfffffffd;
+    const MAX_SEQUENCE_NONFINAL = 0xfffffffe;
+    const SEQUENCE_FINAL = 0xffffffff;
+    let defaultSequence: number;
+    if (replaceableParam === undefined || replaceableParam === null) {
+      defaultSequence = SEQUENCE_FINAL;
+    } else if (replaceableParam === true) {
+      defaultSequence = MAX_BIP125_RBF_SEQUENCE;
+    } else if (replaceableParam === false) {
+      defaultSequence = MAX_SEQUENCE_NONFINAL;
+    } else {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "Invalid parameter, replaceable must be a boolean"
+      );
+    }
+
+    // locktime (default 0).
+    let lockTime = 0;
+    if (locktimeParam !== undefined && locktimeParam !== null) {
+      const lt = Number(locktimeParam);
+      if (!Number.isInteger(lt) || lt < 0 || lt > 0xffffffff) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "Invalid parameter, locktime out of range"
+        );
+      }
+      lockTime = lt;
+    }
+
+    // Build inputs.
+    const inputs: TxIn[] = [];
+    for (const rawIn of inputsParam) {
+      if (rawIn === null || typeof rawIn !== "object") {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, input must be an object");
+      }
+      const inObj = rawIn as Record<string, unknown>;
+      const txidHex = inObj.txid;
+      const vout = inObj.vout;
+      if (typeof txidHex !== "string" || txidHex.length !== 64) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, missing or invalid txid");
+      }
+      if (typeof vout !== "number" || !Number.isInteger(vout) || vout < 0) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, missing or invalid vout");
+      }
+      // Display (big-endian) hex → internal little-endian buffer.
+      const txidLE = Buffer.from(txidHex, "hex").reverse();
+      if (txidLE.length !== 32) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, txid must be 32 bytes");
+      }
+      let sequence = defaultSequence;
+      if (inObj.sequence !== undefined && inObj.sequence !== null) {
+        const seq = Number(inObj.sequence);
+        if (!Number.isInteger(seq) || seq < 0 || seq > SEQUENCE_FINAL) {
+          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, sequence number is out of range");
+        }
+        sequence = seq;
+      }
+      inputs.push({
+        prevOut: { txid: txidLE, vout },
+        scriptSig: Buffer.alloc(0),
+        sequence,
+        witness: [],
+      });
+    }
+
+    // Build outputs. Accept either an object map { addr: amt } or an array of
+    // single-key objects (Core allows the array form to preserve order and
+    // permit duplicate addresses). A reserved "data" key emits an OP_RETURN.
+    const outputs: TxOut[] = [];
+    const addOutput = (key: string, value: unknown): void => {
+      if (key === "data") {
+        if (typeof value !== "string") {
+          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, data must be a hex string");
+        }
+        const dataBuf = Buffer.from(value, "hex");
+        const script = Buffer.concat([Buffer.from([0x6a]), this.encodePushData(dataBuf)]);
+        outputs.push({ value: 0n, scriptPubKey: script });
+        return;
+      }
+      // Amount is in BTC; convert to satoshis. Use a string-safe conversion to
+      // avoid float rounding (8 decimal places).
+      const sats = this.btcToSats(value);
+      outputs.push({ value: sats, scriptPubKey: this.scriptPubKeyForAddress(key) });
+    };
+
+    if (Array.isArray(outputsParam)) {
+      for (const entry of outputsParam) {
+        if (entry === null || typeof entry !== "object") {
+          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, output must be an object");
+        }
+        for (const [k, v] of Object.entries(entry as Record<string, unknown>)) {
+          addOutput(k, v);
+        }
+      }
+    } else {
+      for (const [k, v] of Object.entries(outputsParam as Record<string, unknown>)) {
+        addOutput(k, v);
+      }
+    }
+
+    const tx: Transaction = {
+      version: 2,
+      inputs,
+      outputs,
+      lockTime,
+    };
+
+    // Match Core's guard: if replaceable was explicitly requested but no input
+    // actually signals opt-in RBF, the parameters contradict each other.
+    if (
+      replaceableParam === true &&
+      inputs.length > 0 &&
+      !inputs.some((i) => i.sequence <= MAX_BIP125_RBF_SEQUENCE)
+    ) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "Invalid parameter combination: Sequence number(s) contradict replaceable option"
+      );
+    }
+
+    return serializeTx(tx, false).toString("hex");
+  }
+
+  /**
+   * Convert a BTC amount (number or numeric string) to satoshis as a bigint,
+   * avoiding floating-point rounding by working on the decimal string.
+   */
+  private btcToSats(value: unknown): bigint {
+    let str: string;
+    if (typeof value === "number") {
+      if (!Number.isFinite(value)) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid amount");
+      }
+      str = value.toFixed(8);
+    } else if (typeof value === "string") {
+      str = value;
+    } else {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid amount type");
+    }
+    const neg = str.startsWith("-");
+    if (neg) str = str.slice(1);
+    const [whole, frac = ""] = str.split(".");
+    if (!/^\d*$/.test(whole) || !/^\d*$/.test(frac) || frac.length > 8) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid amount");
+    }
+    const fracPadded = (frac + "00000000").slice(0, 8);
+    const sats = BigInt(whole || "0") * 100_000_000n + BigInt(fracPadded || "0");
+    return neg ? -sats : sats;
   }
 
   private async getMiningInfo(): Promise<Record<string, unknown>> {
