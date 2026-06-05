@@ -225,6 +225,9 @@ export const RPCErrorCodes = {
   // Bitcoin-specific errors
   MISC_ERROR: -1,
   INVALID_ADDRESS_OR_KEY: -5,
+  // RPC_INVALID_PARAMETER (-8): well-formed but semantically invalid argument
+  // (e.g. a block not in the active chain, or an out-of-range block count).
+  INVALID_PARAMETER: -8,
   // Transaction-related errors (sendrawtransaction)
   RPC_TRANSACTION_ERROR: -25,
   RPC_TRANSACTION_REJECTED: -26,
@@ -1095,6 +1098,7 @@ export class RPCServer {
     this.registerMethod("getbestblockhash", () => this.getBestBlockHash());
     this.registerMethod("getsyncstate", () => this.getSyncState());
     this.registerMethod("getchaintips", () => this.getChainTips());
+    this.registerMethod("getchaintxstats", (params) => this.getChainTxStats(params));
     this.registerMethod("getdifficulty", () => this.getDifficulty());
 
     // Transaction methods
@@ -2254,6 +2258,181 @@ export class RPCServer {
   private async getDifficulty(): Promise<number> {
     const bestBlock = this.chainState.getBestBlock();
     return this.calculateDifficulty(bestBlock.hash);
+  }
+
+  /**
+   * Cumulative transaction count from genesis (inclusive) up to and including
+   * the active-chain block at `height` — the analogue of Bitcoin Core's
+   * `CBlockIndex::m_chain_tx_count` (chain.h:129). Computed by summing the
+   * per-block `nTx` over the active chain `[0, height]`.
+   *
+   * Per-block `nTx` is persisted at connect time (sync/blocks.ts and
+   * chain/state.ts). For robustness against blocks indexed before nTx storage
+   * was wired (where the stored value is 0), this falls back to counting txs
+   * from the raw block data — mirroring the getblockheader nTx-resolution path.
+   *
+   * Returns null if any block in the range cannot be resolved at all (so the
+   * caller can omit the optional txcount/window_tx_count fields, exactly as
+   * Core omits them when m_chain_tx_count is 0/unknown, e.g. under assumeutxo).
+   */
+  private async chainTxCountAtHeight(height: number): Promise<number | null> {
+    let total = 0;
+    for (let h = 0; h <= height; h++) {
+      const hash = await this.db.getBlockHashByHeight(h);
+      if (!hash) {
+        return null;
+      }
+      const idx = await this.db.getBlockIndex(hash);
+      if (!idx) {
+        return null;
+      }
+      let nTx = idx.nTx;
+      if (nTx === 0) {
+        // Pre-migration fallback: count from raw block data and persist.
+        const rawBlock = await this.db.getBlock(hash);
+        if (rawBlock !== null) {
+          try {
+            const blk = deserializeBlock(new BufferReader(rawBlock));
+            nTx = blk.transactions.length;
+            await this.db.updateBlockIndexNTx(hash, nTx);
+          } catch {
+            // Leave nTx as 0 if the block is unreadable.
+          }
+        }
+      }
+      total += nTx;
+    }
+    return total;
+  }
+
+  /**
+   * getchaintxstats ( nblocks "blockhash" ): statistics about the total number
+   * and rate of transactions in the chain.
+   *
+   * Core-faithful port of bitcoin-core/src/rpc/blockchain.cpp getchaintxstats:
+   *   - `time` is the FINAL block's RAW header nTime (NOT mediantime).
+   *   - `window_interval` uses MEDIAN-TIME-PAST (11-block window), not raw time.
+   *   - `txcount` = cumulative #txs genesis..pindex (m_chain_tx_count analogue).
+   *   - `window_tx_count` = txcount(pindex) - txcount(pindex - nblocks).
+   *   - `txrate` = window_tx_count / window_interval.
+   *   - The three window_* extras are dropped when nblocks == 0.
+   *   - Default nblocks = 30*24*60*60 / targetSpacing (= "one month", 4320 on
+   *     mainnet@600s); on a short chain it clamps to max(0, min(default, h-1)).
+   *
+   * @param params [nblocks?, blockhash?] — both optional.
+   */
+  private async getChainTxStats(params: unknown[]): Promise<Record<string, unknown>> {
+    const [nblocksParam, blockhashParam] = params ?? [];
+
+    // Default window: one month of blocks at the network's target spacing.
+    // Mirrors Core: 30*24*60*60 / nPowTargetSpacing (4320 on mainnet@600s).
+    let blockcount = Math.floor((30 * 24 * 60 * 60) / this.params.targetSpacing);
+
+    // ── Resolve pindex (the final block of the window). ──────────────────
+    let pindexHash: Buffer;
+    let pindexHeight: number;
+    let pindexHeader: Buffer; // 80-byte header of the final block
+
+    if (blockhashParam === undefined || blockhashParam === null) {
+      // Default: active chain tip.
+      const bestBlock = this.chainState.getBestBlock();
+      pindexHash = Buffer.from(bestBlock.hash);
+      pindexHeight = bestBlock.height;
+      const idx = await this.db.getBlockIndex(pindexHash);
+      if (!idx) {
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found");
+      }
+      pindexHeader = idx.header;
+    } else {
+      if (typeof blockhashParam !== "string") {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
+      }
+      // Hashes in Bitcoin RPC are display-order (reversed bytes).
+      const hash = Buffer.from(blockhashParam, "hex").reverse();
+      if (hash.length !== 32) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
+      }
+      const idx = await this.db.getBlockIndex(hash);
+      if (!idx) {
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found");
+      }
+      // Must be in the active chain: the active-chain hash at idx.height must
+      // equal the requested hash (Core: ActiveChain().Contains(pindex)).
+      const activeAtHeight = await this.db.getBlockHashByHeight(idx.height);
+      if (!activeAtHeight || !activeAtHeight.equals(hash)) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Block is not in main chain");
+      }
+      pindexHash = hash;
+      pindexHeight = idx.height;
+      pindexHeader = idx.header;
+    }
+
+    // ── Resolve / validate the window size (blockcount). ─────────────────
+    if (nblocksParam === undefined || nblocksParam === null) {
+      // Default clamps to the chain length: max(0, min(default, height - 1)).
+      blockcount = Math.max(0, Math.min(blockcount, pindexHeight - 1));
+    } else {
+      if (typeof nblocksParam !== "number" || !Number.isInteger(nblocksParam)) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "nblocks must be an integer");
+      }
+      blockcount = nblocksParam;
+      if (blockcount < 0 || (blockcount > 0 && blockcount >= pindexHeight)) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          "Invalid block count: should be between 0 and the block's height - 1"
+        );
+      }
+    }
+
+    // ── Window interval via MEDIAN-TIME-PAST (NOT raw timestamps). ───────
+    const pastHeight = pindexHeight - blockcount;
+    const pindexEntry = this.headerSync.getHeader(pindexHash);
+
+    // Past block = the active-chain ancestor at `pindexHeight - blockcount`.
+    const pastHash = await this.db.getBlockHashByHeight(pastHeight);
+    const pastEntry = pastHash ? this.headerSync.getHeader(pastHash) : undefined;
+
+    const pindexMTP = pindexEntry ? this.headerSync.getMedianTimePast(pindexEntry) : 0;
+    const pastMTP = pastEntry ? this.headerSync.getMedianTimePast(pastEntry) : 0;
+    const nTimeDiff = pindexMTP - pastMTP;
+
+    // ── Final block's RAW header nTime (offset 68 in the 80-byte header). ─
+    const finalTime = pindexHeader.readUInt32LE(68);
+
+    // ── Cumulative tx counts (m_chain_tx_count analogue). ────────────────
+    const chainTxCount = await this.chainTxCountAtHeight(pindexHeight);
+
+    const result: Record<string, unknown> = {};
+    result.time = finalTime;
+    // txcount is optional: omitted when the cumulative count is unknown
+    // (Core omits when m_chain_tx_count == 0, e.g. under assumeutxo).
+    if (chainTxCount !== null && chainTxCount !== 0) {
+      result.txcount = chainTxCount;
+    }
+    result.window_final_block_hash = Buffer.from(pindexHash).reverse().toString("hex");
+    result.window_final_block_height = pindexHeight;
+    result.window_block_count = blockcount;
+
+    if (blockcount > 0) {
+      result.window_interval = nTimeDiff;
+      // window_tx_count requires a known cumulative count at BOTH ends.
+      const pastChainTxCount =
+        pastHeight >= 0 ? await this.chainTxCountAtHeight(pastHeight) : null;
+      if (
+        chainTxCount !== null &&
+        chainTxCount !== 0 &&
+        pastChainTxCount !== null &&
+        pastChainTxCount !== 0
+      ) {
+        const windowTxCount = chainTxCount - pastChainTxCount;
+        result.window_tx_count = windowTxCount;
+        if (nTimeDiff > 0) {
+          result.txrate = windowTxCount / nTimeDiff;
+        }
+      }
+    }
+
+    return result;
   }
 
   // ========== Transaction Methods ==========
