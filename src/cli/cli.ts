@@ -1802,6 +1802,29 @@ async function startNode(config: NodeConfig): Promise<void> {
   if (mergedConfig.blockfilterindex) {
     filterIndex = new BlockFilterIndex(db, true);
     await filterIndex.init();
+    // SLOW/INCORRECT-RESUME guard (mirrors Bitcoin Core BaseIndex::Rewind,
+    // bitcoin-core/src/index/base.cpp:290). The filter index and the
+    // chainstate flush on independent schedules, so an UNCLEAN exit can leave
+    // the FILTER_TIP singleton AHEAD of the validated chain tip loaded above
+    // by chainState.load(). If we let BlockSync resume in that state it would
+    // chain new filter headers from a block the node no longer considers its
+    // tip, corrupting the filter-header chain served to BIP-157 light clients.
+    // Reconcile here — BEFORE blockSync.start() (the only window before the
+    // per-block connect path fires) — rewinding the index down to bestHeight
+    // when (and only when) it is ahead. No-op in the normal clean-restart case.
+    {
+      const validatedTip = chainState.getBestBlock();
+      const didRewind = await filterIndex.reconcileToValidatedTip(
+        validatedTip.height,
+        validatedTip.hash
+      );
+      if (didRewind) {
+        console.log(
+          `[blockfilterindex] rewound filter index to validated tip ` +
+            `height ${validatedTip.height} (unclean-exit recovery)`
+        );
+      }
+    }
     // Seed the filter-header chain with the genesis block (height 0) so it
     // chains from the genesis filter header — exactly like Bitcoin Core's
     // BaseIndex, which begins at genesis. The genesis block is connected by
