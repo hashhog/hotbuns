@@ -866,6 +866,13 @@ interface NodeState {
    * sessions are released.
    */
   proxyManager?: ProxyManager;
+  /**
+   * Multi-wallet manager. Held on NodeState so gracefulShutdown can flush
+   * every loaded wallet to disk (atomic + durable). Without this reference
+   * the wallet was outside the persistence lifecycle entirely — block-connect
+   * credits and new addresses were lost on every restart.
+   */
+  walletManager: WalletManager;
 }
 
 let runningNode: NodeState | null = null;
@@ -2265,6 +2272,50 @@ async function startNode(config: NodeConfig): Promise<void> {
     }
   );
 
+  // 8-bis. Wallet persistence lifecycle: load the startup wallets, then
+  // reconcile each to the current chain tip.
+  //
+  // (1) loadStartupWallets reads every wallet listed in settings.json (those
+  //     created/loaded with load_on_startup=true). A corrupt/partial wallet
+  //     file is recovered-what's-valid + quarantined as a .bad copy by
+  //     Wallet.load and never crashes startup (the manager's loop catches and
+  //     logs per-wallet failures).
+  // (2) reconcileToTip scans the gap from each wallet's persisted
+  //     lastSyncedHeight to the active tip through the same block-scan path the
+  //     live connect loop uses, so a wallet that missed blocks while the node
+  //     was down — or was just restored from seed — catches up. It also
+  //     re-derives confirmations from the current tip.
+  //
+  // Skipped on the one-shot import/snapshot exits (those never run a node).
+  if (!mergedConfig.importBlocks && !mergedConfig.loadSnapshot) {
+    const getBlockAt = async (
+      height: number
+    ): Promise<import("../validation/block.js").Block | null> => {
+      const hash = await db.getBlockHashByHeight(height);
+      if (!hash) return null;
+      const raw = await db.getBlock(hash);
+      if (!raw) return null;
+      try {
+        return deserializeBlock(new BufferReader(Buffer.from(raw)));
+      } catch {
+        return null;
+      }
+    };
+    try {
+      await walletManager.loadStartupWallets("hotbuns");
+      const tipHeight = chainState.getBestBlock().height;
+      await walletManager.reconcileToTip(getBlockAt, tipHeight);
+    } catch (err) {
+      // Persistence/reconciliation is best-effort at startup — a wallet error
+      // must never prevent the node itself from coming up.
+      console.error(
+        `[wallet] startup load/reconcile failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  }
+
   // 8a. Optional REST server (Core-parity `-rest`).
   //
   // Bitcoin Core registers REST handlers on the same HTTPServer as the
@@ -2321,6 +2372,7 @@ async function startNode(config: NodeConfig): Promise<void> {
     pruneManager,
     filterIndex,
     proxyManager: proxyManager ?? undefined,
+    walletManager,
   };
 
   // Set shutdown callback for RPC stop command
@@ -2496,6 +2548,20 @@ async function gracefulShutdown(): Promise<void> {
     );
   } catch (e) {
     console.error("Failed to dump mempool:", e);
+  }
+
+  // 4c. Persist every loaded wallet (atomic + durable). Best-effort: a failed
+  // wallet flush must never block shutdown, but on a clean stop this is the
+  // last-chance save so nothing accumulated since the last debounced flush is
+  // lost. Pre-fix this step did not exist and the wallet was never saved here.
+  try {
+    await runningNode.walletManager.flushAll();
+    const n = runningNode.walletManager.getWalletCount();
+    if (n > 0) {
+      console.log(`Persisted ${n} wallet(s) to disk`);
+    }
+  } catch (e) {
+    console.error("Failed to persist wallets:", e);
   }
 
   // 5. Flush UTXO cache

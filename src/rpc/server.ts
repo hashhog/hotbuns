@@ -5050,6 +5050,10 @@ export class RPCServer {
       await wallet.rescan((h) => this.getActiveChainBlock(h), 0, tipHeight);
     }
 
+    // Persist the imported key (+ any rescanned credits) so it survives a
+    // restart without re-importing.
+    this.markWalletDirty();
+
     // Core returns null.
     return null;
   }
@@ -7113,6 +7117,32 @@ export class RPCServer {
   }
 
   /**
+   * Save-on-mutation: mark the wallet just mutated by an RPC as dirty so the
+   * WalletManager flushes it to disk (debounced + atomic). Call after any
+   * state-changing wallet RPC (new address, label set, send, importprivkey).
+   * Without this, a fresh receive address or spend lives only in memory until
+   * a block connects — a SIGKILL before then would lose it. No-op for the
+   * legacy single-wallet path (no manager) and for unresolved wallet names.
+   */
+  private markWalletDirty(): void {
+    if (!this.walletManager) return;
+    try {
+      const name =
+        this.currentWalletName !== null
+          ? this.currentWalletName
+          : this.walletManager.getWalletCount() === 1
+            ? this.walletManager.listWallets()[0]
+            : null;
+      if (name !== null) {
+        this.walletManager.markDirty(name);
+      }
+    } catch {
+      // Resolving the active wallet name is best-effort; a failure here must
+      // never turn a successful mutation into an RPC error.
+    }
+  }
+
+  /**
    * createwallet: Create a new wallet.
    *
    * Reference: Bitcoin Core's createwallet in wallet/rpc/wallet.cpp
@@ -7583,6 +7613,7 @@ export class RPCServer {
 
     try {
       wallet.setLabel(address, label);
+      this.markWalletDirty();
       return null;
     } catch (err) {
       throw {
@@ -8942,7 +8973,11 @@ export class RPCServer {
 
   private async getNewAddress(params: unknown[]): Promise<string> {
     const wallet = this.getCurrentWallet();
-    return wallet.getNewAddress();
+    const address = wallet.getNewAddress();
+    // Advancing the receive-index keypool is state-changing: persist so a
+    // SIGKILL before the next block doesn't reissue the same index.
+    this.markWalletDirty();
+    return address;
   }
 
   private async getBalance(_params: unknown[]): Promise<number> {
@@ -9023,6 +9058,10 @@ export class RPCServer {
       }
       throw this.rpcError(RPCErrorCodes.WALLET_ERROR, msg);
     }
+
+    // createTransaction advanced the change keypool and recorded an outgoing
+    // tx (for bumpfee) — persist that mutation before broadcast.
+    this.markWalletDirty();
 
     // Hand off to the regular sendrawtransaction path so we get full mempool
     // validation + peer broadcast for free.
