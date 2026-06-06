@@ -2287,6 +2287,18 @@ async function startNode(config: NodeConfig): Promise<void> {
   //     re-derives confirmations from the current tip.
   //
   // Skipped on the one-shot import/snapshot exits (those never run a node).
+  //
+  // loadStartupWallets is fast and runs synchronously here (wallet RPCs need
+  // the wallets loaded). reconcileToTip is NOT awaited here: it can scan from a
+  // wallet's persisted lastSyncedHeight to the tip, but on a first deploy or a
+  // seed-restore that locator is -1 — i.e. a full ~950k-block scan in Bun.
+  // Awaiting it on the boot path blocks every service below it (peerManager,
+  // blockSync, rpcServer.start) for the whole scan, so the node never binds RPC
+  // and wedges (the exact failure mode that kept ouroboros down). Core keeps
+  // RPC responsive while the wallet rescans (getwalletinfo.scanning); mirror
+  // that by deferring the reconcile to a background task fired AFTER the
+  // services come up (see below, post rpcServer.start()).
+  let startBackgroundWalletReconcile: (() => void) | null = null;
   if (!mergedConfig.importBlocks && !mergedConfig.loadSnapshot) {
     const getBlockAt = async (
       height: number
@@ -2303,17 +2315,26 @@ async function startNode(config: NodeConfig): Promise<void> {
     };
     try {
       await walletManager.loadStartupWallets("hotbuns");
-      const tipHeight = chainState.getBestBlock().height;
-      await walletManager.reconcileToTip(getBlockAt, tipHeight);
     } catch (err) {
-      // Persistence/reconciliation is best-effort at startup — a wallet error
-      // must never prevent the node itself from coming up.
+      // Loading is best-effort at startup — a wallet error must never prevent
+      // the node itself from coming up.
       console.error(
-        `[wallet] startup load/reconcile failed: ${
+        `[wallet] startup load failed: ${
           err instanceof Error ? err.message : String(err)
         }`
       );
     }
+    startBackgroundWalletReconcile = () => {
+      // Re-read the tip at call time (blockSync may have advanced it).
+      const tipHeight = chainState.getBestBlock().height;
+      void walletManager.reconcileToTip(getBlockAt, tipHeight).catch((err) => {
+        console.error(
+          `[wallet] background reconcileToTip failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      });
+    };
   }
 
   // 8a. Optional REST server (Core-parity `-rest`).
@@ -2395,6 +2416,13 @@ async function startNode(config: NodeConfig): Promise<void> {
   await peerManager.start();
   await blockSync.start();
   rpcServer.start();
+
+  // Now that RPC + P2P are up, kick the wallet history reconcile in the
+  // BACKGROUND (see the load section above). It scans the gap from each
+  // wallet's lastSyncedHeight to tip through the same processBlock path the
+  // live connect loop uses; deferring it here means even a full-chain scan
+  // (first deploy / seed-restore) never blocks node boot or RPC bind.
+  if (startBackgroundWalletReconcile) startBackgroundWalletReconcile();
   // Start REST server (opt-in via --rest=1). Bind failure is non-fatal:
   // a busy REST port should not crash the daemon — log + continue.
   if (restServer) {
