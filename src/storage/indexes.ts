@@ -632,6 +632,132 @@ export class BlockFilterIndex {
   }
 
   /**
+   * Reconcile the filter index down to the validated chain tip on startup.
+   *
+   * THE BUG THIS FIXES (SLOW/INCORRECT-RESUME):
+   * The block-filter index and the chainstate are flushed to disk on
+   * independent schedules. On an UNCLEAN exit (SIGKILL / crash / power loss)
+   * the FILTER_TIP singleton can land on disk AHEAD of the chainstate's
+   * `bestHeight` — the index recorded filter headers for blocks N+1..M that
+   * the validated chainstate then "forgot" because its own flush never
+   * completed. On the next startup, `init()` loads the stale-ahead FILTER_TIP,
+   * and the per-block connect path (BlockSync) resumes appending filters from
+   * `chainState.bestHeight + 1`, chaining each new filter header from the
+   * STALE `currentHeader` (the header of a block the node no longer considers
+   * its tip). Every filter header served to BIP-157 light clients from that
+   * point on is corrupt — it diverges from Bitcoin Core's filter-header chain.
+   *
+   * THE FIX (mirrors Bitcoin Core's BaseIndex::Rewind,
+   * bitcoin-core/src/index/base.cpp:290): before BlockSync resumes, if the
+   * index tip is ABOVE the validated chain tip, rewind the index back down to
+   * `targetHeight`. We restore `currentHeader` from the hash-keyed
+   * FILTER_HEADER entry stored under `targetBlockHash` (the validated tip's
+   * block hash) — those entries are intentionally never deleted (see
+   * `removeBlock`), so the correct prev-header link is always recoverable.
+   * The next `indexBlock(target+1, ...)` then chains from the right header.
+   *
+   * Core does the equivalent inside its sync loop: NextSyncBlock detects that
+   * the index's stored tip is not the chain's next block and calls Rewind to
+   * walk the index back to the fork point before re-appending. hotbuns has no
+   * background index-sync thread; the reconciliation happens here at startup
+   * instead, which is the only window before BlockSync's connect path fires.
+   *
+   * Semantics:
+   *   • NO-OP in the normal (clean-restart) case where the index is at or
+   *     behind the validated tip (`currentHeight <= targetHeight`). This is
+   *     the common path and must stay a pure read.
+   *   • Only the FILTER_TIP singleton is rewound. The hash-keyed BLOCK_FILTER
+   *     / FILTER_HEADER entries for the abandoned blocks are left in place
+   *     (Core keeps them too; a `getfilter`/`getfilterheader` against an
+   *     abandoned hash still succeeds, and they get overwritten if the same
+   *     height is re-indexed). This matches `removeBlock`'s data-retention.
+   *   • If `targetHeight < 0` (validated chainstate has no tip yet — should
+   *     not happen once genesis is connected, but guard anyway) the index is
+   *     rewound to the pre-genesis state (height -1, all-zero header).
+   *
+   * @param targetHeight    - The validated chainstate's bestHeight.
+   * @param targetBlockHash - The validated chainstate's best block hash, used
+   *                          to recover the correct filter header to chain from.
+   *                          Ignored when targetHeight < 0.
+   * @returns true if a rewind was performed, false if it was a no-op.
+   */
+  async reconcileToValidatedTip(
+    targetHeight: number,
+    targetBlockHash: Buffer
+  ): Promise<boolean> {
+    if (!this.enabled) return false;
+
+    // Normal case: index is at or behind the validated tip. Nothing to undo.
+    // (Behind is handled by BlockSync re-appending the missing blocks; that
+    // is not a corruption, just a catch-up.)
+    if (this.currentHeight <= targetHeight) {
+      return false;
+    }
+
+    const fromHeight = this.currentHeight;
+
+    // Determine the filter header to chain from at the validated tip.
+    let restoredHeader: Buffer = Buffer.alloc(32, 0);
+    if (targetHeight >= 0) {
+      const stored = await this.getFilterHeader(targetBlockHash);
+      if (stored) {
+        restoredHeader = stored;
+      } else {
+        // The validated tip's filter header is missing from the index. This
+        // can happen if the index was enabled mid-chain (so it never indexed
+        // the validated tip) — the same fresh-enable divergence mode the
+        // genesis seeding handles. Rewinding to the all-zero header is the
+        // safest available state; loud-log so the operator knows the
+        // filter-header chain will rebuild from here.
+        console.warn(
+          `[blockfilterindex] reconcileToValidatedTip(h=${targetHeight}, ` +
+            `${targetBlockHash.toString("hex").slice(0, 16)}): no stored ` +
+            `filter header for validated tip; rewinding to zero header ` +
+            `(filter chain will rebuild on next append)`
+        );
+      }
+    }
+
+    // Atomically rewind the FILTER_TIP singleton to the validated tip.
+    const tipWriter = new BufferWriter();
+    tipWriter.writeUInt32LE(targetHeight >= 0 ? targetHeight : 0);
+    tipWriter.writeHash(restoredHeader);
+
+    const ops: BatchOperation[] = [
+      {
+        type: "put",
+        prefix: IndexPrefix.FILTER_TIP as unknown as (typeof DBPrefix)[keyof typeof DBPrefix],
+        key: Buffer.alloc(0),
+        value: tipWriter.toBuffer(),
+      },
+    ];
+    // When targetHeight < 0 there is nothing valid to point at; delete the
+    // singleton so the index is treated as fresh (currentHeight -1).
+    if (targetHeight < 0) {
+      ops[0] = {
+        type: "del",
+        prefix: IndexPrefix.FILTER_TIP as unknown as (typeof DBPrefix)[keyof typeof DBPrefix],
+        key: Buffer.alloc(0),
+      };
+    }
+
+    await this.db.batch(ops);
+
+    // In-memory rewind happens AFTER the batch lands so a thrown error from
+    // db.batch leaves the in-memory view aligned with disk.
+    this.currentHeight = targetHeight >= 0 ? targetHeight : -1;
+    this.currentHeader = restoredHeader;
+
+    console.warn(
+      `[blockfilterindex] reconciled filter index ahead of chainstate: ` +
+        `rewound tip ${fromHeight} -> ${this.currentHeight} ` +
+        `(unclean-exit recovery; mirrors Core BaseIndex::Rewind)`
+    );
+
+    return true;
+  }
+
+  /**
    * Index the genesis block (height 0) so the filter-header chain starts at
    * the genesis filter header — NOT at the all-zero predecessor.
    *

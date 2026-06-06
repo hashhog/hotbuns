@@ -849,6 +849,148 @@ describe("BlockFilterIndex", () => {
 
     expect(disabled.getHeight()).toBe(-1);
   });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // SLOW/INCORRECT-RESUME: reconcileToValidatedTip (unclean-exit recovery)
+  //
+  // Reference: bitcoin-core/src/index/base.cpp::BaseIndex::Rewind (line 290).
+  // On an unclean exit the FILTER_TIP singleton can be flushed AHEAD of the
+  // validated chainstate. On the next startup, before BlockSync resumes, the
+  // index must rewind down to the validated tip — otherwise the filter-header
+  // chain served to BIP-157 light clients chains from a block the node no
+  // longer considers its tip and is corrupt at every height thereafter.
+  // ──────────────────────────────────────────────────────────────────────
+
+  it("reconcileToValidatedTip is a no-op when index == validated tip", async () => {
+    const block1 = createBlock([createCoinbaseTx(1)], Buffer.alloc(32, 0), 1);
+    const block1Hash = getBlockHash(block1.header);
+    await filterIndex.indexBlock(block1, 1, []);
+    expect(filterIndex.getHeight()).toBe(1);
+
+    const did = await filterIndex.reconcileToValidatedTip(1, block1Hash);
+    expect(did).toBe(false); // no rewind: already at the validated tip
+    expect(filterIndex.getHeight()).toBe(1);
+  });
+
+  it("reconcileToValidatedTip is a no-op when index is BEHIND validated tip", async () => {
+    // Index at height 1, chainstate believes it is at height 5 (index will
+    // catch up via BlockSync re-append — NOT a corruption, so no rewind).
+    const block1 = createBlock([createCoinbaseTx(1)], Buffer.alloc(32, 0), 1);
+    await filterIndex.indexBlock(block1, 1, []);
+    expect(filterIndex.getHeight()).toBe(1);
+
+    const did = await filterIndex.reconcileToValidatedTip(5, Buffer.alloc(32, 0x99));
+    expect(did).toBe(false);
+    expect(filterIndex.getHeight()).toBe(1);
+  });
+
+  it("reconcileToValidatedTip rewinds when the index is AHEAD (unclean exit)", async () => {
+    // Build + index a 3-block chain (index lands at height 3).
+    const block1 = createBlock([createCoinbaseTx(1)], Buffer.alloc(32, 0), 1);
+    const block1Hash = getBlockHash(block1.header);
+    const block2 = createBlock([createCoinbaseTx(2)], block1Hash, 2);
+    const block2Hash = getBlockHash(block2.header);
+    const block3 = createBlock([createCoinbaseTx(3)], block2Hash, 3);
+
+    await filterIndex.indexBlock(block1, 1, []);
+    await filterIndex.indexBlock(block2, 2, []);
+    await filterIndex.indexBlock(block3, 3, []);
+    expect(filterIndex.getHeight()).toBe(3);
+
+    const block1FilterHeader = await filterIndex.getFilterHeader(block1Hash);
+    expect(block1FilterHeader).not.toBeNull();
+
+    // Simulate the unclean-exit gap: the validated chainstate only made it to
+    // height 1 (blocks 2 and 3 were filter-indexed but never flushed into the
+    // chainstate). Reconcile must rewind the index back to height 1.
+    const did = await filterIndex.reconcileToValidatedTip(1, block1Hash);
+    expect(did).toBe(true);
+    expect(filterIndex.getHeight()).toBe(1);
+
+    // The in-memory currentHeader must now be block1's filter header so the
+    // NEXT appended block chains from the right prev-header. We prove this by
+    // re-indexing a fresh block at height 2 and checking its on-disk filter
+    // header equals hash(filter(newBlock2) || filterHeader(block1)).
+    const newBlock2 = createBlock([createCoinbaseTx(0x77)], block1Hash, 2);
+    const newBlock2Hash = getBlockHash(newBlock2.header);
+    const expectedHeader = computeFilterHeader(
+      filterIndex.buildFilter(newBlock2, []).getHash(),
+      block1FilterHeader!
+    );
+
+    await filterIndex.indexBlock(newBlock2, 2, []);
+    const storedNewHeader = await filterIndex.getFilterHeader(newBlock2Hash);
+    expect(storedNewHeader).not.toBeNull();
+    expect(storedNewHeader!.equals(expectedHeader)).toBe(true);
+  });
+
+  it("reconcileToValidatedTip survives a fresh index restart (FILTER_TIP reload)", async () => {
+    // First lifetime: index 3 blocks.
+    const block1 = createBlock([createCoinbaseTx(1)], Buffer.alloc(32, 0), 1);
+    const block1Hash = getBlockHash(block1.header);
+    const block2 = createBlock([createCoinbaseTx(2)], block1Hash, 2);
+    const block2Hash = getBlockHash(block2.header);
+    const block3 = createBlock([createCoinbaseTx(3)], block2Hash, 3);
+
+    await filterIndex.indexBlock(block1, 1, []);
+    await filterIndex.indexBlock(block2, 2, []);
+    await filterIndex.indexBlock(block3, 3, []);
+    const block1FilterHeader = await filterIndex.getFilterHeader(block1Hash);
+
+    // Second lifetime: brand-new index instance over the SAME db (the on-disk
+    // FILTER_TIP says height 3, but the validated chainstate only got to 1).
+    const reopened = new BlockFilterIndex(mockDB as any, true);
+    await reopened.init();
+    expect(reopened.getHeight()).toBe(3); // stale-ahead loaded from disk
+
+    const did = await reopened.reconcileToValidatedTip(1, block1Hash);
+    expect(did).toBe(true);
+    expect(reopened.getHeight()).toBe(1);
+
+    // A subsequent append chains from block1's header — proving the reopened
+    // instance's currentHeader was restored correctly across the restart.
+    const newBlock2 = createBlock([createCoinbaseTx(0x88)], block1Hash, 2);
+    const newBlock2Hash = getBlockHash(newBlock2.header);
+    const expectedHeader = computeFilterHeader(
+      reopened.buildFilter(newBlock2, []).getHash(),
+      block1FilterHeader!
+    );
+    await reopened.indexBlock(newBlock2, 2, []);
+    const storedNewHeader = await reopened.getFilterHeader(newBlock2Hash);
+    expect(storedNewHeader!.equals(expectedHeader)).toBe(true);
+  });
+
+  it("WITHOUT reconcile, a stale-ahead index corrupts the next filter header (negative control)", async () => {
+    // This is the regression the fix prevents. Index 3 blocks, DON'T
+    // reconcile, then append a new block at height 2. Because currentHeader is
+    // still block3's (stale) header, the new block-2 filter header chains from
+    // the WRONG prev — diverging from the Core-correct chain off block1.
+    const block1 = createBlock([createCoinbaseTx(1)], Buffer.alloc(32, 0), 1);
+    const block1Hash = getBlockHash(block1.header);
+    const block2 = createBlock([createCoinbaseTx(2)], block1Hash, 2);
+    const block2Hash = getBlockHash(block2.header);
+    const block3 = createBlock([createCoinbaseTx(3)], block2Hash, 3);
+
+    await filterIndex.indexBlock(block1, 1, []);
+    await filterIndex.indexBlock(block2, 2, []);
+    await filterIndex.indexBlock(block3, 3, []);
+    const block1FilterHeader = await filterIndex.getFilterHeader(block1Hash);
+
+    const newBlock2 = createBlock([createCoinbaseTx(0x77)], block1Hash, 2);
+    const newBlock2Hash = getBlockHash(newBlock2.header);
+    const coreCorrectHeader = computeFilterHeader(
+      filterIndex.buildFilter(newBlock2, []).getHash(),
+      block1FilterHeader!
+    );
+
+    // No reconcile here — straight append while stale-ahead.
+    await filterIndex.indexBlock(newBlock2, 2, []);
+    const corruptHeader = await filterIndex.getFilterHeader(newBlock2Hash);
+
+    // The header produced without reconcile must NOT equal the Core-correct
+    // one — demonstrating the corruption the reconcile step eliminates.
+    expect(corruptHeader!.equals(coreCorrectHeader)).toBe(false);
+  });
 });
 
 // =============================================================================
