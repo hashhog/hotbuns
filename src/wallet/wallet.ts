@@ -17,6 +17,8 @@ import { pbkdf2 } from "@noble/hashes/pbkdf2.js";
 import { gcm } from "@noble/ciphers/aes.js";
 import { randomBytes } from "@noble/ciphers/utils.js";
 import * as crypto from "node:crypto";
+import { promises as fsp } from "node:fs";
+import * as nodePath from "node:path";
 
 import {
   validateMnemonic as bip39ValidateMnemonic,
@@ -382,6 +384,17 @@ interface WalletData {
     encryptionSalt: string | null;
     encryptionIV: string | null;
   };
+  // Wallet transaction history (source of truth for listtransactions /
+  // gettransaction). Persisted so the ledger survives a restart without a
+  // full rescan; absent in pre-W-persistence wallet files (handled on load).
+  txHistory?: WalletTxRecord[];
+  // Monotonic ordinal counter so a reloaded wallet keeps issuing strictly
+  // increasing ordinals (stable newest-first ordering across restarts).
+  nextTxOrdinal?: number;
+  // Highest active-chain height whose block this wallet has already scanned
+  // (processBlock applied). Startup reconciliation scans the gap from here to
+  // the current tip so a wallet is never left behind after an unclean restart.
+  lastSyncedHeight?: number;
 }
 
 interface SerializedUTXO {
@@ -393,6 +406,9 @@ interface SerializedUTXO {
   confirmations: number;
   addressType: string;
   isCoinbase: boolean;
+  // Absolute creation height (added for rescan span-bounding + restart
+  // reconciliation). Optional for backward compatibility with older files.
+  height?: number;
 }
 
 /**
@@ -450,6 +466,13 @@ export class Wallet {
   // returns oldest-to-newest deterministically even within a single block.
   private nextTxOrdinal: number;
 
+  // Highest active-chain height this wallet's ledger reflects (the last block
+  // processBlock was applied for). -1 means "nothing scanned yet"; startup
+  // reconciliation uses this to scan only the gap up to the current tip
+  // instead of replaying the entire chain. Mirrors Core's
+  // CWallet::m_last_block_processed_height (wallet/wallet.h).
+  private lastSyncedHeight: number;
+
   constructor(config: WalletConfig) {
     this.config = config;
     this.keys = new Map();
@@ -460,6 +483,7 @@ export class Wallet {
     this.outgoingTxs = new Map();
     this.txHistory = new Map();
     this.nextTxOrdinal = 0;
+    this.lastSyncedHeight = -1;
 
     // Initialize encryption state
     this.encryption = {
@@ -559,7 +583,25 @@ export class Wallet {
   }
 
   /**
+   * Recoverable error raised by `load` when the wallet file exists but is
+   * corrupt / truncated / undecryptable. Distinct from a *missing* file (a
+   * plain Error): the caller (WalletManager) treats this as "keep a .bak and
+   * skip this wallet" rather than crashing node startup.
+   */
+  static readonly CORRUPT_WALLET = "WALLET_FILE_CORRUPT";
+
+  /**
    * Load wallet from encrypted file.
+   *
+   * Fault tolerance (W wallet-persistence): a wallet file that is missing,
+   * truncated mid-write, or otherwise corrupt must NOT crash node startup.
+   *   - Missing file: throws a plain Error (caller decides — create vs. fail).
+   *   - Corrupt / undecryptable / un-parseable file: the bad file is preserved
+   *     as `<wallet>.dat.<ts>.bad` for forensic recovery, and an Error tagged
+   *     with `CORRUPT_WALLET` is thrown so the manager can log + continue.
+   *   - Partially-valid JSON (e.g. a future field is malformed): each section
+   *     is restored independently so one bad sub-tree never discards the rest
+   *     (seed + indices are the funds-critical core and are recovered first).
    */
   static async load(config: WalletConfig, password: string): Promise<Wallet> {
     const walletPath = `${config.datadir}/wallet.dat`;
@@ -569,80 +611,149 @@ export class Wallet {
       throw new Error(`Wallet file not found: ${walletPath}`);
     }
 
-    const content = await file.text();
-    const encrypted: EncryptedWalletFile = JSON.parse(content);
-
-    if (encrypted.version !== 1) {
-      throw new Error(`Unsupported wallet version: ${encrypted.version}`);
-    }
-
-    // Derive encryption key from password using PBKDF2
-    const salt = Buffer.from(encrypted.salt, "hex");
-    const key = Buffer.from(
-      pbkdf2(sha256, Buffer.from(password, "utf-8"), salt, {
-        c: 100000,
-        dkLen: 32,
-      })
-    );
-
-    // Decrypt using AES-256-GCM
-    const iv = Buffer.from(encrypted.iv, "hex");
-    const ciphertext = Buffer.from(encrypted.ciphertext, "hex");
-
-    const aes = gcm(key, iv);
-    let plaintext: Uint8Array;
+    // Read + decrypt + parse. Any failure here means the bytes on disk are not
+    // a usable wallet — quarantine the file and raise a CORRUPT_WALLET error.
+    let data: WalletData;
     try {
-      plaintext = aes.decrypt(ciphertext);
-    } catch {
-      throw new Error("Failed to decrypt wallet - incorrect password?");
+      const content = await file.text();
+      const encrypted: EncryptedWalletFile = JSON.parse(content);
+
+      if (encrypted.version !== 1) {
+        throw new Error(`Unsupported wallet version: ${encrypted.version}`);
+      }
+
+      const salt = Buffer.from(encrypted.salt, "hex");
+      const key = Buffer.from(
+        pbkdf2(sha256, Buffer.from(password, "utf-8"), salt, {
+          c: 100000,
+          dkLen: 32,
+        })
+      );
+
+      const iv = Buffer.from(encrypted.iv, "hex");
+      const ciphertext = Buffer.from(encrypted.ciphertext, "hex");
+      const aes = gcm(key, iv);
+      const plaintext = aes.decrypt(ciphertext); // throws on bad key / tampered ciphertext
+
+      // The save path encodes bigint as "<digits>n"; reverse it here so
+      // debit/credit/fee come back as bigint. Strings without that suffix are
+      // left untouched.
+      data = JSON.parse(Buffer.from(plaintext).toString("utf-8"), (_k, v) => {
+        if (typeof v === "string" && /^-?\d+n$/.test(v)) {
+          return BigInt(v.slice(0, -1));
+        }
+        return v;
+      });
+    } catch (err) {
+      // Preserve the unreadable bytes for recovery, then signal CORRUPT_WALLET.
+      await Wallet.quarantineCorruptFile(walletPath);
+      const e = new Error(
+        `${Wallet.CORRUPT_WALLET}: wallet file ${walletPath} is corrupt or ` +
+          `undecryptable (${(err as Error).message}); preserved a .bad copy`
+      );
+      (e as Error & { code?: string }).code = Wallet.CORRUPT_WALLET;
+      throw e;
     }
 
-    const data: WalletData = JSON.parse(Buffer.from(plaintext).toString("utf-8"));
-
-    // Reconstruct wallet
+    // Reconstruct wallet. Each restore section is independent so a single bad
+    // field cannot wipe the funds-critical seed/indices that precede it.
     const wallet = new Wallet(config);
-    wallet.seed = Buffer.from(data.seed, "hex");
+    wallet.seed = Buffer.from(data.seed ?? "", "hex");
     wallet.masterKey = wallet.deriveMasterKey(wallet.seed);
 
     // Restore indices - support both new per-type and legacy format
-    if (data.nextReceiveIndices) {
-      for (const [typeStr, index] of Object.entries(data.nextReceiveIndices)) {
-        wallet.nextReceiveIndex.set(typeStr as AddressType, index);
+    try {
+      if (data.nextReceiveIndices) {
+        for (const [typeStr, index] of Object.entries(data.nextReceiveIndices)) {
+          wallet.nextReceiveIndex.set(typeStr as AddressType, index);
+        }
+        for (const [typeStr, index] of Object.entries(data.nextChangeIndices ?? {})) {
+          wallet.nextChangeIndex.set(typeStr as AddressType, index);
+        }
+      } else if (data.nextReceiveIndex !== undefined) {
+        // Legacy format - only P2WPKH was supported
+        wallet.nextReceiveIndex.set(AddressType.P2WPKH, data.nextReceiveIndex);
+        wallet.nextChangeIndex.set(AddressType.P2WPKH, data.nextChangeIndex ?? 0);
       }
-      for (const [typeStr, index] of Object.entries(data.nextChangeIndices)) {
-        wallet.nextChangeIndex.set(typeStr as AddressType, index);
-      }
-    } else if (data.nextReceiveIndex !== undefined) {
-      // Legacy format - only P2WPKH was supported
-      wallet.nextReceiveIndex.set(AddressType.P2WPKH, data.nextReceiveIndex);
-      wallet.nextChangeIndex.set(AddressType.P2WPKH, data.nextChangeIndex ?? 0);
+    } catch (err) {
+      console.warn(
+        `[wallet] partial restore: indices skipped (${(err as Error).message})`
+      );
     }
 
-    // Restore UTXOs
-    for (const utxo of data.utxos) {
-      const utxoKey = `${utxo.txid}:${utxo.vout}`;
-      wallet.utxos.set(utxoKey, {
-        outpoint: {
-          txid: Buffer.from(utxo.txid, "hex"),
-          vout: utxo.vout,
-        },
-        amount: BigInt(utxo.amount),
-        address: utxo.address,
-        keyPath: utxo.keyPath,
-        confirmations: utxo.confirmations,
-        addressType: (utxo.addressType as AddressType) || AddressType.P2WPKH,
-        isCoinbase: utxo.isCoinbase ?? false,
-      });
+    // Restore UTXOs (each entry independently — a single malformed coin must
+    // not discard the rest of the balance).
+    try {
+      for (const utxo of data.utxos ?? []) {
+        try {
+          const utxoKey = `${utxo.txid}:${utxo.vout}`;
+          wallet.utxos.set(utxoKey, {
+            outpoint: {
+              txid: Buffer.from(utxo.txid, "hex"),
+              vout: utxo.vout,
+            },
+            amount: BigInt(utxo.amount),
+            address: utxo.address,
+            keyPath: utxo.keyPath,
+            confirmations: utxo.confirmations,
+            addressType: (utxo.addressType as AddressType) || AddressType.P2WPKH,
+            isCoinbase: utxo.isCoinbase ?? false,
+            height: utxo.height,
+          });
+        } catch (perEntry) {
+          console.warn(
+            `[wallet] partial restore: dropped malformed UTXO (${(perEntry as Error).message})`
+          );
+        }
+      }
+    } catch (err) {
+      console.warn(
+        `[wallet] partial restore: UTXO set skipped (${(err as Error).message})`
+      );
+    }
+
+    // Restore tx history + ordinal counter.
+    try {
+      let maxOrdinal = -1;
+      for (const rec of data.txHistory ?? []) {
+        // txHistory is keyed by INTERNAL txid hex (reverse of display hex).
+        const internalKey = Buffer.from(rec.txid, "hex").reverse().toString("hex");
+        wallet.txHistory.set(internalKey, rec);
+        if (rec.ordinal > maxOrdinal) maxOrdinal = rec.ordinal;
+      }
+      // Never reissue an ordinal: continue past the largest persisted one.
+      wallet.nextTxOrdinal = Math.max(data.nextTxOrdinal ?? 0, maxOrdinal + 1);
+    } catch (err) {
+      console.warn(
+        `[wallet] partial restore: tx history skipped (${(err as Error).message})`
+      );
+    }
+
+    // Restore the sync high-water mark so reconciliation only scans the gap.
+    if (typeof data.lastSyncedHeight === "number") {
+      wallet.lastSyncedHeight = data.lastSyncedHeight;
     }
 
     // Restore labels
-    if (data.labels) {
-      wallet.setLabelsFromObject(data.labels);
+    try {
+      if (data.labels) {
+        wallet.setLabelsFromObject(data.labels);
+      }
+    } catch (err) {
+      console.warn(
+        `[wallet] partial restore: labels skipped (${(err as Error).message})`
+      );
     }
 
     // Restore encryption state
-    if (data.encryption) {
-      wallet.setEncryptionState(data.encryption);
+    try {
+      if (data.encryption) {
+        wallet.setEncryptionState(data.encryption);
+      }
+    } catch (err) {
+      console.warn(
+        `[wallet] partial restore: encryption state skipped (${(err as Error).message})`
+      );
     }
 
     // Regenerate keys (only if not encrypted, or if we have the seed)
@@ -654,7 +765,41 @@ export class Wallet {
   }
 
   /**
+   * Move a corrupt/unreadable wallet file aside to `<path>.<unix-ms>.bad` so
+   * the operator can attempt manual recovery, then leave the canonical path
+   * free for a fresh wallet. Best-effort: a copy/rename failure is logged and
+   * swallowed (never block startup on a forensics-only step).
+   */
+  private static async quarantineCorruptFile(walletPath: string): Promise<void> {
+    try {
+      const bak = `${walletPath}.${Date.now()}.bad`;
+      // copyFile (not rename) so even if a later step recreates wallet.dat the
+      // original bad bytes remain at the canonical path until then.
+      await fsp.copyFile(walletPath, bak);
+      console.error(
+        `[wallet] preserved corrupt wallet file as ${bak} for manual recovery`
+      );
+    } catch (err) {
+      console.error(
+        `[wallet] could not preserve corrupt wallet file: ${(err as Error).message}`
+      );
+    }
+  }
+
+  /**
    * Save wallet to encrypted file.
+   *
+   * Durability: the file is written to a temp sibling, fsync'd, then atomically
+   * renamed over the target, and the containing directory is fsync'd. This is
+   * the same crash-safe pattern the mempool dump uses (node/mempool_persist.cpp
+   * -> DumpMempool's `.new` + rename) and Bitcoin Core's BerkeleyBatch flush.
+   * A SIGKILL / OOM / power-loss mid-write therefore leaves EITHER the old
+   * complete file OR the new complete file on disk — never a truncated one.
+   *
+   * The full ledger is persisted (UTXOs WITH creation height, tx history, the
+   * ordinal counter, and the last-synced height) so a restart reloads the
+   * wallet's funds + history without a full chain rescan; reconciliation then
+   * only scans the gap to the current tip.
    */
   async save(password: string): Promise<void> {
     const walletPath = `${this.config.datadir}/wallet.dat`;
@@ -671,6 +816,7 @@ export class Wallet {
         confirmations: utxo.confirmations,
         addressType: utxo.addressType,
         isCoinbase: utxo.isCoinbase ?? false,
+        height: utxo.height,
       });
     }
 
@@ -693,9 +839,20 @@ export class Wallet {
       utxos,
       labels: this.getLabelsObject(),
       encryption: this.getEncryptionState(),
+      txHistory: Array.from(this.txHistory.values()),
+      nextTxOrdinal: this.nextTxOrdinal,
+      lastSyncedHeight: this.lastSyncedHeight,
     };
 
-    const plaintext = Buffer.from(JSON.stringify(data), "utf-8");
+    // bigint is not JSON-serializable: WalletTxRecord carries debit/credit/fee
+    // as bigint. Encode them as decimal strings via a replacer; the load path
+    // reverses this. (UTXO amounts are already stringified above.)
+    const plaintext = Buffer.from(
+      JSON.stringify(data, (_k, v) =>
+        typeof v === "bigint" ? `${v.toString()}n` : v
+      ),
+      "utf-8"
+    );
 
     // Derive encryption key using PBKDF2
     const salt = Buffer.from(randomBytes(16));
@@ -718,7 +875,53 @@ export class Wallet {
       ciphertext: Buffer.from(ciphertext).toString("hex"),
     };
 
-    await Bun.write(walletPath, JSON.stringify(encrypted, null, 2));
+    await Wallet.atomicWriteFile(
+      walletPath,
+      Buffer.from(JSON.stringify(encrypted, null, 2), "utf-8")
+    );
+  }
+
+  /**
+   * Atomically and durably write `bytes` to `targetPath`:
+   *   1. write to `<target>.tmp`
+   *   2. fsync the temp file (force bytes to the platform's stable storage)
+   *   3. rename temp -> target (atomic on POSIX within one filesystem)
+   *   4. fsync the containing directory (so the rename itself is durable)
+   *
+   * A crash at any step leaves the previous complete file intact (steps 1-2
+   * touch only the temp), or — once the rename lands — the new complete file.
+   * There is no window where `targetPath` holds a partially-written file.
+   *
+   * Directory fsync is best-effort: some platforms reject opening a directory
+   * for fsync; the rename + file fsync already give the core guarantee.
+   */
+  static async atomicWriteFile(targetPath: string, bytes: Buffer): Promise<void> {
+    const dir = nodePath.dirname(targetPath);
+    await fsp.mkdir(dir, { recursive: true });
+    const tmpPath = `${targetPath}.tmp`;
+
+    const fh = await fsp.open(tmpPath, "w");
+    try {
+      await fh.writeFile(bytes);
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+
+    await fsp.rename(tmpPath, targetPath);
+
+    // fsync the directory so the rename metadata is durable. Best-effort.
+    try {
+      const dh = await fsp.open(dir, "r");
+      try {
+        await dh.sync();
+      } finally {
+        await dh.close();
+      }
+    } catch {
+      // Directory fsync unsupported / not permitted on this platform — the
+      // file-level fsync + atomic rename already guarantee no torn write.
+    }
   }
 
   /**
@@ -2525,6 +2728,13 @@ export class Wallet {
         utxo.confirmations++;
       }
     }
+
+    // Advance the high-water mark. Monotonic: a rescan replays in ascending
+    // order so this only ever moves forward to the tip; the connect path
+    // calls processBlock(block, tipHeight) so height is the active tip.
+    if (height > this.lastSyncedHeight) {
+      this.lastSyncedHeight = height;
+    }
   }
 
   /**
@@ -2569,6 +2779,22 @@ export class Wallet {
         utxo.confirmations--;
       }
     }
+
+    // The disconnected block is no longer reflected in the ledger; lower the
+    // sync high-water mark by one so a subsequent reconciliation re-scans the
+    // replacement block on the new active chain.
+    if (this.lastSyncedHeight >= 0) {
+      this.lastSyncedHeight--;
+    }
+  }
+
+  /**
+   * Highest active-chain height this wallet's ledger reflects (-1 if nothing
+   * has been scanned). Used by startup reconciliation to scan only the gap up
+   * to the current tip. See `reconcileToTip`.
+   */
+  getLastSyncedHeight(): number {
+    return this.lastSyncedHeight;
   }
 
   /**
@@ -3376,10 +3602,118 @@ export class WalletManager {
   private network: "mainnet" | "testnet" | "regtest";
   private settingsPath: string;
 
+  /**
+   * File-encryption ("storage") password used for save-on-mutation and the
+   * shutdown save-all of every node-runtime wallet. This is the at-rest
+   * password the RPC layer already hardcodes ("hotbuns") for unencrypted
+   * wallets — NOT the optional per-wallet BIP-39/seed encryption passphrase.
+   * Stored once so the persistence lifecycle does not need a password threaded
+   * through every mutating call site.
+   */
+  private storagePassword: string = "hotbuns";
+
+  /**
+   * Names of wallets whose in-memory state has diverged from disk since the
+   * last successful save. Drained by `flushDirty()`. A short debounce
+   * coalesces a burst of mutations (e.g. a block crediting many outputs) into
+   * a single write while still bounding data loss to the debounce window.
+   */
+  private dirty: Set<string> = new Set();
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private flushInFlight: Promise<void> | null = null;
+
+  /**
+   * Debounce window (ms) for coalescing save-on-mutation writes. A SIGKILL /
+   * OOM / power-loss can lose at most this much wallet activity; clean
+   * shutdown flushes synchronously so nothing is lost there. Mirrors the
+   * bounded-loss tradeoff Core makes with its periodic flush.
+   */
+  private static readonly FLUSH_DEBOUNCE_MS = 250;
+
   constructor(datadir: string, network: "mainnet" | "testnet" | "regtest") {
     this.datadir = datadir;
     this.network = network;
     this.settingsPath = `${datadir}/settings.json`;
+  }
+
+  /**
+   * Override the at-rest storage password used by the persistence lifecycle.
+   * Optional — defaults to the same value the RPC layer uses for unencrypted
+   * wallets. Kept for parity with operators who set a non-default value.
+   */
+  setStoragePassword(password: string): void {
+    this.storagePassword = password || "hotbuns";
+  }
+
+  /**
+   * Mark `name`'s wallet dirty and schedule a debounced flush. Cheap + sync;
+   * the actual write happens on the timer (or at shutdown via `flushAll`).
+   */
+  markDirty(name: string): void {
+    if (!this.wallets.has(name)) return;
+    this.dirty.add(name);
+    if (this.flushTimer === null) {
+      this.flushTimer = setTimeout(() => {
+        this.flushTimer = null;
+        void this.flushDirty();
+      }, WalletManager.FLUSH_DEBOUNCE_MS);
+      // Don't keep the event loop alive solely for a pending wallet flush;
+      // shutdown's synchronous flushAll covers the at-exit case.
+      if (typeof (this.flushTimer as any)?.unref === "function") {
+        (this.flushTimer as any).unref();
+      }
+    }
+  }
+
+  /**
+   * Persist every currently-dirty wallet (atomic + durable per wallet). Errors
+   * on one wallet are logged and do not abort the others. Serialized via
+   * `flushInFlight` so two overlapping flushes never race on the same file.
+   */
+  async flushDirty(): Promise<void> {
+    if (this.flushInFlight) {
+      await this.flushInFlight;
+      // A second drain in case more became dirty while the first ran.
+    }
+    this.flushInFlight = (async () => {
+      while (this.dirty.size > 0) {
+        const names = Array.from(this.dirty);
+        this.dirty.clear();
+        for (const name of names) {
+          const wallet = this.wallets.get(name);
+          if (!wallet) continue;
+          try {
+            await wallet.save(this.storagePassword);
+          } catch (err) {
+            // Re-mark dirty so a later flush retries; never lose the intent.
+            this.dirty.add(name);
+            console.error(
+              `[wallet] failed to persist wallet "${name}": ${(err as Error).message}`
+            );
+          }
+        }
+      }
+    })();
+    try {
+      await this.flushInFlight;
+    } finally {
+      this.flushInFlight = null;
+    }
+  }
+
+  /**
+   * Persist ALL loaded wallets (dirty or not) and cancel any pending debounced
+   * flush. Called from gracefulShutdown so a clean stop never loses state.
+   */
+  async flushAll(): Promise<void> {
+    if (this.flushTimer !== null) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    for (const name of this.wallets.keys()) {
+      this.dirty.add(name);
+    }
+    await this.flushDirty();
   }
 
   /**
@@ -3716,21 +4050,75 @@ export class WalletManager {
   }
 
   /**
-   * Process a new block for all loaded wallets.
+   * Process a new block for all loaded wallets, then persist (debounced) so a
+   * per-block ScanBlock credit/debit survives an unclean restart. Persistence
+   * is the bug fix: pre-fix, processBlock mutated in-memory state that was
+   * never written back, so a SIGKILL between blocks silently lost wallet funds.
    */
   processBlock(block: Block, height: number): void {
-    for (const wallet of this.wallets.values()) {
+    for (const [name, wallet] of this.wallets.entries()) {
       wallet.processBlock(block, height);
+      this.markDirty(name);
     }
   }
 
   /**
    * Reverse a disconnected block's wallet-ledger effects across all loaded
-   * wallets (reorg). Mirrors `processBlock` on the disconnect side.
+   * wallets (reorg). Mirrors `processBlock` on the disconnect side, including
+   * the save-on-mutation so the reverted ledger is persisted.
    */
   disconnectBlock(block: Block): void {
-    for (const wallet of this.wallets.values()) {
+    for (const [name, wallet] of this.wallets.entries()) {
       wallet.disconnectBlock(block);
+      this.markDirty(name);
     }
+  }
+
+  /**
+   * Startup reconciliation: bring every loaded wallet's ledger up to the
+   * current chain tip. For each wallet, scan the gap from its persisted
+   * `lastSyncedHeight + 1` to `tipHeight` (inclusive) through the same
+   * processBlock credit/debit machinery the live connect path uses, so a
+   * wallet that missed blocks while the node was down (or was just restored
+   * from seed) ends exactly where the live path would have left it.
+   *
+   * This is the wallet analogue of Core's CWallet::AttachChain
+   * (wallet/wallet.cpp): on load, scan forward from the wallet's last
+   * processed block to the active tip. Dirty wallets are then flushed so the
+   * recovered `lastSyncedHeight` is durable even if no further block connects.
+   *
+   * @param getBlockAt resolves an active-chain block by height, or null.
+   * @param tipHeight  current active-chain tip height.
+   */
+  async reconcileToTip(
+    getBlockAt: (height: number) => Promise<Block | null>,
+    tipHeight: number
+  ): Promise<void> {
+    if (this.wallets.size === 0) return;
+
+    for (const [name, wallet] of this.wallets.entries()) {
+      const from = wallet.getLastSyncedHeight() + 1;
+      if (from > tipHeight) continue; // already at/ahead of tip
+      try {
+        const { startHeight, stopHeight } = await wallet.rescan(
+          getBlockAt,
+          from,
+          tipHeight
+        );
+        if (stopHeight >= startHeight) {
+          this.markDirty(name);
+          console.log(
+            `[wallet] reconciled "${name}" to tip: scanned blocks ${startHeight}..${stopHeight}`
+          );
+        }
+      } catch (err) {
+        // A reconciliation failure must never block startup — the ledger is
+        // reconstructible via the live connect path / a manual rescan RPC.
+        console.error(
+          `[wallet] reconcileToTip failed for "${name}": ${(err as Error).message}`
+        );
+      }
+    }
+    await this.flushDirty();
   }
 }
