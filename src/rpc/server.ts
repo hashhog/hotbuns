@@ -12,6 +12,7 @@ import { DBPrefix } from "../storage/database.js";
 import type { Mempool, MempoolEntry } from "../mempool/mempool.js";
 import { PackageValidationResult, MAX_PACKAGE_COUNT } from "../mempool/mempool.js";
 import { dumpMempool, loadMempool, mempoolDumpExists } from "../mempool/persist.js";
+import type { OrphanPool, OrphanEntry } from "../mempool/orphan_pool.js";
 import { RBFTransactionState } from "../mempool/rbf.js";
 import type { PeerManager } from "../p2p/manager.js";
 import { ServiceFlags } from "../p2p/manager.js";
@@ -216,6 +217,14 @@ export interface RPCServerDeps {
   zmqInterface?: import("./zmq.js").ZMQNotificationInterface;
   blockSync?: BlockSync;
   /**
+   * The P2P orphan transaction pool (src/mempool/orphan_pool.ts), wired by
+   * cli.ts (it is the live owner — see the orphan-pool DoS batch). Used by the
+   * `getorphantxs` RPC to enumerate held orphans. When absent (e.g. unit-test
+   * servers that don't construct one), `getorphantxs` returns an empty array,
+   * mirroring Bitcoin Core returning [] when the orphanage is empty.
+   */
+  orphanPool?: OrphanPool;
+  /**
    * The BIP-157/158 basic block filter index, present only when the
    * operator started the node with `--blockfilterindex=1` (cli.ts
    * constructs and wires it in that case). Used by `getindexinfo` to
@@ -238,6 +247,10 @@ export const RPCErrorCodes = {
   PARSE_ERROR: -32700,
   // Bitcoin-specific errors
   MISC_ERROR: -1,
+  // RPC_TYPE_ERROR (-3): an argument was the wrong type (e.g. a boolean where
+  // only an integer is allowed). Matches Bitcoin Core's ParseVerbosity guard
+  // (rpc/util.cpp:88) used by getorphantxs / getblock when allow_bool=false.
+  TYPE_ERROR: -3,
   INVALID_ADDRESS_OR_KEY: -5,
   // RPC_INVALID_PARAMETER (-8): well-formed but semantically invalid argument
   // (e.g. a block not in the active chain, or an out-of-range block count).
@@ -485,6 +498,8 @@ export class RPCServer {
   private chainstateManager?: ChainstateManager;
   private zmqInterface?: import("./zmq.js").ZMQNotificationInterface;
   private blockSync?: BlockSync;
+  /** P2P orphan transaction pool, enumerated by `getorphantxs` (may be absent). */
+  private orphanPool?: OrphanPool;
   /** BIP-157/158 basic block filter index (present iff --blockfilterindex). */
   private filterIndex?: import("../storage/indexes.js").BlockFilterIndex;
   private shutdownCallback: (() => void) | null = null;
@@ -579,6 +594,7 @@ export class RPCServer {
     this.chainstateManager = deps.chainstateManager;
     this.zmqInterface = deps.zmqInterface;
     this.blockSync = deps.blockSync;
+    this.orphanPool = deps.orphanPool;
     this.filterIndex = deps.filterIndex;
     this.methods = new Map();
 
@@ -1157,6 +1173,7 @@ export class RPCServer {
     this.registerMethod("savemempool", () => this.saveMempool());
     this.registerMethod("dumpmempool", () => this.saveMempool());
     this.registerMethod("loadmempool", () => this.doLoadMempool());
+    this.registerMethod("getorphantxs", (params) => this.getOrphanTxs(params));
 
     // Fee estimation
     this.registerMethod("estimatesmartfee", (params) =>
@@ -4955,6 +4972,139 @@ export class RPCServer {
         `Unable to load mempool from disk: ${(err as Error).message}`
       );
     }
+  }
+
+  /**
+   * getorphantxs: Show transactions in the tx orphanage.
+   *
+   * Mirrors Bitcoin Core's `getorphantxs` (rpc/mempool.cpp, added in v28). The
+   * orphanage is enumerated via OrphanPool.getAllOrphans() (the analogue of
+   * Core's PeerManager::GetOrphanTransactions()).
+   *
+   * @param params [verbosity?]  (named alias: `verbose`)  default 0.
+   *
+   *   verbosity 0 -> array of txid hex strings (may contain duplicates).
+   *   verbosity 1 -> array of objects:
+   *                  { txid, wtxid, bytes, vsize, weight, from: [peer...] }
+   *   verbosity 2 -> verbosity-1 objects PLUS a `hex` field (the serialized,
+   *                  hex-encoded transaction), exactly as Core's lambda appends
+   *                  `o.pushKV("hex", EncodeHexTx(*orphan.tx))`.
+   *
+   * Verbosity parsing follows Core's ParseVerbosity(arg, default=0,
+   * allow_bool=false):
+   *   - omitted / null      -> 0
+   *   - boolean             -> RPC_TYPE_ERROR (-3) "Verbosity was boolean but
+   *                            only integer allowed"  (allow_bool=false)
+   *   - integer not in 0..2 -> RPC_INVALID_PARAMETER (-8)
+   *                            "Invalid verbosity value <n>"
+   *
+   * NOTE on Core-parity field set: this Core checkout's OrphanDescription()
+   * (rpc/mempool.cpp:1202) emits exactly { txid, wtxid, bytes, vsize, weight,
+   * from } and NO `expiration` field, so we match that exactly. (The orphan
+   * pool does track add-time + ORPHAN_TX_EXPIRE_TIME, kept here as a comment so
+   * a future Core that re-adds `expiration` is a one-line change.)
+   *
+   * NOTE on `from`: Core's `from` is an array of numeric NodeIds (the set of
+   * announcers). hotbuns' OrphanPool tracks a single announcer identified by a
+   * `host:port` string (peerKey in cli.ts) — there is no numeric NodeId in this
+   * node's peer model. We therefore emit a 1-element array containing that
+   * announcer string (best-effort). See `from_peer_source` in the task report.
+   */
+  private async getOrphanTxs(params: unknown[]): Promise<unknown> {
+    const verbosity = this.parseOrphanVerbosity(params[0]);
+
+    const orphans: OrphanEntry[] = this.orphanPool
+      ? this.orphanPool.getAllOrphans()
+      : [];
+
+    if (verbosity === 0) {
+      // Array of txid hex strings (may contain duplicates). Core uses
+      // orphan.tx->GetHash().ToString() — the NON-witness txid, NOT the
+      // wtxid — in big-endian display order, so reverse the internal LE buffer.
+      return orphans.map((o) =>
+        Buffer.from(o.txid).reverse().toString("hex")
+      );
+    }
+
+    // verbosity 1 and 2: object per orphan; 2 additionally carries `hex`.
+    return orphans.map((o) => this.orphanToJSON(o, verbosity === 2));
+  }
+
+  /**
+   * Build the per-orphan JSON object for getorphantxs verbosity >= 1.
+   * Mirrors Core's OrphanToJSON (rpc/mempool.cpp:1217). Field order matches
+   * Core: txid, wtxid, bytes, vsize, weight, from, [hex].
+   */
+  private orphanToJSON(
+    entry: OrphanEntry,
+    includeHex: boolean
+  ): Record<string, unknown> {
+    const tx = entry.tx;
+    // txid/wtxid are stored as internal little-endian buffers; Core prints the
+    // big-endian display hash, so reverse — same convention as
+    // formatTxDecodedV1 / getrawtransaction.
+    const o: Record<string, unknown> = {
+      txid: Buffer.from(entry.txid).reverse().toString("hex"),
+      wtxid: Buffer.from(entry.wtxid).reverse().toString("hex"),
+      // bytes = total serialized size including witness (Core:
+      // tx->ComputeTotalSize()). entry.size is exactly serializeTx(tx,true).length.
+      bytes: entry.size,
+      vsize: getTxVSize(tx),
+      weight: getTxWeight(tx),
+      // from = the set of announcers. This node tracks a single announcer
+      // (host:port string); emit it as a 1-element array. If somehow unset,
+      // emit an empty array (best-effort, matching Core's "no announcers").
+      from: entry.fromPeer !== undefined && entry.fromPeer !== null
+        ? [entry.fromPeer]
+        : [],
+    };
+
+    if (includeHex) {
+      // Core: o.pushKV("hex", EncodeHexTx(*orphan.tx)). Serialize with witness
+      // when present (segwit-aware), matching getrawtransaction's raw hex.
+      o.hex = serializeTx(tx, hasWitness(tx)).toString("hex");
+    }
+
+    return o;
+  }
+
+  /**
+   * Parse the getorphantxs `verbosity` argument exactly as Core's
+   * ParseVerbosity(arg, default_verbosity=0, allow_bool=false) followed by the
+   * lambda's 0/1/2 range check.
+   */
+  private parseOrphanVerbosity(arg: unknown): 0 | 1 | 2 {
+    let verbosity: number;
+    if (arg === undefined || arg === null) {
+      verbosity = 0;
+    } else if (typeof arg === "boolean") {
+      // allow_bool=false -> Core throws RPC_TYPE_ERROR before range-checking.
+      throw this.rpcError(
+        RPCErrorCodes.TYPE_ERROR,
+        "Verbosity was boolean but only integer allowed"
+      );
+    } else if (typeof arg === "number" && Number.isInteger(arg)) {
+      verbosity = arg;
+    } else {
+      // Non-integer numbers / strings: Core's getInt<int>() would throw a type
+      // error. Match with RPC_TYPE_ERROR rather than silently coercing.
+      throw this.rpcError(
+        RPCErrorCodes.TYPE_ERROR,
+        "JSON value of type " +
+          (typeof arg === "number" ? "number" : typeof arg) +
+          " is not of expected type number"
+      );
+    }
+
+    if (verbosity < 0 || verbosity > 2) {
+      // Core: throw JSONRPCError(RPC_INVALID_PARAMETER,
+      //   "Invalid verbosity value " + ToString(verbosity));
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        `Invalid verbosity value ${verbosity}`
+      );
+    }
+    return verbosity as 0 | 1 | 2;
   }
 
   /**

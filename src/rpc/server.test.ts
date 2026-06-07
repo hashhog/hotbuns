@@ -6,7 +6,8 @@ import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { RPCServer, RPCServerConfig, RPCServerDeps, RPCErrorCodes } from "./server.js";
 import { REGTEST } from "../consensus/params.js";
 import { getBlockHash, serializeBlockHeader, serializeBlock, computeWitnessMerkleRoot, computeMerkleRoot, encodeBip34Height } from "../validation/block.js";
-import { getTxId, serializeTx } from "../validation/tx.js";
+import { getTxId, getWTxId, serializeTx } from "../validation/tx.js";
+import { OrphanPool } from "../mempool/orphan_pool.js";
 import { BufferReader } from "../wire/serialization.js";
 import { hash256 } from "../crypto/primitives.js";
 import { bip22Result, ConsensusErrorCode } from "../validation/errors.js";
@@ -2186,5 +2187,189 @@ describe("RPCServer", () => {
         mockHeaderSync.parentHeightOverride = null;
       }
     });
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// getorphantxs (Core-parity; rpc/mempool.cpp, added in v28)
+//
+// These tests use a REAL OrphanPool (src/mempool/orphan_pool.ts) wired into a
+// fresh RPCServer via the orphanPool dep, then drive getorphantxs over real
+// HTTP and assert the exact shape + fields at verbosity 0 / 1 / 2 plus the
+// Core error semantics. "Proven-teeth": an orphan is actually inserted into the
+// pool and the RPC reflects it (not a stubbed handler).
+// ───────────────────────────────────────────────────────────────────────────
+describe("getorphantxs", () => {
+  // Minimal-shape orphan tx (mirrors orphan_pool.test.ts makeTx): one input
+  // referencing a not-yet-known parent, one OP_TRUE output. Non-segwit so
+  // txid == wtxid, which makes the verbosity-0 vs verbosity-1 cross-checks
+  // self-evident.
+  function makeOrphanTx() {
+    const parentTxid = Buffer.alloc(32);
+    parentTxid.writeUInt32LE(0xdeadbeef >>> 0, 0);
+    return {
+      version: 2,
+      inputs: [
+        {
+          prevOut: { txid: parentTxid, vout: 0 },
+          scriptSig: Buffer.alloc(0),
+          sequence: 0xffffffff,
+          witness: [] as Buffer[],
+        },
+      ],
+      outputs: [{ value: 1_000n, scriptPubKey: Buffer.from([0x51]) }],
+      lockTime: 0,
+    };
+  }
+
+  function makeServerWithOrphan(port: number): {
+    server: RPCServer;
+    pool: any;
+    tx: any;
+    txidDisplay: string;
+    wtxidDisplay: string;
+  } {
+    const pool = new OrphanPool();
+    const tx = makeOrphanTx();
+    const admit = pool.add(tx, "203.0.113.7:8333");
+    expect(admit.ok).toBe(true);
+
+    const config: RPCServerConfig = { port, host: "127.0.0.1", noAuth: true };
+    const deps: RPCServerDeps = {
+      chainState: new MockChainStateManager() as any,
+      mempool: new MockMempool() as any,
+      peerManager: new MockPeerManager() as any,
+      feeEstimator: new MockFeeEstimator() as any,
+      headerSync: new MockHeaderSync() as any,
+      db: new MockChainDB() as any,
+      params: REGTEST,
+      orphanPool: pool,
+    };
+    const server = new RPCServer(config, deps);
+
+    const txidDisplay = Buffer.from(getTxId(tx)).reverse().toString("hex");
+    const wtxidDisplay = Buffer.from(getWTxId(tx)).reverse().toString("hex");
+    return { server, pool, tx, txidDisplay, wtxidDisplay };
+  }
+
+  it("verbosity 0: returns an array of orphan txid strings", async () => {
+    const port = getTestPort();
+    const { server, txidDisplay } = makeServerWithOrphan(port);
+    server.start();
+    try {
+      const res = await rpcRequest(port, "getorphantxs");
+      expect(res.error).toBeUndefined();
+      expect(Array.isArray(res.result)).toBe(true);
+      expect(res.result.length).toBe(1);
+      // Core: orphan.tx->GetHash().ToString() — the NON-witness txid.
+      expect(res.result[0]).toBe(txidDisplay);
+    } finally {
+      server.stop();
+    }
+  });
+
+  it("verbosity 1: returns objects with Core's exact field set", async () => {
+    const port = getTestPort();
+    const { server, txidDisplay, wtxidDisplay } = makeServerWithOrphan(port);
+    server.start();
+    try {
+      const res = await rpcRequest(port, "getorphantxs", [1]);
+      expect(res.error).toBeUndefined();
+      expect(Array.isArray(res.result)).toBe(true);
+      expect(res.result.length).toBe(1);
+
+      const o = res.result[0];
+      // Exact Core field set: txid, wtxid, bytes, vsize, weight, from. No more.
+      expect(Object.keys(o).sort()).toEqual(
+        ["bytes", "from", "txid", "vsize", "weight", "wtxid"].sort()
+      );
+      expect(o.txid).toBe(txidDisplay);
+      expect(o.wtxid).toBe(wtxidDisplay);
+      expect(typeof o.bytes).toBe("number");
+      expect(o.bytes).toBeGreaterThan(0);
+      expect(typeof o.vsize).toBe("number");
+      expect(typeof o.weight).toBe("number");
+      // weight == 4*vsize for a non-witness tx.
+      expect(o.weight).toBe(o.vsize * 4);
+      // from = 1-element array of the announcing peer key (host:port).
+      expect(Array.isArray(o.from)).toBe(true);
+      expect(o.from).toEqual(["203.0.113.7:8333"]);
+      // verbosity 1 must NOT include hex.
+      expect(o.hex).toBeUndefined();
+    } finally {
+      server.stop();
+    }
+  });
+
+  it("verbosity 2: verbosity-1 fields PLUS hex", async () => {
+    const port = getTestPort();
+    const { server } = makeServerWithOrphan(port);
+    server.start();
+    try {
+      const res = await rpcRequest(port, "getorphantxs", [2]);
+      expect(res.error).toBeUndefined();
+      const o = res.result[0];
+      expect(typeof o.hex).toBe("string");
+      expect(o.hex.length).toBeGreaterThan(0);
+      // Still carries the verbosity-1 fields.
+      expect(typeof o.txid).toBe("string");
+      expect(Array.isArray(o.from)).toBe(true);
+    } finally {
+      server.stop();
+    }
+  });
+
+  it("returns [] when the orphan pool is empty / absent", async () => {
+    // Default harness server is constructed without an orphanPool dep.
+    const port = getTestPort();
+    const config: RPCServerConfig = { port, host: "127.0.0.1", noAuth: true };
+    const deps: RPCServerDeps = {
+      chainState: new MockChainStateManager() as any,
+      mempool: new MockMempool() as any,
+      peerManager: new MockPeerManager() as any,
+      feeEstimator: new MockFeeEstimator() as any,
+      headerSync: new MockHeaderSync() as any,
+      db: new MockChainDB() as any,
+      params: REGTEST,
+    };
+    const server = new RPCServer(config, deps);
+    server.start();
+    try {
+      const res = await rpcRequest(port, "getorphantxs");
+      expect(res.error).toBeUndefined();
+      expect(res.result).toEqual([]);
+    } finally {
+      server.stop();
+    }
+  });
+
+  it("rejects out-of-range verbosity with RPC_INVALID_PARAMETER (-8)", async () => {
+    const port = getTestPort();
+    const { server } = makeServerWithOrphan(port);
+    server.start();
+    try {
+      const res = await rpcRequest(port, "getorphantxs", [3]);
+      expect(res.error).toBeDefined();
+      expect(res.error.code).toBe(RPCErrorCodes.INVALID_PARAMETER);
+      expect(res.error.message).toBe("Invalid verbosity value 3");
+    } finally {
+      server.stop();
+    }
+  });
+
+  it("rejects boolean verbosity with RPC_TYPE_ERROR (-3)", async () => {
+    const port = getTestPort();
+    const { server } = makeServerWithOrphan(port);
+    server.start();
+    try {
+      const res = await rpcRequest(port, "getorphantxs", [true]);
+      expect(res.error).toBeDefined();
+      expect(res.error.code).toBe(RPCErrorCodes.TYPE_ERROR);
+      expect(res.error.message).toBe(
+        "Verbosity was boolean but only integer allowed"
+      );
+    } finally {
+      server.stop();
+    }
   });
 });

@@ -168,6 +168,17 @@ export class OrphanPool {
     return this.byWtxid.get(wtxid.toString("hex"));
   }
 
+  /**
+   * Snapshot of every orphan currently held, in insertion order (Map iteration
+   * order). Mirrors Bitcoin Core's `TxOrphanage::GetOrphanTransactions()`
+   * (node/txorphanage.cpp), which the `getorphantxs` RPC enumerates. Returns a
+   * fresh array so callers can iterate without exposing the internal Map or
+   * risking concurrent-mutation surprises.
+   */
+  getAllOrphans(): OrphanEntry[] {
+    return Array.from(this.byWtxid.values());
+  }
+
   /** Number of orphans announced by a given peer. */
   countForPeer(peer: string): number {
     return this.peerCount.get(peer) ?? 0;
