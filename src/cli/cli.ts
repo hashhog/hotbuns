@@ -2194,6 +2194,10 @@ async function startNode(config: NodeConfig): Promise<void> {
     blockSync,
     pruneManager,
     walletManager,
+    // Live P2P orphan pool — enumerated by the getorphantxs RPC
+    // (Core-parity; rpc/mempool.cpp). The same instance the block/peer
+    // handlers add/erase orphans against above.
+    orphanPool,
     // Present only when --blockfilterindex=1 (undefined otherwise). Lets
     // getindexinfo report the running "basic block filter index" entry,
     // matching Core's ForEachBlockFilterIndex guard (only running indexes
