@@ -11068,13 +11068,30 @@ export class RPCServer {
         const vout = key.readUInt32LE(33);
         totalAmount += amount;
 
+        // Core (rpc/blockchain.cpp:2455-2464) emits, per matched unspent:
+        // txid, vout, scriptPubKey, desc, amount, coinbase, height, blockhash,
+        // confirmations — in THAT order.
+        //   desc          = InferDescriptor(script)->ToString() of the matched
+        //                   script (checksummed); buildScriptPubKeyObj derives
+        //                   the same inferred descriptor from the scriptPubKey.
+        //   blockhash     = GetBlockHash of the coin's block (big-endian DISPLAY
+        //                   hex). getBlockHashByHeight returns internal byte
+        //                   order, so reverse for display (same as txid above).
+        //   confirmations = active tip height - coin height + 1.
+        const desc = buildScriptPubKeyObj(scriptPubKey).desc;
+        const blockHashBuf = await this.db.getBlockHashByHeight(height);
         unspents.push({
           txid: Buffer.from(txidInternal).reverse().toString("hex"),
           vout,
           scriptPubKey: scriptPubKey.toString("hex"),
+          desc,
           amount: formatBtcAmount(amount),
           coinbase,
           height,
+          blockhash: blockHashBuf
+            ? Buffer.from(blockHashBuf).reverse().toString("hex")
+            : undefined,
+          confirmations: bestBlock.height - height + 1,
         });
       }
     } finally {
