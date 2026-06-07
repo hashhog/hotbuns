@@ -124,6 +124,7 @@ import {
 } from "../crypto/signmessage.js";
 import { base58CheckDecode, decodeAddress, AddressType } from "../address/encoding.js";
 import { isValidPrivateKey } from "../crypto/primitives.js";
+import { GCSFilter } from "../storage/indexes.js";
 import {
   handlePayJoinRequest,
   parsePayJoinQuery,
@@ -1325,6 +1326,7 @@ export class RPCServer {
     // Wave-47b methods
     this.registerMethod("gettxoutsetinfo", (params) => this.getTxOutSetInfo(params));
     this.registerMethod("scantxoutset", (params) => this.scanTxOutSet(params));
+    this.registerMethod("scanblocks", (params) => this.scanBlocks(params));
     this.registerMethod("getnetworkhashps", (params) => this.getNetworkHashPS(params));
     this.registerMethod("gettxoutproof", (params) => this.getTxOutProof(params));
     this.registerMethod("verifytxoutproof", (params) => this.verifyTxOutProof(params));
@@ -11105,6 +11107,179 @@ export class RPCServer {
       bestblock: bestBlockHashHex,
       unspents,
       total_amount: formatBtcAmount(totalAmount),
+    };
+  }
+
+  /**
+   * scanblocks "action" ( [scanobjects] start_height stop_height "filtertype" options )
+   *
+   * Returns the block hashes whose BIP-158 basic block filter MATCHES any of
+   * the supplied scan objects' scriptPubKeys, over the height range
+   * [start_height, stop_height]. This is the index-side counterpart to
+   * scantxoutset: scanblocks walks the compact block filters (which include
+   * both output scriptPubKeys AND spent-prevout scriptPubKeys via undo data),
+   * so it can locate the block a script was funded/spent in even after the
+   * coin is gone.
+   *
+   * Mirrors Bitcoin Core `rpc/blockchain.cpp::scanblocks` (action start/status/
+   * abort) for shape, field order, and error codes:
+   *   { from_height:int, to_height:int, relevant_blocks:[64hex...], completed:bool }
+   *
+   * CAVEAT: GCS filters have FALSE POSITIVES, so relevant_blocks may carry
+   * extra blocks. The contract is only that every TRUE-positive block appears.
+   *
+   * Errors (exact Core parity):
+   *   - unknown action       -> RPC_INVALID_PARAMETER (-8) (status/abort handled)
+   *   - unknown filtertype   -> RPC_INVALID_ADDRESS_OR_KEY (-5) "Unknown filtertype"
+   *   - index not enabled    -> RPC_MISC_ERROR (-1) "Index is not enabled for filtertype <name>"
+   *   - bad start/stop hght  -> RPC_MISC_ERROR (-1) "Invalid start_height" / "Invalid stop_height"
+   *
+   * @param params [action, scanobjects, start_height, stop_height, filtertype, options]
+   */
+  private async scanBlocks(params: unknown[]): Promise<unknown> {
+    // (1) Action dispatch (Core scanblocks: status/abort/start). hotbuns scans
+    // synchronously, so there is never an in-progress scan: "status" -> null,
+    // "abort" -> false. Matches scanTxOutSet.
+    const action = typeof params[0] === "string" ? params[0] : undefined;
+    if (action === "status") {
+      // No background scan is ever in progress (this scan is synchronous).
+      return null;
+    }
+    if (action === "abort") {
+      // Nothing to abort.
+      return false;
+    }
+    if (action !== "start") {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        `Invalid action '${String(action)}'`,
+      );
+    }
+
+    // (2) scanobjects required for "start".
+    const scanobjects = params[1];
+    if (!Array.isArray(scanobjects)) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        "scanobjects argument is required for the start action",
+      );
+    }
+
+    // (3) filtertype validation. Default "basic"; Core only ships
+    // BlockFilterType::BASIC. Unknown -> RPC_INVALID_ADDRESS_OR_KEY (-5).
+    const filtertypeParam = params[4];
+    let filtertypeName = "basic";
+    if (filtertypeParam !== undefined && filtertypeParam !== null) {
+      if (typeof filtertypeParam !== "string") {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "filtertype must be a string");
+      }
+      filtertypeName = filtertypeParam;
+    }
+    if (filtertypeName !== "basic") {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Unknown filtertype");
+    }
+
+    // (4) options.filter_false_positives (Core). Default false. Reading it must
+    // never error when absent / null / non-object. NOTE: hotbuns does not yet
+    // implement the post-match block-body re-scan, so this option is accepted
+    // (never errors) but treated as a no-op. That is SOUND for the scanblocks
+    // contract: the re-scan can only REMOVE GCS false positives, never a
+    // genuine match, so the returned relevant_blocks remains a valid SUPERSET
+    // of the true-positive set (membership of funded/spent blocks always holds).
+    const optionsParam = params[5];
+    void (
+      optionsParam !== null &&
+      typeof optionsParam === "object" &&
+      (optionsParam as Record<string, unknown>).filter_false_positives === true
+    );
+
+    // (5) Index-enabled gate (Core: GetBlockFilterIndex==null ->
+    // RPC_MISC_ERROR "Index is not enabled for filtertype <name>").
+    if (!this.filterIndex || !this.filterIndex.isEnabled()) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        `Index is not enabled for filtertype ${filtertypeName}`,
+      );
+    }
+
+    // (6) Height range (Core uses RPC_MISC_ERROR (-1) for bad heights here, NOT
+    // -8/-32602 like scantxoutset). Default start=genesis(0), default stop=tip.
+    const tip = this.chainState.getBestBlock().height;
+    const startParam = params[2];
+    const stopParam = params[3];
+    const start =
+      startParam === undefined || startParam === null ? 0 : Number(startParam);
+    if (!Number.isInteger(start) || start < 0 || start > tip) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Invalid start_height");
+    }
+    const stop =
+      stopParam === undefined || stopParam === null ? tip : Number(stopParam);
+    if (!Number.isInteger(stop) || stop < start || stop > tip) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Invalid stop_height");
+    }
+
+    // (7) Build the needle set (Core: each scanobject -> scriptPubKey). Reuse
+    // the same descriptor helper scanTxOutSet uses; addr() parity is already
+    // proven by the scantxoutset differential. Key by hex to dedupe.
+    const needleMap = new Map<string, Buffer>();
+    for (const obj of scanobjects) {
+      // Core accepts a bare descriptor string or {desc, range} objects; support
+      // the bare string and the {desc} form (range descriptors out of scope).
+      const desc = typeof obj === "string" ? obj : (obj as { desc?: unknown })?.desc;
+      if (typeof desc !== "string") {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          "Scan object must be either a string or an object",
+        );
+      }
+      const spk = this.scanObjectToScriptPubKey(desc);
+      needleMap.set(spk.toString("hex"), spk);
+    }
+    const needles = [...needleMap.values()];
+
+    // (8) Scan loop (Core: for each height in [start, stop], LookupFilter and
+    // MatchAny against the needles). The active-chain height->hash map is
+    // getBlockHashByHeight (internal byte order). GCSFilter.fromEncoded +
+    // matchAny is the established decode/match path (cfilter_handlers.ts).
+    const relevant: string[] = [];
+    for (let h = start; h <= stop; h++) {
+      const blockHash = await this.db.getBlockHashByHeight(h);
+      if (!blockHash) {
+        // A height in range has no active-chain hash: the chain is shorter than
+        // claimed (should not happen since stop<=tip), or a gap. Raise a clear
+        // error rather than silently returning a misleadingly short list.
+        throw this.rpcError(
+          RPCErrorCodes.MISC_ERROR,
+          "Filter not found. Block filters are still in the process of being indexed.",
+        );
+      }
+      const filterBytes = await this.filterIndex.getFilter(blockHash);
+      if (!filterBytes) {
+        // Index lag — the filter for this in-range block hasn't been built.
+        // Core's LookupFilterRange returning false aborts; raise a clear error
+        // so a partial/lagging index never returns an incomplete list.
+        throw this.rpcError(
+          RPCErrorCodes.MISC_ERROR,
+          "Filter not found. Block filters are still in the process of being indexed.",
+        );
+      }
+      const filter = GCSFilter.fromEncoded(filterBytes, blockHash);
+      if (!filter.matchAny(needles)) {
+        continue;
+      }
+      // Display-order block hash (reverse of internal little-endian storage),
+      // matching Core's uint256 GetHex().
+      relevant.push(Buffer.from(blockHash).reverse().toString("hex"));
+    }
+
+    // (9) Return (Core). The synchronous scan is never aborted, so `completed`
+    // is always true. Field order: from_height, to_height, relevant_blocks,
+    // completed (Core's UniValue pushKV order).
+    return {
+      from_height: start,
+      to_height: stop,
+      relevant_blocks: relevant,
+      completed: true,
     };
   }
 
