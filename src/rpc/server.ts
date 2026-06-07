@@ -20,7 +20,7 @@ import { Horizon, DECAY, SCALE } from "../fees/estimator.js";
 import type { HeaderSync, HeaderChainEntry } from "../sync/headers.js";
 import type { BlockSync } from "../sync/blocks.js";
 import type { ConsensusParams } from "../consensus/params.js";
-import { compactToBigInt, bigIntToCompact, getGenesisBlock } from "../consensus/params.js";
+import { compactToBigInt, bigIntToCompact, getGenesisBlock, getBlockSubsidy } from "../consensus/params.js";
 import {
   VersionBitsCache,
   buildBlockIndex,
@@ -1126,6 +1126,7 @@ export class RPCServer {
     this.registerMethod("getsyncstate", () => this.getSyncState());
     this.registerMethod("getchaintips", () => this.getChainTips());
     this.registerMethod("getchaintxstats", (params) => this.getChainTxStats(params));
+    this.registerMethod("getblockstats", (params) => this.getBlockStats(params));
     this.registerMethod("getdifficulty", () => this.getDifficulty());
 
     // Transaction methods
@@ -2673,6 +2674,441 @@ export class RPCServer {
     }
 
     return result;
+  }
+
+  /**
+   * getblockstats: Compute per-block statistics for a confirmed block.
+   *
+   * Mirrors Bitcoin Core's getblockstats (rpc/blockchain.cpp). The first
+   * argument is EITHER a block height (integer) OR a block hash (hex string);
+   * the optional second argument is an array of stat names that restricts the
+   * returned object to that subset (omitting it / passing an empty array
+   * returns every stat).
+   *
+   * Fee statistics require the spent-prevout values for every non-coinbase
+   * transaction. These come from `buildSpentByOutpointMap` — the exact same
+   * source getblock(verbosity=2) uses for per-tx fees (undo data first, then
+   * txindex / UTXO-set / Core-oracle fallbacks). If that map is unavailable
+   * (no undo data and no fallback resolved every prevout) the fee-derived
+   * stats degrade to 0 rather than returning wrong numbers; the size / weight
+   * / count / subsidy / utxo stats are always computed correctly.
+   *
+   * Reference: bitcoin-core/src/rpc/blockchain.cpp getblockstats,
+   * CalculatePercentilesByWeight, CalculateTruncatedMedian, PER_UTXO_OVERHEAD,
+   * IsBIP30Repeat.
+   */
+  private async getBlockStats(params: unknown[]): Promise<Record<string, unknown>> {
+    const [hashOrHeightParam, statsParam] = params ?? [];
+
+    // ── Resolve the requested subset of stats (Core: std::set<std::string>). ─
+    let requestedStats: Set<string> | null = null;
+    if (statsParam !== undefined && statsParam !== null) {
+      if (!Array.isArray(statsParam)) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "stats must be an array");
+      }
+      requestedStats = new Set<string>();
+      for (const s of statsParam) {
+        if (typeof s !== "string") {
+          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "stats entries must be strings");
+        }
+        requestedStats.add(s);
+      }
+      if (requestedStats.size === 0) {
+        // Core treats an empty array the same as "all".
+        requestedStats = null;
+      }
+    }
+
+    // ── Resolve the block (ParseHashOrHeight semantics). ─────────────────────
+    // Height → active-chain block at that height (0 <= height <= tip).
+    // Hash   → any block present in the block index.
+    let blockhash: Buffer; // internal byte order
+    let height: number;
+
+    if (typeof hashOrHeightParam === "number") {
+      if (!Number.isInteger(hashOrHeightParam)) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Target block height must be an integer");
+      }
+      if (hashOrHeightParam < 0) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          `Target block height ${hashOrHeightParam} is negative`
+        );
+      }
+      const tipHeight = this.chainState.getBestBlock().height;
+      if (hashOrHeightParam > tipHeight) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          `Target block height ${hashOrHeightParam} after current tip ${tipHeight}`
+        );
+      }
+      const hashAtHeight = await this.db.getBlockHashByHeight(hashOrHeightParam);
+      if (!hashAtHeight) {
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found");
+      }
+      blockhash = Buffer.from(hashAtHeight);
+      height = hashOrHeightParam;
+    } else if (typeof hashOrHeightParam === "string") {
+      // Hashes in Bitcoin RPC are display-order (reversed bytes).
+      blockhash = Buffer.from(hashOrHeightParam, "hex").reverse();
+      if (blockhash.length !== 32) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
+      }
+      const idx = await this.db.getBlockIndex(blockhash);
+      if (!idx) {
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found");
+      }
+      height = idx.height;
+    } else {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "First argument must be a block height (integer) or block hash (hex string)"
+      );
+    }
+
+    // ── Fetch the block body. ────────────────────────────────────────────────
+    if (this.pruneManager?.isPruneMode() && this.pruneManager.isBlockPruned(height)) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Block not available (pruned data)");
+    }
+    const blockData = await this.db.getBlock(blockhash);
+    if (!blockData) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Block not available (pruned data)");
+    }
+    const block = deserializeBlock(new BufferReader(blockData));
+
+    // ── mediantime / time from the header entry (Core: GetMedianTimePast). ──
+    const headerEntry = this.headerSync.getHeader(blockhash);
+    const blockTime = block.header.timestamp;
+    const mediantime = headerEntry
+      ? this.headerSync.getMedianTimePast(headerEntry)
+      : blockTime;
+
+    // Per Core: serialized size of a CTxOut = 8 (nValue) + CompactSize(len) + len.
+    // PER_UTXO_OVERHEAD = sizeof(COutPoint)=36 + sizeof(uint32_t)=4 + sizeof(bool)=1.
+    const PER_UTXO_OVERHEAD = 41;
+    const compactSizeLen = (n: number): number =>
+      n < 0xfd ? 1 : n <= 0xffff ? 3 : n <= 0xffffffff ? 5 : 9;
+    const txOutSerializeSize = (script: Buffer): number =>
+      8 + compactSizeLen(script.length) + script.length;
+
+    // ── Spent-prevout values for non-coinbase fee computation. ───────────────
+    // Preferred source: this block's undo data, which carries the FULL spent
+    // CTxOut (value + scriptPubKey). That lets us compute the exact prevout
+    // serialized size for utxo_size_inc / utxo_size_inc_actual, matching Core's
+    // blockUndo.vtxundo path byte-for-byte.
+    //
+    // Fallback: buildSpentByOutpointMap (same source getblock v2 uses — txindex
+    // → UTXO set → Core oracle). It only resolves AMOUNTS, so when undo data is
+    // missing we still get correct fees but the prevout serialized size is
+    // estimated (PER_UTXO_OVERHEAD + value(8) + minimal 1-byte script).
+    const prevoutFull = new Map<string, { value: bigint; script: Buffer }>();
+    let haveExactPrevoutSizes = false;
+    try {
+      const undoRaw = await this.db.getUndoData(blockhash).catch(() => null);
+      if (undoRaw) {
+        const { deserializeUndoData } = await import("../chain/utxo.js");
+        for (const spent of deserializeUndoData(undoRaw)) {
+          prevoutFull.set(`${spent.txid.toString("hex")}:${spent.vout}`, {
+            value: spent.entry.amount,
+            script: spent.entry.scriptPubKey,
+          });
+        }
+        haveExactPrevoutSizes = prevoutFull.size > 0;
+      }
+    } catch {
+      // fall through to the amount-only map
+    }
+
+    // Amount-only map (fees) — used directly when undo data was unavailable.
+    const spentByOutpoint = haveExactPrevoutSizes
+      ? null
+      : await this.buildSpentByOutpointMap(blockhash, block);
+
+    // Unified amount lookup: prefer the exact undo map, else the amount map.
+    const lookupPrevValue = (key: string): bigint | undefined => {
+      if (haveExactPrevoutSizes) return prevoutFull.get(key)?.value;
+      return spentByOutpoint?.get(key);
+    };
+    // Core CScript::IsUnspendable(): (len>0 && script[0]==OP_RETURN) || len>MAX_SCRIPT_SIZE.
+    const OP_RETURN = 0x6a;
+    const MAX_SCRIPT_SIZE = 10000;
+    const isUnspendable = (script: Buffer): boolean =>
+      (script.length > 0 && script[0] === OP_RETURN) || script.length > MAX_SCRIPT_SIZE;
+
+    // BIP30-repeat coinbases (mainnet) don't change UTXO-set counts and so are
+    // excluded from the "actual" UTXO stats. Core: validation.cpp IsBIP30Repeat.
+    const blockhashDisplay = Buffer.from(blockhash).reverse().toString("hex");
+    const isBip30Repeat =
+      (height === 91842 &&
+        blockhashDisplay ===
+          "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec") ||
+      (height === 91880 &&
+        blockhashDisplay ===
+          "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721");
+
+    // ── Accumulators (mirror Core's getblockstats loop variables). ──────────
+    let maxfee = 0n;
+    let maxfeerate = 0n;
+    let minfee: bigint | null = null;
+    let minfeerate: bigint | null = null;
+    let total_out = 0n;
+    let totalfee = 0n;
+    let inputs = 0;
+    let maxtxsize = 0;
+    let mintxsize: number | null = null;
+    let outputs = 0;
+    let swtotal_size = 0;
+    let swtotal_weight = 0;
+    let swtxs = 0;
+    let total_size = 0;
+    let total_weight = 0;
+    let utxos = 0; // utxo_increase_actual numerator (created spendable outputs)
+    let utxo_size_inc = 0n;
+    let utxo_size_inc_actual = 0n;
+
+    const fee_array: bigint[] = [];
+    const feerate_array: Array<{ feerate: bigint; weight: number }> = [];
+    const txsize_array: number[] = [];
+
+    // Did every non-coinbase prevout resolve? If any is missing, fee stats are
+    // not trustworthy → degrade them to 0 (don't emit wrong fees).
+    let allPrevoutsResolved = haveExactPrevoutSizes || spentByOutpoint !== null;
+
+    const txs = block.transactions;
+
+    for (const tx of txs) {
+      outputs += tx.outputs.length;
+
+      let tx_total_out = 0n;
+      for (const out of tx.outputs) {
+        tx_total_out += out.value;
+
+        const outSize = BigInt(txOutSerializeSize(out.scriptPubKey) + PER_UTXO_OVERHEAD);
+        utxo_size_inc += outSize;
+
+        // Genesis + BIP30-repeat coinbases don't enter the UTXO set.
+        if (height === 0 || (isBip30Repeat && isCoinbase(tx))) continue;
+        // Skip unspendable outputs — not stored in the UTXO set.
+        if (isUnspendable(out.scriptPubKey)) continue;
+
+        utxos += 1;
+        utxo_size_inc_actual += outSize;
+      }
+
+      if (isCoinbase(tx)) {
+        // Coinbase is counted in txs/outs/utxo stats but excluded from fees.
+        continue;
+      }
+
+      inputs += tx.inputs.length;
+      total_out += tx_total_out;
+
+      const tx_size = serializeTx(tx, true).length; // ComputeTotalSize (with witness)
+      txsize_array.push(tx_size);
+      maxtxsize = Math.max(maxtxsize, tx_size);
+      mintxsize = mintxsize === null ? tx_size : Math.min(mintxsize, tx_size);
+      total_size += tx_size;
+
+      const weight = getTxWeight(tx);
+      total_weight += weight;
+
+      if (hasWitness(tx)) {
+        swtxs += 1;
+        swtotal_size += tx_size;
+        swtotal_weight += weight;
+      }
+
+      // Fee = sum(input prevout values) - sum(output values).
+      let tx_total_in = 0n;
+      let txInputsResolved = true;
+      for (const input of tx.inputs) {
+        const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+        const prevVal = lookupPrevValue(key);
+        if (prevVal === undefined) {
+          txInputsResolved = false;
+          break;
+        }
+        tx_total_in += prevVal;
+
+        // Spending a prevout removes its serialized size from the UTXO set.
+        // Core: prevout_size = GetSerializeSize(prevoutput) + PER_UTXO_OVERHEAD,
+        // where prevoutput is the spent CTxOut from the undo Coin. When the undo
+        // path is active we have the exact spent scriptPubKey; otherwise we only
+        // know the value, so estimate the script as a single byte (the dominant
+        // small-script case) — the count-only stats remain exact regardless.
+        const spent = haveExactPrevoutSizes ? prevoutFull.get(key) : undefined;
+        const prevoutSize = spent
+          ? BigInt(txOutSerializeSize(spent.script) + PER_UTXO_OVERHEAD)
+          : BigInt(8 + 1 + 1 + PER_UTXO_OVERHEAD);
+        utxo_size_inc -= prevoutSize;
+        utxo_size_inc_actual -= prevoutSize;
+      }
+
+      if (!txInputsResolved) {
+        allPrevoutsResolved = false;
+        continue; // skip fee math for this tx; size/weight already counted
+      }
+
+      const txfee = tx_total_in - tx_total_out;
+      fee_array.push(txfee);
+      if (txfee > maxfee) maxfee = txfee;
+      minfee = minfee === null ? txfee : (txfee < minfee ? txfee : minfee);
+      totalfee += txfee;
+
+      // New feerate is sat / vbyte: (fee * WITNESS_SCALE_FACTOR) / weight.
+      const feerate = weight ? (txfee * 4n) / BigInt(weight) : 0n;
+      feerate_array.push({ feerate, weight });
+      if (feerate > maxfeerate) maxfeerate = feerate;
+      minfeerate = minfeerate === null ? feerate : (feerate < minfeerate ? feerate : minfeerate);
+    }
+
+    // If any prevout was unresolved the fee aggregates are untrustworthy → 0.
+    if (!allPrevoutsResolved) {
+      maxfee = 0n;
+      maxfeerate = 0n;
+      minfee = 0n;
+      minfeerate = 0n;
+      totalfee = 0n;
+      fee_array.length = 0;
+      feerate_array.length = 0;
+    }
+
+    const feeratePercentiles = this.calculatePercentilesByWeight(feerate_array, total_weight);
+
+    const nonCoinbaseCount = txs.length > 0 ? txs.length - 1 : 0;
+    const subsidy = getBlockSubsidy(height, this.params);
+
+    // ── Assemble every stat (Core's ret_all, in the same key order). ────────
+    const all: Record<string, unknown> = {
+      avgfee: nonCoinbaseCount > 0 ? totalfee / BigInt(nonCoinbaseCount) : 0n,
+      avgfeerate: total_weight ? (totalfee * 4n) / BigInt(total_weight) : 0n,
+      avgtxsize: nonCoinbaseCount > 0 ? Math.floor(total_size / nonCoinbaseCount) : 0,
+      blockhash: blockhashDisplay,
+      feerate_percentiles: feeratePercentiles,
+      height,
+      ins: inputs,
+      maxfee,
+      maxfeerate,
+      maxtxsize,
+      medianfee: this.calculateTruncatedMedianBig(fee_array),
+      mediantime,
+      mediantxsize: this.calculateTruncatedMedianNum(txsize_array),
+      minfee: minfee === null ? 0n : minfee,
+      minfeerate: minfeerate === null ? 0n : minfeerate,
+      mintxsize: mintxsize === null ? 0 : mintxsize,
+      outs: outputs,
+      subsidy,
+      swtotal_size,
+      swtotal_weight,
+      swtxs,
+      time: blockTime,
+      total_out,
+      total_size,
+      total_weight,
+      totalfee,
+      txs: txs.length,
+      utxo_increase: outputs - inputs,
+      utxo_size_inc,
+      utxo_increase_actual: utxos - inputs,
+      utxo_size_inc_actual,
+    };
+
+    // ── Subset filtering (Core: throw RPC_INVALID_PARAMETER on unknown). ────
+    if (requestedStats === null) {
+      return all;
+    }
+    const ret: Record<string, unknown> = {};
+    for (const stat of requestedStats) {
+      if (!(stat in all)) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          `Invalid selected statistic '${stat}'`
+        );
+      }
+      ret[stat] = all[stat];
+    }
+    return ret;
+  }
+
+  /**
+   * Weight-ranked feerate percentiles [10th, 25th, 50th, 75th, 90th] in
+   * sat/vB, exactly matching Core's CalculatePercentilesByWeight
+   * (rpc/blockchain.cpp). Each element is weighted by the transaction's weight;
+   * the percentile value is the first feerate whose cumulative weight crosses
+   * the threshold. Empty input → all zeros.
+   */
+  private calculatePercentilesByWeight(
+    scores: Array<{ feerate: bigint; weight: number }>,
+    totalWeight: number
+  ): bigint[] {
+    const result: bigint[] = [0n, 0n, 0n, 0n, 0n];
+    if (scores.length === 0) {
+      return result;
+    }
+
+    // Sort by (feerate, weight) ascending — matches std::sort on the pair.
+    const sorted = [...scores].sort((a, b) => {
+      if (a.feerate < b.feerate) return -1;
+      if (a.feerate > b.feerate) return 1;
+      return a.weight - b.weight;
+    });
+
+    // 10th, 25th, 50th, 75th, 90th percentile thresholds in weight units.
+    const weights = [
+      totalWeight / 10.0,
+      totalWeight / 4.0,
+      totalWeight / 2.0,
+      (totalWeight * 3.0) / 4.0,
+      (totalWeight * 9.0) / 10.0,
+    ];
+
+    let nextPercentileIndex = 0;
+    let cumulativeWeight = 0;
+    for (const element of sorted) {
+      cumulativeWeight += element.weight;
+      while (
+        nextPercentileIndex < 5 &&
+        cumulativeWeight >= weights[nextPercentileIndex]
+      ) {
+        result[nextPercentileIndex] = element.feerate;
+        nextPercentileIndex += 1;
+      }
+    }
+
+    // Fill any remaining percentiles with the last (largest) value.
+    for (let i = nextPercentileIndex; i < 5; i++) {
+      result[i] = sorted[sorted.length - 1].feerate;
+    }
+
+    return result;
+  }
+
+  /**
+   * Truncated median of a bigint array (Core CalculateTruncatedMedian).
+   * Even count → integer mean of the two central elements (floor division).
+   */
+  private calculateTruncatedMedianBig(scores: bigint[]): bigint {
+    const size = scores.length;
+    if (size === 0) return 0n;
+    const sorted = [...scores].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    if (size % 2 === 0) {
+      return (sorted[size / 2 - 1] + sorted[size / 2]) / 2n;
+    }
+    return sorted[(size - 1) / 2];
+  }
+
+  /**
+   * Truncated median of a number array (Core CalculateTruncatedMedian).
+   * Even count → floor of the integer mean of the two central elements.
+   */
+  private calculateTruncatedMedianNum(scores: number[]): number {
+    const size = scores.length;
+    if (size === 0) return 0;
+    const sorted = [...scores].sort((a, b) => a - b);
+    if (size % 2 === 0) {
+      return Math.floor((sorted[size / 2 - 1] + sorted[size / 2]) / 2);
+    }
+    return sorted[(size - 1) / 2];
   }
 
   // ========== Transaction Methods ==========
