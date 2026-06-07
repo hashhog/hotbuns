@@ -258,9 +258,20 @@ class MockChainDB {
   private blockIndexes = new Map<string, any>();
   private hashByHeight = new Map<number, Buffer>();
   private chainWorks = new Map<string, bigint>();
+  private undoData = new Map<string, Buffer>();
 
   async getBlock(hash: Buffer) {
     return this.blocks.get(hash.toString("hex")) ?? null;
+  }
+
+  // Per-block undo data (spent prevouts), keyed by internal-order block hash.
+  // Used by getblock(verbosity=2) and getblockstats for fee computation.
+  async getUndoData(hash: Buffer) {
+    return this.undoData.get(hash.toString("hex")) ?? null;
+  }
+
+  setUndoData(hash: Buffer, data: Buffer) {
+    this.undoData.set(hash.toString("hex"), data);
   }
 
   async getBlockIndex(hash: Buffer) {
@@ -1537,6 +1548,189 @@ describe("RPCServer", () => {
       expect(h.nextblockhash).toBeUndefined();
       // chainwork comes from DB fallback → must match what connectBlock stored
       expect(h.chainwork).toBe(genesisChainWork.toString(16).padStart(64, "0"));
+    });
+  });
+
+  // ─── getblockstats ───────────────────────────────────────────────────────
+  // Proven-teeth: build a real regtest-shaped block (coinbase + one spending
+  // tx) with stored undo data, then assert getblockstats computes the fee /
+  // size / count / percentile fields correctly — by height AND by hash — and
+  // that the subset filter + unknown-stat error path behave like Core.
+  describe("getblockstats", () => {
+    function hdr(
+      version: number, prevBlock: Buffer, merkleRoot: Buffer,
+      timestamp: number, bits: number, nonce: number
+    ): Buffer {
+      const buf = Buffer.allocUnsafe(80);
+      buf.writeInt32LE(version, 0);
+      prevBlock.copy(buf, 4);
+      merkleRoot.copy(buf, 36);
+      buf.writeUInt32LE(timestamp, 68);
+      buf.writeUInt32LE(bits, 72);
+      buf.writeUInt32LE(nonce, 76);
+      return buf;
+    }
+
+    async function setupBlockWithFee() {
+      const { getTxWeight, getTxVSize, hasWitness } = await import("../validation/tx.js");
+      const { serializeUndoData } = await import("../chain/utxo.js");
+
+      const NULL_TXID = Buffer.alloc(32, 0);
+      const p2pkh = Buffer.concat([
+        Buffer.from([0x76, 0xa9, 0x14]), Buffer.alloc(20, 0xab), Buffer.from([0x88, 0xac]),
+      ]);
+
+      // Coinbase: 1 null input, 1 output (subsidy + fees). Non-segwit.
+      const coinbase = {
+        version: 1,
+        inputs: [{ prevOut: { txid: Buffer.from(NULL_TXID), vout: 0xffffffff },
+                   scriptSig: Buffer.from([0x51]), sequence: 0xffffffff, witness: [] }],
+        outputs: [{ value: 5000010000n, scriptPubKey: Buffer.from(p2pkh) }], // 50 BTC + 10000 fee
+        lockTime: 0,
+      };
+
+      // The prevout the spending tx consumes (value 100000 sat).
+      const prevTxid = Buffer.alloc(32, 0x11);
+      const PREV_VALUE = 100000n;
+
+      // Spending tx: 1 input (the prevout above), 1 output of 90000 → fee 10000.
+      const spend = {
+        version: 2,
+        inputs: [{ prevOut: { txid: Buffer.from(prevTxid), vout: 0 },
+                   scriptSig: Buffer.from([0x47, ...new Array(0x47).fill(0)]),
+                   sequence: 0xffffffff, witness: [] }],
+        outputs: [{ value: 90000n, scriptPubKey: Buffer.from(p2pkh) }],
+        lockTime: 0,
+      };
+
+      const merkleRoot = computeMerkleRoot([
+        getTxId(coinbase as any), getTxId(spend as any),
+      ]);
+      const block = {
+        header: { version: 0x20000000, prevBlock: Buffer.from(REGTEST.genesisBlockHash),
+                  merkleRoot, timestamp: 1700000000, bits: 0x207fffff, nonce: 7 },
+        transactions: [coinbase, spend],
+      };
+      const blockRaw = serializeBlock(block as any);
+      const headerBuf = hdr(0x20000000, Buffer.from(REGTEST.genesisBlockHash),
+        merkleRoot, 1700000000, 0x207fffff, 7);
+      const blockHashInternal = getBlockHash(block.header as any);
+      const blockHashDisplay = Buffer.from(blockHashInternal).reverse().toString("hex");
+      const height = 5;
+
+      mockChainState.setBestBlock(Buffer.from(blockHashInternal), height, 12n);
+      mockDB.setBlock(Buffer.from(blockHashInternal), blockRaw);
+      mockDB.setBlockIndex(Buffer.from(blockHashInternal),
+        { height, header: headerBuf, nTx: 2, status: 15, dataPos: 1 });
+      mockDB.setHashByHeight(height, Buffer.from(blockHashInternal));
+
+      // Undo data: one spent prevout carrying the FULL CTxOut (value + script).
+      const undo = serializeUndoData([
+        { txid: Buffer.from(prevTxid), vout: 0,
+          entry: { height: 1, coinbase: false, amount: PREV_VALUE,
+                   scriptPubKey: Buffer.from(p2pkh) } },
+      ]);
+      mockDB.setUndoData(Buffer.from(blockHashInternal), undo);
+
+      const spendWeight = getTxWeight(spend as any);
+      const spendVsize = getTxVSize(spend as any);
+      const spendSize = serializeTx(spend as any, true).length;
+      const isSw = hasWitness(spend as any);
+      return { blockHashDisplay, height, spendWeight, spendVsize, spendSize, isSw };
+    }
+
+    it("computes fee/size/count/percentile fields for a known block (by height)", async () => {
+      const { height, spendWeight, spendVsize, spendSize, isSw } = await setupBlockWithFee();
+
+      const res = await rpcRequest(testPort, "getblockstats", [height]);
+      expect(res.error).toBeUndefined();
+      const s = res.result;
+
+      // Counts: 2 txs, coinbase excluded from inputs (1 real input), 2 outputs.
+      expect(s.height).toBe(height);
+      expect(s.txs).toBe(2);
+      expect(s.ins).toBe(1);
+      expect(s.outs).toBe(2);
+
+      // Fee math: fee = 100000 (in) - 90000 (out) = 10000 sat for the one
+      // non-coinbase tx, so total/avg/min/max/median fee all equal 10000.
+      expect(s.totalfee).toBe(10000);
+      expect(s.avgfee).toBe(10000);
+      expect(s.minfee).toBe(10000);
+      expect(s.maxfee).toBe(10000);
+      expect(s.medianfee).toBe(10000);
+
+      // Feerate = fee * 4 / weight (sat/vB), truncated. Single tx → every
+      // percentile equals that one feerate.
+      const expFeerate = Math.floor((10000 * 4) / spendWeight);
+      expect(s.avgfeerate).toBe(expFeerate);
+      expect(s.minfeerate).toBe(expFeerate);
+      expect(s.maxfeerate).toBe(expFeerate);
+      expect(s.feerate_percentiles).toEqual([
+        expFeerate, expFeerate, expFeerate, expFeerate, expFeerate,
+      ]);
+      void spendVsize;
+
+      // Size stats reflect only the non-coinbase tx.
+      expect(s.total_size).toBe(spendSize);
+      expect(s.mintxsize).toBe(spendSize);
+      expect(s.maxtxsize).toBe(spendSize);
+      expect(s.mediantxsize).toBe(spendSize);
+      expect(s.total_weight).toBe(spendWeight);
+
+      // SegWit accounting: the spending tx is non-witness here.
+      expect(s.swtxs).toBe(isSw ? 1 : 0);
+
+      // total_out = sum of non-coinbase outputs (coinbase reward excluded).
+      expect(s.total_out).toBe(90000);
+
+      // utxo_increase = outs - ins = 2 - 1 = 1.
+      expect(s.utxo_increase).toBe(1);
+
+      // Regtest subsidy at height 5 = 50 BTC (no halving).
+      expect(s.subsidy).toBe(5000000000);
+
+      // blockhash echoes the display-order hash.
+      expect(typeof s.blockhash).toBe("string");
+      expect(s.blockhash).toHaveLength(64);
+    });
+
+    it("returns identical stats when queried by hash, and supports the stats subset", async () => {
+      const { blockHashDisplay } = await setupBlockWithFee();
+
+      const byHash = await rpcRequest(testPort, "getblockstats", [blockHashDisplay]);
+      expect(byHash.error).toBeUndefined();
+      expect(byHash.result.totalfee).toBe(10000);
+      expect(byHash.result.blockhash).toBe(blockHashDisplay);
+
+      // Subset: only the requested keys are present.
+      const subset = await rpcRequest(testPort, "getblockstats",
+        [blockHashDisplay, ["totalfee", "txs", "height"]]);
+      expect(subset.error).toBeUndefined();
+      expect(Object.keys(subset.result).sort()).toEqual(["height", "totalfee", "txs"]);
+      expect(subset.result.totalfee).toBe(10000);
+      expect(subset.result.txs).toBe(2);
+    });
+
+    it("rejects an unknown selected statistic (RPC_INVALID_PARAMETER, -8)", async () => {
+      const { height } = await setupBlockWithFee();
+      const res = await rpcRequest(testPort, "getblockstats", [height, ["not_a_real_stat"]]);
+      expect(res.error).toBeDefined();
+      expect(res.error.code).toBe(RPCErrorCodes.INVALID_PARAMETER);
+    });
+
+    it("rejects a height after the current tip (RPC_INVALID_PARAMETER, -8)", async () => {
+      await setupBlockWithFee(); // tip at height 5
+      const res = await rpcRequest(testPort, "getblockstats", [999999]);
+      expect(res.error).toBeDefined();
+      expect(res.error.code).toBe(RPCErrorCodes.INVALID_PARAMETER);
+    });
+
+    it("returns 'Block not found' (-5) for an unknown block hash", async () => {
+      const unknown = Buffer.alloc(32, 0xee).toString("hex");
+      const res = await rpcRequest(testPort, "getblockstats", [unknown]);
+      expect(res.error).toBeDefined();
+      expect(res.error.code).toBe(RPCErrorCodes.INVALID_ADDRESS_OR_KEY);
     });
   });
 
