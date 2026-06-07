@@ -11,6 +11,8 @@ import { OrphanPool } from "../mempool/orphan_pool.js";
 import { BufferReader } from "../wire/serialization.js";
 import { hash256 } from "../crypto/primitives.js";
 import { bip22Result, ConsensusErrorCode } from "../validation/errors.js";
+import { PeerManager, ServiceFlags, isRoutable } from "../p2p/manager.js";
+import { BIP155Network } from "../p2p/addrv2.js";
 
 // Mock implementations for dependencies
 
@@ -145,6 +147,76 @@ class MockPeerManager {
   usingASMap(): boolean { return false; }
   getMappedAS(_addr: string): number { return 0; }
   getOutboundNetGroups(): Set<string> { return new Set(); }
+
+  // ── addrman substrate for getnodeaddresses / addpeeraddress ───────────
+  // Faithful re-implementation of PeerManager.dumpAddrmanForRpc /
+  // injectKnownAddress (src/p2p/manager.ts:1451 / 1509) so the live RPC
+  // tests exercise the real handler dispatch + count/network arg parsing
+  // and Core-shaped output without standing up a full PeerManager. Mirrors
+  // the production logic exactly: same 5-key order, services as a JS number,
+  // time as integer seconds, network-name filter, count cap (0 = all),
+  // routable-IPv4-only insert. Reuses the real isRoutable +
+  // networkIdToCoreName so the mock cannot silently drift from production.
+  private knownAddresses = new Map<
+    string,
+    { host: string; port: number; services: bigint; lastSeen: number; networkId: number }
+  >();
+
+  dumpAddrmanForRpc(
+    count: number,
+    network?: string,
+  ): Array<{ time: number; services: number; address: string; port: number; network: string }> {
+    const selected: Array<{ host: string; port: number; services: bigint; lastSeen: number; networkId: number }> = [];
+    for (const info of this.knownAddresses.values()) {
+      if (
+        network !== undefined &&
+        PeerManager.networkIdToCoreName(info.networkId) !== network
+      ) {
+        continue;
+      }
+      selected.push(info);
+    }
+    // Shuffle (order is intentionally non-deterministic, like Core).
+    for (let i = selected.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [selected[i], selected[j]] = [selected[j], selected[i]];
+    }
+    const capped =
+      count > 0 && selected.length > count ? selected.slice(0, count) : selected;
+    return capped.map((info) => ({
+      time: Math.floor(info.lastSeen / 1000),
+      services: Number(info.services),
+      address: info.host,
+      port: info.port,
+      network: PeerManager.networkIdToCoreName(info.networkId),
+    }));
+  }
+
+  injectKnownAddress(
+    host: string,
+    port: number,
+    services: bigint,
+    timeSecs: number,
+  ): boolean {
+    if (!isRoutable(host)) return false;
+    if (!Number.isInteger(port) || port <= 0 || port > 0xffff) return false;
+    const key = `${host}:${port}`;
+    const lastSeenMs = timeSecs * 1000;
+    const existing = this.knownAddresses.get(key);
+    if (existing) {
+      existing.services = services;
+      if (lastSeenMs > existing.lastSeen) existing.lastSeen = lastSeenMs;
+      return true;
+    }
+    this.knownAddresses.set(key, {
+      host,
+      port,
+      services,
+      lastSeen: lastSeenMs,
+      networkId: BIP155Network.IPV4,
+    });
+    return true;
+  }
 }
 
 class MockFeeEstimator {
@@ -1732,6 +1804,111 @@ describe("RPCServer", () => {
       const res = await rpcRequest(testPort, "getblockstats", [unknown]);
       expect(res.error).toBeDefined();
       expect(res.error.code).toBe(RPCErrorCodes.INVALID_ADDRESS_OR_KEY);
+    });
+  });
+
+  // getnodeaddresses — Core parity (rpc/net.cpp:911-970 + netbase.cpp:100-128).
+  // Each entry is an object with EXACTLY 5 keys in this order:
+  //   time (unix seconds INTEGER), services (raw bitfield INTEGER, NOT hex),
+  //   address (host literal, no port), port (INTEGER), network (Core name).
+  // Arg shape: count (positional 0, default 1; 0 = all; <0 -> -8
+  // "Address count out of range"); network (positional 1, lowercased, only
+  // ipv4|ipv6|onion|i2p|cjdns, else -8 "Network not recognized: <raw arg>").
+  // Empty addrman -> [] (NOT an error).
+  describe("getnodeaddresses", () => {
+    it("returns [] (not an error) for an empty addrman", async () => {
+      const res = await rpcRequest(testPort, "getnodeaddresses", []);
+      expect(res.error).toBeUndefined();
+      expect(Array.isArray(res.result)).toBe(true);
+      expect(res.result.length).toBe(0);
+    });
+
+    it("addpeeraddress(routable IPv4) returns {success:true}", async () => {
+      const res = await rpcRequest(testPort, "addpeeraddress", ["8.8.8.8", 8333, false]);
+      expect(res.error).toBeUndefined();
+      expect(res.result).toEqual({ success: true });
+    });
+
+    it("addpeeraddress(non-routable) returns {success:false}", async () => {
+      const a = await rpcRequest(testPort, "addpeeraddress", ["10.0.0.1", 8333, false]);
+      expect(a.result.success).toBe(false);
+      const b = await rpcRequest(testPort, "addpeeraddress", ["127.0.0.1", 8333, false]);
+      expect(b.result.success).toBe(false);
+    });
+
+    it("emits EXACTLY 5 keys in time/services/address/port/network order with Core types", async () => {
+      const add = await rpcRequest(testPort, "addpeeraddress", ["8.8.8.8", 8333, false]);
+      expect(add.result.success).toBe(true);
+
+      const res = await rpcRequest(testPort, "getnodeaddresses", [0]);
+      expect(res.error).toBeUndefined();
+      expect(Array.isArray(res.result)).toBe(true);
+
+      const entry = res.result.find((e: any) => e.address === "8.8.8.8");
+      expect(entry).toBeDefined();
+
+      // Key set AND order must match Core exactly.
+      expect(Object.keys(entry)).toEqual([
+        "time",
+        "services",
+        "address",
+        "port",
+        "network",
+      ]);
+
+      // Types: services is a JS number (INTEGER, not a hex string).
+      expect(typeof entry.time).toBe("number");
+      expect(Number.isInteger(entry.time)).toBe(true);
+      expect(typeof entry.services).toBe("number");
+      // addpeeraddress defaults to NODE_NETWORK|NODE_WITNESS = 1|8 = 9; but
+      // assert against the live flags so this stays correct if flags change.
+      expect(entry.services).toBe(
+        Number(ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS),
+      );
+      expect(entry.address).toBe("8.8.8.8");
+      expect(entry.port).toBe(8333);
+      expect(entry.network).toBe("ipv4");
+    });
+
+    it("count < 0 -> error -8 'Address count out of range'", async () => {
+      const res = await rpcRequest(testPort, "getnodeaddresses", [-1]);
+      expect(res.error).toBeDefined();
+      expect(res.error.code).toBe(RPCErrorCodes.INVALID_PARAMETER);
+      expect(res.error.code).toBe(-8);
+      expect(res.error.message).toBe("Address count out of range");
+    });
+
+    it("unknown network filter -> error -8 echoing the RAW (un-lowercased) arg", async () => {
+      const res = await rpcRequest(testPort, "getnodeaddresses", [1, "BogusNet"]);
+      expect(res.error).toBeDefined();
+      expect(res.error.code).toBe(RPCErrorCodes.INVALID_PARAMETER);
+      expect(res.error.code).toBe(-8);
+      expect(res.error.message).toBe("Network not recognized: BogusNet");
+    });
+
+    it("mixed-case network filter 'IPv4' is accepted (ParseNetwork lowercases)", async () => {
+      const add = await rpcRequest(testPort, "addpeeraddress", ["8.8.8.8", 8333, false]);
+      expect(add.result.success).toBe(true);
+
+      const res = await rpcRequest(testPort, "getnodeaddresses", [0, "IPv4"]);
+      expect(res.error).toBeUndefined();
+      expect(Array.isArray(res.result)).toBe(true);
+      expect(res.result.length).toBe(1);
+      expect(res.result[0].network).toBe("ipv4");
+    });
+
+    it("count caps the result; count==0 returns all", async () => {
+      for (const ip of ["8.8.8.8", "1.1.1.1", "9.9.9.9"]) {
+        const add = await rpcRequest(testPort, "addpeeraddress", [ip, 8333, false]);
+        expect(add.result.success).toBe(true);
+      }
+      const capped = await rpcRequest(testPort, "getnodeaddresses", [2]);
+      expect(capped.error).toBeUndefined();
+      expect(capped.result.length).toBeLessThanOrEqual(2);
+
+      const all = await rpcRequest(testPort, "getnodeaddresses", [0]);
+      expect(all.error).toBeUndefined();
+      expect(all.result.length).toBe(3);
     });
   });
 
