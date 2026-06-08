@@ -344,18 +344,20 @@ describe("W133-G12: BIP-30 unspendable coinbase exemption (BUG-10)", () => {
 // G13 — IsUnspendable definition (BUG-11)
 // =============================================================================
 
-describe("W133-G13: IsUnspendable scope (BUG-11)", () => {
-  it("BUG-11: CoinStatsIndex only checks OP_RETURN at offset 0, ignores MAX_SCRIPT_SIZE", () => {
-    // Core script.h:563: size > 0 && first == OP_RETURN || size > MAX_SCRIPT_SIZE (=10000)
+describe("W133-G13: IsUnspendable scope (BUG-11 — FIXED)", () => {
+  it("coinStatsIsUnspendable checks OP_RETURN at offset 0 AND size > MAX_SCRIPT_SIZE (=10000)", () => {
+    // Core script.h:565: (size>0 && first==OP_RETURN) || size > MAX_SCRIPT_SIZE (=10000).
+    // hotbuns implements this as the module-level helper coinStatsIsUnspendable,
+    // applied in indexBlock's created-outputs loop (the CustomAppend mirror).
     const src = readSrc("storage/indexes.ts");
-    const csiStart = src.indexOf("class CoinStatsIndex");
-    const csi = src.slice(csiStart, csiStart + 8000);
-    // Has OP_RETURN check…
-    expect(csi).toMatch(/0x6a/);
-    // …but no MAX_SCRIPT_SIZE / 10000 threshold check.
-    expect(csi).not.toContain("MAX_SCRIPT_SIZE");
-    expect(csi).not.toContain("10000");
-    expect(csi).not.toContain("10_000");
+    const fnStart = src.indexOf("function coinStatsIsUnspendable");
+    expect(fnStart).toBeGreaterThan(0);
+    const fn = src.slice(fnStart, fnStart + 400);
+    // OP_RETURN-at-offset-0 check…
+    expect(fn).toMatch(/0x6a/);
+    // …AND the MAX_SCRIPT_SIZE (10000) threshold, strict `>` (not `>=`).
+    expect(fn).toMatch(/length > 10000/);
+    expect(fn).not.toMatch(/length >= 10000/);
   });
 });
 
@@ -572,16 +574,20 @@ describe("W133-G28: total_unspendables_unclaimed_rewards (BUG-25)", () => {
 // G29 — -coinstatsindex flag + getindexinfo RPC (BUG-26)
 // =============================================================================
 
-describe("W133-G29: -coinstatsindex flag + getindexinfo RPC (BUG-26)", () => {
-  it("BUG-26a: no --coinstatsindex CLI flag", () => {
+describe("W133-G29: -coinstatsindex flag + getindexinfo RPC (BUG-26 — FIXED)", () => {
+  it("BUG-26a: --coinstatsindex flag is declared, defaults off (Core DEFAULT_COINSTATSINDEX=false), parsed, and wired", () => {
     const cliSrc = readSrc("cli/cli.ts");
-    expect(cliSrc).not.toContain("--coinstatsindex");
-    expect(cliSrc).not.toContain("coinstatsindex:");
+    // Config field declared + defaulted false.
+    expect(cliSrc).toContain("coinstatsindex: boolean");
+    expect(cliSrc).toContain("coinstatsindex: false");
+    // CLI arg parsed and actually used to construct/enable the index.
+    expect(cliSrc).toContain('case "coinstatsindex":');
+    expect(cliSrc).toContain("mergedConfig.coinstatsindex");
   });
 
-  it("BUG-26b: no getindexinfo RPC method", () => {
+  it("BUG-26b: getindexinfo RPC method is registered", () => {
     const rpcSrc = readSrc("rpc/server.ts");
-    expect(rpcSrc).not.toMatch(/registerMethod\(\s*["']getindexinfo["']/);
+    expect(rpcSrc).toMatch(/registerMethod\(\s*["']getindexinfo["']/);
   });
 });
 
