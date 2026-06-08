@@ -1156,6 +1156,16 @@ export class Mempool {
   /** Map of "txid_hex:vout" -> spending txid hex. */
   private outpointIndex: Map<string, string>;
 
+  /**
+   * User-created fee-priority deltas keyed by internal-order txid hex.
+   * Mirrors Core's CTxMemPool::mapDeltas (txmempool.h:330). A delta may name
+   * a txid that is not (yet) in the mempool — it is kept so the tx is
+   * prioritised if it later arrives. Deltas accumulate (saturating int64 add)
+   * and an entry whose net delta returns to 0 is erased.
+   * Reference: bitcoin-core/src/txmempool.cpp PrioritiseTransaction.
+   */
+  private mapDeltas: Map<string, bigint>;
+
   /** Maximum mempool size in vbytes. */
   private maxSize: number;
 
@@ -1240,6 +1250,7 @@ export class Mempool {
   ) {
     this.entries = new Map();
     this.outpointIndex = new Map();
+    this.mapDeltas = new Map();
     this.maxSize = maxSize;
     this.currentSize = 0;
     this.utxo = utxo;
@@ -2364,6 +2375,12 @@ export class Mempool {
       const txidHex = txid.toString("hex");
       confirmedTxids.add(txidHex);
 
+      // A confirmed tx's prioritisation delta is cleared (Core removeForBlock
+      // -> ClearPrioritisation, txmempool.cpp:420) so it cannot leak onto a
+      // future unrelated tx reusing this txid. Done regardless of whether the
+      // tx was actually in our mempool, matching Core.
+      this.mapDeltas.delete(txidHex);
+
       // Remove the transaction (but not its dependents yet - they may also be confirmed)
       const entry = this.entries.get(txidHex);
       if (entry) {
@@ -2398,6 +2415,11 @@ export class Mempool {
     // Remove conflicting transactions (with their dependents)
     for (const txidHex of conflictingTxids) {
       const txid = Buffer.from(txidHex, "hex");
+      // Conflicted-out txs also drop their delta (Core removeConflicts ->
+      // ClearPrioritisation). Other removal reasons (RBF replace, size-limit
+      // eviction, expiry, reorg) preserve the delta so a re-entering tx stays
+      // prioritised — hence this is done here and not in removeTransaction.
+      this.mapDeltas.delete(txidHex);
       this.removeTransaction(txid, true);
     }
 
@@ -2632,8 +2654,14 @@ export class Mempool {
   getTransactionsByFeeRate(): MempoolEntry[] {
     const entries = Array.from(this.entries.values());
 
-    // Sort by fee rate descending
-    entries.sort((a, b) => b.feeRate - a.feeRate);
+    // FIX-72: rank by MODIFIED fee rate (base + prioritisetransaction delta),
+    // not the raw base fee rate. This is the entry's own single-entry mining
+    // rank — an operator-prioritised low-base-fee tx now surfaces ahead of a
+    // higher-base-fee peer, matching Core (txmempool.cpp:636-643 drives mining
+    // off GetModifiedFee). Un-prioritised txs (delta 0) compare on entry.feeRate
+    // exactly, so their relative order is unchanged. Multi-ancestor delta
+    // folding is the W106 G8 separate follow-up.
+    entries.sort((a, b) => this.getEntryModifiedFeeRate(b) - this.getEntryModifiedFeeRate(a));
 
     return entries;
   }
@@ -2658,6 +2686,170 @@ export class Mempool {
    */
   getAllTxids(): Buffer[] {
     return Array.from(this.entries.keys()).map((hex) => Buffer.from(hex, "hex"));
+  }
+
+  // ==========================================================================
+  // Prioritisation (PrioritiseTransaction / mapDeltas / GetModifiedFee)
+  // Reference: bitcoin-core/src/txmempool.cpp:630 (PrioritiseTransaction),
+  //   :657 (ApplyDelta), :673 (GetPrioritisedTransactions), and
+  //   kernel/mempool_entry.h GetModifiedFee/UpdateModifiedFee.
+  // ==========================================================================
+
+  /**
+   * int64 saturating add — Core uses SaturatingAdd on CAmount (int64) so that
+   * extreme stacked deltas clamp instead of overflowing. fee_delta is a signed
+   * 64-bit satoshi value.
+   */
+  private static saturatingAddI64(a: bigint, b: bigint): bigint {
+    const I64_MAX = 9_223_372_036_854_775_807n;
+    const I64_MIN = -9_223_372_036_854_775_808n;
+    const sum = a + b;
+    if (sum > I64_MAX) return I64_MAX;
+    if (sum < I64_MIN) return I64_MIN;
+    return sum;
+  }
+
+  /**
+   * Apply a fee-priority delta for *txid* (Core: PrioritiseTransaction).
+   *
+   * Accumulates onto any existing delta (saturating int64 add). The txid may
+   * name a transaction not currently in the mempool: Core stores the delta
+   * anyway so a later-arriving tx is prioritised. When the net delta returns
+   * to 0 the entry is erased from the map (Core txmempool.cpp:644-653).
+   *
+   * @param txid internal-order txid bytes (the mempool's keying order).
+   * @param deltaSats satoshis to add (negative subtracts). Signed int64.
+   */
+  prioritiseTransaction(txid: Buffer, deltaSats: bigint): void {
+    const txidHex = txid.toString("hex");
+    const current = this.mapDeltas.get(txidHex) ?? 0n;
+    const newDelta = Mempool.saturatingAddI64(current, deltaSats);
+    if (newDelta === 0n) {
+      this.mapDeltas.delete(txidHex);
+    } else {
+      this.mapDeltas.set(txidHex, newDelta);
+    }
+    // The delta feeds the modified-fee mining rank + eviction via the cluster
+    // cache; invalidate so getMiningScore()/linearizeCluster() recompute. Core
+    // UpdateModifiedFee likewise re-sorts the entry in-place (txmempool.cpp:636).
+    this.clusterCacheDirty = true;
+  }
+
+  /**
+   * Modified fee for *txid* = base fee + stored delta (Core GetModifiedFee).
+   * Returns the base fee unchanged when no delta is set. If the tx is not in
+   * the mempool the base is 0, so the result is just the stored delta.
+   *
+   * @param txid internal-order txid bytes.
+   */
+  getModifiedFee(txid: Buffer): bigint {
+    const txidHex = txid.toString("hex");
+    const entry = this.entries.get(txidHex);
+    const base = entry ? entry.fee : 0n;
+    const delta = this.mapDeltas.get(txidHex) ?? 0n;
+    return base + delta;
+  }
+
+  /**
+   * Modified fee for an in-mempool *entry* = base fee + stored delta, clamped
+   * at 0 on net-negative (Core GetModifiedFee never goes negative in the
+   * mining/eviction comparators — kernel/mempool_entry.h). Takes the entry by
+   * reference so callers in the hot linearization/sort paths avoid a second
+   * map lookup. When no delta is set this returns `entry.fee` unchanged, which
+   * keeps un-prioritised txs byte-identical to the pre-delta behaviour.
+   *
+   * FIX-72 (mirrors rustoshi get_modified_fee, mempool.rs:3372): the entry's
+   * OWN single-entry mining rank + eviction pick consult this. Multi-ancestor
+   * delta folding (an ancestor's delta propagating into a descendant's
+   * cluster/ancestor score) is the W106 G8 separate follow-up and is NOT done
+   * here — chunk merges still aggregate raw `entry.fee`.
+   */
+  private getEntryModifiedFee(entry: MempoolEntry): bigint {
+    const delta = this.mapDeltas.get(entry.txid.toString("hex")) ?? 0n;
+    if (delta === 0n) return entry.fee;
+    const modified = entry.fee + delta;
+    return modified > 0n ? modified : 0n;
+  }
+
+  /**
+   * Modified fee *rate* (sat/vB) for an in-mempool *entry* = modified fee /
+   * vsize. This is the per-entry rank used by the block-template selection sort
+   * and by each transaction's seed chunk in cluster linearization (which in
+   * turn drives both `miningScore` and the eviction tail-chunk pick). For an
+   * un-prioritised tx this equals `entry.feeRate` exactly.
+   */
+  private getEntryModifiedFeeRate(entry: MempoolEntry): number {
+    const delta = this.mapDeltas.get(entry.txid.toString("hex")) ?? 0n;
+    if (delta === 0n) return entry.feeRate;
+    if (entry.vsize <= 0) return entry.feeRate;
+    return Number(this.getEntryModifiedFee(entry)) / entry.vsize;
+  }
+
+  /**
+   * Return the full mapDeltas snapshot (internal-order txid hex -> delta) for
+   * persistence (mempool.dat). Caller owns the copy.
+   */
+  getFeeDeltas(): Map<string, bigint> {
+    return new Map(this.mapDeltas);
+  }
+
+  /**
+   * Restore a single fee delta on load from mempool.dat. Unlike
+   * prioritiseTransaction this is an absolute set (the persisted value is
+   * already the accumulated net delta), and a 0 value is ignored.
+   *
+   * @param txid internal-order txid bytes.
+   */
+  loadFeeDelta(txid: Buffer, deltaSats: bigint): void {
+    if (deltaSats === 0n) return;
+    this.mapDeltas.set(txid.toString("hex"), deltaSats);
+    this.clusterCacheDirty = true;
+  }
+
+  /**
+   * Per-tx delta info for the getprioritisedtransactions RPC. Mirrors Core
+   * CTxMemPool::GetPrioritisedTransactions (txmempool.cpp:673): one record per
+   * mapDeltas entry, with modified_fee present only when the tx is in mempool.
+   * Returned txids are in internal byte order; the RPC layer reverses to
+   * display order for the JSON keys.
+   */
+  getPrioritisedTransactions(): Array<{
+    txid: Buffer;
+    feeDelta: bigint;
+    inMempool: boolean;
+    modifiedFee: bigint | null;
+  }> {
+    const result: Array<{
+      txid: Buffer;
+      feeDelta: bigint;
+      inMempool: boolean;
+      modifiedFee: bigint | null;
+    }> = [];
+    for (const [txidHex, delta] of this.mapDeltas) {
+      const entry = this.entries.get(txidHex);
+      const inMempool = entry !== undefined;
+      result.push({
+        txid: Buffer.from(txidHex, "hex"),
+        feeDelta: delta,
+        inMempool,
+        modifiedFee: inMempool ? entry!.fee + delta : null,
+      });
+    }
+    return result;
+  }
+
+  /**
+   * Drop *txid*'s prioritisation delta (Core ClearPrioritisation). Called when
+   * a tx confirms in a block so its delta does not leak onto a future
+   * unrelated tx that happens to reuse the txid. Other removal reasons
+   * (RBF replace, size-limit eviction, expiry, reorg) preserve the delta.
+   *
+   * @param txid internal-order txid bytes.
+   */
+  clearPrioritisation(txid: Buffer): void {
+    if (this.mapDeltas.delete(txid.toString("hex"))) {
+      this.clusterCacheDirty = true;
+    }
   }
 
   /**
@@ -3667,12 +3859,23 @@ export class Mempool {
     for (const txidHex of topoOrder) {
       const entry = this.entries.get(txidHex)!;
 
-      // Create a new chunk for this transaction
+      // FIX-72: seed each tx's chunk with its MODIFIED fee (base +
+      // prioritisetransaction delta), not the raw base fee. This single seed
+      // feeds BOTH the mining score (entry.miningScore = chunk.feeRate at
+      // rebuildClusterCache) AND the eviction pick (evict() scans the lowest
+      // tail chunk of each cluster linearization), so the delta now drives
+      // mining + eviction in-place — matching Core's UpdateModifiedFee +
+      // SetTransactionFee (txmempool.cpp:636-643). For an un-prioritised tx
+      // (delta 0) these equal entry.fee / entry.feeRate, so the chunk geometry
+      // is byte-identical to before. NOTE: chunk merges below still aggregate
+      // raw lastChunk.totalFee — multi-ancestor delta folding is W106 G8, a
+      // deliberately separate follow-up.
+      const seedFee = this.getEntryModifiedFee(entry);
       const newChunk: Chunk = {
         txids: new Set([txidHex]),
-        totalFee: entry.fee,
+        totalFee: seedFee,
         totalVsize: entry.vsize,
-        feeRate: entry.feeRate,
+        feeRate: this.getEntryModifiedFeeRate(entry),
       };
 
       // While the new chunk has a higher feerate than the last chunk, absorb it

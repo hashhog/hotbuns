@@ -1189,6 +1189,12 @@ export class RPCServer {
     this.registerMethod("dumpmempool", () => this.saveMempool());
     this.registerMethod("loadmempool", () => this.doLoadMempool());
     this.registerMethod("getorphantxs", (params) => this.getOrphanTxs(params));
+    this.registerMethod("prioritisetransaction", (params) =>
+      this.prioritiseTransaction(params)
+    );
+    this.registerMethod("getprioritisedtransactions", () =>
+      this.getPrioritisedTransactions()
+    );
 
     // Fee estimation
     this.registerMethod("estimatesmartfee", (params) =>
@@ -4728,25 +4734,27 @@ export class RPCServer {
       if (!entry) continue;
 
       const txidHex = Buffer.from(txid).reverse().toString("hex");
+      // Modified fee = base fee + prioritisetransaction delta (Core GetModifiedFee).
+      const modifiedFeeSats = this.mempool.getModifiedFee(txid);
       result[txidHex] = {
         vsize: entry.vsize,
         weight: entry.weight,
         fee: Number(entry.fee) / 100_000_000, // Convert to BTC
-        modifiedfee: Number(entry.fee) / 100_000_000,
+        modifiedfee: Number(modifiedFeeSats) / 100_000_000,
         time: entry.addedTime,
         height: entry.height,
         descendantcount: entry.spentBy.size + 1,
         descendantsize: entry.vsize, // Simplified
-        descendantfees: Number(entry.fee),
+        descendantfees: Number(modifiedFeeSats),
         ancestorcount: entry.dependsOn.size + 1,
         ancestorsize: entry.vsize, // Simplified
-        ancestorfees: Number(entry.fee),
+        ancestorfees: Number(modifiedFeeSats),
         wtxid: txidHex, // Simplified (same as txid for non-witness txs)
         fees: {
           base: Number(entry.fee) / 100_000_000,
-          modified: Number(entry.fee) / 100_000_000,
-          ancestor: Number(entry.fee) / 100_000_000,
-          descendant: Number(entry.fee) / 100_000_000,
+          modified: Number(modifiedFeeSats) / 100_000_000,
+          ancestor: Number(modifiedFeeSats) / 100_000_000,
+          descendant: Number(modifiedFeeSats) / 100_000_000,
         },
         depends: Array.from(entry.dependsOn),
         spentby: Array.from(entry.spentBy),
@@ -4779,25 +4787,28 @@ export class RPCServer {
     // Get mining score (effective fee rate from cluster linearization)
     const miningScore = entry.miningScore;
 
+    // Modified fee = base fee + prioritisetransaction delta (Core GetModifiedFee).
+    const modifiedFeeSats = this.mempool.getModifiedFee(txid);
+
     return {
       vsize: entry.vsize,
       weight: entry.weight,
       fee: Number(entry.fee) / 100_000_000,
-      modifiedfee: Number(entry.fee) / 100_000_000,
+      modifiedfee: Number(modifiedFeeSats) / 100_000_000,
       time: entry.addedTime,
       height: entry.height,
       descendantcount: entry.spentBy.size + 1,
       descendantsize: entry.vsize,
-      descendantfees: Number(entry.fee),
+      descendantfees: Number(modifiedFeeSats),
       ancestorcount: entry.dependsOn.size + 1,
       ancestorsize: entry.vsize,
-      ancestorfees: Number(entry.fee),
+      ancestorfees: Number(modifiedFeeSats),
       wtxid: txidParam,
       fees: {
         base: Number(entry.fee) / 100_000_000,
-        modified: Number(entry.fee) / 100_000_000,
-        ancestor: Number(entry.fee) / 100_000_000,
-        descendant: Number(entry.fee) / 100_000_000,
+        modified: Number(modifiedFeeSats) / 100_000_000,
+        ancestor: Number(modifiedFeeSats) / 100_000_000,
+        descendant: Number(modifiedFeeSats) / 100_000_000,
       },
       depends: Array.from(entry.dependsOn),
       spentby: Array.from(entry.spentBy),
@@ -4806,6 +4817,79 @@ export class RPCServer {
       // Cluster mempool fields
       miningScore: miningScore, // Effective fee rate (sat/vB) from chunk
     };
+  }
+
+  /**
+   * prioritisetransaction: add (or subtract) a fee delta used by mining
+   * selection and RBF fee comparisons, without actually paying the fee.
+   *
+   * Deltas STACK additively on any existing delta; a tx whose net delta
+   * returns to 0 is erased. The delta is stored even when the tx is not (yet)
+   * in the mempool. Persists to mempool.dat.
+   *
+   * @param params [txid, dummy?, fee_delta]
+   *   - txid: display-order (big-endian) hex.
+   *   - dummy: legacy priority arg; MUST be 0 or null (reject non-zero).
+   *   - fee_delta: satoshis to add (signed integer).
+   * Reference: bitcoin-core/src/rpc/mining.cpp:502 prioritisetransaction;
+   *   src/txmempool.cpp:630 PrioritiseTransaction.
+   */
+  private async prioritiseTransaction(params: unknown[]): Promise<boolean> {
+    const [txidParam, dummyParam, feeDeltaParam] = params;
+
+    if (typeof txidParam !== "string" || txidParam.length !== 64 || !/^[0-9a-fA-F]+$/.test(txidParam)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "txid must be a 64-character hex string");
+    }
+
+    // Legacy priority "dummy" arg: must be zero or null/omitted. Core throws
+    // RPC_INVALID_PARAMETER otherwise (mining.cpp:529-531).
+    if (dummyParam !== undefined && dummyParam !== null && dummyParam !== 0) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Priority is no longer supported, dummy argument to prioritisetransaction must be 0."
+      );
+    }
+
+    // fee_delta is an integer number of satoshis (Core: getInt<int64_t>()).
+    if (typeof feeDeltaParam !== "number" || !Number.isInteger(feeDeltaParam)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "fee_delta must be an integer number of satoshis"
+      );
+    }
+    const feeDelta = BigInt(feeDeltaParam);
+
+    // JSON-RPC txids are display order (big-endian); the mempool keys in
+    // internal byte order, so reverse before applying.
+    const txid = Buffer.from(txidParam, "hex").reverse();
+    this.mempool.prioritiseTransaction(txid, feeDelta);
+    return true;
+  }
+
+  /**
+   * getprioritisedtransactions: return a map of all user-created fee deltas
+   * keyed by display-order txid.
+   *
+   * Each value: { fee_delta: <signed int64 satoshis, always present>,
+   *               in_mempool: <bool>,
+   *               modified_fee: <int64 satoshis, ONLY when in_mempool> }.
+   * Reference: bitcoin-core/src/rpc/mining.cpp:547 getprioritisedtransactions.
+   */
+  private async getPrioritisedTransactions(): Promise<Record<string, Record<string, unknown>>> {
+    const result: Record<string, Record<string, unknown>> = {};
+    for (const info of this.mempool.getPrioritisedTransactions()) {
+      // Internal-order txid -> display-order hex for the JSON key.
+      const displayTxid = Buffer.from(info.txid).reverse().toString("hex");
+      const inner: Record<string, unknown> = {
+        fee_delta: info.feeDelta,
+        in_mempool: info.inMempool,
+      };
+      if (info.inMempool && info.modifiedFee !== null) {
+        inner.modified_fee = info.modifiedFee;
+      }
+      result[displayTxid] = inner;
+    }
+    return result;
   }
 
   /**

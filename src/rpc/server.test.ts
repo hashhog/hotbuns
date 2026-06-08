@@ -69,6 +69,33 @@ class MockMempool {
     return this.entries.has(txid.toString("hex"));
   }
 
+  // Mirrors the real Mempool.getModifiedFee (base fee + prioritisetransaction
+  // delta). The mock has no deltas, so this returns the base fee for an
+  // in-mempool tx and 0n otherwise. Required by the getrawmempool/
+  // getmempoolentry modifiedfee wiring (prioritisetransaction support).
+  getModifiedFee(txid: Buffer): bigint {
+    const entry = this.entries.get(txid.toString("hex"));
+    return entry ? entry.fee : 0n;
+  }
+
+  // Mirrors the real Mempool.getPrioritisedTransactions. The mock holds no
+  // deltas, so this is always empty — getprioritisedtransactions returns {}.
+  getPrioritisedTransactions(): Array<{
+    txid: Buffer;
+    feeDelta: bigint;
+    inMempool: boolean;
+    modifiedFee: bigint | null;
+  }> {
+    return [];
+  }
+
+  // Mirrors the real Mempool.prioritiseTransaction (no-op in the mock — there
+  // is no delta store to mutate). Lets the prioritisetransaction RPC dispatch
+  // succeed against the mock without a delta backing store.
+  prioritiseTransaction(_txid: Buffer, _deltaSats: bigint): void {
+    // No-op for tests.
+  }
+
   async addTransaction(tx: any) {
     // For testing, we always accept
     return { accepted: true };

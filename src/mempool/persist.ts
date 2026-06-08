@@ -123,6 +123,22 @@ export function applyObfuscation(
   }
 }
 
+// Core serializes fee deltas as int64_t (signed); BufferWriter.writeUInt64LE
+// only accepts an unsigned 64-bit bigint. These map a signed int64 to/from its
+// two's-complement unsigned bit pattern so negative deltas round-trip exactly.
+const U64_MOD = 1n << 64n;
+const I64_MAX = (1n << 63n) - 1n;
+
+/** Signed int64 -> unsigned 64-bit bit pattern (for writeUInt64LE). */
+function i64ToU64(v: bigint): bigint {
+  return v < 0n ? v + U64_MOD : v;
+}
+
+/** Unsigned 64-bit bit pattern (from readUInt64LE) -> signed int64. */
+function u64ToI64(v: bigint): bigint {
+  return v > I64_MAX ? v - U64_MOD : v;
+}
+
 /**
  * Pack a mempool snapshot into a single Buffer in MEMPOOL_DUMP_VERSION=2
  * format. Used by `dumpMempool` and exposed for unit tests so the byte
@@ -161,7 +177,7 @@ export function encodeMempoolDump(
   for (const { tx, time, feeDelta } of entries) {
     body.writeBytes(serializeTx(tx, true)); // TX_WITH_WITNESS
     body.writeUInt64LE(time);                // int64 LE
-    body.writeUInt64LE(feeDelta);            // int64 LE
+    body.writeUInt64LE(i64ToU64(feeDelta));  // int64 LE (signed bit pattern)
   }
   // mapDeltas: compactsize count, then (txid 32 bytes + int64 LE) per entry.
   // std::map iteration is sorted by key — we sort the txid hex strings to
@@ -172,7 +188,7 @@ export function encodeMempoolDump(
   body.writeVarInt(sortedDeltas.length);
   for (const [txidHex, delta] of sortedDeltas) {
     body.writeBytes(Buffer.from(txidHex, "hex"));
-    body.writeUInt64LE(delta);
+    body.writeUInt64LE(i64ToU64(delta));
   }
   // unbroadcast_txids: compactsize count, then 32-byte txid per entry,
   // again sorted to match std::set iteration order.
@@ -252,7 +268,7 @@ export function decodeMempoolDump(buf: Buffer): {
   for (let i = 0; i < txCount; i++) {
     const tx = deserializeTx(reader);
     const time = reader.readUInt64LE();
-    const feeDelta = reader.readUInt64LE();
+    const feeDelta = u64ToI64(reader.readUInt64LE());
     entries.push({ tx, time, feeDelta });
   }
 
@@ -260,7 +276,7 @@ export function decodeMempoolDump(buf: Buffer): {
   const mapDeltas = new Map<string, bigint>();
   for (let i = 0; i < mapCount; i++) {
     const txid = reader.readBytes(32);
-    const delta = reader.readUInt64LE();
+    const delta = u64ToI64(reader.readUInt64LE());
     mapDeltas.set(txid.toString("hex"), delta);
   }
 
@@ -298,19 +314,26 @@ export async function dumpMempool(
   const key = randomKey ?? Buffer.from(crypto.getRandomValues(new Uint8Array(OBFUSCATION_KEY_SIZE)));
 
   // Snapshot every entry into the format expected by encodeMempoolDump.
-  // hotbuns lacks a tx-level "feeDelta" prioritisation modifier, so 0n.
+  // Mirrors Core node/mempool_persist.cpp: each in-mempool tx carries its
+  // prioritisation delta inline (the per-tx feeDelta field), and that txid is
+  // removed from the trailing mapDeltas block so it is not double-counted.
+  // The remaining mapDeltas entries are deltas for txids NOT in the mempool.
+  const deltas = mempool.getFeeDeltas(); // internal-order txid hex -> delta
   const entries: Array<{ tx: Transaction; time: bigint; feeDelta: bigint }> = [];
   for (const txid of mempool.getAllTxids()) {
     const entry = mempool.getTransaction(txid);
     if (!entry) continue;
+    const txidHex = txid.toString("hex");
     entries.push({
       tx: entry.tx,
       time: BigInt(entry.addedTime),
-      feeDelta: 0n,
+      feeDelta: deltas.get(txidHex) ?? 0n,
     });
+    deltas.delete(txidHex);
   }
 
-  const buf = encodeMempoolDump(entries, new Map(), new Set(), key);
+  // Remaining deltas belong to txids not currently in the mempool.
+  const buf = encodeMempoolDump(entries, deltas, new Set(), key);
 
   await fsp.mkdir(datadir, { recursive: true });
   await fsp.writeFile(newPath, buf);
@@ -360,7 +383,7 @@ export async function loadMempool(
   }
 
   const nowSec = Math.floor(Date.now() / 1000);
-  for (const { tx, time } of decoded.entries) {
+  for (const { tx, time, feeDelta } of decoded.entries) {
     if (Number(time) < nowSec - expirySeconds) {
       result.expired++;
       continue;
@@ -368,18 +391,24 @@ export async function loadMempool(
     const accept = await mempool.acceptToMemoryPool(tx);
     if (accept.accepted) {
       result.succeeded++;
+      // Restore this tx's prioritisation delta (Core stores it inline per tx
+      // and applies it via ApplyDelta at acceptance). loadFeeDelta is an
+      // absolute set and ignores 0, so untouched txs are unaffected.
+      if (feeDelta !== 0n) {
+        mempool.loadFeeDelta(getTxId(tx), feeDelta);
+      }
     } else {
       result.failed++;
     }
   }
 
-  // hotbuns does not yet expose PrioritiseTransaction or an unbroadcast
-  // tracker, but we still report the count so operators can see when a
-  // future load brings priority data through unchanged.
+  // Trailing mapDeltas hold deltas for txids NOT in the mempool (Core keeps
+  // these so a later-arriving tx is still prioritised). Restore them all.
+  for (const [txidHex, delta] of decoded.mapDeltas) {
+    mempool.loadFeeDelta(Buffer.from(txidHex, "hex"), delta);
+  }
+
   result.unbroadcast = decoded.unbroadcast.size;
-  // Touch mapDeltas reference so an unused-var lint doesn't fire on
-  // future strict configs; the data is intentionally dropped today.
-  void decoded.mapDeltas;
 
   return result;
 }
