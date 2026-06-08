@@ -236,6 +236,16 @@ export interface RPCServerDeps {
    * lists indexes that are actually running.
    */
   filterIndex?: import("../storage/indexes.js").BlockFilterIndex;
+  /**
+   * The persistent, reorg-safe coinstatsindex, present only when the operator
+   * started the node with `--coinstatsindex=1` (cli.ts constructs and wires
+   * it). Used by `gettxoutsetinfo` to serve UTXO-set statistics AS OF a
+   * historical `hash_or_height` (per-height MuHash3072 + counts) and by
+   * `getindexinfo` to report the "coinstatsindex" entry. When absent, a non-
+   * tip `hash_or_height` errors with -8 (Core parity).
+   * Reference: bitcoin-core/src/index/coinstatsindex.cpp.
+   */
+  coinStatsIndex?: import("../storage/indexes.js").PersistentCoinStatsIndex;
 }
 
 /** RPC error codes. */
@@ -503,6 +513,9 @@ export class RPCServer {
   private orphanPool?: OrphanPool;
   /** BIP-157/158 basic block filter index (present iff --blockfilterindex). */
   private filterIndex?: import("../storage/indexes.js").BlockFilterIndex;
+  /** Per-height UTXO coinstats index (present iff --coinstatsindex). Backs
+   *  gettxoutsetinfo at a historical hash_or_height + getindexinfo. */
+  private coinStatsIndex?: import("../storage/indexes.js").PersistentCoinStatsIndex;
   private shutdownCallback: (() => void) | null = null;
   /** Current wallet name for request context (set from URL path). */
   private currentWalletName: string | null = null;
@@ -597,6 +610,7 @@ export class RPCServer {
     this.blockSync = deps.blockSync;
     this.orphanPool = deps.orphanPool;
     this.filterIndex = deps.filterIndex;
+    this.coinStatsIndex = deps.coinStatsIndex;
     this.methods = new Map();
 
     this.registerBuiltinMethods();
@@ -2413,6 +2427,16 @@ export class RPCServer {
       const bestBlockHeight = filterHeight < 0 ? 0 : filterHeight;
       const synced = filterHeight >= 0 && filterHeight >= headerHeight;
       pushIndex("basic block filter index", synced, bestBlockHeight);
+    }
+
+    // coinstatsindex — running only when --coinstatsindex set. Same shape as
+    // the other indexes: synced iff its best indexed height has reached the
+    // active chain tip. Mirrors Core's getindexinfo entry "coinstatsindex".
+    if (this.coinStatsIndex && this.coinStatsIndex.isEnabled()) {
+      const csHeight = this.coinStatsIndex.getHeight();
+      const bestBlockHeight = csHeight < 0 ? 0 : csHeight;
+      const synced = csHeight >= 0 && csHeight >= headerHeight;
+      pushIndex("coinstatsindex", synced, bestBlockHeight);
     }
 
     return result;
@@ -7352,6 +7376,17 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.MISC_ERROR, result.error || "Block invalidation failed");
     }
 
+    // Roll the BlockSync IBD frontier back to the now-rolled-back tip.
+    // invalidateBlock rewinds the validated chain state but leaves the sync
+    // frontier (nextHeightToProcess) at its old high-water mark; without this
+    // a subsequently-submitted competing-chain block at a height <= the old
+    // tip is short-circuited as "duplicate" (side-branch only) and never
+    // reaches the connect/reorg path, so the node cannot adopt the more-work
+    // chain. Mirrors Core InvalidateBlock re-deriving the candidate tip set.
+    if (this.blockSync) {
+      this.blockSync.resyncFrontierAfterRollback();
+    }
+
     return null;
   }
 
@@ -10916,22 +10951,99 @@ export class RPCServer {
       );
     }
 
-    // ── hash_or_height / use_index require coinstatsindex (out of scope). ──
-    // A specific block requested with hash_serialized_3 is the explicit Core
-    // error path we mirror (-8); any specific-block request otherwise also
-    // needs coinstatsindex, which hotbuns does not run here.
+    // ── hash_or_height / use_index: serve a HISTORICAL block via the
+    //    coinstatsindex when enabled; otherwise mirror Core's -8 errors. ──
+    //
+    // Core (rpc/blockchain.cpp::gettxoutsetinfo):
+    //   • hash_serialized_3 at a specific block ALWAYS errors -8
+    //     ("hash_serialized_3 hash type cannot be queried for a specific
+    //     block"), even with coinstatsindex — it is computed only over the
+    //     live chainstate cursor, never the index.
+    //   • muhash / none at a specific block require coinstatsindex; without it
+    //     → -8 ("Querying specific block heights requires coinstatsindex").
+    //   • With coinstatsindex, route to g_coin_stats_index->LookUpStats and
+    //     return {height, bestblock@H, txouts, bogosize, muhash, total_amount}.
     const hashOrHeight = params[1];
     if (hashOrHeight !== undefined && hashOrHeight !== null) {
+      // hash_serialized_3 at a specific block is unconditionally rejected.
       if (hashType === "hash_serialized_3") {
         throw this.rpcError(
           RPCErrorCodes.INVALID_PARAMETER,
           "hash_serialized_3 hash type cannot be queried for a specific block",
         );
       }
-      throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMETER,
-        "Querying specific block heights requires coinstatsindex",
-      );
+      // muhash / none at a specific block need the coinstatsindex.
+      if (!this.coinStatsIndex || !this.coinStatsIndex.isEnabled()) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          "Querying specific block heights requires coinstatsindex",
+        );
+      }
+
+      // Resolve hash_or_height -> (height, blockHash@height). Accept an integer
+      // height or a 64-hex block hash, mirroring Core's ParseHashOrHeight.
+      let targetHeight: number | null = null;
+      const tipHeight = this.chainState.getBestBlock().height;
+      if (typeof hashOrHeight === "number" && Number.isInteger(hashOrHeight)) {
+        targetHeight = hashOrHeight;
+      } else if (typeof hashOrHeight === "string") {
+        if (/^[0-9a-fA-F]{64}$/.test(hashOrHeight)) {
+          // Block hash (RPC display order is reversed from internal order).
+          const hashBuf = Buffer.from(hashOrHeight, "hex").reverse();
+          const idx = await this.db.getBlockIndex(hashBuf);
+          if (!idx) {
+            throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found");
+          }
+          targetHeight = idx.height;
+        } else if (/^\d+$/.test(hashOrHeight)) {
+          targetHeight = parseInt(hashOrHeight, 10);
+        } else {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_PARAMETER,
+            `${hashOrHeight} is not a valid hash or height`,
+          );
+        }
+      } else {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          "hash_or_height must be an integer height or a block hash string",
+        );
+      }
+
+      if (targetHeight < 0 || targetHeight > tipHeight) {
+        // Core: "Block height out of range".
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          "Block height out of range",
+        );
+      }
+
+      const csStats = await this.coinStatsIndex.getAtHeight(targetHeight);
+      if (!csStats) {
+        // Index enabled but this height is not yet indexed.
+        throw this.rpcError(
+          RPCErrorCodes.MISC_ERROR,
+          `Unable to read UTXO set at height ${targetHeight}`,
+        );
+      }
+
+      // bestblock = the hash AT the queried height (NOT the tip). The snapshot
+      // stores the block hash at H; reverse to RPC display order.
+      const bestBlockAtH = Buffer.from(csStats.blockHash).reverse().toString("hex");
+
+      const result: Record<string, unknown> = {
+        height: targetHeight,
+        bestblock: bestBlockAtH,
+        txouts: Number(csStats.txouts),
+        bogosize: Number(csStats.bogoSize),
+        total_amount: formatBtcAmount(csStats.totalAmount),
+      };
+      if (hashType === "muhash") {
+        // MuHash3072.finalize() yields the display-order digest; reverse for
+        // the standard hex display, matching Core's uint256::GetHex.
+        result.muhash = Buffer.from(csStats.muhash).reverse().toString("hex");
+      }
+      return result;
     }
 
     const chainState = await this.db.getChainState();

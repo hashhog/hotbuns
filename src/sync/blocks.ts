@@ -401,6 +401,20 @@ export class BlockSync {
   private filterIndex: import("../storage/indexes.js").BlockFilterIndex | null = null;
 
   /**
+   * Persistent, reorg-safe coinstatsindex (Bitcoin Core -coinstatsindex
+   * parity). Present (non-null) only when the operator passed
+   * `--coinstatsindex=1`; cli.ts constructs it and wires it via
+   * `setCoinStatsIndex()`. Every successful `connectBlock` calls
+   * `coinStatsIndex.indexBlock(block, height, spentOutputs)` so the per-height
+   * UTXO MuHash3072 + counts snapshot is maintained on the PRIMARY block
+   * connect path — the same path that maintains txindex / blockfilterindex,
+   * NOT only the submitblock RPC path. The reorg disconnect side rewinds it in
+   * `disconnectBlockUtxo`. Reference:
+   * bitcoin-core/src/index/coinstatsindex.cpp::CustomAppend / CustomRewind.
+   */
+  private coinStatsIndex: import("../storage/indexes.js").PersistentCoinStatsIndex | null = null;
+
+  /**
    * Number of parallel script-verification workers.
    * 1  = sequential (verifyAllInputsSequential) — benchmark baseline.
    * >1 = parallel   (verifyAllInputsParallel)   — production default.
@@ -503,6 +517,107 @@ export class BlockSync {
     filterIndex: import("../storage/indexes.js").BlockFilterIndex
   ): void {
     this.filterIndex = filterIndex;
+  }
+
+  /**
+   * Wire the persistent, reorg-safe coinstatsindex.
+   *
+   * When the operator passes `--coinstatsindex=1`, cli.ts constructs a
+   * `PersistentCoinStatsIndex` and registers it here. Every successful
+   * `connectBlock` calls `coinStatsIndex.indexBlock(block, height,
+   * spentOutputs)` so the per-height UTXO MuHash3072 + counts snapshot is
+   * maintained on the PRIMARY connect path; the reorg disconnect side
+   * (`disconnectBlockUtxo`) calls `removeBlock(height)`.
+   *
+   * No-op when not wired (default off, matches Bitcoin Core's
+   * `DEFAULT_COINSTATSINDEX = false`).
+   *
+   * Reference: bitcoin-core/src/index/coinstatsindex.cpp::CustomAppend.
+   */
+  setCoinStatsIndex(
+    coinStatsIndex: import("../storage/indexes.js").PersistentCoinStatsIndex
+  ): void {
+    this.coinStatsIndex = coinStatsIndex;
+  }
+
+  /**
+   * Re-derive the block-sync frontier from the ChainStateManager's current
+   * (rolled-back) tip.
+   *
+   * `invalidateblock` (and any other path that rolls the active chain back via
+   * `ChainStateManager.invalidateBlock` / `disconnectBlock`) rewinds the
+   * VALIDATED chain state, but the BlockSync IBD frontier
+   * (`state.nextHeightToProcess`) is a SEPARATE high-water mark that is only
+   * advanced on connect — it is never lowered. After an invalidateblock that
+   * rolls the tip from N back to F, the frontier is left at N+1, so a
+   * subsequently-submitted competing-chain block at a height in (F, N] takes
+   * the `headerEntry.height < nextHeightToProcess` early-return in
+   * `injectBlock` ("duplicate", stored only as a side-branch) and NEVER reaches
+   * the connect/reorg dispatch in `connectBlock`. The node then cannot adopt
+   * the more-work competing chain even though every block is valid — it sits
+   * stuck at F. This was caught by the coinstatsindex reorg-safety harness
+   * (test-suite/coinstats/*_coinstatsindex.sh): invalidateblock(F+1) then
+   * submitblock B's F+1..N+3 left hotbuns pinned at F while Core reorged to B.
+   *
+   * Fix: after a rollback, snap the frontier back down to `tip.height + 1` and
+   * evict any buffered/pending blocks at heights >= the new frontier (stale
+   * chain-A bodies that would otherwise be re-fed). Resubmitted competing
+   * blocks at heights in (F, N] then route through the normal connect path,
+   * where the pre-connect reorg dispatch (`handleReorgUtxoAndCollect`) and the
+   * coinstatsindex connect hook fire as on any active-tip extension.
+   *
+   * Mirrors Bitcoin Core's InvalidateBlock, which rolls back the active chain
+   * AND re-derives the set of candidate tips so a competing branch can be
+   * activated by a later block (validation.cpp::InvalidateBlock →
+   * ActivateBestChain). No-op when no ChainStateManager is wired.
+   */
+  resyncFrontierAfterRollback(): void {
+    if (!this.chainStateManager) return;
+    const tip = this.chainStateManager.getBestBlock();
+    const tipHeight = tip.height;
+    const newFrontier = tipHeight + 1;
+    if (newFrontier >= this.state.nextHeightToProcess) {
+      // Frontier already at/below the new tip — nothing to roll back.
+      return;
+    }
+    // CRITICAL: BlockSync owns a SEPARATE UTXOManager instance from the
+    // ChainStateManager (both back the same LevelDB, but each has its own
+    // in-memory cache + view-best-block pointer; see the constructor's
+    // `new UTXOManager(db, ...)`). invalidateBlock rolled the chain back via
+    // ChainStateManager.disconnectBlock, which flushed the rolled-back UTXO
+    // state to disk and re-pointed *its* view at the fork tip — but BlockSync's
+    // utxoManager still caches the pre-rollback set and points its view at the
+    // OLD tip. The next connectBlock then trips coreConnectBlockChecks'
+    // `view-out-of-sync` gate (the cached view-best != the new block's prev).
+    // Drop BlockSync's stale cache and re-point its view at the now-persisted
+    // fork tip so subsequent connects lazy-load the correct rolled-back coins.
+    this.utxoManager.clearCache(tip.hash);
+    this.state.nextHeightToProcess = newFrontier;
+    if (this.state.nextHeightToRequest > newFrontier) {
+      this.state.nextHeightToRequest = newFrontier;
+    }
+    if (this.lastFlushedHeight > tipHeight) {
+      this.lastFlushedHeight = tipHeight;
+    }
+    // Evict buffered + pending blocks at heights at/above the new frontier:
+    // those are stale chain-A bodies (or speculative downloads) that must not
+    // be auto-reconnected ahead of the operator re-feeding the chosen branch.
+    for (const [hex, blk] of this.state.downloadedBlocks) {
+      const entry = this.headerSync.getHeader(getBlockHash(blk.header));
+      if (entry && entry.height >= newFrontier) {
+        this.state.downloadedBlocks.delete(hex);
+        this.downloadedBlockPeers.delete(hex);
+      }
+    }
+    for (const [hex, pending] of this.state.pendingBlocks) {
+      if (pending.height >= newFrontier) {
+        this.state.pendingBlocks.delete(hex);
+      }
+    }
+    console.log(
+      `[invalidateblock] block-sync frontier rolled back to height ${tipHeight} ` +
+        `(nextHeightToProcess=${newFrontier})`
+    );
   }
 
   /**
@@ -2183,6 +2298,28 @@ export class BlockSync {
       }
     }
 
+    // ── coinstatsindex rewind on disconnect (reorg) ──
+    //
+    // Symmetric with the `coinStatsIndex.indexBlock(...)` call in
+    // `connectBlock`: drop the per-height snapshot at `height` so the running
+    // state for the new tip is the already-persisted height-1 snapshot. No
+    // recomputation needed — the per-height snapshots are self-contained.
+    // Mirrors bitcoin-core/src/index/coinstatsindex.cpp::CustomRewind.
+    //
+    // Best-effort: a rewind failure must NOT roll back the disconnect.
+    if (this.coinStatsIndex && this.coinStatsIndex.isEnabled()) {
+      try {
+        await this.coinStatsIndex.removeBlock(height);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[coinstatsindex] failed to remove block ${blockHash
+            .toString("hex")
+            .slice(0, 16)} at h=${height}: ${msg} (continuing)`
+        );
+      }
+    }
+
     return true;
   }
 
@@ -2960,6 +3097,35 @@ export class BlockSync {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(
           `[blockfilterindex] failed to index block ${blockHash.toString("hex").slice(0, 16)} at h=${height}: ${msg} (continuing)`
+        );
+      }
+    }
+
+    // ── coinstatsindex: per-height UTXO MuHash3072 + counts ──
+    //
+    // When the operator passed `--coinstatsindex=1`, cli.ts wires a
+    // PersistentCoinStatsIndex into this BlockSync via setCoinStatsIndex().
+    // Each connected block applies its created-output / spent-prevout delta to
+    // the running MuHash3072 + txouts/total_amount/bogosize and persists a
+    // self-contained per-height snapshot, so `gettxoutsetinfo <type> <height>`
+    // can answer for a HISTORICAL height byte-exactly vs Core's coinstatsindex.
+    //
+    // Run on the PRIMARY connect path (this method) — the same path that
+    // maintains txindex/blockfilterindex above — NOT only the submitblock RPC
+    // path, so P2P/IBD sync is indexed too. The undo data (coreResult.
+    // spentOutputs) carries each spent coin's original height+coinbase+amount+
+    // script, exactly what the TxOutSer REMOVE needs.
+    //
+    // Best-effort: a coinstats failure must NOT roll back the block connect
+    // (mirrors Core's BaseIndex IndexFailure handling).
+    // Reference: bitcoin-core/src/index/coinstatsindex.cpp::CustomAppend.
+    if (this.coinStatsIndex && this.coinStatsIndex.isEnabled()) {
+      try {
+        await this.coinStatsIndex.indexBlock(block, height, coreResult.spentOutputs);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[coinstatsindex] failed to index block ${blockHash.toString("hex").slice(0, 16)} at h=${height}: ${msg} (continuing)`
         );
       }
     }

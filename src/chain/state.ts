@@ -202,6 +202,13 @@ export class ChainStateManager {
    *  generateblock RPC reorg path. The IBD reorg path (BlockSync)
    *  has its own copy of this reference. */
   private filterIndex: import("../storage/indexes.js").BlockFilterIndex | null = null;
+  /** Persistent, reorg-safe coinstatsindex. Wired via setCoinStatsIndex()
+   *  from cli.ts when `--coinstatsindex=1`. Used by the chain-state-manager
+   *  reorg paths (invalidateblock, reorganize, generateblock): connectBlock
+   *  calls indexBlock(...), disconnectBlock calls removeBlock(...). The IBD
+   *  reorg path (BlockSync) holds its own reference to the same instance.
+   *  Reference: bitcoin-core/src/index/coinstatsindex.cpp. */
+  private coinStatsIndex: import("../storage/indexes.js").PersistentCoinStatsIndex | null = null;
   /** Precious block for tie-breaking. null if no precious block set. */
   private preciousBlockHash: Buffer | null = null;
   /** Sequence ID for precious block tie-breaking. Lower = more precious. */
@@ -251,6 +258,21 @@ export class ChainStateManager {
     filterIndex: import("../storage/indexes.js").BlockFilterIndex
   ): void {
     this.filterIndex = filterIndex;
+  }
+
+  /**
+   * Wire the persistent coinstatsindex so reorg paths invoked through the
+   * chain-state manager (invalidateblock, reorganize, generateblock) keep the
+   * per-height UTXO MuHash3072 + counts snapshot in lockstep with the chain
+   * tip — connectBlock appends, disconnectBlock rewinds.
+   *
+   * No-op when not wired (default off; Bitcoin Core DEFAULT_COINSTATSINDEX).
+   * Reference: bitcoin-core/src/index/coinstatsindex.cpp.
+   */
+  setCoinStatsIndex(
+    coinStatsIndex: import("../storage/indexes.js").PersistentCoinStatsIndex
+  ): void {
+    this.coinStatsIndex = coinStatsIndex;
   }
 
   /**
@@ -449,6 +471,29 @@ export class ChainStateManager {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(
           `[blockfilterindex] failed to index block ${blockHash
+            .toString("hex")
+            .slice(0, 16)} at h=${height}: ${msg} (continuing)`
+        );
+      }
+    }
+
+    // ── coinstatsindex: advance the per-height UTXO MuHash on connect ──
+    //
+    // Connect-side counterpart to the `coinStatsIndex.removeBlock(...)` call in
+    // disconnectBlock. Covers the chain-state-manager connect paths
+    // (generateblock / dumptxoutset re-apply / reorganize reconnect). Mirrors
+    // BaseIndex::BlockConnected → CustomAppend. The spentOutputs list is the
+    // same undo data the block-filter index above consumes, carrying each spent
+    // coin's original height+coinbase+amount+script for the TxOutSer REMOVE.
+    // Best-effort: a failure is logged and ignored — never aborts the connect.
+    // Reference: bitcoin-core/src/index/coinstatsindex.cpp::CustomAppend.
+    if (this.coinStatsIndex && this.coinStatsIndex.isEnabled()) {
+      try {
+        await this.coinStatsIndex.indexBlock(block, height, spentOutputs);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[coinstatsindex] failed to index block ${blockHash
             .toString("hex")
             .slice(0, 16)} at h=${height}: ${msg} (continuing)`
         );
@@ -789,6 +834,27 @@ export class ChainStateManager {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(
           `[blockfilterindex] failed to remove block ${blockHash
+            .toString("hex")
+            .slice(0, 16)} at h=${height}: ${msg} (continuing)`
+        );
+      }
+    }
+
+    // ── coinstatsindex rewind on disconnect (invalidateblock / reorg) ──
+    //
+    // Drop the per-height snapshot at `height`; the running state for the new
+    // tip is the already-persisted height-1 snapshot. This is the path that
+    // invalidateblock walks (invalidateBlock → disconnectBlock), so the
+    // harness's invalidateblock-triggered reorg rewinds the index here.
+    // Mirrors bitcoin-core/src/index/coinstatsindex.cpp::CustomRewind.
+    // Best-effort: never roll back the chain disconnect on a rewind hiccup.
+    if (this.coinStatsIndex && this.coinStatsIndex.isEnabled()) {
+      try {
+        await this.coinStatsIndex.removeBlock(height);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[coinstatsindex] failed to remove block ${blockHash
             .toString("hex")
             .slice(0, 16)} at h=${height}: ${msg} (continuing)`
         );

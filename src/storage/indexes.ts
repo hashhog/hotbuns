@@ -19,6 +19,7 @@ import { deserializeBlock, getBlockHash } from "../validation/block.js";
 import { getTxId, isCoinbase } from "../validation/tx.js";
 import { sha256Hash, hash256 } from "../crypto/primitives.js";
 import type { SpentUTXO } from "../chain/utxo.js";
+import { MuHash3072 } from "../wire/muhash.js";
 
 // =============================================================================
 // Database Prefixes for Indexes
@@ -1445,6 +1446,430 @@ export class CoinStatsIndex {
       totalAmount: this.totalAmount,
       totalSubsidy: this.totalSubsidy,
       bogoSize: this.bogoSize,
+    };
+  }
+}
+
+// =============================================================================
+// Persistent, reorg-safe Coin Stats Index (Bitcoin Core -coinstatsindex parity)
+// =============================================================================
+
+/**
+ * Per-coin TxOutSer bytes — the canonical Bitcoin Core kernel/coinstats.cpp
+ * `TxOutSer` element fed into the running MuHash3072. Byte-identical to
+ * `src/chain/snapshot.ts::txOutSerBytes` (the @tip gettxoutsetinfo path), so
+ * the historical digest is constructed exactly like the tip digest:
+ *
+ *   COutPoint  = txid (32 LE) || vout (uint32 LE)
+ *   uint32     = (height << 1) + coinbase
+ *   CTxOut     = int64 nValue (LE) || CScript (CompactSize len || bytes)
+ *
+ * Reference: bitcoin-core/src/kernel/coinstats.cpp::TxOutSer / ApplyCoinHash.
+ */
+function coinStatsTxOutSer(
+  txid: Buffer,
+  vout: number,
+  height: number,
+  coinbase: boolean,
+  amount: bigint,
+  scriptPubKey: Buffer
+): Buffer {
+  const writer = new BufferWriter();
+  writer.writeHash(txid);
+  writer.writeUInt32LE(vout);
+  writer.writeUInt32LE(((height << 1) + (coinbase ? 1 : 0)) >>> 0);
+  writer.writeUInt64LE(amount);
+  writer.writeVarBytes(scriptPubKey);
+  return writer.toBuffer();
+}
+
+/**
+ * Per-coin "bogo size" — kernel/coinstats.cpp::GetBogoSize:
+ *   32 (txid) + 4 (vout) + 4 (height|coinbase) + 8 (amount) + 2 (len field)
+ *   + scriptPubKey.size()
+ * This is the SAME constant set used by `src/chain/snapshot.ts::getBogoSize`
+ * for the @tip path, so historical bogosize matches the tip computation.
+ */
+function coinStatsBogoSize(scriptPubKeyLen: number): bigint {
+  return 32n + 4n + 4n + 8n + 2n + BigInt(scriptPubKeyLen);
+}
+
+/** Mirror Bitcoin Core `CScript::IsUnspendable` (script/script.h):
+ *  empty-or-OP_RETURN-prefixed, or longer than MAX_SCRIPT_SIZE (10000).
+ *  Unspendable outputs are never added to the UTXO set, so the index must
+ *  skip them when applying created outputs (matches CoinsViewCache.addCoin). */
+function coinStatsIsUnspendable(script: Buffer): boolean {
+  return (script.length > 0 && script[0] === 0x6a) || script.length > 10000;
+}
+
+/**
+ * Self-contained per-height running coinstats snapshot record.
+ *
+ * Wire format (LevelDB value under prefix COIN_STATS, key = height BE32):
+ *   block_hash        32 bytes (internal byte order)
+ *   muhash serialize  768 bytes (numerator 384 LE || denominator 384 LE)
+ *   txouts            u64 LE
+ *   total_amount      u64 LE (sats; UTXO totals are always >= 0)
+ *   bogo_size         u64 LE
+ *
+ * Storing the FULL MuHash3072 accumulator (num/den) — not just the digest —
+ * makes every height self-contained: connect(H) loads the H-1 record, applies
+ * the block delta, writes H; disconnect(H) just drops H and the new tip's
+ * running state is the already-persisted H-1 record. No recomputation on
+ * reorg, which makes reorg trivially correct and per-height atomic.
+ */
+interface CoinStatsSnapshot {
+  blockHash: Buffer;
+  muhash: MuHash3072;
+  txouts: bigint;
+  totalAmount: bigint;
+  bogoSize: bigint;
+}
+
+function serializeCoinStatsSnapshot(snap: CoinStatsSnapshot): Buffer {
+  const writer = new BufferWriter();
+  writer.writeHash(snap.blockHash);
+  // MuHash3072.serialize() = numerator(384) || denominator(384) = 768 bytes.
+  const mu = snap.muhash.serialize();
+  for (const b of mu) writer.writeUInt8(b);
+  writer.writeUInt64LE(snap.txouts);
+  writer.writeUInt64LE(snap.totalAmount);
+  writer.writeUInt64LE(snap.bogoSize);
+  return writer.toBuffer();
+}
+
+function deserializeCoinStatsSnapshot(data: Buffer): CoinStatsSnapshot {
+  const reader = new BufferReader(data);
+  const blockHash = reader.readHash();
+  const muBytes = reader.readBytes(768);
+  const txouts = reader.readUInt64LE();
+  const totalAmount = reader.readUInt64LE();
+  const bogoSize = reader.readUInt64LE();
+  return {
+    blockHash,
+    muhash: MuHash3072.deserialize(muBytes),
+    txouts,
+    totalAmount,
+    bogoSize,
+  };
+}
+
+/** Query result for gettxoutsetinfo @ a historical height / getindexinfo. */
+export interface CoinStatsAtHeight {
+  /** Block hash AT the queried height, internal byte order (32 bytes). */
+  blockHash: Buffer;
+  /** 32-byte MuHash3072 digest, internal byte order (caller reverses for hex). */
+  muhash: Buffer;
+  txouts: bigint;
+  totalAmount: bigint;
+  bogoSize: bigint;
+}
+
+/**
+ * PersistentCoinStatsIndex — Bitcoin Core `-coinstatsindex` parity.
+ *
+ * Maintains, per block height, a running MuHash3072 over the UTXO set plus
+ * cumulative counts (txouts), total amount, and bogosize, persisted as a
+ * SELF-CONTAINED per-height snapshot. Lets `gettxoutsetinfo` answer for a
+ * HISTORICAL `hash_or_height` byte-exactly vs Core, and `getindexinfo`
+ * report the index.
+ *
+ * Maintained INCREMENTALLY on the node's PRIMARY block connect+disconnect
+ * path (the same path that maintains txindex / blockfilterindex):
+ *   - connect(block, H, spentOutputs): load H-1 running state, INSERT each
+ *     created spendable output's TxOutSer (skip unspendable), REMOVE each
+ *     spent prevout's TxOutSer (from undo data, using its ORIGINAL height +
+ *     coinbase flag + amount + script), update counters, write the H snapshot.
+ *   - disconnect(H): drop the H snapshot, roll best height back to H-1.
+ *
+ * Reorg = a sequence of disconnects (drop snapshots) followed by connects of
+ * the new branch (each recomputed from its parent snapshot). Idempotent: a
+ * repeat connect at an already-indexed height recomputes from H-1 and
+ * overwrites, so a double-fire never double-counts.
+ *
+ * References:
+ *   - bitcoin-core/src/index/coinstatsindex.cpp  (CustomAppend / CustomRewind)
+ *   - bitcoin-core/src/kernel/coinstats.cpp       (TxOutSer / ApplyCoinHash /
+ *                                                  GetBogoSize)
+ *   - ouroboros src/ouroboros/coinstatsindex.py,
+ *     blockbrew internal/storage/coinstatsindex.go (committed reorg-safe refs).
+ */
+export class PersistentCoinStatsIndex {
+  private db: ChainDB;
+  private enabled: boolean;
+  /** Highest height with a persisted snapshot, or -1 when empty. */
+  private bestHeight: number;
+
+  constructor(db: ChainDB, enabled: boolean = false) {
+    this.db = db;
+    this.enabled = enabled;
+    this.bestHeight = -1;
+  }
+
+  isEnabled(): boolean {
+    return this.enabled;
+  }
+
+  /** Best indexed height (-1 when nothing indexed yet). */
+  getHeight(): number {
+    return this.bestHeight;
+  }
+
+  /** Encode a height as a 4-byte big-endian key for lexicographic ordering. */
+  private heightKey(height: number): Buffer {
+    const k = Buffer.alloc(4);
+    k.writeUInt32BE(height >>> 0, 0);
+    return k;
+  }
+
+  private snapPutOp(height: number, snap: CoinStatsSnapshot): BatchOperation {
+    return {
+      type: "put",
+      prefix: IndexPrefix.COIN_STATS as unknown as DBPrefix,
+      key: this.heightKey(height),
+      value: serializeCoinStatsSnapshot(snap),
+    };
+  }
+
+  private tipPutOp(height: number): BatchOperation {
+    const w = new BufferWriter();
+    w.writeUInt32LE(height >>> 0);
+    return {
+      type: "put",
+      prefix: IndexPrefix.COIN_STATS_TIP as unknown as DBPrefix,
+      key: Buffer.alloc(0),
+      value: w.toBuffer(),
+    };
+  }
+
+  /**
+   * Load the persisted snapshot at *height*, or null if absent.
+   * Reads through the underlying ClassicLevel (same accessor pattern the
+   * sibling indexes use).
+   */
+  private async readSnapshot(height: number): Promise<CoinStatsSnapshot | null> {
+    if (height < 0) return null;
+    const key = Buffer.concat([
+      Buffer.from([IndexPrefix.COIN_STATS]),
+      this.heightKey(height),
+    ]);
+    try {
+      const data = await (this.db as any).db.get(key);
+      if (!data) return null;
+      return deserializeCoinStatsSnapshot(data);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Running accumulator AS OF *height* (empty multiset for height < 0). */
+  private async loadRunning(height: number): Promise<CoinStatsSnapshot> {
+    const snap = await this.readSnapshot(height);
+    if (snap) return snap;
+    return {
+      blockHash: Buffer.alloc(32, 0),
+      muhash: new MuHash3072(),
+      txouts: 0n,
+      totalAmount: 0n,
+      bogoSize: 0n,
+    };
+  }
+
+  /**
+   * Initialise from disk: recover the best indexed height from the TIP
+   * singleton (mirrors BlockFilterIndex.init / TxIndexManager.init).
+   */
+  async init(): Promise<void> {
+    if (!this.enabled) return;
+    const tipKey = Buffer.from([IndexPrefix.COIN_STATS_TIP]);
+    try {
+      const tipData = await (this.db as any).db.get(tipKey);
+      if (tipData && tipData.length >= 4) {
+        this.bestHeight = new BufferReader(tipData).readUInt32LE();
+      }
+    } catch {
+      this.bestHeight = -1;
+    }
+  }
+
+  /**
+   * Seed the height-0 (genesis) snapshot: the EMPTY UTXO set. Core's
+   * CoinStatsIndex::CustomAppend takes the genesis `else` branch and adds
+   * NOTHING to the muhash (the genesis coinbase output is never spendable),
+   * so height 0 is the empty multiset (txouts=0, total_amount=0). The genesis
+   * block is connected by chainState.load() and never passes through the
+   * per-block connect path, so we seed it explicitly here — symmetric with
+   * BlockFilterIndex.ensureGenesisIndexed. No-op if already present.
+   */
+  async ensureGenesisIndexed(genesisHash: Buffer): Promise<void> {
+    if (!this.enabled) return;
+    if (this.bestHeight >= 0) return;
+    const existing = await this.readSnapshot(0);
+    if (existing) {
+      if (this.bestHeight < 0) this.bestHeight = 0;
+      return;
+    }
+    const snap: CoinStatsSnapshot = {
+      blockHash: Buffer.from(genesisHash),
+      muhash: new MuHash3072(),
+      txouts: 0n,
+      totalAmount: 0n,
+      bogoSize: 0n,
+    };
+    await this.db.batch([this.snapPutOp(0, snap), this.tipPutOp(0)]);
+    this.bestHeight = 0;
+  }
+
+  /**
+   * Connect *block* at *height* into the index (PRIMARY connect hook).
+   *
+   * Mirrors Bitcoin Core CoinStatsIndex::CustomAppend:
+   *   - created outputs: skip unspendable, INSERT TxOutSer, ++txouts,
+   *     += amount, += bogosize.
+   *   - spent prevouts (from undo data): REMOVE TxOutSer using the coin's
+   *     ORIGINAL height + coinbase + amount + script, --txouts, -= amount,
+   *     -= bogosize.
+   *
+   * `spentOutputs` is the same undo data the connect path already collected
+   * (coreConnectBlockChecks → serializeUndoData), so no separate UTXO lookup
+   * is needed — and it carries each spent coin's original creation metadata.
+   *
+   * Idempotent: always recomputes from the H-1 snapshot and overwrites H.
+   */
+  async indexBlock(
+    block: Block,
+    height: number,
+    spentOutputs: SpentUTXO[]
+  ): Promise<void> {
+    if (!this.enabled) return;
+    const blockHash = getBlockHash(block.header);
+
+    // Genesis: empty set (see ensureGenesisIndexed rationale).
+    if (height === 0) {
+      const snap: CoinStatsSnapshot = {
+        blockHash,
+        muhash: new MuHash3072(),
+        txouts: 0n,
+        totalAmount: 0n,
+        bogoSize: 0n,
+      };
+      await this.db.batch([this.snapPutOp(0, snap), this.tipPutOp(0)]);
+      if (height > this.bestHeight) this.bestHeight = height;
+      return;
+    }
+
+    const running = await this.loadRunning(height - 1);
+    const muhash = running.muhash;
+    let txouts = running.txouts;
+    let totalAmount = running.totalAmount;
+    let bogoSize = running.bogoSize;
+
+    // ── Created outputs (skip unspendable). ──
+    for (const tx of block.transactions) {
+      const txid = getTxId(tx);
+      const txIsCoinbase = isCoinbase(tx);
+      for (let vout = 0; vout < tx.outputs.length; vout++) {
+        const out = tx.outputs[vout];
+        if (coinStatsIsUnspendable(out.scriptPubKey)) continue;
+        muhash.add(
+          coinStatsTxOutSer(
+            txid,
+            vout,
+            height,
+            txIsCoinbase,
+            out.value,
+            out.scriptPubKey
+          )
+        );
+        txouts += 1n;
+        totalAmount += out.value;
+        bogoSize += coinStatsBogoSize(out.scriptPubKey.length);
+      }
+    }
+
+    // ── Spent prevouts (from undo data; coinbase spends nothing). ──
+    for (const spent of spentOutputs) {
+      const e = spent.entry;
+      muhash.remove(
+        coinStatsTxOutSer(
+          spent.txid,
+          spent.vout,
+          e.height,
+          e.coinbase,
+          e.amount,
+          e.scriptPubKey
+        )
+      );
+      txouts -= 1n;
+      totalAmount -= e.amount;
+      bogoSize -= coinStatsBogoSize(e.scriptPubKey.length);
+    }
+
+    const snap: CoinStatsSnapshot = {
+      blockHash,
+      muhash,
+      txouts,
+      totalAmount,
+      bogoSize,
+    };
+    await this.db.batch([this.snapPutOp(height, snap), this.tipPutOp(height)]);
+    if (height > this.bestHeight) this.bestHeight = height;
+  }
+
+  /**
+   * Disconnect the block at *height* (PRIMARY disconnect / reorg hook).
+   *
+   * Drops the per-height snapshot; the running state for the new tip is the
+   * already-persisted H-1 snapshot, so no recomputation is needed. Rolls
+   * bestHeight back to H-1 when *height* is at/above the current best.
+   *
+   * Mirrors Bitcoin Core CoinStatsIndex::CustomRewind (per-height reversal).
+   */
+  async removeBlock(height: number): Promise<void> {
+    if (!this.enabled) return;
+    const ops: BatchOperation[] = [
+      {
+        type: "del",
+        prefix: IndexPrefix.COIN_STATS as unknown as DBPrefix,
+        key: this.heightKey(height),
+      },
+    ];
+    const newBest = height > 0 ? height - 1 : -1;
+    if (this.bestHeight !== -1 && height >= this.bestHeight) {
+      if (newBest >= 0) {
+        ops.push(this.tipPutOp(newBest));
+      } else {
+        ops.push({
+          type: "del",
+          prefix: IndexPrefix.COIN_STATS_TIP as unknown as DBPrefix,
+          key: Buffer.alloc(0),
+        });
+      }
+    }
+    await this.db.batch(ops);
+    if (this.bestHeight !== -1 && height >= this.bestHeight) {
+      this.bestHeight = newBest;
+    }
+  }
+
+  /**
+   * Query the coinstats snapshot AS OF *height* (used by gettxoutsetinfo and
+   * getindexinfo). Returns null when the index is disabled or no snapshot
+   * exists at that height.
+   */
+  async getAtHeight(height: number): Promise<CoinStatsAtHeight | null> {
+    if (!this.enabled) return null;
+    const snap = await this.readSnapshot(height);
+    if (!snap) return null;
+    // finalize() mutates the accumulator (folds denominator into numerator),
+    // so digest a fresh deserialized copy to keep the snapshot reusable.
+    const muCopy = MuHash3072.deserialize(snap.muhash.serialize());
+    return {
+      blockHash: snap.blockHash,
+      muhash: muCopy.finalize(),
+      txouts: snap.txouts,
+      totalAmount: snap.totalAmount,
+      bogoSize: snap.bogoSize,
     };
   }
 }

@@ -30,7 +30,7 @@ import { HeaderSync } from "../sync/headers.js";
 import { BlockSync } from "../sync/blocks.js";
 import { RPCServer, type RPCServerConfig, type RPCServerDeps } from "../rpc/server.js";
 import { RESTServer, type RESTServerConfig, type RESTServerDeps } from "../rpc/rest.js";
-import { BlockFilterIndex } from "../storage/indexes.js";
+import { BlockFilterIndex, PersistentCoinStatsIndex } from "../storage/indexes.js";
 import { InventoryRelay } from "../p2p/relay.js";
 import { getTxId, getTxVSize } from "../validation/tx.js";
 import { InvType, type NetworkMessage, type InvVector } from "../p2p/messages.js";
@@ -187,6 +187,21 @@ export interface NodeConfig {
    */
   blockfilterindex: boolean;
   /**
+   * Enable the per-height UTXO coinstats index. Mirrors Bitcoin Core's
+   * `-coinstatsindex` (default OFF: DEFAULT_COINSTATSINDEX = false).
+   *
+   * When enabled, every connected/disconnected block maintains a running
+   * MuHash3072 over the UTXO set plus txouts/total_amount/bogosize, persisted
+   * as a self-contained per-height snapshot under DB prefix `COIN_STATS`. Lets
+   * `gettxoutsetinfo "muhash" <hash_or_height>` answer for a HISTORICAL height
+   * (byte-exact vs Core) and `getindexinfo` report the index. Without it, a
+   * non-tip hash_or_height errors with -8.
+   *
+   * Reference: bitcoin-core/src/index/coinstatsindex.cpp,
+   *            bitcoin-core/src/kernel/coinstats.cpp
+   */
+  coinstatsindex: boolean;
+  /**
    * Path to an ASMap binary file for ASN-aware peer grouping.
    * Mirrors Bitcoin Core's `-asmap=<file>` (init.cpp:540).
    * Relative paths are resolved against the network-specific datadir.
@@ -282,6 +297,7 @@ const DEFAULT_CONFIG: NodeConfig = {
   internalDaemonChild: false,
   rest: false,
   blockfilterindex: false,
+  coinstatsindex: false,
 };
 
 /**
@@ -549,6 +565,17 @@ export function parseArgs(argv: string[]): ParsedArgs {
             config.blockfilterindex = false;
           }
           break;
+        case "coinstatsindex":
+          // Bitcoin Core flag `-coinstatsindex=1`. Bare flag / `=1` / `=true`
+          // enables; `=0` / `=false` disables. Default OFF (matches Core's
+          // `DEFAULT_COINSTATSINDEX = false`). Enables per-height
+          // gettxoutsetinfo via the UTXO MuHash index.
+          if (value === undefined || value === "1" || value === "true") {
+            config.coinstatsindex = true;
+          } else if (value === "0" || value === "false") {
+            config.coinstatsindex = false;
+          }
+          break;
         case "asmap":
           // Bitcoin Core flag `-asmap=<file>` (init.cpp:540).
           // Points to an ASMap binary file for ASN-aware outbound peer
@@ -774,6 +801,10 @@ export async function loadConfig(
           // Mirror CLI: 0/false = off; 1/true/basic = on.
           config.blockfilterindex =
             value === "1" || value === "true" || value === "basic";
+          break;
+        case "coinstatsindex":
+          // Mirror CLI: 0/false = off; 1/true = on.
+          config.coinstatsindex = value === "1" || value === "true";
           break;
         case "rpctlscert":
           if (value) config.rpcTlsCert = value;
@@ -1860,6 +1891,46 @@ async function startNode(config: NodeConfig): Promise<void> {
     console.log("[blockfilterindex] BIP-157/158 basic filter index enabled");
   }
 
+  // 6c. Persistent, reorg-safe coinstatsindex (Bitcoin Core `-coinstatsindex`).
+  // Maintains a per-height running MuHash3072 over the UTXO set + counts so
+  // `gettxoutsetinfo "muhash" <hash_or_height>` can answer for a HISTORICAL
+  // height byte-exactly vs Core, and `getindexinfo` reports it. Default OFF
+  // (Core DEFAULT_COINSTATSINDEX = false). Wired into BOTH the BlockSync
+  // primary connect/disconnect path (P2P/IBD + submitblock) AND the
+  // ChainStateManager reorg paths (invalidateblock / reorganize /
+  // generateblock) — the same instance/DB, so all connect/disconnect sites
+  // maintain the one index.
+  let coinStatsIndex: PersistentCoinStatsIndex | undefined;
+  if (mergedConfig.coinstatsindex) {
+    coinStatsIndex = new PersistentCoinStatsIndex(db, true);
+    await coinStatsIndex.init();
+    // Startup reconcile: the index is written after the chainstate commit, so
+    // an unclean exit can leave it AHEAD of the validated tip. Rewind any
+    // snapshot strictly above the validated tip before the connect path fires.
+    {
+      const validatedTip = chainState.getBestBlock();
+      while (coinStatsIndex.getHeight() > validatedTip.height) {
+        await coinStatsIndex.removeBlock(coinStatsIndex.getHeight());
+      }
+    }
+    // Seed the genesis (height 0) snapshot = the empty UTXO set, since the
+    // genesis block is connected by chainState.load() and never passes through
+    // the per-block connect path. Symmetric with the blockfilterindex genesis
+    // seed above. No-op on restart.
+    try {
+      await coinStatsIndex.ensureGenesisIndexed(params.genesisBlockHash);
+    } catch (err) {
+      console.warn(
+        `[coinstatsindex] could not seed genesis snapshot: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+    blockSync.setCoinStatsIndex(coinStatsIndex);
+    chainState.setCoinStatsIndex(coinStatsIndex);
+    console.log("[coinstatsindex] per-height UTXO coinstats index enabled");
+  }
+
   // 7b. Wire mempool tx relay: accept incoming transactions via AcceptToMemoryPool
   // and relay accepted txs to peers via inventory trickling.
   const txRelay = new InventoryRelay((peer, inventory) => {
@@ -2203,6 +2274,10 @@ async function startNode(config: NodeConfig): Promise<void> {
     // matching Core's ForEachBlockFilterIndex guard (only running indexes
     // are listed).
     filterIndex,
+    // Present only when --coinstatsindex=1 (undefined otherwise). Backs
+    // gettxoutsetinfo at a historical hash_or_height and getindexinfo's
+    // "coinstatsindex" entry.
+    coinStatsIndex,
   };
 
   const rpcServer = new RPCServer(rpcConfig, rpcDeps);
