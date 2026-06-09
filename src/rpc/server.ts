@@ -1212,6 +1212,7 @@ export class RPCServer {
 
     // Network methods
     this.registerMethod("getpeerinfo", () => this.getPeerInfo());
+    this.registerMethod("getblockfrompeer", (params) => this.getBlockFromPeer(params));
     this.registerMethod("getnetworkinfo", () => this.getNetworkInfo());
     this.registerMethod("getconnectioncount", async () => this.getConnectionCount());
     this.registerMethod("getnodeaddresses", (params) => this.getNodeAddresses(params));
@@ -5970,6 +5971,95 @@ export class RPCServer {
 
       return entry;
     });
+  }
+
+  /**
+   * getblockfrompeer "blockhash" peer_id
+   *
+   * Attempt to fetch a block from a given peer by scheduling a block-level
+   * `getdata` request to that peer. Returns an empty object `{}` on success.
+   *
+   * Core ref: rpc/blockchain.cpp:514 getblockfrompeer + net_processing.cpp:1960
+   * PeerManagerImpl::FetchBlock. The contract enforced here, in Core order:
+   *   1. We must already know the header for this block (Core
+   *      LookupBlockIndex). Here the in-memory header index is HeaderSync, so
+   *      an unknown hash → RPC_MISC_ERROR (-1) "Block header missing"
+   *      (blockchain.cpp:547).
+   *   2. The peer must exist. hotbuns' getpeerinfo assigns each peer an `id`
+   *      equal to its index in getConnectedPeers() (see getPeerInfo above), so
+   *      we resolve peer_id the same way: getConnectedPeers()[peer_id]. A
+   *      missing peer → RPC_MISC_ERROR (-1) "Peer does not exist"
+   *      (net_processing.cpp:1966).
+   *   3. If the block body is already on disk, Core throws
+   *      RPC_MISC_ERROR (-1) "Block already downloaded" (blockchain.cpp:558).
+   *   4. On success we send a single block `getdata` (MSG_BLOCK with the
+   *      BIP-144 witness flag — InvType.MSG_WITNESS_BLOCK is exactly Core's
+   *      MSG_BLOCK | MSG_WITNESS_FLAG, net_processing.cpp:1981) carrying the
+   *      block hash, to the resolved peer, and return `{}`.
+   *
+   * @param params [blockhash (display-order hex), peer_id (int)]
+   */
+  private async getBlockFromPeer(params: unknown[]): Promise<Record<string, never>> {
+    const [blockhashParam, peerIdParam] = params;
+
+    // ── blockhash (positional 0) — STR_HEX, required ──────────────────────
+    if (typeof blockhashParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
+    }
+    // RPC hashes are display-order (reversed bytes); reverse to the internal
+    // byte order used by the header index and the p2p wire (matches
+    // getblockheader / the block-download getdata path).
+    const blockhash = Buffer.from(blockhashParam, "hex").reverse();
+    if (blockhash.length !== 32) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
+    }
+
+    // ── peer_id (positional 1) — NUM, required ────────────────────────────
+    if (
+      typeof peerIdParam !== "number" ||
+      !Number.isInteger(peerIdParam)
+    ) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "JSON value of type " + typeof peerIdParam + " is not of expected type number",
+      );
+    }
+    const peerId = peerIdParam;
+
+    // 1. Header must be known (Core LookupBlockIndex). HeaderSync is hotbuns'
+    //    in-memory header index — an unknown hash returns undefined.
+    if (this.headerSync.getHeader(blockhash) === undefined) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Block header missing");
+    }
+
+    // 2. Resolve the peer using the SAME convention getpeerinfo exposes:
+    //    id === index into getConnectedPeers().
+    const peers = this.peerManager.getConnectedPeers();
+    const peer = peerId >= 0 && peerId < peers.length ? peers[peerId] : undefined;
+    if (peer === undefined) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Peer does not exist");
+    }
+
+    // 3. If we already have the block body on disk, Core rejects with
+    //    "Block already downloaded" (BLOCK_HAVE_DATA).
+    const haveBody = await this.db.getBlock(blockhash);
+    if (haveBody !== null) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Block already downloaded");
+    }
+
+    // 4. Schedule the fetch: send a block getdata (MSG_BLOCK | MSG_WITNESS_FLAG)
+    //    for this hash to the resolved peer. InvType.MSG_WITNESS_BLOCK
+    //    (0x40000002) is exactly Core's MSG_BLOCK | MSG_WITNESS_FLAG.
+    const getdata: NetworkMessage = {
+      type: "getdata",
+      payload: {
+        inventory: [{ type: InvType.MSG_WITNESS_BLOCK, hash: blockhash }],
+      },
+    };
+    peer.send(getdata);
+
+    // Returns an empty JSON object if the request was successfully scheduled.
+    return {};
   }
 
   /**
