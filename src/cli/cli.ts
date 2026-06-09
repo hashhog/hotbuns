@@ -2551,6 +2551,11 @@ async function startNode(config: NodeConfig): Promise<void> {
         const height = chainState.getBestBlock().height;
         const peers = peerManager.getConnectedPeers().length;
         const mempoolCount = mempool.getInfo().size;
+        // Process memory gauges (bytes) — same values the IBD log prints
+        // (sync/blocks.ts:3757). Surfaces the IBD-phase real-leak / native
+        // (mimalloc) retention that the MemoryMax cgroup cap backstops.
+        // Mirrors Core's getmemoryinfo RPC. Observability-only, additive.
+        const mem = process.memoryUsage();
         const body =
           `# HELP bitcoin_blocks_total Current block height\n` +
           `# TYPE bitcoin_blocks_total gauge\n` +
@@ -2560,7 +2565,22 @@ async function startNode(config: NodeConfig): Promise<void> {
           `bitcoin_peers_connected ${peers}\n` +
           `# HELP bitcoin_mempool_size Mempool transaction count\n` +
           `# TYPE bitcoin_mempool_size gauge\n` +
-          `bitcoin_mempool_size ${mempoolCount}\n`;
+          `bitcoin_mempool_size ${mempoolCount}\n` +
+          `# HELP bitcoin_mem_rss_bytes Resident set size in bytes\n` +
+          `# TYPE bitcoin_mem_rss_bytes gauge\n` +
+          `bitcoin_mem_rss_bytes ${mem.rss}\n` +
+          `# HELP bitcoin_mem_heap_used_bytes V8 heap in use in bytes\n` +
+          `# TYPE bitcoin_mem_heap_used_bytes gauge\n` +
+          `bitcoin_mem_heap_used_bytes ${mem.heapUsed}\n` +
+          `# HELP bitcoin_mem_heap_total_bytes V8 heap allocated in bytes\n` +
+          `# TYPE bitcoin_mem_heap_total_bytes gauge\n` +
+          `bitcoin_mem_heap_total_bytes ${mem.heapTotal}\n` +
+          `# HELP bitcoin_mem_external_bytes C++ objects bound to JS in bytes\n` +
+          `# TYPE bitcoin_mem_external_bytes gauge\n` +
+          `bitcoin_mem_external_bytes ${mem.external}\n` +
+          `# HELP bitcoin_mem_arraybuffers_bytes ArrayBuffer/Buffer memory in bytes\n` +
+          `# TYPE bitcoin_mem_arraybuffers_bytes gauge\n` +
+          `bitcoin_mem_arraybuffers_bytes ${mem.arrayBuffers}\n`;
         return new Response(body, {
           headers: {
             "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
