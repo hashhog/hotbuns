@@ -100,6 +100,21 @@ async function rpc(port: number, method: string, params: any[] = []): Promise<an
   return r.json();
 }
 
+/** Wallet-routed call (/wallet/<name>) for multi-wallet setups. */
+async function rpcWallet(
+  port: number,
+  wallet: string,
+  method: string,
+  params: any[] = []
+): Promise<any> {
+  const r = await fetch(`http://127.0.0.1:${port}/wallet/${wallet}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+  return r.json();
+}
+
 function makeServer(opts?: { walletManager?: any }): { server: RPCServer; port: number; chainState: MockChainStateManager } {
   const port = getTestPort();
   const chainState = new MockChainStateManager();
@@ -346,7 +361,13 @@ describe("wallet/PSBT RPC wiring", () => {
   // ---------------------------------------------------------------------
 
   describe("importdescriptors", () => {
-    it("accepts a syntactically valid wpkh() descriptor", async () => {
+    // Watch-only (pubkey-only) descriptors are importable ONLY into a
+    // disable_private_keys wallet (Core wallet/rpc/backup.cpp:259-262); the
+    // old version of this test imported one into the privkey-ENABLED default
+    // wallet and expected success, which Core rejects with -4.
+    it("accepts a syntactically valid wpkh() descriptor into a dpk wallet", async () => {
+      await manager.createWallet("wo", { disablePrivateKeys: true, blank: true });
+
       // wpkh() with a fixed pubkey hex; checksum will be validated.
       const desc =
         "wpkh(0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798)";
@@ -354,12 +375,30 @@ describe("wallet/PSBT RPC wiring", () => {
       const info = await rpc(port, "getdescriptorinfo", [desc]);
       expect(info.error).toBeUndefined();
 
-      const r = await rpc(port, "importdescriptors", [
+      const r = await rpcWallet(port, "wo", "importdescriptors", [
         [{ desc: info.result.descriptor, timestamp: "now" }],
       ]);
       expect(r.error).toBeUndefined();
       expect(Array.isArray(r.result)).toBe(true);
       expect(r.result[0].success).toBe(true);
+    });
+
+    it("rejects a pubkey-only descriptor into a privkey-enabled wallet with -4", async () => {
+      const desc =
+        "wpkh(0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798)";
+      const info = await rpc(port, "getdescriptorinfo", [desc]);
+      expect(info.error).toBeUndefined();
+
+      // The default wallet has private keys enabled -> Core backup.cpp:259-262.
+      const r = await rpc(port, "importdescriptors", [
+        [{ desc: info.result.descriptor, timestamp: "now" }],
+      ]);
+      expect(r.error).toBeUndefined();
+      expect(r.result[0].success).toBe(false);
+      expect(r.result[0].error.code).toBe(RPCErrorCodes.WALLET_ERROR);
+      expect(r.result[0].error.message).toBe(
+        "Cannot import descriptor without private keys to a wallet with private keys enabled"
+      );
     });
 
     it("rejects malformed descriptor with success=false", async () => {
@@ -369,6 +408,9 @@ describe("wallet/PSBT RPC wiring", () => {
       expect(r.error).toBeUndefined();
       expect(r.result[0].success).toBe(false);
       expect(r.result[0].error).toBeDefined();
+      // No '#' -> the require_checksum=true path (Core CheckChecksum), -5.
+      expect(r.result[0].error.code).toBe(RPCErrorCodes.INVALID_ADDRESS_OR_KEY);
+      expect(r.result[0].error.message).toBe("Missing checksum");
     });
   });
 
