@@ -26,6 +26,12 @@ import {
 } from "./bip39.js";
 
 import {
+  parseDescriptor,
+  addChecksum,
+  DescriptorType,
+} from "./descriptor.js";
+
+import {
   hash160,
   privateKeyToPublicKey,
   ecdsaSign,
@@ -213,6 +219,37 @@ export interface WalletKey {
   addressType: AddressType;
 }
 
+/**
+ * A watch-only descriptor imported via importdescriptors. Kept SEPARATE from
+ * the key-bearing `WalletKey` ring so the signing paths can never source key
+ * material from a watch entry (Core: an imported DescriptorScriptPubKeyMan
+ * with no private keys). The stored `desc` is the normalized public
+ * descriptor string WITH checksum (Core's `parent_desc`).
+ */
+export interface WatchDescriptorRecord {
+  desc: string;
+  /** Import timestamp (unix seconds; Core clamps to >= 1). */
+  timestamp: number;
+  label?: string;
+  /** Inclusive derivation range for ranged descriptors. */
+  range?: [number, number];
+}
+
+/**
+ * Per-address view derived from the imported watch descriptors (rebuilt from
+ * `WatchDescriptorRecord`s on load — never persisted directly).
+ */
+export interface WatchAddressInfo {
+  type: AddressType;
+  /** The imported descriptor that produced this address (checksummed). */
+  parentDesc: string;
+  /** False for addr()/raw() (no key material — Core InferDescriptor->IsSolvable). */
+  solvable: boolean;
+  timestamp: number;
+  /** Hex public key when the descriptor exposes exactly one (single-key types). */
+  pubkey?: string;
+}
+
 export interface WalletUTXO {
   outpoint: OutPoint;
   amount: bigint;
@@ -395,6 +432,14 @@ interface WalletData {
   // (processBlock applied). Startup reconciliation scans the gap from here to
   // the current tip so a wallet is never left behind after an unclean restart.
   lastSyncedHeight?: number;
+  // WALLET_FLAG_DISABLE_PRIVATE_KEYS equivalent (createwallet
+  // disable_private_keys). Absent in older files -> false.
+  disablePrivateKeys?: boolean;
+  // createwallet blank=true (born with no keys). Absent -> false.
+  blank?: boolean;
+  // Imported watch-only descriptors (importdescriptors). The per-address
+  // watch view is re-expanded from these on load.
+  watchDescriptors?: WatchDescriptorRecord[];
 }
 
 interface SerializedUTXO {
@@ -473,6 +518,21 @@ export class Wallet {
   // CWallet::m_last_block_processed_height (wallet/wallet.h).
   private lastSyncedHeight: number;
 
+  // WALLET_FLAG_DISABLE_PRIVATE_KEYS equivalent: the wallet holds no private
+  // keys and never will (watch-only). Key-using RPCs are guarded at the RPC
+  // layer; creation/load skip key pre-generation (Core skips
+  // SetupDescriptorScriptPubKeyMans, wallet/wallet.cpp:3104).
+  private disablePrivateKeys: boolean;
+
+  // createwallet blank=true: born with zero keys (Core WALLET_FLAG_BLANK_WALLET).
+  private blank: boolean;
+
+  // Imported watch-only descriptors + the address view derived from them.
+  // INTENTIONALLY separate from `keys` so coin signing can never treat a
+  // watch address as key-bearing.
+  private watchDescriptors: WatchDescriptorRecord[];
+  private watchAddresses: Map<string, WatchAddressInfo>;
+
   constructor(config: WalletConfig) {
     this.config = config;
     this.keys = new Map();
@@ -484,6 +544,10 @@ export class Wallet {
     this.txHistory = new Map();
     this.nextTxOrdinal = 0;
     this.lastSyncedHeight = -1;
+    this.disablePrivateKeys = false;
+    this.blank = false;
+    this.watchDescriptors = [];
+    this.watchAddresses = new Map();
 
     // Initialize encryption state
     this.encryption = {
@@ -529,9 +593,12 @@ export class Wallet {
   static create(
     config: WalletConfig,
     mnemonic?: string,
-    passphrase: string = ""
+    passphrase: string = "",
+    opts: { disablePrivateKeys?: boolean; blank?: boolean } = {}
   ): Wallet {
     const wallet = new Wallet(config);
+    wallet.disablePrivateKeys = opts.disablePrivateKeys === true;
+    wallet.blank = opts.blank === true;
 
     if (mnemonic) {
       // Validate the mnemonic at the boundary: word count, wordlist
@@ -560,8 +627,13 @@ export class Wallet {
     // Derive master key from seed using HMAC-SHA512
     wallet.masterKey = wallet.deriveMasterKey(wallet.seed);
 
-    // Pre-generate addresses for all address types
-    wallet.pregenerateAddresses();
+    // Pre-generate addresses for all address types. A disable_private_keys
+    // or blank wallet is born with ZERO key material (Core skips
+    // SetupDescriptorScriptPubKeyMans when DISABLE_PRIVATE_KEYS | BLANK is
+    // set, wallet/wallet.cpp:3104).
+    if (!wallet.disablePrivateKeys && !wallet.blank) {
+      wallet.pregenerateAddresses();
+    }
 
     return wallet;
   }
@@ -745,6 +817,23 @@ export class Wallet {
       );
     }
 
+    // Restore wallet flags (absent in pre-watch-only files -> false).
+    wallet.disablePrivateKeys = data.disablePrivateKeys === true;
+    wallet.blank = data.blank === true;
+
+    // Restore imported watch-only descriptors: re-expand each one so the
+    // per-address watch view is rebuilt (each entry independently — one
+    // malformed descriptor must not discard the rest).
+    for (const wd of data.watchDescriptors ?? []) {
+      try {
+        wallet.addWatchDescriptor(wd.desc, wd.timestamp, wd.range, wd.label);
+      } catch (err) {
+        console.warn(
+          `[wallet] partial restore: dropped watch descriptor (${(err as Error).message})`
+        );
+      }
+    }
+
     // Restore encryption state
     try {
       if (data.encryption) {
@@ -756,8 +845,13 @@ export class Wallet {
       );
     }
 
-    // Regenerate keys (only if not encrypted, or if we have the seed)
-    if (!wallet.encryption.isEncrypted || wallet.seed.length > 0) {
+    // Regenerate keys (only if not encrypted, or if we have the seed).
+    // disable_private_keys / blank wallets stay keyless across restarts.
+    if (
+      !wallet.disablePrivateKeys &&
+      !wallet.blank &&
+      (!wallet.encryption.isEncrypted || wallet.seed.length > 0)
+    ) {
       wallet.pregenerateAddresses();
     }
 
@@ -842,6 +936,9 @@ export class Wallet {
       txHistory: Array.from(this.txHistory.values()),
       nextTxOrdinal: this.nextTxOrdinal,
       lastSyncedHeight: this.lastSyncedHeight,
+      disablePrivateKeys: this.disablePrivateKeys,
+      blank: this.blank,
+      watchDescriptors: this.watchDescriptors,
     };
 
     // bigint is not JSON-serializable: WalletTxRecord carries debit/credit/fee
@@ -2583,6 +2680,18 @@ export class Wallet {
       addressToType.set(key.address, key.addressType);
     }
 
+    // Watch-only ownership (imported descriptors): union the watch set into
+    // the scan's address view so the SAME credit/debit/history machinery
+    // covers watch-only funds (Core: an imported descriptor's scripts are
+    // ISMINE, so ScanForWalletTransactions credits them). Key-bearing entries
+    // take precedence on (impossible-in-Core) collision.
+    for (const [addr, w] of this.watchAddresses.entries()) {
+      if (ourAddresses.has(addr)) continue;
+      ourAddresses.add(addr);
+      addressToPath.set(addr, "watch");
+      addressToType.set(addr, w.type);
+    }
+
     // Track the outpoints credited in THIS block so the per-block confirmation
     // bump below does not double-count their creating block. A coin included in
     // the current tip block has exactly 1 confirmation (Core: GetDepthInMainChain
@@ -3073,6 +3182,102 @@ export class Wallet {
       this.labels.set(address, label);
     }
     return address;
+  }
+
+  /**
+   * Whether this wallet was created with disable_private_keys (Core's
+   * WALLET_FLAG_DISABLE_PRIVATE_KEYS). getwalletinfo reports
+   * private_keys_enabled = !this; key-using RPCs guard on it with -4.
+   */
+  isPrivateKeysDisabled(): boolean {
+    return this.disablePrivateKeys;
+  }
+
+  /** Whether this wallet was created blank (no keys generated). */
+  isBlank(): boolean {
+    return this.blank;
+  }
+
+  /** Whether `address` belongs to an imported watch-only descriptor. */
+  isWatchAddress(address: string): boolean {
+    return this.watchAddresses.has(address);
+  }
+
+  /** Watch-view detail for `address` (parent_desc/solvable/timestamp/pubkey). */
+  getWatchAddressInfo(address: string): WatchAddressInfo | undefined {
+    return this.watchAddresses.get(address);
+  }
+
+  /** The imported watch-only descriptor records (normalized, checksummed). */
+  getWatchDescriptors(): WatchDescriptorRecord[] {
+    return [...this.watchDescriptors];
+  }
+
+  /**
+   * Register a watch-only descriptor: parse + normalize it, expand every
+   * derivation index in `range` (single index 0 when un-ranged), and add each
+   * resulting address to the watch view so processBlock / rescan credit any
+   * output paying it. The wallet-side half of importdescriptors (Core:
+   * CWallet::AddWalletDescriptor, wallet/rpc/backup.cpp:269-276).
+   *
+   * The caller is responsible for the RPC-layer policy checks (checksum
+   * requirement, privkey polarity, dpk guards); this method only registers
+   * ownership. Returns the registered addresses.
+   */
+  addWatchDescriptor(
+    descStr: string,
+    timestamp: number,
+    range?: [number, number],
+    label?: string
+  ): string[] {
+    const parsed = parseDescriptor(descStr, this.config.network);
+    const d = parsed.descriptor;
+    // Normalized public form WITH checksum — what Core surfaces as parent_desc.
+    const normalized = addChecksum(d.toString());
+    const solvable =
+      d.getType() !== DescriptorType.ADDR && d.getType() !== DescriptorType.RAW;
+
+    let indices: number[];
+    if (d.isRange()) {
+      const [start, end] = range ?? [0, 0];
+      if (end < start) {
+        throw new Error("Range specified as [begin,end] must not have begin after end");
+      }
+      indices = [];
+      for (let i = start; i <= end; i++) indices.push(i);
+    } else {
+      indices = [0];
+    }
+
+    const addresses: string[] = [];
+    for (const index of indices) {
+      for (const out of d.expand(index, this.config.network)) {
+        // Resolve the address form: the expansion's own address when present,
+        // else decode the scriptPubKey (covers every standard script type).
+        const info = this.scriptPubKeyToAddressInfo(out.scriptPubKey);
+        const address = out.address ?? info?.address;
+        if (!address || !info) {
+          // Bare scripts (raw()/pk()) have no address form; the watch view is
+          // address-keyed, so skip them (matches the wallet's scan keying).
+          continue;
+        }
+        this.watchAddresses.set(address, {
+          type: info.type,
+          parentDesc: normalized,
+          solvable,
+          timestamp,
+          pubkey:
+            out.pubkeys.length === 1 ? out.pubkeys[0].toString("hex") : undefined,
+        });
+        if (label !== undefined) {
+          this.labels.set(address, label);
+        }
+        addresses.push(address);
+      }
+    }
+
+    this.watchDescriptors.push({ desc: normalized, timestamp, label, range });
+    return addresses;
   }
 
   /**
@@ -3792,12 +3997,17 @@ export class WalletManager {
       );
     }
 
+    // A passphrase only encrypts private keys, so it is incompatible with
+    // disable_private_keys (Core CreateWallet, wallet/wallet.cpp:409-413 —
+    // surfaces as RPC_WALLET_ERROR at the RPC layer).
+    if (options.disablePrivateKeys && encryptionPassphrase) {
+      throw new Error(
+        "Passphrase provided but private keys are disabled. A passphrase is only used to encrypt private keys, so cannot be used for wallets with private keys disabled."
+      );
+    }
+
     // Use storage password (for file encryption, not wallet encryption)
     const storagePassword = password || "hotbuns";
-
-    // Blank wallet: no keys generated
-    // disablePrivateKeys: watch-only wallet
-    // For now, we create a standard HD wallet
 
     const config: WalletConfig = {
       datadir: name === "" ? this.getWalletsDir() : walletDir,
@@ -3807,9 +4017,16 @@ export class WalletManager {
     // Seed-only restore: when a BIP-39 mnemonic is supplied, derive the seed
     // deterministically so the SAME mnemonic re-creates byte-identical keys
     // (wallet recovery after disk loss). Otherwise generate a random seed.
+    // disablePrivateKeys (watch-only) / blank wallets are created keyless —
+    // the flags persist in the wallet file (Core WALLET_FLAG_DISABLE_PRIVATE_KEYS
+    // / WALLET_FLAG_BLANK_WALLET).
+    const createOpts = {
+      disablePrivateKeys: options.disablePrivateKeys,
+      blank: options.blank,
+    };
     const wallet = options.mnemonic
-      ? Wallet.create(config, options.mnemonic, options.mnemonicPassphrase ?? "")
-      : Wallet.create(config);
+      ? Wallet.create(config, options.mnemonic, options.mnemonicPassphrase ?? "", createOpts)
+      : Wallet.create(config, undefined, "", createOpts);
 
     // If passphrase provided in options, encrypt the wallet
     if (encryptionPassphrase) {

@@ -224,6 +224,50 @@ export function validateChecksum(desc: string): string {
   return base;
 }
 
+/**
+ * Core-exact descriptor checksum check, mirroring CheckChecksum
+ * (bitcoin-core/src/script/descriptor.cpp:2838-2869) including the exact
+ * error strings. Returns the checksum-less payload on success.
+ *
+ * Unlike `validateChecksum` (which tolerates a missing checksum — the correct
+ * default for getdescriptorinfo / deriveaddresses, Core Parse with
+ * require_checksum=false), `requireChecksum=true` enforces the BIP-380
+ * checksum's PRESENCE — Core's importdescriptors parses with
+ * require_checksum=true (wallet/rpc/backup.cpp:158), so an unchecksummed
+ * descriptor must fail there with "Missing checksum".
+ */
+export function checkDescriptorChecksum(
+  desc: string,
+  requireChecksum: boolean
+): string {
+  const parts = desc.split("#");
+  if (parts.length > 2) {
+    throw new Error("Multiple '#' symbols");
+  }
+  if (parts.length === 1 && requireChecksum) {
+    throw new Error("Missing checksum");
+  }
+  if (parts.length === 2 && parts[1].length !== 8) {
+    throw new Error(
+      `Expected 8 character checksum, not ${parts[1].length} characters`
+    );
+  }
+  let computed: string;
+  try {
+    computed = descriptorChecksum(parts[0]);
+  } catch {
+    // descriptorChecksum throws on chars outside INPUT_CHARSET; Core's
+    // DescriptorChecksum returns "" and CheckChecksum maps that to this.
+    throw new Error("Invalid characters in payload");
+  }
+  if (parts.length === 2 && computed !== parts[1]) {
+    throw new Error(
+      `Provided checksum '${parts[1]}' does not match computed checksum '${computed}'`
+    );
+  }
+  return parts[0];
+}
+
 // =============================================================================
 // Key Types
 // =============================================================================
@@ -634,6 +678,13 @@ export interface Descriptor {
   toString(): string;
   /** Convert to string with private keys */
   toPrivateString(): string;
+  /**
+   * Whether any private key material was supplied with this descriptor
+   * (Core: FlatSigningProvider.keys non-empty after Parse — the predicate
+   * behind importdescriptors' privkey-polarity checks at
+   * wallet/rpc/backup.cpp:224-226 and 259-262).
+   */
+  hasPrivateKeys(): boolean;
 }
 
 // Network type for address encoding
@@ -695,6 +746,10 @@ export class PKDescriptor implements Descriptor {
   toPrivateString(): string {
     return `pk(${this.pubkeyProvider.toPrivateString()})`;
   }
+
+  hasPrivateKeys(): boolean {
+    return this.pubkeyProvider.getPrivKey() !== undefined;
+  }
 }
 
 /**
@@ -755,6 +810,10 @@ export class PKHDescriptor implements Descriptor {
 
   toPrivateString(): string {
     return `pkh(${this.pubkeyProvider.toPrivateString()})`;
+  }
+
+  hasPrivateKeys(): boolean {
+    return this.pubkeyProvider.getPrivKey() !== undefined;
   }
 }
 
@@ -819,6 +878,10 @@ export class WPKHDescriptor implements Descriptor {
 
   toPrivateString(): string {
     return `wpkh(${this.pubkeyProvider.toPrivateString()})`;
+  }
+
+  hasPrivateKeys(): boolean {
+    return this.pubkeyProvider.getPrivKey() !== undefined;
   }
 }
 
@@ -888,6 +951,10 @@ export class SHDescriptor implements Descriptor {
   toPrivateString(): string {
     return `sh(${this.subdescriptor.toPrivateString()})`;
   }
+
+  hasPrivateKeys(): boolean {
+    return this.subdescriptor.hasPrivateKeys();
+  }
 }
 
 /**
@@ -946,6 +1013,10 @@ export class WSHDescriptor implements Descriptor {
 
   toPrivateString(): string {
     return `wsh(${this.subdescriptor.toPrivateString()})`;
+  }
+
+  hasPrivateKeys(): boolean {
+    return this.subdescriptor.hasPrivateKeys();
   }
 }
 
@@ -1034,6 +1105,11 @@ export class TRDescriptor implements Descriptor {
     }
     return `tr(${this.internalKey.toPrivateString()})`;
   }
+
+  hasPrivateKeys(): boolean {
+    if (this.internalKey.getPrivKey() !== undefined) return true;
+    return this.scriptTree ? treeHasPrivateKeys(this.scriptTree) : false;
+  }
 }
 
 /**
@@ -1095,6 +1171,10 @@ export class RawtrDescriptor implements Descriptor {
 
   toPrivateString(): string {
     return `rawtr(${this.pubkeyProvider.toPrivateString()})`;
+  }
+
+  hasPrivateKeys(): boolean {
+    return this.pubkeyProvider.getPrivKey() !== undefined;
   }
 }
 
@@ -1168,6 +1248,10 @@ export class MultiDescriptor implements Descriptor {
     const name = this.sorted ? "sortedmulti" : "multi";
     const keys = this.pubkeyProviders.map((p) => p.toPrivateString()).join(",");
     return `${name}(${this.threshold},${keys})`;
+  }
+
+  hasPrivateKeys(): boolean {
+    return this.pubkeyProviders.some((p) => p.getPrivKey() !== undefined);
   }
 }
 
@@ -1252,6 +1336,10 @@ export class AddrDescriptor implements Descriptor {
   toPrivateString(): string {
     return this.toString();
   }
+
+  hasPrivateKeys(): boolean {
+    return false;
+  }
 }
 
 /**
@@ -1297,6 +1385,10 @@ export class RawDescriptor implements Descriptor {
 
   toPrivateString(): string {
     return this.toString();
+  }
+
+  hasPrivateKeys(): boolean {
+    return false;
   }
 }
 
@@ -1401,6 +1493,10 @@ export class ComboDescriptor implements Descriptor {
   toPrivateString(): string {
     return `combo(${this.pubkeyProvider.toPrivateString()})`;
   }
+
+  hasPrivateKeys(): boolean {
+    return this.pubkeyProvider.getPrivKey() !== undefined;
+  }
 }
 
 /**
@@ -1459,6 +1555,12 @@ export class MiniscriptDescriptor implements Descriptor {
     return this.miniscriptStr;
   }
 
+  hasPrivateKeys(): boolean {
+    // Miniscript expressions embed raw public keys only (no WIF/xprv key
+    // expressions survive into MiniscriptNode), so no private material here.
+    return false;
+  }
+
   getNode(): MiniscriptNode {
     return this.node;
   }
@@ -1498,6 +1600,13 @@ function treeToPrivateString(tree: TaprootTree): string {
     return tree.script.toPrivateString();
   }
   return `{${treeToPrivateString(tree.left)},${treeToPrivateString(tree.right)}}`;
+}
+
+function treeHasPrivateKeys(tree: TaprootTree): boolean {
+  if (tree.type === "leaf") {
+    return tree.script.hasPrivateKeys();
+  }
+  return treeHasPrivateKeys(tree.left) || treeHasPrivateKeys(tree.right);
 }
 
 function buildTaprootMerkleRoot(tree: TaprootTree, index: number): Buffer {
@@ -2392,14 +2501,25 @@ function parseKey(
     return parseExtendedKey(desc, pos, origin, network);
   }
 
-  // Check for hex pubkey
-  if (/^[0-9a-fA-F]/.test(remaining)) {
+  // Decide hex-pubkey vs WIF on the WHOLE key token, not its first char
+  // (Core ParsePubkeyInner: IsHex(str) first, else DecodeSecret). A
+  // regtest/testnet compressed WIF starts with 'c' and an uncompressed one
+  // with '9' — both hex characters — so a first-char heuristic misroutes
+  // them into the hex-pubkey path.
+  const token = remaining.match(/^[^,)/]*/)?.[0] ?? "";
+  if (token.length > 0 && /^(?:[0-9a-fA-F]{2})+$/.test(token)) {
     return parseHexKey(desc, pos, origin);
   }
 
   // Check for WIF private key (starts with 5, K, L, c, or 9)
   if (/^[5KLc9]/.test(remaining)) {
     return parseWIFKey(desc, pos, origin, network);
+  }
+
+  // Preserve the legacy error shape for malformed hex-ish tokens (odd
+  // length / truncated) that are not WIF candidates.
+  if (/^[0-9a-fA-F]/.test(remaining)) {
+    return parseHexKey(desc, pos, origin);
   }
 
   throw new Error(`Unknown key format at position ${pos}`);
@@ -2597,15 +2717,17 @@ export interface DescriptorInfo {
 /**
  * Get information about a descriptor.
  */
-export function getDescriptorInfo(descStr: string): DescriptorInfo {
-  const parsed = parseDescriptor(descStr);
+export function getDescriptorInfo(
+  descStr: string,
+  network: NetworkType = "mainnet"
+): DescriptorInfo {
+  const parsed = parseDescriptor(descStr, network);
   const descriptor = parsed.descriptor;
   const canonicalStr = descriptor.toString();
   const checksum = descriptorChecksum(canonicalStr);
 
-  // Check if solvable and has private keys
+  // Check if solvable
   let isSolvable = true;
-  let hasPrivateKeys = false;
 
   // addr() and raw() are not solvable
   if (
@@ -2615,14 +2737,12 @@ export function getDescriptorInfo(descStr: string): DescriptorInfo {
     isSolvable = false;
   }
 
-  // TODO: Check for private keys in providers
-
   return {
     descriptor: `${canonicalStr}#${checksum}`,
     checksum,
     isRange: descriptor.isRange(),
     isSolvable,
-    hasPrivateKeys,
+    hasPrivateKeys: descriptor.hasPrivateKeys(),
   };
 }
 

@@ -76,6 +76,7 @@ import {
   getDescriptorInfo,
   deriveAddresses,
   addChecksum,
+  checkDescriptorChecksum,
   MultiDescriptor,
   SHDescriptor,
   WSHDescriptor,
@@ -1283,6 +1284,11 @@ export class RPCServer {
       );
       this.registerMethod("importdescriptors", (params) =>
         this.importDescriptors(params)
+      );
+      // Wallet-side address introspection (ismine / solvable / parent_desc /
+      // labels). Core: wallet/rpc/addresses.cpp::getaddressinfo.
+      this.registerMethod("getaddressinfo", (params) =>
+        this.getAddressInfo(params)
       );
       // Wallet rescan: scan EXISTING active-chain blocks for outputs paying
       // wallet-owned scripts and credit them into the wallet ledger (the
@@ -5698,6 +5704,16 @@ export class RPCServer {
   private async importPrivKey(params: unknown[]): Promise<unknown> {
     const wallet = this.getCurrentWallet();
 
+    // Core rejects private-key imports into a disable_private_keys wallet
+    // with -4 (wallet/rpc/backup.cpp:224-226 — same contract as the
+    // importdescriptors privkey-polarity check).
+    if (wallet.isPrivateKeysDisabled()) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_ERROR,
+        "Cannot import private keys to a wallet with private keys disabled"
+      );
+    }
+
     const wif = params[0];
     if (typeof wif !== "string") {
       throw this.rpcError(
@@ -5767,6 +5783,14 @@ export class RPCServer {
    */
   private async dumpPrivKey(params: unknown[]): Promise<string> {
     const wallet = this.getCurrentWallet();
+
+    // A disable_private_keys wallet has no private keys to reveal (-4).
+    if (wallet.isPrivateKeysDisabled()) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_ERROR,
+        "Error: Private keys are disabled for this wallet"
+      );
+    }
     const address = params[0];
     if (typeof address !== "string") {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "dumpprivkey requires an address");
@@ -6483,6 +6507,107 @@ export class RPCServer {
       result.witness_program = decoded.witnessProgram!.toString("hex");
     }
 
+    return result;
+  }
+
+  /**
+   * getaddressinfo "address" — wallet-side address introspection.
+   *
+   * Field EMISSION ORDER mirrors Core (wallet/rpc/addresses.cpp:423-511):
+   * address, scriptPubKey, ismine, solvable, desc (ONLY when solvable;
+   * inferred, checksummed), parent_desc (only when a wallet descriptor owns
+   * the script — the imported public descriptor with checksum), iswatchonly
+   * (DEPRECATED — ALWAYS false, addresses.cpp:383,478), then the
+   * DescribeAddress detail (isscript/iswitness/witness_version/
+   * witness_program per rpc/util.cpp:268+, pubkey when known per
+   * addresses.cpp:304-335), ischange, timestamp, hdkeypath, labels.
+   *
+   * An imported addr() watch address yields ismine:true, solvable:false, no
+   * desc, parent_desc set; an imported single-key wpkh(PUB) yields
+   * ismine:true, solvable:true with both desc and parent_desc.
+   *
+   * @param params [address]
+   */
+  private async getAddressInfo(params: unknown[]): Promise<Record<string, unknown>> {
+    const [addressParam] = params;
+    if (typeof addressParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "address must be a string");
+    }
+    const wallet = this.getCurrentWallet();
+
+    const decoded = this.decodeAddress(addressParam);
+    if (!decoded.valid || !decoded.scriptPubKey) {
+      // Core: top-level -5 with the decode error (addresses.cpp:430-439).
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Invalid address");
+    }
+
+    const key = wallet.getKey(addressParam);
+    const watch = wallet.getWatchAddressInfo(addressParam);
+    const ismine = key !== undefined || watch !== undefined;
+    // solvable: we have enough key/script knowledge to produce a spending
+    // template — true for keyring addresses and key-bearing watch descriptors,
+    // false for bare addr()/raw() watches (Core InferDescriptor->IsSolvable).
+    const solvable = key !== undefined || (watch !== undefined && watch.solvable);
+
+    const pubkeyHex = key ? key.publicKey.toString("hex") : watch?.pubkey;
+
+    const result: Record<string, unknown> = {};
+    result.address = addressParam;
+    result.scriptPubKey = decoded.scriptPubKey.toString("hex");
+    result.ismine = ismine;
+    result.solvable = solvable;
+    if (solvable) {
+      // Inferred descriptor WITH checksum (Core emits desc only when
+      // solvable, addresses.cpp:458-460). For a single-key watch import the
+      // imported descriptor IS the inference; for keyring addresses infer
+      // from the address type + known pubkey.
+      if (watch && watch.solvable) {
+        result.desc = watch.parentDesc;
+      } else if (pubkeyHex) {
+        switch (key!.addressType) {
+          case AddressType.P2WPKH:
+            result.desc = addChecksum(`wpkh(${pubkeyHex})`);
+            break;
+          case AddressType.P2PKH:
+            result.desc = addChecksum(`pkh(${pubkeyHex})`);
+            break;
+          case AddressType.P2SH:
+            result.desc = addChecksum(`sh(wpkh(${pubkeyHex}))`);
+            break;
+          case AddressType.P2TR:
+            // HD taproot keys are BIP-86 (key-path, tweaked) — tr(), not rawtr().
+            result.desc = addChecksum(`tr(${pubkeyHex})`);
+            break;
+        }
+      }
+    }
+    if (watch) {
+      result.parent_desc = watch.parentDesc;
+    }
+    // DEPRECATED in Core — documented "Always false" (addresses.cpp:383,478).
+    result.iswatchonly = false;
+    result.isscript = decoded.isScript;
+    result.iswitness = decoded.isWitness;
+    if (decoded.isWitness) {
+      result.witness_version = decoded.witnessVersion;
+      result.witness_program = decoded.witnessProgram!.toString("hex");
+    }
+    if (pubkeyHex && !decoded.isScript) {
+      result.pubkey = pubkeyHex;
+      if (!decoded.isWitness) {
+        // P2PKH detail (addresses.cpp:304-314): compressed = 33-byte key.
+        result.iscompressed = pubkeyHex.length === 66;
+      }
+    }
+    result.ischange = false;
+    if (watch) {
+      result.timestamp = watch.timestamp;
+    }
+    if (key && key.path !== "imported") {
+      result.hdkeypath = key.path;
+    }
+    const label = wallet.getLabel(addressParam);
+    result.labels = label ? [label] : [];
     return result;
   }
 
@@ -8271,6 +8396,15 @@ export class RPCServer {
       };
     }
 
+    // A watch-only (disable_private_keys) wallet has nothing to encrypt.
+    // Core: -16 RPC_WALLET_ENCRYPTION_FAILED (wallet/rpc/encrypt.cpp:255-256).
+    if (wallet.isPrivateKeysDisabled()) {
+      throw {
+        code: RPCErrorCodes.WALLET_ENCRYPTION_FAILED,
+        message: "Error: wallet does not contain private keys, nothing to encrypt.",
+      };
+    }
+
     if (wallet.isEncrypted()) {
       throw {
         code: RPCErrorCodes.WALLET_WRONG_ENC_STATE,
@@ -8689,6 +8823,10 @@ export class RPCServer {
     const balance = wallet.getBalance();
     const utxos = wallet.getUTXOs();
 
+    // Core: private_keys_enabled = !WALLET_FLAG_DISABLE_PRIVATE_KEYS
+    // (wallet/rpc/wallet.cpp:50,98); a dpk wallet has no keypool.
+    const privateKeysEnabled = !wallet.isPrivateKeysDisabled();
+
     return {
       walletname: this.getCurrentWalletName(),
       walletversion: 1,
@@ -8696,11 +8834,11 @@ export class RPCServer {
       unconfirmed_balance: Number(balance.unconfirmed) / 100_000_000,
       immature_balance: 0, // Would need to track immature coinbase separately
       txcount: utxos.length,
-      keypoolsize: 20, // Address gap
+      keypoolsize: privateKeysEnabled ? 20 : 0, // Address gap
       unlocked_until: wallet.isLocked() ? 0 : undefined,
       paytxfee: 0,
       hdseedid: undefined,
-      private_keys_enabled: true,
+      private_keys_enabled: privateKeysEnabled,
       avoid_reuse: false,
       scanning: false,
       descriptors: true,
@@ -8723,7 +8861,9 @@ export class RPCServer {
     }
 
     try {
-      const info = getDescriptorInfo(descriptorParam);
+      // Parse with the node's actual network so WIF/xprv version bytes and
+      // address prefixes validate against the chain we're on.
+      const info = getDescriptorInfo(descriptorParam, this.getNetworkType());
       return {
         descriptor: info.descriptor,
         checksum: info.checksum,
@@ -9770,6 +9910,14 @@ export class RPCServer {
 
   private async getNewAddress(params: unknown[]): Promise<string> {
     const wallet = this.getCurrentWallet();
+    // A disable_private_keys / blank wallet has no keys to hand out. Core:
+    // CanGetAddresses() false -> -4 (wallet/rpc/addresses.cpp:46-47).
+    if (wallet.isPrivateKeysDisabled() || wallet.isBlank()) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_ERROR,
+        "Error: This wallet has no available keys"
+      );
+    }
     const address = wallet.getNewAddress();
     // Advancing the receive-index keypool is state-changing: persist so a
     // SIGKILL before the next block doesn't reissue the same index.
@@ -9829,6 +9977,15 @@ export class RPCServer {
     }
 
     const wallet = this.getCurrentWallet();
+    // Watch-only (disable_private_keys) wallets cannot spend. Core: SendMoney
+    // -> -4 (wallet/rpc/spend.cpp:177-178). This is the PRIMARY defense; the
+    // signing path additionally throws on a missing key.
+    if (wallet.isPrivateKeysDisabled()) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_ERROR,
+        "Error: Private keys are disabled for this wallet"
+      );
+    }
     if (wallet.isLocked()) {
       throw this.rpcError(
         RPCErrorCodes.WALLET_UNLOCK_NEEDED,
@@ -9912,6 +10069,14 @@ export class RPCServer {
     }
 
     const wallet = this.getCurrentWallet();
+    // bumpfee re-signs, so it needs private keys (Core: -4 unless external
+    // signer / psbtbumpfee, wallet/rpc/spend.cpp:1035).
+    if (wallet.isPrivateKeysDisabled()) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_ERROR,
+        "Error: Private keys are disabled for this wallet"
+      );
+    }
     if (wallet.isLocked()) {
       throw this.rpcError(
         RPCErrorCodes.WALLET_UNLOCK_NEEDED,
@@ -10376,18 +10541,23 @@ export class RPCServer {
       if (addressFilter && !addressFilter.has(utxo.address)) continue;
 
       const key = wallet.getKey(utxo.address);
+      // Reconstruct scriptPubKey from address type + hash. Works for both
+      // key-bearing and watch-only entries (no key material required).
       let scriptPubKeyHex = "";
-      if (key) {
-        // Reconstruct scriptPubKey from address type + hash.
-        try {
-          const decoded = decodeAddress(utxo.address);
-          scriptPubKeyHex = this.buildScriptPubKeyHex(decoded.type, decoded.hash);
-        } catch {
-          scriptPubKeyHex = "";
-        }
+      try {
+        const decoded = decodeAddress(utxo.address);
+        scriptPubKeyHex = this.buildScriptPubKeyHex(decoded.type, decoded.hash);
+      } catch {
+        scriptPubKeyHex = "";
       }
 
       const spendable = wallet.isUTXOSpendable(utxo);
+      // solvable: true when we know the key, or the watch descriptor carries
+      // key material; false for bare addr() watch imports (Core: descriptor
+      // ISMINE entries list spendable:true, solvable:false for addr()).
+      const solvable =
+        key !== undefined ||
+        (wallet.getWatchAddressInfo(utxo.address)?.solvable ?? false);
       result.push({
         txid: Buffer.from(utxo.outpoint.txid).reverse().toString("hex"),
         vout: utxo.outpoint.vout,
@@ -10397,7 +10567,7 @@ export class RPCServer {
         amount: Number(utxo.amount) / 100_000_000,
         confirmations: utxo.confirmations,
         spendable,
-        solvable: true,
+        solvable,
         safe: spendable,
       });
     }
@@ -10571,16 +10741,31 @@ export class RPCServer {
   }
 
   /**
-   * importdescriptors: validate-and-accept descriptor records.
+   * importdescriptors: import descriptors into the wallet's ownership view
+   * and synchronously rescan so PRE-IMPORT funds are credited.
    *
-   * Hotbuns' descriptor parser doesn't yet expose private-key extraction, so
-   * this handler validates each descriptor (rejecting malformed ones), pre-
-   * derives addresses for ranged descriptors via `deriveAddresses`, and
-   * returns Core's per-record result shape.
+   * Core parity (bitcoin-core/src/wallet/rpc/backup.cpp::importdescriptors):
+   *  - `timestamp` is REQUIRED per entry, number | "now" only. Missing /
+   *    wrong type throws TOP-LEVEL -3 and aborts the whole call
+   *    (GetImportTimestamp, backup.cpp:127-139,390). Numeric values clamp to
+   *    minimum_timestamp=1 (backup.cpp:376,390).
+   *  - the BIP-380 checksum is REQUIRED (Parse with require_checksum=true,
+   *    backup.cpp:158); failures are embedded PER-ENTRY as
+   *    {success:false, error:{code:-5, message}} with CheckChecksum's exact
+   *    strings (script/descriptor.cpp:2838-2869) — the call itself still
+   *    returns 200 and the remaining entries are processed.
+   *  - privkey polarity (backup.cpp:224-226, 259-262): private-key material
+   *    into a disable_private_keys wallet -> per-entry -4; a pubkey-only
+   *    descriptor into a privkey-ENABLED wallet -> per-entry -4.
+   *  - after the loop, if >=1 entry succeeded, a SYNCHRONOUS (blocking)
+   *    rescan runs from min(all entry timestamps) - TIMESTAMP_WINDOW (7200s,
+   *    chain.h:37) via the same machinery as rescanblockchain/importprivkey
+   *    (CWallet::RescanFromTime, wallet/wallet.cpp:1827-1847). ts=0 (clamped
+   *    to 1) therefore rescans from GENESIS and credits pre-import funds;
+   *    "now" resolves past every existing block and skips the historical
+   *    walk.
    *
-   * Reference: bitcoin-core/src/wallet/rpc/backup.cpp::importdescriptors.
-   *
-   * @param params [requests: Array<{desc, range?, timestamp, ...}>]
+   * @param params [requests: Array<{desc, timestamp, range?, label?, ...}>]
    */
   private async importDescriptors(params: unknown[]): Promise<unknown[]> {
     const [requestsParam] = params;
@@ -10588,60 +10773,251 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "requests must be an array");
     }
 
-    // Confirm we have a wallet so we mirror Core's "wallet required" error.
-    this.getCurrentWallet();
-
+    const wallet = this.getCurrentWallet();
     const network = this.getNetworkType();
-    const results: Array<Record<string, unknown>> = [];
+    const tipHeight = this.chainState.getBestBlock().height;
+    // Core uses the tip's MTP as "now"; wall-clock is an equivalent stand-in
+    // for the "skip the historical scan" semantics it drives.
+    const now = Math.floor(Date.now() / 1000);
+    const MINIMUM_TIMESTAMP = 1; // backup.cpp:376 — ts=0 clamps to 1 (genesis)
+    const TIMESTAMP_WINDOW = 7200; // chain.h:29,37 (MAX_FUTURE_BLOCK_TIME)
 
+    // ── Pass 1: Core's GetImportTimestamp. These errors are TOP-LEVEL -3 and
+    // abort the entire call (thrown outside ProcessDescriptorImport's try).
+    const timestamps: number[] = [];
     for (const reqUnknown of requestsParam) {
-      if (!reqUnknown || typeof reqUnknown !== "object") {
-        results.push({
-          success: false,
-          error: { code: RPCErrorCodes.INVALID_PARAMS, message: "request must be object" },
-        });
-        continue;
+      const req = (
+        reqUnknown && typeof reqUnknown === "object" ? reqUnknown : {}
+      ) as Record<string, unknown>;
+      if (!("timestamp" in req)) {
+        throw this.rpcError(
+          RPCErrorCodes.TYPE_ERROR,
+          "Missing required timestamp field for key"
+        );
       }
-      const req = reqUnknown as Record<string, unknown>;
-      const desc = req.desc;
-      if (typeof desc !== "string") {
-        results.push({
-          success: false,
-          error: { code: RPCErrorCodes.INVALID_PARAMS, message: "desc must be a string" },
-        });
-        continue;
+      const ts = req.timestamp;
+      if (typeof ts === "number" && Number.isFinite(ts)) {
+        timestamps.push(Math.max(Math.floor(ts), MINIMUM_TIMESTAMP));
+      } else if (ts === "now") {
+        timestamps.push(now);
+      } else {
+        throw this.rpcError(
+          RPCErrorCodes.TYPE_ERROR,
+          `Expected number or "now" timestamp value for key. got type ${
+            ts === null ? "null" : typeof ts
+          }`
+        );
       }
+    }
+
+    // ── Pass 2: per-entry import. EVERY failure here is embedded per-entry
+    // (Core's ProcessDescriptorImport try/catch, backup.cpp:146,293-299).
+    const results: Array<Record<string, unknown>> = [];
+    let anySuccess = false;
+
+    for (let i = 0; i < requestsParam.length; i++) {
+      const reqUnknown = requestsParam[i];
+      const req = (
+        reqUnknown && typeof reqUnknown === "object" ? reqUnknown : {}
+      ) as Record<string, unknown>;
+      const warnings: string[] = [];
 
       try {
-        // Parse + checksum validation.
-        const info = getDescriptorInfo(desc);
+        const desc = req.desc;
+        if (typeof desc !== "string") {
+          throw {
+            code: RPCErrorCodes.INVALID_PARAMETER,
+            message: "Descriptor not found.",
+          };
+        }
 
-        // Range pre-derivation (validates the parser handles the provided range).
-        if (info.isRange) {
-          const rangeRaw = req.range;
-          let range: [number, number] | undefined;
-          if (typeof rangeRaw === "number") {
-            range = [0, rangeRaw];
-          } else if (Array.isArray(rangeRaw) && rangeRaw.length === 2) {
-            range = [rangeRaw[0] as number, rangeRaw[1] as number];
-          }
-          if (range) {
-            // Best-effort derive-and-discard; surfaces parse errors early.
-            deriveAddresses(desc, network, range);
+        // BIP-380 checksum is REQUIRED here (Core require_checksum=true,
+        // backup.cpp:158 -> CheckChecksum exact strings, -5).
+        try {
+          checkDescriptorChecksum(desc, true);
+        } catch (e) {
+          throw {
+            code: RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+            message: e instanceof Error ? e.message : String(e),
+          };
+        }
+
+        // Parse with the node's ACTUAL network (WIF version bytes, address
+        // prefixes). Parse failures are -5 like Core's Parse error.
+        let descriptor;
+        try {
+          descriptor = parseDescriptor(desc, network).descriptor;
+        } catch (e) {
+          throw {
+            code: RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+            message: e instanceof Error ? e.message : String(e),
+          };
+        }
+
+        // Range checks (Core backup.cpp:172-186).
+        let range: [number, number] | undefined;
+        if (!descriptor.isRange() && req.range !== undefined) {
+          throw {
+            code: RPCErrorCodes.INVALID_PARAMETER,
+            message: "Range should not be specified for an un-ranged descriptor",
+          };
+        }
+        if (descriptor.isRange()) {
+          if (req.range !== undefined) {
+            const rangeRaw = req.range;
+            if (typeof rangeRaw === "number" && Number.isInteger(rangeRaw)) {
+              range = [0, rangeRaw];
+            } else if (
+              Array.isArray(rangeRaw) &&
+              rangeRaw.length === 2 &&
+              Number.isInteger(rangeRaw[0]) &&
+              Number.isInteger(rangeRaw[1])
+            ) {
+              range = [rangeRaw[0] as number, rangeRaw[1] as number];
+            } else {
+              throw {
+                code: RPCErrorCodes.INVALID_PARAMETER,
+                message: "Range must be specified as end or as [begin,end]",
+              };
+            }
+            if (range[0] < 0) {
+              throw {
+                code: RPCErrorCodes.INVALID_PARAMETER,
+                message: "Range should be greater or equal than 0",
+              };
+            }
+            if (range[1] < range[0]) {
+              throw {
+                code: RPCErrorCodes.INVALID_PARAMETER,
+                message: "Range specified as [begin,end] must not have begin after end",
+              };
+            }
+          } else {
+            // Core warns + falls back to the keypool-size default range.
+            warnings.push("Range not given, using default keypool range");
+            range = [0, 999];
           }
         }
 
-        results.push({ success: true });
+        // Privkey polarity (Core backup.cpp:224-226 and 259-262).
+        const hasPriv = descriptor.hasPrivateKeys();
+        if (wallet.isPrivateKeysDisabled() && hasPriv) {
+          throw {
+            code: RPCErrorCodes.WALLET_ERROR,
+            message: "Cannot import private keys to a wallet with private keys disabled",
+          };
+        }
+        if (!wallet.isPrivateKeysDisabled() && !hasPriv) {
+          throw {
+            code: RPCErrorCodes.WALLET_ERROR,
+            message: "Cannot import descriptor without private keys to a wallet with private keys enabled",
+          };
+        }
+
+        const label = typeof req.label === "string" ? req.label : undefined;
+
+        // Register ownership: the watch view feeds the SAME processBlock /
+        // rescan machinery the HD keyring uses, so funds are credited by the
+        // post-loop rescan and by future block connects.
+        wallet.addWatchDescriptor(desc, timestamps[i], range, label);
+        anySuccess = true;
+
+        const result: Record<string, unknown> = { success: true };
+        if (warnings.length > 0) result.warnings = warnings;
+        results.push(result);
       } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
+        const errObj = e as { code?: unknown; message?: unknown };
         results.push({
           success: false,
-          error: { code: RPCErrorCodes.INVALID_ADDRESS_OR_KEY, message: msg },
+          error: {
+            code:
+              typeof errObj?.code === "number"
+                ? errObj.code
+                : RPCErrorCodes.MISC_ERROR,
+            message:
+              e instanceof Error
+                ? e.message
+                : String(errObj?.message ?? e),
+          },
         });
       }
     }
 
+    // ── Synchronous rescan (Core backup.cpp:399-410): fires once when >=1
+    // entry succeeded, from the LOWEST timestamp across all entries, minus
+    // the 7200s TIMESTAMP_WINDOW. Blocking by design — Core's
+    // importdescriptors does not return until RescanFromTime completes.
+    if (anySuccess && tipHeight >= 0) {
+      const lowest = Math.min(...timestamps);
+      let startHeight: number | null = 0;
+      if (lowest > MINIMUM_TIMESTAMP) {
+        startHeight = await this.findRescanHeightForTime(
+          lowest - TIMESTAMP_WINDOW,
+          tipHeight
+        );
+      }
+      if (startHeight !== null) {
+        await wallet.rescan(
+          (h) => this.getActiveChainBlock(h),
+          startHeight,
+          tipHeight
+        );
+      }
+    }
+
+    // Persist the imported descriptors (+ rescanned credits) so they survive
+    // a restart (same save-on-mutation contract as importprivkey).
+    this.markWalletDirty();
+
     return results;
+  }
+
+  /**
+   * First active-chain height whose block could contain transactions at or
+   * after `target` (unix seconds). The wallet-rescan floor finder behind
+   * importdescriptors' numeric timestamps — mirrors CWallet::RescanFromTime's
+   * use of CChain::FindEarliestAtLeast (wallet/wallet.cpp:1827-1847). Core
+   * searches the monotonic max-of-block-times; raw header timestamps are only
+   * locally non-monotonic (bounded by the MTP rule), so a binary search plus
+   * a backward correction walk is equivalent in practice and conservative
+   * (never starts LATER than the true floor by more than the walk corrects).
+   * Returns null when no block reaches the target (the rescan would be a
+   * no-op); returns 0 if a block in the span is unreadable (scan everything
+   * rather than risk missing funds).
+   */
+  private async findRescanHeightForTime(
+    target: number,
+    tipHeight: number
+  ): Promise<number | null> {
+    const timeAt = async (h: number): Promise<number | null> => {
+      const block = await this.getActiveChainBlock(h);
+      return block ? block.header.timestamp : null;
+    };
+
+    const tipTime = await timeAt(tipHeight);
+    if (tipTime === null) return 0;
+    if (tipTime < target) return null;
+
+    let lo = 0;
+    let hi = tipHeight;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      const t = await timeAt(mid);
+      if (t === null) return 0; // unreadable: be conservative, scan all
+      if (t >= target) {
+        hi = mid;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    // Local non-monotonicity guard: include earlier blocks whose timestamp
+    // still reaches the target.
+    while (lo > 0) {
+      const t = await timeAt(lo - 1);
+      if (t === null || t < target) break;
+      lo--;
+    }
+    return lo;
   }
 
   /**
