@@ -1404,9 +1404,6 @@ export class RPCServer {
         chain = "unknown";
     }
 
-    // Build softforks object
-    const softforks = this.getSoftforkStatus(bestBlock.height);
-
     // Get pruning info
     const pruneInfo = this.pruneManager?.getPruneInfo() ?? {
       pruned: false,
@@ -1424,25 +1421,36 @@ export class RPCServer {
     const tipBitsHex = tipBitsNum.toString(16).padStart(8, "0");
     const tipTargetHex = compactToBigInt(tipBitsNum).toString(16).padStart(64, "0");
 
+    // size_on_disk: total block-storage bytes (Core m_blockman.CalculateCurrentUsage).
+    const sizeOnDisk = this.pruneManager?.calculateCurrentUsage?.() ?? 0;
+
+    // Core v31.99 getblockchaininfo pushKV order (rpc/blockchain.cpp):
+    //   chain, blocks, headers, bestblockhash, bits, target, difficulty, time,
+    //   mediantime, verificationprogress, initialblockdownload, chainwork,
+    //   size_on_disk, pruned, [pruneheight, automatic_pruning, prune_target_size],
+    //   warnings.
+    // softforks was DROPPED from getblockchaininfo in v31.99 (moved to
+    // getdeploymentinfo) — do NOT emit it here. warnings is an ARRAY of strings
+    // (empty = no warnings), not a bare string.
     const result: Record<string, unknown> = {
       chain,
       blocks: bestBlock.height,
       headers: headers,
       bestblockhash: Buffer.from(bestBlock.hash).reverse().toString("hex"),
+      bits: tipBitsHex,
+      target: tipTargetHex,
       difficulty,
       time: tipTimestamp,
       mediantime,
       verificationprogress,
       initialblockdownload,
       chainwork: bestBlock.chainWork.toString(16).padStart(64, "0"),
-      bits: tipBitsHex,
-      target: tipTargetHex,
+      size_on_disk: sizeOnDisk,
       pruned: pruneInfo.pruned,
-      softforks,
-      warnings: "",
     };
 
-    // Add pruning-specific fields if pruning is enabled
+    // Add pruning-specific fields if pruning is enabled (Core emits these between
+    // pruned and warnings).
     if (pruneInfo.pruned && pruneInfo.pruneheight !== undefined) {
       result.pruneheight = pruneInfo.pruneheight;
     }
@@ -1452,6 +1460,9 @@ export class RPCServer {
         result.prune_target_size = pruneInfo.prune_target_size;
       }
     }
+
+    // warnings: ARRAY of warning strings (Core v31.99 GetWarningsForRpc).
+    result.warnings = [];
 
     return result;
   }
@@ -1669,13 +1680,16 @@ export class RPCServer {
       }
     }
 
-    // Verbosity 1 or 2: return JSON
+    // Verbosity 1 or 2: return JSON.
+    // Core's blockToJSON pushKV order (rpc/blockchain.cpp) is the header fields
+    // first (blockheaderToJSON: ...previousblockhash, nextblockhash), THEN
+    // strippedsize, size, weight, coinbase_tx, tx. Build the object in that exact
+    // order — strippedsize/size/weight come AFTER previous/next block hash, NOT
+    // right after confirmations, and the order is strippedsize, size, weight.
+    const nextHash = await this.db.getBlockHashByHeight(blockIndex.height + 1);
     const result: Record<string, unknown> = {
       hash: blockhashParam,
       confirmations: this.chainState.getBestBlock().height - blockIndex.height + 1,
-      size: blockData.length,
-      strippedsize: this.getStrippedSize(block),
-      weight: this.getBlockWeight(block),
       height: blockIndex.height,
       version: block.header.version,
       versionHex: block.header.version.toString(16).padStart(8, "0"),
@@ -1690,15 +1704,19 @@ export class RPCServer {
       difficulty: this.calculateDifficultyFromBits(block.header.bits),
       chainwork: chainWorkHex,
       nTx: block.transactions.length,
-      previousblockhash: Buffer.from(block.header.prevBlock).reverse().toString("hex"),
-      coinbase_tx: coinbaseTxObj,
     };
-
-    // Add next block hash if available
-    const nextHash = await this.db.getBlockHashByHeight(blockIndex.height + 1);
+    // previousblockhash only when a parent exists (Core: blockindex.pprev guard;
+    // omitted for genesis). nextblockhash immediately follows it (header order).
+    if (blockIndex.height > 0) {
+      result.previousblockhash = Buffer.from(block.header.prevBlock).reverse().toString("hex");
+    }
     if (nextHash) {
       result.nextblockhash = Buffer.from(nextHash).reverse().toString("hex");
     }
+    result.strippedsize = this.getStrippedSize(block);
+    result.size = blockData.length;
+    result.weight = this.getBlockWeight(block);
+    result.coinbase_tx = coinbaseTxObj;
 
     // Add transactions
     if (verbosity === 1) {
@@ -1739,6 +1757,7 @@ export class RPCServer {
     let amtIn = 0n;
     let amtOut = 0n;
     const haveUndo = !isCb && spentByOutpoint !== null;
+    const network = this.getNetworkType();
 
     const result: Record<string, unknown> = {
       txid: Buffer.from(txid).reverse().toString("hex"),
@@ -1753,7 +1772,6 @@ export class RPCServer {
 
         if (isCb && i === 0) {
           vin.coinbase = input.scriptSig.toString("hex");
-          vin.sequence = input.sequence;
         } else {
           vin.txid = Buffer.from(input.prevOut.txid).reverse().toString("hex");
           vin.vout = input.prevOut.vout;
@@ -1763,7 +1781,6 @@ export class RPCServer {
             asm: disassembleScriptSigHashDecode(input.scriptSig),
             hex: input.scriptSig.toString("hex"),
           };
-          vin.sequence = input.sequence;
 
           if (haveUndo && spentByOutpoint) {
             const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
@@ -1774,9 +1791,11 @@ export class RPCServer {
           }
         }
 
+        // Core's TxToUniv pushes txinwitness BEFORE sequence (core_io.cpp).
         if (input.witness.length > 0) {
           vin.txinwitness = input.witness.map((w) => w.toString("hex"));
         }
+        vin.sequence = input.sequence;
 
         return vin;
       }),
@@ -1790,8 +1809,9 @@ export class RPCServer {
           // ValueFromAmount (0 satoshis → "0.00000000", not integer 0).
           value: formatBtcAmount(output.value),
           n: i,
-          // buildScriptPubKeyObj includes desc + correct OP_0→"0" asm
-          scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey),
+          // buildScriptPubKeyObj includes desc + correct OP_0→"0" asm, with the
+          // active network so desc/address use the regtest/testnet prefix.
+          scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey, network),
         };
       }),
     };
@@ -3935,18 +3955,11 @@ export class RPCServer {
    * always uses the active CChainParams for EncodeDestination.
    */
   private buildScriptPubKeyObjNetworkAware(scriptPubKey: Buffer): Record<string, unknown> {
-    const base = buildScriptPubKeyObj(scriptPubKey);
-    const result: Record<string, unknown> = {
-      asm: base.asm,
-      desc: base.desc,
-      hex: base.hex,
-      type: base.type,
-    };
-    const address = this.scriptPubKeyToAddress(scriptPubKey);
-    if (address) {
-      result.address = address;
-    }
-    return result;
+    // buildScriptPubKeyObj is now network-aware (regtest HRP "bcrt" + testnet
+    // base58 versions) AND emits Core's pushKV order asm, desc, hex, address?,
+    // type. Delegate to it with the active network so desc + address + key order
+    // all match Core's ScriptToUniv on regtest/testnet.
+    return buildScriptPubKeyObj(scriptPubKey, this.getNetworkType()) as unknown as Record<string, unknown>;
   }
 
   /**
@@ -4716,6 +4729,18 @@ export class RPCServer {
       incrementalrelayfee: 0.000001, // 0.1 sat/vB = Core's DEFAULT_INCREMENTAL_RELAY_FEE{100} (0.00000100 BTC/kvB)
       unbroadcastcount: 0,
       fullrbf: true,
+      // Core v31.99 MempoolInfoToJSON appends these 5 fields after fullrbf
+      // (rpc/mempool.cpp). Values are the policy defaults (policy.h):
+      //   permit_bare_multisig (DEFAULT_PERMIT_BAREMULTISIG=true),
+      //   max_datacarrier_bytes (MAX_OP_RETURN_RELAY=100000),
+      //   limits.cluster_count (DEFAULT_CLUSTER_LIMIT=64),
+      //   limits.cluster_size_vbytes (DEFAULT_CLUSTER_SIZE_LIMIT_KVB*1000=101000),
+      //   optimal (txgraph quick optimality check — true for an empty/clean pool).
+      permitbaremultisig: true,
+      maxdatacarriersize: 100_000,
+      limitclustercount: 64,
+      limitclustersize: 101_000,
+      optimal: true,
     };
   }
 
@@ -6252,26 +6277,25 @@ export class RPCServer {
       connections: peers.length,
       connections_in: 0,
       connections_out: peers.length,
+      // Core's getnetworkinfo lists ALL networks it knows about (GetNetworksInfo
+      // in rpc/net.cpp), in the order ipv4, ipv6, onion, i2p, cjdns — not just
+      // the reachable ones. onion/i2p/cjdns are limited+unreachable with no proxy
+      // configured. Mirror the full 5-entry array.
       networks: [
-        {
-          name: "ipv4",
-          limited: false,
-          reachable: true,
-          proxy: "",
-          proxy_randomize_credentials: false,
-        },
-        {
-          name: "ipv6",
-          limited: false,
-          reachable: true,
-          proxy: "",
-          proxy_randomize_credentials: false,
-        },
+        { name: "ipv4", limited: false, reachable: true, proxy: "", proxy_randomize_credentials: false },
+        { name: "ipv6", limited: false, reachable: true, proxy: "", proxy_randomize_credentials: false },
+        { name: "onion", limited: true, reachable: false, proxy: "", proxy_randomize_credentials: false },
+        { name: "i2p", limited: true, reachable: false, proxy: "", proxy_randomize_credentials: false },
+        { name: "cjdns", limited: true, reachable: false, proxy: "", proxy_randomize_credentials: false },
       ],
-      relayfee: 0.00001,
-      incrementalfee: 0.00001,
+      // relayfee/incrementalfee are the policy fee defaults in BTC/kvB:
+      //   DEFAULT_MIN_RELAY_TX_FEE=100 sat/kvB = 0.00000100 BTC/kvB,
+      //   DEFAULT_INCREMENTAL_RELAY_FEE=100 sat/kvB = 0.00000100 BTC/kvB.
+      relayfee: 0.000001,
+      incrementalfee: 0.000001,
       localaddresses: [],
-      warnings: "",
+      // warnings: ARRAY of warning strings (Core v31.99 GetWarningsForRpc).
+      warnings: [],
     };
   }
 
@@ -6490,9 +6514,10 @@ export class RPCServer {
 
     if (!decoded.valid) {
       result.isvalid = false;
-      // Bitcoin Core 27+ always returns this exact error string and an empty error_locations array
-      result.error = "Invalid or unsupported Segwit (Bech32) or Base58 encoding.";
+      // Core v31.99 pushKV order for an invalid address: isvalid, error_locations,
+      // error (error_locations BEFORE error — rpc/util.cpp validateaddress).
       result.error_locations = [];
+      result.error = "Invalid or unsupported Segwit (Bech32) or Base58 encoding.";
       return result;
     }
 
@@ -7798,10 +7823,20 @@ export class RPCServer {
     const nowSeconds = Math.floor(Date.now() / 1000);
     const maxTipAgeSeconds = 24 * 60 * 60; // 24 hours
 
-    // Still in IBD if chainwork is below minimum OR tip is older than 24 hours
+    // On regtest the tip-age gate does not apply: Core evaluates tip age against
+    // GetTime() which honours -mocktime, so a regtest chain mined under mocktime
+    // (tip time ~= mocktime) is NOT "old" and IsInitialBlockDownload latches to
+    // false at the tip. hotbuns has no mocktime clock here, so a regtest chain's
+    // (intentionally backdated) tip would otherwise look perpetually stale and
+    // pin IBD=true. Exempt regtest from the wall-clock tip-age check so it
+    // latches false at tip like Core. Mainnet/testnet keep the real gate.
+    const isRegtest = this.params.networkMagic === 0xdab5bffa;
+    const tipTooOld = !isRegtest && bestBlockTimestamp < nowSeconds - maxTipAgeSeconds;
+
+    // Still in IBD if chainwork is below minimum OR (off-regtest) tip is stale.
     const stillInIBD =
       bestBlockChainWork < this.params.nMinimumChainWork ||
-      bestBlockTimestamp < nowSeconds - maxTipAgeSeconds;
+      tipTooOld;
 
     // If we've exited IBD, latch to false
     if (!stillInIBD) {
@@ -9524,15 +9559,15 @@ export class RPCServer {
     const txid = getTxId(tx);
     const wtxid = getWTxId(tx);
 
-    // Build vin array matching Core's TxToUniv:
-    //   - coinbase input: { coinbase, sequence[, txinwitness] }
-    //   - regular input:  { txid, vout, scriptSig:{asm,hex}, sequence[, txinwitness] }
-    // scriptSig.asm uses fAttemptSighashDecode=true (ScriptToAsmStr in Core).
+    // Build vin array matching Core's TxToUniv pushKV order:
+    //   - coinbase input: { coinbase, txinwitness?, sequence }
+    //   - regular input:  { txid, vout, scriptSig:{asm,hex}, txinwitness?, sequence }
+    // Core pushes txinwitness BEFORE sequence (core_io.cpp TxToUniv), so build the
+    // object in that exact order. scriptSig.asm uses fAttemptSighashDecode=true.
     const vinArr = tx.inputs.map((input, i) => {
       const vin: Record<string, unknown> = {};
       if (isCoinbase(tx) && i === 0) {
         vin.coinbase = input.scriptSig.toString("hex");
-        vin.sequence = input.sequence;
       } else {
         vin.txid = Buffer.from(input.prevOut.txid).reverse().toString("hex");
         vin.vout = input.prevOut.vout;
@@ -9540,20 +9575,22 @@ export class RPCServer {
           asm: disassembleScriptSigHashDecode(input.scriptSig),
           hex: input.scriptSig.toString("hex"),
         };
-        vin.sequence = input.sequence;
       }
       if (input.witness && input.witness.length > 0) {
         vin.txinwitness = input.witness.map((w) => w.toString("hex"));
       }
+      vin.sequence = input.sequence;
       return vin;
     });
 
     // Build vout array: value via BTC sentinel (0.00000000 format), full
-    // scriptPubKey shape {asm, desc, hex, address?, type} via W53 helper.
+    // scriptPubKey shape {asm, desc, hex, address?, type} via W53 helper, with
+    // the active network so desc/address use the regtest/testnet prefix.
+    const network = this.getNetworkType();
     const voutArr = tx.outputs.map((output, i) => ({
       value: formatBtcAmount(output.value),
       n: i,
-      scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey),
+      scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey, network),
     }));
 
     return {
@@ -9576,7 +9613,9 @@ export class RPCServer {
     const hexStr = params[0] as string;
     // Allow empty string (Core handles it as an empty script)
     const script = Buffer.from(hexStr, "hex");
-    return decodeScriptRPC(script);
+    // Thread the active network so desc/address/p2sh use the regtest/testnet
+    // prefix (bcrt / 0x6f / 0xc4) instead of mainnet (bc / 0x00 / 0x05).
+    return decodeScriptRPC(script, this.getNetworkType());
   }
 
   /**
@@ -9824,14 +9863,20 @@ export class RPCServer {
     const tipTargetHex = compactToBigInt(tipBitsNum).toString(16).padStart(64, "0");
     const difficulty = this.calculateDifficultyFromBits(tipBitsNum);
     const nextHeight = best.height + 1;
+    // Core v31.99 getmininginfo pushKV order (rpc/mining.cpp):
+    //   blocks, bits, difficulty, target, networkhashps, pooledtx,
+    //   [currentblockweight, currentblocktx], blockmintxfee, chain, next, warnings.
+    // blockmintxfee comes AFTER networkhashps/pooledtx, and is the
+    // DEFAULT_BLOCK_MIN_TX_FEE policy default: 1 sat/kvB = 0.00000001 BTC/kvB.
+    // warnings is an ARRAY of strings (empty = none).
     return {
       blocks: best.height,
       bits: tipBitsHex,
       difficulty,
       target: tipTargetHex,
-      blockmintxfee: 0.00001000,
       networkhashps: 0,
       pooledtx: this.mempool.getSize(),
+      blockmintxfee: 0.00000001,
       chain: this.getNetworkType(),
       next: {
         height: nextHeight,
@@ -9839,7 +9884,7 @@ export class RPCServer {
         difficulty,
         target: tipTargetHex,
       },
-      warnings: "",
+      warnings: [],
     };
   }
 
@@ -9870,8 +9915,9 @@ export class RPCServer {
     const txidBuf = Buffer.from(txidHex, "hex").reverse();
     const bestBlock = this.chainState.getBestBlock();
     const bestBlockHash = Buffer.from(bestBlock.hash).reverse().toString("hex");
+    const network = this.getNetworkType();
 
-    // Check mempool first if requested
+    // Check mempool first if requested.
     if (includeMempool) {
       // txidBuf is internal byte order (already reversed above); mempool keys by internal order
       const mpEntry = this.mempool.getTransaction(txidBuf);
@@ -9883,15 +9929,18 @@ export class RPCServer {
             bestblock: bestBlockHash,
             confirmations: 0,
             value: formatBtcAmount(output.value),
-            scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey),
+            scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey, network),
             coinbase: false,
           };
         }
       }
     }
 
-    // Look up in chainstate UTXO set
-    const utxoManager = this.chainState.getUTXOManager();
+    // Look up in the authoritative live UTXO view (BlockSync's manager when
+    // wired — it reflects the post-connect spent state; ChainStateManager's
+    // cache does not). This makes gettxout return null for an output already
+    // spent by a connected block (Core's CCoinsView semantics).
+    const utxoManager = this.liveUTXOManager();
     const outpoint = { txid: txidBuf, vout };
     const entry = await utxoManager.getUTXOAsync(outpoint);
     if (!entry) {
@@ -9903,7 +9952,7 @@ export class RPCServer {
       bestblock: bestBlockHash,
       confirmations,
       value: formatBtcAmount(entry.amount),
-      scriptPubKey: buildScriptPubKeyObj(entry.scriptPubKey),
+      scriptPubKey: buildScriptPubKeyObj(entry.scriptPubKey, network),
       coinbase: entry.coinbase,
     };
   }
@@ -11455,6 +11504,37 @@ export class RPCServer {
   // ========== Wave-47b Methods ==========
 
   /**
+   * The AUTHORITATIVE live UTXO view for RPC reads.
+   *
+   * hotbuns runs two UTXOManagers over one coins DB: BlockSync's (mutated on
+   * every connectBlock and flushed) and ChainStateManager's (read by most RPC
+   * paths but NOT updated by block connect). A coin spent by a freshly connected
+   * block is correctly gone from BlockSync's view + the DB, yet can linger
+   * stale-cached in ChainStateManager's view. So gettxout would report a spent
+   * output as still-unspent (e.g. a coinbase consumed by an in-block spend).
+   * Prefer BlockSync's authoritative manager when present; fall back to
+   * ChainStateManager's (e.g. when no BlockSync is wired, as in some tests).
+   */
+  private liveUTXOManager(): import("../chain/utxo.js").UTXOManager {
+    return this.blockSync?.getUTXOManager() ?? this.chainState.getUTXOManager();
+  }
+
+  /**
+   * Estimated on-disk size of the coins database, mirroring Core's
+   * CCoinsViewDB::EstimateSize() reported as gettxoutsetinfo.disk_size. The
+   * CoinsViewDB reports 0 until coins are flushed to its backing store, so an
+   * unflushed chainstate (e.g. a freshly-mirrored regtest chain) reports 0 —
+   * matching Core.
+   */
+  private utxoDiskSize(): number {
+    try {
+      return this.liveUTXOManager().getCoinsViewDB().estimateSize();
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
    * gettxoutsetinfo ( "hash_type" hash_or_height use_index )
    *
    * Returns statistics about the unspent transaction output set, mirroring
@@ -11616,10 +11696,14 @@ export class RPCServer {
       total_amount: formatBtcAmount(stats.totalAmount),
       // Not available when coinstatsindex is used; always present here.
       transactions: Number(stats.transactions),
-      // Impl-specific: hotbuns is LevelDB-backed; report the database-
-      // independent bogosize as a stable on-disk-size proxy (Core reports a
-      // backend EstimateSize() that is likewise not portable).
-      disk_size: Number(stats.bogosize),
+      // disk_size mirrors Core's CCoinsViewDB::EstimateSize() (kernel/coinstats):
+      // the LevelDB on-disk size of the coins database. hotbuns keeps the coin
+      // set in the in-memory CoinsViewCache and writes a separate on-disk coins
+      // database only at flush boundaries, so its EstimateSize() equivalent is 0
+      // for an UNFLUSHED chainstate (e.g. a freshly-mirrored regtest chain) —
+      // matching Core, which also reports 0 there. The earlier bogosize proxy
+      // over-reported relative to Core.
+      disk_size: this.utxoDiskSize(),
     };
 
     if (hashType === "hash_serialized_3" && stats.hash) {

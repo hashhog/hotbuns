@@ -340,9 +340,11 @@ describe("W123-G12: generateSingleBlock timestamp >= MTP+1 — FIXED (was BUG-19
 // G13 — blockmintxfee from -blockmintxfee arg
 // =============================================================================
 describe("W123-G13: blockmintxfee from operator -blockmintxfee arg — MISSING (BUG-22)", () => {
-  it("BUG-22: getmininginfo emits blockmintxfee: 0.00001000 (hardcoded)", () => {
-    const mi = rpcSlice("private async getMiningInfo()", 35);
-    expect(mi).toContain("blockmintxfee: 0.00001000");
+  it("getmininginfo emits blockmintxfee = DEFAULT_BLOCK_MIN_TX_FEE (0.00000001), hardcoded", () => {
+    // Core's DEFAULT_BLOCK_MIN_TX_FEE is 1 sat/kvB = 0.00000001 BTC/kvB
+    // (policy.h). The earlier hardcoded 0.00001000 over-reported by 1000x.
+    const mi = rpcSlice("private async getMiningInfo()", 40);
+    expect(mi).toContain("blockmintxfee: 0.00000001");
   });
   it("No `-blockmintxfee` CLI arg or config parsing exists", () => {
     // Search whole codebase for the option name. Not parsed anywhere.

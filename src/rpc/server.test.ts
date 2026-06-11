@@ -692,6 +692,17 @@ describe("RPCServer", () => {
       expect(typeof result.result.size).toBe("number");
       expect(typeof result.result.bytes).toBe("number");
     });
+
+    it("should include the v31.99 policy fields", async () => {
+      const result = await rpcRequest(testPort, "getmempoolinfo");
+      // Core v31.99 appends these 5 fields after fullrbf (rpc/mempool.cpp).
+      expect(result.result.fullrbf).toBe(true);
+      expect(result.result.permitbaremultisig).toBe(true);
+      expect(result.result.maxdatacarriersize).toBe(100_000);
+      expect(result.result.limitclustercount).toBe(64);
+      expect(result.result.limitclustersize).toBe(101_000);
+      expect(result.result.optimal).toBe(true);
+    });
   });
 
   describe("getrawmempool", () => {
@@ -1038,6 +1049,31 @@ describe("RPCServer", () => {
       expect(result.result.subversion).toBe(REGTEST.userAgent);
       expect(typeof result.result.connections).toBe("number");
     });
+
+    it("should list all five networks (ipv4, ipv6, onion, i2p, cjdns)", async () => {
+      const result = await rpcRequest(testPort, "getnetworkinfo");
+      expect(Array.isArray(result.result.networks)).toBe(true);
+      expect(result.result.networks.length).toBe(5);
+      expect(result.result.networks.map((n: { name: string }) => n.name)).toEqual([
+        "ipv4", "ipv6", "onion", "i2p", "cjdns",
+      ]);
+    });
+
+    it("should report the policy fee defaults (1e-6) and warnings as an array", async () => {
+      const result = await rpcRequest(testPort, "getnetworkinfo");
+      expect(result.result.relayfee).toBeCloseTo(0.000001, 12);
+      expect(result.result.incrementalfee).toBeCloseTo(0.000001, 12);
+      expect(Array.isArray(result.result.warnings)).toBe(true);
+    });
+
+    it("should advertise hotbuns's REAL service word 0x409 (no P2P_V2 — v2 default-off)", async () => {
+      const result = await rpcRequest(testPort, "getnetworkinfo");
+      // hotbuns does NOT advertise NODE_P2P_V2 (BIP-324 v2 transport is
+      // default-off), so localservices is the real 0x409 word, NOT Core's 0xc09.
+      // This is a correct-but-differs-from-Core divergence, never to be faked.
+      expect(result.result.localservices).toBe("0000000000000409");
+      expect(result.result.localservicesnames).not.toContain("P2P_V2");
+    });
   });
 
   describe("getblockhash", () => {
@@ -1197,6 +1233,12 @@ describe("RPCServer", () => {
       expect(result.result).toBeDefined();
       expect(result.result.isvalid).toBe(false);
       expect(result.result.error).toBeDefined();
+      expect(Array.isArray(result.result.error_locations)).toBe(true);
+      // Core v31.99 key order for an invalid address: isvalid, error_locations,
+      // error (error_locations BEFORE error). Lock the emission order in.
+      expect(Object.keys(result.result)).toEqual([
+        "isvalid", "error_locations", "error",
+      ]);
     });
 
     it("should reject non-string parameter", async () => {
@@ -1426,17 +1468,24 @@ describe("RPCServer", () => {
     });
   });
 
-  describe("getblockchaininfo softforks", () => {
-    it("should include softforks in response", async () => {
+  describe("getblockchaininfo v31.99 shape", () => {
+    it("should NOT include softforks (dropped in v31.99, moved to getdeploymentinfo)", async () => {
       const result = await rpcRequest(testPort, "getblockchaininfo");
 
       expect(result.result).toBeDefined();
-      expect(result.result.softforks).toBeDefined();
-      expect(result.result.softforks.segwit).toBeDefined();
-      expect(result.result.softforks.segwit.type).toBe("buried");
-      expect(result.result.softforks.taproot).toBeDefined();
-      expect(result.result.softforks.csv).toBeDefined();
-      expect(result.result.softforks.bip34).toBeDefined();
+      // Core v31.99 removed `softforks` from getblockchaininfo (it now lives in
+      // getdeploymentinfo). hotbuns matches: the key must be absent.
+      expect(result.result.softforks).toBeUndefined();
+    });
+
+    it("should emit warnings as an array of strings", async () => {
+      const result = await rpcRequest(testPort, "getblockchaininfo");
+      expect(Array.isArray(result.result.warnings)).toBe(true);
+    });
+
+    it("should include size_on_disk", async () => {
+      const result = await rpcRequest(testPort, "getblockchaininfo");
+      expect(typeof result.result.size_on_disk).toBe("number");
     });
   });
 
