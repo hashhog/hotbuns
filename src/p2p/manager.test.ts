@@ -732,20 +732,24 @@ describe("PeerManager service flags", () => {
   });
 });
 
-describe("PeerManager BIP-159 NODE_NETWORK_LIMITED advertisement (W26)", () => {
-  // Regression coverage for the W26 wiring fix: hotbuns shipped a working
-  // PruneManager + GETDATA gate but never plumbed `pruneMode` from the
-  // CLI into the PeerManager constructor.  Before the fix, even when an
-  // operator passed `--prune=550`, hotbuns advertised 0x09n and lied to
-  // peers about its pruning state.  These tests pin the new contract:
+describe("PeerManager NODE_NETWORK_LIMITED advertisement (service-flags 2026-06-11)", () => {
+  // Core advertises NODE_NETWORK_LIMITED UNCONDITIONALLY for a full node — its
+  // base g_local_services is (NODE_NETWORK_LIMITED | NODE_WITNESS) at
+  // init.cpp:863, with NODE_NETWORK added for non-prune nodes at init.cpp:1950.
+  // A full node always serves at least the last 288 blocks, so it always sets
+  // the limited bit, regardless of prune mode.  Previously hotbuns gated the
+  // bit on prune mode and advertised only 0x09 by default — under-claiming.
+  // The corrected contract:
   //
-  //   - default (no --prune)  → services == 0x09n  (NETWORK | WITNESS)
-  //   - --prune=N>0           → services == 0x0409n (+ NETWORK_LIMITED)
+  //   - any mode  → services == 0x409 (NETWORK | WITNESS | NETWORK_LIMITED)
+  //   - NODE_P2P_V2 (0x800) is NEVER set (BIP-324 v2 transport is default-off
+  //     for hotbuns; advertising it would claim an off-wire capability)
   //
-  // Implementation: cli.ts:1329 now passes `pruneMode: pruneManager !== undefined`,
-  // and the PeerManager constructor copy retains the field (it was previously
-  // dropped by the `this.config = {…}` whitelisting).  The OR-in itself was
-  // already wired at manager.ts:638-640 (outbound) and :1881-1883 (inbound).
+  // Implementation: params.services is now 0x409n; the three advertise sites
+  // (getAdvertisedServices, outbound connect, inbound listen) pass it through
+  // with no prune gate.
+  const NODE_P2P_V2 = 0x800n; // 1<<11 — NOT in ServiceFlags; must never be set.
+
   const baseConfig = (overrides: Partial<PeerManagerConfig> = {}): PeerManagerConfig => ({
     maxOutbound: 8,
     maxInbound: 117,
@@ -755,33 +759,43 @@ describe("PeerManager BIP-159 NODE_NETWORK_LIMITED advertisement (W26)", () => {
     ...overrides,
   });
 
-  test("default (pruneMode unset) advertises NETWORK | WITNESS = 0x09n", () => {
+  test("default (pruneMode unset) advertises exactly 0x409 (NETWORK|WITNESS|NETWORK_LIMITED)", () => {
     const manager = new PeerManager(baseConfig());
-    expect(manager.getAdvertisedServices()).toBe(0x09n);
-    expect(manager.getAdvertisedServices()).toBe(1n | 8n);
+    const advertised = manager.getAdvertisedServices();
+    expect(advertised).toBe(0x409n);
+    expect(advertised).toBe(1n | 8n | 1024n);
+    // NODE_NETWORK_LIMITED is set; NODE_P2P_V2 is NOT.
+    expect(advertised & ServiceFlags.NODE_NETWORK_LIMITED).toBe(
+      ServiceFlags.NODE_NETWORK_LIMITED
+    );
+    expect(advertised & NODE_P2P_V2).toBe(0n);
   });
 
-  test("pruneMode: false advertises NETWORK | WITNESS = 0x09n (explicit off)", () => {
+  test("pruneMode: false still advertises 0x409 (bit is unconditional, not prune-gated)", () => {
     const manager = new PeerManager(baseConfig({ pruneMode: false }));
-    expect(manager.getAdvertisedServices()).toBe(0x09n);
+    const advertised = manager.getAdvertisedServices();
+    expect(advertised).toBe(0x409n);
+    expect(advertised & ServiceFlags.NODE_NETWORK_LIMITED).toBe(
+      ServiceFlags.NODE_NETWORK_LIMITED
+    );
+    expect(advertised & NODE_P2P_V2).toBe(0n);
   });
 
-  test("pruneMode: true OR's in NODE_NETWORK_LIMITED → 0x0409n", () => {
+  test("pruneMode: true advertises 0x409 (NETWORK_LIMITED already present)", () => {
     const manager = new PeerManager(baseConfig({ pruneMode: true }));
-    // 1 (NETWORK) | 8 (WITNESS) | 1024 (NETWORK_LIMITED) = 0x0409 = 1033.
-    expect(manager.getAdvertisedServices()).toBe(0x0409n);
-    expect(manager.getAdvertisedServices()).toBe(1n | 8n | 1024n);
+    // 1 (NETWORK) | 8 (WITNESS) | 1024 (NETWORK_LIMITED) = 0x409 = 1033.
+    expect(manager.getAdvertisedServices()).toBe(0x409n);
   });
 
-  test("pruneMode: true sets the NETWORK_LIMITED bit on top of network defaults", () => {
+  test("advertised bitset preserves NETWORK + WITNESS and never sets P2P_V2", () => {
     const manager = new PeerManager(baseConfig({ pruneMode: true }));
     const advertised = manager.getAdvertisedServices();
-    // The bit is OR'd, not assigned: existing flags must still be present.
     expect(advertised & ServiceFlags.NODE_NETWORK).toBe(ServiceFlags.NODE_NETWORK);
     expect(advertised & ServiceFlags.NODE_WITNESS).toBe(ServiceFlags.NODE_WITNESS);
     expect(advertised & ServiceFlags.NODE_NETWORK_LIMITED).toBe(
       ServiceFlags.NODE_NETWORK_LIMITED
     );
+    expect(advertised & NODE_P2P_V2).toBe(0n);
   });
 
   test("regtest pruneMode: true also advertises NETWORK_LIMITED", () => {

@@ -128,12 +128,12 @@ export interface PeerManagerConfig {
   /** P2P port to listen on (default: network default port) */
   port?: number;
   /**
-   * BIP-159: when true, OR `NODE_NETWORK_LIMITED` (1<<10 = 0x400)
-   * into the advertised services bitfield in outbound version handshakes.
-   * Set when prune mode is enabled (--prune > 0).  Mirrors Core's
-   * `init.cpp` (`nLocalServices |= NODE_NETWORK_LIMITED` when
-   * `IsPruneMode()` is true).  Peers seeing this bit must not request
-   * blocks below the recent-`MIN_BLOCKS_TO_KEEP` (288) keep window.
+   * Whether prune mode is enabled (--prune > 0).  Note: this does NOT gate
+   * NODE_NETWORK_LIMITED advertisement.  Core advertises NODE_NETWORK_LIMITED
+   * UNCONDITIONALLY for full nodes (init.cpp:863 base g_local_services =
+   * NODE_NETWORK_LIMITED | NODE_WITNESS), so the bit lives in
+   * `params.services` (0x409) and is always sent.  Peers seeing it must not
+   * request blocks below the recent-`MIN_BLOCKS_TO_KEEP` (288) keep window.
    */
   pruneMode?: boolean;
   /**
@@ -599,10 +599,9 @@ export class PeerManager {
       connect: config.connect,
       listen: config.listen ?? true,
       port: config.port ?? config.params.defaultPort,
-      // BIP-159: must be retained so the OR-in sites at lines ~638 (outbound)
-      // and ~1881 (inbound) can advertise NODE_NETWORK_LIMITED when the
-      // operator passed --prune>0.  Previously dropped, defeating the
-      // service-bit-gate even when cli.ts plumbed the flag through.
+      // Retained for prune-mode behavior generally; it no longer gates the
+      // NODE_NETWORK_LIMITED service bit (advertised unconditionally for this
+      // full node via params.services = 0x409, per Core init.cpp:863/1950).
       pruneMode: config.pruneMode ?? false,
     };
     this.peers = new Map();
@@ -923,16 +922,18 @@ export class PeerManager {
 
   /**
    * Resolved service-bit field advertised in outbound + inbound version
-   * handshakes, identical to the value computed at the connect/listen sites
-   * (lines ~638 and ~1881).  When `pruneMode === true`, OR's in
-   * NODE_NETWORK_LIMITED (1<<10 = 0x400) per BIP-159 / Core's
-   * `init.cpp` rule.  Exposed primarily so tests can pin the
-   * --prune→service-bit wiring without poking at private state.
+   * handshakes, identical to the value computed at the connect/listen sites.
+   * For a full node this is NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED
+   * (0x409): Core advertises NODE_NETWORK_LIMITED UNCONDITIONALLY for full
+   * nodes (init.cpp:863 base g_local_services = NODE_NETWORK_LIMITED |
+   * NODE_WITNESS; NODE_NETWORK added for non-prune at init.cpp:1950).  The
+   * bit lives in `params.services`, so no prune gate is needed here.
+   * NODE_P2P_V2 is NOT advertised (BIP-324 v2 is default-off for hotbuns).
+   * Exposed primarily so tests can pin the advertised bitset without poking
+   * at private state.
    */
   getAdvertisedServices(): bigint {
-    return this.config.pruneMode
-      ? (this.config.params.services | ServiceFlags.NODE_NETWORK_LIMITED)
-      : this.config.params.services;
+    return this.config.params.services;
   }
 
   /**
@@ -1221,12 +1222,11 @@ export class PeerManager {
 
     this.connectingPeers.add(key);
 
-    // BIP-159: OR `NODE_NETWORK_LIMITED` (1<<10) into the advertised
-    // services when prune mode is on.  Otherwise advertise the
-    // network-default services from `params.services`.
-    const advertisedServices = this.config.pruneMode
-      ? (this.config.params.services | ServiceFlags.NODE_NETWORK_LIMITED)
-      : this.config.params.services;
+    // NODE_NETWORK_LIMITED (1<<10 = 0x400) is advertised UNCONDITIONALLY for
+    // this full node — it is already part of `params.services` (0x409), per
+    // Core (init.cpp:863 base g_local_services includes NODE_NETWORK_LIMITED;
+    // NODE_NETWORK added for non-prune at init.cpp:1950).  No prune gate here.
+    const advertisedServices = this.config.params.services;
 
     const config: PeerConfig = {
       host,
@@ -2818,11 +2818,10 @@ export class PeerManager {
               manager.disconnectPeer(evicted);
             }
 
-            // BIP-159: same NODE_NETWORK_LIMITED gate as outbound; advertise
-            // the bit if and only if prune mode is on.
-            const inAdvertisedServices = manager.config.pruneMode
-              ? (manager.config.params.services | ServiceFlags.NODE_NETWORK_LIMITED)
-              : manager.config.params.services;
+            // NODE_NETWORK_LIMITED is advertised UNCONDITIONALLY for this full
+            // node — already part of `params.services` (0x409), same as the
+            // outbound site.  No prune gate (Core init.cpp:863/1950).
+            const inAdvertisedServices = manager.config.params.services;
 
             // Create a Peer for this inbound connection
             const peerConfig: PeerConfig = {

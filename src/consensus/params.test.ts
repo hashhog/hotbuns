@@ -45,12 +45,13 @@ describe("network constants", () => {
   });
 
   test("services field defaults to NETWORK | WITNESS (NETWORK_LIMITED is conditional)", () => {
-    // NODE_NETWORK (1) | NODE_WITNESS (8) = 9.
-    // NODE_NETWORK_LIMITED (1024) is OR'd in by PeerManager when --prune>0
-    // (see p2p/manager.ts:638-640, mirrors Core's init.cpp).  Tested
-    // separately in p2p/manager.test.ts via getAdvertisedServices().
-    expect(MAINNET.services).toBe(0x09n);
-    expect(MAINNET.services).toBe(1n | 8n);
+    // NODE_NETWORK (1) | NODE_WITNESS (8) | NODE_NETWORK_LIMITED (1024) = 0x409.
+    // Core advertises NODE_NETWORK_LIMITED UNCONDITIONALLY for a full node
+    // (init.cpp:863 base g_local_services; NODE_NETWORK added for non-prune at
+    // init.cpp:1950), so it is part of the base services, not prune-gated.
+    // NODE_P2P_V2 (0x800) is NOT set — BIP-324 v2 is default-off for hotbuns.
+    expect(MAINNET.services).toBe(0x409n);
+    expect(MAINNET.services).toBe(1n | 8n | 1024n);
   });
 
   test("difficulty adjustment interval is 2016 blocks", () => {
