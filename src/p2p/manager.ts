@@ -195,6 +195,13 @@ export interface PeerInfo {
    * For IPv4/IPv6, we use the host field.
    */
   rawAddr?: Buffer;
+  /**
+   * Internal provenance tag for the address. "fixedseeds" mirrors Core's
+   * CNetAddr::SetInternal("fixedseeds") used as the source when injecting the
+   * hardcoded last-resort seeds (net.cpp:2642). Unset for normally-learned
+   * addresses.
+   */
+  source?: string;
 }
 
 /**
@@ -232,6 +239,70 @@ const FALLBACK_PEERS: Record<number, Array<{ host: string; port: number }>> = {
     { host: "seed.testnet4.wiz.biz", port: 48333 },
   ],
   // Regtest (networkMagic: 0xdab5bffa) - no fallbacks, local only
+  0xdab5bffa: [],
+};
+
+/**
+ * Curated, hardcoded fixed-seed IPs — the LAST-RESORT bootstrap fallback,
+ * keyed by networkMagic. These are Core-vetted IPv4 peer addresses (NOT DNS
+ * hostnames) injected into the known-address pool only when DNS seeding has
+ * yielded nothing and the book is empty. They are layered AFTER the normal
+ * DNS bootstrap; they never replace nor bypass it.
+ *
+ * Reference: Bitcoin Core net.cpp:2607-2643 ThreadOpenConnections fixed-seed
+ * trigger (add_fixed_seeds one-shot) + chainparams.cpp m_params.FixedSeeds().
+ * Core clears vFixedSeeds for non-mainnet, so only mainnet carries entries;
+ * testnet/testnet4/regtest are empty.
+ */
+export const FIXED_SEEDS: Record<number, Array<{ host: string; port: number }>> = {
+  // Mainnet (networkMagic: 0xd9b4bef9) — 40 curated IPv4:8333 fixed seeds.
+  0xd9b4bef9: [
+    { host: "2.121.116.198", port: 8333 },
+    { host: "3.86.179.235", port: 8333 },
+    { host: "4.2.51.251", port: 8333 },
+    { host: "5.2.23.226", port: 8333 },
+    { host: "12.11.29.34", port: 8333 },
+    { host: "14.49.142.41", port: 8333 },
+    { host: "18.27.125.103", port: 8333 },
+    { host: "23.93.18.82", port: 8333 },
+    { host: "24.16.202.74", port: 8333 },
+    { host: "27.83.109.113", port: 8333 },
+    { host: "31.41.23.249", port: 8333 },
+    { host: "34.65.45.157", port: 8333 },
+    { host: "35.78.97.86", port: 8333 },
+    { host: "37.15.61.236", port: 8333 },
+    { host: "38.52.3.192", port: 8333 },
+    { host: "40.160.1.232", port: 8333 },
+    { host: "44.223.26.178", port: 8333 },
+    { host: "45.19.130.200", port: 8333 },
+    { host: "46.126.216.3", port: 8333 },
+    { host: "47.90.137.13", port: 8333 },
+    { host: "50.4.123.66", port: 8333 },
+    { host: "51.154.0.142", port: 8333 },
+    { host: "52.182.185.242", port: 8333 },
+    { host: "60.241.1.72", port: 8333 },
+    { host: "62.34.57.141", port: 8333 },
+    { host: "63.247.147.166", port: 8333 },
+    { host: "64.23.97.128", port: 8333 },
+    { host: "65.94.134.253", port: 8333 },
+    { host: "66.35.84.14", port: 8333 },
+    { host: "67.4.139.122", port: 8333 },
+    { host: "68.61.69.53", port: 8333 },
+    { host: "69.4.94.226", port: 8333 },
+    { host: "70.44.20.24", port: 8333 },
+    { host: "71.56.178.136", port: 8333 },
+    { host: "72.88.192.74", port: 8333 },
+    { host: "73.42.33.255", port: 8333 },
+    { host: "74.48.195.218", port: 8333 },
+    { host: "75.80.3.4", port: 8333 },
+    { host: "76.124.35.108", port: 8333 },
+    { host: "77.38.72.37", port: 8333 },
+  ],
+  // Testnet (networkMagic: 0x0709110b) — Core clears vFixedSeeds: none.
+  0x0709110b: [],
+  // Testnet4 (networkMagic: 0x283f161c) — none.
+  0x283f161c: [],
+  // Regtest (networkMagic: 0xdab5bffa) — none.
   0xdab5bffa: [],
 };
 
@@ -492,6 +563,21 @@ export class PeerManager {
   private dnsSeed: boolean;
 
   /**
+   * One-shot guard for the fixed-seed last-resort injection. Set true after
+   * {@link maybeAddFixedSeeds} fires once so subsequent ticks are no-ops.
+   * Mirrors Core's `add_fixed_seeds = false` (net.cpp:2641).
+   */
+  private fixedSeedsAdded: boolean;
+
+  /**
+   * Wall-clock ms timestamp anchored at the top of {@link start}. Used by
+   * {@link maybeAddFixedSeeds} for the 60s grace period before falling back to
+   * fixed seeds. Mirrors Core's `start` anchor in ThreadOpenConnections
+   * (net.cpp `GetTime() > start + 1min`).
+   */
+  private loopStartTs: number;
+
+  /**
    * Parsed, pinned `-connect` peers (host + port). Non-empty iff the
    * operator passed one or more `-connect=<ip:port>` flags. When non-empty
    * the node is in connect-only mode: DNS seeding, fallback peers, anchors,
@@ -568,6 +654,11 @@ export class PeerManager {
     this.proxyManager = config.proxyManager ?? null;
     this.cjdnsReachable = config.cjdnsReachable ?? false;
     this.dnsSeed = config.dnsSeed ?? true;
+    this.fixedSeedsAdded = false;
+    // Anchored properly at the top of start(); initialized here so the field
+    // is always defined even for tests that exercise the manager without
+    // calling start().
+    this.loopStartTs = Date.now();
 
     // Parse the pinned -connect addresses once. host:port split mirrors the
     // start()-path parsing below (lastIndexOf(":") so IPv6 literals survive),
@@ -849,6 +940,9 @@ export class PeerManager {
    */
   async start(): Promise<void> {
     this.running = true;
+    // Anchor the connection-loop start timestamp for the fixed-seed 60s grace
+    // period (Core net.cpp ThreadOpenConnections `start`).
+    this.loopStartTs = Date.now();
 
     // Start TCP listener for inbound connections
     if (this.config.listen && this.config.port) {
@@ -949,6 +1043,13 @@ export class PeerManager {
     } else {
       console.log("P2P: -nodnsseed — skipping DNS seed resolution");
     }
+
+    // Last-resort fixed-seed fallback. Layered AFTER the normal DNS / fallback
+    // bootstrap above — it never replaces nor bypasses DNS. Fires immediately
+    // here only for the DNS-disabled / connect-disabled-but-still-empty case
+    // (Core's cheap `!dnsseed && !use_seednodes` shortcut, net.cpp:2620); the
+    // 60s-grace empty-book case is handled in the maintain() loop.
+    this.maybeAddFixedSeeds();
 
     // Fill initial connections
     await this.fillConnections();
@@ -1541,6 +1642,12 @@ export class PeerManager {
   private async maintain(): Promise<void> {
     if (!this.running) return;
 
+    // Last-resort fixed-seed fallback (60s-grace empty-book case). The DNS /
+    // fallback bootstrap in start() ran first; if it produced nothing and the
+    // book is still empty 60s in, fall through to the curated fixed seeds.
+    // Falls THROUGH after DNS — never replaces it (Core net.cpp:2616-2643).
+    this.maybeAddFixedSeeds();
+
     // Evict peers with high ban scores
     for (const [key, info] of this.knownAddresses) {
       if (info.banScore >= 100) {
@@ -1564,6 +1671,85 @@ export class PeerManager {
 
     // Save addresses periodically
     await this.saveAddresses();
+  }
+
+  /**
+   * Last-resort fixed-seed fallback (Core net.cpp:2607-2643,
+   * ThreadOpenConnections fixed-seed trigger).
+   *
+   * Fires the one-shot curated fixed-seed injection ONLY when ALL hold:
+   *  (1) ENABLED: fixed seeds are on (default; off under `-connect`) AND the
+   *      per-network {@link FIXED_SEEDS} list is non-empty (mainnet only —
+   *      empty for testnet/signet/regtest, matching Core clearing vFixedSeeds).
+   *  (2) BOOK EMPTY: {@link knownAddresses} is empty — our impl-local proxy
+   *      for Core's `!GetReachableEmptyNetworks().empty()` over this
+   *      IPv4-only set (addrman has no addresses for a reachable network).
+   *  (3) EITHER (a) >60s elapsed since {@link loopStartTs} (gives DNS /
+   *      addnode / seednode time to populate the book first), OR (b) DNS
+   *      seeding is disabled and there is no pinned source to wait for
+   *      (Core's cheap `!dnsseed && !use_seednodes` shortcut at net.cpp:2620 —
+   *      fire immediately).
+   *
+   * After firing, sets the one-shot guard ({@link fixedSeedsAdded}, Core's
+   * `add_fixed_seeds = false`) so subsequent ticks are no-ops. Injected addrs
+   * carry the "fixedseeds" internal source tag (Core CNetAddr::SetInternal)
+   * and pass the normal routable / dedup / ban filter on add.
+   *
+   * This is a LAST-RESORT fallback layered AFTER the untouched normal DNS
+   * bootstrap — it never replaces DNS, never bypasses it, and only adds
+   * IPv4-routable curated entries.
+   */
+  private maybeAddFixedSeeds(): void {
+    // One-shot guard (Core: add_fixed_seeds already false).
+    if (this.fixedSeedsAdded) return;
+
+    const seeds = FIXED_SEEDS[this.config.params.networkMagic] ?? [];
+
+    // (1) ENABLED: fixed seeds present (mainnet only) and not in connect-only
+    // mode. Core folds -connect into "fixed-seed path off".
+    if (seeds.length === 0) return;
+    if (this.isConnectOnly()) return;
+
+    // (2) BOOK EMPTY: no known addresses for any reachable network.
+    if (this.knownAddresses.size !== 0) return;
+
+    // (3) Timing gate: either >60s since the loop start, OR DNS seeding is
+    // disabled (nothing to wait for) ⇒ fire immediately. We have no
+    // -addnode/-seednode source other than -connect (already excluded above),
+    // so the DNS-off branch mirrors Core's `!dnsseed && !use_seednodes`.
+    const graceElapsed = Date.now() - this.loopStartTs > 60_000;
+    if (!graceElapsed && this.dnsSeed) return;
+
+    // Mark the one-shot guard before adding so a re-entrant tick is a no-op.
+    this.fixedSeedsAdded = true;
+
+    const now = Date.now();
+    const services = ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS;
+    let added = 0;
+    for (const { host, port } of seeds) {
+      // Pass the normal routable + dedup + ban filter, exactly as a learned
+      // address would (Core: addrman.Add drops non-routable; we also honor the
+      // ban list so a banned fixed seed is not injected).
+      if (!isRoutable(host)) continue;
+      if (this.banManager.isBanned(host)) continue;
+      const key = `${host}:${port}`;
+      if (this.knownAddresses.has(key)) continue;
+      this.addKnownAddress(key, {
+        host,
+        port,
+        services,
+        lastSeen: now,
+        banScore: 0,
+        lastConnected: 0,
+        source: "fixedseeds",
+      });
+      added++;
+    }
+
+    console.log(
+      `P2P: added ${added} fixed seed(s) as a last-resort fallback ` +
+      `(DNS bootstrap produced no addresses${this.dnsSeed ? " within 60s" : "; -nodnsseed"})`
+    );
   }
 
   /**
