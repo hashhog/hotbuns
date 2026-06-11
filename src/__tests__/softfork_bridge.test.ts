@@ -1,10 +1,11 @@
 /**
- * Regtest test: getblockchaininfo.softforks and getdeploymentinfo.deployments
- * must agree on every shared field (type, active, height).
+ * Regtest test: getdeploymentinfo.deployments is the canonical softfork-state
+ * surface, and getblockchaininfo NO LONGER carries `softforks`.
  *
- * Both RPCs now project from the same buildDeploymentState() helper, so any
- * divergence here means the helper is broken or a new deployment was added to
- * only one RPC.
+ * Core v31.99 dropped `softforks` from getblockchaininfo (it moved entirely to
+ * getdeploymentinfo). hotbuns matches: getblockchaininfo must not emit
+ * `softforks`, and getdeploymentinfo remains the source of truth for per-fork
+ * type/active/height (+ min_activation_height).
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
@@ -29,7 +30,7 @@ class MockHeaderSync {
   getMedianTimePast() { return 0; }
 }
 
-describe("softfork bridge: getblockchaininfo.softforks === getdeploymentinfo.deployments", () => {
+describe("softfork surface: getdeploymentinfo.deployments (getblockchaininfo.softforks dropped in v31.99)", () => {
   let db: ChainDB;
   let cleanup: () => Promise<void>;
   let chainState: ChainStateManager;
@@ -67,59 +68,40 @@ describe("softfork bridge: getblockchaininfo.softforks === getdeploymentinfo.dep
     if (cleanup) await cleanup();
   });
 
-  test("shared fields (type, active, height) match across both RPCs at genesis", async () => {
+  test("getblockchaininfo does NOT carry softforks (v31.99 dropped it)", async () => {
     const chainInfo = await (rpcServer as any).getBlockchainInfo() as Record<string, unknown>;
+    expect("softforks" in chainInfo).toBe(false);
+  });
+
+  test("getdeploymentinfo.deployments exposes type/active/height at genesis", async () => {
     const deployInfo = await (rpcServer as any).getDeploymentInfo([]) as {
       hash: string;
       height: number;
       deployments: Record<string, { type: string; active: boolean; height: number; min_activation_height: number }>;
     };
 
-    const softforks = chainInfo.softforks as Record<string, { type: string; active: boolean; height: number }>;
     const deployments = deployInfo.deployments;
-
-    // The two RPCs must cover the same set of softfork names.
-    const sfNames = new Set(Object.keys(softforks));
-    const depNames = new Set(Object.keys(deployments));
-    expect(sfNames).toEqual(depNames);
-
-    // For every named deployment the shared fields must agree exactly.
-    for (const name of sfNames) {
-      const sf = softforks[name];
-      const dep = deployments[name];
-
-      expect(sf.type).toBe(dep.type);
-      expect(sf.active).toBe(dep.active);
-      expect(sf.height).toBe(dep.height);
+    expect(Object.keys(deployments).length).toBeGreaterThan(0);
+    for (const [name, dep] of Object.entries(deployments)) {
+      expect(typeof dep.type, `${name}.type`).toBe("string");
+      expect(typeof dep.active, `${name}.active`).toBe("boolean");
+      expect(typeof dep.height, `${name}.height`).toBe("number");
     }
   });
 
-  test("shared fields match after generating blocks (height > 0)", async () => {
+  test("getdeploymentinfo.deployments stays consistent after generating blocks (height > 0)", async () => {
     // Mine several regtest blocks so we cross some activation thresholds.
     const address = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
     await (rpcServer as any).generateToAddress([10, address]);
 
-    const chainInfo = await (rpcServer as any).getBlockchainInfo() as Record<string, unknown>;
     const deployInfo = await (rpcServer as any).getDeploymentInfo([]) as {
-      hash: string;
-      height: number;
       deployments: Record<string, { type: string; active: boolean; height: number; min_activation_height: number }>;
     };
 
-    const softforks = chainInfo.softforks as Record<string, { type: string; active: boolean; height: number }>;
-    const deployments = deployInfo.deployments;
-
-    const sfNames = new Set(Object.keys(softforks));
-    const depNames = new Set(Object.keys(deployments));
-    expect(sfNames).toEqual(depNames);
-
-    for (const name of sfNames) {
-      const sf = softforks[name];
-      const dep = deployments[name];
-
-      expect(sf.type).toBe(dep.type);
-      expect(sf.active).toBe(dep.active);
-      expect(sf.height).toBe(dep.height);
+    for (const [name, dep] of Object.entries(deployInfo.deployments)) {
+      expect(typeof dep.type, `${name}.type`).toBe("string");
+      expect(typeof dep.active, `${name}.active`).toBe("boolean");
+      expect(typeof dep.height, `${name}.height`).toBe("number");
     }
   });
 
@@ -133,18 +115,6 @@ describe("softfork bridge: getblockchaininfo.softforks === getdeploymentinfo.dep
         typeof entry.min_activation_height,
         `${name}.min_activation_height should be a number`
       ).toBe("number");
-    }
-  });
-
-  test("getblockchaininfo.softforks does NOT emit min_activation_height", async () => {
-    const chainInfo = await (rpcServer as any).getBlockchainInfo() as Record<string, unknown>;
-    const softforks = chainInfo.softforks as Record<string, Record<string, unknown>>;
-
-    for (const [name, entry] of Object.entries(softforks)) {
-      expect(
-        "min_activation_height" in entry,
-        `${name} should not have min_activation_height in getblockchaininfo`
-      ).toBe(false);
     }
   });
 

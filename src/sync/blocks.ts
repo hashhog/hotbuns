@@ -3723,6 +3723,21 @@ export class BlockSync {
   }
 
   /**
+   * The AUTHORITATIVE UTXO view — the one this BlockSync mutates on every
+   * connectBlock (spendOutput / addTransaction) and flushes to the coins DB.
+   *
+   * NOTE: ChainStateManager constructs a SEPARATE UTXOManager over the same
+   * LevelDB (chain/state.ts), but its in-memory CoinsViewCache is NOT updated
+   * by block connect — so a coin spent by a freshly-connected block can linger
+   * (stale-cached) in ChainStateManager's view while it is correctly gone from
+   * THIS view + the DB. RPC reads of the live UTXO set (gettxout) must therefore
+   * consult THIS manager to see the post-connect state. Exposed read-only.
+   */
+  getUTXOManager(): UTXOManager {
+    return this.utxoManager;
+  }
+
+  /**
    * Get sync progress as a percentage.
    */
   getProgress(): number {

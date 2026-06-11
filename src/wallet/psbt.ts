@@ -3078,23 +3078,54 @@ export function formatBtcAmount(sats: bigint): { toJSON(): string } {
  * Core's ExtractDestination. Returns null for P2PK, multisig, nulldata,
  * nonstandard. The network is always mainnet for the live PSBT fleet.
  */
-function spkToAddress(script: Buffer): string | null {
+/**
+ * Active-network selector for the decode* / build* RPC formatters.
+ * Mirrors Bitcoin Core's CChainParams::Base58Prefixes / bech32_hrp: every
+ * address/descriptor/p2sh string an RPC emits is encoded under the ACTIVE
+ * network, never a hardcoded mainnet prefix. Defaults to "mainnet" so the
+ * many wallet/PSBT call sites that do not pass a network keep their existing
+ * (mainnet) behaviour; the chain/tx RPC handlers thread the real network.
+ */
+export type PsbtNetwork = "mainnet" | "testnet" | "regtest";
+
+/** Bech32 HRP for the active network (Core: CChainParams::bech32_hrp). */
+function bech32HrpFor(network: PsbtNetwork): string {
+  switch (network) {
+    case "mainnet": return "bc";
+    case "regtest": return "bcrt";
+    case "testnet":
+    default: return "tb";
+  }
+}
+
+/** Base58 P2PKH version byte (Core: base58Prefixes[PUBKEY_ADDRESS]). */
+function p2pkhVersionFor(network: PsbtNetwork): number {
+  return network === "mainnet" ? 0x00 : 0x6f;
+}
+
+/** Base58 P2SH version byte (Core: base58Prefixes[SCRIPT_ADDRESS]). */
+function p2shVersionFor(network: PsbtNetwork): number {
+  return network === "mainnet" ? 0x05 : 0xc4;
+}
+
+function spkToAddress(script: Buffer, network: PsbtNetwork = "mainnet"): string | null {
   const type = getScriptType(script);
+  const hrp = bech32HrpFor(network);
 
   if (type === "pubkeyhash" && script.length === 25) {
-    return base58CheckEncode(0x00, script.subarray(3, 23));
+    return base58CheckEncode(p2pkhVersionFor(network), script.subarray(3, 23));
   }
   if (type === "scripthash" && script.length === 23) {
-    return base58CheckEncode(0x05, script.subarray(2, 22));
+    return base58CheckEncode(p2shVersionFor(network), script.subarray(2, 22));
   }
   if (type === "witness_v0_keyhash" && script.length === 22) {
-    return bech32Encode("bc", 0, script.subarray(2, 22));
+    return bech32Encode(hrp, 0, script.subarray(2, 22));
   }
   if (type === "witness_v0_scripthash" && script.length === 34) {
-    return bech32Encode("bc", 0, script.subarray(2, 34));
+    return bech32Encode(hrp, 0, script.subarray(2, 34));
   }
   if (type === "witness_v1_taproot" && script.length === 34) {
-    return bech32Encode("bc", 1, script.subarray(2, 34));
+    return bech32Encode(hrp, 1, script.subarray(2, 34));
   }
   return null;
 }
@@ -3149,7 +3180,7 @@ function parseP2MSScript(script: Buffer): { n: number; keys: Buffer[] } | null {
   return { n, keys };
 }
 
-function inferDescriptor(script: Buffer): string {
+function inferDescriptor(script: Buffer, network: PsbtNetwork = "mainnet"): string {
   // witness_v1_taproot: OP_1 (0x51) + OP_DATA_32 (0x20) + 32 bytes = 34 bytes
   if (script.length === 34 && script[0] === 0x51 && script[1] === 0x20) {
     const xonly = script.subarray(2, 34).toString("hex");
@@ -3174,7 +3205,7 @@ function inferDescriptor(script: Buffer): string {
     }
   }
 
-  const addr = spkToAddress(script);
+  const addr = spkToAddress(script, network);
   let inner: string;
   if (addr !== null) {
     inner = `addr(${addr})`;
@@ -3194,21 +3225,27 @@ function inferDescriptor(script: Buffer): string {
  * The `address` field is suppressed for bare-pubkey scripts (type==="pubkey"),
  * matching Core's ScriptToUniv behaviour.
  */
-export function buildScriptPubKeyObj(script: Buffer): DecodedScriptPubKey {
+export function buildScriptPubKeyObj(
+  script: Buffer,
+  network: PsbtNetwork = "mainnet",
+): DecodedScriptPubKey {
   const type = getScriptType(script);
-  const result: DecodedScriptPubKey = {
+  // Core's ScriptToUniv emits keys in the order: asm, desc, hex, address?, type
+  // (rpc address pushed BEFORE type). Build the object in that exact insertion
+  // order so the byte-exact JSON matches Core's pushKV order, then cast back to
+  // DecodedScriptPubKey (the cast is needed because the address key is inserted
+  // conditionally between hex and type).
+  const addr = type !== "pubkey" ? spkToAddress(script, network) : null;
+  const result: Record<string, unknown> = {
     asm: disassembleScript(script),
-    desc: inferDescriptor(script),
+    desc: inferDescriptor(script, network),
     hex: script.toString("hex"),
-    type,
   };
-  if (type !== "pubkey") {
-    const addr = spkToAddress(script);
-    if (addr !== null) {
-      result.address = addr;
-    }
+  if (addr !== null) {
+    result.address = addr;
   }
-  return result;
+  result.type = type;
+  return result as unknown as DecodedScriptPubKey;
 }
 
 // =============================================================================
@@ -3403,8 +3440,8 @@ function hasChecksigAddOrOpSuccess(script: Buffer): boolean {
  * Compute the P2SH address for a script: base58check(0x05, hash160(script)).
  * Mirrors EncodeDestination(ScriptHash(script)).
  */
-function p2shAddress(script: Buffer): string {
-  return base58CheckEncode(0x05, hash160(script));
+function p2shAddress(script: Buffer, network: PsbtNetwork = "mainnet"): string {
+  return base58CheckEncode(p2shVersionFor(network), hash160(script));
 }
 
 /**
@@ -3419,20 +3456,25 @@ function p2shAddress(script: Buffer): string {
  *
  * Reference: bitcoin-core/src/rpc/rawtransaction.cpp::decodescript
  */
-export function decodeScriptRPC(script: Buffer): Record<string, unknown> {
+export function decodeScriptRPC(
+  script: Buffer,
+  network: PsbtNetwork = "mainnet",
+): Record<string, unknown> {
   const { type, solutionsData } = solveScript(script);
 
   // Build base shape from the existing helper, then override type with the
   // Core-accurate solver result and strip top-level hex.
-  const base = buildScriptPubKeyObj(script);
+  const base = buildScriptPubKeyObj(script, network);
+  // Core's decodescript emits root keys in the order: asm, desc, address?, type,
+  // p2sh? (address pushed BEFORE type). Mirror that pushKV order exactly.
   const result: Record<string, unknown> = {
     asm: base.asm,
     desc: base.desc,
-    type,
   };
   if (base.address !== undefined) {
     result.address = base.address;
   }
+  result.type = type;
 
   // can_wrap: types that may be wrapped in P2SH
   // (MULTISIG / NONSTANDARD / PUBKEY / PUBKEYHASH / WITNESS_V0_KEYHASH / WITNESS_V0_SCRIPTHASH)
@@ -3449,7 +3491,7 @@ export function decodeScriptRPC(script: Buffer): Record<string, unknown> {
     !hasChecksigAddOrOpSuccess(script);
 
   if (canWrap) {
-    result.p2sh = p2shAddress(script);
+    result.p2sh = p2shAddress(script, network);
 
     // can_wrap_P2WSH: types eligible for P2WSH wrap
     // (MULTISIG / PUBKEY [compressed only] / NONSTANDARD / PUBKEYHASH)
@@ -3482,18 +3524,20 @@ export function decodeScriptRPC(script: Buffer): Record<string, unknown> {
         segwitScr = Buffer.concat([Buffer.from([0x00, 0x20]), wsh]);
       }
 
-      // Build inner segwit object via buildScriptPubKeyObj (which includes hex)
-      const inner = buildScriptPubKeyObj(segwitScr);
+      // Build inner segwit object via buildScriptPubKeyObj (which includes hex).
+      // Core's ScriptPubKeyToUniv emits: asm, desc, hex, address?, type (address
+      // before type), then decodescript appends p2sh-segwit.
+      const inner = buildScriptPubKeyObj(segwitScr, network);
       const segwitObj: Record<string, unknown> = {
         asm: inner.asm,
         desc: inner.desc,
         hex: segwitScr.toString("hex"),
-        type: inner.type,
       };
       if (inner.address !== undefined) {
         segwitObj.address = inner.address;
       }
-      segwitObj["p2sh-segwit"] = p2shAddress(segwitScr);
+      segwitObj.type = inner.type;
+      segwitObj["p2sh-segwit"] = p2shAddress(segwitScr, network);
       result.segwit = segwitObj;
     }
   }
