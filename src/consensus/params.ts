@@ -449,12 +449,16 @@ export const MAINNET: ConsensusParams = {
   // Used by shouldSkipScripts() for the proper ancestor-check semantics.
   assumedValid: "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac",
   protocolVersion: 70016,
-  // Default-advertised services: NODE_NETWORK | NODE_WITNESS = 0x09.
-  // BIP-159 NODE_NETWORK_LIMITED (0x400) is OR'd in by PeerManager when
-  // prune mode is enabled (config.pruneMode === true).  Mirrors Core's
-  // init.cpp (`nLocalServices |= NODE_NETWORK_LIMITED` only when
-  // `IsPruneMode()` is true).
-  services: 0x09n, // NODE_NETWORK | NODE_WITNESS
+  // Default-advertised services: NODE_NETWORK | NODE_WITNESS |
+  // NODE_NETWORK_LIMITED = 0x409.  Core advertises NODE_NETWORK_LIMITED
+  // UNCONDITIONALLY for a full node — its base g_local_services is
+  // (NODE_NETWORK_LIMITED | NODE_WITNESS) at init.cpp:863, and NODE_NETWORK
+  // is added for non-prune nodes at init.cpp:1950.  A full node always
+  // serves at least the last 288 blocks, so it always advertises the
+  // limited bit.  NODE_P2P_V2 (0x800) is NOT advertised: BIP-324 v2
+  // transport is default-off for hotbuns, so advertising it would claim an
+  // off-wire capability.
+  services: 0x409n, // NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED
   userAgent: "/hotbuns:0.1.0/",
   dnsSeed: [
     "seed.bitcoin.sipa.be",
