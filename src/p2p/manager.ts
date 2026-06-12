@@ -19,6 +19,7 @@ import {
   MAX_OUTBOUND_PEERS_TO_PROTECT,
 } from "./peer.js";
 import type { NetworkMessage, AddrPayload, NetworkAddress, AddrV2Payload, FeeFilterPayload } from "./messages.js";
+import { ipv4ToBuffer } from "./messages.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { BanManager, DEFAULT_BAN_TIME, type BanEntry } from "./banman.js";
@@ -47,6 +48,7 @@ import {
   asmapVersion,
 } from "./asmap.js";
 import type { ProxyManager, NetworkType } from "./proxy.js";
+import { AddrMan } from "./addrman.js";
 
 /**
  * Maximum number of addresses retained in the v1-only fallback cache.
@@ -326,7 +328,64 @@ export const EVICTION_PROTECT_BLOCKS = 4;
 export const EVICTION_PROTECT_BLOCK_RELAY = 8;
 
 /** Connection type for outbound connections. */
-export type ConnectionType = "full_relay" | "block_relay" | "inbound";
+export type ConnectionType = "full_relay" | "block_relay" | "inbound" | "feeler";
+
+/**
+ * FEELER scheduling interval, in milliseconds.
+ *
+ * Core net.h `FEELER_INTERVAL = 120s` — the mean of the exponential timer that
+ * decides when the next short-lived feeler probe is opened (net.cpp
+ * ThreadOpenConnections `next_feeler = now + rng.rand_exp_duration(FEELER_INTERVAL)`).
+ * A feeler dials ONE address from the addrman NEW table, completes the
+ * handshake to confirm liveness, marks it Good (NEW->TRIED) on success, then
+ * disconnects. Keeping TRIED fresh is Core's primary anti-eclipse mitigation.
+ */
+export const FEELER_INTERVAL_MS = 120_000;
+
+/**
+ * Maximum number of in-flight feeler connections.
+ *
+ * Core net.h `MAX_FEELER_CONNECTIONS = 1` — only one feeler probe is ever in
+ * flight, and it lives OFF the full-relay / block-relay outbound slot budget
+ * (net.cpp: ConnectionType::FEELER is excluded from nOutboundFullRelay /
+ * nOutboundBlockRelay counting and from netgroup-diversity gating).
+ */
+export const MAX_FEELER_CONNECTIONS = 1;
+
+/**
+ * Absolute cap on addresses returned in a single getaddr response.
+ *
+ * Core net_processing.h `MAX_ADDR_TO_SEND = 1000`. Also the amount the inbound
+ * addr-processing token bucket is topped up by, ONCE, when WE send a getaddr
+ * (net_processing.cpp:3767 `peer.m_addr_token_bucket += MAX_ADDR_TO_SEND`).
+ */
+export const MAX_ADDR_TO_SEND = 1000;
+
+/**
+ * getaddr response is capped at this percentage of the addrman size.
+ *
+ * Core net_processing.h `MAX_PCT_ADDR_TO_SEND = 23`. The effective cap is
+ * `min(MAX_ADDR_TO_SEND, ceil(0.23 * addrman_size))` (CConnman::GetAddresses ->
+ * AddrMan::GetAddr with max_pct=23, addrman.cpp). Both bound the leak surface of
+ * an attacker probing our addrman via getaddr.
+ */
+export const MAX_PCT_ADDR_TO_SEND = 23;
+
+/**
+ * Inbound addr-message rate limit, in addresses per second.
+ *
+ * Core net_processing.cpp `MAX_ADDR_RATE_PER_SECOND = 0.1` — the token bucket
+ * refills by elapsed_seconds * 0.1 (one address every 10 s sustained).
+ */
+export const MAX_ADDR_RATE_PER_SECOND = 0.1;
+
+/**
+ * Maximum size of the inbound addr-processing token bucket.
+ *
+ * Core net_processing.cpp `MAX_ADDR_PROCESSING_TOKEN_BUCKET = 1000` — refill is
+ * clamped to this ceiling so a long-idle peer cannot bank unlimited credit.
+ */
+export const MAX_ADDR_PROCESSING_TOKEN_BUCKET = 1000;
 
 /**
  * Compute the network group for an IP address.
@@ -490,6 +549,52 @@ export class PeerManager {
   private inboundPeers: Set<string>;
 
   /**
+   * Bucketed Core CAddrMan bridged onto the live address store.
+   *
+   * The live node serves getaddr / outbound dialing from {@link knownAddresses}
+   * (a flat host:port map). The bucketed NEW/TRIED CAddrMan (axis #2,
+   * `addrman.ts`) is mirrored here so the FEELER probe has a real NEW table to
+   * select from and a real TRIED table to promote into. Every insert into
+   * {@link knownAddresses} is mirrored into this addrman (NEW table) via
+   * {@link mirrorToAddrMan}; a successful feeler handshake calls
+   * `addrMan.good()` to move that address NEW->TRIED — exactly Core's
+   * net.cpp/addrman.cpp Good() promotion path. Without this bridge the feeler
+   * would select from an empty throwaway table.
+   */
+  private addrMan: AddrMan;
+
+  /**
+   * Set of address keys currently being probed by a feeler (host:port). Bounds
+   * in-flight feelers to {@link MAX_FEELER_CONNECTIONS}=1 and lets the
+   * disconnect path identify a feeler peer. Core CNode::m_conn_type==FEELER +
+   * the single-feeler `now > next_feeler` gate.
+   */
+  private feelerInFlight: Set<string>;
+
+  /**
+   * Earliest wall-clock time (ms) at which the next feeler may be opened.
+   * Core net.cpp `next_feeler` exponential timer; we approximate the
+   * exponential with a {@link FEELER_INTERVAL_MS}-mean jitter on each schedule.
+   */
+  private nextFeelerAt: number;
+
+  /**
+   * Per-peer "we already answered one getaddr" guard (key = host:port).
+   * Core Peer::m_getaddr_recvd (net_processing.cpp:4833) — only the FIRST
+   * getaddr per connection is answered; repeats are ignored.
+   */
+  private getaddrRecvd: Set<string>;
+
+  /**
+   * Per-peer inbound-addr token bucket state (key = host:port). Core
+   * Peer::m_addr_token_bucket / m_addr_token_timestamp. Shared by BOTH the addr
+   * and addrv2 handlers so an attacker cannot bypass the rate limit by sending
+   * addrv2 (Core routes both through the same ProcessAddrs bucket,
+   * net_processing.cpp:4022).
+   */
+  private addrTokenBucket: Map<string, { tokens: number; ts: number }>;
+
+  /**
    * Set true once {@link stop} has been entered.  Independent of
    * {@link running} because tests (and the mainnet `connectPeer` path)
    * exercise the manager without first calling {@link start}, so
@@ -617,6 +722,13 @@ export class PeerManager {
     this.outboundNetGroups = new Set();
     this.anchors = [];
     this.inboundPeers = new Set();
+    this.addrMan = new AddrMan();
+    this.feelerInFlight = new Set();
+    // First feeler may fire one interval after construction (Core seeds
+    // next_feeler = start + rand_exp_duration(FEELER_INTERVAL)).
+    this.nextFeelerAt = Date.now() + this.randFeelerDelay();
+    this.getaddrRecvd = new Set();
+    this.addrTokenBucket = new Map();
     this.pingInterval = null;
     this.staleCheckInterval = null;
     this.protectedPeers = new Set();
@@ -1143,6 +1255,9 @@ export class PeerManager {
     this.peerConnectionType.clear();
     this.outboundNetGroups.clear();
     this.inboundPeers.clear();
+    this.feelerInFlight.clear();
+    this.getaddrRecvd.clear();
+    this.addrTokenBucket.clear();
 
     // Save addresses and ban list before shutdown
     await this.saveAddresses();
@@ -1212,8 +1327,17 @@ export class PeerManager {
     }
 
     // Network group diversity check for outbound connections
-    // Skip for localhost (allows testing with multiple connections)
-    if (connectionType !== "inbound" && !isLocalAddress(host)) {
+    // Skip for localhost (allows testing with multiple connections).
+    // FEELER connections are short-lived liveness probes and are EXEMPT from
+    // netgroup diversity — Core net.cpp only requires "non-feelers ... to be to
+    // distinct network groups" (the `!fFeeler && outbound_ipv46_peer_netgroups
+    // .contains(...)` guard). A feeler must be able to probe a NEW-table
+    // address even when we already hold a peer in its /16.
+    if (
+      connectionType !== "inbound" &&
+      connectionType !== "feeler" &&
+      !isLocalAddress(host)
+    ) {
       const netGroup = this.getNetGroupForAddr(host);
       if (this.outboundNetGroups.has(netGroup)) {
         throw new Error(`Already have outbound connection in netgroup ${netGroup}`);
@@ -1236,7 +1360,11 @@ export class PeerManager {
       services: advertisedServices,
       userAgent: this.config.params.userAgent,
       bestHeight: this.config.bestHeight,
-      relay: connectionType !== "block_relay", // Block-relay-only connections don't relay txs,
+      // Block-relay-only AND feeler connections do not relay txs. Core sets
+      // relay=false for ConnectionType::FEELER (net.cpp OpenNetworkConnection),
+      // since a feeler is a throwaway liveness probe that disconnects after the
+      // handshake.
+      relay: connectionType !== "block_relay" && connectionType !== "feeler",
       // FIX-56 W117: plumb the proxy manager + network type into the Peer
       // so non-clearnet outbound (.onion, .b32.i2p) routes through SOCKS5
       // or I2P SAM rather than the direct Bun.connect path.  CJDNS is
@@ -1300,12 +1428,15 @@ export class PeerManager {
       // Track connection type
       this.peerConnectionType.set(key, connectionType);
 
-      // Track network group for outbound connections
-      if (connectionType !== "inbound") {
+      // Track network group for outbound connections.
+      // FEELER is OFF-budget: it neither consumes a netgroup slot nor an
+      // inbound slot (Core net.cpp excludes ConnectionType::FEELER from the
+      // outbound netgroup set and the full-relay/block-relay counts).
+      if (connectionType === "inbound") {
+        this.inboundPeers.add(key);
+      } else if (connectionType !== "feeler") {
         const netGroup = this.getNetGroupForAddr(host);
         this.outboundNetGroups.add(netGroup);
-      } else {
-        this.inboundPeers.add(key);
       }
 
       // Add or update known address
@@ -1663,11 +1794,18 @@ export class PeerManager {
     if (connectedPeers.length > 0 && this.knownAddresses.size < 1000) {
       // Ask a random peer for addresses (CSPRNG — Core: FastRandomContext)
       const randomPeer = connectedPeers[this.secureRandInt(connectedPeers.length)];
+      // Credit its bucket by MAX_ADDR_TO_SEND so the solicited addr response is
+      // not rate-limited (Core net_processing.cpp:3767).
+      this.creditGetaddrResponse(randomPeer);
       randomPeer.send({ type: "getaddr", payload: null });
     }
 
     // Fill connections up to maxOutbound
     await this.fillConnections();
+
+    // Open a feeler probe when due (Core ThreadOpenConnections FEELER branch).
+    // OFF the outbound budget, ONE in flight, promotes NEW->TRIED on success.
+    await this.maybeOpenFeeler();
 
     // Save addresses periodically
     await this.saveAddresses();
@@ -2179,6 +2317,127 @@ export class PeerManager {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // FEELER probes (Core net.cpp ThreadOpenConnections FEELER branch)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Draw the delay (ms) until the next feeler. Core uses
+   * `rng.rand_exp_duration(FEELER_INTERVAL)` — an exponential with mean
+   * {@link FEELER_INTERVAL_MS}. We approximate the exponential with its
+   * inverse-CDF over a CSPRNG uniform so the schedule is unpredictable (an
+   * attacker cannot phase-lock to a fixed 120 s tick) while keeping the same
+   * mean. Bounded below by 1 ms so the timer always advances.
+   */
+  private randFeelerDelay(): number {
+    // U in (0,1]; -ln(U)*mean is Exp(1/mean). randomBytes avoids Math.random.
+    const u = (randomBytes(4).readUInt32BE(0) + 1) / 0x1_0000_0001;
+    const delay = -Math.log(u) * FEELER_INTERVAL_MS;
+    return Math.max(1, Math.floor(delay));
+  }
+
+  /**
+   * Mirror a {@link knownAddresses} insertion into the bucketed {@link addrMan}
+   * NEW table (the BRIDGE). The live node still serves getaddr / outbound from
+   * `knownAddresses`; this keeps a parallel Core CAddrMan populated so the
+   * feeler has a real NEW table to {@link AddrMan.select}(newOnly) from and a
+   * real TRIED table to promote into via {@link AddrMan.good}.
+   *
+   * Only IPv4/IPv6 literals (and routable ones) are mirrored — addrman.add
+   * itself drops non-routable. `source` defaults to the address itself when the
+   * advertising peer is unknown (Core uses the relaying peer as the source
+   * group; we approximate with self-source, which still spreads NEW buckets by
+   * the address group).
+   */
+  private mirrorToAddrMan(info: PeerInfo, source?: string): void {
+    // The bucketed addrman keys on host literals; only mirror IP-literal
+    // entries (the live store's IPv4/IPv6 keys). Non-IP (Tor/I2P/CJDNS) live
+    // under prefixed keys and are not dialable as plain feelers here.
+    const isIpLiteral =
+      /^\d+\.\d+\.\d+\.\d+$/.test(info.host) || info.host.includes(":");
+    if (!isIpLiteral) return;
+    const src = source ?? info.host;
+    const nowSec = Math.floor((info.lastSeen || Date.now()) / 1000);
+    try {
+      this.addrMan.add(info.host, info.port, src, info.services, nowSec, nowSec);
+    } catch {
+      // addrman.add is defensive; never let a mirror failure break the live
+      // address path.
+    }
+  }
+
+  /**
+   * Open at most ONE feeler probe if the schedule is due.
+   *
+   * Core net.cpp ThreadOpenConnections FEELER branch (the `now > next_feeler`
+   * arm): select ONE address from the addrman NEW table
+   * ({@link AddrMan.select}(newOnly=true)), open a short-lived connection OFF
+   * the regular outbound slot budget, and on a successful handshake promote it
+   * NEW->TRIED (done in {@link handleHandshakeComplete}); on any failure leave
+   * TRIED untouched. Bounded to {@link MAX_FEELER_CONNECTIONS}=1 in flight.
+   *
+   * No-op when: not running, in `-connect` mode (Core folds connect.size()>0
+   * into "no automatic outbound"), the schedule is not yet due, a feeler is
+   * already in flight, or the NEW table has no selectable address.
+   */
+  private async maybeOpenFeeler(): Promise<void> {
+    if (!this.running) return;
+    if (this.isConnectOnly()) return;
+    if (this.feelerInFlight.size >= MAX_FEELER_CONNECTIONS) return;
+    if (Date.now() < this.nextFeelerAt) return;
+
+    // Re-arm the timer NOW (Core advances next_feeler the moment it decides to
+    // make a feeler, before the dial), so a slow/failed dial does not stall the
+    // cadence.
+    this.nextFeelerAt = Date.now() + this.randFeelerDelay();
+
+    // Select ONE address from the NEW table only (Core addrman.Select(true)).
+    const target = this.selectFeelerTarget();
+    if (!target) return; // empty NEW table -> no-op
+
+    const key = `${target.host}:${target.port}`;
+    this.feelerInFlight.add(key);
+
+    // Record the attempt in the addrman (Core addrman.Attempt on connect).
+    try {
+      this.addrMan.attempt(target.host, target.port);
+    } catch {
+      // non-fatal
+    }
+
+    try {
+      await this.connectPeer(target.host, target.port, "feeler");
+      // On a successful handshake, handleHandshakeComplete promotes the address
+      // NEW->TRIED and then we disconnect the throwaway probe here. If the
+      // handshake never completed, good() was never called -> TRIED unchanged.
+      this.disconnectPeer(key, false, "feeler probe complete");
+    } catch {
+      // Dial / handshake failure: do NOT promote. The NEW entry stays NEW
+      // (Core only calls Good() on a successful feeler).
+    } finally {
+      this.feelerInFlight.delete(key);
+    }
+  }
+
+  /**
+   * Pick ONE not-currently-connected NEW-table address for a feeler probe.
+   * Bounded retry over {@link AddrMan.select}(newOnly=true) to skip addresses
+   * we already hold a connection to (Core's feeler likewise reselects an
+   * already-connected target). Returns null when the NEW table is empty or
+   * yields only connected/un-dialable addresses.
+   */
+  private selectFeelerTarget(): { host: string; port: number } | null {
+    for (let i = 0; i < 16; i++) {
+      const info = this.addrMan.select(/* newOnly */ true);
+      if (!info) return null;
+      const key = `${info.host}:${info.port}`;
+      if (this.peers.has(key) || this.connectingPeers.has(key)) continue;
+      if (this.banManager.isBanned(info.host)) continue;
+      return { host: info.host, port: info.port };
+    }
+    return null;
+  }
+
   /**
    * Get candidate addresses for connection, sorted by preference.
    * Prefers peers with NODE_WITNESS, recently seen, low ban scores.
@@ -2277,17 +2536,28 @@ export class PeerManager {
     const connType = this.peerConnectionType.get(key);
     this.peerConnectionType.delete(key);
 
-    if (connType !== "inbound") {
+    if (connType === "inbound") {
+      this.inboundPeers.delete(key);
+    } else if (connType !== "feeler") {
       // FIX-51: use getNetGroupForAddr (ASN-aware when asmap loaded) so the
       // key matches what was inserted in connectPeer().  The old getNetGroup()
       // call returned an ipv4:/16 string even when the outboundNetGroups entry
       // was keyed as "asn:N", causing stale entries that permanently blocked
       // new connections to any peer in the same AS.
+      //
+      // FEELER is OFF-budget (Core net.cpp excludes ConnectionType::FEELER from
+      // netgroup gating) — connectPeer() never inserts a netgroup for it, so we
+      // must not try to release one here either.
       const netGroup = this.getNetGroupForAddr(peer.host);
       this.outboundNetGroups.delete(netGroup);
-    } else {
-      this.inboundPeers.delete(key);
     }
+
+    // Per-connection anti-DoS state is scoped to the connection (Core resets
+    // m_getaddr_recvd / m_addr_token_bucket per CNode). Clear it so a
+    // reconnection from the same address starts fresh.
+    this.feelerInFlight.delete(key);
+    this.getaddrRecvd.delete(key);
+    this.addrTokenBucket.delete(key);
 
     // Emit disconnect event to handlers
     const handlers = this.messageHandlers.get("__disconnect__") ?? [];
@@ -2314,13 +2584,42 @@ export class PeerManager {
       info.lastSeen = Date.now();
     }
 
+    const connType = this.peerConnectionType.get(key);
+
+    // FEELER promotion: a successful feeler handshake confirms the NEW-table
+    // address is live, so promote it NEW->TRIED in the bucketed addrman (Core
+    // net.cpp: a feeler that completes the handshake reaches
+    // FinalizeNode/Good() -> addrman.Good()). This is the ONLY place we promote
+    // a feeler — a dial/handshake FAILURE never reaches here, so a not-probed
+    // (or failed) NEW entry stays NEW. The maybeOpenFeeler() finally-block then
+    // disconnects the throwaway probe.
+    if (connType === "feeler") {
+      try {
+        this.addrMan.good(peer.host, peer.port);
+      } catch {
+        // good() is defensive; never let a promote failure wedge the handshake.
+      }
+      // A feeler is a throwaway probe: do not send it feefilter / getaddr.
+      return;
+    }
+
     // Send initial feefilter if this isn't a block-relay-only peer
     // BIP133: peers supporting feefilter (>= 70013) receive our min fee rate
-    const connType = this.peerConnectionType.get(key);
     if (connType !== "block_relay" && peer.versionPayload) {
       if (peer.versionPayload.version >= FEEFILTER_VERSION) {
         this.feeFilterManager.sendInitialFeeFilter(peer);
       }
+    }
+
+    // Solicit addresses from non-block-relay OUTBOUND peers exactly once, right
+    // after the handshake, crediting this peer's token bucket by
+    // MAX_ADDR_TO_SEND so the solicited response is not rate-limited (Core
+    // net_processing.cpp:3760-3768 — getaddr is sent to non-block-relay-only
+    // outbound peers during version processing, then m_addr_token_bucket +=
+    // MAX_ADDR_TO_SEND). Inbound peers are not solicited (Core's asymmetry).
+    if (connType !== "block_relay" && !this.inboundPeers.has(key)) {
+      this.creditGetaddrResponse(peer);
+      peer.send({ type: "getaddr", payload: null });
     }
 
     // Emit connect event to handlers
@@ -2356,7 +2655,10 @@ export class PeerManager {
       peer.send({ type: "pong", payload: { nonce: msg.payload.nonce } });
     }
 
-    // Handle addr messages to learn new peers
+    // Handle addr messages to learn new peers. BOTH addr and addrv2 share ONE
+    // per-peer token bucket (Core net_processing.cpp:4022 routes ADDR and
+    // ADDRV2 through the same ProcessAddrs), so an attacker cannot bypass the
+    // rate limit by switching to addrv2.
     if (msg.type === "addr") {
       this.handleAddrMessage(peer, msg.payload);
       // BIP155: Relay to up to 2 random peers
@@ -2365,6 +2667,9 @@ export class PeerManager {
       this.handleAddrV2Message(peer, msg.payload);
       // BIP155: Relay addrv2 to up to 2 random peers
       this.relayAddrToRandomPeers(peer, msg);
+    } else if (msg.type === "getaddr") {
+      // Anti-DoS getaddr responder (Core net_processing.cpp:4815).
+      this.handleGetAddr(peer);
     } else if (msg.type === "feefilter") {
       // BIP133: Handle received feefilter
       this.handleFeeFilterMessage(peer, msg.payload);
@@ -2397,6 +2702,12 @@ export class PeerManager {
       this.evictOldestKnownAddress();
     }
     this.knownAddresses.set(key, info);
+    // BRIDGE: mirror every learned address into the bucketed addrman NEW table
+    // so the feeler probe (selectFeelerTarget -> addrMan.select(newOnly)) has a
+    // real NEW table to draw from and a real TRIED table to promote into. The
+    // live getaddr/outbound path still reads knownAddresses; this keeps the two
+    // in sync without changing the live store's behaviour.
+    this.mirrorToAddrMan(info);
   }
 
   /**
@@ -2419,13 +2730,122 @@ export class PeerManager {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Inbound addr-message token bucket (Core net_processing.cpp ProcessAddrs)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Whether this peer is exempt from the inbound-addr rate limit.
+   *
+   * Core: `rate_limited = !pfrom.HasPermission(NetPermissionFlags::Addr)` — i.e.
+   * only peers WITHOUT the Addr permission are rate-limited. We approximate the
+   * Addr permission with the existing {@link Peer.noban} whitelist flag (Core
+   * grants NoBan peers the relaxed addr handling). hotbuns has no separate
+   * "manual"/addnode ConnectionType in the manager, so NoBan is the only
+   * exemption surface here.
+   */
+  private addrRateLimitExempt(peer: Peer): boolean {
+    return peer.noban === true;
+  }
+
+  /**
+   * Refill this peer's shared addr token bucket and return how many of
+   * `numAddrs` may be processed, spending one token each.
+   *
+   * Core ProcessAddrs (net_processing.cpp:5640-5660): refill by
+   * elapsed_seconds * {@link MAX_ADDR_RATE_PER_SECOND}, clamped to
+   * {@link MAX_ADDR_PROCESSING_TOKEN_BUCKET}; spend 1.0 per processed address;
+   * once the bucket drops below 1.0, drop the remaining addresses for
+   * rate-limited (non-NoBan/non-manual) peers. Exempt peers process all.
+   *
+   * Shared by BOTH the addr and addrv2 handlers (ONE bucket per peer keyed on
+   * host:port) so an attacker cannot bypass the limit by sending addrv2 —
+   * Core routes both through this same bucket (net_processing.cpp:4022).
+   */
+  private admitAddrTokens(peer: Peer, numAddrs: number): number {
+    const key = `${peer.host}:${peer.port}`;
+    const nowMs = Date.now();
+    let state = this.addrTokenBucket.get(key);
+    if (!state) {
+      // Core initializes m_addr_token_bucket to 1.0 on construction.
+      state = { tokens: 1.0, ts: nowMs };
+      this.addrTokenBucket.set(key, state);
+    }
+
+    // Refill (only when below the ceiling — Core skips refill if already full).
+    if (state.tokens < MAX_ADDR_PROCESSING_TOKEN_BUCKET) {
+      const elapsedSec = Math.max(0, (nowMs - state.ts) / 1000);
+      state.tokens = Math.min(
+        MAX_ADDR_PROCESSING_TOKEN_BUCKET,
+        state.tokens + elapsedSec * MAX_ADDR_RATE_PER_SECOND,
+      );
+    }
+    state.ts = nowMs;
+
+    const exempt = this.addrRateLimitExempt(peer);
+    let admitted = 0;
+    for (let i = 0; i < numAddrs; i++) {
+      if (state.tokens < 1.0) {
+        if (!exempt) {
+          // Rate-limited: drop the rest.
+          break;
+        }
+        // Exempt peer: process anyway, without going negative.
+      } else {
+        state.tokens -= 1.0;
+      }
+      admitted++;
+    }
+    return admitted;
+  }
+
+  /**
+   * Top up this peer's bucket by {@link MAX_ADDR_TO_SEND} when WE send it a
+   * getaddr (Core net_processing.cpp:3767 `m_addr_token_bucket +=
+   * MAX_ADDR_TO_SEND`), so the solicited response is not rate-limited. Init the
+   * bucket at 1.0 first if unseen (Core's construction default — NOT 1000).
+   *
+   * DIVERGENCE FROM CORE (documented, not a constant fake): Core tops up the
+   * bucket EXACTLY ONCE per connection, gated by `peer.m_getaddr_sent` — it
+   * sends getaddr a single time during version processing
+   * (net_processing.cpp:3760-3768). hotbuns' maintain() loop instead asks a
+   * RANDOM connected peer for addresses each tick while the book is under 1000
+   * (manager.ts maintain()), so the same peer can be re-solicited and thus
+   * credited more than once. The bucket INIT (1.0) and the per-send top-up
+   * (+1000) are both Core-exact; only the send CADENCE diverges. Because the
+   * refill ceiling is MAX_ADDR_PROCESSING_TOKEN_BUCKET=1000 for the *passive*
+   * refill path and unsolicited floods are still bounded by the spend loop, the
+   * extra solicited credit only relaxes the limit for peers WE chose to query,
+   * matching Core's intent (a solicited response should not be rate-limited).
+   */
+  private creditGetaddrResponse(peer: Peer): void {
+    const key = `${peer.host}:${peer.port}`;
+    let state = this.addrTokenBucket.get(key);
+    if (!state) {
+      state = { tokens: 1.0, ts: Date.now() };
+      this.addrTokenBucket.set(key, state);
+    }
+    state.tokens += MAX_ADDR_TO_SEND;
+  }
+
   /**
    * Process addr message and add new addresses to known pool.
+   *
+   * Rate-limited through the shared per-peer token bucket
+   * ({@link admitAddrTokens}) BEFORE any address is stored, so an addr flood
+   * past the drained bucket is dropped.
    */
-  private handleAddrMessage(_peer: Peer, payload: AddrPayload): void {
+  private handleAddrMessage(peer: Peer, payload: AddrPayload): void {
     const now = Math.floor(Date.now() / 1000);
 
+    // Shared token bucket (covers addr + addrv2). Admit at most this many.
+    const budget = this.admitAddrTokens(peer, payload.addrs.length);
+    let processed = 0;
+
     for (const entry of payload.addrs) {
+      if (processed >= budget) break; // rate-limited: drop excess
+      processed++;
+
       // Skip addresses that are too old (more than 3 hours)
       if (now - entry.timestamp > 3 * 60 * 60) {
         continue;
@@ -2467,11 +2887,23 @@ export class PeerManager {
    *
    * ADDRv2 supports Tor v3, I2P, CJDNS, and native IPv4/IPv6 addresses.
    * Reference: Bitcoin Core net_processing.cpp ProcessMessage() for "addrv2"
+   *
+   * Rate-limited through the SAME per-peer token bucket as the addr handler
+   * ({@link admitAddrTokens}) so an attacker cannot bypass the limit by
+   * switching to addrv2 (Core net_processing.cpp:4022 routes both through one
+   * ProcessAddrs bucket).
    */
-  private handleAddrV2Message(_peer: Peer, payload: AddrV2Payload): void {
+  private handleAddrV2Message(peer: Peer, payload: AddrV2Payload): void {
     const now = Math.floor(Date.now() / 1000);
 
+    // Shared token bucket (covers addr + addrv2). Admit at most this many.
+    const budget = this.admitAddrTokens(peer, payload.addrs.length);
+    let processed = 0;
+
     for (const entry of payload.addrs) {
+      if (processed >= budget) break; // rate-limited: drop excess
+      processed++;
+
       // Skip addresses that are too old (more than 3 hours)
       if (now - entry.timestamp > 3 * 60 * 60) {
         continue;
@@ -2501,6 +2933,83 @@ export class PeerManager {
         }
       }
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // GETADDR responder (Core net_processing.cpp:4815 GETADDR handler)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Compute the getaddr response cap: `min(MAX_ADDR_TO_SEND, ceil(0.23 * size))`
+   * (Core MAX_PCT_ADDR_TO_SEND=23 applied over the addrman size, then min with
+   * the 1000 absolute cap). Exposed for the functional test to pin the formula.
+   */
+  getAddrResponseCap(addrmanSize: number): number {
+    const pctCap = Math.ceil((MAX_PCT_ADDR_TO_SEND / 100) * addrmanSize);
+    return Math.min(MAX_ADDR_TO_SEND, pctCap);
+  }
+
+  /**
+   * Respond to an inbound getaddr (Core net_processing.cpp:4815).
+   *
+   * Three Core anti-fingerprinting / anti-DoS guards:
+   *  (1) IGNORE getaddr from OUTBOUND peers. The asymmetric inbound-only answer
+   *      prevents the attack where a peer stamps fake addresses into our
+   *      addrman and later harvests them back (Core: `if (!pfrom.IsInboundConn())
+   *      return;`).
+   *  (2) ANSWER ONCE per connection. A repeated getaddr from the same peer is
+   *      ignored (Core: `if (peer.m_getaddr_recvd) return;` then sets it).
+   *  (3) CAP the response at `min(1000, ceil(0.23 * addrman_size))`
+   *      ({@link getAddrResponseCap}).
+   *
+   * The selected addresses are drawn from the live store ({@link knownAddresses})
+   * — the same pool getnodeaddresses serves — shuffled (CSPRNG) so order leaks
+   * nothing about bucket layout, and capped. Only IPv4 literals are sent over
+   * the v1 `addr` message here (Core sends addrv2 to v2-addr-relay peers; the
+   * v1 IPv4 subset is sufficient and Core-faithful for the cap/once guards).
+   */
+  private handleGetAddr(peer: Peer): void {
+    const key = `${peer.host}:${peer.port}`;
+
+    // (1) Ignore getaddr from outbound peers (inbound-only answer).
+    if (!this.inboundPeers.has(key)) {
+      return;
+    }
+
+    // (2) Answer only the first getaddr per connection.
+    if (this.getaddrRecvd.has(key)) {
+      return;
+    }
+    this.getaddrRecvd.add(key);
+
+    // (3) Cap: min(1000, ceil(0.23 * addrman_size)).
+    const cap = this.getAddrResponseCap(this.knownAddresses.size);
+
+    // Gather IPv4-literal candidates from the live store.
+    const candidates: PeerInfo[] = [];
+    for (const info of this.knownAddresses.values()) {
+      if (!/^\d+\.\d+\.\d+\.\d+$/.test(info.host)) continue;
+      if (!isRoutable(info.host)) continue;
+      candidates.push(info);
+    }
+
+    // Shuffle (Fisher–Yates, CSPRNG) then cap.
+    for (let i = candidates.length - 1; i > 0; i--) {
+      const j = this.secureRandInt(i + 1);
+      [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+    }
+    const selected = candidates.slice(0, cap);
+
+    const addrs = selected.map((info) => ({
+      timestamp: Math.floor((info.lastSeen || Date.now()) / 1000),
+      addr: {
+        services: info.services,
+        ip: ipv4ToBuffer(info.host),
+        port: info.port,
+      } as NetworkAddress,
+    }));
+
+    peer.send({ type: "addr", payload: { addrs } });
   }
 
   /**

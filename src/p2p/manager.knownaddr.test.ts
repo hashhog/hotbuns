@@ -135,7 +135,13 @@ describe("Tier A.1: knownAddresses cap + eviction", () => {
       });
     }
 
-    (mgr as any).handleAddrMessage(undefined, { addrs });
+    // Feed through a NoBan peer so the anti-eclipse inbound-addr token bucket
+    // (added with the feeler axis) does NOT rate-limit this batch — Core exempts
+    // Addr-permission/NoBan peers from rate limiting, and this test exercises
+    // the CAP-eviction path, not the rate limiter. The cap assertion is
+    // unchanged.
+    const nobanPeer = { host: "203.0.113.200", port: 8333, noban: true };
+    (mgr as any).handleAddrMessage(nobanPeer, { addrs });
 
     expect(mgr.getKnownAddresses().size).toBe(KNOWN_ADDRESSES_MAX);
   }, 30000);
