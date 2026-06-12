@@ -932,4 +932,82 @@ describe("W92 disconnectBlock audit", () => {
       expect(uncleanMsg).toBe(true);
     });
   });
+
+  // ── txospenderindex: wired into the REAL connect/disconnect (reorg) path ────
+  //
+  // Proves the index hook fires through ChainStateManager.connectBlock /
+  // disconnectBlock — the exact path invalidateblock walks AND the chain-state
+  // reorg path — not the index called in isolation. connect writes the spend
+  // record; disconnect (the reorg/invalidateblock undo) RE-DERIVES the keys and
+  // erases them. This is the SAME removeBlock the LIVE P2P reorg loop
+  // (BlockSync.disconnectBlockUtxo) calls.
+  describe("txospenderindex wired into connect/disconnect (reorg) path", () => {
+    test("connect writes spend record; disconnect (reorg undo) erases it", async () => {
+      const { TxoSpenderIndex } = await import("../storage/indexes.js");
+      const idx = new TxoSpenderIndex(db, true);
+      await idx.init();
+      await idx.ensureGenesisIndexed();
+      // Wire it exactly like cli.ts does for the chain-state reorg path.
+      chainState.setTxoSpenderIndex(idx);
+
+      // Block 1: coinbase (OP_TRUE so it is spendable with an empty scriptSig).
+      const coinbase1 = createCoinbaseTx(1, 50_00000000n);
+      const block1 = createBlock(REGTEST.genesisBlockHash, [coinbase1]);
+      await chainState.connectBlock(block1, 1);
+      const coinbase1Txid = getTxId(coinbase1);
+
+      // Mine to coinbase maturity (100).
+      let prevHash = getBlockHash(block1.header);
+      for (let h = 2; h <= 101; h++) {
+        const cb = createCoinbaseTx(h, 50_00000000n);
+        const blk = createBlock(prevHash, [cb]);
+        await chainState.connectBlock(blk, h);
+        prevHash = getBlockHash(blk.header);
+      }
+
+      // Block 102: coinbase + tx B spending coinbase1:0 (= outpoint A:0).
+      const coinbase102 = createCoinbaseTx(102, 50_00000000n);
+      const b = createSpendingTx(coinbase1Txid, 0, 49_99990000n);
+      const block102 = createBlock(prevHash, [coinbase102, b]);
+      await chainState.connectBlock(block102, 102);
+
+      // The REAL connect path wrote the spend record.
+      const found = await idx.findSpender(coinbase1Txid, 0);
+      expect(found).not.toBeNull();
+      expect(found!.spendingTxid.equals(getTxId(b))).toBe(true);
+      expect(found!.blockHash.equals(getBlockHash(block102.header))).toBe(true);
+
+      // Reorg/invalidateblock disconnect of block 102 -> index erases A:0.
+      await chainState.disconnectBlock(block102, 102);
+      expect(await idx.findSpender(coinbase1Txid, 0)).toBeNull();
+      expect(idx.getHeight()).toBe(101);
+    });
+
+    test("disabled index: connect/disconnect never write (default-off falsification)", async () => {
+      const { TxoSpenderIndex } = await import("../storage/indexes.js");
+      const idx = new TxoSpenderIndex(db, false); // default-off
+      await idx.init();
+      chainState.setTxoSpenderIndex(idx);
+
+      const coinbase1 = createCoinbaseTx(1, 50_00000000n);
+      const block1 = createBlock(REGTEST.genesisBlockHash, [coinbase1]);
+      await chainState.connectBlock(block1, 1);
+      const coinbase1Txid = getTxId(coinbase1);
+
+      let prevHash = getBlockHash(block1.header);
+      for (let h = 2; h <= 101; h++) {
+        const cb = createCoinbaseTx(h, 50_00000000n);
+        const blk = createBlock(prevHash, [cb]);
+        await chainState.connectBlock(blk, h);
+        prevHash = getBlockHash(blk.header);
+      }
+      const b = createSpendingTx(coinbase1Txid, 0, 49_99990000n);
+      const block102 = createBlock(prevHash, [createCoinbaseTx(102, 50_00000000n), b]);
+      await chainState.connectBlock(block102, 102);
+
+      // Disabled index answers nothing — the pre-index node cannot serve the
+      // confirmed-spend path.
+      expect(await idx.findSpender(coinbase1Txid, 0)).toBeNull();
+    });
+  });
 });

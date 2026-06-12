@@ -247,6 +247,15 @@ export interface RPCServerDeps {
    * Reference: bitcoin-core/src/index/coinstatsindex.cpp.
    */
   coinStatsIndex?: import("../storage/indexes.js").PersistentCoinStatsIndex;
+  /**
+   * The txospenderindex, present only when the operator started the node with
+   * `--txospenderindex=1` (cli.ts constructs and wires it). Backs the
+   * CONFIRMED-spend path of `gettxspendingprevout` and the "txospenderindex"
+   * entry of `getindexinfo`. When absent, a `gettxspendingprevout` request the
+   * mempool cannot answer (and which is not mempool_only) errors with -1.
+   * Reference: bitcoin-core/src/index/txospenderindex.cpp.
+   */
+  txoSpenderIndex?: import("../storage/indexes.js").TxoSpenderIndex;
 }
 
 /** RPC error codes. */
@@ -517,6 +526,9 @@ export class RPCServer {
   /** Per-height UTXO coinstats index (present iff --coinstatsindex). Backs
    *  gettxoutsetinfo at a historical hash_or_height + getindexinfo. */
   private coinStatsIndex?: import("../storage/indexes.js").PersistentCoinStatsIndex;
+  /** Spent-outpoint -> spending-tx index (present iff --txospenderindex).
+   *  Backs gettxspendingprevout's confirmed-spend path + getindexinfo. */
+  private txoSpenderIndex?: import("../storage/indexes.js").TxoSpenderIndex;
   private shutdownCallback: (() => void) | null = null;
   /** Current wallet name for request context (set from URL path). */
   private currentWalletName: string | null = null;
@@ -612,6 +624,7 @@ export class RPCServer {
     this.orphanPool = deps.orphanPool;
     this.filterIndex = deps.filterIndex;
     this.coinStatsIndex = deps.coinStatsIndex;
+    this.txoSpenderIndex = deps.txoSpenderIndex;
     this.methods = new Map();
 
     this.registerBuiltinMethods();
@@ -1250,6 +1263,12 @@ export class RPCServer {
 
     // Index status (util category in Core — rpc/node.cpp getindexinfo)
     this.registerMethod("getindexinfo", (params) => this.getIndexInfo(params));
+
+    // gettxspendingprevout (blockchain category in Core — rpc/mempool.cpp).
+    // Scans the mempool reverse-index and (when running) the txospenderindex.
+    this.registerMethod("gettxspendingprevout", (params) =>
+      this.getTxSpendingPrevout(params)
+    );
 
     // Control methods
     this.registerMethod("stop", () => this.stopNode());
@@ -2470,6 +2489,232 @@ export class RPCServer {
       const bestBlockHeight = csHeight < 0 ? 0 : csHeight;
       const synced = csHeight >= 0 && csHeight >= headerHeight;
       pushIndex("coinstatsindex", synced, bestBlockHeight);
+    }
+
+    // txospenderindex — running only when --txospenderindex set. Same shape:
+    // synced iff its best indexed height has reached the active chain tip.
+    if (this.txoSpenderIndex && this.txoSpenderIndex.isEnabled()) {
+      const tsHeight = this.txoSpenderIndex.getHeight();
+      const bestBlockHeight = tsHeight < 0 ? 0 : tsHeight;
+      const synced = tsHeight >= 0 && tsHeight >= headerHeight;
+      pushIndex("txospenderindex", synced, bestBlockHeight);
+    }
+
+    return result;
+  }
+
+  /**
+   * gettxspendingprevout ( [{"txid":..,"vout":..},...] {options} )
+   *
+   * Scans the mempool (and the txospenderindex, if available) to find
+   * transactions spending any of the given outputs. Mirrors Bitcoin Core's
+   * gettxspendingprevout exactly, INCLUDING error codes
+   * (bitcoin-core/src/rpc/mempool.cpp:897-1041):
+   *   - empty outputs        -> -8  "Invalid parameter, outputs are missing"
+   *   - negative vout        -> -8  "Invalid parameter, vout cannot be negative"
+   *   - unknown options key / wrong type -> -3 (RPC_TYPE_ERROR, strict check)
+   *   - mempool lacks a spend AND txospenderindex unavailable
+   *                          -> -1  "Mempool lacks a relevant spend, and
+   *                                  txospenderindex is unavailable."
+   *
+   * Per-output result object pushKV order: txid, vout, spendingtxid (iff
+   * spent), spendingtx (iff spent AND return_spending_tx), blockhash (CONFIRMED
+   * / index path ONLY). Unspent -> bare {txid, vout}.
+   *
+   * options: { mempool_only (default !index), return_spending_tx (default false) }.
+   * The mempool reverse-index is searched first; only outpoints the mempool
+   * cannot answer fall through to the index (when !mempool_only).
+   */
+  private async getTxSpendingPrevout(params: unknown[]): Promise<unknown[]> {
+    // ── arg 0: outputs array ──
+    const outputsParam = params[0];
+    if (!Array.isArray(outputsParam)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Invalid parameter, outputs are missing"
+      );
+    }
+    if (outputsParam.length === 0) {
+      // Core: RPC_INVALID_PARAMETER (-8).
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Invalid parameter, outputs are missing"
+      );
+    }
+
+    // ── arg 1: options (strict named-param check, Core RPCTypeCheckObj) ──
+    const optionsParam = params[1];
+    let mempoolOnlyOpt: boolean | undefined;
+    let returnSpendingTxOpt: boolean | undefined;
+    if (optionsParam !== undefined && optionsParam !== null) {
+      if (
+        typeof optionsParam !== "object" ||
+        Array.isArray(optionsParam)
+      ) {
+        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Expected type object for options");
+      }
+      const opts = optionsParam as Record<string, unknown>;
+      // fStrict: reject unknown keys with RPC_TYPE_ERROR (-3).
+      for (const key of Object.keys(opts)) {
+        if (key !== "mempool_only" && key !== "return_spending_tx") {
+          throw this.rpcError(
+            RPCErrorCodes.TYPE_ERROR,
+            `Unexpected key ${key}`
+          );
+        }
+      }
+      if ("mempool_only" in opts) {
+        if (typeof opts.mempool_only !== "boolean") {
+          throw this.rpcError(
+            RPCErrorCodes.TYPE_ERROR,
+            "Expected type bool for mempool_only"
+          );
+        }
+        mempoolOnlyOpt = opts.mempool_only;
+      }
+      if ("return_spending_tx" in opts) {
+        if (typeof opts.return_spending_tx !== "boolean") {
+          throw this.rpcError(
+            RPCErrorCodes.TYPE_ERROR,
+            "Expected type bool for return_spending_tx"
+          );
+        }
+        returnSpendingTxOpt = opts.return_spending_tx;
+      }
+    }
+
+    const indexAvailable = !!(
+      this.txoSpenderIndex && this.txoSpenderIndex.isEnabled()
+    );
+    // Core default: mempool_only is true when the index is unavailable.
+    const mempoolOnly = mempoolOnlyOpt ?? !indexAvailable;
+    const returnSpendingTx = returnSpendingTxOpt ?? false;
+
+    // Parse the outpoints. txid hex is display-order (big-endian); internal
+    // key is wire-order (little-endian, reversed). Core ParseHashO rejects bad
+    // hex / wrong length; negative vout -> -8.
+    interface Prevout {
+      txidLE: Buffer; // internal byte order
+      txidDisplay: string; // big-endian hex as given (re-emitted in result)
+      vout: number;
+    }
+    const prevouts: Prevout[] = [];
+    for (const raw of outputsParam) {
+      if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Expected type object");
+      }
+      const o = raw as Record<string, unknown>;
+      const txidVal = o.txid;
+      const voutVal = o.vout;
+      if (typeof txidVal !== "string") {
+        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Expected type string for txid");
+      }
+      if (!/^[0-9a-fA-F]{64}$/.test(txidVal)) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          txidVal.length !== 64 ? "txid must be of length 64" : "txid must be hexadecimal string"
+        );
+      }
+      if (typeof voutVal !== "number" || !Number.isInteger(voutVal)) {
+        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Expected type number for vout");
+      }
+      if (voutVal < 0) {
+        // Core: RPC_INVALID_PARAMETER (-8).
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          "Invalid parameter, vout cannot be negative"
+        );
+      }
+      prevouts.push({
+        txidLE: Buffer.from(txidVal, "hex").reverse(),
+        txidDisplay: txidVal.toLowerCase(),
+        vout: voutVal,
+      });
+    }
+
+    const { getTxId, serializeTx } = await import("../validation/tx.js");
+
+    // Per-output result builder. pushKV order: txid, vout, [spendingtxid],
+    // [spendingtx], [blockhash].
+    const makeOutput = (
+      p: Prevout,
+      spendingTxidDisplay?: string,
+      spendingTxHex?: string,
+      blockhashDisplay?: string
+    ): Record<string, unknown> => {
+      const out: Record<string, unknown> = { txid: p.txidDisplay, vout: p.vout };
+      if (spendingTxidDisplay !== undefined) {
+        out.spendingtxid = spendingTxidDisplay;
+        if (returnSpendingTx && spendingTxHex !== undefined) {
+          out.spendingtx = spendingTxHex;
+        }
+      }
+      if (blockhashDisplay !== undefined) {
+        out.blockhash = blockhashDisplay;
+      }
+      return out;
+    };
+
+    const result: Record<string, unknown>[] = [];
+    const remaining: Prevout[] = [];
+
+    // ── Search the mempool first (GetConflictTx analog). ──
+    for (const p of prevouts) {
+      const spendingTxidHex = this.mempool.getSpendingTxid(p.txidLE, p.vout);
+      if (!spendingTxidHex && !mempoolOnly) {
+        // Cannot answer yet; defer to the index.
+        remaining.push(p);
+        continue;
+      }
+      if (spendingTxidHex) {
+        const entry = this.mempool.getTransaction(Buffer.from(spendingTxidHex, "hex"));
+        const spendingTx = entry?.tx;
+        const txidDisplay = Buffer.from(spendingTxidHex, "hex")
+          .reverse()
+          .toString("hex");
+        result.push(
+          makeOutput(
+            p,
+            txidDisplay,
+            spendingTx ? serializeTx(spendingTx, true).toString("hex") : undefined
+          )
+        );
+      } else {
+        // mempool_only and unspent in mempool -> bare {txid, vout}.
+        result.push(makeOutput(p));
+      }
+    }
+
+    // Return early if the mempool search resolved everything.
+    if (remaining.length === 0) {
+      return result;
+    }
+
+    // ── Index path: remaining outpoints, !mempool_only. ──
+    if (!indexAvailable || !this.txoSpenderIndex) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        "Mempool lacks a relevant spend, and txospenderindex is unavailable."
+      );
+    }
+
+    for (const p of remaining) {
+      const spender = await this.txoSpenderIndex.findSpender(p.txidLE, p.vout);
+      if (spender) {
+        const txidDisplay = Buffer.from(spender.spendingTxid).reverse().toString("hex");
+        const blockhashDisplay = Buffer.from(spender.blockHash).reverse().toString("hex");
+        result.push(
+          makeOutput(
+            p,
+            txidDisplay,
+            Buffer.from(spender.spendingTxHex).toString("hex"),
+            blockhashDisplay
+          )
+        );
+      } else {
+        // Unspent on-chain -> bare {txid, vout}.
+        result.push(makeOutput(p));
+      }
     }
 
     return result;

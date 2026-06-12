@@ -415,6 +415,19 @@ export class BlockSync {
   private coinStatsIndex: import("../storage/indexes.js").PersistentCoinStatsIndex | null = null;
 
   /**
+   * Optional txospenderindex (Bitcoin Core -txospenderindex parity). Present
+   * (non-null) only when the operator passed `--txospenderindex=1`; cli.ts
+   * constructs it and wires it via `setTxoSpenderIndex()`. Every successful
+   * `connectBlock` calls `txoSpenderIndex.indexBlock(block, height)` so the
+   * spent-outpoint -> spending-tx mapping is maintained on the PRIMARY connect
+   * path (P2P/IBD + submitblock) — the same path that maintains txindex /
+   * blockfilterindex / coinstatsindex. The LIVE reorg disconnect side rewinds it
+   * in `disconnectBlockUtxo`. Reference:
+   * bitcoin-core/src/index/txospenderindex.cpp::CustomAppend / CustomRemove.
+   */
+  private txoSpenderIndex: import("../storage/indexes.js").TxoSpenderIndex | null = null;
+
+  /**
    * Number of parallel script-verification workers.
    * 1  = sequential (verifyAllInputsSequential) — benchmark baseline.
    * >1 = parallel   (verifyAllInputsParallel)   — production default.
@@ -538,6 +551,27 @@ export class BlockSync {
     coinStatsIndex: import("../storage/indexes.js").PersistentCoinStatsIndex
   ): void {
     this.coinStatsIndex = coinStatsIndex;
+  }
+
+  /**
+   * Wire the txospenderindex.
+   *
+   * When the operator passes `--txospenderindex=1`, cli.ts constructs a
+   * `TxoSpenderIndex` and registers it here. Every successful `connectBlock`
+   * calls `txoSpenderIndex.indexBlock(block, height)` so the spent-outpoint ->
+   * spending-tx mapping is maintained on the PRIMARY connect path; the LIVE
+   * reorg disconnect side (`disconnectBlockUtxo`) calls `removeBlock(block,
+   * height)`.
+   *
+   * No-op when not wired (default off, matches Bitcoin Core's
+   * `DEFAULT_TXOSPENDERINDEX = false`).
+   *
+   * Reference: bitcoin-core/src/index/txospenderindex.cpp::CustomAppend.
+   */
+  setTxoSpenderIndex(
+    txoSpenderIndex: import("../storage/indexes.js").TxoSpenderIndex
+  ): void {
+    this.txoSpenderIndex = txoSpenderIndex;
   }
 
   /**
@@ -2320,6 +2354,30 @@ export class BlockSync {
       }
     }
 
+    // ── txospenderindex rewind on disconnect (LIVE reorg) ──
+    //
+    // Symmetric with the `txoSpenderIndex.indexBlock(...)` call in
+    // `connectBlock`: RE-DERIVE the disconnected block's spend keys from its OWN
+    // inputs and erase them (Core CustomRemove). This is the LIVE reorg path
+    // (P2P / submitblock heavier-branch reorg) — the heavier branch orphans this
+    // block and its spend records are erased here, BEFORE the new branch's
+    // blocks are connected (disconnect-before-connect, inherited from this
+    // reorg loop). Mirrors bitcoin-core/src/index/txospenderindex.cpp::CustomRemove.
+    //
+    // Best-effort: a rewind failure must NOT roll back the disconnect.
+    if (this.txoSpenderIndex && this.txoSpenderIndex.isEnabled()) {
+      try {
+        await this.txoSpenderIndex.removeBlock(block, height);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[txospenderindex] failed to remove block ${blockHash
+            .toString("hex")
+            .slice(0, 16)} at h=${height}: ${msg} (continuing)`
+        );
+      }
+    }
+
     return true;
   }
 
@@ -3126,6 +3184,32 @@ export class BlockSync {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(
           `[coinstatsindex] failed to index block ${blockHash.toString("hex").slice(0, 16)} at h=${height}: ${msg} (continuing)`
+        );
+      }
+    }
+
+    // ── txospenderindex: spent-outpoint -> spending-tx ──
+    //
+    // When the operator passed `--txospenderindex=1`, cli.ts wires a
+    // TxoSpenderIndex into this BlockSync via setTxoSpenderIndex(). Each
+    // connected block writes, for every non-coinbase input, a record mapping the
+    // spent outpoint to the spending tx (txid + confirming block hash + full tx
+    // hex), so `gettxspendingprevout` can answer the CONFIRMED-spend path.
+    //
+    // Run on the PRIMARY connect path (this method) — the same path that
+    // maintains txindex/blockfilterindex/coinstatsindex above — NOT only the
+    // submitblock RPC path, so P2P/IBD sync is indexed too.
+    //
+    // Best-effort: a failure must NOT roll back the block connect (mirrors
+    // Core's BaseIndex IndexFailure handling).
+    // Reference: bitcoin-core/src/index/txospenderindex.cpp::CustomAppend.
+    if (this.txoSpenderIndex && this.txoSpenderIndex.isEnabled()) {
+      try {
+        await this.txoSpenderIndex.indexBlock(block, height);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[txospenderindex] failed to index block ${blockHash.toString("hex").slice(0, 16)} at h=${height}: ${msg} (continuing)`
         );
       }
     }

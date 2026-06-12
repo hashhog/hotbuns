@@ -3670,6 +3670,21 @@ export class Mempool {
     return this.outpointIndex.has(outpointKey);
   }
 
+  /**
+   * Return the txid (hex, internal byte order) of the mempool transaction that
+   * spends `(txid, vout)`, or null when no mempool tx spends it. The mempool
+   * reverse-index (`outpointIndex`) analog of Bitcoin Core's
+   * `CTxMemPool::GetConflictTx` — used by `gettxspendingprevout` to resolve the
+   * MEMPOOL-spend path before consulting the on-chain txospenderindex.
+   *
+   * `txid` is internal/wire byte order (matching `input.prevOut.txid`).
+   * Reference: bitcoin-core/src/txmempool.h::GetConflictTx.
+   */
+  getSpendingTxid(txid: Buffer, vout: number): string | null {
+    const outpointKey = `${txid.toString("hex")}:${vout}`;
+    return this.outpointIndex.get(outpointKey) ?? null;
+  }
+
   // ============================================================================
   // Cluster Mempool Methods
   // ============================================================================

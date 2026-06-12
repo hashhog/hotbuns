@@ -30,7 +30,7 @@ import { HeaderSync } from "../sync/headers.js";
 import { BlockSync } from "../sync/blocks.js";
 import { RPCServer, type RPCServerConfig, type RPCServerDeps } from "../rpc/server.js";
 import { RESTServer, type RESTServerConfig, type RESTServerDeps } from "../rpc/rest.js";
-import { BlockFilterIndex, PersistentCoinStatsIndex } from "../storage/indexes.js";
+import { BlockFilterIndex, PersistentCoinStatsIndex, TxoSpenderIndex } from "../storage/indexes.js";
 import { InventoryRelay } from "../p2p/relay.js";
 import { getTxId, getTxVSize } from "../validation/tx.js";
 import { InvType, type NetworkMessage, type InvVector } from "../p2p/messages.js";
@@ -202,6 +202,21 @@ export interface NodeConfig {
    */
   coinstatsindex: boolean;
   /**
+   * Enable the txospenderindex. Mirrors Bitcoin Core's `-txospenderindex`
+   * (default OFF: DEFAULT_TXOSPENDERINDEX = false).
+   *
+   * When enabled, every connected/disconnected block maintains a
+   * spent-outpoint -> spending-tx mapping (txid + confirming block hash + full
+   * spending-tx bytes) under DB prefix `TXO_SPENDER`. Backs the CONFIRMED-spend
+   * path of the `gettxspendingprevout` RPC. Without it, a `gettxspendingprevout`
+   * request that the mempool cannot answer (and is not mempool_only) errors with
+   * -1 "Mempool lacks a relevant spend, and txospenderindex is unavailable."
+   *
+   * Reference: bitcoin-core/src/index/txospenderindex.cpp,
+   *            bitcoin-core/src/rpc/mempool.cpp::gettxspendingprevout
+   */
+  txospenderindex: boolean;
+  /**
    * Path to an ASMap binary file for ASN-aware peer grouping.
    * Mirrors Bitcoin Core's `-asmap=<file>` (init.cpp:540).
    * Relative paths are resolved against the network-specific datadir.
@@ -298,6 +313,7 @@ const DEFAULT_CONFIG: NodeConfig = {
   rest: false,
   blockfilterindex: false,
   coinstatsindex: false,
+  txospenderindex: false,
 };
 
 /**
@@ -576,6 +592,17 @@ export function parseArgs(argv: string[]): ParsedArgs {
             config.coinstatsindex = false;
           }
           break;
+        case "txospenderindex":
+          // Bitcoin Core flag `-txospenderindex=1`. Bare flag / `=1` / `=true`
+          // enables; `=0` / `=false` disables. Default OFF (matches Core's
+          // `DEFAULT_TXOSPENDERINDEX = false`). Enables the spent-outpoint ->
+          // spending-tx mapping backing gettxspendingprevout.
+          if (value === undefined || value === "1" || value === "true") {
+            config.txospenderindex = true;
+          } else if (value === "0" || value === "false") {
+            config.txospenderindex = false;
+          }
+          break;
         case "asmap":
           // Bitcoin Core flag `-asmap=<file>` (init.cpp:540).
           // Points to an ASMap binary file for ASN-aware outbound peer
@@ -805,6 +832,10 @@ export async function loadConfig(
         case "coinstatsindex":
           // Mirror CLI: 0/false = off; 1/true = on.
           config.coinstatsindex = value === "1" || value === "true";
+          break;
+        case "txospenderindex":
+          // Mirror CLI: 0/false = off; 1/true = on.
+          config.txospenderindex = value === "1" || value === "true";
           break;
         case "rpctlscert":
           if (value) config.rpcTlsCert = value;
@@ -1931,6 +1962,69 @@ async function startNode(config: NodeConfig): Promise<void> {
     console.log("[coinstatsindex] per-height UTXO coinstats index enabled");
   }
 
+  // 6d. Txo-spender index (Bitcoin Core `-txospenderindex`). Maintains a
+  // spent-outpoint -> spending-tx mapping so `gettxspendingprevout` can answer
+  // the CONFIRMED-spend path. Default OFF (Core DEFAULT_TXOSPENDERINDEX=false).
+  // Wired into BOTH the BlockSync primary connect/disconnect path (P2P/IBD +
+  // submitblock + LIVE reorg) AND the ChainStateManager reorg paths
+  // (invalidateblock / reorganize) — the same instance/DB, so all
+  // connect/disconnect sites maintain the one index.
+  let txoSpenderIndex: TxoSpenderIndex | undefined;
+  if (mergedConfig.txospenderindex) {
+    txoSpenderIndex = new TxoSpenderIndex(db, true);
+    await txoSpenderIndex.init();
+    // Startup reconcile: the index is written after the chainstate commit, so
+    // an unclean exit can leave it AHEAD of the validated tip. Rewind any height
+    // strictly above the validated tip before the connect path fires. Reading
+    // back the orphaned block to re-derive its keys is best-effort (a missing
+    // block just rolls the tip pointer down).
+    {
+      const validatedTip = chainState.getBestBlock();
+      while (txoSpenderIndex.getHeight() > validatedTip.height) {
+        const h = txoSpenderIndex.getHeight();
+        let orphan: import("../validation/block.js").Block | null = null;
+        try {
+          const hash = await db.getBlockHashByHeight(h);
+          if (hash) {
+            const raw = await db.getBlock(hash);
+            if (raw) {
+              orphan = deserializeBlock(new BufferReader(raw));
+            }
+          }
+        } catch {
+          orphan = null;
+        }
+        if (orphan) {
+          await txoSpenderIndex.removeBlock(orphan, h);
+        } else {
+          // Cannot re-derive keys; roll the tip pointer down so we never serve a
+          // tip ahead of chainstate (leftover records are overwritten/deleted
+          // when the height is re-indexed or re-disconnected).
+          await txoSpenderIndex.removeBlock(
+            { header: { prevBlock: Buffer.alloc(32) } as any, transactions: [] } as any,
+            h
+          );
+        }
+      }
+    }
+    // Seed the genesis (height 0) tip marker — the genesis block is connected by
+    // chainState.load() and never passes through the per-block connect path.
+    // Symmetric with the coinstatsindex/blockfilterindex genesis seeds. No-op on
+    // restart.
+    try {
+      await txoSpenderIndex.ensureGenesisIndexed();
+    } catch (err) {
+      console.warn(
+        `[txospenderindex] could not seed genesis marker: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+    blockSync.setTxoSpenderIndex(txoSpenderIndex);
+    chainState.setTxoSpenderIndex(txoSpenderIndex);
+    console.log("[txospenderindex] spent-outpoint -> spending-tx index enabled");
+  }
+
   // 7b. Wire mempool tx relay: accept incoming transactions via AcceptToMemoryPool
   // and relay accepted txs to peers via inventory trickling.
   const txRelay = new InventoryRelay((peer, inventory) => {
@@ -2278,6 +2372,10 @@ async function startNode(config: NodeConfig): Promise<void> {
     // gettxoutsetinfo at a historical hash_or_height and getindexinfo's
     // "coinstatsindex" entry.
     coinStatsIndex,
+    // Present only when --txospenderindex=1 (undefined otherwise). Backs the
+    // confirmed-spend path of gettxspendingprevout and getindexinfo's
+    // "txospenderindex" entry.
+    txoSpenderIndex,
   };
 
   const rpcServer = new RPCServer(rpcConfig, rpcDeps);

@@ -16,7 +16,8 @@ import { DBPrefix } from "./database.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import type { Block } from "../validation/block.js";
 import { deserializeBlock, getBlockHash } from "../validation/block.js";
-import { getTxId, isCoinbase } from "../validation/tx.js";
+import { getTxId, isCoinbase, serializeTx } from "../validation/tx.js";
+import type { Transaction } from "../validation/tx.js";
 import { sha256Hash, hash256 } from "../crypto/primitives.js";
 import type { SpentUTXO } from "../chain/utxo.js";
 import { MuHash3072 } from "../wire/muhash.js";
@@ -42,6 +43,14 @@ export const IndexPrefix = {
 
   // TxIndex extended prefix (for height-based lookups)
   TX_BY_HEIGHT: 0x54, // 'T' - height -> list of txids
+
+  // Txo-spender index prefixes (Bitcoin Core -txospenderindex parity).
+  // Distinct from DBPrefix.CHAIN_STATE (0x73 's') / DBPrefix.UTXO (0x75 'u'):
+  // those are LOWER-case; these are UPPER-case bytes, so the namespaces never
+  // collide. TXO_SPENDER keys are the 36-byte spent outpoint (txid||vout);
+  // TXO_SPENDER_TIP is a singleton holding the best indexed height.
+  TXO_SPENDER: 0x53, // 'S' - spent outpoint (txid 32 LE || vout u32 LE) -> spender record
+  TXO_SPENDER_TIP: 0x55, // 'U' - txospender index tip (singleton: best height u32 LE)
 } as const;
 
 // =============================================================================
@@ -1871,6 +1880,284 @@ export class PersistentCoinStatsIndex {
       totalAmount: snap.totalAmount,
       bogoSize: snap.bogoSize,
     };
+  }
+}
+
+// =============================================================================
+// Txo-Spender Index (Bitcoin Core -txospenderindex parity)
+// =============================================================================
+
+/** Decoded value of a txospender-index entry (the on-chain spend of an
+ *  outpoint). All hashes are internal/wire byte order (32 bytes). */
+export interface TxoSpenderRecord {
+  /** txid of the transaction that spends the keyed outpoint. */
+  spendingTxid: Buffer;
+  /** hash of the block that confirmed the spending tx. */
+  blockHash: Buffer;
+  /** full witness-serialized spending tx (for return_spending_tx). */
+  spendingTxHex: Buffer;
+}
+
+/**
+ * Build the per-outpoint DB key: spent outpoint = txid (32, internal byte
+ * order) || vout (uint32 LE). 36 bytes, fixed. An outpoint is spent at most
+ * once on a single chain, so each key maps to exactly one record. This is the
+ * faithful from-scratch equivalent the Core header comment sanctions
+ * (outpoint -> spender directly), rather than Core's siphash(outpoint)||CDiskTxPos
+ * flat-file scheme — no salt and no separate undo data are needed because the
+ * disconnect path RE-DERIVES the same keys from the disconnected block's own
+ * inputs (mirrors CustomRemove(BuildSpenderPositions(block))).
+ */
+function txoSpenderKey(prevTxid: Buffer, prevVout: number): Buffer {
+  const k = Buffer.allocUnsafe(36);
+  prevTxid.copy(k, 0);
+  k.writeUInt32LE(prevVout >>> 0, 32);
+  return k;
+}
+
+function serializeTxoSpenderRecord(rec: TxoSpenderRecord): Buffer {
+  const w = new BufferWriter();
+  w.writeHash(rec.spendingTxid);
+  w.writeHash(rec.blockHash);
+  w.writeUInt32LE(rec.spendingTxHex.length >>> 0);
+  for (const b of rec.spendingTxHex) w.writeUInt8(b);
+  return w.toBuffer();
+}
+
+function deserializeTxoSpenderRecord(data: Buffer): TxoSpenderRecord {
+  const r = new BufferReader(data);
+  const spendingTxid = r.readHash();
+  const blockHash = r.readHash();
+  const txLen = r.readUInt32LE();
+  const spendingTxHex = r.readBytes(txLen);
+  return { spendingTxid, blockHash, spendingTxHex };
+}
+
+/**
+ * TxoSpenderIndex — Bitcoin Core `-txospenderindex` parity.
+ *
+ * For every input of every NON-coinbase transaction in a connected block,
+ * records `spent outpoint -> (spending txid, confirming block hash, full
+ * spending-tx bytes)`. Backs the CONFIRMED-spend path of the
+ * `gettxspendingprevout` RPC.
+ *
+ * Maintained INCREMENTALLY on the node's PRIMARY block connect+disconnect path
+ * — the SAME path that maintains txindex / blockfilterindex / coinstatsindex:
+ *   - connect(block, H): for each non-coinbase input, write the spend record.
+ *   - disconnect(H): RE-DERIVE the keys from the disconnected block's OWN
+ *     inputs and DELETE them (Core CustomRemove). No undo data needed — the
+ *     keys are a pure function of the block's inputs.
+ *
+ * Reorg-safe by construction: a reorg is a sequence of disconnects (erase the
+ * orphaned branch's spend keys) followed by connects of the new branch (write
+ * its spend keys). This is wired into BOTH (a) the LIVE reorg path
+ * (BlockSync.disconnectBlockUtxo, the P2P / submitblock reorg loop) AND (b) the
+ * invalidateblock path (ChainStateManager.disconnectBlock) — the exact two
+ * disconnect sites the coinstatsindex/blockfilterindex use, sharing one
+ * instance/DB. disconnect-BEFORE-connect ordering is inherited from those
+ * paths.
+ *
+ * Idempotent: a repeat connect at the same height overwrites the same keys with
+ * the same values; a repeat disconnect deletes already-absent keys (no-op).
+ *
+ * Default-off, gated by `--txospenderindex` (Core DEFAULT_TXOSPENDERINDEX=false).
+ *
+ * References:
+ *   - bitcoin-core/src/index/txospenderindex.{h,cpp} (CustomAppend/CustomRemove)
+ *   - bitcoin-core/src/rpc/mempool.cpp::gettxspendingprevout
+ *   - blockbrew internal/storage/txospenderindex.go, ouroboros
+ *     src/ouroboros/txospenderindex.py (committed reorg-safe templates)
+ *   - this impl's PersistentCoinStatsIndex (above) for the connect/disconnect
+ *     plumbing (incl. the live-reorg disconnect wiring).
+ */
+export class TxoSpenderIndex {
+  private db: ChainDB;
+  private enabled: boolean;
+  /** Highest height indexed, or -1 when nothing indexed yet. */
+  private bestHeight: number;
+
+  constructor(db: ChainDB, enabled: boolean = false) {
+    this.db = db;
+    this.enabled = enabled;
+    this.bestHeight = -1;
+  }
+
+  isEnabled(): boolean {
+    return this.enabled;
+  }
+
+  /** Best indexed height (-1 when nothing indexed yet). */
+  getHeight(): number {
+    return this.bestHeight;
+  }
+
+  private tipPutOp(height: number): BatchOperation {
+    const w = new BufferWriter();
+    w.writeUInt32LE(height >>> 0);
+    return {
+      type: "put",
+      prefix: IndexPrefix.TXO_SPENDER_TIP as unknown as DBPrefix,
+      key: Buffer.alloc(0),
+      value: w.toBuffer(),
+    };
+  }
+
+  /**
+   * Initialise from disk: recover the best indexed height from the TIP
+   * singleton (mirrors PersistentCoinStatsIndex.init).
+   */
+  async init(): Promise<void> {
+    if (!this.enabled) return;
+    const tipKey = Buffer.from([IndexPrefix.TXO_SPENDER_TIP]);
+    try {
+      const tipData = await (this.db as any).db.get(tipKey);
+      if (tipData && tipData.length >= 4) {
+        this.bestHeight = new BufferReader(tipData).readUInt32LE();
+      }
+    } catch {
+      this.bestHeight = -1;
+    }
+  }
+
+  /**
+   * Seed the height-0 (genesis) marker. The genesis coinbase has a null prevout
+   * and is never spendable, so there is nothing to index — just record the best
+   * pointer (Core's CustomAppend writes nothing for a coinbase-only block). The
+   * genesis block is connected by chainState.load() and never passes through the
+   * per-block connect path, so we seed the tip explicitly — symmetric with the
+   * coinstatsindex/blockfilterindex genesis seeds. No-op on restart.
+   */
+  async ensureGenesisIndexed(): Promise<void> {
+    if (!this.enabled) return;
+    if (this.bestHeight >= 0) return;
+    await this.db.batch([this.tipPutOp(0)]);
+    this.bestHeight = 0;
+  }
+
+  /**
+   * Re-derive every (outpoint-key, spending-tx) pair from a block. Mirrors Core
+   * BuildSpenderPositions: for each non-coinbase tx, one entry per input. Both
+   * the connect (write) and disconnect (erase) paths call this so the keys are
+   * a pure function of the block's own inputs (no undo data required).
+   */
+  private static spendKeysForBlock(
+    block: Block
+  ): Array<{ key: Buffer; tx: Transaction }> {
+    const out: Array<{ key: Buffer; tx: Transaction }> = [];
+    for (const tx of block.transactions) {
+      if (isCoinbase(tx)) continue;
+      for (const input of tx.inputs) {
+        out.push({
+          key: txoSpenderKey(input.prevOut.txid, input.prevOut.vout),
+          tx,
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Connect *block* at *height* into the index (PRIMARY connect hook).
+   *
+   * Writes `spent_outpoint -> (spending txid, block hash, spending tx hex)` for
+   * every non-coinbase input. Idempotent: a repeat connect overwrites the same
+   * keys with the same values. Mirrors Core CustomAppend.
+   */
+  async indexBlock(block: Block, height: number): Promise<void> {
+    if (!this.enabled) return;
+
+    // Genesis (height 0): coinbase-only, null prevout, nothing to index.
+    if (height === 0) {
+      await this.db.batch([this.tipPutOp(0)]);
+      if (height > this.bestHeight) this.bestHeight = height;
+      return;
+    }
+
+    const blockHash = getBlockHash(block.header);
+    const ops: BatchOperation[] = [];
+    for (const { key, tx } of TxoSpenderIndex.spendKeysForBlock(block)) {
+      const rec: TxoSpenderRecord = {
+        spendingTxid: getTxId(tx),
+        blockHash,
+        spendingTxHex: serializeTx(tx, true),
+      };
+      ops.push({
+        type: "put",
+        prefix: IndexPrefix.TXO_SPENDER as unknown as DBPrefix,
+        key,
+        value: serializeTxoSpenderRecord(rec),
+      });
+    }
+    ops.push(this.tipPutOp(height));
+    await this.db.batch(ops);
+    if (height > this.bestHeight) this.bestHeight = height;
+  }
+
+  /**
+   * Disconnect the block at *height* (PRIMARY disconnect / reorg hook).
+   *
+   * RE-DERIVES the block's spend keys from its OWN inputs and erases them,
+   * mirroring Core CustomRemove(BuildSpenderPositions(block)). Rolls bestHeight
+   * back to H-1. No undo data needed — the keys are a pure function of the
+   * disconnected block's inputs. Wired into BOTH the live reorg path and the
+   * invalidateblock path.
+   */
+  async removeBlock(block: Block, height: number): Promise<void> {
+    if (!this.enabled) return;
+
+    const ops: BatchOperation[] = [];
+    for (const { key } of TxoSpenderIndex.spendKeysForBlock(block)) {
+      ops.push({
+        type: "del",
+        prefix: IndexPrefix.TXO_SPENDER as unknown as DBPrefix,
+        key,
+      });
+    }
+    const newBest = height > 0 ? height - 1 : -1;
+    if (this.bestHeight !== -1 && height >= this.bestHeight) {
+      if (newBest >= 0) {
+        ops.push(this.tipPutOp(newBest));
+      } else {
+        ops.push({
+          type: "del",
+          prefix: IndexPrefix.TXO_SPENDER_TIP as unknown as DBPrefix,
+          key: Buffer.alloc(0),
+        });
+      }
+    }
+    if (ops.length > 0) await this.db.batch(ops);
+    if (this.bestHeight !== -1 && height >= this.bestHeight) {
+      this.bestHeight = newBest;
+    }
+  }
+
+  /**
+   * Return the on-chain tx that spends `(prevTxid, prevVout)`, or null when the
+   * outpoint is unspent on-chain. Mirrors Core TxoSpenderIndex::FindSpender
+   * (std::nullopt when unspent). `prevTxid` is internal/wire byte order.
+   */
+  async findSpender(
+    prevTxid: Buffer,
+    prevVout: number
+  ): Promise<TxoSpenderRecord | null> {
+    if (!this.enabled) return null;
+    const key = Buffer.concat([
+      Buffer.from([IndexPrefix.TXO_SPENDER]),
+      txoSpenderKey(prevTxid, prevVout),
+    ]);
+    try {
+      const data = await (this.db as any).db.get(key);
+      if (!data) return null;
+      return deserializeTxoSpenderRecord(data);
+    } catch {
+      return null;
+    }
+  }
+
+  /** True iff the index has caught up to *chainTipHeight*. */
+  isSynced(chainTipHeight: number): boolean {
+    if (chainTipHeight < 0) return false;
+    return this.bestHeight >= 0 && this.bestHeight >= chainTipHeight;
   }
 }
 
