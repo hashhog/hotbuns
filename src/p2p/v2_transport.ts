@@ -136,6 +136,11 @@ export class V2Transport {
   // Receive buffers
   private recvBuffer: Buffer = Buffer.alloc(0);
   private recvGarbage: Buffer = Buffer.alloc(0);
+  /** End offset of the trailing-16B garbage windows already compared against
+   *  the terminator (Core scans one byte at a time, so each window is checked
+   *  exactly once as it completes; this is the cursor that makes our batched
+   *  receive equivalent to Core's per-byte GARB_GARBTERM loop). */
+  private garbageScanned: number = 0;
   private currentPacketLen: number = -1;
   private theirKey: EllSwiftPubKey | null = null;
   private receivedMessages: V2Message[] = [];
@@ -211,6 +216,7 @@ export class V2Transport {
     t.sendGarbage = garbage;
     t.recvBuffer = Buffer.alloc(0);
     t.recvGarbage = Buffer.alloc(0);
+    t.garbageScanned = 0;
     t.currentPacketLen = -1;
     t.theirKey = null;
     t.receivedMessages = [];
@@ -406,6 +412,7 @@ export class V2Transport {
     this.sendState = SendState.READY;
     this.recvState = RecvState.GARB_GARBTERM;
     this.recvGarbage = Buffer.alloc(0);
+    this.garbageScanned = 0;
 
     return { continue: true, fallbackV1: false };
   }
@@ -413,63 +420,70 @@ export class V2Transport {
   /**
    * Process garbage reception (GARB_GARBTERM state).
    *
-   * Scans for the recv_garbage_terminator within the inbound stream.  The
-   * preceding bytes are the peer's "garbage" and are stashed as AAD for
-   * authenticating the first inbound application packet.
+   * Faithful port of Bitcoin Core V2Transport::ProcessReceivedGarbageBytes
+   * (net.cpp:1180-1205).  Core feeds garbage ONE byte at a time
+   * (GetMaxBytesToProcess returns 1 in GARB_GARBTERM, net.cpp:1296-1298) and,
+   * after each byte, compares the TRAILING GARBAGE_TERMINATOR_LEN bytes of the
+   * accumulated buffer against the receive garbage terminator.  The terminator
+   * is therefore recognized at the earliest buffer length where it completes
+   * as a *suffix* — i.e. the leftmost window in scan order — and the bytes
+   * before it are the peer's garbage (stashed as AAD).
+   *
+   * We receive in batches rather than byte-by-byte, so `garbageScanned` records
+   * the end offset of the trailing windows already compared; on each call we
+   * only test the newly-completed windows (ending at offsets
+   * garbageScanned+1 .. recvBuffer.length).  This makes the batched path
+   * byte-for-byte equivalent to Core's per-byte loop, with no forward-scan that
+   * could skip a terminator beyond MAX_GARBAGE_LEN or pick a non-Core offset.
    */
   private processGarbage(): RecvResult {
     const terminator = this.cipher.recvGarbageTerminator;
-    if (this.recvBuffer.length < GARBAGE_TERMINATOR_LEN) {
-      return { continue: false, fallbackV1: false };
-    }
+    const MAX = MAX_GARBAGE_LEN + GARBAGE_TERMINATOR_LEN; // 4111
 
-    // Search for the terminator at any offset.  Per BIP-324, terminator
-    // may be preceded by 0..MAX_GARBAGE_LEN bytes of garbage.
-    const maxScan = Math.min(
-      this.recvBuffer.length,
-      MAX_GARBAGE_LEN + GARBAGE_TERMINATOR_LEN
-    );
-    let foundAt = -1;
-    for (let i = 0; i + GARBAGE_TERMINATOR_LEN <= maxScan; i++) {
+    // Advance the per-byte equivalent scan over any windows completed since the
+    // last call.  `end` is the (exclusive) end of the trailing window — i.e.
+    // Core's m_recv_buffer.size() after appending that byte.
+    for (
+      let end = Math.max(this.garbageScanned, GARBAGE_TERMINATOR_LEN);
+      end <= this.recvBuffer.length;
+      end++
+    ) {
+      // Core only checks once buffer.size() >= GARBAGE_TERMINATOR_LEN
+      // (net.cpp:1185); the trailing window is [end-16, end).
       if (
         this.recvBuffer
-          .subarray(i, i + GARBAGE_TERMINATOR_LEN)
+          .subarray(end - GARBAGE_TERMINATOR_LEN, end)
           .equals(terminator)
       ) {
-        foundAt = i;
-        break;
+        // Garbage terminator received.  Bytes before it are the garbage,
+        // stashed as AAD for the first inbound (version) packet — Core moves
+        // m_recv_buffer into m_recv_aad and trims the terminator
+        // (net.cpp:1187-1191).
+        const garbEnd = end - GARBAGE_TERMINATOR_LEN;
+        this.recvGarbage =
+          garbEnd > 0
+            ? Buffer.from(this.recvBuffer.subarray(0, garbEnd))
+            : Buffer.alloc(0);
+        this.recvAad = this.recvGarbage;
+        this.recvBuffer = Buffer.from(this.recvBuffer.subarray(end));
+        this.garbageScanned = 0;
+        this.recvState = RecvState.VERSION;
+        this.currentPacketLen = -1;
+        return { continue: true, fallbackV1: false };
+      }
+      // Core aborts when the buffer reaches MAX_GARBAGE_LEN +
+      // GARBAGE_TERMINATOR_LEN (4111) and the trailing terminator still does
+      // not match (net.cpp:1192-1196): too much garbage, terminator absent.
+      if (end === MAX) {
+        return { continue: false, fallbackV1: false, error: "Garbage too long" };
       }
     }
 
-    if (foundAt < 0) {
-      // Not yet found.  If we've already buffered too many bytes without
-      // a match, treat as a protocol violation (Core caps at 4095 bytes
-      // of garbage; we add the terminator length for slack).
-      if (this.recvBuffer.length > MAX_GARBAGE_LEN + GARBAGE_TERMINATOR_LEN) {
-        return {
-          continue: false,
-          fallbackV1: false,
-          error: "Garbage too long",
-        };
-      }
-      return { continue: false, fallbackV1: false };
-    }
-
-    // Stash the bytes preceding the terminator as AAD for the version packet.
-    this.recvGarbage =
-      foundAt > 0
-        ? Buffer.from(this.recvBuffer.subarray(0, foundAt))
-        : Buffer.alloc(0);
-    this.recvAad = this.recvGarbage;
-
-    // Skip garbage + terminator from the receive buffer.
-    this.recvBuffer = Buffer.from(
-      this.recvBuffer.subarray(foundAt + GARBAGE_TERMINATOR_LEN)
-    );
-
-    this.recvState = RecvState.VERSION;
-    this.currentPacketLen = -1;
-    return { continue: true, fallbackV1: false };
+    // Remember how far we have scanned so we never re-compare a window, and
+    // wait for more bytes (Core's "need to receive more" branch,
+    // net.cpp:1197-1203).
+    this.garbageScanned = this.recvBuffer.length;
+    return { continue: false, fallbackV1: false };
   }
 
   /**
@@ -552,10 +566,15 @@ export class V2Transport {
       }
     }
 
-    if (isVersion) {
-      // First non-decoy or decoy packet completes the handshake-version
-      // phase; subsequent packets are application messages.  Per BIP-324,
-      // even decoys advance us out of VERSION state.
+    if (isVersion && !result.ignore) {
+      // Only a NON-decoy (ignore-bit clear) packet is the version packet that
+      // completes the handshake-version phase and transitions us to APP.  A
+      // decoy (ignore=true) received in the VERSION state must be skipped
+      // WITHOUT advancing — we loop over any number of leading decoys until
+      // the first real version packet arrives.  Matches Bitcoin Core
+      // net.cpp:1249-1264 ProcessReceivedPacketBytes (state only advances on
+      // !ignore).  Advancing on a decoy desyncs the receiver: the real
+      // version packet would then be mis-parsed as an APP message.
       this.versionReceived = true;
       this.recvState = RecvState.APP;
     }
