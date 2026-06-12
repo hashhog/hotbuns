@@ -43,7 +43,13 @@ import {
   MAX_OUTBOUND_FULL_RELAY,
   MAX_OUTBOUND_BLOCK_RELAY,
   MAX_BLOCK_RELAY_ONLY_ANCHORS,
+  MAX_FEELER_CONNECTIONS,
+  FEELER_INTERVAL_MS,
+  MAX_ADDR_TO_SEND,
+  MAX_PCT_ADDR_TO_SEND,
+  PeerManager,
 } from "../p2p/manager.js";
+import { REGTEST as REGTEST_W128 } from "../consensus/params.js";
 import { DEFAULT_BAN_TIME } from "../p2p/banman.js";
 import {
   AddrMan,
@@ -492,21 +498,28 @@ describe("W128-G19: IsBadPort skip (until 50 invalid addresses) — MISSING (BUG
 });
 
 // =============================================================================
-// G20 — FEELER connection type + 2min exponential — MISSING (BUG-20)
+// G20 — FEELER connection type + 120s exponential — FIXED (anti-eclipse axis)
 // =============================================================================
-describe("W128-G20: FEELER connection type + 2min exponential schedule — MISSING (BUG-20)", () => {
-  it("BUG-20: ConnectionType union has no 'feeler' variant", () => {
-    // Line 226: `"full_relay" | "block_relay" | "inbound"` — no feeler.
+// FLIPPED from "assert ABSENT" to "assert PRESENT + Core-correct": the feeler
+// probe (Core net.cpp ThreadOpenConnections FEELER branch) landed. The
+// behavioural proof (select-from-NEW, promote-on-success-ONLY, off-budget,
+// bounded) lives in feeler_anti_eclipse.test.ts; these gates pin the surface.
+describe("W128-G20: FEELER connection type + 120s exponential schedule — FIXED", () => {
+  it("FIXED: ConnectionType union now includes the 'feeler' variant", () => {
     expect(MANAGER_SRC).toMatch(
-      /export type ConnectionType = "full_relay" \| "block_relay" \| "inbound";/
+      /export type ConnectionType = "full_relay" \| "block_relay" \| "inbound" \| "feeler";/
     );
   });
-  it("BUG-20: no FEELER_INTERVAL or rand_exp_duration", () => {
-    expect(MANAGER_SRC).not.toMatch(/FEELER_INTERVAL|feelerInterval/);
-    expect(MANAGER_SRC).not.toMatch(/rand_exp_duration|randExpDuration/);
+  it("FIXED: FEELER_INTERVAL_MS present and an exp-jitter feeler delay exists", () => {
+    expect(MANAGER_SRC).toMatch(/FEELER_INTERVAL_MS/);
+    expect(MANAGER_SRC).toMatch(/randFeelerDelay/);
   });
-  it("BUG-20: no MAX_FEELER_CONNECTIONS constant", () => {
-    expect(MANAGER_SRC).not.toMatch(/MAX_FEELER_CONNECTIONS/);
+  it("FIXED: MAX_FEELER_CONNECTIONS constant present (=1)", () => {
+    expect(MANAGER_SRC).toMatch(/MAX_FEELER_CONNECTIONS/);
+    expect(MAX_FEELER_CONNECTIONS).toBe(1);
+  });
+  it("FIXED: FEELER_INTERVAL_MS === 120_000 (Core net.h FEELER_INTERVAL=120s)", () => {
+    expect(FEELER_INTERVAL_MS).toBe(120_000);
   });
 });
 
@@ -572,10 +585,16 @@ describe("W128-G24: AlreadyConnectedToAddress short-circuit + Good() — MISSING
   it("BUG-22: getCandidateAddresses skip is exact key match only", () => {
     expect(MANAGER_SRC).toMatch(/this\.peers\.has\(key\)/);
   });
-  it("BUG-22: no Good() call to short-circuit when already connected", () => {
-    // Core: if test-before-evict picks an already-connected peer, mark
-    // it Good and reselect.  hotbuns has no Good() either.
-    expect(MANAGER_SRC).not.toMatch(/markGood|\.good\(|Good_/);
+  it("FIXED (anti-eclipse axis): Good() promotion IS now called — on feeler success", () => {
+    // FLIPPED: the original audit noted hotbuns "has no Good() either". The
+    // anti-eclipse feeler axis now calls addrMan.good() to promote a NEW-table
+    // address to TRIED ON A SUCCESSFUL FEELER HANDSHAKE (Core net.cpp feeler ->
+    // addrman.Good()). That is a genuine, Core-correct Good() call, so the old
+    // "no .good()" assertion is now (correctly) false. We pin the promotion
+    // call-site instead so a refactor that drops it flips red.
+    expect(MANAGER_SRC).toMatch(/this\.addrMan\.good\(/);
+    // The remaining test-before-evict AlreadyConnectedToAddress short-circuit
+    // (a distinct addrman path) is still out of scope — guarded above.
   });
 });
 
@@ -624,33 +643,46 @@ describe("W128-G25: IsRoutable enforced for IPv4/IPv6/Tor/I2P/CJDNS — PARTIAL 
 });
 
 // =============================================================================
-// G26 — getaddr response cap MAX_ADDR_TO_SEND=1000 — MISSING (BUG-24)
+// G26 — getaddr response cap MAX_ADDR_TO_SEND=1000 — FIXED (anti-eclipse axis)
 // =============================================================================
-describe("W128-G26: getaddr response capped at MAX_ADDR_TO_SEND=1000 — MISSING (BUG-24)", () => {
-  it("BUG-24: no MAX_ADDR_TO_SEND constant in p2p sources", () => {
-    expect(MANAGER_SRC).not.toMatch(/MAX_ADDR_TO_SEND/);
-    expect(PEER_SRC).not.toMatch(/MAX_ADDR_TO_SEND/);
+// FLIPPED: the incoming-getaddr responder + MAX_ADDR_TO_SEND cap landed.
+describe("W128-G26: getaddr response capped at MAX_ADDR_TO_SEND=1000 — FIXED", () => {
+  it("FIXED: MAX_ADDR_TO_SEND constant present (=1000)", () => {
+    expect(MANAGER_SRC).toMatch(/MAX_ADDR_TO_SEND/);
+    expect(MAX_ADDR_TO_SEND).toBe(1000);
   });
-  it("BUG-24: no incoming-getaddr handler in handlePeerMessage", () => {
-    const dispatch = MANAGER_SRC.match(
-      /private handlePeerMessage\(peer: Peer, msg: NetworkMessage\): void \{[^]*?\n\s*\}/
-    );
-    if (dispatch) {
-      // The outgoing direction issues `getaddr` (line 1321) but the
-      // incoming direction has no `case "getaddr"`.
-      expect(dispatch[0]).not.toMatch(/msg\.type === "getaddr"/);
-      expect(dispatch[0]).not.toMatch(/case "getaddr"/);
-    }
+  it("FIXED: handlePeerMessage now routes incoming getaddr to a responder", () => {
+    // The incoming direction now dispatches `msg.type === "getaddr"` to the
+    // handleGetAddr responder (Core net_processing.cpp:4815). Both the dispatch
+    // arm and the responder method must be present.
+    expect(MANAGER_SRC).toMatch(/msg\.type === "getaddr"/);
+    expect(MANAGER_SRC).toMatch(/private handleGetAddr\(peer: Peer\): void/);
   });
 });
 
 // =============================================================================
-// G27 — getaddr response cap MAX_PCT_ADDR_TO_SEND=23 — MISSING (BUG-25)
+// G27 — getaddr response cap MAX_PCT_ADDR_TO_SEND=23 — FIXED (anti-eclipse axis)
 // =============================================================================
-describe("W128-G27: getaddr response capped at MAX_PCT_ADDR_TO_SEND=23% — MISSING (BUG-25)", () => {
-  it("BUG-25: no MAX_PCT_ADDR_TO_SEND constant", () => {
-    expect(MANAGER_SRC).not.toMatch(/MAX_PCT_ADDR_TO_SEND/);
-    expect(MANAGER_SRC).not.toMatch(/23\s*\*.*knownAddresses.*size/);
+// FLIPPED: the 23% cap formula min(1000, ceil(0.23*size)) landed.
+describe("W128-G27: getaddr response capped at MAX_PCT_ADDR_TO_SEND=23% — FIXED", () => {
+  it("FIXED: MAX_PCT_ADDR_TO_SEND constant present (=23)", () => {
+    expect(MANAGER_SRC).toMatch(/MAX_PCT_ADDR_TO_SEND/);
+    expect(MAX_PCT_ADDR_TO_SEND).toBe(23);
+  });
+  it("FIXED: getAddrResponseCap applies min(1000, ceil(0.23*size))", () => {
+    const mgr = new PeerManager({
+      maxOutbound: 8,
+      maxInbound: 117,
+      params: REGTEST_W128,
+      bestHeight: 0,
+      datadir: "/tmp/hotbuns-w128-getaddrcap",
+    });
+    // ceil(0.23 * 100) = 23
+    expect(mgr.getAddrResponseCap(100)).toBe(23);
+    // min(1000, ceil(0.23 * 100000)) = 1000 (absolute cap dominates)
+    expect(mgr.getAddrResponseCap(100_000)).toBe(1000);
+    // ceil(0.23 * 1) = 1
+    expect(mgr.getAddrResponseCap(1)).toBe(1);
   });
 });
 
@@ -756,9 +788,11 @@ describe("W128 forward-regression guard: bucketed addrman helpers must remain", 
     expect(ADDRMAN_TRIED_BUCKETS_PER_GROUP).toBe(8);
     expect(ADDRMAN_CEILING).toBe(81920);
   });
-  it("guard: ConnectionType still excludes 'feeler' (FEELER is a separate axis)", () => {
+  it("guard: ConnectionType now INCLUDES 'feeler' (anti-eclipse axis landed)", () => {
+    // FLIPPED: the feeler axis landed; pin the variant so a refactor that rips
+    // it back out flips red.
     expect(MANAGER_SRC).toMatch(
-      /export type ConnectionType = "full_relay" \| "block_relay" \| "inbound";/
+      /export type ConnectionType = "full_relay" \| "block_relay" \| "inbound" \| "feeler";/
     );
   });
 });
