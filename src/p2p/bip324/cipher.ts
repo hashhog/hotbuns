@@ -303,12 +303,37 @@ export class BIP324Cipher {
 }
 
 /**
+ * Draw a uniformly-random integer in [0, bound) from a CSPRNG.
+ *
+ * Mirrors Bitcoin Core FastRandomContext::randrange (a CSPRNG), used by
+ * GenerateRandomGarbage (net.cpp:978-985) for the garbage LENGTH.  We must
+ * NOT use the non-crypto global Math.random() here: the garbage length is a
+ * (small) part of the BIP-324 anti-fingerprinting surface, and Core derives
+ * it from a cryptographic RNG.  Rejection sampling over a 32-bit draw gives
+ * an unbiased result for bound <= 2^32.
+ */
+function csprngRandrange(bound: number): number {
+  if (bound <= 1) return 0;
+  // Largest multiple of `bound` that fits in 2^32, to reject the biased tail.
+  const limit = Math.floor(0x100000000 / bound) * bound;
+  let x: number;
+  do {
+    x = randomBytes(4).readUInt32LE(0);
+  } while (x >= limit);
+  return x % bound;
+}
+
+/**
  * Generate random garbage data for BIP324 handshake.
+ *
+ * Both the length and the bytes are drawn from a CSPRNG (crypto.randomBytes),
+ * matching Core GenerateRandomGarbage which uses FastRandomContext for both
+ * rng.randrange(MAX_GARBAGE_LEN+1) and rng.fillrand(...).
  *
  * @param maxLen - Maximum length (default: MAX_GARBAGE_LEN)
  * @returns Random garbage bytes (0 to maxLen bytes)
  */
 export function generateGarbage(maxLen: number = MAX_GARBAGE_LEN): Buffer {
-  const len = Math.floor(Math.random() * (maxLen + 1));
+  const len = csprngRandrange(maxLen + 1);
   return randomBytes(len);
 }
