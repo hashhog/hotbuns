@@ -13,6 +13,11 @@ import { hash256 } from "../crypto/primitives.js";
 import { bip22Result, ConsensusErrorCode } from "../validation/errors.js";
 import { PeerManager, ServiceFlags, isRoutable } from "../p2p/manager.js";
 import { BIP155Network } from "../p2p/addrv2.js";
+import { ChainDB } from "../storage/database.js";
+import { TxoSpenderIndex } from "../storage/indexes.js";
+import { mkdtemp, rm } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
 
 // Mock implementations for dependencies
 
@@ -67,6 +72,34 @@ class MockMempool {
 
   hasTransaction(txid: Buffer) {
     return this.entries.has(txid.toString("hex"));
+  }
+
+  // ── gettxspendingprevout support ──
+  // outpointIndex analog: "txidHex:vout" -> spending txid hex (internal order).
+  private outpointIndex = new Map<string, string>();
+
+  // Test helper: register that `spendingTx` (with txid `spendingTxid`, internal
+  // byte order) spends outpoint (prevTxid:vout). Adds the spending tx as a
+  // mempool entry so getTransaction(spendingTxid) returns it.
+  addSpend(prevTxid: Buffer, vout: number, spendingTxid: Buffer, spendingTx: any) {
+    this.outpointIndex.set(`${prevTxid.toString("hex")}:${vout}`, spendingTxid.toString("hex"));
+    this.entries.set(spendingTxid.toString("hex"), {
+      tx: spendingTx,
+      txid: spendingTxid,
+      fee: 1000n,
+      feeRate: 1,
+      vsize: 100,
+      weight: 400,
+      addedTime: 0,
+      height: 1,
+      spentBy: new Set(),
+      dependsOn: new Set(),
+    });
+  }
+
+  // Mirrors the real Mempool.getSpendingTxid (CTxMemPool::GetConflictTx analog).
+  getSpendingTxid(txid: Buffer, vout: number): string | null {
+    return this.outpointIndex.get(`${txid.toString("hex")}:${vout}`) ?? null;
   }
 
   // Mirrors the real Mempool.getModifiedFee (base fee + prioritisetransaction
@@ -2637,5 +2670,201 @@ describe("getorphantxs", () => {
     } finally {
       server.stop();
     }
+  });
+});
+
+// ===========================================================================
+// gettxspendingprevout (Bitcoin Core -txospenderindex parity)
+// ===========================================================================
+
+describe("gettxspendingprevout", () => {
+  let port: number;
+  let dbPath: string;
+  let db: ChainDB;
+  let idx: TxoSpenderIndex;
+  let mempool: MockMempool;
+  let server: RPCServer;
+
+  // display-order (big-endian) hex helper.
+  const displayHex = (le: Buffer) => Buffer.from(le).reverse().toString("hex");
+
+  function spendTx(prevTxidLE: Buffer, vout: number, tag: number) {
+    return {
+      version: 2,
+      inputs: [
+        { prevOut: { txid: prevTxidLE, vout }, scriptSig: Buffer.from([tag]), sequence: 0xffffffff, witness: [] },
+      ],
+      outputs: [{ value: 1n, scriptPubKey: Buffer.from([0x51]) }],
+      lockTime: 0,
+    };
+  }
+
+  function makeBlock(txs: any[], nonce: number) {
+    return {
+      header: {
+        version: 0x20000000,
+        prevBlock: Buffer.alloc(32, nonce & 0xff),
+        merkleRoot: Buffer.alloc(32, nonce & 0xff),
+        timestamp: 1700000000 + nonce,
+        bits: 0x207fffff,
+        nonce,
+      },
+      transactions: txs,
+    };
+  }
+
+  async function makeServer(opts: { withIndex: boolean }) {
+    mempool = new MockMempool();
+    const deps: RPCServerDeps = {
+      chainState: new MockChainStateManager() as any,
+      mempool: mempool as any,
+      peerManager: new MockPeerManager() as any,
+      feeEstimator: new MockFeeEstimator() as any,
+      headerSync: new MockHeaderSync() as any,
+      db: db as any,
+      params: REGTEST,
+      txoSpenderIndex: opts.withIndex ? (idx as any) : undefined,
+    };
+    const s = new RPCServer({ port, host: "127.0.0.1", noAuth: true }, deps);
+    s.start();
+    return s;
+  }
+
+  beforeEach(async () => {
+    port = getTestPort();
+    dbPath = await mkdtemp(join(tmpdir(), "hotbuns-gtsp-"));
+    db = new ChainDB(dbPath);
+    await db.open();
+    idx = new TxoSpenderIndex(db, true);
+    await idx.init();
+  });
+
+  afterEach(async () => {
+    if (server) server.stop();
+    await db.close();
+    await rm(dbPath, { recursive: true, force: true });
+  });
+
+  it("empty outputs -> RPC_INVALID_PARAMETER (-8) outputs are missing", async () => {
+    server = await makeServer({ withIndex: true });
+    const r = await rpcRequest(port, "gettxspendingprevout", [[]]);
+    expect(r.error.code).toBe(-8);
+    expect(r.error.message).toBe("Invalid parameter, outputs are missing");
+  });
+
+  it("negative vout -> RPC_INVALID_PARAMETER (-8) vout cannot be negative", async () => {
+    server = await makeServer({ withIndex: true });
+    const txid = "ab".repeat(32);
+    const r = await rpcRequest(port, "gettxspendingprevout", [[{ txid, vout: -1 }]]);
+    expect(r.error.code).toBe(-8);
+    expect(r.error.message).toBe("Invalid parameter, vout cannot be negative");
+  });
+
+  it("unknown options key -> RPC_TYPE_ERROR (-3) strict check", async () => {
+    server = await makeServer({ withIndex: true });
+    const txid = "ab".repeat(32);
+    const r = await rpcRequest(port, "gettxspendingprevout", [[{ txid, vout: 0 }], { bogus: true }]);
+    expect(r.error.code).toBe(-3);
+  });
+
+  it("mempool_only=false AND index unavailable -> RPC_MISC_ERROR (-1)", async () => {
+    // Core: with no index, mempool_only defaults to true and an unspent
+    // outpoint returns a bare {txid,vout}. The -1 only fires when the caller
+    // EXPLICITLY sets mempool_only=false while the index is unavailable.
+    server = await makeServer({ withIndex: false });
+    const txid = "ab".repeat(32);
+    const r = await rpcRequest(port, "gettxspendingprevout", [
+      [{ txid, vout: 0 }],
+      { mempool_only: false },
+    ]);
+    expect(r.error.code).toBe(-1);
+    expect(r.error.message).toBe(
+      "Mempool lacks a relevant spend, and txospenderindex is unavailable."
+    );
+  });
+
+  it("default mempool_only with no index -> bare {txid,vout} for unspent (no error)", async () => {
+    server = await makeServer({ withIndex: false });
+    const txid = "ab".repeat(32);
+    const r = await rpcRequest(port, "gettxspendingprevout", [[{ txid, vout: 0 }]]);
+    expect(r.error).toBeUndefined();
+    expect(r.result[0].txid).toBe(txid);
+    expect(r.result[0].vout).toBe(0);
+    expect(r.result[0].spendingtxid).toBeUndefined();
+  });
+
+  it("confirmed spend via index -> spendingtxid + blockhash; return_spending_tx adds spendingtx", async () => {
+    server = await makeServer({ withIndex: true });
+    const aTxidLE = Buffer.alloc(32, 0xa1);
+    const b = spendTx(aTxidLE, 0, 0x9);
+    const blk = makeBlock([
+      { version: 1, inputs: [{ prevOut: { txid: Buffer.alloc(32, 0), vout: 0xffffffff }, scriptSig: Buffer.from([1]), sequence: 0xffffffff, witness: [] }], outputs: [{ value: 5n, scriptPubKey: Buffer.from([0x51]) }], lockTime: 0 },
+      b,
+    ], 7);
+    const blkHash = getBlockHash(blk.header);
+    await idx.indexBlock(blk, 1);
+
+    // Without return_spending_tx.
+    const r1 = await rpcRequest(port, "gettxspendingprevout", [[{ txid: displayHex(aTxidLE), vout: 0 }]]);
+    expect(r1.error).toBeUndefined();
+    expect(r1.result.length).toBe(1);
+    expect(r1.result[0].txid).toBe(displayHex(aTxidLE));
+    expect(r1.result[0].vout).toBe(0);
+    expect(r1.result[0].spendingtxid).toBe(displayHex(getTxId(b)));
+    expect(r1.result[0].blockhash).toBe(displayHex(blkHash));
+    expect(r1.result[0].spendingtx).toBeUndefined();
+
+    // With return_spending_tx.
+    const r2 = await rpcRequest(port, "gettxspendingprevout", [
+      [{ txid: displayHex(aTxidLE), vout: 0 }],
+      { return_spending_tx: true },
+    ]);
+    expect(r2.result[0].spendingtx).toBe(serializeTx(b as any, true).toString("hex"));
+
+    // An unspent outpoint -> bare {txid, vout}.
+    const r3 = await rpcRequest(port, "gettxspendingprevout", [[{ txid: displayHex(aTxidLE), vout: 5 }]]);
+    expect(r3.result[0].spendingtxid).toBeUndefined();
+    expect(r3.result[0].blockhash).toBeUndefined();
+  });
+
+  it("mempool spend resolves before the index (no blockhash for mempool spend)", async () => {
+    server = await makeServer({ withIndex: true });
+    const aTxidLE = Buffer.alloc(32, 0xb2);
+    const b = spendTx(aTxidLE, 0, 0x3);
+    const bTxid = getTxId(b as any);
+    mempool.addSpend(aTxidLE, 0, bTxid, b);
+
+    const r = await rpcRequest(port, "gettxspendingprevout", [
+      [{ txid: displayHex(aTxidLE), vout: 0 }],
+      { return_spending_tx: true },
+    ]);
+    expect(r.error).toBeUndefined();
+    expect(r.result[0].spendingtxid).toBe(displayHex(bTxid));
+    expect(r.result[0].spendingtx).toBe(serializeTx(b as any, true).toString("hex"));
+    // Mempool spend is unconfirmed -> no blockhash.
+    expect(r.result[0].blockhash).toBeUndefined();
+  });
+
+  it("LIVE reorg erases the confirmed spend: after disconnect the index no longer answers", async () => {
+    server = await makeServer({ withIndex: true });
+    const aTxidLE = Buffer.alloc(32, 0xc3);
+    const b = spendTx(aTxidLE, 0, 0x1);
+    const blk = makeBlock([
+      { version: 1, inputs: [{ prevOut: { txid: Buffer.alloc(32, 0), vout: 0xffffffff }, scriptSig: Buffer.from([1]), sequence: 0xffffffff, witness: [] }], outputs: [{ value: 5n, scriptPubKey: Buffer.from([0x51]) }], lockTime: 0 },
+      b,
+    ], 8);
+    await idx.indexBlock(blk, 1);
+
+    // Confirmed-spend path answers.
+    const before = await rpcRequest(port, "gettxspendingprevout", [[{ txid: displayHex(aTxidLE), vout: 0 }]]);
+    expect(before.result[0].spendingtxid).toBe(displayHex(getTxId(b)));
+
+    // Heavier branch orphans the block carrying B -> index erases A:0.
+    await idx.removeBlock(blk, 1);
+
+    const after = await rpcRequest(port, "gettxspendingprevout", [[{ txid: displayHex(aTxidLE), vout: 0 }]]);
+    expect(after.error).toBeUndefined();
+    expect(after.result[0].spendingtxid).toBeUndefined();
+    expect(after.result[0].blockhash).toBeUndefined();
   });
 });

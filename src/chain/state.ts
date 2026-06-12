@@ -209,6 +209,13 @@ export class ChainStateManager {
    *  reorg path (BlockSync) holds its own reference to the same instance.
    *  Reference: bitcoin-core/src/index/coinstatsindex.cpp. */
   private coinStatsIndex: import("../storage/indexes.js").PersistentCoinStatsIndex | null = null;
+  /** Optional txospenderindex (Bitcoin Core -txospenderindex parity). Wired via
+   *  setTxoSpenderIndex() from cli.ts when `--txospenderindex=1`. Used by the
+   *  chain-state-manager reorg paths (invalidateblock, reorganize): connectBlock
+   *  calls indexBlock(...), disconnectBlock calls removeBlock(...). The live
+   *  reorg path (BlockSync) holds its own reference to the same instance.
+   *  Reference: bitcoin-core/src/index/txospenderindex.cpp. */
+  private txoSpenderIndex: import("../storage/indexes.js").TxoSpenderIndex | null = null;
   /** Precious block for tie-breaking. null if no precious block set. */
   private preciousBlockHash: Buffer | null = null;
   /** Sequence ID for precious block tie-breaking. Lower = more precious. */
@@ -273,6 +280,21 @@ export class ChainStateManager {
     coinStatsIndex: import("../storage/indexes.js").PersistentCoinStatsIndex
   ): void {
     this.coinStatsIndex = coinStatsIndex;
+  }
+
+  /**
+   * Wire the txospenderindex so reorg paths invoked through the chain-state
+   * manager (invalidateblock, reorganize) keep the spent-outpoint -> spending-tx
+   * mapping in lockstep with the chain tip — connectBlock writes spend records,
+   * disconnectBlock erases them.
+   *
+   * No-op when not wired (default off; Bitcoin Core DEFAULT_TXOSPENDERINDEX).
+   * Reference: bitcoin-core/src/index/txospenderindex.cpp.
+   */
+  setTxoSpenderIndex(
+    txoSpenderIndex: import("../storage/indexes.js").TxoSpenderIndex
+  ): void {
+    this.txoSpenderIndex = txoSpenderIndex;
   }
 
   /**
@@ -494,6 +516,27 @@ export class ChainStateManager {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(
           `[coinstatsindex] failed to index block ${blockHash
+            .toString("hex")
+            .slice(0, 16)} at h=${height}: ${msg} (continuing)`
+        );
+      }
+    }
+
+    // ── txospenderindex: write spent-outpoint -> spending-tx on connect ──
+    //
+    // Connect-side counterpart to the `txoSpenderIndex.removeBlock(...)` call in
+    // disconnectBlock. Covers the chain-state-manager connect paths
+    // (generateblock / reorganize reconnect). Mirrors Core
+    // BaseIndex::BlockConnected -> CustomAppend. Best-effort: a failure is
+    // logged and ignored — never aborts the connect.
+    // Reference: bitcoin-core/src/index/txospenderindex.cpp::CustomAppend.
+    if (this.txoSpenderIndex && this.txoSpenderIndex.isEnabled()) {
+      try {
+        await this.txoSpenderIndex.indexBlock(block, height);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[txospenderindex] failed to index block ${blockHash
             .toString("hex")
             .slice(0, 16)} at h=${height}: ${msg} (continuing)`
         );
@@ -855,6 +898,28 @@ export class ChainStateManager {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(
           `[coinstatsindex] failed to remove block ${blockHash
+            .toString("hex")
+            .slice(0, 16)} at h=${height}: ${msg} (continuing)`
+        );
+      }
+    }
+
+    // ── txospenderindex rewind on disconnect (invalidateblock / reorg) ──
+    //
+    // RE-DERIVE the disconnected block's spend keys from its OWN inputs and
+    // erase them (Core CustomRemove). This is the path invalidateblock walks
+    // (invalidateBlock -> disconnectBlock), so an invalidateblock-triggered
+    // rewind erases the orphaned branch's spend records here. The live reorg
+    // path (BlockSync.disconnectBlockUtxo) does the same on the same instance.
+    // Best-effort: never roll back the chain disconnect on a rewind hiccup.
+    // Mirrors bitcoin-core/src/index/txospenderindex.cpp::CustomRemove.
+    if (this.txoSpenderIndex && this.txoSpenderIndex.isEnabled()) {
+      try {
+        await this.txoSpenderIndex.removeBlock(block, height);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[txospenderindex] failed to remove block ${blockHash
             .toString("hex")
             .slice(0, 16)} at h=${height}: ${msg} (continuing)`
         );
