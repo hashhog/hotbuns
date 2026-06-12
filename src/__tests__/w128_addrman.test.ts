@@ -663,13 +663,15 @@ describe("W128-G26: getaddr response capped at MAX_ADDR_TO_SEND=1000 — FIXED",
 // =============================================================================
 // G27 — getaddr response cap MAX_PCT_ADDR_TO_SEND=23 — FIXED (anti-eclipse axis)
 // =============================================================================
-// FLIPPED: the 23% cap formula min(1000, ceil(0.23*size)) landed.
+// FLIPPED: the 23% cap formula min(1000, floor(0.23*size)) landed.
+// Core AddrManImpl::GetAddr_ (addrman.cpp:800) uses size_t `max_pct*nNodes/100`
+// = integer division = FLOOR, not ceil.
 describe("W128-G27: getaddr response capped at MAX_PCT_ADDR_TO_SEND=23% — FIXED", () => {
   it("FIXED: MAX_PCT_ADDR_TO_SEND constant present (=23)", () => {
     expect(MANAGER_SRC).toMatch(/MAX_PCT_ADDR_TO_SEND/);
     expect(MAX_PCT_ADDR_TO_SEND).toBe(23);
   });
-  it("FIXED: getAddrResponseCap applies min(1000, ceil(0.23*size))", () => {
+  it("FIXED: getAddrResponseCap applies min(1000, floor(0.23*size))", () => {
     const mgr = new PeerManager({
       maxOutbound: 8,
       maxInbound: 117,
@@ -677,12 +679,14 @@ describe("W128-G27: getaddr response capped at MAX_PCT_ADDR_TO_SEND=23% — FIXE
       bestHeight: 0,
       datadir: "/tmp/hotbuns-w128-getaddrcap",
     });
-    // ceil(0.23 * 100) = 23
+    // 23*100/100 = 23 (exact multiple)
     expect(mgr.getAddrResponseCap(100)).toBe(23);
-    // min(1000, ceil(0.23 * 100000)) = 1000 (absolute cap dominates)
+    // min(1000, 23*100000/100) = 1000 (absolute cap dominates)
     expect(mgr.getAddrResponseCap(100_000)).toBe(1000);
-    // ceil(0.23 * 1) = 1
-    expect(mgr.getAddrResponseCap(1)).toBe(1);
+    // floor(0.23 * 1) = 0 (distinguishing: ceil would give 1)
+    expect(mgr.getAddrResponseCap(1)).toBe(0);
+    // floor(0.23 * 10) = 2 (distinguishing: ceil would give 3)
+    expect(mgr.getAddrResponseCap(10)).toBe(2);
   });
 });
 

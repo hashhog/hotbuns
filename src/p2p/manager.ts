@@ -365,9 +365,10 @@ export const MAX_ADDR_TO_SEND = 1000;
  * getaddr response is capped at this percentage of the addrman size.
  *
  * Core net_processing.h `MAX_PCT_ADDR_TO_SEND = 23`. The effective cap is
- * `min(MAX_ADDR_TO_SEND, ceil(0.23 * addrman_size))` (CConnman::GetAddresses ->
- * AddrMan::GetAddr with max_pct=23, addrman.cpp). Both bound the leak surface of
- * an attacker probing our addrman via getaddr.
+ * `min(MAX_ADDR_TO_SEND, floor(0.23 * addrman_size))` (CConnman::GetAddresses ->
+ * AddrMan::GetAddr with max_pct=23, addrman.cpp:800 — `max_pct * nNodes / 100`
+ * is size_t integer division = FLOOR). Both bound the leak surface of an
+ * attacker probing our addrman via getaddr.
  */
 export const MAX_PCT_ADDR_TO_SEND = 23;
 
@@ -2940,12 +2941,18 @@ export class PeerManager {
   // ---------------------------------------------------------------------------
 
   /**
-   * Compute the getaddr response cap: `min(MAX_ADDR_TO_SEND, ceil(0.23 * size))`
+   * Compute the getaddr response cap: `min(MAX_ADDR_TO_SEND, floor(0.23 * size))`
    * (Core MAX_PCT_ADDR_TO_SEND=23 applied over the addrman size, then min with
    * the 1000 absolute cap). Exposed for the functional test to pin the formula.
+   *
+   * Core AddrManImpl::GetAddr_ (addrman.cpp:800) computes
+   * `nNodes = max_pct * nNodes / 100` in `size_t` arithmetic — integer division,
+   * i.e. FLOOR, not ceil. e.g. size=1 -> floor(0.23)=0; size=10 -> floor(2.3)=2;
+   * size=1000 -> floor(230)=230. Compute it the same way: integer-multiply then
+   * integer-divide so the rounding matches Core exactly.
    */
   getAddrResponseCap(addrmanSize: number): number {
-    const pctCap = Math.ceil((MAX_PCT_ADDR_TO_SEND / 100) * addrmanSize);
+    const pctCap = Math.floor((MAX_PCT_ADDR_TO_SEND * addrmanSize) / 100);
     return Math.min(MAX_ADDR_TO_SEND, pctCap);
   }
 
@@ -2959,7 +2966,7 @@ export class PeerManager {
    *      return;`).
    *  (2) ANSWER ONCE per connection. A repeated getaddr from the same peer is
    *      ignored (Core: `if (peer.m_getaddr_recvd) return;` then sets it).
-   *  (3) CAP the response at `min(1000, ceil(0.23 * addrman_size))`
+   *  (3) CAP the response at `min(1000, floor(0.23 * addrman_size))`
    *      ({@link getAddrResponseCap}).
    *
    * The selected addresses are drawn from the live store ({@link knownAddresses})
@@ -2982,7 +2989,7 @@ export class PeerManager {
     }
     this.getaddrRecvd.add(key);
 
-    // (3) Cap: min(1000, ceil(0.23 * addrman_size)).
+    // (3) Cap: min(1000, floor(0.23 * addrman_size)).
     const cap = this.getAddrResponseCap(this.knownAddresses.size);
 
     // Gather IPv4-literal candidates from the live store.

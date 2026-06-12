@@ -6,7 +6,9 @@
  *     MAX_FEELER_CONNECTIONS=1, conn_type=FEELER off-budget + relay=false,
  *     addrman.Select(newOnly=true), Good() promote NEW->TRIED on success only).
  *   - net_processing.cpp:4815 GETADDR handler (inbound-only, answer-once,
- *     MAX_PCT_ADDR_TO_SEND=23 -> min(1000, ceil(0.23*size))).
+ *     MAX_PCT_ADDR_TO_SEND=23 -> min(1000, floor(0.23*size)); the percentage
+ *     cap is computed as size_t `max_pct * nNodes / 100` in
+ *     addrman.cpp:800 GetAddr_ — integer division = FLOOR, not ceil).
  *   - net_processing.cpp ProcessAddrs token bucket (init 1.0, refill
  *     elapsed*0.1 cap 1000, spend 1/addr, drop excess for rate-limited peers;
  *     ADDR + ADDRV2 share ONE bucket, net_processing.cpp:4022).
@@ -279,11 +281,15 @@ describe("anti-eclipse: GETADDR responder (inbound-only, answer-once, 23% cap)",
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  it("23% cap formula: min(1000, ceil(0.23 * size))", () => {
+  it("23% cap formula: min(1000, floor(0.23 * size)) — Core size_t division", () => {
     expect(mgr.getAddrResponseCap(0)).toBe(0);
-    expect(mgr.getAddrResponseCap(1)).toBe(1); // ceil(0.23) = 1
-    expect(mgr.getAddrResponseCap(100)).toBe(23); // ceil(23) = 23
-    expect(mgr.getAddrResponseCap(1000)).toBe(230); // ceil(230) = 230
+    // Distinguishing cases where 23*N is NOT a multiple of 100, so floor != ceil:
+    expect(mgr.getAddrResponseCap(1)).toBe(0); // floor(0.23)=0 (ceil would give 1)
+    expect(mgr.getAddrResponseCap(10)).toBe(2); // floor(2.3)=2 (ceil would give 3)
+    expect(mgr.getAddrResponseCap(99)).toBe(22); // floor(22.77)=22 (ceil would give 23)
+    // Exact multiples where floor == ceil (sanity that the cap still lands right):
+    expect(mgr.getAddrResponseCap(100)).toBe(23); // 23*100/100 = 23
+    expect(mgr.getAddrResponseCap(1000)).toBe(230); // 23*1000/100 = 230
     expect(mgr.getAddrResponseCap(100_000)).toBe(1000); // absolute cap dominates
   });
 
@@ -309,16 +315,18 @@ describe("anti-eclipse: GETADDR responder (inbound-only, answer-once, 23% cap)",
     expect(peer._sent.length).toBe(1);
   });
 
-  it("caps the answered set at ceil(0.23 * addrman_size)", () => {
-    // 200 routable addrs -> cap = ceil(0.23 * 200) = 46.
-    const n = 200;
+  it("caps the answered set at floor(0.23 * addrman_size)", () => {
+    // 210 routable addrs -> floor(0.23 * 210) = floor(48.3) = 48 (a
+    // distinguishing size: ceil would have given 49).
+    const n = 210;
     for (let i = 0; i < n; i++) {
       const b = (i >>> 8) & 0xff;
       const c = i & 0xff;
       addAddr(mgr, `8.7.${b}.${c}`);
     }
     const size = (mgr as any).knownAddresses.size;
-    const expectedCap = Math.min(1000, Math.ceil((23 / 100) * size));
+    const expectedCap = Math.min(1000, Math.floor((23 * size) / 100));
+    expect(expectedCap).toBe(48); // pin the distinguishing value (not 49)
     const peer = makePeer("203.0.113.9", 8333);
     (mgr as any).inboundPeers.add("203.0.113.9:8333");
     (mgr as any).handleGetAddr(peer);
