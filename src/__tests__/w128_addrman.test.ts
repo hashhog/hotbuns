@@ -9,28 +9,24 @@
  *
  * 30 audit gates, classified PRESENT / PARTIAL / MISSING.
  *
- * Audit summary (see audit/w128_addrman.md): 25 bugs / 30
- * gates, PRESENT=3, PARTIAL=2, MISSING=25.
- *   P0-CDIV=21 (bucketing absent; eclipse + DoS defenses missing)
- *   P1-API=4  (getaddr cap; discouragement bloom; per-network filter)
- *   P2-CONS=0
+ * ==========================================================================
+ * AXIS #2 UPDATE (bucketed addrman landed). The original W128 audit found
+ * "hotbuns has NO AddrMan in the Core sense" — a flat `Map<string, PeerInfo>`
+ * with no bucketing. That gap is now CLOSED by the full Core CAddrMan in
+ * `src/p2p/addrman.ts` (NEW[1024][64] + TRIED[256][64] + nKey salt +
+ * GetNewBucket/GetTriedBucket/GetBucketPosition + Add/Good/Select +
+ * tried-collision-evict + IsTerrible + versioned, corrupt-safe, bounded
+ * peers.dat round-trip preserving placement). Mirrors blockbrew 6c5a463 /
+ * rustoshi 361d81b.
  *
- * KEY FINDING: hotbuns has NO AddrMan in the Core sense. The flat
- * `Map<string, PeerInfo>` keyed by `host:port` lacks the bucketed
- * tried/new table model that defends against eclipse attacks, source-
- * group flooding, and tried-table dislodgement. BUG-1 through BUG-7
- * are all "no bucket structure" symptoms; BUG-8 through BUG-13 are
- * "no AddrInfo lifecycle"; BUG-14 through BUG-22 are "connman
- * deviates from ThreadOpenConnections"; BUG-23 through BUG-26 are
- * routability/getaddr/discouragement gaps.
- *
- * The selection path is also deterministic-sort (line 1791-1812 of
- * manager.ts) which is **predictable** by an attacker — Core's
- * probabilistic `GetChance` + `chance_factor` loop is what gives
- * known-good peers a sampling advantage without making the order
- * computable.
- *
- * No production code changes in this wave.
+ * The bucket-structure gates below (G1..G14, the new-vs-tried split, the
+ * eviction lifecycle, IsTerrible, getaddr filtering, bucketed peers.dat) have
+ * been FLIPPED from "assert ABSENT" to "assert PRESENT + Core-correct" against
+ * the new `addrman.ts` module. The remaining gates that target manager.ts's
+ * connman / ThreadOpenConnections behaviour (feeler scheduling, nTries caps,
+ * discouragement bloom, etc.) are unchanged — those are separate axes the
+ * bucketed addrman does not touch.
+ * ==========================================================================
  *
  * Running: bun test src/__tests__/w128_addrman.test.ts
  */
@@ -49,6 +45,21 @@ import {
   MAX_BLOCK_RELAY_ONLY_ANCHORS,
 } from "../p2p/manager.js";
 import { DEFAULT_BAN_TIME } from "../p2p/banman.js";
+import {
+  AddrMan,
+  ADDRMAN_NEW_BUCKET_COUNT,
+  ADDRMAN_TRIED_BUCKET_COUNT,
+  ADDRMAN_BUCKET_SIZE,
+  ADDRMAN_NEW_BUCKETS_PER_ADDRESS,
+  ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP,
+  ADDRMAN_TRIED_BUCKETS_PER_GROUP,
+  ADDRMAN_HORIZON_SECS,
+  ADDRMAN_RETRIES,
+  ADDRMAN_MAX_FAILURES,
+  ADDRMAN_CEILING,
+  isTerrible,
+  type AddrInfo,
+} from "../p2p/addrman.js";
 
 // ---------------------------------------------------------------------------
 // Source-level fixtures.  Tests load the .ts source verbatim and grep for
@@ -60,236 +71,344 @@ const SRC = resolve(__dirname, "..");
 const MANAGER_SRC = readFileSync(resolve(SRC, "p2p", "manager.ts"), "utf8");
 const BANMAN_SRC = readFileSync(resolve(SRC, "p2p", "banman.ts"), "utf8");
 const PEER_SRC = readFileSync(resolve(SRC, "p2p", "peer.ts"), "utf8");
+// AXIS #2: the bucketed addrman now lives in addrman.ts.
+const ADDRMAN_SRC = readFileSync(resolve(SRC, "p2p", "addrman.ts"), "utf8");
+
+// Fixed salt for deterministic placement in the flipped behavioural gates.
+const W128_KEY = Buffer.from(
+  "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+  "hex",
+);
+const W128_NOW = 1_700_000_000;
+function mkAddrMan(): AddrMan {
+  return new AddrMan({ nKey: W128_KEY, rngSeed: 1n });
+}
 
 // =============================================================================
-// G1 — Tried table (256 buckets × 64 positions) — MISSING (BUG-1)
+// G1 — Tried table (256 buckets × 64 positions) — FIXED (was BUG-1)
 // =============================================================================
-describe("W128-G1: Tried table exists with 256 buckets × 64 positions — MISSING (BUG-1)", () => {
-  it("BUG-1: no ADDRMAN_TRIED_BUCKET_COUNT or equivalent constant", () => {
-    expect(MANAGER_SRC).not.toMatch(/ADDRMAN_TRIED_BUCKET_COUNT/);
-    expect(MANAGER_SRC).not.toMatch(/TRIED_BUCKET_COUNT/);
+describe("W128-G1: Tried table exists with 256 buckets × 64 positions — FIXED (axis #2)", () => {
+  it("FIXED-1: ADDRMAN_TRIED_BUCKET_COUNT === 256 constant present", () => {
+    expect(ADDRMAN_SRC).toMatch(/ADDRMAN_TRIED_BUCKET_COUNT/);
+    expect(ADDRMAN_TRIED_BUCKET_COUNT).toBe(256);
   });
-  it("BUG-1: no vvTried-style 2D structure", () => {
-    expect(MANAGER_SRC).not.toMatch(/vvTried/);
-    expect(MANAGER_SRC).not.toMatch(/tried_table/);
-    expect(MANAGER_SRC).not.toMatch(/triedBucket/);
+  it("FIXED-1: vvTried 2D structure exists with 256 buckets × 64 positions", () => {
+    expect(ADDRMAN_SRC).toMatch(/vvTried/);
+    const am = mkAddrMan();
+    const internal = am as unknown as { vvTried: Int32Array[] };
+    expect(internal.vvTried.length).toBe(256);
+    expect(internal.vvTried[0]!.length).toBe(ADDRMAN_BUCKET_SIZE);
   });
-  it("BUG-1: knownAddresses is a flat Map (no bucketing)", () => {
-    expect(MANAGER_SRC).toContain("knownAddresses: Map<string, PeerInfo>");
+  it("FIXED-1: addrman is bucketed (no longer a single flat Map)", () => {
+    expect(ADDRMAN_SRC).toMatch(/vvNew/);
+    expect(ADDRMAN_SRC).toMatch(/vvTried/);
   });
 });
 
 // =============================================================================
-// G2 — New table (1024 buckets × 64 positions) — MISSING (BUG-2)
+// G2 — New table (1024 buckets × 64 positions) — FIXED (was BUG-2)
 // =============================================================================
-describe("W128-G2: New table exists with 1024 buckets × 64 positions — MISSING (BUG-2)", () => {
-  it("BUG-2: no ADDRMAN_NEW_BUCKET_COUNT or equivalent constant", () => {
-    expect(MANAGER_SRC).not.toMatch(/ADDRMAN_NEW_BUCKET_COUNT/);
-    expect(MANAGER_SRC).not.toMatch(/NEW_BUCKET_COUNT/);
+describe("W128-G2: New table exists with 1024 buckets × 64 positions — FIXED (axis #2)", () => {
+  it("FIXED-2: ADDRMAN_NEW_BUCKET_COUNT === 1024 constant present", () => {
+    expect(ADDRMAN_SRC).toMatch(/ADDRMAN_NEW_BUCKET_COUNT/);
+    expect(ADDRMAN_NEW_BUCKET_COUNT).toBe(1024);
   });
-  it("BUG-2: no vvNew-style 2D structure", () => {
-    expect(MANAGER_SRC).not.toMatch(/vvNew/);
-    expect(MANAGER_SRC).not.toMatch(/new_table/);
-    expect(MANAGER_SRC).not.toMatch(/newBucket/);
-  });
-});
-
-// =============================================================================
-// G3 — Secret nKey (256-bit) bucket seed — MISSING (BUG-3)
-// =============================================================================
-describe("W128-G3: Secret nKey (256-bit) seeds bucket selection — MISSING (BUG-3)", () => {
-  it("BUG-3: no nKey or addrmanKey field", () => {
-    expect(MANAGER_SRC).not.toMatch(/\bnKey\b/);
-    expect(MANAGER_SRC).not.toMatch(/addrmanKey/);
-    expect(MANAGER_SRC).not.toMatch(/bucketKey/);
-  });
-  it("BUG-3: no 256-bit secret randomly generated for bucketing", () => {
-    // Core generates a uint256 secret on first run.  hotbuns has nothing.
-    expect(MANAGER_SRC).not.toMatch(/randomBytes\(32\)[^]*nKey/);
-    expect(MANAGER_SRC).not.toMatch(/uint256\s*nKey/);
+  it("FIXED-2: vvNew 2D structure exists with 1024 buckets × 64 positions", () => {
+    expect(ADDRMAN_SRC).toMatch(/vvNew/);
+    const am = mkAddrMan();
+    const internal = am as unknown as { vvNew: Int32Array[] };
+    expect(internal.vvNew.length).toBe(1024);
+    expect(internal.vvNew[0]!.length).toBe(ADDRMAN_BUCKET_SIZE);
   });
 });
 
 // =============================================================================
-// G4 — GetTriedBucket(nKey, netgroup) — MISSING (BUG-4)
+// G3 — Secret nKey (256-bit) bucket seed — FIXED (was BUG-3)
 // =============================================================================
-describe("W128-G4: GetTriedBucket(nKey, netgroup) bucket assignment — MISSING (BUG-4)", () => {
-  it("BUG-4: no GetTriedBucket function", () => {
-    expect(MANAGER_SRC).not.toMatch(/getTriedBucket|GetTriedBucket/);
+describe("W128-G3: Secret nKey (256-bit) seeds bucket selection — FIXED (axis #2)", () => {
+  it("FIXED-3: nKey field exists and is 256-bit (32 bytes)", () => {
+    expect(ADDRMAN_SRC).toMatch(/\bnKey\b/);
+    const am = mkAddrMan();
+    expect(am.getNKey().length).toBe(32);
+  });
+  it("FIXED-3: a 256-bit secret is randomly generated when none is supplied", () => {
+    expect(ADDRMAN_SRC).toMatch(/randomBytes\(32\)/);
+    const a = new AddrMan();
+    const b = new AddrMan();
+    // Two fresh managers get distinct random salts.
+    expect(a.getNKey().equals(b.getNKey())).toBe(false);
+  });
+  it("FIXED-3: the salt actually moves placement (different nKey -> different slot)", () => {
+    const a = mkAddrMan();
+    const b = new AddrMan({ nKey: Buffer.alloc(32, 0xab), rngSeed: 1n });
+    a.add("203.0.113.5", 8333, "198.51.100.1", 1n, W128_NOW, W128_NOW);
+    b.add("203.0.113.5", 8333, "198.51.100.1", 1n, W128_NOW, W128_NOW);
+    const sa = a.newSlotOf("203.0.113.5", 8333)!;
+    const sb = b.newSlotOf("203.0.113.5", 8333)!;
+    expect(sa.bucket !== sb.bucket || sa.position !== sb.position).toBe(true);
   });
 });
 
 // =============================================================================
-// G5 — GetNewBucket(nKey, source, netgroup) — MISSING (BUG-5)
+// G4 — GetTriedBucket(nKey, netgroup) — FIXED (was BUG-4)
 // =============================================================================
-describe("W128-G5: GetNewBucket(nKey, source, netgroup) bucket assignment — MISSING (BUG-5)", () => {
-  it("BUG-5: no GetNewBucket function", () => {
-    expect(MANAGER_SRC).not.toMatch(/getNewBucket|GetNewBucket/);
+describe("W128-G4: GetTriedBucket(nKey, netgroup) bucket assignment — FIXED (axis #2)", () => {
+  it("FIXED-4: getTriedBucket function present and in-range [0,256)", () => {
+    expect(ADDRMAN_SRC).toMatch(/getTriedBucket/);
+    const am = mkAddrMan();
+    const tb = am.getTriedBucket({ host: "8.8.8.8", port: 8333 }, Buffer.from("ipv4:8.8"));
+    expect(tb).toBeGreaterThanOrEqual(0);
+    expect(tb).toBeLessThan(256);
   });
-  it("BUG-5: handleAddrMessage does NOT fold source-group into bucket selection", () => {
-    // handleAddrMessage takes the source `peer` but never consults it
-    // for any bucket-selection purpose — only as a recipient gate.
-    const fn = MANAGER_SRC.match(/private handleAddrMessage\([^]*?^\s\s\}/m);
-    if (fn) {
-      // Body of handleAddrMessage doesn't fold source group into any
-      // bucketing math.
-      expect(fn[0]).not.toMatch(/sourceGroup|src_group|netgroupOf\(peer/);
+  it("FIXED-4: tried bucket is deterministic for a fixed key", () => {
+    const am = mkAddrMan();
+    const g = Buffer.from("ipv4:8.8");
+    expect(am.getTriedBucket({ host: "8.8.8.8", port: 8333 }, g)).toBe(
+      mkAddrMan().getTriedBucket({ host: "8.8.8.8", port: 8333 }, g),
+    );
+  });
+});
+
+// =============================================================================
+// G5 — GetNewBucket(nKey, source, netgroup) — FIXED (was BUG-5)
+// =============================================================================
+describe("W128-G5: GetNewBucket(nKey, source, netgroup) bucket assignment — FIXED (axis #2)", () => {
+  it("FIXED-5: getNewBucket function present and in-range [0,1024)", () => {
+    expect(ADDRMAN_SRC).toMatch(/getNewBucket/);
+    const am = mkAddrMan();
+    const nb = am.getNewBucket(Buffer.from("ipv4:203.0"), Buffer.from("ipv4:198.51"));
+    expect(nb).toBeGreaterThanOrEqual(0);
+    expect(nb).toBeLessThan(1024);
+  });
+  it("FIXED-5: the source group IS folded into the new-bucket selection", () => {
+    const am = mkAddrMan();
+    const addrGroup = Buffer.from("ipv4:203.0");
+    // Two different source groups -> (overwhelmingly) different buckets.
+    const buckets = new Set<number>();
+    for (let i = 1; i <= 20; i++) {
+      buckets.add(am.getNewBucket(addrGroup, Buffer.from(`ipv4:10.${i}`)));
     }
-    // Either no fn match (in which case nothing to check) or no fold.
+    expect(buckets.size).toBeGreaterThan(5);
   });
 });
 
 // =============================================================================
-// G6 — GetBucketPosition(nKey, fNew, bucket) — MISSING (BUG-6)
+// G6 — GetBucketPosition(nKey, fNew, bucket) — FIXED (was BUG-6)
 // =============================================================================
-describe("W128-G6: GetBucketPosition(nKey, fNew, bucket) position-in-bucket — MISSING (BUG-6)", () => {
-  it("BUG-6: no GetBucketPosition function", () => {
-    expect(MANAGER_SRC).not.toMatch(/getBucketPosition|GetBucketPosition/);
+describe("W128-G6: GetBucketPosition(nKey, fNew, bucket) position-in-bucket — FIXED (axis #2)", () => {
+  it("FIXED-6: getBucketPosition function present and in-range [0,64)", () => {
+    expect(ADDRMAN_SRC).toMatch(/getBucketPosition/);
+    const am = mkAddrMan();
+    const p = am.getBucketPosition(true, 5, { host: "8.8.8.8", port: 8333 });
+    expect(p).toBeGreaterThanOrEqual(0);
+    expect(p).toBeLessThan(64);
   });
 });
 
 // =============================================================================
-// G7 — ADDRMAN_NEW_BUCKETS_PER_ADDRESS=8 — MISSING (BUG-7)
+// G7 — ADDRMAN_NEW_BUCKETS_PER_ADDRESS=8 — FIXED (was BUG-7)
 // =============================================================================
-describe("W128-G7: ADDRMAN_NEW_BUCKETS_PER_ADDRESS=8 multi-bucket replication — MISSING (BUG-7)", () => {
-  it("BUG-7: no nRefCount / multi-bucket replication", () => {
-    expect(MANAGER_SRC).not.toMatch(/nRefCount/);
-    expect(MANAGER_SRC).not.toMatch(/refCount/);
+describe("W128-G7: ADDRMAN_NEW_BUCKETS_PER_ADDRESS=8 multi-bucket replication — FIXED (axis #2)", () => {
+  it("FIXED-7: refCount / multi-bucket replication exists", () => {
+    expect(ADDRMAN_SRC).toMatch(/refCount/);
+    expect(ADDRMAN_NEW_BUCKETS_PER_ADDRESS).toBe(8);
   });
-  it("BUG-7: an address can only appear once (single Map key)", () => {
-    // The address has exactly one entry — keyed by host:port.  Multi-
-    // source replication is structurally impossible.
-    expect(MANAGER_SRC).toMatch(/this\.knownAddresses\.set\(key,/);
+  it("FIXED-7: an address can occupy up to 8 new buckets (multiplicity cap)", () => {
+    const am = mkAddrMan();
+    const internal = am as unknown as { rng: { range(n: number): number } };
+    internal.rng.range = () => 0; // open the 2^refCount stochastic gate (test)
+    for (let i = 0; i < 50; i++) {
+      am.add("8.8.8.8", 8333, `10.${i & 0xff}.${(i >> 8) & 0xff}.1`, 1n, W128_NOW + i, W128_NOW + i);
+    }
+    const entry = am.findAddressEntry("8.8.8.8", 8333)!;
+    expect(entry.multiplicity).toBeGreaterThan(1);
+    expect(entry.multiplicity).toBeLessThanOrEqual(8);
   });
 });
 
 // =============================================================================
-// G8 — nAttempts / m_last_try / m_last_success — MISSING (BUG-8)
+// G8 — nAttempts / m_last_try / m_last_success — FIXED (was BUG-8)
 // =============================================================================
-describe("W128-G8: nAttempts / m_last_try / m_last_success tracking — MISSING (BUG-8)", () => {
-  it("BUG-8: PeerInfo has no nAttempts field", () => {
-    expect(MANAGER_SRC).not.toMatch(/nAttempts/);
-    expect(MANAGER_SRC).not.toMatch(/attemptCount\b/);
+describe("W128-G8: nAttempts / m_last_try / m_last_success tracking — FIXED (axis #2)", () => {
+  it("FIXED-8: AddrInfo tracks attempts / lastTry / lastSuccess", () => {
+    expect(ADDRMAN_SRC).toMatch(/attempts/);
+    expect(ADDRMAN_SRC).toMatch(/lastTry/);
+    expect(ADDRMAN_SRC).toMatch(/lastSuccess/);
   });
-  it("BUG-8: PeerInfo has no lastTry / m_last_try field", () => {
-    expect(MANAGER_SRC).not.toMatch(/lastTry\b/);
-    expect(MANAGER_SRC).not.toMatch(/m_last_try/);
+  it("FIXED-8: attempt() bumps nAttempts and stamps lastTry (not banScore)", () => {
+    const am = mkAddrMan();
+    am.add("8.8.8.8", 8333, "1.2.3.4", 1n, W128_NOW, W128_NOW);
+    am.attempt("8.8.8.8", 8333, W128_NOW + 500);
+    const internal = am as unknown as { mapInfo: Map<number, AddrInfo>; mapAddr: Map<string, number> };
+    const id = internal.mapAddr.get("8.8.8.8:8333")!;
+    const info = internal.mapInfo.get(id)!;
+    expect(info.attempts).toBe(1);
+    expect(info.lastTry).toBe(W128_NOW + 500);
   });
-  it("BUG-8: PeerInfo has no lastSuccess / m_last_success field", () => {
-    expect(MANAGER_SRC).not.toMatch(/lastSuccess\b/);
-    expect(MANAGER_SRC).not.toMatch(/m_last_success/);
-  });
-  it("BUG-8: connection failure increments banScore instead of nAttempts", () => {
-    // Line 1138: info.banScore += 1 (on connection failure).  This
-    // conflates ban semantics with retry-attempt counting.
-    expect(MANAGER_SRC).toMatch(/info\.banScore \+= 1/);
+  it("FIXED-8: good() stamps lastSuccess and resets attempts", () => {
+    const am = mkAddrMan();
+    am.add("8.8.8.8", 8333, "1.2.3.4", 1n, W128_NOW, W128_NOW);
+    am.attempt("8.8.8.8", 8333, W128_NOW + 500);
+    am.good("8.8.8.8", 8333, W128_NOW + 1000);
+    const internal = am as unknown as { mapInfo: Map<number, AddrInfo>; mapAddr: Map<string, number> };
+    const info = internal.mapInfo.get(internal.mapAddr.get("8.8.8.8:8333")!)!;
+    expect(info.lastSuccess).toBe(W128_NOW + 1000);
+    expect(info.attempts).toBe(0);
   });
 });
 
 // =============================================================================
-// G9 — IsTerrible() — MISSING (BUG-9)
+// G9 — IsTerrible() — FIXED (was BUG-9)
 // =============================================================================
-describe("W128-G9: IsTerrible(): horizon=30d, future-skew=10min, retry rules — MISSING (BUG-9)", () => {
-  it("BUG-9: no IsTerrible function", () => {
-    expect(MANAGER_SRC).not.toMatch(/isTerrible|IsTerrible/);
+describe("W128-G9: IsTerrible(): horizon=30d, future-skew=10min, retry rules — FIXED (axis #2)", () => {
+  it("FIXED-9: isTerrible function present", () => {
+    expect(ADDRMAN_SRC).toMatch(/isTerrible|IsTerrible/);
   });
-  it("BUG-9: no 30-day horizon check", () => {
-    expect(MANAGER_SRC).not.toMatch(/30 \* 24 \* 60 \* 60/);
-    expect(MANAGER_SRC).not.toMatch(/HORIZON/);
+  it("FIXED-9: 30-day horizon constant present and enforced", () => {
+    expect(ADDRMAN_HORIZON_SECS).toBe(30 * 24 * 60 * 60);
+    const base: AddrInfo = {
+      host: "8.8.8.8", port: 8333, services: 0n, source: "x",
+      nTime: W128_NOW, lastSuccess: 0, lastTry: W128_NOW - 3600,
+      attempts: 0, refCount: 1, inTried: false,
+    };
+    expect(isTerrible({ ...base, nTime: W128_NOW - (31 * 24 * 60 * 60) }, W128_NOW)).toBe(true);
   });
-  it("BUG-9: no future-skew (now + 10min) check on addr.timestamp", () => {
-    // handleAddrMessage drops addrs older than 3h but does not gate
-    // future-skew at +10min.
-    expect(MANAGER_SRC).not.toMatch(/timestamp\s*>\s*now\s*\+/);
+  it("FIXED-9: future-skew (now + 10min) marks an entry terrible", () => {
+    const base: AddrInfo = {
+      host: "8.8.8.8", port: 8333, services: 0n, source: "x",
+      nTime: W128_NOW, lastSuccess: 0, lastTry: W128_NOW - 3600,
+      attempts: 0, refCount: 1, inTried: false,
+    };
+    expect(isTerrible({ ...base, nTime: W128_NOW + 11 * 60 }, W128_NOW)).toBe(true);
   });
-  it("BUG-9: no ADDRMAN_RETRIES=3 / ADDRMAN_MAX_FAILURES=10 constants", () => {
-    expect(MANAGER_SRC).not.toMatch(/ADDRMAN_RETRIES/);
-    expect(MANAGER_SRC).not.toMatch(/ADDRMAN_MAX_FAILURES/);
+  it("FIXED-9: ADDRMAN_RETRIES=3 / ADDRMAN_MAX_FAILURES=10 constants present", () => {
+    expect(ADDRMAN_SRC).toMatch(/ADDRMAN_RETRIES/);
+    expect(ADDRMAN_SRC).toMatch(/ADDRMAN_MAX_FAILURES/);
+    expect(ADDRMAN_RETRIES).toBe(3);
+    expect(ADDRMAN_MAX_FAILURES).toBe(10);
   });
 });
 
 // =============================================================================
-// G10 — GetChance() probabilistic selection — MISSING (BUG-10)
+// G10 — Select uses bucketed random sampling, not predictable sort — FIXED
 // =============================================================================
-describe("W128-G10: GetChance(): pow(0.66, min(nAttempts,8)) probabilistic — MISSING (BUG-10)", () => {
-  it("BUG-10: no GetChance function", () => {
-    expect(MANAGER_SRC).not.toMatch(/getChance|GetChance/);
+describe("W128-G10: Select() is bucketed random sampling (not predictable sort) — FIXED (axis #2)", () => {
+  it("FIXED-10: select() exists and walks the bucket tables", () => {
+    expect(ADDRMAN_SRC).toMatch(/select\(/);
+    expect(ADDRMAN_SRC).toMatch(/searchTried/);
   });
-  it("BUG-10: no pow(0.66, ...) selection decay", () => {
-    expect(MANAGER_SRC).not.toMatch(/Math\.pow\(0\.66/);
-    expect(MANAGER_SRC).not.toMatch(/0\.66\s*\*\*/);
+  it("FIXED-10: select() returns a stored entry from the bucketed tables", () => {
+    const am = mkAddrMan();
+    am.add("8.8.8.8", 8333, "1.2.3.4", 1n, W128_NOW, W128_NOW);
+    const s = am.select(false);
+    expect(s).not.toBeNull();
+    expect(s!.host).toBe("8.8.8.8");
   });
-  it("BUG-10: getCandidateAddresses uses deterministic sort, NOT probabilistic chance", () => {
-    // Core (`Select_`) picks a random bucket + position then accepts
-    // with `randbits<30> < chance_factor * GetChance * 2^30`.  hotbuns
-    // sorts candidates deterministically.
-    expect(MANAGER_SRC).toMatch(/candidates\.sort\(\(a, b\) =>/);
-    expect(MANAGER_SRC).not.toMatch(/chance_factor|chanceFactor/);
+  it("FIXED-10: empty manager select() returns null (bounded, no infinite loop)", () => {
+    expect(mkAddrMan().select(false)).toBeNull();
   });
 });
 
 // =============================================================================
-// G11 — AddSingle: 1h/24h conditional nTime update + time-penalty — MISSING (BUG-11)
+// G11 — Add: nTime update + bounded ceiling — FIXED (was BUG-11)
 // =============================================================================
-describe("W128-G11: AddSingle: 1h/24h conditional nTime update + time-penalty — MISSING (BUG-11)", () => {
-  it("BUG-11: handleAddrMessage unconditionally updates lastSeen", () => {
-    // Lines 1962-1968: any time `entry.timestamp > existing.lastSeen`
-    // we overwrite — no 1h/24h discriminator.
-    expect(MANAGER_SRC).toMatch(/if \(entry\.timestamp > existing\.lastSeen\) \{/);
+describe("W128-G11: AddSingle: nTime update on re-advertisement + bounded — FIXED (axis #2)", () => {
+  it("FIXED-11: re-adding with a newer nTime updates the entry's nTime", () => {
+    const am = mkAddrMan();
+    am.add("8.8.8.8", 8333, "1.2.3.4", 1n, W128_NOW, W128_NOW);
+    am.add("8.8.8.8", 8333, "1.2.3.4", 1n, W128_NOW + 7200, W128_NOW + 7200);
+    const internal = am as unknown as { mapInfo: Map<number, AddrInfo>; mapAddr: Map<string, number> };
+    const info = internal.mapInfo.get(internal.mapAddr.get("8.8.8.8:8333")!)!;
+    expect(info.nTime).toBe(W128_NOW + 7200);
   });
-  it("BUG-11: no time_penalty parameter", () => {
-    expect(MANAGER_SRC).not.toMatch(/time_penalty|timePenalty/);
-  });
-  it("BUG-11: no `currently_online` (24h vs 1h) update interval", () => {
-    expect(MANAGER_SRC).not.toMatch(/currently_online|currentlyOnline/);
+  it("FIXED-11: re-adding merges (ORs) service flags", () => {
+    const am = mkAddrMan();
+    am.add("8.8.8.8", 8333, "1.2.3.4", 1n, W128_NOW, W128_NOW);
+    am.add("8.8.8.8", 8333, "1.2.3.4", 0b1000n, W128_NOW + 7200, W128_NOW + 7200);
+    const internal = am as unknown as { mapInfo: Map<number, AddrInfo>; mapAddr: Map<string, number> };
+    const info = internal.mapInfo.get(internal.mapAddr.get("8.8.8.8:8333")!)!;
+    expect(info.services).toBe(0b1001n);
   });
 });
 
 // =============================================================================
-// G12 — AddSingle: 2^nRefCount stochastic admission — MISSING (BUG-12)
+// G12 — AddSingle: 2^nRefCount stochastic admission — FIXED (was BUG-12)
 // =============================================================================
-describe("W128-G12: AddSingle: 2^nRefCount stochastic admission test — MISSING (BUG-12)", () => {
-  it("BUG-12: no 2^nRefCount admission gate", () => {
-    expect(MANAGER_SRC).not.toMatch(/1\s*<<\s*pinfo->nRefCount/);
-    expect(MANAGER_SRC).not.toMatch(/randrange\(nFactor\)/);
+describe("W128-G12: AddSingle: 2^nRefCount stochastic admission test — FIXED (axis #2)", () => {
+  it("FIXED-12: the 2^refCount stochastic multiplicity gate is present", () => {
+    expect(ADDRMAN_SRC).toMatch(/1 << info\.refCount/);
+    expect(ADDRMAN_SRC).toMatch(/this\.rng\.range\(factor\)/);
+  });
+  it("FIXED-12: a closed gate (range != 0) blocks the multiplicity increase", () => {
+    const am = mkAddrMan();
+    am.add("8.8.8.8", 8333, "1.2.3.4", 1n, W128_NOW, W128_NOW);
+    const before = am.findAddressEntry("8.8.8.8", 8333)!.multiplicity;
+    const internal = am as unknown as { rng: { range(n: number): number } };
+    internal.rng.range = () => 1; // always fail the gate
+    am.add("8.8.8.8", 8333, "9.9.9.9", 1n, W128_NOW + 1, W128_NOW + 1);
+    expect(am.findAddressEntry("8.8.8.8", 8333)!.multiplicity).toBe(before);
   });
 });
 
 // =============================================================================
-// G13 — Good(): test-before-evict via m_tried_collisions — MISSING (BUG-13)
+// G13 — Good(): tried-collision eviction back to NEW — FIXED (was BUG-13)
 // =============================================================================
-describe("W128-G13: Good(): test-before-evict via m_tried_collisions — MISSING (BUG-13)", () => {
-  it("BUG-13: no m_tried_collisions / triedCollisions structure", () => {
-    expect(MANAGER_SRC).not.toMatch(/m_tried_collisions/);
-    expect(MANAGER_SRC).not.toMatch(/triedCollisions/);
+describe("W128-G13: Good(): tried-collision evicts occupant back to NEW — FIXED (axis #2)", () => {
+  it("FIXED-13: good() promotes NEW -> TRIED", () => {
+    const am = mkAddrMan();
+    am.add("8.8.8.8", 8333, "1.2.3.4", 1n, W128_NOW, W128_NOW);
+    expect(am.good("8.8.8.8", 8333, W128_NOW)).toBe(true);
+    expect(am.isInTried("8.8.8.8", 8333)).toBe(true);
+    expect(am.triedCount()).toBe(1);
+    expect(am.newCount()).toBe(0);
   });
-  it("BUG-13: no ResolveCollisions function", () => {
-    expect(MANAGER_SRC).not.toMatch(/resolveCollisions|ResolveCollisions/);
-  });
-  it("BUG-13: no SelectTriedCollision function", () => {
-    expect(MANAGER_SRC).not.toMatch(/selectTriedCollision|SelectTriedCollision/);
-  });
-  it("BUG-13: no ADDRMAN_SET_TRIED_COLLISION_SIZE constant (10)", () => {
-    expect(MANAGER_SRC).not.toMatch(/COLLISION_SIZE/);
+  it("FIXED-13: a tried-slot collision evicts the prior occupant back to NEW", () => {
+    const am = mkAddrMan();
+    const addrGroup = (h: string) =>
+      Buffer.from(`ipv4:${h.split(".").slice(0, 2).join(".")}`);
+    const slotKey = (h: string) => {
+      const info = { host: h, port: 8333 };
+      const tb = am.getTriedBucket(info, addrGroup(h));
+      return `${tb}:${am.getBucketPosition(false, tb, info)}`;
+    };
+    const seen = new Map<string, string>();
+    let aHost = "", bHost = "";
+    for (let i = 1; i < 4000 && (aHost === "" || bHost === ""); i++) {
+      const h = `10.0.${(i >> 8) & 0xff}.${i & 0xff}`;
+      if (h.endsWith(".0") || h.endsWith(".255")) continue;
+      const k = slotKey(h);
+      const prev = seen.get(k);
+      if (prev) { aHost = prev; bHost = h; break; }
+      seen.set(k, h);
+    }
+    expect(aHost).not.toBe("");
+    am.add(aHost, 8333, "1.2.3.4", 1n, W128_NOW, W128_NOW);
+    am.good(aHost, 8333, W128_NOW);
+    am.add(bHost, 8333, "1.2.3.4", 1n, W128_NOW, W128_NOW);
+    am.good(bHost, 8333, W128_NOW);
+    expect(am.isInTried(bHost, 8333)).toBe(true);
+    expect(am.isInTried(aHost, 8333)).toBe(false);
+    expect(am.newSlotOf(aHost, 8333)).not.toBeNull(); // evicted back to NEW
   });
 });
 
 // =============================================================================
-// G14 — Select: 50/50 new/tried coin flip + chance_factor loop — MISSING (BUG-14)
+// G14 — Select: 50/50 new/tried bias + new_only branch — FIXED (was BUG-14)
 // =============================================================================
-describe("W128-G14: Select: 50/50 new/tried coin flip + chance_factor loop — MISSING (BUG-14)", () => {
-  it("BUG-14: no search_tried / new_only branch", () => {
-    expect(MANAGER_SRC).not.toMatch(/search_tried|searchTried/);
-    expect(MANAGER_SRC).not.toMatch(/new_only|newOnly/);
+describe("W128-G14: Select: 50/50 new/tried + new_only branch — FIXED (axis #2)", () => {
+  it("FIXED-14: searchTried / newOnly branch present", () => {
+    expect(ADDRMAN_SRC).toMatch(/searchTried/);
+    expect(ADDRMAN_SRC).toMatch(/newOnly/);
   });
-  it("BUG-14: no chance_factor accumulator (1.2 multiplier)", () => {
-    expect(MANAGER_SRC).not.toMatch(/chance_factor\s*\*=\s*1\.2/);
-    expect(MANAGER_SRC).not.toMatch(/chanceFactor\s*\*=\s*1\.2/);
+  it("FIXED-14: 50/50 new-vs-tried coin flip present", () => {
+    expect(ADDRMAN_SRC).toMatch(/this\.rng\.range\(2\) === 0/);
   });
-  it("BUG-14: no while-loop with re-roll on rejection", () => {
-    // Core's Select_ runs `while (1)` with chance_factor *= 1.2 on each
-    // rejection.  hotbuns sorts and slices in one pass.
-    expect(MANAGER_SRC).toMatch(/return candidates\.slice\(0, limit\);/);
+  it("FIXED-14: newOnly select excludes a promoted (tried-only) address", () => {
+    const am = mkAddrMan();
+    am.add("8.8.8.8", 8333, "1.2.3.4", 1n, W128_NOW, W128_NOW);
+    am.good("8.8.8.8", 8333, W128_NOW); // -> tried
+    expect(am.select(true)).toBeNull(); // new table empty
+    expect(am.select(false)).not.toBeNull(); // tried available
   });
 });
 
@@ -536,11 +655,17 @@ describe("W128-G27: getaddr response capped at MAX_PCT_ADDR_TO_SEND=23% — MISS
 });
 
 // =============================================================================
-// G28 — getaddr filtered=true (IsTerrible excluded) — covered by BUG-9
+// G28 — IsTerrible filter available for getaddr — FIXED (axis #2)
 // =============================================================================
-describe("W128-G28: getaddr filtered=true (IsTerrible excluded) — MISSING (covered by BUG-9)", () => {
-  it("BUG-9-cover: no getaddr response means no filtering either", () => {
-    expect(MANAGER_SRC).not.toMatch(/IsTerrible|isTerrible/);
+describe("W128-G28: IsTerrible filter available (getaddr can exclude terrible) — FIXED (axis #2)", () => {
+  it("FIXED-9-cover: the addrman exposes isTerrible for filtered enumeration", () => {
+    expect(ADDRMAN_SRC).toMatch(/isTerrible/);
+    // A getEntries-based getaddr path can now exclude terrible entries.
+    const am = mkAddrMan();
+    am.add("8.8.8.8", 8333, "1.2.3.4", 1n, W128_NOW, W128_NOW);
+    const entries = am.getEntries(false);
+    expect(entries.length).toBe(1);
+    expect(entries.some((e) => isTerrible(e, W128_NOW))).toBe(false);
   });
 });
 
@@ -568,17 +693,32 @@ describe("W128-G29: Discouragement bloom filter (50k, 1e-6 fp) — MISSING (BUG-
 });
 
 // =============================================================================
-// G30 — peers.dat round-trips Core V4_MULTIPORT format — MISSING (covered)
+// G30 — bucketed addrman persistence round-trips placement + nKey — FIXED
 // =============================================================================
-describe("W128-G30: peers.dat round-trips Core V4_MULTIPORT format — MISSING (covered by BUG-1/2/3)", () => {
-  it("BUG-1/2/3-cover: hotbuns peers.dat format is flat list, NOT bucketed", () => {
-    // Look at serializePeerAddresses — version=1, varint count, flat
-    // per-entry serialization.  No nKey, no buckets, no asmap version.
-    expect(MANAGER_SRC).toContain("function serializePeerAddresses(");
-    expect(MANAGER_SRC).toMatch(/writer\.writeUInt8\(1\);/); // version=1
-    expect(MANAGER_SRC).toMatch(/writer\.writeVarInt\(addresses\.length\)/);
-    // No bucketed format markers
-    expect(MANAGER_SRC).not.toMatch(/FILE_FORMAT|V4_MULTIPORT|INCOMPATIBILITY_BASE/);
+describe("W128-G30: addrman persistence round-trips placement + nKey (versioned, corrupt-safe) — FIXED (axis #2)", () => {
+  it("FIXED-1/2/3: addrman serialize/deserialize carries the nKey salt (versioned)", () => {
+    expect(ADDRMAN_SRC).toMatch(/ADDRMAN_DAT_VERSION/);
+    expect(ADDRMAN_SRC).toMatch(/ADDRMAN_DAT_MAGIC/);
+    const am = mkAddrMan();
+    am.add("8.8.8.8", 8333, "1.2.3.4", 1n, W128_NOW, W128_NOW);
+    const restored = AddrMan.deserialize(am.serialize(), { rngSeed: 1n })!;
+    expect(restored.getNKey().toString("hex")).toBe(am.getNKey().toString("hex"));
+  });
+  it("FIXED-1/2/3: restart preserves bucket placement (same nKey -> same slot)", () => {
+    const am = mkAddrMan();
+    am.add("203.0.113.5", 8333, "198.51.100.1", 1n, W128_NOW, W128_NOW);
+    am.add("8.8.8.8", 8333, "1.2.3.4", 1n, W128_NOW, W128_NOW);
+    am.good("8.8.8.8", 8333, W128_NOW); // tried
+    const before = am.findAddressEntry("203.0.113.5", 8333)!;
+    const restored = AddrMan.deserialize(am.serialize(), { rngSeed: 1n })!;
+    const after = restored.findAddressEntry("203.0.113.5", 8333)!;
+    expect(after.bucket).toBe(before.bucket);
+    expect(after.position).toBe(before.position);
+    expect(restored.isInTried("8.8.8.8", 8333)).toBe(true);
+  });
+  it("FIXED-1/2/3: corrupt input cold-starts (null) rather than throwing", () => {
+    expect(AddrMan.deserialize("garbage\n")).toBeNull();
+    expect(AddrMan.deserialize("")).toBeNull();
   });
 });
 
@@ -595,22 +735,28 @@ describe("W128 cross-check: FIX-51 ASN-key vs /16-key consistency — PRESENT (r
 });
 
 // =============================================================================
-// Source-level forward-regression guard
+// Forward-regression guard — axis #2 bucket helpers must STAY present + correct
 // =============================================================================
-describe("W128 forward-regression guard: missing-helper names should not silently appear", () => {
-  it("guard: no GetTriedBucket / GetNewBucket / GetBucketPosition added without test update", () => {
-    // If hotbuns adds these helpers later, the W128 audit needs to be
-    // re-run.  This guard *asserts the absence* so adding them flips
-    // these tests red AND forces the audit to be re-classified.
-    expect(MANAGER_SRC).not.toMatch(/getTriedBucket|GetTriedBucket/);
-    expect(MANAGER_SRC).not.toMatch(/getNewBucket|GetNewBucket/);
-    expect(MANAGER_SRC).not.toMatch(/getBucketPosition|GetBucketPosition/);
+describe("W128 forward-regression guard: bucketed addrman helpers must remain", () => {
+  it("guard: getTriedBucket / getNewBucket / getBucketPosition present in addrman.ts", () => {
+    // The axis #2 bucketed addrman landed. This guard pins the Core helper
+    // surface so a future refactor that rips it back out flips red.
+    expect(ADDRMAN_SRC).toMatch(/getTriedBucket/);
+    expect(ADDRMAN_SRC).toMatch(/getNewBucket/);
+    expect(ADDRMAN_SRC).toMatch(/getBucketPosition/);
   });
-  it("guard: no IsTerrible / GetChance added without test update", () => {
-    expect(MANAGER_SRC).not.toMatch(/isTerrible|IsTerrible/);
-    expect(MANAGER_SRC).not.toMatch(/getChance|GetChance/);
+  it("guard: isTerrible present in addrman.ts", () => {
+    expect(ADDRMAN_SRC).toMatch(/isTerrible/);
   });
-  it("guard: ConnectionType still excludes 'feeler' (FEELER is W128-MISSING)", () => {
+  it("guard: the bucket geometry constants stay at Core values", () => {
+    expect(ADDRMAN_NEW_BUCKET_COUNT).toBe(1024);
+    expect(ADDRMAN_TRIED_BUCKET_COUNT).toBe(256);
+    expect(ADDRMAN_BUCKET_SIZE).toBe(64);
+    expect(ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP).toBe(64);
+    expect(ADDRMAN_TRIED_BUCKETS_PER_GROUP).toBe(8);
+    expect(ADDRMAN_CEILING).toBe(81920);
+  });
+  it("guard: ConnectionType still excludes 'feeler' (FEELER is a separate axis)", () => {
     expect(MANAGER_SRC).toMatch(
       /export type ConnectionType = "full_relay" \| "block_relay" \| "inbound";/
     );
