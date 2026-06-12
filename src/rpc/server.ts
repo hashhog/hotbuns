@@ -7606,6 +7606,35 @@ export class RPCServer {
     const blockHashHex = Buffer.from(blockHash).reverse().toString("hex");
 
     if (submit) {
+      // B3 FIX: route the freshly-mined block through BlockSync.injectBlock —
+      // the SAME path submitblock uses (server.ts submitBlock → blockSync
+      // .injectBlock).  The previous direct chainState.connectBlock +
+      // headerSync.processHeaders pair advanced the RPC/headerSync tip but left
+      // BlockSync's own frontier (state.nextHeightToProcess) pinned at its
+      // startup value (0 on a fresh regtest node).  That split-brain meant the
+      // P2P version.startHeight / tip-announce (driven off config.bestHeight,
+      // advanced ONLY by BlockSync's processConnectedBlock →
+      // peerManager.updateBestHeight) still told peers target=0, so a connected
+      // peer synced zero blocks after self-mining.  injectBlock runs the
+      // canonical connect path which advances nextHeightToProcess, calls
+      // updateBestHeight, updateTip, mempool.setTipHeight/removeForBlock, and
+      // broadcasts the new-tip inv — exactly what submitblock relies on.  This
+      // is purely a wiring fix; it does NOT touch consensus/connect logic.
+      if (this.blockSync) {
+        const result = await this.blockSync.injectBlock(block);
+        // injectBlock returns null on success, or a BIP-22 reject string.
+        if (result !== null && result !== "duplicate") {
+          throw this.rpcError(RPCErrorCodes.MISC_ERROR, `mined block rejected: ${result}`);
+        }
+        // BlockSync's connect path already handles mempool.removeForBlock and
+        // the new-tip inv broadcast (blocks.ts processConnectedBlock); nothing
+        // further to do here.
+        return { hash: blockHashHex };
+      }
+      // Fallback for configurations without a BlockSync instance (none in the
+      // regtest mining path today, but keep the node functional): the original
+      // direct connect.  Note this re-introduces the frontier split-brain, so
+      // BlockSync MUST be present for self-mine → peer-sync to work.
       await this.chainState.connectBlock(block, height);
       await this.headerSync.processHeaders([block.header], null);
       for (const tx of selectedTxs) {
@@ -7993,6 +8022,10 @@ export class RPCServer {
     if (services & 4n) names.push("BLOOM");
     if (services & 8n) names.push("WITNESS");
     if (services & 1024n) names.push("NETWORK_LIMITED");
+    // NODE_P2P_V2 (1<<11) -> "P2P_V2", matching Core serviceFlagToStr
+    // (protocol.cpp:101). Set in localservices iff BIP-324 v2 transport is
+    // enabled, mirroring Core init.cpp:987-989.
+    if (services & 2048n) names.push("P2P_V2");
     return names;
   }
 

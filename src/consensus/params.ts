@@ -382,6 +382,29 @@ const mainnetGenesisHash = hash256(mainnetGenesisBlock.subarray(0, 80));
 const testnetGenesisHash = hash256(testnetGenesisBlock.subarray(0, 80));
 const regtestGenesisHash = hash256(regtestGenesisBlock.subarray(0, 80));
 
+// BIP-324 v2 transport enablement predicate.  Kept byte-for-byte in lockstep
+// with Peer.bip324V2Enabled (src/p2p/peer.ts): env unset -> ON; explicit
+// 0/false/off (any case) -> OFF.  Inlined here (rather than importing Peer)
+// to avoid a p2p<-consensus import cycle, and so the advertised-services
+// computation below is gated on EXACTLY the same condition that decides
+// whether the v2 transport is offered on the wire.  Advertising NODE_P2P_V2
+// without offering v2 (or vice-versa) would mis-claim an on-wire capability.
+function bip324V2EnabledForServices(): boolean {
+  const v = process.env.HOTBUNS_BIP324_V2;
+  if (v === undefined) return true;
+  const lc = v.toLowerCase();
+  if (lc === "0" || lc === "false" || lc === "off") return false;
+  return true;
+}
+
+// NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED (Core protocol.h:315/320/327).
+const BASE_SERVICES = 0x409n;
+// NODE_P2P_V2 = 1<<11 (Core protocol.h:330): "the node supports BIP324
+// transport".  Advertised iff the v2 transport is actually enabled, so the
+// wire claim matches behaviour.  When enabled the resulting bitset is 0xc09.
+const NODE_P2P_V2 = 0x800n;
+const ADVERTISED_SERVICES = BASE_SERVICES | (bip324V2EnabledForServices() ? NODE_P2P_V2 : 0n);
+
 /**
  * Mainnet consensus parameters.
  */
@@ -455,10 +478,12 @@ export const MAINNET: ConsensusParams = {
   // (NODE_NETWORK_LIMITED | NODE_WITNESS) at init.cpp:863, and NODE_NETWORK
   // is added for non-prune nodes at init.cpp:1950.  A full node always
   // serves at least the last 288 blocks, so it always advertises the
-  // limited bit.  NODE_P2P_V2 (0x800) is NOT advertised: BIP-324 v2
-  // transport is default-off for hotbuns, so advertising it would claim an
-  // off-wire capability.
-  services: 0x409n, // NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED
+  // limited bit.  NODE_P2P_V2 (0x800) is added iff the BIP-324 v2 transport
+  // is enabled (bip324V2EnabledForServices, the same predicate as
+  // Peer.bip324V2Enabled), making the wire claim match behaviour — Core sets
+  // NODE_P2P_V2 in g_local_services when v2 is on (init.cpp).  With v2 now
+  // default-on the advertised bitset is 0xc09 (matching Core v31.99).
+  services: ADVERTISED_SERVICES, // 0xc09 when v2 enabled, 0x409 when opted out
   userAgent: "/hotbuns:0.1.0/",
   dnsSeed: [
     "seed.bitcoin.sipa.be",

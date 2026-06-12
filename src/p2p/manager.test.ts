@@ -174,8 +174,18 @@ describe("PeerManager", () => {
   let tempDir: string;
   let mockServer1: MockPeerServer;
   let mockServer2: MockPeerServer;
+  // MockPeerServer is a v1-only fixture (parseHeader / magic framing, no
+  // BIP-324 v2 handshake).  Now that the v2 transport is DEFAULT-ON, an
+  // outbound connect would send the v2 ellswift/garbage handshake the mock
+  // cannot answer, so these connection-lifecycle tests must pin v1.  This is
+  // scoping, not faking: the v2 default-on behaviour is covered by the
+  // service-advertise tests below and the real-Core interop arm
+  // (test-suite/v2interop/hotbuns_v2interop.sh).
+  let prevV2Env: string | undefined;
 
   beforeEach(async () => {
+    prevV2Env = process.env.HOTBUNS_BIP324_V2;
+    process.env.HOTBUNS_BIP324_V2 = "0";
     tempDir = await mkdtemp(join(tmpdir(), "hotbuns-test-"));
     mockServer1 = new MockPeerServer();
     mockServer2 = new MockPeerServer();
@@ -184,6 +194,8 @@ describe("PeerManager", () => {
   });
 
   afterEach(async () => {
+    if (prevV2Env === undefined) delete process.env.HOTBUNS_BIP324_V2;
+    else process.env.HOTBUNS_BIP324_V2 = prevV2Env;
     mockServer1.stop();
     mockServer2.stop();
     await rm(tempDir, { recursive: true, force: true });
@@ -553,12 +565,18 @@ describe("PeerManager", () => {
 
 describe("PeerManager address persistence", () => {
   let tempDir: string;
+  // v1-only mock fixture; pin v1 (see PeerManager block note).
+  let prevV2Env: string | undefined;
 
   beforeEach(async () => {
+    prevV2Env = process.env.HOTBUNS_BIP324_V2;
+    process.env.HOTBUNS_BIP324_V2 = "0";
     tempDir = await mkdtemp(join(tmpdir(), "hotbuns-test-"));
   });
 
   afterEach(async () => {
+    if (prevV2Env === undefined) delete process.env.HOTBUNS_BIP324_V2;
+    else process.env.HOTBUNS_BIP324_V2 = prevV2Env;
     await rm(tempDir, { recursive: true, force: true });
   });
 
@@ -602,14 +620,20 @@ describe("PeerManager address persistence", () => {
 describe("PeerManager addr message handling", () => {
   let tempDir: string;
   let mockServer: MockPeerServer;
+  // v1-only mock fixture; pin v1 (see PeerManager block note).
+  let prevV2Env: string | undefined;
 
   beforeEach(async () => {
+    prevV2Env = process.env.HOTBUNS_BIP324_V2;
+    process.env.HOTBUNS_BIP324_V2 = "0";
     tempDir = await mkdtemp(join(tmpdir(), "hotbuns-test-"));
     mockServer = new MockPeerServer();
     await mockServer.start();
   });
 
   afterEach(async () => {
+    if (prevV2Env === undefined) delete process.env.HOTBUNS_BIP324_V2;
+    else process.env.HOTBUNS_BIP324_V2 = prevV2Env;
     mockServer.stop();
     await rm(tempDir, { recursive: true, force: true });
   });
@@ -741,14 +765,29 @@ describe("PeerManager NODE_NETWORK_LIMITED advertisement (service-flags 2026-06-
   // bit on prune mode and advertised only 0x09 by default — under-claiming.
   // The corrected contract:
   //
-  //   - any mode  → services == 0x409 (NETWORK | WITNESS | NETWORK_LIMITED)
-  //   - NODE_P2P_V2 (0x800) is NEVER set (BIP-324 v2 transport is default-off
-  //     for hotbuns; advertising it would claim an off-wire capability)
+  //   - any mode  → NETWORK | WITNESS | NETWORK_LIMITED (0x409) is always set
+  //   - NODE_P2P_V2 (0x800) is set iff the BIP-324 v2 transport is enabled
+  //     (bip324V2Enabled / params.ADVERTISED_SERVICES).  v2 is now DEFAULT-ON
+  //     (env HOTBUNS_BIP324_V2 unset -> on), so with no env override the
+  //     default advertised bitset is 0xc09.  Setting HOTBUNS_BIP324_V2=0
+  //     drops the bit back to 0x409.  The test runner inherits no env override,
+  //     so EXPECTED_BASE below resolves to 0xc09.
   //
-  // Implementation: params.services is now 0x409n; the three advertise sites
-  // (getAdvertisedServices, outbound connect, inbound listen) pass it through
-  // with no prune gate.
-  const NODE_P2P_V2 = 0x800n; // 1<<11 — NOT in ServiceFlags; must never be set.
+  // Implementation: params.services is now ADVERTISED_SERVICES; the three
+  // advertise sites (getAdvertisedServices, outbound connect, inbound listen)
+  // pass it through with no prune gate.
+  const NODE_P2P_V2 = 0x800n; // 1<<11 — set iff v2 transport enabled.
+  // Resolve the v2-gated expectation from the SAME predicate the impl uses, so
+  // the test is correct under either env state (default-on, or explicit opt-out
+  // in CI). No env override in the runner -> 0xc09.
+  const v2On = (() => {
+    const v = process.env.HOTBUNS_BIP324_V2;
+    if (v === undefined) return true;
+    const lc = v.toLowerCase();
+    return !(lc === "0" || lc === "false" || lc === "off");
+  })();
+  const EXPECTED_BASE = v2On ? 0xc09n : 0x409n;
+  const EXPECTED_V2 = v2On ? NODE_P2P_V2 : 0n;
 
   const baseConfig = (overrides: Partial<PeerManagerConfig> = {}): PeerManagerConfig => ({
     maxOutbound: 8,
@@ -759,35 +798,35 @@ describe("PeerManager NODE_NETWORK_LIMITED advertisement (service-flags 2026-06-
     ...overrides,
   });
 
-  test("default (pruneMode unset) advertises exactly 0x409 (NETWORK|WITNESS|NETWORK_LIMITED)", () => {
+  test("default (pruneMode unset) advertises NETWORK|WITNESS|NETWORK_LIMITED + v2-gated P2P_V2", () => {
     const manager = new PeerManager(baseConfig());
     const advertised = manager.getAdvertisedServices();
-    expect(advertised).toBe(0x409n);
-    expect(advertised).toBe(1n | 8n | 1024n);
-    // NODE_NETWORK_LIMITED is set; NODE_P2P_V2 is NOT.
+    expect(advertised).toBe(EXPECTED_BASE);
+    expect(advertised).toBe(1n | 8n | 1024n | EXPECTED_V2);
+    // NODE_NETWORK_LIMITED is always set; NODE_P2P_V2 tracks the v2 toggle.
     expect(advertised & ServiceFlags.NODE_NETWORK_LIMITED).toBe(
       ServiceFlags.NODE_NETWORK_LIMITED
     );
-    expect(advertised & NODE_P2P_V2).toBe(0n);
+    expect(advertised & NODE_P2P_V2).toBe(EXPECTED_V2);
   });
 
-  test("pruneMode: false still advertises 0x409 (bit is unconditional, not prune-gated)", () => {
+  test("pruneMode: false still advertises the same bitset (bit is unconditional, not prune-gated)", () => {
     const manager = new PeerManager(baseConfig({ pruneMode: false }));
     const advertised = manager.getAdvertisedServices();
-    expect(advertised).toBe(0x409n);
+    expect(advertised).toBe(EXPECTED_BASE);
     expect(advertised & ServiceFlags.NODE_NETWORK_LIMITED).toBe(
       ServiceFlags.NODE_NETWORK_LIMITED
     );
-    expect(advertised & NODE_P2P_V2).toBe(0n);
+    expect(advertised & NODE_P2P_V2).toBe(EXPECTED_V2);
   });
 
-  test("pruneMode: true advertises 0x409 (NETWORK_LIMITED already present)", () => {
+  test("pruneMode: true advertises the same bitset (NETWORK_LIMITED already present)", () => {
     const manager = new PeerManager(baseConfig({ pruneMode: true }));
-    // 1 (NETWORK) | 8 (WITNESS) | 1024 (NETWORK_LIMITED) = 0x409 = 1033.
-    expect(manager.getAdvertisedServices()).toBe(0x409n);
+    // 1 (NETWORK) | 8 (WITNESS) | 1024 (NETWORK_LIMITED) [| 0x800 v2] = EXPECTED_BASE.
+    expect(manager.getAdvertisedServices()).toBe(EXPECTED_BASE);
   });
 
-  test("advertised bitset preserves NETWORK + WITNESS and never sets P2P_V2", () => {
+  test("advertised bitset preserves NETWORK + WITNESS; P2P_V2 tracks the v2 toggle", () => {
     const manager = new PeerManager(baseConfig({ pruneMode: true }));
     const advertised = manager.getAdvertisedServices();
     expect(advertised & ServiceFlags.NODE_NETWORK).toBe(ServiceFlags.NODE_NETWORK);
@@ -795,7 +834,7 @@ describe("PeerManager NODE_NETWORK_LIMITED advertisement (service-flags 2026-06-
     expect(advertised & ServiceFlags.NODE_NETWORK_LIMITED).toBe(
       ServiceFlags.NODE_NETWORK_LIMITED
     );
-    expect(advertised & NODE_P2P_V2).toBe(0n);
+    expect(advertised & NODE_P2P_V2).toBe(EXPECTED_V2);
   });
 
   test("regtest pruneMode: true also advertises NETWORK_LIMITED", () => {
@@ -842,14 +881,20 @@ describe("PeerManager DNS resolution", () => {
 describe("PeerManager connection lifecycle", () => {
   let tempDir: string;
   let mockServer: MockPeerServer;
+  // v1-only mock fixture; pin v1 (see PeerManager block note).
+  let prevV2Env: string | undefined;
 
   beforeEach(async () => {
+    prevV2Env = process.env.HOTBUNS_BIP324_V2;
+    process.env.HOTBUNS_BIP324_V2 = "0";
     tempDir = await mkdtemp(join(tmpdir(), "hotbuns-test-"));
     mockServer = new MockPeerServer();
     await mockServer.start();
   });
 
   afterEach(async () => {
+    if (prevV2Env === undefined) delete process.env.HOTBUNS_BIP324_V2;
+    else process.env.HOTBUNS_BIP324_V2 = prevV2Env;
     mockServer.stop();
     await rm(tempDir, { recursive: true, force: true });
   });

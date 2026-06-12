@@ -933,8 +933,15 @@ export class Peer {
    */
   static bip324V2Enabled(): boolean {
     const v = process.env.HOTBUNS_BIP324_V2;
-    if (!v) return false;
-    if (v === "0" || v === "false" || v === "FALSE") return false;
+    // Default ON: env unset -> v2 enabled. Only an explicit opt-out
+    // (0 / false / off, any case) disables it. Mirrors haskoin 6963b93 and
+    // camlcoin bb4894f, which flipped their BIP-324 v2 default ON once the
+    // initiator + responder paths were interop-proven against a real Core v2
+    // peer across a rekey boundary (test-suite/v2interop). The forced-on env
+    // (HOTBUNS_BIP324_V2=1) still works and is now a no-op vs the default.
+    if (v === undefined) return true;
+    const lc = v.toLowerCase();
+    if (lc === "0" || lc === "false" || lc === "off") return false;
     return true;
   }
 

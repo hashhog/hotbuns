@@ -245,7 +245,21 @@ export function buildCoinbaseTransaction(
   const totalReward = subsidy + fees;
 
   const heightPush = encodeBIP34Height(height);
-  const scriptSig = Buffer.concat([heightPush, extraNonce]);
+  let scriptSig = Buffer.concat([heightPush, extraNonce]);
+
+  // Consensus requires the coinbase scriptSig to be at least 2 bytes
+  // (COINBASE_SCRIPT_SIZE_MIN; tx_check.cpp "bad-cb-length").  For blocks at
+  // heights 0..16 the BIP34 height push is a single byte (OP_0..OP_16), so when
+  // no extranonce is supplied the bare height push is only 1 byte and the block
+  // fails CheckTransaction.  Bitcoin Core's miner pads with a dummy OP_0
+  // extranonce in exactly this case (node/miner.cpp:187-193,
+  // include_dummy_extranonce → `scriptSig << OP_0`).  Mirror that here so the
+  // regtest mining path (generatetoaddress / generateblock at low heights)
+  // produces a consensus-valid coinbase.  No-op once scriptSig is already
+  // >= 2 bytes (any extranonce, or height >= 17).
+  if (scriptSig.length < 2) {
+    scriptSig = Buffer.concat([scriptSig, Buffer.from([0x00])]); // OP_0
+  }
 
   const inputs: TxIn[] = [
     {

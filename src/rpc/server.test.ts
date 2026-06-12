@@ -1066,13 +1066,26 @@ describe("RPCServer", () => {
       expect(Array.isArray(result.result.warnings)).toBe(true);
     });
 
-    it("should advertise hotbuns's REAL service word 0x409 (no P2P_V2 — v2 default-off)", async () => {
+    it("should advertise hotbuns's REAL service word, P2P_V2 gated on the v2 toggle", async () => {
       const result = await rpcRequest(testPort, "getnetworkinfo");
-      // hotbuns does NOT advertise NODE_P2P_V2 (BIP-324 v2 transport is
-      // default-off), so localservices is the real 0x409 word, NOT Core's 0xc09.
-      // This is a correct-but-differs-from-Core divergence, never to be faked.
-      expect(result.result.localservices).toBe("0000000000000409");
-      expect(result.result.localservicesnames).not.toContain("P2P_V2");
+      // hotbuns advertises NODE_P2P_V2 (0x800) iff the BIP-324 v2 transport is
+      // enabled.  v2 is now DEFAULT-ON (env HOTBUNS_BIP324_V2 unset -> on,
+      // matching haskoin/camlcoin and Core init.cpp:987-989), so the default
+      // localservices word is 0xc09 (== Core v31.99) with P2P_V2 named.  An
+      // explicit HOTBUNS_BIP324_V2=0 opt-out drops it back to 0x409.  Resolved
+      // from the same predicate so the test is correct under either env; never
+      // faked — the bit is set only because v2 is genuinely offered on the wire.
+      const v = process.env.HOTBUNS_BIP324_V2;
+      const v2On =
+        v === undefined ||
+        !["0", "false", "off"].includes(v.toLowerCase());
+      if (v2On) {
+        expect(result.result.localservices).toBe("0000000000000c09");
+        expect(result.result.localservicesnames).toContain("P2P_V2");
+      } else {
+        expect(result.result.localservices).toBe("0000000000000409");
+        expect(result.result.localservicesnames).not.toContain("P2P_V2");
+      }
     });
   });
 
