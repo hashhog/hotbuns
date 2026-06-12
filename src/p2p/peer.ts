@@ -310,6 +310,28 @@ export class Peer {
   /** V2 transport state machine, populated when transportMode === "v2". */
   private v2Transport: V2Transport | null;
 
+  /**
+   * Outbound BIP-324 v2 cipher-handshake gate.  ONLY used on the
+   * useV2=true initiator path.  connect(useV2=true) does not resolve the
+   * instant the TCP socket opens — it awaits this promise, which settles
+   * exactly once:
+   *   - resolve: the v2 cipher handshake reached isHandshakeReady()
+   *     (same instant the "[bip324] v2 outbound connected" log fires);
+   *   - reject : the socket closed/errored before the handshake completed
+   *     (a v1-only peer replies with a v1 VERSION then disconnects — Core
+   *     logs "Wrong MessageStart"), the peer was detected as v1, the v2
+   *     transport errored, or the handshake deadline elapsed.
+   * The reject lets PeerManager.connectPeer run its markV1Only + fresh
+   * v1 re-dial fallback (manager.ts), mirroring Bitcoin Core
+   * V2Transport::ShouldReconnectV1 (net.cpp:1555) and clearbit
+   * connectOutboundNegotiated (peer.zig:2888).  Left null on the v1
+   * (useV2=false) path so that path is byte-for-byte unchanged.
+   */
+  private v2HandshakeResolve: (() => void) | null;
+  private v2HandshakeReject: ((err: Error) => void) | null;
+  /** One-shot guard so the v2 gate settles at most once. */
+  private v2HandshakeSettled: boolean;
+
   /** Network magic in 4-byte little-endian form (for v1/v2 classification). */
   private magicLE: Buffer;
 
@@ -377,6 +399,9 @@ export class Peer {
     // the wire after the first 16 bytes arrive.
     this.transportMode = "v1";
     this.v2Transport = null;
+    this.v2HandshakeResolve = null;
+    this.v2HandshakeReject = null;
+    this.v2HandshakeSettled = false;
     this.magicLE = Buffer.alloc(4);
     this.magicLE.writeUInt32LE(config.magic, 0);
     this.versionSent = false;
@@ -445,6 +470,19 @@ export class Peer {
    * require a new dispatch branch above).
    */
   private async connectDirect(useV2: boolean): Promise<void> {
+    // Arm the v2 cipher-handshake gate BEFORE we open the socket so the
+    // socket close/error handlers (and processRecvBufferV2) can settle it.
+    // Only the useV2=true path awaits this gate; the v1 path leaves the
+    // resolver/rejecter null and its behaviour is unchanged.
+    let v2HandshakePromise: Promise<void> | null = null;
+    if (useV2) {
+      this.v2HandshakeSettled = false;
+      v2HandshakePromise = new Promise<void>((resolve, reject) => {
+        this.v2HandshakeResolve = resolve;
+        this.v2HandshakeReject = reject;
+      });
+    }
+
     const connectPromise = Bun.connect({
       hostname: this.host,
       port: this.port,
@@ -484,6 +522,11 @@ export class Peer {
         close: (_socket) => {
           this.cleanupHandshakeTimer();
           this.releaseNonce();
+          // v2-only: a socket close before the cipher handshake completed
+          // means the peer was v1-only and disconnected after our ellswift
+          // garbage (Core logs "Wrong MessageStart").  Reject the gate so
+          // the manager falls back to v1.  No-op on the v1 path.
+          this.settleV2HandshakeFail("socket closed before v2 handshake");
           if (this.state !== "disconnected") {
             this.state = "disconnected";
             this.events.onDisconnect(this);
@@ -492,6 +535,9 @@ export class Peer {
         error: (_socket, error) => {
           this.cleanupHandshakeTimer();
           this.releaseNonce();
+          this.settleV2HandshakeFail(
+            `socket error before v2 handshake: ${error instanceof Error ? error.message : String(error)}`
+          );
           if (this.state !== "disconnected") {
             this.state = "disconnected";
             this.events.onDisconnect(this, error);
@@ -500,6 +546,9 @@ export class Peer {
         connectError: (_socket, error) => {
           this.cleanupHandshakeTimer();
           this.releaseNonce();
+          this.settleV2HandshakeFail(
+            `connect error before v2 handshake: ${error instanceof Error ? error.message : String(error)}`
+          );
           this.state = "disconnected";
           this.events.onDisconnect(this, error);
         },
@@ -518,7 +567,24 @@ export class Peer {
       // nonce here so a failed outbound dial doesn't leak one bigint.
       this.releaseNonce();
       this.state = "disconnected";
+      // Settle the v2 gate as failed too so an awaiter on the useV2 path
+      // does not hang (no-op on the v1 path).
+      this.settleV2HandshakeFail(
+        `tcp connect failed: ${error instanceof Error ? error.message : String(error)}`
+      );
       throw error;
+    }
+
+    // v1 path: the connect promise already represents a usable peer at TCP
+    // open (VERSION sent inline in the open handler) — return as before.
+    // v2 path: do NOT resolve at TCP open.  The promise resolves only when
+    // the BIP-324 cipher handshake reaches isHandshakeReady (settled in
+    // processRecvBufferV2) and REJECTS on socket-close-before-handshake /
+    // wrong-magic / v1-detected / transport-error / handshake timeout —
+    // letting PeerManager fall back to v1.  Mirrors Core ShouldReconnectV1
+    // (net.cpp:1555) and clearbit connectOutboundNegotiated (peer.zig:2888).
+    if (useV2 && v2HandshakePromise) {
+      await v2HandshakePromise;
     }
   }
 
@@ -751,6 +817,13 @@ export class Peer {
     this.cleanupHandshakeTimer();
     // Clean up our nonce from local nonces
     this.releaseNonce();
+    // If an outbound v2 handshake is still in flight, reject its gate so
+    // connect(useV2=true) returns control to the manager for v1 fallback.
+    // Covers the typed v2 teardown reasons set in processRecvBufferV2
+    // (peer responded with v1 VERSION / v2 transport requested v1 fallback
+    // / v2 transport error) and the v2 handshake-deadline timer.  No-op on
+    // the v1 path and after the gate has already settled successfully.
+    this.settleV2HandshakeFail(_reason ?? "disconnected during v2 handshake");
     this.state = "disconnected";
     if (this.socket) {
       this.socket.end();
@@ -781,6 +854,40 @@ export class Peer {
       clearTimeout(this.handshakeTimer);
       this.handshakeTimer = null;
     }
+  }
+
+  /**
+   * Resolve the outbound v2 cipher-handshake gate (success).  One-shot.
+   * Called from {@link processRecvBufferV2} the instant the cipher
+   * handshake reaches isHandshakeReady().  No-op on the v1 path (the
+   * resolver is null there) and after the gate has already settled.
+   */
+  private settleV2HandshakeOk(): void {
+    if (this.v2HandshakeSettled) return;
+    this.v2HandshakeSettled = true;
+    const resolve = this.v2HandshakeResolve;
+    this.v2HandshakeResolve = null;
+    this.v2HandshakeReject = null;
+    if (resolve) resolve();
+  }
+
+  /**
+   * Reject the outbound v2 cipher-handshake gate (failure).  One-shot.
+   * Called from every path that tears the peer down before the v2 cipher
+   * handshake completed: the socket close/error handlers (a v1-only peer
+   * disconnects after our ellswift garbage — Core "Wrong MessageStart"),
+   * the v2 handshake-deadline timer, and {@link disconnect} for the typed
+   * v1-fallback / transport-error reasons.  Rejecting unblocks
+   * connect(useV2=true) so PeerManager runs markV1Only + a fresh v1
+   * re-dial.  No-op on the v1 path (rejecter is null) and after settle.
+   */
+  private settleV2HandshakeFail(reason: string): void {
+    if (this.v2HandshakeSettled) return;
+    this.v2HandshakeSettled = true;
+    const reject = this.v2HandshakeReject;
+    this.v2HandshakeResolve = null;
+    this.v2HandshakeReject = null;
+    if (reject) reject(new Error(reason));
   }
 
   /**
@@ -1156,6 +1263,10 @@ export class Peer {
       console.log(
         `[bip324] v2 ${dir} connected (encrypted) peer=${this.host}:${this.port}`
       );
+      // Outbound: the cipher handshake is complete and our version packet
+      // is queued — resolve connect(useV2=true).  No-op for responder
+      // (inbound) peers, where the gate was never armed.
+      this.settleV2HandshakeOk();
       this.sendVersionMessage();
     }
 

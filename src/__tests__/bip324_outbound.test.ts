@@ -301,6 +301,141 @@ describe("BIP-324 outbound state machine", () => {
   });
 });
 
+describe("BIP-324 outbound v2-handshake gate (B1 v1-fallback regression)", () => {
+  // Arm the v2 cipher-handshake gate exactly as connectDirect(useV2=true)
+  // does (resolver/rejecter wired into the Peer), then return the promise
+  // the manager would await.  Reproduces the contract: connect(useV2=true)
+  // resolves ONLY on cipher-handshake-ready and REJECTS on any teardown
+  // before that, so PeerManager runs markV1Only + a fresh v1 re-dial.
+  function armGate(peer: Peer): Promise<void> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const p = peer as any;
+    p.v2HandshakeSettled = false;
+    return new Promise<void>((resolve, reject) => {
+      p.v2HandshakeResolve = resolve;
+      p.v2HandshakeReject = reject;
+    });
+  }
+
+  test("REJECTS when a v1-only peer replies v1 then the wire is torn down (THE B1 BUG)", async () => {
+    const captured = { msgs: [] as NetworkMessage[], handshakeComplete: false };
+    const peer = new Peer(makeConfig(), makeEvents(captured));
+    const stub = makeStubSocket();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const p = peer as any;
+    p.socket = stub.socket;
+    p.state = "handshaking";
+    p.prepareV2Outbound();
+    p.flushV2SendBuffer();
+
+    const gate = armGate(peer);
+    // The gate must NOT be resolved at this point (TCP is open but the
+    // cipher handshake has not completed) — the pre-fix bug resolved here.
+    let settled = false;
+    gate.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      }
+    );
+    await new Promise((r) => setTimeout(r, 5));
+    expect(settled).toBe(false);
+
+    // v1 peer responds with a v1 VERSION prefix; processRecvBufferV2 hits
+    // the typed disconnect, which must REJECT the gate.
+    const v1Prefix = Buffer.concat([
+      REGTEST_MAGIC_LE,
+      Buffer.from([0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0, 0, 0, 0, 0]),
+    ]);
+    peer.feedData(v1Prefix);
+
+    let rejected = false;
+    let resolvedWrongly = false;
+    await gate.then(
+      () => {
+        resolvedWrongly = true;
+      },
+      () => {
+        rejected = true;
+      }
+    );
+    expect(rejected).toBe(true);
+    expect(resolvedWrongly).toBe(false);
+    expect(peer.state).toBe("disconnected");
+  });
+
+  test("REJECTS when the socket closes before the v2 handshake completes", async () => {
+    const captured = { msgs: [] as NetworkMessage[], handshakeComplete: false };
+    const peer = new Peer(makeConfig(), makeEvents(captured));
+    const stub = makeStubSocket();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const p = peer as any;
+    p.socket = stub.socket;
+    p.state = "handshaking";
+    p.prepareV2Outbound();
+    p.flushV2SendBuffer();
+
+    const gate = armGate(peer);
+    // Simulate the Bun socket `close` handler firing before handshake — the
+    // exact event when a v1-only Core peer drops us after our ellswift
+    // garbage ("Wrong MessageStart").  settleV2HandshakeFail is what the
+    // close handler calls.
+    p.settleV2HandshakeFail("socket closed before v2 handshake");
+
+    let rejected = false;
+    await gate.then(
+      () => {},
+      () => {
+        rejected = true;
+      }
+    );
+    expect(rejected).toBe(true);
+  });
+
+  test("RESOLVES only once the cipher handshake reaches isHandshakeReady", async () => {
+    const captured = { msgs: [] as NetworkMessage[], handshakeComplete: false };
+    const peer = new Peer(makeConfig(), makeEvents(captured));
+    const stub = makeStubSocket();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const p = peer as any;
+    p.socket = stub.socket;
+    p.state = "handshaking";
+    p.prepareV2Outbound();
+    p.flushV2SendBuffer();
+
+    const initBytes1 = Buffer.concat(stub.written);
+    stub.written.length = 0;
+
+    const gate = armGate(peer);
+    let resolved = false;
+    gate.then(
+      () => {
+        resolved = true;
+      },
+      () => {}
+    );
+    // Not resolved before the responder replies.
+    await new Promise((r) => setTimeout(r, 5));
+    expect(resolved).toBe(false);
+
+    // Drive a real synthetic v2 responder handshake.
+    const responder = new V2Transport(REGTEST_MAGIC_LE, /* initiator */ false);
+    responder.receiveBytes(initBytes1);
+    const respBytes = responder.consumeSendBuffer();
+    peer.feedData(respBytes);
+
+    // The gate must now have resolved (cipher ready + version queued).
+    await gate;
+    expect(resolved).toBe(true);
+    expect(peer.state).not.toBe("disconnected");
+  });
+});
+
 describe("PeerManager v1-only cache", () => {
   let manager: PeerManager;
   let datadir: string;
