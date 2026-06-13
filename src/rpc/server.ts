@@ -58,6 +58,10 @@ import {
   getTxWeight,
   hasWitness,
   isCoinbase,
+  SIGHASH_ALL,
+  SIGHASH_NONE,
+  SIGHASH_SINGLE,
+  SIGHASH_ANYONECANPAY,
 } from "../validation/tx.js";
 import { hash256, hash160 } from "../crypto/primitives.js";
 import { BufferReader } from "../wire/serialization.js";
@@ -96,6 +100,7 @@ import {
   convertToPSBT,
   updateInputUTXO,
   isInputFinalized,
+  getInputUTXO,
   analyzePSBTCore,
   BTC_AMOUNT_SENTINEL,
   formatBtcAmount,
@@ -1328,6 +1333,14 @@ export class RPCServer {
       this.registerMethod("signmessage", (params) => this.signMessage(params));
       this.registerMethod("walletcreatefundedpsbt", (params) =>
         this.walletCreateFundedPSBT(params)
+      );
+      // walletprocesspsbt: UPDATER + SIGNER + (optional) FINALIZER roles on a
+      // base64 PSBT, using the wallet's keys/UTXO knowledge. Reuses the same
+      // PSBT-signer engine as signrawtransactionwithwallet
+      // (convertToPSBT/updateInputUTXO/signPSBTInput/finalizePSBT). Core:
+      // wallet/rpc/spend.cpp::walletprocesspsbt.
+      this.registerMethod("walletprocesspsbt", (params) =>
+        this.walletProcessPSBT(params)
       );
       // fundrawtransaction: raw-tx sibling of walletcreatefundedpsbt — decode a
       // raw tx, add wallet inputs + change via the same coin selector, return
@@ -11858,6 +11871,182 @@ export class RPCServer {
       fee: Number(selection.fee) / 100_000_000,
       changepos: changePos,
     };
+  }
+
+  /**
+   * Parse a Core sighashtype string ("ALL" / "NONE" / "SINGLE", optionally
+   * suffixed with "|ANYONECANPAY") into the numeric sighash byte. Mirrors
+   * Core's `ParseSighashString` (bitcoin-core/src/rpc/util.cpp). "DEFAULT" maps
+   * to ALL for the legacy/SegWit-v0 inputs this signer engine supports (we do
+   * not yet wire Taproot key-path signing, so SIGHASH_DEFAULT's Taproot
+   * semantics are not exercised). An unrecognised string throws RPC -8, matching
+   * Core. `undefined` (param omitted) defaults to ALL.
+   */
+  private parseSighashType(sighashParam: unknown): number {
+    if (sighashParam === undefined || sighashParam === null) {
+      return SIGHASH_ALL;
+    }
+    if (typeof sighashParam !== "string") {
+      throw this.rpcError(
+        RPCErrorCodes.TYPE_ERROR,
+        "sighashtype must be a string"
+      );
+    }
+    switch (sighashParam) {
+      case "DEFAULT":
+      case "ALL":
+        return SIGHASH_ALL;
+      case "NONE":
+        return SIGHASH_NONE;
+      case "SINGLE":
+        return SIGHASH_SINGLE;
+      case "ALL|ANYONECANPAY":
+        return SIGHASH_ALL | SIGHASH_ANYONECANPAY;
+      case "NONE|ANYONECANPAY":
+        return SIGHASH_NONE | SIGHASH_ANYONECANPAY;
+      case "SINGLE|ANYONECANPAY":
+        return SIGHASH_SINGLE | SIGHASH_ANYONECANPAY;
+      default:
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMS,
+          `Invalid sighash param ${sighashParam}`
+        );
+    }
+  }
+
+  /**
+   * walletprocesspsbt "psbt" ( sign sighashtype bip32derivs finalize )
+   *
+   * UPDATER + SIGNER + (optional) FINALIZER roles on a base64 PSBT, using the
+   * wallet's keys and UTXO knowledge:
+   *   - UPDATER: for each input lacking UTXO data, look up the prevout in the
+   *     chainstate UTXO set (then mempool) and attach a witness/non-witness
+   *     UTXO so the signer has the value + scriptPubKey BIP-143 commits to.
+   *   - SIGNER (sign, default true): for each non-finalized input whose
+   *     scriptPubKey resolves to a wallet key, produce a REAL ECDSA signature
+   *     over the correct BIP-143 / legacy sighash for `sighashtype` and attach
+   *     it as a partial signature.
+   *   - FINALIZER (finalize, default true): collapse complete inputs into final
+   *     scriptSig/witness. `complete` is true ONLY when every input is fully
+   *     signed AND finalizable into a network tx.
+   *
+   * REUSES the exact same PSBT-signer engine as signrawtransactionwithwallet
+   * (convertToPSBT / updateInputUTXO / signPSBTInput / finalizePSBT /
+   * extractTransaction in src/wallet/psbt.ts). The sighash + ECDSA signing live
+   * in signPSBTInput (sigHashWitnessV0 / sigHashLegacy + ecdsaSign); this method
+   * does NOT reimplement any of them.
+   *
+   * Result: { psbt: <base64>, complete: <bool> } plus { hex: <network tx hex> }
+   * WHEN complete — matching Core v31.99 (bitcoin-core/src/wallet/rpc/spend.cpp
+   * walletprocesspsbt, spend.cpp:1634-1646: hex is pushed iff complete). When
+   * finalize=false the inputs are not collapsed, so complete stays false and no
+   * hex is emitted — the same gating Core gets from FillPSBT(finalize=false).
+   *
+   * @param params [psbt, sign?, sighashtype?, bip32derivs?, finalize?]
+   */
+  private async walletProcessPSBT(params: unknown[]): Promise<Record<string, unknown>> {
+    const [psbtParam, signParam, sighashParam, , finalizeParam] = params;
+    if (typeof psbtParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "psbt must be a string");
+    }
+    const sign = signParam === undefined ? true : signParam === true;
+    const finalize = finalizeParam === undefined ? true : finalizeParam === true;
+    const sighashType = this.parseSighashType(sighashParam);
+
+    const wallet = this.getCurrentWallet();
+    if (sign && wallet.isLocked()) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_UNLOCK_NEEDED,
+        "Error: Please enter the wallet passphrase with walletpassphrase first."
+      );
+    }
+
+    let psbt: PSBT;
+    try {
+      psbt = decodePSBTBase64(psbtParam);
+    } catch (e) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `TX decode failed ${(e as Error).message}`
+      );
+    }
+
+    const utxoManager = this.chainState.getUTXOManager();
+
+    for (let i = 0; i < psbt.tx.inputs.length; i++) {
+      const txin = psbt.tx.inputs[i];
+      // Already-finalized inputs need no updater/signer work.
+      if (isInputFinalized(psbt.inputs[i])) continue;
+
+      // ── UPDATER: fill in UTXO data the wallet knows but the PSBT lacks.
+      let utxo = getInputUTXO(psbt, i);
+      if (!utxo) {
+        let prevScriptPubKey: Buffer | undefined;
+        let prevValue: bigint | undefined;
+        try {
+          const entry = await utxoManager.getUTXOAsync({
+            txid: txin.prevOut.txid,
+            vout: txin.prevOut.vout,
+          });
+          if (entry) {
+            prevScriptPubKey = entry.scriptPubKey;
+            prevValue = entry.amount;
+          }
+        } catch {
+          // Fall through to mempool lookup.
+        }
+        if (!prevScriptPubKey) {
+          const mpEntry = this.mempool.getTransaction(txin.prevOut.txid);
+          if (mpEntry && txin.prevOut.vout < mpEntry.tx.outputs.length) {
+            const out = mpEntry.tx.outputs[txin.prevOut.vout];
+            prevScriptPubKey = out.scriptPubKey;
+            prevValue = out.value;
+          }
+        }
+        if (prevScriptPubKey && prevValue !== undefined) {
+          updateInputUTXO(
+            psbt,
+            i,
+            { value: prevValue, scriptPubKey: prevScriptPubKey } as TxOut,
+            true
+          );
+          utxo = getInputUTXO(psbt, i);
+        }
+      }
+      if (!utxo) continue; // No UTXO known for this input — can't sign it.
+
+      // ── SIGNER: only when sign=true and we hold the key.
+      if (!sign) continue;
+      const address = this.scriptPubKeyToAddress(utxo.scriptPubKey);
+      if (!address) continue; // Unsupported scriptPubKey type — leave unsigned.
+      const key = wallet.getKey(address);
+      if (!key) continue; // Not our key — leave the partial sig to another signer.
+
+      try {
+        signPSBTInput(psbt, i, key.privateKey, key.publicKey, sighashType);
+      } catch {
+        // A per-input signing failure (e.g. pubkey/script mismatch) leaves the
+        // input unsigned; `complete` will reflect that. Core's FillPSBT
+        // likewise records per-input errors without aborting the call.
+      }
+    }
+
+    // ── FINALIZER: collapse complete inputs (default true). `finalizePSBT`
+    // returns true only when EVERY input is finalized.
+    let complete = false;
+    if (finalize) {
+      complete = finalizePSBT(psbt);
+    }
+
+    const result: Record<string, unknown> = {
+      psbt: encodePSBTBase64(psbt),
+      complete,
+    };
+    if (complete) {
+      const signedTx = extractTransaction(psbt);
+      result.hex = serializeTx(signedTx, true).toString("hex");
+    }
+    return result;
   }
 
   /**
