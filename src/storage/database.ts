@@ -18,6 +18,15 @@ const DEFAULT_MAX_BATCH_SIZE = 10000;
 /** IBD-optimized batch size (larger batches, less fsync overhead). */
 const IBD_BATCH_SIZE = 50000;
 
+/**
+ * On-disk coins/chain block-cache budget passed to the backing LevelDB store
+ * (the analogue of Bitcoin Core's `m_coinsdb_cache_size_bytes`). 256 MB
+ * LevelDB block cache, sized for the 2 GB UTXO cache budget. Exported so the
+ * RPC layer (getchainstates) can report the genuine configured value rather
+ * than re-deriving it, keeping the constructor and the reported value in sync.
+ */
+export const COINS_DB_BLOCK_CACHE_BYTES = 256 * 1024 * 1024;
+
 /** Key prefixes for database namespaces. */
 export const enum DBPrefix {
   BLOCK_INDEX = 0x62, // 'b' - block hash -> block index record
@@ -278,7 +287,7 @@ export class ChainDB {
       keyEncoding: 'buffer',
       valueEncoding: 'buffer',
       // 256 MB LevelDB block cache (increased for 2GB UTXO cache budget)
-      cacheSize: 256 * 1024 * 1024,
+      cacheSize: COINS_DB_BLOCK_CACHE_BYTES,
       // 16 MB write buffer
       writeBufferSize: 16 * 1024 * 1024,
       // Limit open file handles to cap mmap RSS overhead.
@@ -311,6 +320,16 @@ export class ChainDB {
    */
   isClosing(): boolean {
     return this.closing;
+  }
+
+  /**
+   * The configured on-disk (LevelDB) block-cache budget in bytes — the value
+   * passed to the underlying store's `cacheSize`. This is hotbuns's analogue of
+   * Bitcoin Core's `Chainstate::m_coinsdb_cache_size_bytes`, surfaced for the
+   * getchainstates RPC so it can report the genuine configured cache size.
+   */
+  getBlockCacheBytes(): number {
+    return COINS_DB_BLOCK_CACHE_BYTES;
   }
 
   // Block index operations
