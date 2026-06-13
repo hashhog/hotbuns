@@ -561,6 +561,99 @@ describe("RPCServer", () => {
     });
   });
 
+  // ── ParseHashV malformed txid/blockhash parse boundary (Core parity) ──────
+  //
+  // Bitcoin Core's rpc/util.cpp::ParseHashV (line 117) rejects a malformed
+  // txid/blockhash at the PARSE boundary, BEFORE any lookup, with
+  // RPC_INVALID_PARAMETER (-8):
+  //   - wrong length -> "<name> must be of length 64 (not N, for '<hex>')"
+  //   - right length, bad hex -> "<name> must be hexadecimal string (not '<hex>')"
+  // A WELL-FORMED 64-hex hash that simply is not found stays -5
+  // (RPC_INVALID_ADDRESS_OR_KEY) / null for gettxout.
+  describe("ParseHashV malformed-hash parse boundary (-8)", () => {
+    const SHORT = "abc"; // too short (3 chars)
+    const NONHEX = "z".repeat(64); // right length, non-hex
+    const ABSENT = "0".repeat(64); // well-formed 64-hex, never present
+
+    // [method, paramsBuilder(hashArg)] for each in-scope RPC. The hash arg is
+    // the txid/blockhash; trailing args are filled so the handler reaches the
+    // parse guard.
+    const cases: Array<[string, (h: string) => unknown[]]> = [
+      ["getrawtransaction", (h) => [h]],
+      ["gettxout", (h) => [h, 0]],
+      ["getblock", (h) => [h]],
+      ["getblockheader", (h) => [h, true]],
+      ["getmempoolentry", (h) => [h]],
+    ];
+
+    for (const [method, build] of cases) {
+      it(`${method}: too-short hash -> -8 'must be of length 64'`, async () => {
+        const res = await rpcRequest(testPort, method, build(SHORT));
+        expect(res.error).toBeDefined();
+        expect(res.error.code).toBe(RPCErrorCodes.INVALID_PARAMETER);
+        expect(res.error.message).toContain("must be of length 64 (not 3");
+      });
+
+      it(`${method}: 64-char non-hex hash -> -8 'must be hexadecimal string'`, async () => {
+        const res = await rpcRequest(testPort, method, build(NONHEX));
+        expect(res.error).toBeDefined();
+        expect(res.error.code).toBe(RPCErrorCodes.INVALID_PARAMETER);
+        expect(res.error.message).toContain("must be hexadecimal string");
+      });
+    }
+
+    // Direction (b): a WELL-FORMED but absent 64-zero hash must NOT be -8 —
+    // it must reach the lookup and return -5 (or null for gettxout).
+    it("getrawtransaction: well-formed-but-absent hash parses past the -8 boundary", async () => {
+      // A well-formed 64-hex txid clears the ParseHashV guard and reaches the
+      // mempool/txindex lookup. In this RPC unit harness the MockChainDB has
+      // no txindex backing, so the post-parse "not found" path surfaces as an
+      // internal error rather than the production -5 "No such ... transaction"
+      // — but the load-bearing fact is that it is NOT the -8 parse rejection a
+      // malformed hash gets. (The -5-on-absent contract is exercised against a
+      // real txindex in src/__tests__/getrawtx.test.ts.)
+      const res = await rpcRequest(testPort, "getrawtransaction", [ABSENT]);
+      expect(res.error).toBeDefined();
+      expect(res.error.code).not.toBe(RPCErrorCodes.INVALID_PARAMETER);
+    });
+
+    it("getblock: well-formed-but-absent hash stays -5 (not -8)", async () => {
+      const res = await rpcRequest(testPort, "getblock", [ABSENT]);
+      expect(res.error).toBeDefined();
+      expect(res.error.code).toBe(RPCErrorCodes.INVALID_ADDRESS_OR_KEY);
+      expect(res.error.message).toContain("Block not found");
+    });
+
+    it("getblockheader: well-formed-but-absent hash stays -5 (not -8)", async () => {
+      const res = await rpcRequest(testPort, "getblockheader", [ABSENT, true]);
+      expect(res.error).toBeDefined();
+      expect(res.error.code).toBe(RPCErrorCodes.INVALID_ADDRESS_OR_KEY);
+      expect(res.error.message).toContain("Block not found");
+    });
+
+    it("getmempoolentry: well-formed-but-absent hash stays -5 (not -8)", async () => {
+      const res = await rpcRequest(testPort, "getmempoolentry", [ABSENT]);
+      expect(res.error).toBeDefined();
+      expect(res.error.code).toBe(RPCErrorCodes.INVALID_ADDRESS_OR_KEY);
+      expect(res.error.code).not.toBe(RPCErrorCodes.INVALID_PARAMETER);
+    });
+
+    it("gettxout: well-formed-but-absent hash parses past the -8 boundary", async () => {
+      // gettxout's well-formed-absent path returns null in Core; here it
+      // reaches the UTXO lookup (the mock has no live UTXO set, so the exact
+      // post-parse outcome is environment-dependent). The load-bearing
+      // assertion is that a well-formed hash is NOT rejected with -8 at the
+      // ParseHashV boundary the way a malformed one is.
+      const res = await rpcRequest(testPort, "gettxout", [ABSENT, 0]);
+      if (res.error) {
+        expect(res.error.code).not.toBe(RPCErrorCodes.INVALID_PARAMETER);
+      } else {
+        // null result == output not found (Core's gettxout "no entry" path).
+        expect(res.result === null || res.result === undefined).toBe(true);
+      }
+    });
+  });
+
   describe("Authentication", () => {
     it("should allow requests without auth when no credentials configured", async () => {
       const result = await rpcRequest(testPort, "getmempoolinfo");
