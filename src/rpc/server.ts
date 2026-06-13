@@ -51,6 +51,7 @@ import {
 import type { Transaction, TxIn, TxOut } from "../validation/tx.js";
 import {
   deserializeTx,
+  decodeTxWitnessAware,
   serializeTx,
   getTxId,
   getWTxId,
@@ -98,6 +99,8 @@ import {
   extractTransaction,
   decodePSBT as decodePSBTToJSON,
   convertToPSBT,
+  rpcConvertToPSBT,
+  joinPSBTs,
   updateInputUTXO,
   isInputFinalized,
   getInputUTXO,
@@ -1401,6 +1404,8 @@ export class RPCServer {
     this.registerMethod("combinepsbt", (params) => this.combinePSBTRpc(params));
     this.registerMethod("finalizepsbt", (params) => this.finalizePSBTRpc(params));
     this.registerMethod("analyzepsbt", (params) => this.analyzePSBTRpc(params));
+    this.registerMethod("converttopsbt", (params) => this.convertToPSBTRpc(params));
+    this.registerMethod("joinpsbts", (params) => this.joinPSBTsRpc(params));
 
     // Utility methods
     this.registerMethod("help", (params) => this.help(params));
@@ -12137,6 +12142,128 @@ export class RPCServer {
       );
     }
     return encodePSBTBase64(combined);
+  }
+
+  /**
+   * converttopsbt: convert a network-serialized transaction to a blank PSBT.
+   *
+   * Reference: bitcoin-core/src/rpc/rawtransaction.cpp::converttopsbt.
+   *
+   * Decodes the raw tx hex (iswitness forces witness/non-witness when present;
+   * otherwise both forms are tried heuristically). If any input carries a
+   * scriptSig or witness and `permitsigdata` is false, fails with the Core
+   * RPC_DESERIALIZATION_ERROR (-22). All scriptSigs/witnesses are then cleared
+   * unconditionally and a blank PSBT (empty per-input/output maps) is emitted.
+   *
+   * @param params [hexstring, permitsigdata=false, iswitness?]
+   */
+  private async convertToPSBTRpc(params: unknown[]): Promise<string> {
+    const [hexParam, permitParam, iswitnessParam] = params;
+    if (typeof hexParam !== "string") {
+      throw this.rpcError(-22, "TX decode failed");
+    }
+    const permitSigData = permitParam === true;
+
+    // Decode the raw tx with Bitcoin Core's exact witness-hint semantics
+    // (rawtransaction.cpp::converttopsbt -> core_io.cpp::DecodeTx):
+    //   witness_specified = iswitness param present
+    //   iswitness         = witness_specified ? bool : false
+    //   try_witness       = witness_specified ? iswitness  : true
+    //   try_no_witness    = witness_specified ? !iswitness : true
+    // So iswitness=true forces the WITNESS-only decode (a non-witness hex that
+    // the extended reader cannot fully consume fails -22); iswitness=false
+    // forces the legacy-only decode; omitted tries both heuristically.
+    const witnessSpecified =
+      iswitnessParam !== undefined && iswitnessParam !== null;
+    const iswitness = witnessSpecified ? iswitnessParam === true : false;
+    const tryWitness = witnessSpecified ? iswitness : true;
+    const tryNoWitness = witnessSpecified ? !iswitness : true;
+
+    if (!/^[0-9a-fA-F]*$/.test(hexParam) || hexParam.length % 2 !== 0) {
+      throw this.rpcError(-22, "TX decode failed");
+    }
+    const txBytes = Buffer.from(hexParam, "hex");
+
+    let tx: Transaction;
+    try {
+      tx = decodeTxWitnessAware(txBytes, tryNoWitness, tryWitness);
+    } catch {
+      throw this.rpcError(-22, "TX decode failed");
+    }
+
+    let psbt: PSBT;
+    try {
+      psbt = rpcConvertToPSBT(tx, permitSigData);
+    } catch (e) {
+      // The only error rpcConvertToPSBT throws is the sig-data policy
+      // violation, which Core reports as RPC_DESERIALIZATION_ERROR (-22).
+      throw this.rpcError(-22, (e as Error).message);
+    }
+    return encodePSBTBase64(psbt);
+  }
+
+  /**
+   * joinpsbts: join multiple distinct PSBTs (different inputs/outputs) into one.
+   *
+   * Reference: bitcoin-core/src/rpc/rawtransaction.cpp::joinpsbts.
+   *
+   * Requires >= 2 PSBTs (RPC_INVALID_PARAMETER -8). Chooses max tx.version and
+   * min tx.locktime, unions all inputs+outputs (duplicate outpoint across
+   * PSBTs -> -8), merges global xpubs/unknown, and shuffles inputs/outputs for
+   * privacy parity with Core (FastRandomContext). A base64 decode failure is
+   * RPC_DESERIALIZATION_ERROR (-22).
+   *
+   * @param params [txs (array of base64 PSBT strings)]
+   */
+  private async joinPSBTsRpc(params: unknown[]): Promise<string> {
+    const [txsParam] = params;
+    if (!Array.isArray(txsParam)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "txs must be an array");
+    }
+    // Core checks size <= 1 BEFORE decoding any PSBT (-8).
+    if (txsParam.length <= 1) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "At least two PSBTs are required to join PSBTs."
+      );
+    }
+    const psbts: PSBT[] = [];
+    for (const s of txsParam) {
+      if (typeof s !== "string") {
+        throw this.rpcError(-22, "TX decode failed");
+      }
+      try {
+        psbts.push(decodePSBTBase64(s));
+      } catch (e) {
+        throw this.rpcError(-22, `TX decode failed ${(e as Error).message}`);
+      }
+    }
+    let joined: PSBT;
+    try {
+      // Fisher–Yates shuffle for Core privacy parity (FastRandomContext).
+      joined = joinPSBTs(psbts, (n) => this.shufflePermutation(n));
+    } catch (e) {
+      // Duplicate-input (and the size guard, already handled above) map to -8.
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, (e as Error).message);
+    }
+    return encodePSBTBase64(joined);
+  }
+
+  /**
+   * Fisher–Yates shuffle producing a random permutation of [0, n). Mirrors
+   * Core's std::shuffle(..., FastRandomContext()) used by joinpsbts to
+   * randomize input/output order for privacy.
+   */
+  private shufflePermutation(n: number): number[] {
+    const order = new Array<number>(n);
+    for (let i = 0; i < n; i++) order[i] = i;
+    for (let i = n - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = order[i];
+      order[i] = order[j];
+      order[j] = tmp;
+    }
+    return order;
   }
 
   /**
