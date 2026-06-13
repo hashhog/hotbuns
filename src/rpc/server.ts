@@ -1624,15 +1624,9 @@ export class RPCServer {
   private async getBlock(params: unknown[]): Promise<unknown> {
     const [blockhashParam, verbosityParam] = params;
 
-    if (typeof blockhashParam !== "string") {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
-    }
-
-    // Hashes in Bitcoin RPC are display-order (reversed bytes); reverse to get internal key
-    const blockhash = Buffer.from(blockhashParam, "hex").reverse();
-    if (blockhash.length !== 32) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
-    }
+    // Core ParseHashV: malformed blockhash (wrong length / non-hex) -> -8 at
+    // the parse boundary, BEFORE the LookupBlockIndex "Block not found" (-5).
+    const blockhash = this.parseHashV(blockhashParam, "blockhash");
 
     const verbosity = typeof verbosityParam === "number" ? verbosityParam : 1;
 
@@ -2169,15 +2163,9 @@ export class RPCServer {
   private async getBlockHeader(params: unknown[]): Promise<unknown> {
     const [blockhashParam, verboseParam] = params;
 
-    if (typeof blockhashParam !== "string") {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
-    }
-
-    // Hashes in Bitcoin RPC are display-order (reversed bytes); reverse to get internal key
-    const blockhash = Buffer.from(blockhashParam, "hex").reverse();
-    if (blockhash.length !== 32) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
-    }
+    // Core ParseHashV: malformed blockhash (wrong length / non-hex) -> -8 at
+    // the parse boundary, BEFORE the LookupBlockIndex "Block not found" (-5).
+    const blockhash = this.parseHashV(blockhashParam, "blockhash");
 
     const verbose = verboseParam !== false;
 
@@ -3450,10 +3438,6 @@ export class RPCServer {
   private async getRawTransaction(params: unknown[]): Promise<unknown> {
     const [txidParam, verboseParam, blockhashParam] = params;
 
-    if (typeof txidParam !== "string") {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "txid must be a string");
-    }
-
     // Bitcoin RPC convention: txid hex is display-order (big-endian);
     // the on-disk / in-memory key is wire-order (little-endian).  The
     // sibling blockhash branch on line 1498 below already does this
@@ -3463,18 +3447,10 @@ export class RPCServer {
     // Surfaced by the txindex-revert-on-reorg corpus entry against
     // the cross-impl reference txid `ec14e5fbd6a0...` (display order).
     //
-    // Validate strict 64-char hex first (Core ParseHashV rejects bad hex /
-    // wrong length before doing anything else).
-    if (!/^[0-9a-fA-F]{64}$/.test(txidParam)) {
-      throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
-        txidParam.length !== 64 ? "Invalid txid length" : "txid must be hexadecimal string"
-      );
-    }
-    const txid = Buffer.from(txidParam, "hex").reverse();
-    if (txid.length !== 32) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid txid length");
-    }
+    // Core ParseHashV: a malformed txid (wrong length / non-hex) -> -8 at the
+    // parse boundary, BEFORE any mempool/txindex lookup.  A well-formed but
+    // absent txid still falls through to the -5 "No such ... transaction".
+    const txid = this.parseHashV(txidParam, "txid");
 
     // Special exception for the genesis-block coinbase transaction.  Core
     // refuses to retrieve it because the genesis coinbase is never stored
@@ -3530,18 +3506,10 @@ export class RPCServer {
 
     // If blockhash provided, look in that specific block only.
     if (haveBlockhashArg) {
-      if (typeof blockhashParam !== "string") {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
-      }
-      if (!/^[0-9a-fA-F]{64}$/.test(blockhashParam)) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
-      }
-
-      // Hashes in Bitcoin RPC are display-order (reversed bytes); reverse to get internal key
-      const blockhash = Buffer.from(blockhashParam, "hex").reverse();
-      if (blockhash.length !== 32) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
-      }
+      // Core ParseHashV on the optional blockhash arg: malformed (wrong
+      // length / non-hex) -> -8 BEFORE the LookupBlockIndex "Block hash not
+      // found" (-5).
+      const blockhash = this.parseHashV(blockhashParam, "blockhash");
 
       // Core distinguishes "block hash not found" (-5) from "tx not in
       // block" (-5, different message).  Resolve the block index first so
@@ -5050,11 +5018,13 @@ export class RPCServer {
   private async getMempoolEntry(params: unknown[]): Promise<Record<string, unknown>> {
     const [txidParam] = params;
 
-    if (typeof txidParam !== "string" || txidParam.length !== 64) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "txid must be a 64-character hex string");
-    }
-
-    const txid = Buffer.from(txidParam, "hex");
+    // Core ParseHashV: malformed txid (wrong length / non-hex) -> -8 at the
+    // parse boundary, BEFORE the mempool lookup.  A well-formed but absent
+    // txid still falls through to -5 "Transaction not in mempool".
+    // parseHashV returns wire (little-endian) order, which is how the mempool
+    // is keyed (the previous code passed display order without reversing, but
+    // the mempool keys on wire order — see gettxout/getrawtransaction).
+    const txid = this.parseHashV(txidParam, "txid");
     const entry = this.mempool.getTransaction(txid);
 
     if (!entry) {
@@ -8066,6 +8036,43 @@ export class RPCServer {
   }
 
   /**
+   * ParseHashV — validate a txid/blockhash hex argument exactly like Bitcoin
+   * Core's rpc/util.cpp::ParseHashV (line 117).  A malformed hash (wrong
+   * length OR non-hex characters) is rejected at the PARSE boundary with
+   * RPC_INVALID_PARAMETER (-8), BEFORE any lookup.  The two Core messages are
+   * reproduced verbatim:
+   *   - wrong length: "<name> must be of length 64 (not N, for '<hex>')"
+   *   - bad hex     : "<name> must be hexadecimal string (not '<hex>')"
+   *
+   * Returns the internal (wire-order, little-endian) 32-byte buffer.  Callers
+   * that previously did `Buffer.from(hex, "hex").reverse()` get the same
+   * result, but now with a Core-faithful guard in front.  A well-formed but
+   * absent hash is NOT this helper's concern — the handler's own lookup still
+   * returns -5 / null for "not found".
+   */
+  private parseHashV(value: unknown, name: string): Buffer {
+    if (typeof value !== "string") {
+      // Core's get_str() would raise a type error; we keep the existing
+      // "<name> must be a string" surface for the non-string case.
+      throw this.rpcError(RPCErrorCodes.TYPE_ERROR, `${name} must be a string`);
+    }
+    if (value.length !== 64) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        `${name} must be of length 64 (not ${value.length}, for '${value}')`
+      );
+    }
+    if (!/^[0-9a-fA-F]{64}$/.test(value)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        `${name} must be hexadecimal string (not '${value}')`
+      );
+    }
+    // Display order (big-endian) hex -> internal (wire/little-endian) buffer.
+    return Buffer.from(value, "hex").reverse();
+  }
+
+  /**
    * Calculate difficulty from a block hash.
    */
   private async calculateDifficulty(blockhash: Buffer): Promise<number> {
@@ -10175,22 +10182,19 @@ export class RPCServer {
    * Reference: Bitcoin Core src/rpc/blockchain.cpp::gettxout
    */
   private async getTxOut(params: unknown[]): Promise<Record<string, unknown> | null> {
-    if (!params[0] || typeof params[0] !== "string") {
-      throw this.rpcError(-8, "txid must be a string");
-    }
+    // Core gettxout parses the txid (ParseHashV) FIRST, then reads the vout
+    // int (rpc/blockchain.cpp).  A malformed txid (wrong length / non-hex) ->
+    // -8 at the parse boundary, BEFORE the UTXO lookup.  A well-formed but
+    // absent txid still returns null (Core gettxout's "no entry" path).
+    // Previously this returned -5 "Invalid txid" for a wrong-length hash and
+    // silently produced a garbage buffer for a 64-char non-hex string.
+    const txidBuf = this.parseHashV(params[0], "txid");
+
     if (params[1] === undefined || params[1] === null) {
-      throw this.rpcError(-8, "vout index required");
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "vout index required");
     }
-    const txidHex = params[0] as string;
     const vout = Number(params[1]);
     const includeMempool = params[2] !== false;
-
-    if (txidHex.length !== 64) {
-      throw this.rpcError(-5, "Invalid txid");
-    }
-
-    // txid in display format is reversed; convert to internal byte order
-    const txidBuf = Buffer.from(txidHex, "hex").reverse();
     const bestBlock = this.chainState.getBestBlock();
     const bestBlockHash = Buffer.from(bestBlock.hash).reverse().toString("hex");
     const network = this.getNetworkType();

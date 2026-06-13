@@ -574,34 +574,51 @@ describe("getrawtransaction", () => {
   });
 
   describe("error cases", () => {
-    it("should error with invalid txid format", async () => {
+    it("should error -8 with invalid txid format (wrong length)", async () => {
+      // "not-a-hex-txid" is 14 chars -> wrong length, Core ParseHashV emits
+      // RPC_INVALID_PARAMETER (-8) "must be of length 64".
       const res = await rpcRequest(testPort, "getrawtransaction", [
         "not-a-hex-txid",
       ]);
 
       expect(res.error).toBeDefined();
-      expect(res.error?.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+      expect(res.error?.code).toBe(RPCErrorCodes.INVALID_PARAMETER);
+      expect(res.error?.message).toContain("txid must be of length 64");
     });
 
-    it("should error with wrong txid length", async () => {
+    it("should error -8 with wrong txid length", async () => {
       const res = await rpcRequest(testPort, "getrawtransaction", [
         "abcd1234", // Too short
       ]);
 
       expect(res.error).toBeDefined();
-      expect(res.error?.code).toBe(RPCErrorCodes.INVALID_PARAMS);
-      expect(res.error?.message).toContain("Invalid txid length");
+      expect(res.error?.code).toBe(RPCErrorCodes.INVALID_PARAMETER);
+      expect(res.error?.message).toContain("txid must be of length 64 (not 8");
     });
 
-    it("should error with invalid blockhash format", async () => {
+    it("should error -8 with a 64-char non-hex txid", async () => {
+      // Right length, bad hex -> Core ParseHashV emits "must be hexadecimal".
       const res = await rpcRequest(testPort, "getrawtransaction", [
-        Buffer.alloc(32, 0x01).toString("hex"),
-        true,
-        123, // Not a string
+        "z".repeat(64),
       ]);
 
       expect(res.error).toBeDefined();
-      expect(res.error?.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+      expect(res.error?.code).toBe(RPCErrorCodes.INVALID_PARAMETER);
+      expect(res.error?.message).toContain("txid must be hexadecimal string");
+    });
+
+    it("should error -8 with a malformed blockhash arg (non-hex 64)", async () => {
+      // Core ParseHashV(params[2], "blockhash") -> -8 for a malformed hash,
+      // BEFORE the LookupBlockIndex "Block hash not found" (-5).
+      const res = await rpcRequest(testPort, "getrawtransaction", [
+        Buffer.alloc(32, 0x01).toString("hex"),
+        true,
+        "z".repeat(64),
+      ]);
+
+      expect(res.error).toBeDefined();
+      expect(res.error?.code).toBe(RPCErrorCodes.INVALID_PARAMETER);
+      expect(res.error?.message).toContain("blockhash must be hexadecimal string");
     });
 
     it("should error when tx not found anywhere", async () => {
