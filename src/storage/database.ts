@@ -282,7 +282,12 @@ export class ChainDB {
    */
   private closing: boolean;
 
+  /** The on-disk directory this store was opened at (for the AssumeUTXO
+   *  background chainstate, which derives a SEPARATE store path from it). */
+  private readonly dbPath: string;
+
   constructor(dbPath: string) {
+    this.dbPath = dbPath;
     this.db = new ClassicLevel<Buffer, Buffer>(dbPath, {
       keyEncoding: 'buffer',
       valueEncoding: 'buffer',
@@ -298,6 +303,11 @@ export class ChainDB {
       maxOpenFiles: 256,
     });
     this.closing = false;
+  }
+
+  /** The on-disk directory this store was opened at. */
+  path(): string {
+    return this.dbPath;
   }
 
   async open(): Promise<void> {

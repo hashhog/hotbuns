@@ -26,11 +26,13 @@ import {
   NUM_SPECIAL_SCRIPTS,
 } from "../wire/compressor.js";
 import { MuHash3072 } from "../wire/muhash.js";
-import type { ChainDB, UTXOEntry, BatchOperation } from "../storage/database.js";
-import { DBPrefix } from "../storage/database.js";
+import type { UTXOEntry, BatchOperation } from "../storage/database.js";
+import { ChainDB, DBPrefix } from "../storage/database.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import type { Coin, CoinsViewCache, CoinsViewDB } from "./utxo.js";
 import { UTXOManager } from "./utxo.js";
+import type { Block } from "../validation/block.js";
+import { isCoinbase, getTxId } from "../validation/tx.js";
 
 /**
  * Snapshot file magic bytes: 'utxo\xff'
@@ -953,6 +955,17 @@ export class ChainstateManager {
   /** The background chainstate (validates from genesis). */
   private backgroundChainstate: Chainstate | null = null;
 
+  /**
+   * The REAL background validator (owns a SEPARATE ChainDB) wired up at snapshot
+   * activation. Distinct from `backgroundChainstate` (a lightweight marker kept
+   * for the legacy progress fields). This is the genesis->base re-validation
+   * with its own coins store — Core's background chainstate from AddChainstate.
+   */
+  private backgroundValidator: BackgroundValidator | null = null;
+
+  /** Cached terminal verdict of the background pass (drives getStatus). */
+  private backgroundVerdict: SnapshotValidationResult | null = null;
+
   /** Whether background validation is running. */
   private backgroundValidationRunning = false;
 
@@ -962,11 +975,28 @@ export class ChainstateManager {
   /** Cache budget propagated to every Chainstate this manager creates. */
   private maxCacheBytes?: number;
 
-  constructor(db: ChainDB, params: ConsensusParams, maxCacheBytes?: number) {
+  /**
+   * Filesystem path where the background chainstate's SEPARATE coins store is
+   * opened. Must be a DIFFERENT path than the active `db`'s. Defaults under
+   * `<active-db-path>-bgvalidate` when not given explicitly.
+   */
+  private bgDataDir?: string;
+
+  constructor(db: ChainDB, params: ConsensusParams, maxCacheBytes?: number, bgDataDir?: string) {
     this.db = db;
     this.params = params;
     this.maxCacheBytes = maxCacheBytes;
+    this.bgDataDir = bgDataDir;
     this.activeChainstate = new Chainstate(db, params, { maxCacheBytes });
+  }
+
+  /**
+   * Set the on-disk directory for the background chainstate's SEPARATE coins
+   * store (used by {@link startBackgroundValidation}). Must NOT be the active
+   * db's path.
+   */
+  setBackgroundDataDir(dir: string): void {
+    this.bgDataDir = dir;
   }
 
   /**
@@ -1427,63 +1457,105 @@ export class ChainstateManager {
   }
 
   /**
-   * Start background validation.
+   * Start background validation — the REAL dual-chainstate pass.
    *
-   * Uses setImmediate for cooperative scheduling to avoid blocking.
+   * Builds a {@link BackgroundValidator} over a SEPARATE {@link ChainDB} (a
+   * distinct LevelDB at `bgDataDir`, defaulting to `<active-db-path>-bgvalidate`)
+   * and re-connects every block genesis -> base into that store via REAL block
+   * connection (spend inputs / add outputs), then recomputes the bg store's
+   * HASH_SERIALIZED and compares it to the assumeutxo commitment. MATCH ->
+   * snapshot VALIDATED + bg retired; MISMATCH -> snapshot INVALID (never
+   * silently accepted).
+   *
+   * This replaces the old counter loop that walked heights over the SAME `this.db`
+   * with no real connection. Mirrors Core ActivateSnapshot/AddChainstate/
+   * MaybeCompleteSnapshotValidation (validation.cpp) and the cross-impl pilots
+   * (blockbrew bfd429a, lunarblock a39dd42, camlcoin 2675b31).
+   *
+   * @param getBlock      fn(height) -> canonical block for genesis+1..base
+   *                      (shared block store; bg chainstate owns only its coins)
+   * @param onComplete    optional callback fired with the terminal result
+   * @returns the {@link SnapshotActivation} (snapshot chainstate + background
+   *          validator) so a caller can inspect / drive it; null if not
+   *          activatable (no snapshot loaded / no assumeutxo data).
    */
-  startBackgroundValidation(
-    validateBlock: (height: number) => Promise<boolean>
-  ): void {
+  async startBackgroundValidation(
+    getBlock: (height: number) => Promise<Block | null>,
+    onComplete?: (result: SnapshotValidationResult) => void,
+  ): Promise<SnapshotActivation | null> {
     if (this.backgroundValidationRunning) {
-      return;
+      return null;
+    }
+    // Require an active snapshot with a known base + assumeutxo data.
+    const baseHash = this.backgroundChainstate?.targetBlockHash
+      ?? this.activeChainstate.snapshotBaseBlockHash;
+    if (!baseHash) {
+      return null;
+    }
+    const auData = getAssumeutxoData(this.params, baseHash);
+    if (!auData) {
+      this.backgroundVerdict = SnapshotValidationResult.MISSING_CHAINPARAMS;
+      return null;
     }
 
-    if (!this.backgroundChainstate) {
-      return;
+    // Open the SEPARATE background coins store. MUST be a different path/object
+    // than the active db.
+    const bgDir = this.bgDataDir ?? `${this.db.path()}-bgvalidate`;
+    const bgDB = new ChainDB(bgDir);
+    await bgDB.open();
+
+    let activation: SnapshotActivation;
+    try {
+      activation = activateSnapshotWithBackground(
+        this.activeChainstate,
+        bgDB,
+        auData,
+        getBlock,
+        this.maxCacheBytes,
+      );
+    } catch (e) {
+      await bgDB.close().catch(() => { /* best-effort */ });
+      throw e;
     }
 
+    this.backgroundValidator = activation.background;
     this.backgroundValidationRunning = true;
+    this.backgroundVerdict = null;
 
-    const validate = async () => {
-      if (!this.backgroundChainstate || !this.backgroundValidationRunning) {
-        return;
+    // Drive the real genesis->base connection + hash compare.
+    const result = await activation.background.runToBase();
+
+    if (this.onBackgroundProgress) {
+      this.onBackgroundProgress(activation.background.currentHeight(), auData.height);
+    }
+
+    // Apply the verdict to the (active) snapshot chainstate.
+    const { validated, error } = finishSnapshotActivation(activation);
+
+    let verdict: SnapshotValidationResult;
+    if (validated) {
+      verdict = SnapshotValidationResult.SUCCESS;
+      // Retire the bg chainstate (Core ValidatedSnapshotCleanup).
+      this.backgroundChainstate = null;
+    } else if (result === BackgroundValidationResult.INVALID) {
+      verdict = SnapshotValidationResult.HASH_MISMATCH;
+      if (error) {
+        console.error(`AssumeUTXO background validation FAILED: ${error.message}`);
       }
+    } else {
+      verdict = SnapshotValidationResult.SKIPPED;
+    }
 
-      // Check if we've reached the target
-      if (this.backgroundChainstate.hasReachedTarget()) {
-        await this.finalizeBackgroundValidation();
-        return;
-      }
+    this.backgroundVerdict = verdict;
+    this.backgroundValidationRunning = false;
 
-      // Validate next block
-      const nextHeight = this.backgroundChainstate.tipHeight + 1;
+    // Close the bg store regardless of verdict (Core retires the bg chainstate
+    // on completion; on failure the node aborts so the store is discarded).
+    await activation.background.close();
+    this.backgroundValidator = null;
 
-      try {
-        const success = await validateBlock(nextHeight);
-        if (success) {
-          this.backgroundChainstate.tipHeight = nextHeight;
-
-          // Report progress
-          if (this.onBackgroundProgress && this.backgroundChainstate.targetBlockHash) {
-            const auData = getAssumeutxoData(this.params, this.backgroundChainstate.targetBlockHash);
-            if (auData) {
-              this.onBackgroundProgress(nextHeight, auData.height);
-            }
-          }
-        }
-      } catch (error) {
-        console.error(`Background validation failed at height ${nextHeight}:`, error);
-        this.backgroundChainstate.status = ChainstateStatus.INVALID;
-        this.backgroundValidationRunning = false;
-        return;
-      }
-
-      // Schedule next iteration
-      setImmediate(validate);
-    };
-
-    // Start validation
-    setImmediate(validate);
+    onComplete?.(verdict);
+    return activation;
   }
 
   /**
@@ -1494,75 +1566,55 @@ export class ChainstateManager {
   }
 
   /**
-   * Finalize background validation after reaching target.
-   */
-  private async finalizeBackgroundValidation(): Promise<SnapshotValidationResult> {
-    if (!this.backgroundChainstate || !this.backgroundChainstate.targetBlockHash) {
-      return SnapshotValidationResult.SKIPPED;
-    }
-
-    // Get assumeutxo data for the target
-    const auData = getAssumeutxoData(this.params, this.backgroundChainstate.targetBlockHash);
-    if (!auData) {
-      return SnapshotValidationResult.MISSING_CHAINPARAMS;
-    }
-
-    // Compute UTXO set hash for background chainstate
-    try {
-      const { hash } = await computeUTXOSetHash(this.db);
-
-      if (!hash.equals(auData.hashSerialized)) {
-        console.error(
-          `Background validation hash mismatch: expected ${auData.hashSerialized.toString("hex")}, ` +
-          `got ${hash.toString("hex")}`
-        );
-        this.activeChainstate.status = ChainstateStatus.INVALID;
-        return SnapshotValidationResult.HASH_MISMATCH;
-      }
-
-      // Validation succeeded - mark snapshot as validated
-      this.activeChainstate.status = ChainstateStatus.VALIDATED;
-
-      // Clean up background chainstate
-      this.backgroundChainstate = null;
-      this.backgroundValidationRunning = false;
-
-      return SnapshotValidationResult.SUCCESS;
-    } catch (error) {
-      console.error("Failed to compute UTXO hash:", error);
-      return SnapshotValidationResult.STATS_FAILED;
-    }
-  }
-
-  /**
    * Get status of assumeUTXO validation.
    */
   getStatus(): {
     hasSnapshot: boolean;
     snapshotValidated: boolean;
+    backgroundRunning: boolean;
     backgroundProgress: number | null;
     backgroundTarget: number | null;
   } {
     const hasSnapshot = this.activeChainstate.isSnapshot();
+    // A from-snapshot chainstate is `validated` (getchainstates) only AFTER the
+    // background pass matches: false while UNVALIDATED / running, true once the
+    // bg hash compare succeeds (Core's m_assumeutxo == VALIDATED).
     const snapshotValidated = this.activeChainstate.status === ChainstateStatus.VALIDATED;
 
     let backgroundProgress: number | null = null;
     let backgroundTarget: number | null = null;
 
-    if (this.backgroundChainstate && this.backgroundChainstate.targetBlockHash) {
+    if (this.backgroundValidator) {
+      // Live progress from the real validator.
+      backgroundProgress = this.backgroundValidator.currentHeight();
+      const baseHash = this.activeChainstate.snapshotBaseBlockHash;
+      if (baseHash) {
+        const auData = getAssumeutxoData(this.params, baseHash);
+        if (auData) backgroundTarget = auData.height;
+      }
+    } else if (this.backgroundChainstate && this.backgroundChainstate.targetBlockHash) {
       backgroundProgress = this.backgroundChainstate.tipHeight;
       const auData = getAssumeutxoData(this.params, this.backgroundChainstate.targetBlockHash);
-      if (auData) {
-        backgroundTarget = auData.height;
-      }
+      if (auData) backgroundTarget = auData.height;
     }
 
     return {
       hasSnapshot,
       snapshotValidated,
+      backgroundRunning: this.backgroundValidationRunning,
       backgroundProgress,
       backgroundTarget,
     };
+  }
+
+  /** The active background validator, if a real pass is wired up. */
+  backgroundValidatorRef(): BackgroundValidator | null {
+    return this.backgroundValidator;
+  }
+
+  /** Last terminal verdict of the background pass (null if never run). */
+  backgroundValidationVerdict(): SnapshotValidationResult | null {
+    return this.backgroundVerdict;
   }
 }
 
@@ -1641,4 +1693,393 @@ export function getLatestSnapshotHeightForRollback(
     }
   }
   return chosen;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AssumeUTXO dual-chainstate (REAL background 2nd chainstate)
+//
+// Core reference: bitcoin-core/src/validation.cpp.
+//   * ActivateSnapshot (5588) loads the snapshot coins into a NEW chainstate
+//     which becomes the active/tip-serving chainstate (m_assumeutxo =
+//     UNVALIDATED).
+//   * AddChainstate (6170) DEMOTES the original genesis-validated chainstate to
+//     a BACKGROUND chainstate by setting its m_target_blockhash to the snapshot
+//     base. The background chainstate keeps its OWN coins DB
+//     (`prev_chainstate.m_coins_views`) and re-connects blocks genesis -> base
+//     independently of the loaded snapshot coins.
+//   * MaybeCompleteSnapshotValidation (5967) runs once the background chainstate
+//     reaches the base: it computes the HASH_SERIALIZED of the BACKGROUND
+//     chainstate's OWN coins (ComputeUTXOStats / kernel/coinstats.cpp) and
+//     compares it to au_data.hash_serialized. MATCH -> the snapshot chainstate's
+//     m_assumeutxo flips to VALIDATED and the background chainstate is retired
+//     (ValidatedSnapshotCleanup, 6280). MISMATCH -> snapshot marked INVALID and
+//     AbortNode (the handle-invalid-snapshot path) — NEVER silently accepted.
+//
+// The load-time HASH_SERIALIZED gate (loadSnapshot, the `computedHash !==
+// auData.hashSerialized` check above) already authenticates the snapshot bytes.
+// This background pass is the trustless re-verification by INDEPENDENT
+// re-computation: it never trusts the loaded coins, it rebuilds the UTXO set
+// from genesis in a SEPARATE coins store and checks that an honest replay
+// arrives at the same committed hash.
+//
+// Replaces the old `ChainstateManager.startBackgroundValidation` counter loop
+// (which had no callers, walked heights with no real block connection, and
+// operated over the SAME `this.db` as the active store). The machinery below is
+// a genuinely separate background chainstate with its OWN ChainDB.
+//
+// Cross-impl references for the same machinery: blockbrew bfd429a
+// (BackgroundValidator / ActivateSnapshotWithBackground,
+// internal/consensus/assumeutxo.go), lunarblock a39dd42
+// (BackgroundValidator over new_memory_storage, src/utxo.lua), and camlcoin
+// 2675b31 (make_background_chainstate / run_background_to_completion,
+// lib/assume_utxo.ml).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Terminal verdict of the background validation pass.
+ */
+export enum BackgroundValidationResult {
+  /** The background pass has not yet reached the base height. */
+  PENDING = "pending",
+  /** Background-recomputed HASH_SERIALIZED MATCHED the assumeutxo commitment. */
+  VALIDATED = "validated",
+  /** Mismatch, or a block failed to connect — snapshot is INVALID / abort. */
+  INVALID = "invalid",
+}
+
+/**
+ * BackgroundValidator owns the SECOND (background) chainstate for AssumeUTXO
+ * validation: a genesis-rooted chainstate with its OWN separate coins store.
+ *
+ * The store is a distinct {@link ChainDB} (a distinct LevelDB instance at a
+ * distinct on-disk path / keyspace) wrapped in its own {@link UTXOManager} — it
+ * is NOT the active snapshot chainstate's `db`, and a write to the active store
+ * is INVISIBLE here (proven by the dual-chainstate aliasing falsification test).
+ *
+ * It re-connects every block genesis -> base into that store via REAL block
+ * connection (`connectNext`: spend every non-coinbase input out of the bg store,
+ * add every new output into the bg store — NOT a height counter), then
+ * recomputes the HASH_SERIALIZED of its OWN coins ({@link computeUTXOSetHash}
+ * over the bg ChainDB — the SAME kernel the load-time gate uses) and compares it
+ * to the assumeutxo commitment.
+ *
+ * This is Core's background (validated, genesis-rooted) chainstate from
+ * AddChainstate: it keeps its own m_coins_views and replays forward to
+ * m_target_blockhash (the snapshot base).
+ */
+export class BackgroundValidator {
+  /**
+   * The background chainstate's OWN coins store — a genuinely separate
+   * {@link ChainDB} from the active (snapshot) chainstate's `db`. Owned by this
+   * validator; closed by {@link close}.
+   */
+  private readonly bgDB: ChainDB;
+
+  /** Layered UTXO view over {@link bgDB} (spend/add/flush). */
+  private readonly bgUTXO: UTXOManager;
+
+  /** Snapshot base height (Core m_target_blockhash height). */
+  private readonly targetHeight: number;
+
+  /**
+   * The assumeutxo HASH_SERIALIZED commitment (au_data.hash_serialized) the
+   * recomputed bg hash is compared against.
+   */
+  private readonly targetHash: Buffer;
+
+  /**
+   * Reads canonical blocks for heights 1..base from the node's block store. The
+   * bg chainstate only owns its coins, not block bodies (Core shares
+   * BlockManager across chainstates), so blocks come from the shared store.
+   */
+  private readonly getBlock: (height: number) => Promise<Block | null>;
+
+  private currentHeightVal = 0; // genesis-seeded: empty coins at height 0
+  private resultVal: BackgroundValidationResult = BackgroundValidationResult.PENDING;
+  private errVal: Error | null = null;
+  private closed = false;
+
+  /**
+   * @param bgDB         the SEPARATE background coins store (a distinct ChainDB;
+   *                     MUST NOT be the active snapshot store's db)
+   * @param targetHeight snapshot base height to validate up to
+   * @param targetHash   assumeutxo HASH_SERIALIZED commitment at the base
+   * @param getBlock     fn(height) -> block for heights 1..targetHeight
+   * @param maxCacheBytes optional cache budget for the bg UTXO view
+   */
+  constructor(
+    bgDB: ChainDB,
+    targetHeight: number,
+    targetHash: Buffer,
+    getBlock: (height: number) => Promise<Block | null>,
+    maxCacheBytes?: number,
+  ) {
+    this.bgDB = bgDB;
+    this.bgUTXO = new UTXOManager(bgDB, maxCacheBytes);
+    this.targetHeight = targetHeight;
+    this.targetHash = targetHash;
+    this.getBlock = getBlock;
+  }
+
+  /** Background chainstate's current tip height. */
+  currentHeight(): number {
+    return this.currentHeightVal;
+  }
+
+  /** Terminal verdict (PENDING until {@link runToBase} completes). */
+  result(): BackgroundValidationResult {
+    return this.resultVal;
+  }
+
+  /** The connection / mismatch error, if any. */
+  error(): Error | null {
+    return this.errVal;
+  }
+
+  /**
+   * The background chainstate's OWN coins ChainDB. Exposed so tests can prove
+   * the store is genuinely separate from the active one (an active-store write
+   * is NOT visible here).
+   */
+  backgroundDB(): ChainDB {
+    return this.bgDB;
+  }
+
+  /** The layered UTXO view over the background store. */
+  backgroundUTXO(): UTXOManager {
+    return this.bgUTXO;
+  }
+
+  /**
+   * Connect exactly one block (currentHeight+1) into the background
+   * chainstate's OWN coins via REAL block connection. This is NOT a counter
+   * bump: it spends every non-coinbase input out of the bg store and adds every
+   * (spendable) new output into the bg store, mutating the independent coins
+   * set.
+   *
+   * Mirrors the coins-layer half of Core's Chainstate::ConnectBlock
+   * (validation.cpp): for each tx, `view.SpendCoin(prevout)` for every input
+   * (coinbase excepted) then `AddCoins(tx, height)` for the outputs. An aliasing
+   * bug (reading the active store) or a missing parent coin surfaces here as a
+   * spend of a coin absent from THIS store.
+   */
+  private async connectNext(): Promise<void> {
+    const next = this.currentHeightVal + 1;
+    const block = await this.getBlock(next);
+    if (!block) {
+      throw new Error(`background validation: missing block at height ${next}`);
+    }
+
+    const cache = this.bgUTXO.getCoinsViewCache();
+
+    for (const tx of block.transactions) {
+      const coinbase = isCoinbase(tx);
+
+      // Spend inputs (coinbase has no real prevouts).
+      if (!coinbase) {
+        for (const input of tx.inputs) {
+          const spent = await cache.spendCoin(input.prevOut);
+          if (!spent) {
+            throw new Error(
+              `background validation: block ${next} spends a coin absent from the ` +
+                `background store (${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}); ` +
+                `connection is not real or the store is aliased`,
+            );
+          }
+        }
+      }
+
+      // Add this tx's outputs (CoinsViewCache.addCoin skips unspendable
+      // scripts, matching Core's AddCoins).
+      const txid = getTxId(tx);
+      for (let vout = 0; vout < tx.outputs.length; vout++) {
+        const out = tx.outputs[vout];
+        const coin: Coin = {
+          txOut: { value: out.value, scriptPubKey: out.scriptPubKey },
+          height: next,
+          isCoinbase: coinbase,
+        };
+        // possibleOverwrite=coinbase mirrors Core's `AddCoins(tx, ..., overwrite)`
+        // where overwrite is set for BIP-30 duplicate-coinbase handling.
+        cache.addCoin({ txid, vout }, coin, coinbase);
+      }
+    }
+
+    this.currentHeightVal = next;
+  }
+
+  /**
+   * Recompute the background chainstate's HASH_SERIALIZED at the base and apply
+   * the verdict (Core MaybeCompleteSnapshotValidation).
+   *
+   * Flushes the bg coins cache to the bg ChainDB, then runs
+   * {@link computeUTXOSetHash} over THAT db — the same HASH_SERIALIZED kernel
+   * the load-time gate uses (validation.cpp ComputeUTXOStats over the chainstate
+   * cursor). Correct even if the cache has spilled to disk.
+   */
+  private async finalizeAtBase(): Promise<void> {
+    let computed: Buffer;
+    try {
+      await this.bgUTXO.flush();
+      const res = await computeUTXOSetHash(this.bgDB);
+      computed = res.hash;
+    } catch (e) {
+      this.errVal = e instanceof Error ? e : new Error(String(e));
+      this.resultVal = BackgroundValidationResult.INVALID;
+      return;
+    }
+
+    if (computed.equals(this.targetHash)) {
+      // MATCH: Core flips the snapshot chainstate to VALIDATED and retires bg.
+      this.resultVal = BackgroundValidationResult.VALIDATED;
+      return;
+    }
+
+    // MISMATCH: Core marks the snapshot INVALID and AbortNodes. Surface a hard
+    // error; never silently accept. ("mismatch" kept in the message so external
+    // tooling scraping it keeps working — cross-impl convention.)
+    this.errVal = new Error(
+      `background validation hash mismatch: background-recomputed HASH_SERIALIZED ` +
+        `${computed.toString("hex")} != assumeutxo ${this.targetHash.toString("hex")}`,
+    );
+    this.resultVal = BackgroundValidationResult.INVALID;
+  }
+
+  /**
+   * Synchronously drive the background validation to its terminal state:
+   * connect every block genesis+1..base into the bg coins store, then recompute
+   * the HASH_SERIALIZED and compare to the assumeutxo commitment. Returns the
+   * terminal result. A live node could instead tick {@link connectNext} from a
+   * maintenance loop and call finalize on reaching the base; this in-process
+   * driver mirrors Core's validation-queue work synchronously.
+   */
+  async runToBase(): Promise<BackgroundValidationResult> {
+    if (this.resultVal !== BackgroundValidationResult.PENDING) {
+      return this.resultVal;
+    }
+    try {
+      while (this.currentHeightVal < this.targetHeight) {
+        await this.connectNext();
+      }
+    } catch (e) {
+      this.errVal = e instanceof Error ? e : new Error(String(e));
+      this.resultVal = BackgroundValidationResult.INVALID;
+      return this.resultVal;
+    }
+    await this.finalizeAtBase();
+    return this.resultVal;
+  }
+
+  /**
+   * Close the background chainstate's OWN ChainDB. Called after the verdict is
+   * applied (Core's ValidatedSnapshotCleanup retires the bg chainstate). Safe to
+   * call more than once.
+   */
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    await this.bgDB.close().catch(() => { /* best-effort */ });
+  }
+}
+
+/**
+ * Pairs the active (snapshot) chainstate with the background validator that
+ * re-derives its UTXO hash. Mirrors Core's triple through ActivateSnapshot /
+ * AddChainstate: the UNVALIDATED snapshot chainstate, and the VALIDATED
+ * background chainstate targeting the snapshot base.
+ */
+export interface SnapshotActivation {
+  /**
+   * The ACTIVE chainstate (snapshot-loaded). Starts UNVALIDATED (Core
+   * Assumeutxo::UNVALIDATED); the background pass flips its `status` to
+   * VALIDATED (match) or INVALID (mismatch) via {@link finishSnapshotActivation}.
+   */
+  snapshot: Chainstate;
+  /** The genesis-rooted validator with its OWN separate coins store. */
+  background: BackgroundValidator;
+}
+
+/**
+ * Wire up a real dual-chainstate validation for an already-loaded snapshot
+ * chainstate (Core ActivateSnapshot + AddChainstate).
+ *
+ * Performs NO block connection itself — exactly like Core's ActivateSnapshot,
+ * which returns after demoting the prior chainstate and lets the validation
+ * queue do the background work. Drive it with `background.runToBase()` and then
+ * call {@link finishSnapshotActivation}.
+ *
+ * @param snapshotCS the ACTIVE chainstate produced by loading the snapshot (its
+ *                   coins live in its OWN `db`). Forced to UNVALIDATED here.
+ * @param bgDB       the BACKGROUND chainstate's OWN coins store — MUST be a
+ *                   genuinely separate {@link ChainDB} from the snapshot
+ *                   chainstate's `db`. Refuses to proceed if it is the same
+ *                   object (aliasing guard, mirroring blockbrew's
+ *                   "background coins store must be separate" check).
+ * @param au         the assumeutxo entry for the base (its hashSerialized is the
+ *                   commitment the background pass re-derives and checks).
+ * @param getBlock   fn(height) -> block for genesis+1..base (shared block store).
+ * @param maxCacheBytes optional cache budget for the bg UTXO view.
+ */
+export function activateSnapshotWithBackground(
+  snapshotCS: Chainstate,
+  bgDB: ChainDB,
+  au: AssumeutxoData,
+  getBlock: (height: number) => Promise<Block | null>,
+  maxCacheBytes?: number,
+): SnapshotActivation {
+  if (!snapshotCS) {
+    throw new Error("activateSnapshotWithBackground: nil snapshot chainstate");
+  }
+  if (!au) {
+    throw new Error("activateSnapshotWithBackground: nil assumeutxo data");
+  }
+  if (!bgDB) {
+    throw new Error("activateSnapshotWithBackground: nil background coins store");
+  }
+  // Aliasing guard: the bg coins store MUST be a different object from the
+  // active store (Core's background chainstate keeps its OWN m_coins_views).
+  if (bgDB === snapshotCS.db) {
+    throw new Error(
+      "activateSnapshotWithBackground: background coins store must be separate from " +
+        "the active (snapshot) chainstate store",
+    );
+  }
+
+  // The snapshot chainstate is the active, not-yet-validated one
+  // (Core Assumeutxo::UNVALIDATED).
+  snapshotCS.status = ChainstateStatus.UNVALIDATED;
+
+  const background = new BackgroundValidator(bgDB, au.height, au.hashSerialized, getBlock, maxCacheBytes);
+  return { snapshot: snapshotCS, background };
+}
+
+/**
+ * Apply the background verdict to the snapshot chainstate (Core's flip of
+ * unvalidated_cs.m_assumeutxo).
+ *
+ *   - VALIDATED match -> snapshot.status = VALIDATED, returns { validated: true }.
+ *   - INVALID mismatch -> snapshot.status = INVALID, returns
+ *     { validated: false, error } — the snapshot is NEVER silently accepted on a
+ *     mismatch; the caller should treat the error as fatal (Core AbortNode).
+ *   - still PENDING -> leaves the snapshot unchanged, returns
+ *     { validated: false }.
+ */
+export function finishSnapshotActivation(
+  activation: SnapshotActivation,
+): { validated: boolean; error?: Error } {
+  const bg = activation.background;
+  switch (bg.result()) {
+    case BackgroundValidationResult.VALIDATED:
+      activation.snapshot.status = ChainstateStatus.VALIDATED;
+      return { validated: true };
+    case BackgroundValidationResult.INVALID:
+      activation.snapshot.status = ChainstateStatus.INVALID;
+      return {
+        validated: false,
+        error: bg.error() ?? new Error("background validation failed"),
+      };
+    default:
+      // Still pending: not terminal. Do not flip the snapshot's status.
+      return { validated: false };
+  }
 }
