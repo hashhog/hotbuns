@@ -1329,6 +1329,11 @@ export class RPCServer {
       this.registerMethod("importdescriptors", (params) =>
         this.importDescriptors(params)
       );
+      // listdescriptors: dump the wallet's imported descriptors in Core's
+      // shape (sorted by descriptor string). Core: wallet/rpc/backup.cpp.
+      this.registerMethod("listdescriptors", (params) =>
+        this.listDescriptors(params)
+      );
       // Wallet-side address introspection (ismine / solvable / parent_desc /
       // labels). Core: wallet/rpc/addresses.cpp::getaddressinfo.
       this.registerMethod("getaddressinfo", (params) =>
@@ -11805,6 +11810,99 @@ export class RPCServer {
     this.markWalletDirty();
 
     return results;
+  }
+
+  /**
+   * listdescriptors: list all descriptors present in the wallet.
+   *
+   * Core parity (bitcoin-core/src/wallet/rpc/backup.cpp::listdescriptors):
+   *  - Returns { wallet_name, descriptors: [...] }; the descriptors array is
+   *    SORTED by the descriptor string (backup.cpp:541-543).
+   *  - Per descriptor: `desc` (WITH the BIP-380 #checksum), `timestamp`,
+   *    `active`, and — only when present — `internal` (active descriptors
+   *    only), `range` ([begin,end] inclusive) and `next`/`next_index` (ranged
+   *    descriptors only).
+   *  - private=true (default false) emits the xprv/WIF form and requires an
+   *    unlocked, private-key-bearing wallet. hotbuns stores only the PUBLIC
+   *    watch-only descriptor (importdescriptors registers ownership without
+   *    key material), so a wallet with private keys disabled rejects
+   *    private=true exactly like Core (backup.cpp:500-502).
+   *
+   * hotbuns' descriptors are all watch-only imports (no active/internal HD
+   * ScriptPubKeyMan), so `active` is false and `internal` is omitted — Core's
+   * shape for an inactive imported descriptor (IsInternalScriptPubKeyMan ->
+   * nullopt, "defined only for active descriptors").
+   *
+   * @param params [private?: boolean]
+   */
+  private async listDescriptors(params: unknown[]): Promise<Record<string, unknown>> {
+    const wallet = this.getCurrentWallet();
+
+    const priv = params[0] === undefined || params[0] === null ? false : params[0];
+    if (typeof priv !== "boolean") {
+      throw this.rpcError(
+        RPCErrorCodes.TYPE_ERROR,
+        "JSON value of type string is not of expected type bool"
+      );
+    }
+
+    // Core: private descriptors are unavailable for watch-only (DISABLE_
+    // PRIVATE_KEYS) wallets (backup.cpp:500-502). Every hotbuns descriptor is
+    // an imported watch-only public descriptor, so the private form never
+    // exists here — surface Core's exact error rather than a public string.
+    if (priv && wallet.isPrivateKeysDisabled()) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_ERROR,
+        "Can't get private descriptor string for watch-only wallets"
+      );
+    }
+    if (priv) {
+      // hotbuns has no private form for imported descriptors regardless of the
+      // wallet flag; refuse rather than emit the public string as "private".
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_ERROR,
+        "Can't get private descriptor string for watch-only wallets"
+      );
+    }
+
+    const descriptors = wallet.getWatchDescriptors().map((rec) => {
+      // The stored `desc` is already the normalized public form WITH checksum
+      // (addWatchDescriptor -> addChecksum). Re-apply addChecksum defensively
+      // so the trailing #checksum is guaranteed present and canonical.
+      const desc = addChecksum(rec.desc);
+      const out: Record<string, unknown> = {
+        desc,
+        timestamp: rec.timestamp,
+        // Imported watch-only descriptors are not active ScriptPubKeyMans (they
+        // do not generate new addresses); Core marks these active:false and
+        // omits `internal` (defined only for active descriptors).
+        active: false,
+      };
+      // Ranged descriptors carry the inclusive [begin,end] range and the next
+      // index to derive. hotbuns stores `range` inclusive already (Core's
+      // listdescriptors emits range_end-1, i.e. the same inclusive end). The
+      // next index for an undriven watch-only descriptor is the range start.
+      if (rec.range) {
+        out.range = [rec.range[0], rec.range[1]];
+        out.next = rec.range[0];
+        out.next_index = rec.range[0];
+      }
+      return out;
+    });
+
+    // Sort by descriptor string (Core backup.cpp:541-543).
+    descriptors.sort((a, b) =>
+      (a.desc as string) < (b.desc as string)
+        ? -1
+        : (a.desc as string) > (b.desc as string)
+          ? 1
+          : 0
+    );
+
+    return {
+      wallet_name: this.getCurrentWalletName(),
+      descriptors,
+    };
   }
 
   /**
