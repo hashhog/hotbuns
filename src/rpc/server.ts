@@ -2846,6 +2846,10 @@ export class RPCServer {
    *   - headers: best-header height from the header index (-1 if none seen).
    *   - blocks / bestblockhash: active chainstate tip (ChainStateManager).
    *   - difficulty: GetDifficulty of the tip (shared with getdifficulty).
+   *   - bits / target: the active-chainstate tip nBits (compact, 8-hex lower)
+   *     and the difficulty target derived from it (64-hex), the same source +
+   *     conversion getblockchaininfo uses (Core make_chain_data emits
+   *     strprintf("%08x", tip->nBits) and GetTarget(tip).GetHex()).
    *   - verificationprogress: blocks/headers clamped to [0,1] (same derivation
    *     getblockchaininfo uses).
    *   - coins_db_cache_bytes: the configured on-disk (LevelDB) coins block-cache
@@ -2869,6 +2873,18 @@ export class RPCServer {
 
     const difficulty = await this.calculateDifficulty(bestBlock.hash);
 
+    // bits/target from the active chainstate tip — same source + same
+    // conversion getblockchaininfo uses (tip header nBits → compact-hex /
+    // 64-hex target). Core make_chain_data emits strprintf("%08x", tip->nBits)
+    // and GetTarget(tip).GetHex() for the identical tip, so these are genuine
+    // and match getblockchaininfo's bits/target for the same block.
+    const tipHeaderEntry = this.headerSync.getHeader(bestBlock.hash);
+    const tipBitsNum = tipHeaderEntry ? tipHeaderEntry.header.bits : 0x1d00ffff;
+    const tipBitsHex = tipBitsNum.toString(16).padStart(8, "0");
+    const tipTargetHex = compactToBigInt(tipBitsNum)
+      .toString(16)
+      .padStart(64, "0");
+
     // Coins-cache budgets (Core m_coinsdb_cache_size_bytes /
     // m_coinstip_cache_size_bytes — always emitted). The on-disk LevelDB block
     // cache is a fixed configured budget on ChainDB; the in-memory coins-tip
@@ -2889,10 +2905,15 @@ export class RPCServer {
     // (active) LAST" ordering is trivially satisfied. snapshot_blockhash is
     // OPTIONAL (Core only pushes it for a from-snapshot chainstate) and is
     // omitted here.
+    // Core make_chain_data field order: blocks, bestblockhash, bits,
+    // difficulty, target, verificationprogress, [snapshot_blockhash],
+    // coins_db_cache_bytes, coins_tip_cache_bytes, validated.
     const chainstate: Record<string, unknown> = {
       blocks,
       bestblockhash: Buffer.from(bestBlock.hash).reverse().toString("hex"),
+      bits: tipBitsHex,
       difficulty,
+      target: tipTargetHex,
       verificationprogress,
       coins_db_cache_bytes: coinsDbCacheBytes,
       coins_tip_cache_bytes: coinsTipCacheBytes,

@@ -3052,12 +3052,14 @@ describe("getchainstates", () => {
     const cs = m.chainstates[0];
 
     // Exact Core field set for a single validated (non-snapshot) chainstate:
-    // NO snapshot_blockhash key.
+    // NO snapshot_blockhash key. bits/target are emitted (Core make_chain_data).
     expect(Object.keys(cs).sort()).toEqual(
       [
         "blocks",
         "bestblockhash",
+        "bits",
         "difficulty",
+        "target",
         "verificationprogress",
         "coins_db_cache_bytes",
         "coins_tip_cache_bytes",
@@ -3077,6 +3079,22 @@ describe("getchainstates", () => {
 
     expect(typeof cs.difficulty).toBe("number");
     expect(cs.difficulty).toBeGreaterThan(0);
+
+    // bits: tip nBits as 8-char lower-hex (Core strprintf("%08x", tip->nBits)).
+    expect(typeof cs.bits).toBe("string");
+    expect(cs.bits).toMatch(/^[0-9a-f]{8}$/);
+
+    // target: tip difficulty target from nBits, 64-char lower-hex
+    // (Core GetTarget(tip).GetHex()).
+    expect(typeof cs.target).toBe("string");
+    expect(cs.target).toMatch(/^[0-9a-f]{64}$/);
+
+    // bits/target are GENUINE — they equal exactly what getblockchaininfo
+    // reports for the SAME tip (same source nBits + same conversion helpers).
+    const gbci = await rpcRequest(port, "getblockchaininfo");
+    expect(gbci.error).toBeUndefined();
+    expect(cs.bits).toBe(gbci.result.bits);
+    expect(cs.target).toBe(gbci.result.target);
 
     expect(typeof cs.verificationprogress).toBe("number");
     expect(cs.verificationprogress).toBeGreaterThanOrEqual(0);
