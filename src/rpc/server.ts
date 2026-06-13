@@ -1170,6 +1170,7 @@ export class RPCServer {
     this.registerMethod("getbestblockhash", () => this.getBestBlockHash());
     this.registerMethod("getsyncstate", () => this.getSyncState());
     this.registerMethod("getchaintips", () => this.getChainTips());
+    this.registerMethod("getchainstates", () => this.getChainStates());
     this.registerMethod("getchaintxstats", (params) => this.getChainTxStats(params));
     this.registerMethod("getblockstats", (params) => this.getBlockStats(params));
     this.registerMethod("getdifficulty", () => this.getDifficulty());
@@ -2800,6 +2801,81 @@ export class RPCServer {
     });
 
     return tips;
+  }
+
+  /**
+   * getchainstates: Return information about chainstates.
+   *
+   * Mirrors Bitcoin Core's `getchainstates`
+   * (rpc/blockchain.cpp::getchainstates + RPCHelpForChainstate). The top-level
+   * object is `{ headers, chainstates }` where `chainstates` is an array
+   * ordered by work with the most-work (active) chainstate LAST. hotbuns runs a
+   * single, fully-validated chainstate (no active assumeUTXO snapshot — the
+   * snapshot-bootstrap path validates before promotion and never leaves an
+   * unvalidated chainstate live), so the array has exactly one element with
+   * `validated: true` and `snapshot_blockhash` omitted.
+   *
+   * Field sources (all genuine node state, nothing fabricated):
+   *   - headers: best-header height from the header index (-1 if none seen).
+   *   - blocks / bestblockhash: active chainstate tip (ChainStateManager).
+   *   - difficulty: GetDifficulty of the tip (shared with getdifficulty).
+   *   - verificationprogress: blocks/headers clamped to [0,1] (same derivation
+   *     getblockchaininfo uses).
+   *   - coins_db_cache_bytes: the configured on-disk (LevelDB) coins block-cache
+   *     budget (ChainDB.getBlockCacheBytes() → COINS_DB_BLOCK_CACHE_BYTES), the
+   *     analogue of Core's m_coinsdb_cache_size_bytes.
+   *   - coins_tip_cache_bytes: the configured in-memory coins (UTXO) cache
+   *     budget (CoinsViewCache maxMemory), the analogue of Core's
+   *     m_coinstip_cache_size_bytes.
+   */
+  private async getChainStates(): Promise<Record<string, unknown>> {
+    const bestBlock = this.chainState.getBestBlock();
+    const bestHeader = this.headerSync.getBestHeader();
+
+    // headers: best-header height seen so far; -1 if no header is known.
+    const headers = bestHeader?.height ?? bestBlock.height ?? -1;
+
+    // verificationprogress: progress towards the network tip, in [0, 1].
+    const blocks = bestBlock.height;
+    const verificationprogress =
+      headers > 0 ? Math.min(blocks / headers, 1.0) : 1.0;
+
+    const difficulty = await this.calculateDifficulty(bestBlock.hash);
+
+    // Coins-cache budgets (Core m_coinsdb_cache_size_bytes /
+    // m_coinstip_cache_size_bytes — always emitted). The on-disk LevelDB block
+    // cache is a fixed configured budget on ChainDB; the in-memory coins-tip
+    // budget is the CoinsViewCache's maxMemory. Read the genuine configured
+    // values; fall back to 0 only if a manager is genuinely unwired (some
+    // unit-test servers).
+    const coinsDbCacheBytes = this.db.getBlockCacheBytes();
+    let coinsTipCacheBytes = 0;
+    try {
+      coinsTipCacheBytes = this.liveUTXOManager()
+        .getCoinsViewCache()
+        .getStats().maxMemory;
+    } catch {
+      coinsTipCacheBytes = 0;
+    }
+
+    // Single fully-validated chainstate. With one chainstate the "most-work
+    // (active) LAST" ordering is trivially satisfied. snapshot_blockhash is
+    // OPTIONAL (Core only pushes it for a from-snapshot chainstate) and is
+    // omitted here.
+    const chainstate: Record<string, unknown> = {
+      blocks,
+      bestblockhash: Buffer.from(bestBlock.hash).reverse().toString("hex"),
+      difficulty,
+      verificationprogress,
+      coins_db_cache_bytes: coinsDbCacheBytes,
+      coins_tip_cache_bytes: coinsTipCacheBytes,
+      validated: true,
+    };
+
+    return {
+      headers,
+      chainstates: [chainstate],
+    };
   }
 
   /**

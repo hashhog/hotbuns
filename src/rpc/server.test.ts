@@ -13,7 +13,8 @@ import { hash256 } from "../crypto/primitives.js";
 import { bip22Result, ConsensusErrorCode } from "../validation/errors.js";
 import { PeerManager, ServiceFlags, isRoutable } from "../p2p/manager.js";
 import { BIP155Network } from "../p2p/addrv2.js";
-import { ChainDB } from "../storage/database.js";
+import { ChainDB, COINS_DB_BLOCK_CACHE_BYTES } from "../storage/database.js";
+import { UTXOManager } from "../chain/utxo.js";
 import { TxoSpenderIndex } from "../storage/indexes.js";
 import { mkdtemp, rm } from "fs/promises";
 import { tmpdir } from "os";
@@ -2959,5 +2960,140 @@ describe("gettxspendingprevout", () => {
     expect(after.error).toBeUndefined();
     expect(after.result[0].spendingtxid).toBeUndefined();
     expect(after.result[0].blockhash).toBeUndefined();
+  });
+});
+
+// ===========================================================================
+// getchainstates (Bitcoin Core v31.99 rpc/blockchain.cpp::getchainstates)
+//
+// hotbuns runs a single, fully-validated chainstate (no active assumeUTXO
+// snapshot), so the contract under test is:
+//   - top-level { headers: NUM, chainstates: ARR (most-work/active LAST) }
+//   - chainstates is a 1-element array
+//   - the entry carries blocks, bestblockhash, difficulty,
+//     verificationprogress, coins_db_cache_bytes, coins_tip_cache_bytes,
+//     validated — with the correct types
+//   - validated === true
+//   - snapshot_blockhash is OMITTED (only present for a from-snapshot
+//     chainstate)
+//   - coins_db_cache_bytes / coins_tip_cache_bytes report the GENUINE
+//     configured cache budgets (the on-disk LevelDB block cache and the
+//     in-memory CoinsViewCache budget), not fabricated values.
+// ===========================================================================
+
+describe("getchainstates", () => {
+  let port: number;
+  let dbPath: string;
+  let db: ChainDB;
+  let server: RPCServer;
+
+  // Known in-memory coins-tip cache budget so the test can assert a genuine,
+  // non-fabricated value flows through to coins_tip_cache_bytes.
+  const TIP_CACHE_BYTES = 64 * 1024 * 1024;
+
+  // chainState mock that returns a REAL UTXOManager (so getchainstates reads a
+  // genuine CoinsViewCache budget) plus the canonical best-block shape.
+  class ChainStateWithUTXO {
+    private bestBlock = {
+      hash: Buffer.alloc(32, 0),
+      height: 100,
+      chainWork: 1000n,
+    };
+    private utxo: UTXOManager;
+    constructor(d: ChainDB) {
+      this.utxo = new UTXOManager(d, TIP_CACHE_BYTES);
+    }
+    getBestBlock() {
+      return { ...this.bestBlock };
+    }
+    getUTXOManager() {
+      return this.utxo;
+    }
+  }
+
+  beforeEach(async () => {
+    port = getTestPort();
+    dbPath = await mkdtemp(join(tmpdir(), "hotbuns-gcs-"));
+    db = new ChainDB(dbPath);
+    await db.open();
+    const deps: RPCServerDeps = {
+      chainState: new ChainStateWithUTXO(db) as any,
+      mempool: new MockMempool() as any,
+      peerManager: new MockPeerManager() as any,
+      feeEstimator: new MockFeeEstimator() as any,
+      headerSync: new MockHeaderSync() as any,
+      db: db as any,
+      params: REGTEST,
+    };
+    server = new RPCServer({ port, host: "127.0.0.1", noAuth: true }, deps);
+    server.start();
+  });
+
+  afterEach(async () => {
+    if (server) server.stop();
+    await db.close();
+    await rm(dbPath, { recursive: true, force: true });
+  });
+
+  it("returns { headers: int, chainstates: [ <fully-validated entry> ] }", async () => {
+    const res = await rpcRequest(port, "getchainstates");
+    expect(res.error).toBeUndefined();
+    const m = res.result;
+
+    // Top-level: headers is an integer; chainstates is a 1-element array.
+    expect(typeof m.headers).toBe("number");
+    expect(Number.isInteger(m.headers)).toBe(true);
+    // MockHeaderSync.getBestHeader().height === 100.
+    expect(m.headers).toBe(100);
+
+    expect(Array.isArray(m.chainstates)).toBe(true);
+    expect(m.chainstates.length).toBe(1);
+
+    const cs = m.chainstates[0];
+
+    // Exact Core field set for a single validated (non-snapshot) chainstate:
+    // NO snapshot_blockhash key.
+    expect(Object.keys(cs).sort()).toEqual(
+      [
+        "blocks",
+        "bestblockhash",
+        "difficulty",
+        "verificationprogress",
+        "coins_db_cache_bytes",
+        "coins_tip_cache_bytes",
+        "validated",
+      ].sort()
+    );
+
+    // Types.
+    expect(typeof cs.blocks).toBe("number");
+    expect(Number.isInteger(cs.blocks)).toBe(true);
+    expect(cs.blocks).toBe(100); // active-chainstate tip height
+
+    expect(typeof cs.bestblockhash).toBe("string");
+    expect(cs.bestblockhash).toMatch(/^[0-9a-f]{64}$/);
+    // Display (big-endian) hex of the all-zero internal tip hash.
+    expect(cs.bestblockhash).toBe("0".repeat(64));
+
+    expect(typeof cs.difficulty).toBe("number");
+    expect(cs.difficulty).toBeGreaterThan(0);
+
+    expect(typeof cs.verificationprogress).toBe("number");
+    expect(cs.verificationprogress).toBeGreaterThanOrEqual(0);
+    expect(cs.verificationprogress).toBeLessThanOrEqual(1);
+    // blocks(100) / headers(100) === 1.0 at tip.
+    expect(cs.verificationprogress).toBe(1.0);
+
+    // Cache budgets are GENUINE configured values, always emitted.
+    expect(typeof cs.coins_db_cache_bytes).toBe("number");
+    expect(cs.coins_db_cache_bytes).toBe(COINS_DB_BLOCK_CACHE_BYTES);
+    expect(typeof cs.coins_tip_cache_bytes).toBe("number");
+    expect(cs.coins_tip_cache_bytes).toBe(TIP_CACHE_BYTES);
+
+    // Single fully-validated chainstate.
+    expect(cs.validated).toBe(true);
+
+    // snapshot_blockhash MUST be absent (no active snapshot).
+    expect("snapshot_blockhash" in cs).toBe(false);
   });
 });
