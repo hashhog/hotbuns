@@ -129,7 +129,7 @@ import {
   MessageVerificationResult,
 } from "../crypto/signmessage.js";
 import { base58CheckDecode, decodeAddress, AddressType } from "../address/encoding.js";
-import { isValidPrivateKey } from "../crypto/primitives.js";
+import { isValidPrivateKey, privateKeyToPublicKey } from "../crypto/primitives.js";
 import { GCSFilter } from "../storage/indexes.js";
 import {
   handlePayJoinRequest,
@@ -1196,6 +1196,14 @@ export class RPCServer {
     this.registerMethod("decodescript", (params) => this.decodeScript(params));
     this.registerMethod("createrawtransaction", (params) =>
       this.createRawTransaction(params)
+    );
+    // signrawtransactionwithkey: wallet-LESS raw-tx signer. Builds a temporary
+    // keystore from the explicit WIF keys + prevtxs and reuses the same
+    // BIP-143/BIP-341 sighash + ECDSA engine (convertToPSBT/updateInputUTXO/
+    // signPSBTInput/finalizePSBT) as signrawtransactionwithwallet. Core:
+    // rpc/rawtransaction.cpp::signrawtransactionwithkey — does NOT need a wallet.
+    this.registerMethod("signrawtransactionwithkey", (params) =>
+      this.signRawTransactionWithKey(params)
     );
 
     // Mempool methods
@@ -11158,6 +11166,283 @@ export class RPCServer {
     } else {
       // Return the partially-signed tx as best-effort. Re-serialize the
       // current `psbt.tx` (with whatever finalScripts/scriptSigs survive).
+      hex = serializeTx(psbt.tx, true).toString("hex");
+    }
+
+    const out: Record<string, unknown> = { hex, complete };
+    if (errors.length > 0) out.errors = errors;
+    return out;
+  }
+
+  /**
+   * signrawtransactionwithkey "hexstring" ["privatekey",...] ( [{prevtx},...] "sighashtype" )
+   *
+   * Wallet-LESS counterpart of signrawtransactionwithwallet. Instead of the
+   * wallet keyring, the SIGNER role is fed a temporary keystore built from the
+   * explicit WIF private keys passed in `keys`, and missing prevout info is
+   * filled from the optional `prevtxs` array (each {txid, vout, scriptPubKey,
+   * redeemScript?, witnessScript?, amount?}) BEFORE falling back to the
+   * chainstate UTXO set / mempool.
+   *
+   * REUSES the exact same BIP-143/BIP-341 sighash + ECDSA engine as
+   * signrawtransactionwithwallet / walletprocesspsbt: convertToPSBT →
+   * updateInputUTXO → signPSBTInput (which computes the correct sighash for the
+   * input's script type and ECDSA-signs it) → finalizePSBT → extractTransaction.
+   * The ONLY difference is the key source. No sighash/signing is reimplemented.
+   *
+   * Reference: bitcoin-core/src/rpc/rawtransaction.cpp::signrawtransactionwithkey
+   * (672) — DecodeSecret into a FlatSigningProvider, ParsePrevouts, then the
+   * shared SignTransaction. Result EXACTLY { hex, complete, errors? }; errors[]
+   * carries Core's TransactionError shape and is present only when >=1 input is
+   * left unsigned. complete=true ONLY when every input is fully signed.
+   *
+   * Does NOT require a wallet (registered in the non-wallet RPC section).
+   *
+   * @param params [hexstring, keys(WIF[]), prevtxs?, sighashtype?]
+   */
+  private async signRawTransactionWithKey(params: unknown[]): Promise<Record<string, unknown>> {
+    const [hexParam, keysParam, prevtxsParam, sighashParam] = params;
+    if (typeof hexParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "hexstring must be a string");
+    }
+    if (!Array.isArray(keysParam)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "keys must be an array of WIF private keys");
+    }
+
+    let tx: Transaction;
+    try {
+      tx = deserializeTx(new BufferReader(Buffer.from(hexParam, "hex")));
+    } catch (e) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        `TX decode failed: ${(e as Error).message}`
+      );
+    }
+
+    // Build the temporary keystore from the WIF keys. Index by the 20-byte
+    // hash160(pubkey) (Core's CKeyID) so we can match each input's script to a
+    // provided key. Decode mirrors importprivkey / signMessageWithPrivKey.
+    const keystore = new Map<string, { privateKey: Buffer; publicKey: Buffer }>();
+    for (const kRaw of keysParam) {
+      if (typeof kRaw !== "string") {
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Invalid private key");
+      }
+      let decoded: { version: number; hash: Buffer };
+      try {
+        decoded = base58CheckDecode(kRaw);
+      } catch {
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Invalid private key");
+      }
+      if (decoded.version !== 0x80 && decoded.version !== 0xef) {
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Invalid private key");
+      }
+      let privkey: Buffer;
+      let compressed = false;
+      if (decoded.hash.length === 33 && decoded.hash[32] === 0x01) {
+        privkey = decoded.hash.subarray(0, 32) as Buffer;
+        compressed = true;
+      } else if (decoded.hash.length === 32) {
+        privkey = decoded.hash;
+        compressed = false;
+      } else {
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Invalid private key");
+      }
+      if (!isValidPrivateKey(privkey)) {
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Invalid private key");
+      }
+      const publicKey = privateKeyToPublicKey(privkey, compressed);
+      keystore.set(hash160(publicKey).toString("hex"), { privateKey: privkey, publicKey });
+    }
+
+    // Index the optional prevtxs by outpoint (txid:vout) so each input can fill
+    // its missing scriptPubKey / amount / redeemScript / witnessScript.
+    // Mirrors Core ParsePrevouts (rpc/rawtransaction.cpp).
+    interface PrevOutInfo {
+      scriptPubKey: Buffer;
+      amount?: bigint;
+      redeemScript?: Buffer;
+      witnessScript?: Buffer;
+    }
+    const prevByOutpoint = new Map<string, PrevOutInfo>();
+    if (prevtxsParam !== undefined && prevtxsParam !== null) {
+      if (!Array.isArray(prevtxsParam)) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "prevtxs must be an array");
+      }
+      for (const pRaw of prevtxsParam) {
+        if (!pRaw || typeof pRaw !== "object") {
+          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "expected prevtxs object");
+        }
+        const p = pRaw as Record<string, unknown>;
+        const txidHex = p.txid;
+        const vout = p.vout;
+        const spkHex = p.scriptPubKey;
+        if (typeof txidHex !== "string" || typeof vout !== "number" || typeof spkHex !== "string") {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_PARAMS,
+            "prevtxs entry requires txid, vout and scriptPubKey"
+          );
+        }
+        // RPC txids are big-endian; outpoints index by internal little-endian.
+        const txidLE = Buffer.from(txidHex, "hex").reverse();
+        const info: PrevOutInfo = { scriptPubKey: Buffer.from(spkHex, "hex") };
+        if (typeof p.amount === "number") {
+          info.amount = BigInt(Math.round(p.amount * 1e8));
+        }
+        if (typeof p.redeemScript === "string") {
+          info.redeemScript = Buffer.from(p.redeemScript, "hex");
+        }
+        if (typeof p.witnessScript === "string") {
+          info.witnessScript = Buffer.from(p.witnessScript, "hex");
+        }
+        prevByOutpoint.set(`${txidLE.toString("hex")}:${vout}`, info);
+      }
+    }
+
+    const sighashType = this.parseSighashType(sighashParam);
+
+    const psbt = convertToPSBT(tx);
+    const utxoManager = this.chainState.getUTXOManager();
+    const errors: Array<Record<string, unknown>> = [];
+
+    for (let i = 0; i < tx.inputs.length; i++) {
+      const txin = tx.inputs[i];
+      if (isInputFinalized(psbt.inputs[i])) continue;
+
+      const txidBE = Buffer.from(txin.prevOut.txid).reverse().toString("hex");
+      const opKey = `${txin.prevOut.txid.toString("hex")}:${txin.prevOut.vout}`;
+
+      // Resolve prevout: prevtxs first (Core ParsePrevouts), then chain UTXO,
+      // then mempool.
+      let prevScriptPubKey: Buffer | undefined;
+      let prevValue: bigint | undefined;
+      let redeemScript: Buffer | undefined;
+      let witnessScript: Buffer | undefined;
+
+      const pinfo = prevByOutpoint.get(opKey);
+      if (pinfo) {
+        prevScriptPubKey = pinfo.scriptPubKey;
+        prevValue = pinfo.amount;
+        redeemScript = pinfo.redeemScript;
+        witnessScript = pinfo.witnessScript;
+      }
+      if (prevValue === undefined || !prevScriptPubKey) {
+        try {
+          const entry = await utxoManager.getUTXOAsync({
+            txid: txin.prevOut.txid,
+            vout: txin.prevOut.vout,
+          });
+          if (entry) {
+            if (!prevScriptPubKey) prevScriptPubKey = entry.scriptPubKey;
+            if (prevValue === undefined) prevValue = entry.amount;
+          }
+        } catch {
+          // Fall through to mempool lookup.
+        }
+      }
+      if (prevValue === undefined || !prevScriptPubKey) {
+        const mpEntry = this.mempool.getTransaction(txin.prevOut.txid);
+        if (mpEntry && txin.prevOut.vout < mpEntry.tx.outputs.length) {
+          const out = mpEntry.tx.outputs[txin.prevOut.vout];
+          if (!prevScriptPubKey) prevScriptPubKey = out.scriptPubKey;
+          if (prevValue === undefined) prevValue = out.value;
+        }
+      }
+
+      if (!prevScriptPubKey || prevValue === undefined) {
+        errors.push({
+          txid: txidBE,
+          vout: txin.prevOut.vout,
+          witness: [],
+          scriptSig: "",
+          sequence: txin.sequence,
+          error: "Input not found or already spent",
+        });
+        continue;
+      }
+
+      // Wire UTXO + any redeem/witness scripts into the PSBT input so the
+      // shared signer can compute the correct BIP-143 scriptCode.
+      updateInputUTXO(
+        psbt,
+        i,
+        { value: prevValue, scriptPubKey: prevScriptPubKey } as TxOut,
+        true
+      );
+      if (redeemScript) psbt.inputs[i].redeemScript = redeemScript;
+      if (witnessScript) psbt.inputs[i].witnessScript = witnessScript;
+
+      // Match a provided key to this input. The committed pubkey-hash is read
+      // from the P2WPKH/P2PKH scriptPubKey, or from the P2SH-P2WPKH redeemScript.
+      const candidateHashes: string[] = [];
+      const spk = prevScriptPubKey;
+      if (spk.length === 22 && spk[0] === 0x00 && spk[1] === 0x14) {
+        candidateHashes.push(spk.subarray(2, 22).toString("hex")); // P2WPKH
+      } else if (
+        spk.length === 25 && spk[0] === 0x76 && spk[1] === 0xa9 &&
+        spk[2] === 0x14 && spk[23] === 0x88 && spk[24] === 0xac
+      ) {
+        candidateHashes.push(spk.subarray(3, 23).toString("hex")); // P2PKH
+      } else if (
+        spk.length === 23 && spk[0] === 0xa9 && spk[1] === 0x14 && spk[22] === 0x87 &&
+        redeemScript && redeemScript.length === 22 &&
+        redeemScript[0] === 0x00 && redeemScript[1] === 0x14
+      ) {
+        candidateHashes.push(redeemScript.subarray(2, 22).toString("hex")); // P2SH-P2WPKH
+      }
+
+      let key: { privateKey: Buffer; publicKey: Buffer } | undefined;
+      for (const h of candidateHashes) {
+        const k = keystore.get(h);
+        if (k) {
+          key = k;
+          break;
+        }
+      }
+      // P2WSH / P2SH-P2WSH (witnessScript-driven, e.g. single-key bare
+      // CHECKSIG): fall back to whichever provided key matches a pubkey pushed
+      // in the witnessScript. signPSBTInput verifies the commitment.
+      if (!key && witnessScript) {
+        for (const [, k] of keystore) {
+          if (witnessScript.includes(k.publicKey)) {
+            key = k;
+            break;
+          }
+        }
+      }
+
+      if (!key) {
+        errors.push({
+          txid: txidBE,
+          vout: txin.prevOut.vout,
+          witness: [],
+          scriptSig: "",
+          sequence: txin.sequence,
+          error: "Unable to sign input, invalid stack size (possibly missing key)",
+        });
+        continue;
+      }
+
+      try {
+        signPSBTInput(psbt, i, key.privateKey, key.publicKey, sighashType);
+      } catch (e) {
+        errors.push({
+          txid: txidBE,
+          vout: txin.prevOut.vout,
+          witness: [],
+          scriptSig: "",
+          sequence: txin.sequence,
+          error: (e as Error).message,
+        });
+      }
+    }
+
+    const complete = finalizePSBT(psbt);
+
+    let hex: string;
+    if (complete) {
+      const signedTx = extractTransaction(psbt);
+      hex = serializeTx(signedTx, true).toString("hex");
+    } else {
       hex = serializeTx(psbt.tx, true).toString("hex");
     }
 
