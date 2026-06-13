@@ -591,24 +591,28 @@ describe("W138-G20: cleanup_bad_snapshot on error path (BUG-11, P2)", () => {
 // =============================================================================
 
 describe("W138-G21: rename to _INVALID on background validation failure (BUG-12, P2)", () => {
-  it("BUG-12: finalizeBackgroundValidation logs to console + sets in-memory INVALID but does NOT rename / fatalError", () => {
-    // Core validation.cpp:6201-6230 (InvalidateCoinsDBOnDisk):
-    //   fs::rename(db_path, db_path + "_INVALID");
-    // And :6017 — handle_invalid_snapshot calls fatalError.
-    // Hotbuns finalizeBackgroundValidation at snapshot.ts:1336-1372:
+  it("BUG-12 (partial fix): mismatch flips the snapshot to INVALID + surfaces a fatal error; on-disk _INVALID rename still a follow-up", () => {
+    // FLIPPED (2026-06-13): with the dual-chainstate pass landed, a hash
+    // mismatch now flips the snapshot chainstate to INVALID (via
+    // finishSnapshotActivation) AND surfaces a fatal error to the caller
+    // (Core handle_invalid_snapshot → AbortNode). The bg store's own ChainDB
+    // is closed/discarded. What is STILL a follow-up (kept as documented gap):
+    // Core's InvalidateCoinsDBOnDisk renames the bg coins dir to `<dir>_INVALID`
+    // on disk and the node calls a GLOBAL fatalError; hotbuns surfaces the error
+    // to the loadtxoutset caller instead of renaming + global-aborting.
     expect(SNAPSHOT_TS).not.toMatch(/InvalidateCoinsDBOnDisk/);
     expect(SNAPSHOT_TS).not.toMatch(/invalidateCoinsDBOnDisk/);
-    expect(SNAPSHOT_TS).not.toMatch(/_INVALID/);
-    expect(SNAPSHOT_TS).not.toMatch(/fatalError/);
-    expect(SNAPSHOT_TS).not.toMatch(/handle_invalid_snapshot/);
-    expect(SNAPSHOT_TS).not.toMatch(/handleInvalidSnapshot/);
+    // The bg dir-rename-to-_INVALID is NOT implemented (the only `_INVALID`
+    // mention would be this absent feature).
+    expect(SNAPSHOT_TS).not.toMatch(/db_path \+ ['"]_INVALID/);
 
-    // What IS there: console.error and an in-memory flag flip.
+    // What IS there now: the INVALID flip on the active/snapshot chainstate
+    // (finishSnapshotActivation) and a surfaced fatal-error log.
     expect(SNAPSHOT_TS).toMatch(
-      /console\.error\(\s*[`"]Background validation hash mismatch/,
+      /activation\.snapshot\.status = ChainstateStatus\.INVALID/,
     );
     expect(SNAPSHOT_TS).toMatch(
-      /this\.activeChainstate\.status = ChainstateStatus\.INVALID/,
+      /AssumeUTXO background validation FAILED/,
     );
   });
 });
@@ -780,19 +784,27 @@ describe("W138-G26: dumptxoutset types + rollback option", () => {
 // G27 — MaybeValidateSnapshot tautology (BUG-17)
 // =============================================================================
 
-describe("W138-G27: MaybeValidateSnapshot is tautological under single-db model (BUG-17, P0-CDIV)", () => {
-  it("BUG-17: finalizeBackgroundValidation calls computeUTXOSetHash(this.db) — the SAME hash that gated load", async () => {
-    // The strict-load gate at snapshot.ts:1042 computes
+describe("W138-G27: MaybeValidateSnapshot tautology FIXED — bg validator hashes its OWN store (BUG-17, P0-CDIV)", () => {
+  it("BUG-17 FIXED: the background pass recomputes HASH_SERIALIZED over its OWN separate store, NOT this.db", async () => {
+    // FLIPPED (2026-06-13): the dual-chainstate pass landed. The strict-load
+    // gate still computes over the active db:
     //   const { hash } = await computeUTXOSetHash(this.db, interruptCheck)
-    // and finalizeBackgroundValidation at :1349 computes
-    //   const { hash } = await computeUTXOSetHash(this.db)
-    // — same db, same function, same iteration order → tautological.
+    // but the BACKGROUND validator now computes over its OWN ChainDB
+    // (BackgroundValidator.finalizeAtBase → computeUTXOSetHash(this.bgDB)),
+    // which is a genuinely independent genesis->base replay — no longer the
+    // tautological hash-of-self over this.db.
     expect(SNAPSHOT_TS).toMatch(
       /await computeUTXOSetHash\(this\.db, interruptCheck\)/,
     );
-    expect(SNAPSHOT_TS).toMatch(
+    // The old tautological `computeUTXOSetHash(this.db)` in
+    // finalizeBackgroundValidation is GONE.
+    expect(SNAPSHOT_TS).not.toMatch(
       /const \{ hash \} = await computeUTXOSetHash\(this\.db\)/,
     );
+    // The bg validator hashes its OWN store.
+    expect(SNAPSHOT_TS).toMatch(/computeUTXOSetHash\(this\.bgDB\)/);
+    // And the bg store is constructed as a separate ChainDB, refusing to alias.
+    expect(SNAPSHOT_TS).toContain("background coins store must be separate");
   });
 
   it("BUG-17: empirical proof — running the gate twice on the same db gives identical hashes", async () => {
