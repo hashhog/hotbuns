@@ -1632,6 +1632,60 @@ export function getAssumeutxoData(
   return assumeutxo.get(key) ?? null;
 }
 
+/** Regtest network magic (REGTEST.networkMagic in consensus/params.ts). */
+const REGTEST_NETWORK_MAGIC = 0xdab5bffa;
+
+/**
+ * Register a regtest AssumeUTXO whitelist entry at runtime.
+ *
+ * Core's regtest chainparams DOES carry `m_assumeutxo_data` entries (heights
+ * 110 / 200 / 299 in `bitcoin-core/src/kernel/chainparams.cpp`, explicitly
+ * "for use by test/functional/feature_assumeutxo.py" and the snapshot fuzz
+ * target). Those Core values are pinned to Core's deterministic regtest mining
+ * chain; hotbuns's snapshot tests build their own short regtest chains, so the
+ * regtest table is REGISTERABLE at runtime — exactly mirroring how Core's
+ * regtest is a mockable chain whose assumeutxo data is purpose-built for the
+ * snapshot tests rather than a permanent network commitment (camlcoin 3140ab9
+ * `register_regtest_assumeutxo`, lunarblock a39dd42).
+ *
+ * REGTEST ONLY: refuses any non-regtest params so a mainnet/testnet4 whitelist
+ * can never be mutated at runtime — those remain the hardcoded, immutable Core
+ * values. Idempotent on the base block hash (re-registering replaces the prior
+ * entry). The entry is keyed by `au.blockHash.toString("hex")`, the same key
+ * {@link getAssumeutxoData} reads.
+ */
+export function registerRegtestAssumeutxo(
+  params: ConsensusParams,
+  au: AssumeutxoData,
+): void {
+  if (params.networkMagic !== REGTEST_NETWORK_MAGIC) {
+    throw new Error(
+      "registerRegtestAssumeutxo: refusing to mutate a non-regtest assumeutxo " +
+        "whitelist (mainnet/testnet4 entries are immutable Core values)",
+    );
+  }
+  let assumeutxo = (params as any).assumeutxo as Map<string, AssumeutxoData> | undefined;
+  if (!assumeutxo) {
+    assumeutxo = new Map<string, AssumeutxoData>();
+    (params as any).assumeutxo = assumeutxo;
+  }
+  assumeutxo.set(au.blockHash.toString("hex"), au);
+}
+
+/**
+ * Empty the regtest AssumeUTXO whitelist (test teardown hygiene so
+ * registrations never leak across test cases). REGTEST ONLY.
+ */
+export function clearRegtestAssumeutxo(params: ConsensusParams): void {
+  if (params.networkMagic !== REGTEST_NETWORK_MAGIC) {
+    throw new Error(
+      "clearRegtestAssumeutxo: refusing to clear a non-regtest assumeutxo whitelist",
+    );
+  }
+  const assumeutxo = (params as any).assumeutxo as Map<string, AssumeutxoData> | undefined;
+  if (assumeutxo) assumeutxo.clear();
+}
+
 /**
  * Get assumeUTXO data for a height from chain parameters.
  */
