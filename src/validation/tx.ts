@@ -248,6 +248,128 @@ export function deserializeTx(reader: BufferReader): Transaction {
 }
 
 /**
+ * Deserialize a transaction in LEGACY (non-witness) form only.
+ *
+ * Mirrors Core's `TX_NO_WITNESS` deserialization (allow_witness=false): the
+ * byte after `version` is always interpreted as the input-count varint, never
+ * as a segwit `0x00` marker. A genuinely witness-serialized hex (which starts
+ * with the `0x00 0x01` marker/flag, i.e. a zero-input vin under legacy rules)
+ * therefore parses differently here — exactly as Core's two decoders diverge.
+ */
+function deserializeTxLegacy(reader: BufferReader): Transaction {
+  const version = reader.readInt32LE();
+
+  // Input count varint (no segwit-marker special-casing).
+  const inputCount = reader.readVarInt();
+
+  const inputs: TxIn[] = [];
+  for (let i = 0; i < inputCount; i++) {
+    const txidBytes = reader.readHash();
+    const vout = reader.readUInt32LE();
+    const scriptSig = reader.readVarBytes();
+    const sequence = reader.readUInt32LE();
+    inputs.push({
+      prevOut: { txid: txidBytes, vout },
+      scriptSig,
+      sequence,
+      witness: [],
+    });
+  }
+
+  const outputCount = reader.readVarInt();
+  const outputs: TxOut[] = [];
+  for (let i = 0; i < outputCount; i++) {
+    const value = reader.readUInt64LE();
+    const scriptPubKey = reader.readVarBytes();
+    outputs.push({ value, scriptPubKey });
+  }
+
+  const lockTime = reader.readUInt32LE();
+  return { version, inputs, outputs, lockTime };
+}
+
+/**
+ * Lightweight equivalent of Core's `CheckTxScriptsSanity` tie-breaker used by
+ * `DecodeTx`. Core checks every input scriptSig (non-coinbase) and every output
+ * scriptPubKey decodes as a valid op sequence and is within MAX_SCRIPT_SIZE.
+ * We only need it to break the rare tie where BOTH the witness and legacy
+ * decodes fully consume the input; a too-large script is the practical signal.
+ */
+const MAX_SCRIPT_SIZE = 10000;
+
+function checkTxScriptsSanity(tx: Transaction): boolean {
+  const isCoinbase =
+    tx.inputs.length === 1 &&
+    tx.inputs[0].prevOut.vout === 0xffffffff &&
+    tx.inputs[0].prevOut.txid.every((b) => b === 0);
+  if (!isCoinbase) {
+    for (const input of tx.inputs) {
+      if (input.scriptSig.length > MAX_SCRIPT_SIZE) return false;
+    }
+  }
+  for (const output of tx.outputs) {
+    if (output.scriptPubKey.length > MAX_SCRIPT_SIZE) return false;
+  }
+  return true;
+}
+
+/** A decode attempt that succeeded only if it fully consumed the input. */
+function tryDecode(
+  bytes: Buffer,
+  decode: (r: BufferReader) => Transaction,
+): Transaction | null {
+  const reader = new BufferReader(bytes);
+  let tx: Transaction;
+  try {
+    tx = decode(reader);
+  } catch {
+    return null;
+  }
+  // Core ignores serializations that do not fully consume the hex string.
+  if (!reader.eof) return null;
+  return tx;
+}
+
+/**
+ * Decode a network-serialized transaction honoring an explicit witness hint,
+ * faithfully mirroring Bitcoin Core's `DecodeTx(try_no_witness, try_witness)`
+ * (core_io.cpp). Used by the `converttopsbt` RPC.
+ *
+ *   - try_witness    enables the extended (BIP-144 witness) deserialization.
+ *   - try_no_witness enables the legacy (no-witness) deserialization.
+ *
+ * A serialization is only accepted if it FULLY consumes the input. If both
+ * decode attempts succeed, the one passing `checkTxScriptsSanity` wins; if
+ * neither or both pass, the extended one wins (Core's documented tie-break).
+ *
+ * Throws an Error (caller maps to RPC -22) when neither permitted form decodes.
+ */
+export function decodeTxWitnessAware(
+  bytes: Buffer,
+  tryNoWitness: boolean,
+  tryWitness: boolean,
+): Transaction {
+  // Extended (witness) decode — deserializeTx interprets the 0x00/0x01 marker.
+  const txExtended = tryWitness ? tryDecode(bytes, deserializeTx) : null;
+  // Fast path: extended decodes and is sane (Core's early-return optimization).
+  if (txExtended && checkTxScriptsSanity(txExtended)) {
+    return txExtended;
+  }
+
+  // Legacy (no-witness) decode.
+  const txLegacy = tryNoWitness ? tryDecode(bytes, deserializeTxLegacy) : null;
+  if (txLegacy && checkTxScriptsSanity(txLegacy)) {
+    return txLegacy;
+  }
+
+  // Neither (or both) passed sanity: prefer extended, then legacy.
+  if (txExtended) return txExtended;
+  if (txLegacy) return txLegacy;
+
+  throw new Error("TX decode failed");
+}
+
+/**
  * Compute the transaction ID (hash of non-witness serialization, reversed).
  * The txid is stored in little-endian (internal) format.
  */

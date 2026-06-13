@@ -867,9 +867,9 @@ describe("W137-G30: FINALIZER — finalizePSBTInput (BUG-12, P1-WIRE)", () => {
 // =============================================================================
 
 describe("W137-G31: walletprocesspsbt RPC (BUG-13, P1-API)", () => {
-  it("BUG-13: rpc/server.ts has NO registerMethod for 'walletprocesspsbt'", () => {
+  it("BUG-13 FIXED: rpc/server.ts registers 'walletprocesspsbt'", () => {
     const src = readSrc("rpc/server.ts");
-    expect(src).not.toMatch(/registerMethod\("walletprocesspsbt"/);
+    expect(src).toMatch(/registerMethod\("walletprocesspsbt"/);
     // But it does have the other PSBT methods.
     expect(src).toMatch(/registerMethod\("createpsbt"/);
     expect(src).toMatch(/registerMethod\("decodepsbt"/);
@@ -883,9 +883,9 @@ describe("W137-G31: walletprocesspsbt RPC (BUG-13, P1-API)", () => {
 // =============================================================================
 
 describe("W137-G32: joinpsbts RPC (BUG-14, P1-API)", () => {
-  it("BUG-14: no registerMethod for 'joinpsbts'", () => {
+  it("BUG-14 FIXED: registerMethod for 'joinpsbts' is present", () => {
     const src = readSrc("rpc/server.ts");
-    expect(src).not.toMatch(/registerMethod\("joinpsbts"/);
+    expect(src).toMatch(/registerMethod\("joinpsbts"/);
   });
 });
 

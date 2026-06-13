@@ -1879,6 +1879,203 @@ export function combinePSBTs(psbts: PSBT[]): PSBT {
 }
 
 /**
+ * convertToPSBT — turn a (possibly signed) network transaction into a blank PSBT.
+ *
+ * Mirrors Bitcoin Core's `converttopsbt` RPC body
+ * (bitcoin-core/src/rpc/rawtransaction.cpp::converttopsbt). The caller is
+ * responsible for deserializing the raw tx hex; this function performs the
+ * signature-data policy check and produces the blank PSBT.
+ *
+ * Behavior (exactly matching Core):
+ *   - For each input: if it carries a non-empty scriptSig OR a non-null
+ *     witness AND `permitSigData` is false, throw. (Core message:
+ *     "Inputs must not have scriptSigs and scriptWitnesses".)
+ *   - Unconditionally clear ALL scriptSigs and witnesses on every input.
+ *   - Build a blank PSBT (one empty per-input map, one empty per-output map,
+ *     no UTXO / sigs / scripts).
+ *
+ * The input `tx` is shallow-cloned with cleared inputs; the caller's object is
+ * not mutated. Throws a plain `Error` whose `.message` is the Core string so
+ * the RPC wrapper can map it to the right code (-22).
+ *
+ * NOTE: distinct from the legacy `convertToPSBT(tx)` helper used by the
+ * signing pipeline (which PRESERVES sig data as finalized fields). This one
+ * implements the network-RPC contract: reject (unless permitted) then blank.
+ */
+export function rpcConvertToPSBT(tx: Transaction, permitSigData: boolean): PSBT {
+  // Check + clear signature data on every input.
+  const clearedInputs: TxIn[] = tx.inputs.map((input) => {
+    const hasScriptSig = input.scriptSig.length > 0;
+    const hasWitness = (input.witness?.length ?? 0) > 0;
+    if ((hasScriptSig || hasWitness) && !permitSigData) {
+      throw new Error("Inputs must not have scriptSigs and scriptWitnesses");
+    }
+    return {
+      prevOut: input.prevOut,
+      scriptSig: Buffer.alloc(0),
+      sequence: input.sequence,
+      witness: [],
+    };
+  });
+
+  const clearedTx: Transaction = {
+    version: tx.version,
+    inputs: clearedInputs,
+    outputs: tx.outputs,
+    lockTime: tx.lockTime,
+  };
+
+  // createPSBT builds the blank PSBT (empty per-input/output maps) and
+  // re-asserts that scriptSigs/witnesses are empty.
+  return createPSBT(clearedTx);
+}
+
+/**
+ * joinPSBTs — union of multiple distinct PSBTs into one.
+ *
+ * Mirrors Bitcoin Core's `joinpsbts` RPC body
+ * (bitcoin-core/src/rpc/rawtransaction.cpp::joinpsbts):
+ *   - At least two PSBTs are required (caller maps the empty/short cases to
+ *     RPC error -8 — Core uses RPC_INVALID_PARAMETER for both the size guard
+ *     and duplicate inputs).
+ *   - Chosen tx.version = MAX over all PSBTs (Core seeds best_version=1).
+ *   - Chosen tx.lockTime = MIN over all PSBTs (Core seeds best_locktime=2^32-1).
+ *   - Union of every input (across all PSBTs); a duplicate outpoint
+ *     (same txid:vout already present) throws — Core message
+ *     "Input <txid>:<n> exists in multiple PSBTs".
+ *   - Union of every output (outputs are never deduplicated).
+ *   - Global xpubs and unknown maps are merged (first-writer-wins, same as
+ *     Core's `contains`/`insert` semantics).
+ *   - Inputs and outputs are then reordered by `shuffle` for privacy parity
+ *     with Core (which uses FastRandomContext). The default `shuffle` is the
+ *     identity permutation (NO shuffle) so the transform is deterministic and
+ *     unit-testable; the RPC wrapper passes a real Fisher–Yates shuffle to
+ *     match Core's privacy behavior. Callers comparing results MUST treat the
+ *     input/output lists as SETS, not ordered.
+ *
+ * Throws a plain `Error` for the duplicate-input case so the RPC wrapper can
+ * map it to -8.
+ */
+export function joinPSBTs(
+  psbts: PSBT[],
+  shuffle: (n: number) => number[] = identityPermutation,
+): PSBT {
+  if (psbts.length <= 1) {
+    // Core: "At least two PSBTs are required to join PSBTs." (RPC -8)
+    throw new Error("At least two PSBTs are required to join PSBTs.");
+  }
+
+  // Pick max version, min locktime across all PSBTs (Core seeds 1 / 2^32-1).
+  let bestVersion = 1;
+  let bestLocktime = 0xffffffff;
+  for (const psbt of psbts) {
+    if (psbt.tx.version > bestVersion) bestVersion = psbt.tx.version;
+    if (psbt.tx.lockTime < bestLocktime) bestLocktime = psbt.tx.lockTime;
+  }
+
+  // Merge inputs/outputs/xpubs/unknown into a flat (unshuffled) PSBT.
+  const mergedTxInputs: TxIn[] = [];
+  const mergedInputs: PSBTInput[] = [];
+  // Core dedups via PartiallySignedTransaction::AddInput, which calls
+  // std::find over tx.vin using CTxIn::operator== — that compares prevout
+  // AND scriptSig AND nSequence (primitives/transaction.h:126-131). Two
+  // inputs sharing an outpoint but differing in scriptSig or nSequence are
+  // BOTH accepted, so the dedup key must include all three fields.
+  const seenInputs = new Set<string>();
+
+  const mergedTxOutputs: TxOut[] = [];
+  const mergedOutputs: PSBTOutput[] = [];
+
+  const mergedXpubs: PSBT["xpubs"] = new Map();
+  const mergedUnknown: Map<string, Buffer> = new Map();
+
+  for (const psbt of psbts) {
+    for (let i = 0; i < psbt.tx.inputs.length; i++) {
+      const txin = psbt.tx.inputs[i];
+      // Full-CTxIn dedup key (prevout + scriptSig + nSequence).
+      const key = [
+        txin.prevOut.txid.toString("hex"),
+        txin.prevOut.vout,
+        txin.scriptSig.toString("hex"),
+        txin.sequence,
+      ].join(":");
+      if (seenInputs.has(key)) {
+        // Core: "Input <hash>:<n> exists in multiple PSBTs" (RPC -8). Match
+        // Core's display: txid in big-endian (reversed) hex.
+        const displayTxid = Buffer.from(txin.prevOut.txid).reverse().toString("hex");
+        throw new Error(
+          `Input ${displayTxid}:${txin.prevOut.vout} exists in multiple PSBTs`,
+        );
+      }
+      seenInputs.add(key);
+      mergedTxInputs.push({
+        prevOut: txin.prevOut,
+        scriptSig: txin.scriptSig,
+        sequence: txin.sequence,
+        witness: txin.witness,
+      });
+      // Core's AddInput (psbt.cpp:58-60) UNCONDITIONALLY clears partial_sigs,
+      // final_script_sig and final_script_witness on every input it adds, so
+      // joining already-signed PSBTs drops signature data. Mirror that by
+      // copying the input map with those three fields cleared before pushing.
+      const src = psbt.inputs[i];
+      mergedInputs.push({
+        ...src,
+        partialSigs: new Map(),
+        finalScriptSig: undefined,
+        finalScriptWitness: undefined,
+      });
+    }
+
+    for (let i = 0; i < psbt.tx.outputs.length; i++) {
+      mergedTxOutputs.push({
+        value: psbt.tx.outputs[i].value,
+        scriptPubKey: psbt.tx.outputs[i].scriptPubKey,
+      });
+      mergedOutputs.push(psbt.outputs[i]);
+    }
+
+    for (const [key, value] of psbt.xpubs) {
+      if (!mergedXpubs.has(key)) mergedXpubs.set(key, value);
+    }
+    for (const [key, value] of psbt.unknown) {
+      if (!mergedUnknown.has(key)) mergedUnknown.set(key, value);
+    }
+  }
+
+  // Shuffle inputs/outputs for privacy (default identity = deterministic).
+  const inputOrder = shuffle(mergedTxInputs.length);
+  const outputOrder = shuffle(mergedTxOutputs.length);
+
+  const shuffledTxInputs = inputOrder.map((i) => mergedTxInputs[i]);
+  const shuffledInputs = inputOrder.map((i) => mergedInputs[i]);
+  const shuffledTxOutputs = outputOrder.map((i) => mergedTxOutputs[i]);
+  const shuffledOutputs = outputOrder.map((i) => mergedOutputs[i]);
+
+  const joinedTx: Transaction = {
+    version: bestVersion,
+    inputs: shuffledTxInputs,
+    outputs: shuffledTxOutputs,
+    lockTime: bestLocktime,
+  };
+
+  return {
+    tx: joinedTx,
+    xpubs: mergedXpubs,
+    inputs: shuffledInputs,
+    outputs: shuffledOutputs,
+    unknown: mergedUnknown,
+  };
+}
+
+/** Identity permutation [0, 1, ..., n-1] — the default (no-shuffle) order. */
+function identityPermutation(n: number): number[] {
+  const out = new Array<number>(n);
+  for (let i = 0; i < n; i++) out[i] = i;
+  return out;
+}
+
+/**
  * Finalize a PSBT input by constructing the final scriptSig/witness.
  *
  * This is the FINALIZER role.
