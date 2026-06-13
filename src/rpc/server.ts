@@ -1329,6 +1329,12 @@ export class RPCServer {
       this.registerMethod("walletcreatefundedpsbt", (params) =>
         this.walletCreateFundedPSBT(params)
       );
+      // fundrawtransaction: raw-tx sibling of walletcreatefundedpsbt — decode a
+      // raw tx, add wallet inputs + change via the same coin selector, return
+      // { hex, fee, changepos }. Core: wallet/rpc/spend.cpp::fundrawtransaction.
+      this.registerMethod("fundrawtransaction", (params) =>
+        this.fundRawTransaction(params)
+      );
       // BIP-125 RBF: bump the fee of an unconfirmed wallet tx by re-signing
       // a replacement that pays more, reducing change. psbtbumpfee returns
       // the unsigned PSBT instead of broadcasting.
@@ -11849,6 +11855,238 @@ export class RPCServer {
 
     return {
       psbt: encodePSBTBase64(psbt),
+      fee: Number(selection.fee) / 100_000_000,
+      changepos: changePos,
+    };
+  }
+
+  /**
+   * fundrawtransaction "hexstring" ( options iswitness )
+   *
+   * Raw-tx sibling of walletCreateFundedPSBT: decode an existing raw tx, keep
+   * its outputs (and any pre-supplied inputs), then add wallet inputs and (if
+   * needed) a single change output so the wallet funds all outputs + the fee.
+   * Returns { hex, fee, changepos } — the funded tx hex, the fee it pays, and
+   * the index of the added change output (-1 if none).
+   *
+   * REUSES the same coin-selection engine walletCreateFundedPSBT calls
+   * (`Wallet.selectCoinsAdvanced`, src/wallet/wallet.ts) — Core funds both RPCs
+   * through one FundTransaction path (bitcoin-core/src/wallet/rpc/spend.cpp:470,
+   * fundrawtransaction at :706). We do not reimplement coin selection; we run
+   * the same selector on the decoded tx's outputs and serialize the funded tx
+   * to hex instead of PSBT-encoding it.
+   *
+   * @param params [hexstring, options?, iswitness?]
+   */
+  private async fundRawTransaction(params: unknown[]): Promise<Record<string, unknown>> {
+    const [hexParam, optionsParam] = params;
+
+    if (typeof hexParam !== "string" || hexParam.length === 0) {
+      // Core: RPC_DESERIALIZATION_ERROR (-22) "TX decode failed".
+      throw this.rpcError(-22, "TX decode failed");
+    }
+
+    // Decode the raw transaction. Existing inputs/outputs are preserved.
+    //
+    // Mirror Core's DecodeHexTx heuristic (primitives/transaction.cpp): a tx
+    // with no inputs serializes its input-count byte as 0x00, which is also the
+    // segwit marker — so a no-input non-witness tx is ambiguous with a segwit
+    // tx. Core tries non-witness deserialization first and, only if that fails
+    // to consume the whole buffer, falls back to witness deserialization. The
+    // optional `iswitness` (params[2]) forces one branch. createrawtransaction
+    // emits exactly this no-input non-witness form, so the default funding path
+    // depends on getting this right — the shared `deserializeTx` auto-detects
+    // segwit from the marker and would misparse it, so the non-witness branch
+    // uses a dedicated legacy decoder.
+    const txBytes = Buffer.from(hexParam, "hex");
+    const iswitnessParam = params[2];
+    const forceWitness = typeof iswitnessParam === "boolean" ? iswitnessParam : undefined;
+
+    // Legacy (non-witness) decoder: never treats the first input-count byte as
+    // a segwit marker. Must consume the entire buffer.
+    const decodeLegacy = (): Transaction => {
+      const r = new BufferReader(txBytes);
+      const version = r.readInt32LE();
+      const inCount = r.readVarInt();
+      const inputs: TxIn[] = [];
+      for (let i = 0; i < inCount; i++) {
+        const txid = r.readHash();
+        const vout = r.readUInt32LE();
+        const scriptSig = r.readVarBytes();
+        const sequence = r.readUInt32LE();
+        inputs.push({ prevOut: { txid, vout }, scriptSig, sequence, witness: [] });
+      }
+      const outCount = r.readVarInt();
+      const outputs: TxOut[] = [];
+      for (let i = 0; i < outCount; i++) {
+        const value = r.readUInt64LE();
+        const scriptPubKey = r.readVarBytes();
+        outputs.push({ value, scriptPubKey });
+      }
+      const lockTime = r.readUInt32LE();
+      if (!r.eof) {
+        throw new Error("trailing bytes after transaction");
+      }
+      return { version, inputs, outputs, lockTime };
+    };
+
+    // Witness decoder via the shared segwit-aware deserializer; full-consume.
+    const decodeWitness = (): Transaction => {
+      const r = new BufferReader(txBytes);
+      const decoded = deserializeTx(r);
+      if (!r.eof) {
+        throw new Error("trailing bytes after transaction");
+      }
+      return decoded;
+    };
+
+    let tx: Transaction;
+    try {
+      if (forceWitness === false) {
+        tx = decodeLegacy();
+      } else if (forceWitness === true) {
+        tx = decodeWitness();
+      } else {
+        // Heuristic: prefer non-witness (Core's try_no_witness first), then
+        // fall back to witness.
+        try {
+          tx = decodeLegacy();
+        } catch {
+          tx = decodeWitness();
+        }
+      }
+    } catch {
+      throw this.rpcError(-22, "TX decode failed");
+    }
+
+    const wallet = this.getCurrentWallet();
+    const options = (typeof optionsParam === "object" && optionsParam)
+      ? optionsParam as Record<string, unknown>
+      : {};
+
+    // Sum the existing outputs the wallet must fund.
+    let totalOutputSats = 0n;
+    for (const out of tx.outputs) {
+      totalOutputSats += out.value;
+    }
+
+    // subtractFeeFromOutputs: indices whose amounts absorb the fee instead of
+    // the sender paying it from selected inputs (Core
+    // InterpretSubtractFeeFromOutputInstructions).
+    const sffo = new Set<number>();
+    if (Array.isArray(options.subtractFeeFromOutputs)) {
+      for (const idx of options.subtractFeeFromOutputs as unknown[]) {
+        if (typeof idx !== "number" || !Number.isInteger(idx) || idx < 0 || idx >= tx.outputs.length) {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_PARAMETER,
+            `subtractFeeFromOutputs: vout index ${String(idx)} out of range`
+          );
+        }
+        sffo.add(idx);
+      }
+    }
+
+    // Fee rate: prefer options.fee_rate (sat/vB), else options.feeRate
+    // (BTC/kvB, Core's deprecated alias). Default 1 sat/vB, matching
+    // walletCreateFundedPSBT's default path.
+    let feeRate = 1;
+    if (typeof options.fee_rate === "number" && (options.fee_rate as number) > 0) {
+      feeRate = options.fee_rate as number;
+    } else if (typeof options.feeRate === "number" && (options.feeRate as number) > 0) {
+      feeRate = ((options.feeRate as number) * 100_000_000) / 1000;
+    }
+
+    // Coin selection over the wallet UTXO set — the SAME engine
+    // walletCreateFundedPSBT uses. The selector targets the output sum and
+    // returns {inputs, totalInput, fee, change}.
+    let selection;
+    try {
+      selection = wallet.selectCoinsAdvanced(totalOutputSats, feeRate);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS, msg);
+    }
+
+    // Append the selected wallet inputs to whatever inputs were already there.
+    const sequenceDefault = 0xfffffffd; // opt-in RBF, Core's funding default.
+    for (const u of selection.inputs) {
+      tx.inputs.push({
+        prevOut: u.outpoint,
+        scriptSig: Buffer.alloc(0),
+        sequence: sequenceDefault,
+        witness: [],
+      });
+    }
+
+    // If subtractFeeFromOutputs was requested, deduct the fee from the listed
+    // outputs (split as evenly as Core does) instead of charging the sender.
+    if (sffo.size > 0) {
+      const n = BigInt(sffo.size);
+      const per = selection.fee / n;
+      let remainder = selection.fee - per * n;
+      for (const idx of sffo) {
+        let deduct = per;
+        if (remainder > 0n) {
+          deduct += 1n;
+          remainder -= 1n;
+        }
+        if (tx.outputs[idx].value < deduct) {
+          throw this.rpcError(
+            RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS,
+            "The transaction amount is too small to pay the fee"
+          );
+        }
+        tx.outputs[idx].value -= deduct;
+      }
+    }
+
+    // Add a single change output if the residual exceeds dust. With SFFO the
+    // fee came out of the outputs, so the full change (inputs - outputs) is
+    // returned; otherwise change = inputs - outputs - fee (already in
+    // selection.change).
+    let changePos = -1;
+    const DUST_THRESHOLD = 546n;
+    const changeValue = sffo.size > 0
+      ? selection.totalInput - totalOutputSats
+      : selection.change;
+    if (changeValue > DUST_THRESHOLD) {
+      const changeAddr = (typeof options.changeAddress === "string"
+        && (options.changeAddress as string).length > 0)
+        ? options.changeAddress as string
+        : wallet.getChangeAddress();
+      let decoded;
+      try {
+        decoded = decodeAddress(changeAddr);
+      } catch {
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid change address: ${changeAddr}`);
+      }
+      const changeScript = Buffer.from(
+        this.buildScriptPubKeyHex(decoded.type, decoded.hash),
+        "hex"
+      );
+      const changeOut: TxOut = { value: changeValue, scriptPubKey: changeScript };
+
+      // changePosition (Core options.changePosition): explicit insert index;
+      // otherwise append. Validate against the post-insert length.
+      if (options.changePosition !== undefined && options.changePosition !== null) {
+        const pos = Number(options.changePosition);
+        if (!Number.isInteger(pos) || pos < 0 || pos > tx.outputs.length) {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_PARAMETER,
+            "changePosition out of bounds"
+          );
+        }
+        changePos = pos;
+        tx.outputs.splice(pos, 0, changeOut);
+      } else {
+        changePos = tx.outputs.length;
+        tx.outputs.push(changeOut);
+      }
+    }
+
+    const hex = serializeTx(tx, hasWitness(tx)).toString("hex");
+    return {
+      hex,
       fee: Number(selection.fee) / 100_000_000,
       changepos: changePos,
     };
