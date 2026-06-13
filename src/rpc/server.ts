@@ -8,7 +8,7 @@
 import * as path from "path";
 import type { ChainStateManager } from "../chain/state.js";
 import type { ChainDB } from "../storage/database.js";
-import { DBPrefix } from "../storage/database.js";
+import { DBPrefix, BlockStatus } from "../storage/database.js";
 import type { Mempool, MempoolEntry } from "../mempool/mempool.js";
 import { PackageValidationResult, MAX_PACKAGE_COUNT } from "../mempool/mempool.js";
 import { dumpMempool, loadMempool, mempoolDumpExists } from "../mempool/persist.js";
@@ -522,6 +522,17 @@ export class RPCServer {
   private wallet?: Wallet;
   private walletManager?: WalletManager;
   private chainstateManager?: ChainstateManager;
+  /**
+   * The live AssumeUTXO snapshot activation produced by `loadtxoutset` (Core's
+   * second chainstate in ChainstateManager). null until a snapshot is loaded.
+   * `getchainstates` reads the snapshot chainstate's validated state +
+   * snapshot_blockhash off the SAME manager that `loadtxoutset` populated —
+   * mirroring Core where ActivateSnapshot installs the chainstate into the
+   * long-lived ChainstateManager that getchainstates later inspects. We retain
+   * the manager (rather than a bare flag) so the verdict + base hash are read
+   * directly from the manager's getStatus()/active chainstate.
+   */
+  private snapshotChainstateManager?: ChainstateManager;
   private zmqInterface?: import("./zmq.js").ZMQNotificationInterface;
   private blockSync?: BlockSync;
   /** P2P orphan transaction pool, enumerated by `getorphantxs` (may be absent). */
@@ -2901,13 +2912,34 @@ export class RPCServer {
       coinsTipCacheBytes = 0;
     }
 
-    // Single fully-validated chainstate. With one chainstate the "most-work
-    // (active) LAST" ordering is trivially satisfied. snapshot_blockhash is
-    // OPTIONAL (Core only pushes it for a from-snapshot chainstate) and is
-    // omitted here.
-    // Core make_chain_data field order: blocks, bestblockhash, bits,
-    // difficulty, target, verificationprogress, [snapshot_blockhash],
-    // coins_db_cache_bytes, coins_tip_cache_bytes, validated.
+    // AssumeUTXO awareness (Core getchainstates / make_chain_data,
+    // rpc/blockchain.cpp:3462-3519). When a snapshot has been activated via
+    // loadtxoutset, the ACTIVE chainstate is the snapshot one: it carries
+    // `snapshot_blockhash` (the snapshot base) and `validated` reflects whether
+    // the background re-validation matched the base UTXO hash yet — false while
+    // the bg pass runs / after a mismatch (Core Assumeutxo::UNVALIDATED /
+    // INVALID), true after a match (VALIDATED). When no snapshot is active we
+    // keep the single fully-validated chainstate (validated=true,
+    // snapshot_blockhash omitted).
+    let snapshotValidated = true;
+    let snapshotBlockhashHex: string | null = null;
+    const snapManager = this.snapshotChainstateManager;
+    if (snapManager) {
+      const status = snapManager.getStatus();
+      if (status.hasSnapshot) {
+        snapshotValidated = status.snapshotValidated;
+        const baseHash = snapManager.current().snapshotBaseBlockHash;
+        if (baseHash) {
+          snapshotBlockhashHex = Buffer.from(baseHash).reverse().toString("hex");
+        }
+      }
+    }
+
+    // Field order mirrors Core make_chain_data: snapshot_blockhash is emitted
+    // between verificationprogress and the coins_*_cache_bytes pair, and ONLY
+    // for a from-snapshot chainstate (Core only sets it when
+    // m_from_snapshot_blockhash is present). With one chainstate the "most-work
+    // (active) LAST" ordering is trivially satisfied.
     const chainstate: Record<string, unknown> = {
       blocks,
       bestblockhash: Buffer.from(bestBlock.hash).reverse().toString("hex"),
@@ -2915,9 +2947,10 @@ export class RPCServer {
       difficulty,
       target: tipTargetHex,
       verificationprogress,
+      ...(snapshotBlockhashHex ? { snapshot_blockhash: snapshotBlockhashHex } : {}),
       coins_db_cache_bytes: coinsDbCacheBytes,
       coins_tip_cache_bytes: coinsTipCacheBytes,
-      validated: true,
+      validated: snapshotValidated,
     };
 
     return {
@@ -9525,41 +9558,41 @@ export class RPCServer {
   // ========== assumeUTXO Methods ==========
 
   /**
-   * loadtxoutset: Load a UTXO snapshot from a file.
+   * loadtxoutset: Load a UTXO snapshot from a file and drive the real
+   * background (dual-chainstate) validation.
    *
-   * Refused with `RPC_INTERNAL_ERROR`. The handler used to call
-   * `ChainstateManager.loadSnapshot(path)` which streams coins into
-   * `DBPrefix.UTXO` and sets `manager.activeChainstate`, but it did
-   * NOT call:
+   * Mirrors Bitcoin Core's `loadtxoutset` (rpc/blockchain.cpp) →
+   * `ChainstateManager::ActivateSnapshot` / `AddChainstate` /
+   * `MaybeValidateSnapshot` (validation.cpp:5588 / 6170 / 5967), and the
+   * cross-impl pilots camlcoin 3140ab9 + lunarblock a39dd42:
    *
-   *   - `db.putChainState({ bestBlockHash, bestHeight, ... })`
-   *   - `db.putBlockIndex(baseBlockHash, { height, header, status, ... })`
+   *   1. `ChainstateManager.loadSnapshot(path)` streams the coins into the
+   *      active store and runs the LOAD-TIME content-hash gate (recomputes
+   *      HASH_SERIALIZED over the loaded set and compares it to the
+   *      chainparams-pinned `au_data.hash_serialized`). That gate authenticates
+   *      the snapshot FILE bytes; a malformed/out-of-band file is refused here.
    *
-   * Both of those calls are made by the CLI path (`runSnapshotLoad` in
-   * `src/cli/cli.ts`) AFTER `manager.loadSnapshot` returns. Without
-   * them, the UTXO rows for the snapshot height live in the DB while
-   * `getChainState()` still reports the pre-load tip (typically
-   * genesis on a fresh datadir). Subsequent IBD will silently
-   * re-download the entire chain from genesis and overwrite the
-   * snapshot UTXOs — a slow, silent corruption that the RPC reported
-   * as "success".
+   *   2. `startBackgroundValidation(getBlock)` then spins up the REAL second
+   *      (background) chainstate with its OWN separate coins store, connects
+   *      every block genesis -> base into it via real block connection (spend
+   *      inputs / add outputs), recomputes the background store's
+   *      HASH_SERIALIZED and compares to the same assumeutxo commitment by
+   *      INDEPENDENT re-derivation — the trustless re-verification.
    *
-   * Wiring the missing put-* calls in-handler is also not enough on
-   * its own: the running daemon's header-sync / block-download
-   * components were initialised at boot from the pre-load chainstate
-   * and have no in-handler refresh path. The CLI is the only entry
-   * point that runs BEFORE those components start, so there's no
-   * stale in-memory tip to swap.
+   * MISMATCH must NEVER silently succeed: a background mismatch flips the
+   * snapshot chainstate to INVALID. Per Core's ASYNCHRONOUS MaybeValidateSnapshot
+   * (it runs after ActivateSnapshot returns; a hash mismatch triggers a fatal
+   * AbortNode in the background, NOT an error from the loadtxoutset call), this
+   * handler still returns success — the verdict is surfaced via
+   * `getchainstates` (validated=false / snapshot invalid). We DRIVE the
+   * background pass synchronously here (matching the pilot tests + Core's
+   * in-process validation queue): the historical blocks resolve via the shared
+   * block store the daemon already persisted.
    *
-   * Mirrors rustoshi's `option B` fix from 2026-05-05 (rustoshi
-   * 1d0a325): refuse the RPC at the gate, leave the datadir
-   * untouched, point the operator at the CLI flag. Same JSON-RPC
-   * error code Bitcoin Core uses in
-   * `bitcoin-core/src/rpc/blockchain.cpp::loadtxoutset` when
-   * `ActivateSnapshot` cannot proceed.
+   * The activation is recorded on `this.snapshotChainstateManager` so
+   * `getchainstates` reads validated / snapshot_blockhash off the same manager.
    *
-   * @param params - [path] Path to the snapshot file (validated for
-   *                 shape only; never opened)
+   * @param params - [path] Path to the Core-format snapshot file.
    */
   private async loadTxoutset(params: unknown[]): Promise<Record<string, unknown>> {
     const [pathParam] = params;
@@ -9568,15 +9601,85 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "path must be a string");
     }
 
-    throw this.rpcError(
-      RPCErrorCodes.INTERNAL_ERROR,
-      "loadtxoutset RPC is disabled in this build because the live daemon "
-        + "cannot atomically activate a UTXO snapshot once the header-sync "
-        + "and block-download components have started. Use the CLI flag "
-        + "--load-snapshot=<path> at startup instead — that path imports "
-        + "the snapshot, pins the chain tip, and writes the block index "
-        + "before any P2P/sync components are constructed."
-    );
+    // Use (or lazily construct) the ChainstateManager over the active store.
+    // The manager loads the snapshot coins into `this.db` (the active
+    // chainstate's store); the background validator it spins up owns a SEPARATE
+    // coins store at `<active-db-path>-bgvalidate` — set explicitly below so the
+    // aliasing guard in activateSnapshotWithBackground is satisfied.
+    let manager = this.chainstateManager;
+    if (!manager) {
+      manager = new ChainstateManager(this.db, this.params);
+      this.chainstateManager = manager;
+    }
+
+    // (1) LOAD-TIME content-hash gate. A malformed snapshot / unrecognized
+    //     assumeutxo base / bad content hash throws here and is the rejecter
+    //     (Core PopulateAndValidateSnapshot). Map any throw to a JSON-RPC error.
+    let loadResult;
+    try {
+      loadResult = await manager.loadSnapshot(pathParam);
+    } catch (e) {
+      throw this.rpcError(
+        RPCErrorCodes.INTERNAL_ERROR,
+        e instanceof Error ? e.message : String(e),
+      );
+    }
+
+    // Stitch the active chain tip + a minimal block index to the snapshot base
+    // (the same put-* calls the CLI snapshot path runs after loadSnapshot), so
+    // the snapshot baseline is the active tip and getchainstates reads it.
+    await this.db.putChainState({
+      bestBlockHash: loadResult.baseBlockHash,
+      bestHeight: loadResult.baseHeight,
+      totalWork: this.params.nMinimumChainWork,
+    });
+    if (!(await this.db.getBlockIndex(loadResult.baseBlockHash))) {
+      await this.db.putBlockIndex(loadResult.baseBlockHash, {
+        height: loadResult.baseHeight,
+        header: Buffer.alloc(80),
+        nTx: 0,
+        status:
+          BlockStatus.HEADER_VALID | BlockStatus.TXS_VALID | BlockStatus.HAVE_DATA,
+        dataPos: 0,
+      });
+    }
+
+    // (2) REAL background dual-chainstate validation (Core AddChainstate +
+    //     MaybeValidateSnapshot). The background validator owns a SEPARATE
+    //     coins store; getBlock(height) reads canonical blocks from the shared
+    //     block store the daemon persisted (Core shares BlockManager across
+    //     chainstates).
+    manager.setBackgroundDataDir(`${this.db.path()}-bgvalidate-${Date.now()}`);
+
+    const getBlock = async (height: number): Promise<Block | null> => {
+      const hash = await this.db.getBlockHashByHeight(height);
+      if (!hash) return null;
+      const raw = await this.db.getBlock(hash);
+      if (!raw) return null;
+      return deserializeBlock(new BufferReader(raw));
+    };
+
+    // Drive the background pass to its terminal verdict. A MISMATCH flips the
+    // snapshot chainstate to INVALID inside startBackgroundValidation (never
+    // silently accepted); per Core's async model the mismatch is surfaced via
+    // the chainstate state, NOT an error from this call, so we do not rethrow.
+    await manager.startBackgroundValidation(getBlock);
+
+    // Record the activation on the context so getchainstates can read
+    // validated / snapshot_blockhash from the snapshot chainstate.
+    this.snapshotChainstateManager = manager;
+
+    const status = manager.getStatus();
+    return {
+      coins_loaded: Number(loadResult.coinsLoaded),
+      tip_hash: Buffer.from(loadResult.baseBlockHash).reverse().toString("hex"),
+      base_height: loadResult.baseHeight,
+      base_hash: Buffer.from(loadResult.baseBlockHash).reverse().toString("hex"),
+      path: pathParam,
+      // AssumeUTXO validated state (Core getchainstates.validated): true once
+      // the background chainstate re-derived the same base UTXO hash.
+      validated: status.snapshotValidated,
+    };
   }
 
   /**

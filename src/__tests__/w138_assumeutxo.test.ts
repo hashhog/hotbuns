@@ -471,13 +471,14 @@ describe("W138-G16: best-block persistence after coin load (BUG-8, P0-CDIV)", ()
     expect(CLI_TS).toMatch(/bestBlockHash: result\.baseBlockHash/);
   });
 
-  it("BUG-8: loadSnapshot leaves the CHAIN-STATE row stale even after a successful return", async () => {
-    // After loadSnapshot returns, db.getChainState() still reports the
-    // pre-load tip (typically genesis on a fresh db). External callers
-    // must do their own putChainState — the CLI does; the RPC handler
-    // (refused with INTERNAL_ERROR by design at server.ts:7017) does
-    // not. Confirm RPC refusal is explicit:
-    expect(RPC_SERVER_TS).toContain("loadtxoutset RPC is disabled in this build");
+  it("BUG-8 CLOSED: loadtxoutset RPC is now wired (drives the background validator), no longer refused", async () => {
+    // The loadtxoutset RPC used to be refused ("disabled in this build"). It is
+    // now wired: it loads the snapshot into an isolated store and drives the
+    // background validator (startBackgroundValidation) genesis->base, surfacing
+    // the verdict via getchainstates rather than promoting the snapshot into the
+    // live chainstate. Confirm the refusal string is gone and the bg driver wired.
+    expect(RPC_SERVER_TS).not.toContain("loadtxoutset RPC is disabled in this build");
+    expect(RPC_SERVER_TS).toContain("startBackgroundValidation");
   });
 });
 
@@ -622,14 +623,16 @@ describe("W138-G21: rename to _INVALID on background validation failure (BUG-12,
 // =============================================================================
 
 describe("W138-G22: getchainstates RPC (BUG-13, P1-API)", () => {
-  it("BUG-13: no getchainstates RPC registered in src/rpc/server.ts", () => {
+  it("BUG-13 FIXED: getchainstates RPC is registered + reports snapshot_blockhash/validated", () => {
     // Core rpc/blockchain.cpp:3462-3517 registers getchainstates returning
     // { headers, chainstates: [{ blocks, bestblockhash, bits, target,
     //   difficulty, verificationprogress, snapshot_blockhash?, validated,
-    //   coins_db_cache_bytes, coins_tip_cache_bytes }] }.
-    expect(RPC_SERVER_TS).not.toMatch(/registerMethod\("getchainstates"/);
-    expect(RPC_SERVER_TS).not.toMatch(/getchainstates/i);
-    expect(RPC_SERVER_TS).not.toMatch(/snapshot_blockhash/);
+    //   coins_db_cache_bytes, coins_tip_cache_bytes }] }. hotbuns now registers
+    // it (7125559 emitted bits+target; the loadtxoutset wiring added the
+    // snapshot_blockhash/validated branch — camlcoin 3140ab9 / lunarblock
+    // a39dd42 parity).
+    expect(RPC_SERVER_TS).toMatch(/registerMethod\("getchainstates"/);
+    expect(RPC_SERVER_TS).toContain("snapshot_blockhash");
   });
 
   it("BUG-13: closest hotbuns equivalent is the non-Core getutxosetsnapshot (no dual-chainstate info)", () => {
@@ -641,11 +644,17 @@ describe("W138-G22: getchainstates RPC (BUG-13, P1-API)", () => {
     expect(RPC_SERVER_TS).toContain("coins_count");
   });
 
-  it("BUG-13: loadtxoutset RPC is registered but refuses with INTERNAL_ERROR (intentional, see source)", () => {
+  it("BUG-13 FIXED: loadtxoutset RPC is registered + WIRED to the real background validator", () => {
+    // The refusal ("loadtxoutset RPC is disabled in this build") is GONE: the
+    // live handler now loads the snapshot + drives the real dual-chainstate
+    // background validation (ChainstateManager.startBackgroundValidation) so a
+    // mismatch can never silently validate. Core async AbortNode model:
+    // loadtxoutset returns success; getchainstates surfaces the verdict.
     expect(RPC_SERVER_TS).toContain('registerMethod("loadtxoutset"');
-    expect(RPC_SERVER_TS).toContain(
+    expect(RPC_SERVER_TS).not.toContain(
       "loadtxoutset RPC is disabled in this build",
     );
+    expect(RPC_SERVER_TS).toContain("startBackgroundValidation");
   });
 
   it("BUG-13: dumptxoutset RPC is registered (functional)", () => {
@@ -840,11 +849,14 @@ describe("W138-G27: MaybeValidateSnapshot tautology FIXED — bg validator hashe
 // =============================================================================
 
 describe("W138-G28: startBackgroundValidation has no callers (BUG-17 sister)", () => {
-  it("BUG-17: startBackgroundValidation method exists but is unreferenced in cli.ts / rpc/server.ts / index.ts", () => {
+  it("BUG-17 FIXED: startBackgroundValidation is now CALLED by the live loadtxoutset RPC handler", () => {
     expect(SNAPSHOT_TS).toContain("startBackgroundValidation(");
-    // Search all non-test source for callers.
+    // The live loadtxoutset RPC handler now drives the real background
+    // validator (camlcoin 3140ab9 / lunarblock a39dd42 parity). The CLI path
+    // still does not call it directly (it loads the snapshot before P2P/sync
+    // components start); the RPC path is the live driver.
     expect(CLI_TS).not.toMatch(/startBackgroundValidation/);
-    expect(RPC_SERVER_TS).not.toMatch(/startBackgroundValidation/);
+    expect(RPC_SERVER_TS).toMatch(/startBackgroundValidation/);
   });
 
   it("BUG-17: SnapshotValidationResult enum exists but its values are returned only to the void caller", () => {
