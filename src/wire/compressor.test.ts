@@ -16,6 +16,7 @@ import {
   deserializeTxOutCompressed,
   getSpecialScriptSize,
   NUM_SPECIAL_SCRIPTS,
+  MAX_SCRIPT_SIZE,
 } from "./compressor.js";
 import { BufferWriter, BufferReader } from "./serialization.js";
 
@@ -248,5 +249,41 @@ describe("TxOutCompression (VarInt(value)+ScriptCompression)", () => {
     const got = deserializeTxOutCompressed(r);
     expect(got.value).toBe(1n);
     expect(got.scriptPubKey.equals(odd)).toBe(true);
+  });
+
+  // 3H: MAX_SCRIPT_SIZE clamp — compressor.h:ScriptCompression::Unser lines 87-90.
+  // An oversized non-special script (rawSize > MAX_SCRIPT_SIZE) must be replaced
+  // with a single OP_RETURN and the oversized bytes consumed from the stream.
+  // Before the fix the raw 10001-byte script was returned as-is.
+  test("deserializeTxOutCompressed clamps script > MAX_SCRIPT_SIZE to OP_RETURN (3H)", () => {
+    // Build a synthetic compressed stream: amount 0 + VARINT(10001 + 6) + 10001 raw bytes.
+    const w = new BufferWriter();
+    writeVarIntCore(w, compressAmount(0n));
+    writeVarIntCore(w, BigInt(MAX_SCRIPT_SIZE + 1 + NUM_SPECIAL_SCRIPTS));
+    w.writeBytes(Buffer.alloc(MAX_SCRIPT_SIZE + 1, 0x42));
+
+    const r = new BufferReader(w.toBuffer());
+    const got = deserializeTxOutCompressed(r);
+
+    // Must be a single-byte OP_RETURN (0x6a), NOT the 10001-byte raw script.
+    expect(got.scriptPubKey.length).toBe(1);
+    expect(got.scriptPubKey[0]).toBe(0x6a);
+    // Stream must be fully consumed (no leftover bytes).
+    expect(r.remaining).toBe(0);
+  });
+
+  test("deserializeTxOutCompressed round-trips scripts exactly at MAX_SCRIPT_SIZE boundary (not clamped)", () => {
+    // A script of exactly MAX_SCRIPT_SIZE bytes must survive without clamping.
+    const script = Buffer.alloc(MAX_SCRIPT_SIZE, 0x51); // OP_1 repeated
+    const w = new BufferWriter();
+    writeVarIntCore(w, compressAmount(1000n));
+    writeVarIntCore(w, BigInt(MAX_SCRIPT_SIZE + NUM_SPECIAL_SCRIPTS));
+    w.writeBytes(script);
+
+    const r = new BufferReader(w.toBuffer());
+    const got = deserializeTxOutCompressed(r);
+
+    expect(got.scriptPubKey.length).toBe(MAX_SCRIPT_SIZE);
+    expect(got.scriptPubKey.equals(script)).toBe(true);
   });
 });

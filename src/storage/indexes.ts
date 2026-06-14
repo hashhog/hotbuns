@@ -1351,8 +1351,9 @@ export class CoinStatsIndex {
       for (let vout = 0; vout < tx.outputs.length; vout++) {
         const output = tx.outputs[vout];
 
-        // Skip OP_RETURN (unspendable)
-        if (output.scriptPubKey.length > 0 && output.scriptPubKey[0] === 0x6a) {
+        // Skip unspendable outputs (OP_RETURN-prefixed or >MAX_SCRIPT_SIZE),
+        // mirroring CScript::IsUnspendable (script/script.h:565).
+        if (coinStatsIsUnspendable(output.scriptPubKey)) {
           continue;
         }
 
