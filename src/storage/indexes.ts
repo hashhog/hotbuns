@@ -1576,6 +1576,44 @@ export interface CoinStatsAtHeight {
 }
 
 /**
+ * The two mainnet blocks whose coinbase outputs are BIP-30 unspendable.
+ * Bitcoin Core validation.cpp:6197-6198 / coinstatsindex.cpp:128-132:
+ *   IsBIP30Unspendable checks height AND block hash; when true the entire
+ *   coinbase tx must be SKIPPED (its outputs must NOT be applied to the
+ *   muhash / txout-count / total-amount / bogosize accumulators).
+ *
+ * Stored as INTERNAL (wire / little-endian) byte order — same order as the
+ * Buffer returned by getBlockHash().  Display-order hex reversed byte-by-byte.
+ *   display: 00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e
+ *   display: 00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f
+ */
+const BIP30_BLOCK_91722 = Buffer.from(
+  "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e",
+  "hex"
+).reverse();
+const BIP30_BLOCK_91812 = Buffer.from(
+  "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f",
+  "hex"
+).reverse();
+
+/**
+ * Mirror of Bitcoin Core's IsBIP30Unspendable (validation.cpp:6195-6199).
+ * Returns true iff the coinbase at this (height, blockHash) is the special
+ * duplicate-coinbase case — its outputs were made permanently unspendable by
+ * the LATER duplicate at h=91842 / h=91880.  The coinstatsindex must skip
+ * the entire coinbase tx for these two blocks (Core coinstatsindex.cpp:128-132).
+ *
+ * @param height    - Block height being indexed.
+ * @param blockHash - Block hash in internal (wire) byte order, as returned by getBlockHash().
+ */
+export function isBIP30UnspendableCoinbase(height: number, blockHash: Buffer): boolean {
+  return (
+    (height === 91722 && blockHash.equals(BIP30_BLOCK_91722)) ||
+    (height === 91812 && blockHash.equals(BIP30_BLOCK_91812))
+  );
+}
+
+/**
  * PersistentCoinStatsIndex — Bitcoin Core `-coinstatsindex` parity.
  *
  * Maintains, per block height, a running MuHash3072 over the UTXO set plus
@@ -1778,6 +1816,18 @@ export class PersistentCoinStatsIndex {
     for (const tx of block.transactions) {
       const txid = getTxId(tx);
       const txIsCoinbase = isCoinbase(tx);
+
+      // BIP-30 duplicate-coinbase skip (Core coinstatsindex.cpp:128-132):
+      // At mainnet heights 91722 and 91812 the coinbase outputs are
+      // permanently unspendable (a later duplicate coinbase overwrote them).
+      // Skip the entire coinbase tx — do NOT apply its outputs to the
+      // muhash / txout-count / total-amount / bogosize.
+      // References: bitcoin-core/src/validation.cpp:6195-6199 (IsBIP30Unspendable)
+      //             bitcoin-core/src/index/coinstatsindex.cpp:128-132
+      if (txIsCoinbase && isBIP30UnspendableCoinbase(height, blockHash)) {
+        continue;
+      }
+
       for (let vout = 0; vout < tx.outputs.length; vout++) {
         const out = tx.outputs[vout];
         if (coinStatsIsUnspendable(out.scriptPubKey)) continue;

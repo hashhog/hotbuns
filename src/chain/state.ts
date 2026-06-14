@@ -831,21 +831,20 @@ export class ChainStateManager {
     // ── Pattern D: single-batch atomicity for disconnectBlock ──
     //
     // Compute the post-disconnect chain state, then commit it together
-    // with the txindex deletes and the UTXO flush in ONE ClassicLevel
-    // batch.  Mirrors bitcoin-core/src/validation.cpp::DisconnectTip,
-    // which routes every disconnect-side write through a single
-    // `CDBBatch`.  Prior to this fix `disconnectBlock` issued three
-    // separate awaits (utxo.flush + putChainState + deleteTxIndex
-    // loop); a crash between any two left the chainstate inconsistent.
-    // See CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md
-    // (Pattern D, hotbuns row — flagged as the worst single-block
-    // atomicity exposure in the fleet).
+    // with the UTXO flush in ONE ClassicLevel batch.  Mirrors
+    // bitcoin-core/src/validation.cpp::DisconnectTip, which routes every
+    // disconnect-side write through a single CDBBatch.  Prior to the
+    // Pattern D fix, disconnectBlock issued separate awaits (utxo.flush +
+    // putChainState); a crash between any two left the chainstate
+    // inconsistent.  See CORE-PARITY-AUDIT/_post-reorg-consistency-…
     //
-    // Pattern C0 (txindex revert on disconnect) rides along inside the
-    // same atomic batch.  Best-effort framing is preserved at the
-    // call-site level: a serialization failure here aborts the whole
-    // disconnect rather than leaving a half-written state, which is the
-    // correct safety property — Core also aborts on undo-write failure.
+    // NOTE: txindex entries are intentionally NOT deleted on disconnect.
+    // Bitcoin Core's TxIndex has no CustomRemove override — its default
+    // (base.h:136) is a no-op that returns true.  Core keeps txid->block
+    // entries even for disconnected blocks so that getrawtransaction can
+    // still resolve a tx from an orphaned block via the txindex path.
+    // Reference: bitcoin-core/src/index/txindex.{h,cpp} (only CustomAppend,
+    // no CustomRemove / BlockDisconnected erase).
     const prevHeight = height - 1;
     const prevHash = block.header.prevBlock;
     const work = this.calculateWork(block.header.bits);
@@ -863,12 +862,6 @@ export class ChainStateManager {
     this.utxo.setBestBlock(prevHash);
 
     const extraOps: BatchOperation[] = [];
-
-    // Pattern C0: txindex deletes (was: per-tx await db.deleteTxIndex).
-    for (const tx of block.transactions) {
-      const txid = getTxId(tx);
-      extraOps.push(this.db.buildTxIndexDeleteOp(txid));
-    }
 
     // Pattern D: chain-state write rides the same batch.
     extraOps.push(
