@@ -2066,43 +2066,6 @@ export class BlockSync {
   }
 
   /**
-   * Delete txindex entries for every transaction in a disconnected
-   * block (Pattern C0 revert side).  Mirrors
-   * `bitcoin-core/src/index/txindex.cpp` — `BaseIndex::BlockDisconnected`
-   * removes the entries that `CustomAppend` wrote on connect.
-   *
-   * Called from `disconnectBlockUtxo` (the BlockSync reorg path) and
-   * from chain/state.ts::disconnectBlock (the generateblock /
-   * dumptxoutset rollback path).  Best-effort: a del failure is
-   * logged and ignored — same rationale as `writeTxIndexForBlock`.
-   */
-  private async deleteTxIndexForBlock(
-    block: Block,
-    blockHash: Buffer
-  ): Promise<void> {
-    const ops: BatchOperation[] = [];
-    const { getTxId } = await import("../validation/tx.js");
-    for (const tx of block.transactions) {
-      const txid = getTxId(tx);
-      ops.push({
-        type: "del",
-        prefix: DBPrefix.TX_INDEX,
-        key: txid,
-      });
-    }
-    if (ops.length === 0) return;
-    try {
-      await this.db.batchWrite(ops);
-    } catch (err) {
-      console.warn(
-        `[txindex] failed to delete entries for block ${blockHash
-          .toString("hex")
-          .slice(0, 16)}: ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
-  }
-
-  /**
    * Disconnect a single block at `height`, restoring spent UTXOs from
    * undo data and removing UTXOs the block created.  Best-effort:
    * returns false (and logs) if undo data is missing on disk, in
@@ -2274,30 +2237,13 @@ export class BlockSync {
     // in-memory hashBlock aligned with the just-rolled-back state.
     this.utxoManager.setBestBlock(block.header.prevBlock);
 
-    // ── Pattern C0: revert txindex on disconnect ──
-    //
-    // Mirrors bitcoin-core/src/index/txindex.cpp's
-    // `BaseIndex::BlockDisconnected` → `CustomRemove`.  Without this,
-    // post-reorg `getrawtransaction(<old-tx>, true)` would still resolve
-    // to the disconnected block (or report stale `confirmations` in the
-    // findTxInBlock fallback) — Pattern C in the audit.  See
-    // CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
-    // for the cross-impl table and Core-vs-fleet expected behavior.
-    //
-    // Pattern D (multi-block atomicity): when called from
-    // handleReorgUtxoAndCollect, the txindex deletes accumulate in the
-    // shared `pendingOps` buffer so they ride the same final batch as
-    // the UTXO + chain-state writes.  When called standalone (legacy
-    // unit-test path), fall back to the per-block batch helper.
-    if (pendingOps) {
-      const { getTxId } = await import("../validation/tx.js");
-      for (const tx of block.transactions) {
-        const txid = getTxId(tx);
-        pendingOps.push(this.db.buildTxIndexDeleteOp(txid));
-      }
-    } else {
-      await this.deleteTxIndexForBlock(block, blockHash);
-    }
+    // NOTE: txindex entries are intentionally NOT deleted on disconnect.
+    // Bitcoin Core's TxIndex has no CustomRemove override — the default
+    // BaseIndex::CustomRemove (base.h:136) is a no-op returning true.
+    // Core keeps txid->block entries for disconnected blocks so that
+    // getrawtransaction can still resolve a tx from an orphaned block.
+    // Reference: bitcoin-core/src/index/txindex.{h,cpp} — only CustomAppend
+    // is defined; there is no CustomRemove / BlockDisconnected erase.
 
     // ── BIP-157 Phase 2: filter-chain rewind on disconnect ──
     //
