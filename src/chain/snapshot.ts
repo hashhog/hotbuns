@@ -24,6 +24,7 @@ import {
   decompressScript,
   getSpecialScriptSize,
   NUM_SPECIAL_SCRIPTS,
+  MAX_SCRIPT_SIZE,
 } from "../wire/compressor.js";
 import { MuHash3072 } from "../wire/muhash.js";
 import type { UTXOEntry, BatchOperation } from "../storage/database.js";
@@ -1157,7 +1158,14 @@ export class ChainstateManager {
             scriptPubKey = decompressScript(nSize, payload);
           } else {
             const rawSize = nSize - NUM_SPECIAL_SCRIPTS;
-            scriptPubKey = await stream.readBytes(rawSize);
+            if (rawSize > MAX_SCRIPT_SIZE) {
+              // Overly long script: replace with OP_RETURN and consume the bytes,
+              // mirroring compressor.h:ScriptCompression::Unser (lines 87-90).
+              await stream.readBytes(rawSize);
+              scriptPubKey = Buffer.from([0x6a]);
+            } else {
+              scriptPubKey = await stream.readBytes(rawSize);
+            }
           }
 
           // Validate coin height (must be ≤ snapshot height).

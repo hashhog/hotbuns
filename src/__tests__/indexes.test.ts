@@ -1097,6 +1097,45 @@ describe("CoinStatsIndex", () => {
     expect(stats!.txOutputCount).toBe(1n);
   });
 
+  // 3I: CoinStatsIndex.indexBlock must route through coinStatsIsUnspendable
+  // (CScript::IsUnspendable, script/script.h:565) which includes the
+  // size > MAX_SCRIPT_SIZE branch, not just the OP_RETURN prefix check.
+  // Before the fix, an output whose script starts with a non-OP_RETURN byte
+  // but is longer than 10000 bytes was incorrectly counted in the UTXO stats.
+  it("should exclude script > MAX_SCRIPT_SIZE (unspendable) from statistics (3I)", async () => {
+    const oversizedScript = Buffer.alloc(10001, 0x51); // 10001 OP_1 bytes, NOT OP_RETURN
+    const spendableScript = Buffer.from([
+      0x76, 0xa9, 0x14, ...Buffer.alloc(20, 0x33), 0x88, 0xac,
+    ]); // normal P2PKH
+
+    const tx: Transaction = {
+      version: 1,
+      inputs: [
+        {
+          prevOut: { txid: Buffer.alloc(32, 0), vout: 0xffffffff },
+          scriptSig: Buffer.from([1]),
+          sequence: 0xffffffff,
+          witness: [],
+        },
+      ],
+      outputs: [
+        { value: 5000000000n, scriptPubKey: spendableScript },
+        { value: 0n, scriptPubKey: oversizedScript },
+      ],
+      lockTime: 0,
+    };
+
+    const block = createBlock([tx], Buffer.alloc(32, 0), 1);
+    await coinStats.indexBlock(block, 1, 5000000000n, []);
+
+    const stats = coinStats.getCurrentStats();
+    expect(stats).not.toBeNull();
+    // The oversized script is unspendable per CScript::IsUnspendable; only
+    // the P2PKH output should appear in the UTXO set count.
+    expect(stats!.txOutputCount).toBe(1n);
+    expect(stats!.totalAmount).toBe(5000000000n);
+  });
+
   it("should update height after indexing", async () => {
     expect(coinStats.getHeight()).toBe(-1);
 

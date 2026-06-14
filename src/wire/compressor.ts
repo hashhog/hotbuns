@@ -29,6 +29,14 @@ const OP_HASH160 = 0xa9;
 const OP_EQUALVERIFY = 0x88;
 const OP_CHECKSIG = 0xac;
 const OP_EQUAL = 0x87;
+const OP_RETURN = 0x6a;
+
+/**
+ * Maximum script byte length (script/script.h:MAX_SCRIPT_SIZE).
+ * Scripts longer than this are unspendable; the compressor replaces them with
+ * a single OP_RETURN when deserializing (compressor.h:ScriptCompression::Unser).
+ */
+export const MAX_SCRIPT_SIZE = 10000;
 
 // ---------------------------------------------------------------------------
 // VarInt (Pieter's variable-length, NOT wire-protocol CompactSize)
@@ -403,6 +411,12 @@ export function deserializeTxOutCompressed(reader: BufferReader): {
   }
 
   const rawSize = nSize - NUM_SPECIAL_SCRIPTS;
+  if (rawSize > MAX_SCRIPT_SIZE) {
+    // Overly long script: replace with a single OP_RETURN and skip remaining
+    // bytes, mirroring compressor.h:ScriptCompression::Unser (lines 87-90).
+    reader.readBytes(rawSize);
+    return { value, scriptPubKey: Buffer.from([OP_RETURN]) };
+  }
   const scriptPubKey = reader.readBytes(rawSize);
   return { value, scriptPubKey };
 }
