@@ -1995,6 +1995,20 @@ export interface SequenceLockResult {
  * @param utxoConfirmations - Confirmation info for each input's UTXO
  * @returns The minimum height and time locks
  */
+
+/**
+ * BIP-68 applies only when version >= 2. Core stores version as uint32_t and
+ * compares it UNSIGNED (fEnforceBIP68 = tx.version >= 2, tx_verify.cpp:51), so a
+ * high-bit version (e.g. 0x80000002) STILL enforces BIP-68. hotbuns reads the
+ * version via readInt32LE (signed), so a signed `>= 2` would treat 0x80000002 as
+ * negative and SKIP enforcement, false-accepting a tx with an unmet relative
+ * timelock (a chain split). `>>> 0` reinterprets as unsigned 32-bit -- same as the
+ * OP_CSV path (interpreter.ts:1249).
+ */
+export function bip68VersionActive(version: number): boolean {
+  return (version >>> 0) >= 2;
+}
+
 export function calculateSequenceLocks(
   tx: Transaction,
   enforceBIP68: boolean,
@@ -2004,8 +2018,8 @@ export function calculateSequenceLocks(
   let minHeight = -1;
   let minTime = -1;
 
-  // BIP68 only applies to transactions with version >= 2
-  if (!enforceBIP68 || tx.version < 2) {
+  // BIP68 only applies to transactions with version >= 2 (compared unsigned).
+  if (!enforceBIP68 || !bip68VersionActive(tx.version)) {
     return { minHeight, minTime };
   }
 
