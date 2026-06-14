@@ -270,6 +270,51 @@ describe("Balance and UTXOs", () => {
     expect(balance.total).toBe(150000000n);
   });
 
+  test("getBalances splits trusted / immature coinbase / untrusted pending (Core GetBalance)", () => {
+    const config = createTestConfig();
+    const wallet = Wallet.create(config, TEST_MNEMONIC);
+    const address = wallet.getNewAddress();
+    const mk = (
+      n: number,
+      amount: bigint,
+      confirmations: number,
+      isCoinbase: boolean
+    ): WalletUTXO => ({
+      outpoint: { txid: Buffer.alloc(32, n), vout: 0 },
+      amount,
+      address,
+      keyPath: "m/84'/0'/0'/0/0",
+      confirmations,
+      addressType: AddressType.P2WPKH,
+      isCoinbase,
+    });
+
+    // Mature coinbase: depth >= COINBASE_SPENDABLE_DEPTH (101) -> trusted/spendable.
+    wallet.addUTXO(mk(1, 5000000000n, 101, true));
+    // Immature coinbase: depth 100 < 101 -> immature, NOT spendable.
+    wallet.addUTXO(mk(2, 5000000000n, 100, true));
+    // Confirmed non-coinbase -> trusted.
+    wallet.addUTXO(mk(3, 100000000n, 6, false));
+    // Unconfirmed non-coinbase -> untrusted pending.
+    wallet.addUTXO(mk(4, 200000000n, 0, false));
+
+    const b = wallet.getBalances();
+    // trusted = mature coinbase (50) + confirmed non-cb (1) = 51 BTC.
+    expect(b.trusted).toBe(5100000000n);
+    // immature = the depth-100 coinbase only (50 BTC).
+    expect(b.immature).toBe(5000000000n);
+    // untrusted pending = the unconfirmed non-cb (2 BTC).
+    expect(b.untrustedPending).toBe(200000000n);
+
+    // The invariant getwalletinfo violated pre-fix: trusted (getwalletinfo.balance)
+    // MUST equal the getSpendableUTXOs sum (== getbalance). Raw getBalance().confirmed
+    // counted immature coinbase as confirmed, over-reporting the balance after mining.
+    const spendable = wallet
+      .getSpendableUTXOs()
+      .reduce((s, u) => s + u.amount, 0n);
+    expect(b.trusted).toBe(spendable);
+  });
+
   test("getUTXOs returns all UTXOs", () => {
     const config = createTestConfig();
     const wallet = Wallet.create(config, TEST_MNEMONIC);
