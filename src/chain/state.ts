@@ -244,6 +244,40 @@ export class ChainStateManager {
   }
 
   /**
+   * Fire the `blockConnected` notification on the shared bus for a block that
+   * was connected through a path OTHER than `connectBlock` (state.ts:595) —
+   * namely the BlockSync connect path used by injectBlock (generatetoaddress /
+   * submitblock) and P2P tip-extension. Lets those paths feed the SAME
+   * cli.ts listeners (wallet block-connect credit, fee estimator, mempool tip)
+   * that `connectBlock` feeds, so wallet getbalance reflects mined coinbases.
+   * Core parity: validation.cpp ConnectTip fires GetMainSignals().BlockConnected
+   * for every connected block, not only reorg reconnections. No-op when no
+   * emitter is wired (e.g. headless tooling). Idempotent per block: a block
+   * connects through exactly one of connectBlock / BlockSync, never both.
+   */
+  emitBlockConnected(block: Block): void {
+    if (this.notificationEmitter) {
+      this.notificationEmitter.emit("blockConnected", block);
+    }
+  }
+
+  /**
+   * Symmetric counterpart of {@link emitBlockConnected} for the BlockSync reorg
+   * disconnect path (disconnectBlockUtxo). Fires `blockDisconnected` so the
+   * wallet rolls back the credits this block created (cli.ts: chainEvents.on
+   * blockDisconnected -> walletManager.disconnectBlock), keeping wallet state
+   * reorg-safe when a fork is replaced via P2P rather than invalidateblock.
+   * Core parity: validation.cpp DisconnectTip fires BlockDisconnected. No-op
+   * when no emitter is wired; disconnectBlock removes only outpoints the block
+   * created, so a notify for a never-credited block is a harmless no-op.
+   */
+  emitBlockDisconnected(block: Block): void {
+    if (this.notificationEmitter) {
+      this.notificationEmitter.emit("blockDisconnected", block);
+    }
+  }
+
+  /**
    * Set the mempool for conflict removal during invalidation.
    */
   setMempool(mempool: import("../mempool/mempool.js").Mempool): void {

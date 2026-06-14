@@ -9307,7 +9307,12 @@ export class RPCServer {
   private async getWalletInfo(): Promise<Record<string, unknown>> {
     const wallet = this.getCurrentWallet();
 
-    const balance = wallet.getBalance();
+    // Core getwalletinfo reports the maturity-aware split (GetBalance()):
+    // balance = trusted spendable (== getbalance), immature_balance = immature
+    // coinbase, unconfirmed_balance = untrusted pending. The raw getBalance()
+    // sums every credited UTXO as "confirmed", which over-reports right after
+    // mining (every fresh coinbase is immature) — use getBalances() instead.
+    const balances = wallet.getBalances();
     const utxos = wallet.getUTXOs();
 
     // Core: private_keys_enabled = !WALLET_FLAG_DISABLE_PRIVATE_KEYS
@@ -9317,9 +9322,9 @@ export class RPCServer {
     return {
       walletname: this.getCurrentWalletName(),
       walletversion: 1,
-      balance: Number(balance.confirmed) / 100_000_000,
-      unconfirmed_balance: Number(balance.unconfirmed) / 100_000_000,
-      immature_balance: 0, // Would need to track immature coinbase separately
+      balance: Number(balances.trusted) / 100_000_000,
+      unconfirmed_balance: Number(balances.untrustedPending) / 100_000_000,
+      immature_balance: Number(balances.immature) / 100_000_000,
       txcount: utxos.length,
       keypoolsize: privateKeysEnabled ? 20 : 0, // Address gap
       unlocked_until: wallet.isLocked() ? 0 : undefined,

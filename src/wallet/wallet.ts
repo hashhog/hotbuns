@@ -1404,6 +1404,31 @@ export class Wallet {
   }
 
   /**
+   * Core CWallet::GetBalance() (wallet/wallet.cpp): split the balance into the
+   * trusted-spendable, immature-coinbase, and untrusted-pending buckets that
+   * getwalletinfo / getbalances report. `trusted` excludes both unconfirmed
+   * coins and immature coinbase (under COINBASE_SPENDABLE_DEPTH), so it equals
+   * the getbalance / getSpendableUTXOs sum; `immature` is the immature-coinbase
+   * total; `untrustedPending` is the unconfirmed (conf < 1) total. Single pass,
+   * same maturity predicate as getSpendableUTXOs so the buckets stay consistent.
+   */
+  getBalances(): { trusted: bigint; immature: bigint; untrustedPending: bigint } {
+    let trusted = 0n;
+    let immature = 0n;
+    let untrustedPending = 0n;
+    for (const utxo of this.utxos.values()) {
+      if (utxo.confirmations < 1) {
+        untrustedPending += utxo.amount;
+      } else if (utxo.isCoinbase && utxo.confirmations < COINBASE_SPENDABLE_DEPTH) {
+        immature += utxo.amount;
+      } else {
+        trusted += utxo.amount;
+      }
+    }
+    return { trusted, immature, untrustedPending };
+  }
+
+  /**
    * Scan the UTXO set for outputs matching our addresses.
    */
   async scanUTXOs(db: ChainDB): Promise<void> {

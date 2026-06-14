@@ -2378,6 +2378,27 @@ export class BlockSync {
       }
     }
 
+    // Roll back wallet credits this block created — symmetric with the
+    // emitBlockConnected on the connect side. The BlockSync reorg path bypasses
+    // chainState.disconnectBlock (state.ts:934, the only other blockDisconnected
+    // emitter), so without this a P2P-driven reorg would leave phantom wallet
+    // coins from the disconnected fork (reconstructible only by rescan). Core's
+    // DisconnectTip fires BlockDisconnected for every disconnected block. The
+    // wallet's disconnectBlock removes only outpoints this block created, so a
+    // notify for a block whose connect was not credited (deep-IBD, atTip=false)
+    // is a harmless no-op. Best-effort: never roll back the UTXO disconnect.
+    if (this.chainStateManager) {
+      try {
+        this.chainStateManager.emitBlockDisconnected(block);
+      } catch (err) {
+        console.warn(
+          `[blockDisconnected notify] non-fatal failure for block ${blockHash
+            .toString("hex")
+            .slice(0, 16)} at h=${height}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+
     return true;
   }
 
@@ -3380,6 +3401,36 @@ export class BlockSync {
         },
       };
       this.peerManager.broadcast(invMsg);
+    }
+
+    // ── Feed the wallet / fee-estimator on block-connect ──
+    //
+    // generatetoaddress + submitblock route through injectBlock (server.ts
+    // generateSingleBlock B3 fix) and P2P tip-extension lands here too — all
+    // BYPASS chainState.connectBlock, which is the only other place that fires
+    // the shared `blockConnected` notification (state.ts:595). Without this, the
+    // wallet's block-connect credit hook (cli.ts: chainEvents.on blockConnected
+    // -> walletManager.processBlock) never runs for mined/synced tip blocks, so
+    // getbalance stays 0 after generatetoaddress even though the coinbase pays a
+    // wallet address (the spend/history/import regression FAIL). Emit here so
+    // BOTH connect paths converge on the same listeners — Core's ConnectTip
+    // fires BlockConnected for every connected block.
+    //
+    // Gated on `atTip` (matching removeForBlock + the tip inv above): deep-IBD
+    // historical blocks are intentionally not fed per-block — the wallet adopts
+    // its funds via the post-IBD rescan, unchanged by this fix. A block connects
+    // through exactly one of connectBlock / BlockSync, so there is no double
+    // credit. Best-effort: a notify failure must never roll back the connect.
+    if (atTip && this.chainStateManager) {
+      try {
+        this.chainStateManager.emitBlockConnected(block);
+      } catch (err) {
+        console.warn(
+          `[blockConnected notify] non-fatal failure for block ${blockHash
+            .toString("hex")
+            .slice(0, 16)} at h=${height}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
     }
 
     // ── Pattern B: mempool refill on reorg ──
