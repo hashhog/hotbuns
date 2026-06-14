@@ -936,6 +936,57 @@ export function serializeScript(script: Script): Buffer {
 }
 
 /**
+ * Build the minimal-encoding push script for `data`, mirroring the
+ * `CScript() << std::vector<unsigned char>` operator in Bitcoin Core
+ * (interpreter.cpp:2082).
+ *
+ * Encoding rules (identical to blockbrew canonicalPushScript / Core CScript<<):
+ *   - empty (0 bytes) → OP_0  (0x00)
+ *   - 1–75 bytes      → <len> <data>                          (direct push)
+ *   - 76–255 bytes    → OP_PUSHDATA1 <len8> <data>
+ *   - 256–65535 bytes → OP_PUSHDATA2 <len16le> <data>
+ *   - >65535 bytes    → OP_PUSHDATA4 <len32le> <data>
+ *
+ * Used by the P2SH-wrapped-witness malleation check (BIP141 §Native P2WPKH):
+ * the scriptSig must be BYTE-FOR-BYTE equal to this value.
+ */
+function canonicalPushScript(data: Buffer): Buffer {
+  const n = data.length;
+  if (n === 0) {
+    return Buffer.from([Opcode.OP_0]);
+  }
+  if (n <= 75) {
+    const out = Buffer.allocUnsafe(1 + n);
+    out[0] = n;
+    data.copy(out, 1);
+    return out;
+  }
+  if (n <= 0xff) {
+    const out = Buffer.allocUnsafe(2 + n);
+    out[0] = Opcode.OP_PUSHDATA1;
+    out[1] = n;
+    data.copy(out, 2);
+    return out;
+  }
+  if (n <= 0xffff) {
+    const out = Buffer.allocUnsafe(3 + n);
+    out[0] = Opcode.OP_PUSHDATA2;
+    out[1] = n & 0xff;
+    out[2] = (n >> 8) & 0xff;
+    data.copy(out, 3);
+    return out;
+  }
+  const out = Buffer.allocUnsafe(5 + n);
+  out[0] = Opcode.OP_PUSHDATA4;
+  out[1] = n & 0xff;
+  out[2] = (n >> 8) & 0xff;
+  out[3] = (n >> 16) & 0xff;
+  out[4] = (n >> 24) & 0xff;
+  data.copy(out, 5);
+  return out;
+}
+
+/**
  * Remove all occurrences of a signature from scriptCode (FindAndDelete).
  * ONLY for legacy (BASE) signature version.
  *
@@ -2347,13 +2398,25 @@ export function verifyScript(
 
     // Check for P2SH-wrapped witness
     if (flags.verifyWitness) {
-      if (isP2WPKH(redeemScript)) {
-        return verifyWitnessV0(redeemScript, witness, flags, witnessSigHasher ?? sigHasher, txContext);
-      }
-      if (isP2WSH(redeemScript)) {
-        return verifyWitnessV0(redeemScript, witness, flags, witnessSigHasher ?? sigHasher, txContext);
-      }
       if (isWitnessProgram(redeemScript)) {
+        // Core interpreter.cpp:2082-2086: for a P2SH-wrapped witness program the
+        // scriptSig must be EXACTLY the minimal canonical push of the redeemScript
+        // bytes — nothing more, nothing less.  An OP_PUSHDATA1-encoded push of the
+        // same bytes is push-only, evaluates identically, but is NOT the canonical
+        // encoding, so Core rejects it as SCRIPT_ERR_WITNESS_MALLEATED_P2SH.
+        // MINIMALDATA is a policy/standard flag (not in GetBlockScriptFlags), so
+        // under block/ConnectBlock validation this byte-exact comparison is the
+        // ONLY guard against scriptSig malleability for this spend type.
+        if (!scriptSig.equals(canonicalPushScript(redeemScript))) {
+          throw new ScriptError("WITNESS_MALLEATED_P2SH");
+        }
+        if (isP2WPKH(redeemScript)) {
+          return verifyWitnessV0(redeemScript, witness, flags, witnessSigHasher ?? sigHasher, txContext);
+        }
+        if (isP2WSH(redeemScript)) {
+          return verifyWitnessV0(redeemScript, witness, flags, witnessSigHasher ?? sigHasher, txContext);
+        }
+        // Remaining witness versions (v1+)
         // P2SH-wrapped witness: check v0 program length
         const witnessVersion = redeemScript[0];
         const programLen = redeemScript[1];

@@ -20,6 +20,7 @@ import {
   getConsensusFlags,
   compactSizeLen,
   serializedWitnessStackSize,
+  ScriptError,
   type ScriptFlags,
   type ExecutionContext,
   SigVersion,
@@ -1288,5 +1289,115 @@ describe("BIP-342 tapscript validation-weight budget", () => {
       // No sigopsBudget on the legacy path.
     };
     expect(executeScript(parsed, ctx)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WITNESS_MALLEATED_P2SH — byte-exact scriptSig check (Core interpreter.cpp:2082-2086)
+// ---------------------------------------------------------------------------
+//
+// Bitcoin Core requires that for a P2SH-wrapped witness program the scriptSig
+// MUST equal EXACTLY the minimal canonical push of the redeemScript bytes
+// (CScript() << redeemScript).  A non-canonical push (e.g. OP_PUSHDATA1) that
+// evaluates to the same data on the stack is REJECTED with
+// SCRIPT_ERR_WITNESS_MALLEATED_P2SH even though it is push-only and the P2SH
+// EQUAL check passes.  MINIMALDATA is a policy/standard flag absent from
+// GetBlockScriptFlags, so this byte-exact check is the ONLY guard under
+// block/ConnectBlock validation.
+//
+// Test vector: redeemScript W = OP_0 <20-byte hash> (22 bytes, a P2WPKH program)
+//   scriptPubKey = OP_HASH160 <HASH160(W)> OP_EQUAL   (P2SH wrapping W)
+//   canonical scriptSig    = 0x16 <W>               (direct push, 23 bytes total)
+//   non-canonical scriptSig = 0x4c 0x16 <W>          (OP_PUSHDATA1 form, 24 bytes)
+//
+// Under block flags (verifyP2SH=true, verifyWitness=true, verifyMinimalData=false):
+//   non-canonical → REJECTED (WITNESS_MALLEATED_P2SH)
+//   canonical     → passes the malleation check (witness verification may fail
+//                   separately because no real witness data is supplied, but
+//                   must NOT throw WITNESS_MALLEATED_P2SH)
+describe("WITNESS_MALLEATED_P2SH — P2SH-wrapped witness scriptSig byte-exact check", () => {
+  // Block-validation flags: P2SH + WITNESS enabled, MINIMALDATA deliberately OFF
+  // (mirrors GetBlockScriptFlags which never sets SCRIPT_VERIFY_MINIMALDATA).
+  const blockFlags: ScriptFlags = {
+    verifyP2SH: true,
+    verifyWitness: true,
+    verifyTaproot: false,
+    verifyStrictEncoding: false,
+    verifyDERSignatures: false,
+    verifyLowS: false,
+    verifyNullDummy: false,
+    verifyNullFail: false,
+    verifyCheckLockTimeVerify: false,
+    verifyCheckSequenceVerify: false,
+    // verifyMinimalData intentionally absent → false (policy flag, not in block flags)
+  };
+
+  // Build the test vector.
+  // redeemScript W = OP_0 (0x00) + push of 20-byte hash (0x14 <hash>)
+  const witnessHash = Buffer.alloc(20, 0xab);       // arbitrary 20-byte key hash
+  const redeemScript = Buffer.concat([
+    Buffer.from([0x00, 0x14]),                       // OP_0, PUSH20
+    witnessHash,
+  ]);                                                // 22 bytes total
+
+  // P2SH scriptPubKey: OP_HASH160 <20-byte hash160(redeemScript)> OP_EQUAL
+  const rsHash = hash160(redeemScript);
+  const scriptPubKey = Buffer.concat([
+    Buffer.from([0xa9, 0x14]),                       // OP_HASH160, PUSH20
+    rsHash,
+    Buffer.from([0x87]),                             // OP_EQUAL
+  ]);
+
+  // canonical scriptSig: direct push (opcode = length = 22 = 0x16)
+  const canonicalScriptSig = Buffer.concat([
+    Buffer.from([0x16]),                             // direct push 22 bytes
+    redeemScript,
+  ]);
+
+  // non-canonical scriptSig: same bytes encoded with OP_PUSHDATA1
+  const nonCanonicalScriptSig = Buffer.concat([
+    Buffer.from([0x4c, 0x16]),                      // OP_PUSHDATA1, length=22
+    redeemScript,
+  ]);
+
+  test("non-canonical OP_PUSHDATA1 scriptSig rejected with WITNESS_MALLEATED_P2SH (block flags, MINIMALDATA off)", () => {
+    // The non-canonical push is push-only and evaluates identically on the stack,
+    // but Core rejects it.  MINIMALDATA is OFF — without the byte-exact check,
+    // this tx would be ACCEPTED and would split the chain.
+    expect(() =>
+      verifyScript(
+        nonCanonicalScriptSig,
+        scriptPubKey,
+        [],           // no witness data
+        blockFlags,
+        dummySigHasher,
+      )
+    ).toThrow(ScriptError);
+
+    try {
+      verifyScript(nonCanonicalScriptSig, scriptPubKey, [], blockFlags, dummySigHasher);
+    } catch (e) {
+      expect(e).toBeInstanceOf(ScriptError);
+      expect((e as ScriptError).code).toBe("WITNESS_MALLEATED_P2SH");
+    }
+  });
+
+  test("canonical direct-push scriptSig passes the malleation check (block flags)", () => {
+    // The canonical scriptSig must NOT be rejected with WITNESS_MALLEATED_P2SH.
+    // With an empty witness the spend will fail at P2WPKH verification
+    // (witness.length !== 2), but the malleation guard must not fire first.
+    let caughtCode: string | undefined;
+    try {
+      verifyScript(
+        canonicalScriptSig,
+        scriptPubKey,
+        [],           // empty witness → P2WPKH check fails, but NOT malleation
+        blockFlags,
+        dummySigHasher,
+      );
+    } catch (e) {
+      if (e instanceof ScriptError) caughtCode = e.code;
+    }
+    expect(caughtCode).not.toBe("WITNESS_MALLEATED_P2SH");
   });
 });
