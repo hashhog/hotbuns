@@ -240,6 +240,13 @@ export function deserializeTx(reader: BufferReader): Transaction {
       }
       inputs[i].witness = witness;
     }
+    // Core primitives/transaction.h:228-231: it is illegal to encode witnesses
+    // when all witness stacks are empty (BIP144 segwit marker+flag present but
+    // tx.HasWitness() is false).  Throw exactly as Core does.
+    const hasWitness = inputs.some((inp) => inp.witness.length > 0);
+    if (!hasWitness) {
+      throw new Error("Superfluous witness record");
+    }
   }
 
   const lockTime = reader.readUInt32LE();

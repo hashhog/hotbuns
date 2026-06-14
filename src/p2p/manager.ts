@@ -2662,12 +2662,17 @@ export class PeerManager {
     // rate limit by switching to addrv2.
     if (msg.type === "addr") {
       this.handleAddrMessage(peer, msg.payload);
-      // BIP155: Relay to up to 2 random peers
-      this.relayAddrToRandomPeers(peer, msg);
+      // Core net_processing.cpp:5688: only relay if the message carries <=10
+      // addresses (unsolicited spontaneous advertisements, not getaddr replies).
+      if (msg.payload.addrs.length <= 10) {
+        this.relayAddrToRandomPeers(peer, msg);
+      }
     } else if (msg.type === "addrv2") {
       this.handleAddrV2Message(peer, msg.payload);
-      // BIP155: Relay addrv2 to up to 2 random peers
-      this.relayAddrToRandomPeers(peer, msg);
+      // Core net_processing.cpp:5688: same <=10 relay gate applies to addrv2.
+      if (msg.payload.addrs.length <= 10) {
+        this.relayAddrToRandomPeers(peer, msg);
+      }
     } else if (msg.type === "getaddr") {
       // Anti-DoS getaddr responder (Core net_processing.cpp:4815).
       this.handleGetAddr(peer);
@@ -2847,9 +2852,13 @@ export class PeerManager {
       if (processed >= budget) break; // rate-limited: drop excess
       processed++;
 
-      // Skip addresses that are too old (more than 3 hours)
-      if (now - entry.timestamp > 3 * 60 * 60) {
-        continue;
+      // Core net_processing.cpp:5678-5680: clamp timestamps that are either
+      // pre-2001 (<=100000000s) or more than 10 minutes in the future.
+      // Core does NOT drop old addresses here — it clamps and stores them.
+      let ts = entry.timestamp;
+      if (ts <= 100_000_000 || ts > now + 10 * 60) {
+        // Clamp to 5 days ago (Core: current_time - 5*24h)
+        ts = now - 5 * 24 * 60 * 60;
       }
 
       const ip = bufferToIPv4(entry.addr.ip);
@@ -2865,8 +2874,8 @@ export class PeerManager {
       const existing = this.knownAddresses.get(key);
       if (existing) {
         // Update if more recent
-        if (entry.timestamp > existing.lastSeen) {
-          existing.lastSeen = entry.timestamp * 1000;
+        if (ts > existing.lastSeen) {
+          existing.lastSeen = ts * 1000;
           existing.services = entry.addr.services;
         }
       } else {
@@ -2874,7 +2883,7 @@ export class PeerManager {
           host: ip,
           port: entry.addr.port,
           services: entry.addr.services,
-          lastSeen: entry.timestamp * 1000,
+          lastSeen: ts * 1000,
           banScore: 0,
           lastConnected: 0,
           networkId: BIP155Network.IPV4,
@@ -2905,9 +2914,13 @@ export class PeerManager {
       if (processed >= budget) break; // rate-limited: drop excess
       processed++;
 
-      // Skip addresses that are too old (more than 3 hours)
-      if (now - entry.timestamp > 3 * 60 * 60) {
-        continue;
+      // Core net_processing.cpp:5678-5680: clamp timestamps that are either
+      // pre-2001 (<=100000000s) or more than 10 minutes in the future.
+      // Core does NOT drop old addresses here — it clamps and stores them.
+      let ts = entry.timestamp;
+      if (ts <= 100_000_000 || ts > now + 10 * 60) {
+        // Clamp to 5 days ago (Core: current_time - 5*24h)
+        ts = now - 5 * 24 * 60 * 60;
       }
 
       // Validate the address for known network types
@@ -2923,12 +2936,12 @@ export class PeerManager {
       const existing = this.knownAddresses.get(key);
       if (existing) {
         // Update if more recent
-        if (entry.timestamp > existing.lastSeen) {
-          existing.lastSeen = entry.timestamp * 1000;
+        if (ts > existing.lastSeen) {
+          existing.lastSeen = ts * 1000;
           existing.services = entry.addr.services;
         }
       } else {
-        const peerInfo = this.addrV2ToPeerInfo(entry.addr, entry.timestamp);
+        const peerInfo = this.addrV2ToPeerInfo(entry.addr, ts);
         if (peerInfo) {
           this.addKnownAddress(key, peerInfo);
         }
