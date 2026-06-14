@@ -71,6 +71,7 @@ import {
   getTxId,
   isCoinbase,
   checkSequenceLocks,
+  bip68VersionActive,
   verifyAllInputsParallel,
   verifyAllInputsSequential,
   ScriptFlags,
@@ -599,8 +600,8 @@ export async function coreConnectBlockChecks(
         }
       }
 
-      // ── BIP-68 / CSV sequence locks.
-      if (enforceBIP68 && tx.version >= 2) {
+      // ── BIP-68 / CSV sequence locks. Version compared unsigned (Core uint32_t).
+      if (enforceBIP68 && bip68VersionActive(tx.version)) {
         const seqLockValid = checkSequenceLocks(
           tx,
           enforceBIP68,
