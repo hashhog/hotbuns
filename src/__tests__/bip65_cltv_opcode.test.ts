@@ -739,3 +739,55 @@ describe("edge cases: boundary values", () => {
     );
   });
 });
+
+// bug-hunt 8B: CLTV/CSV must honor MINIMALDATA on their operand, exactly like
+// every arithmetic opcode. Core: CScriptNum(stacktop(-1), fRequireMinimal, 5).
+// Before the fix the CLTV (interpreter.ts ~1228) and CSV (~1285) call sites
+// dropped the fRequireMinimal argument, so a non-minimally-encoded operand was
+// silently accepted under SCRIPT_VERIFY_MINIMALDATA — a Core differential.
+describe("BIP-65/112: MINIMALDATA on CLTV/CSV operand (bug-hunt 8B)", () => {
+  // Value 1 encoded non-minimally as [0x01, 0x00] (trailing zero byte that
+  // scriptNumDecode rejects under requireMinimal -> ScriptError "UNKNOWN").
+  const NON_MINIMAL_ONE = Buffer.from([0x01, 0x00]);
+
+  const CLTV_MINIMAL_FLAGS: ScriptFlags = { ...CLTV_FLAGS, verifyMinimalData: true };
+  const CSV_MINIMAL_FLAGS: ScriptFlags = {
+    ...CLTV_FLAGS,
+    verifyCheckLockTimeVerify: false,
+    verifyCheckSequenceVerify: true,
+    verifyMinimalData: true,
+  };
+
+  test("CLTV rejects a non-minimally-encoded operand under MINIMALDATA", () => {
+    // Context chosen so that WITHOUT the fix the operand decodes to 1 and every
+    // downstream gate passes (txLockTime=1, txSequence=0 non-final) -> the only
+    // thing that can reject it is the minimal-encoding check.
+    const ctx = makeCtx([NON_MINIMAL_ONE], CLTV_MINIMAL_FLAGS, 1, 0, 2);
+    const script = parseScript(Buffer.from([Opcode.OP_CHECKLOCKTIMEVERIFY]));
+    let err: ScriptError | undefined;
+    try {
+      executeScript(script, ctx);
+    } catch (e) {
+      if (e instanceof ScriptError) err = e;
+      else throw e;
+    }
+    expect(err).toBeInstanceOf(ScriptError);
+    expect(err!.code).toBe("UNKNOWN");
+  });
+
+  test("CSV rejects a non-minimally-encoded operand under MINIMALDATA", () => {
+    // txVersion=2, txSequence=1 (disable bit clear, same height domain) so that
+    // WITHOUT the fix the operand decodes to 1 and CSV passes cleanly.
+    const ctx = makeCtx([NON_MINIMAL_ONE], CSV_MINIMAL_FLAGS, undefined, 1, 2);
+    const script = parseScript(Buffer.from([Opcode.OP_CHECKSEQUENCEVERIFY]));
+    let err: ScriptError | undefined;
+    try {
+      executeScript(script, ctx);
+    } catch (e) {
+      if (e instanceof ScriptError) err = e;
+      else throw e;
+    }
+    expect(err).toBeInstanceOf(ScriptError);
+    expect(err!.code).toBe("UNKNOWN");
+  });
+});
