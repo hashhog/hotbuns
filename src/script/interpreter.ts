@@ -1224,8 +1224,12 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
         // Gate 1: empty stack → invalid stack operation
         if (stack.length < 1) throw new ScriptError("INVALID_STACK_OPERATION");
         // Gate 2: 5-byte script num (year-2038-safe, per BIP-65 §Motivation)
-        // Value is checked but NOT popped
-        const locktime = scriptNumDecode(stack[stack.length - 1], 5);
+        // Value is checked but NOT popped.
+        // bug-hunt 8B: Core passes fRequireMinimal — CScriptNum(stacktop(-1),
+        // fRequireMinimal, 5) (interpreter.cpp OP_CHECKLOCKTIMEVERIFY). A
+        // non-minimally-encoded operand must be rejected under MINIMALDATA, same
+        // as every arithmetic opcode below; previously this dropped the flag.
+        const locktime = scriptNumDecode(stack[stack.length - 1], 5, !!flags.verifyMinimalData);
         // Gate 3: negative operand → reject
         if (locktime < 0) throw new ScriptError("NEGATIVE_LOCKTIME");
 
@@ -1281,8 +1285,10 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
           break; // Treated as NOP3
         }
         if (stack.length < 1) throw new ScriptError("INVALID_STACK_OPERATION");
-        // nSequence is a 32-bit unsigned field; allow 5-byte encoding (Core: CScriptNum(_, _, 5))
-        const sequence = scriptNumDecode(stack[stack.length - 1], 5);
+        // nSequence is a 32-bit unsigned field; allow 5-byte encoding.
+        // bug-hunt 8B: Core: CScriptNum(stacktop(-1), fRequireMinimal, 5)
+        // (interpreter.cpp OP_CHECKSEQUENCEVERIFY) — honor MINIMALDATA here too.
+        const sequence = scriptNumDecode(stack[stack.length - 1], 5, !!flags.verifyMinimalData);
         if (sequence < 0) throw new ScriptError("NEGATIVE_LOCKTIME");
 
         // If the disable flag (bit 31) is set, CSV behaves as NOP (BIP-112 §3)
