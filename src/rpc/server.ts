@@ -16,6 +16,7 @@ import type { OrphanPool, OrphanEntry } from "../mempool/orphan_pool.js";
 import { RBFTransactionState } from "../mempool/rbf.js";
 import type { PeerManager } from "../p2p/manager.js";
 import { ServiceFlags } from "../p2p/manager.js";
+import { parseIPv4, parseIPv6 } from "../p2p/asmap.js";
 import type { FeeEstimator } from "../fees/estimator.js";
 import { Horizon, DECAY, SCALE } from "../fees/estimator.js";
 import type { HeaderSync, HeaderChainEntry } from "../sync/headers.js";
@@ -288,6 +289,19 @@ export const RPCErrorCodes = {
   RPC_TRANSACTION_ERROR: -25,
   RPC_TRANSACTION_REJECTED: -26,
   RPC_TRANSACTION_ALREADY_IN_CHAIN: -27,
+  // P2P client errors — Core protocol.h:60-63. Application-layer codes for the
+  // net RPCs (addnode / disconnectnode / setban), distinct from the JSON-RPC
+  // transport code INVALID_PARAMS (-32602).
+  // RPC_CLIENT_NODE_ALREADY_ADDED (-23): `addnode "add"` on an already-added node.
+  CLIENT_NODE_ALREADY_ADDED: -23,
+  // RPC_CLIENT_NODE_NOT_ADDED (-24): `addnode "remove"` on a node not in the
+  // added-node list.
+  CLIENT_NODE_NOT_ADDED: -24,
+  // RPC_CLIENT_NODE_NOT_CONNECTED (-29): `disconnectnode` for a peer not in the
+  // currently-connected set.
+  CLIENT_NODE_NOT_CONNECTED: -29,
+  // RPC_CLIENT_INVALID_IP_OR_SUBNET (-30): `setban` with an unparseable IP/subnet.
+  CLIENT_INVALID_IP_OR_SUBNET: -30,
   // Legacy aliases for backward compatibility
   VERIFY_ALREADY_IN_CHAIN: -25,
   VERIFY_REJECTED: -26,
@@ -2185,14 +2199,16 @@ export class RPCServer {
     }
 
     const height = heightParam;
-    if (height < 0) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "height must be non-negative");
-    }
-
+    // Core parity (bitcoin-core/src/rpc/blockchain.cpp::getblockhash):
+    //   if (nHeight < 0 || nHeight > active_chain.Height())
+    //       throw JSONRPCError(RPC_INVALID_PARAMETER, "Block height out of range");
+    // RPC_INVALID_PARAMETER (-8) is the application-layer parameter code, not the
+    // JSON-RPC transport code INVALID_PARAMS (-32602). Message text matches Core
+    // exactly (no interpolation). (Ported from rustoshi ee86d76; W125 BUG-17/G29.)
     const bestBlock = this.chainState.getBestBlock();
-    if (height > bestBlock.height) {
+    if (height < 0 || height > bestBlock.height) {
       throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
+        RPCErrorCodes.INVALID_PARAMETER,
         "Block height out of range"
       );
     }
@@ -6718,20 +6734,48 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid port number");
     }
 
-    if (command === "onetry" || command === "add") {
+    const key = `${host}:${port}`;
+
+    if (command === "add") {
+      // Core parity (bitcoin-core/src/rpc/net.cpp::addnode):
+      //   if (!connman.AddNode({node_arg, ...}))
+      //       throw JSONRPCError(RPC_CLIENT_NODE_ALREADY_ADDED, "Error: Node already added");
+      // RPC_CLIENT_NODE_ALREADY_ADDED = -23 (protocol.h:60). Register the node
+      // in the manually-added list BEFORE attempting the connection; a repeat
+      // "add" of an already-added node is the -23 error.
+      // (Ported from rustoshi 7b94ef1.)
+      if (!this.peerManager.addAddedNode(key)) {
+        throw this.rpcError(
+          RPCErrorCodes.CLIENT_NODE_ALREADY_ADDED,
+          "Error: Node already added"
+        );
+      }
       try {
         await this.peerManager.connectPeer(host, port);
       } catch (err: unknown) {
-        if (command === "add") {
-          throw this.rpcError(
-            RPCErrorCodes.MISC_ERROR,
-            `Failed to connect: ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
+        throw this.rpcError(
+          RPCErrorCodes.MISC_ERROR,
+          `Failed to connect: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    } else if (command === "onetry") {
+      try {
+        await this.peerManager.connectPeer(host, port);
+      } catch {
         // onetry silently ignores connection failure
       }
     } else if (command === "remove") {
-      const key = `${host}:${port}`;
+      // Core parity (bitcoin-core/src/rpc/net.cpp::addnode):
+      //   if (!connman.RemoveAddedNode(node_arg))
+      //       throw JSONRPCError(RPC_CLIENT_NODE_NOT_ADDED,
+      //                          "Error: Node could not be removed. It has not been added previously.");
+      // RPC_CLIENT_NODE_NOT_ADDED = -24 (protocol.h:61). (Ported from rustoshi 7b94ef1.)
+      if (!this.peerManager.removeAddedNode(key)) {
+        throw this.rpcError(
+          RPCErrorCodes.CLIENT_NODE_NOT_ADDED,
+          "Error: Node could not be removed. It has not been added previously."
+        );
+      }
       this.peerManager.disconnectPeer(key);
     }
 
@@ -6771,7 +6815,15 @@ export class RPCServer {
     const peers = this.peerManager.getConnectedPeers();
     const found = peers.some(p => `${p.host}:${p.port}` === key);
     if (!found) {
-      throw this.rpcError(RPCErrorCodes.MISC_ERROR, `Node ${address} not found`);
+      // Core parity (bitcoin-core/src/rpc/net.cpp::disconnectnode):
+      //   if (!success) throw JSONRPCError(RPC_CLIENT_NODE_NOT_CONNECTED,
+      //                                    "Node not found in connected nodes");
+      // RPC_CLIENT_NODE_NOT_CONNECTED = -29 (protocol.h:62). Previously this was
+      // MISC_ERROR (-1) with a non-Core message. (Ported from rustoshi 845f7e4.)
+      throw this.rpcError(
+        RPCErrorCodes.CLIENT_NODE_NOT_CONNECTED,
+        "Node not found in connected nodes"
+      );
     }
 
     this.peerManager.disconnectPeer(key);
@@ -6802,6 +6854,43 @@ export class RPCServer {
   }
 
   /**
+   * Validate a `setban` subnet/IP argument the way Core's setban does
+   * (bitcoin-core/src/rpc/net.cpp::setban): if the arg contains '/', it is a
+   * subnet (host part + CIDR/dotted netmask); otherwise it is a bare host
+   * (LookupHost). Returns true iff the argument resolves to a valid IP/Subnet.
+   * Non-consensus RPC-layer validation only.
+   */
+  private isValidIpOrSubnet(arg: string): boolean {
+    const slash = arg.indexOf("/");
+    if (slash === -1) {
+      // Bare IP (LookupHost) — IPv4 or IPv6.
+      return parseIPv4(arg) !== null || parseIPv6(arg) !== null;
+    }
+    // Subnet: "<host>/<netmask>". Host must be a valid IP; the netmask is
+    // either a prefix length (0..32 for IPv4, 0..128 for IPv6) or a dotted
+    // IPv4 netmask. LookupSubNet rejects an empty/garbage netmask.
+    const hostPart = arg.slice(0, slash);
+    const maskPart = arg.slice(slash + 1);
+    if (maskPart.length === 0) return false;
+
+    const v4 = parseIPv4(hostPart);
+    const v6 = v4 ? null : parseIPv6(hostPart);
+    if (!v4 && !v6) return false;
+
+    // Prefix-length form ("/24"): integer in range for the address family.
+    if (/^[0-9]+$/.test(maskPart)) {
+      const bits = Number(maskPart);
+      const max = v4 ? 32 : 128;
+      return bits >= 0 && bits <= max;
+    }
+    // Dotted-netmask form ("/255.255.255.0") — only valid for IPv4 hosts.
+    if (v4) {
+      return parseIPv4(maskPart) !== null;
+    }
+    return false;
+  }
+
+  /**
    * setban: Add or remove an IP/Subnet from the banned list.
    * @param params [ip, command, bantime, absolute]
    *   ip: IP address or subnet
@@ -6822,6 +6911,19 @@ export class RPCServer {
 
     const ip = ipParam;
     const command = commandParam.toLowerCase();
+
+    // Core parity (bitcoin-core/src/rpc/net.cpp::setban): the IP/Subnet is parsed
+    // and validated up front, BEFORE the command branch:
+    //   if (!(isSubnet ? subNet.IsValid() : netAddr.IsValid()))
+    //       throw JSONRPCError(RPC_CLIENT_INVALID_IP_OR_SUBNET, "Error: Invalid IP/Subnet");
+    // RPC_CLIENT_INVALID_IP_OR_SUBNET = -30 (protocol.h:63). Previously hotbuns
+    // performed no IP validation at all. (Ported from rustoshi 980a31d.)
+    if (!this.isValidIpOrSubnet(ip)) {
+      throw this.rpcError(
+        RPCErrorCodes.CLIENT_INVALID_IP_OR_SUBNET,
+        "Error: Invalid IP/Subnet"
+      );
+    }
 
     if (command === "add") {
       const bantime = typeof bantimeParam === "number" ? bantimeParam : 24 * 60 * 60;

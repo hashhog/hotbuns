@@ -548,6 +548,15 @@ export class PeerManager {
   private anchors: Array<{ host: string; port: number }>;
   /** Track inbound peers for eviction */
   private inboundPeers: Set<string>;
+  /**
+   * Manually-added nodes registered via the `addnode "add"` RPC (Core's
+   * CConnman::m_added_nodes). Distinct from {@link peers} (the live connection
+   * set): a node stays "added" across connect/disconnect cycles. Backs the
+   * RPC_CLIENT_NODE_ALREADY_ADDED (-23) / RPC_CLIENT_NODE_NOT_ADDED (-24)
+   * error parity for addnode (Core rpc/net.cpp:361-369). Keyed by the exact
+   * "host:port" string passed to addnode.
+   */
+  private addedNodes: Set<string> = new Set();
 
   /**
    * Bucketed Core CAddrMan bridged onto the live address store.
@@ -1509,6 +1518,37 @@ export class PeerManager {
         info.banScore = 100; // Mark as banned in known addresses too
       }
     }
+  }
+
+  /**
+   * Register a node in the manually-added-node list (Core CConnman::AddNode).
+   * Mirrors net.cpp:361 — returns false if the node was already added (the
+   * addnode "add" caller maps that to RPC_CLIENT_NODE_ALREADY_ADDED -23),
+   * true if it was newly added.
+   */
+  addAddedNode(key: string): boolean {
+    if (this.addedNodes.has(key)) {
+      return false;
+    }
+    this.addedNodes.add(key);
+    return true;
+  }
+
+  /**
+   * Remove a node from the manually-added-node list (Core
+   * CConnman::RemoveAddedNode). Mirrors net.cpp:367 — returns false if the node
+   * was not in the added list (the addnode "remove" caller maps that to
+   * RPC_CLIENT_NODE_NOT_ADDED -24), true if it was present and removed.
+   */
+  removeAddedNode(key: string): boolean {
+    return this.addedNodes.delete(key);
+  }
+
+  /**
+   * Snapshot of the manually-added-node keys (for getaddednodeinfo / tests).
+   */
+  getAddedNodes(): string[] {
+    return Array.from(this.addedNodes);
   }
 
   /**

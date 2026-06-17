@@ -1232,7 +1232,12 @@ describe("RPCServer", () => {
       const result = await rpcRequest(testPort, "getblockhash", [200]);
 
       expect(result.error).toBeDefined();
-      expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+      // Core parity: getblockhash out-of-range -> RPC_INVALID_PARAMETER (-8),
+      // not the JSON-RPC transport code INVALID_PARAMS (-32602).
+      // (Ported from rustoshi ee86d76; bitcoin-core rpc/blockchain.cpp.)
+      expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMETER);
+      expect(result.error.code).toBe(-8);
+      expect(result.error.message).toBe("Block height out of range");
     });
 
     it("should reject non-integer height", async () => {
