@@ -3224,46 +3224,69 @@ export class PeerManager {
 
   /**
    * Load persisted addresses from disk.
+   *
+   * The bucketed {@link AddrMan} (Core CAddrMan) is the persisted source of
+   * truth: peers.dat now holds {@link AddrMan.serialize} output, so the NEW/
+   * TRIED placement and the per-manager nKey salt survive a restart (Core
+   * addrman.cpp Load on startup). After restoring the addrman we re-hydrate the
+   * flat {@link knownAddresses} map from it so the live getaddr / outbound /
+   * fixed-seed paths (which still read the flat map) have their learned peer
+   * set back. Corrupt / truncated / wrong-version input cold-starts cleanly
+   * (deserialize returns null) without wiping the in-memory addrman.
    */
   private async loadAddresses(): Promise<void> {
     const path = `${this.config.datadir}/peers.dat`;
     try {
       const file = Bun.file(path);
-      if (await file.exists()) {
-        const data = await file.arrayBuffer();
-        const buffer = Buffer.from(data);
-        const addresses = deserializePeerAddresses(buffer);
-        // A peers.dat written before the cap existed (or by an older build)
-        // may hold more than KNOWN_ADDRESSES_MAX entries. Keep the newest by
-        // lastSeen so a stale oversized file can't reload the map uncapped.
-        addresses.sort((a, b) => b.lastSeen - a.lastSeen);
-        for (const info of addresses) {
-          if (this.knownAddresses.size >= KNOWN_ADDRESSES_MAX) break;
-          const key = `${info.host}:${info.port}`;
-          this.knownAddresses.set(key, info);
-        }
+      if (!(await file.exists())) return;
+      const text = await file.text();
+      // deserialize defaults groupFn to getNetGroup — the same resolver the live
+      // `new AddrMan()` uses — so restored NEW/TRIED placement matches runtime.
+      const restored = AddrMan.deserialize(text);
+      if (!restored) return; // corrupt / empty / wrong-version -> cold start
+      this.addrMan = restored;
+
+      // Re-hydrate the flat live store from the restored bucketed addrman so the
+      // getaddr / outbound / fixed-seed paths see the persisted peer set. Newest
+      // by nTime first, capped at KNOWN_ADDRESSES_MAX (belt-and-braces ceiling).
+      const entries = [
+        ...this.addrMan.getEntries(false),
+        ...this.addrMan.getEntries(true),
+      ].sort((a, b) => b.nTime - a.nTime);
+      for (const e of entries) {
+        if (this.knownAddresses.size >= KNOWN_ADDRESSES_MAX) break;
+        const key = `${e.host}:${e.port}`;
+        if (this.knownAddresses.has(key)) continue;
+        this.knownAddresses.set(key, {
+          host: e.host,
+          port: e.port,
+          services: e.services,
+          lastSeen: e.nTime * 1000,
+          banScore: 0,
+          lastConnected: e.lastSuccess * 1000,
+          rawAddr: e.rawAddr,
+        });
       }
     } catch {
-      // No saved addresses or read error
+      // No saved addresses or read error -> cold start.
     }
   }
 
   /**
    * Save known addresses to disk.
+   *
+   * Persists the bucketed {@link AddrMan} (Core CAddrMan) — the source of truth
+   * for feeler select / good / attempt — to peers.dat via
+   * {@link AddrMan.serialize} (Core addrman.cpp Save on shutdown). The flat
+   * {@link knownAddresses} map is kept in lockstep with the addrman on every
+   * insertion ({@link mirrorToAddrMan}), so serializing the addrman captures the
+   * learned peer set together with its NEW/TRIED placement and nKey salt.
    */
   private async saveAddresses(): Promise<void> {
     const path = `${this.config.datadir}/peers.dat`;
     try {
-      let addresses = Array.from(this.knownAddresses.values());
-      // Hard-cap what we persist so peers.dat can't grow monotonically across
-      // restarts. The in-memory map is already capped at KNOWN_ADDRESSES_MAX,
-      // so this is a belt-and-braces ceiling: keep the freshest by lastSeen.
-      if (addresses.length > KNOWN_ADDRESSES_MAX) {
-        addresses.sort((a, b) => b.lastSeen - a.lastSeen);
-        addresses = addresses.slice(0, KNOWN_ADDRESSES_MAX);
-      }
-      const buffer = serializePeerAddresses(addresses);
-      await Bun.write(path, buffer);
+      const text = this.addrMan.serialize();
+      await Bun.write(path, text);
     } catch {
       // Write error
     }
