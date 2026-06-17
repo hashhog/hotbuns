@@ -714,45 +714,74 @@ interface MempoolUTXO {
 // Ephemeral Anchor Policy Functions
 // ============================================================================
 
+/** Maximum script size (script/script.h MAX_SCRIPT_SIZE). */
+const MAX_SCRIPT_SIZE = 10000;
+
 /**
- * Get the dust threshold for a given scriptPubKey.
+ * Get the dust threshold (in satoshis) for an output with the given
+ * scriptPubKey at the given dust relay fee rate (sat/kvB).
  *
- * Dust is defined as an output whose value is less than the cost to spend it.
- * The threshold depends on the output type (witness vs non-witness).
+ * Faithful to Core `GetDustThreshold` (policy/policy.cpp:27-63):
  *
- * Default dust relay fee: 3000 sat/kvB
- * - Segwit output: 98 * 3000 / 1000 = 294 sats
- * - Non-segwit output: 182 * 3000 / 1000 = 546 sats
+ *   nSize = GetSerializeSize(txout) + spending_cost
+ *         = (8 + CompactSize(scriptlen) + scriptlen) + spending_cost
+ * where the spending cost estimates the CTxIn needed to spend it:
+ *   * witness program: 32 + 4 + 1 + (107 / 4) + 4 = 67  (WITNESS_SCALE_FACTOR=4)
+ *   * non-witness:     32 + 4 + 1 + 107 + 4                          = 148
+ * The witness branch is Core's `IsWitnessProgram` test — uniform across all
+ * witness versions/sizes (P2WPKH, P2WSH, P2TR, unknown-witness all take the
+ * segwit-discounted 67), NOT a per-script-type table.
+ *
+ * threshold = dustRelayFee.GetFee(nSize) = CeilDiv(nSize * fee, 1000)
+ * (Core `CFeeRate::GetFee` → `FeePerVSize::EvaluateFeeUp` → `CeilDiv`,
+ * util/feefrac.h:212). Unspendable scripts (OP_RETURN, oversize) return 0.
+ *
+ * Default dust relay fee 3000 sat/kvB yields the canonical Core thresholds:
+ * P2PKH 546, P2SH 540, P2WPKH 294, P2WSH 330, P2TR 330.
+ *
+ * NON-consensus: mempool RELAY policy (IsStandardTx / ephemeral-anchor),
+ * never block/tx validation.
  */
-export function getDustThreshold(scriptPubKey: Buffer): bigint {
-  // OP_RETURN is unspendable, dust threshold is 0
-  if (scriptPubKey.length > 0 && scriptPubKey[0] === 0x6a) {
+export function getDustThreshold(
+  scriptPubKey: Buffer,
+  dustRelayFee: number = DUST_RELAY_FEE,
+): bigint {
+  // Core: txout.scriptPubKey.IsUnspendable() ⇒ 0.
+  // IsUnspendable() = (size > 0 && first == OP_RETURN) || size > MAX_SCRIPT_SIZE.
+  if (
+    (scriptPubKey.length > 0 && scriptPubKey[0] === 0x6a) ||
+    scriptPubKey.length > MAX_SCRIPT_SIZE
+  ) {
     return 0n;
   }
 
-  // Check if witness program (OP_0/OP_1-16 + push)
-  const isWitness = scriptPubKey.length >= 4 &&
-    (scriptPubKey[0] === 0x00 || (scriptPubKey[0] >= 0x51 && scriptPubKey[0] <= 0x60)) &&
-    scriptPubKey[1] >= 2 && scriptPubKey[1] <= 40 &&
-    scriptPubKey.length === scriptPubKey[1] + 2;
+  // GetSerializeSize(txout) = 8 (value) + CompactSize(scriptlen) + scriptlen.
+  const scriptLen = scriptPubKey.length;
+  let prefix: bigint;
+  if (scriptLen < 0xfd) prefix = 1n;
+  else if (scriptLen <= 0xffff) prefix = 3n;
+  else prefix = 5n;
+  let nSize = 8n + prefix + BigInt(scriptLen);
+
+  // Core: CScript::IsWitnessProgram — size in [4,42], first byte OP_0 or
+  // OP_1..OP_16, and program-length-byte + 2 == size.
+  const isWitness =
+    scriptLen >= 4 &&
+    scriptLen <= 42 &&
+    (scriptPubKey[0] === 0x00 ||
+      (scriptPubKey[0] >= 0x51 && scriptPubKey[0] <= 0x60)) &&
+    scriptPubKey[1] + 2 === scriptLen;
 
   if (isWitness) {
-    // Segwit: output size + input size with witness discount
-    // nSize = output_size + (32 + 4 + 1 + (107/4) + 4) = output_size + 67.75
-    // For typical P2WPKH (31 bytes output): 31 + 67 = 98 bytes
-    // At 3000 sat/kvB: 98 * 3000 / 1000 = 294 sats
-    const outputSize = BigInt(scriptPubKey.length + 8 + 1); // value (8) + scriptLen (1) + script
-    const inputSize = 32n + 4n + 1n + 26n + 4n; // prevout + vout + scriptLen + sig/4 + sequence
-    return ((outputSize + inputSize) * BigInt(DUST_RELAY_FEE)) / 1000n;
+    // 107 / WITNESS_SCALE_FACTOR (=4) = 26 (BigInt floor), segwit-discounted.
+    nSize += 32n + 4n + 1n + 107n / 4n + 4n; // 67
   } else {
-    // Non-segwit: output size + input size
-    // nSize = output_size + (32 + 4 + 1 + 107 + 4) = output_size + 148
-    // For typical P2PKH (34 bytes output): 34 + 148 = 182 bytes
-    // At 3000 sat/kvB: 182 * 3000 / 1000 = 546 sats
-    const outputSize = BigInt(scriptPubKey.length + 8 + 1);
-    const inputSize = 32n + 4n + 1n + 107n + 4n;
-    return ((outputSize + inputSize) * BigInt(DUST_RELAY_FEE)) / 1000n;
+    nSize += 32n + 4n + 1n + 107n + 4n; // 148
   }
+
+  // CFeeRate::GetFee(nSize) = CeilDiv(nSize * dustRelayFee, 1000).
+  const fee = BigInt(dustRelayFee);
+  return (nSize * fee + 999n) / 1000n;
 }
 
 /**

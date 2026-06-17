@@ -1165,6 +1165,46 @@ describe("RPCServer", () => {
       expect(result.result.length).toBe(1);
       expect(result.result[0].addr).toBe("192.168.1.1:8333");
     });
+
+    it("emits Core v31.99 fields: last_inv_sequence + inv_to_send, no startingheight", async () => {
+      mockPeerManager.addMockPeer({
+        host: "192.168.1.2",
+        port: 8333,
+        versionPayload: {
+          version: 70016,
+          services: 1n,
+          userAgent: "/Satoshi:31.99.0/",
+          startHeight: 800000,
+          relay: true,
+        },
+      });
+
+      const result = await rpcRequest(testPort, "getpeerinfo");
+      const peer = result.result[0];
+
+      // Core rpc/net.cpp:243-244 emits these two NUM fields.
+      expect(typeof peer.last_inv_sequence).toBe("number");
+      expect(typeof peer.inv_to_send).toBe("number");
+      // Core v31.99 removed startingheight from getpeerinfo entirely.
+      expect("startingheight" in peer).toBe(false);
+
+      // Wire order: relaytxes -> last_inv_sequence -> inv_to_send -> lastsend
+      // (Core rpc/net.cpp:242-245). JS object key order is serialization order.
+      const keys = Object.keys(peer);
+      const iRelay = keys.indexOf("relaytxes");
+      const iLastInv = keys.indexOf("last_inv_sequence");
+      const iInvToSend = keys.indexOf("inv_to_send");
+      const iLastsend = keys.indexOf("lastsend");
+      expect(iRelay).toBeGreaterThanOrEqual(0);
+      expect(iLastInv).toBe(iRelay + 1);
+      expect(iInvToSend).toBe(iLastInv + 1);
+      expect(iLastsend).toBe(iInvToSend + 1);
+
+      // bip152_hb_from -> presynced_headers immediately, no startingheight gap.
+      const iHbFrom = keys.indexOf("bip152_hb_from");
+      const iPresync = keys.indexOf("presynced_headers");
+      expect(iPresync).toBe(iHbFrom + 1);
+    });
   });
 
   describe("getnetworkinfo", () => {
