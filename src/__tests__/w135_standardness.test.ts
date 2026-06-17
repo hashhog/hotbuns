@@ -560,6 +560,115 @@ describe("W135 — Standardness rules (IsStandardTx)", () => {
   });
 
   // -------------------------------------------------------------------------
+  // Ported from rustoshi 269681b / a11cdd4 — NON-consensus relay standardness
+  // (Core Solver / MatchMultisig parity). getScriptType + getBareMultisigParams
+  // are reached only from mempool addTransaction (IsStandardTx /
+  // ValidateInputsStandardness) and wallet PSBT — never from block/tx consensus
+  // validation (verified: block.ts / validation/tx.ts do not reference them).
+  // -------------------------------------------------------------------------
+
+  describe("Ported(269681b): WITNESS_UNKNOWN classifies v1+ programs, v0 odd-size is nonstandard", () => {
+    // Core Solver (script/solver.cpp:154-178): a witness program with
+    // version != 0 → WITNESS_UNKNOWN; a v0 program whose size is not {20,32} →
+    // NONSTANDARD. Core does NOT exclude OP_1 from witness_unknown.
+
+    test("v1 (OP_1) 16-byte witness program → witness_unknown (NOT p2tr, NOT nonstandard)", () => {
+      // OP_1 + 16-byte push. Not P2TR (needs 32B), not P2A (needs the 0x4e73 anchor).
+      const v1_16 = Buffer.concat([Buffer.from([0x51, 0x10]), Buffer.alloc(16)]);
+      // Mutation guard: an OP_2..OP_16-only branch (excluding OP_1) would mis-
+      // classify this as nonstandard.
+      expect(getScriptType(v1_16)).toBe("witness_unknown");
+    });
+
+    test("v1 16-byte program is a KNOWN witness shape, not nonstandard (vs v0 odd-size)", () => {
+      // The classifier-level fix: a v1 16-byte program is a recognised
+      // witness_unknown shape, whereas a v0 program of the SAME odd size is
+      // nonstandard. This is the version != 0 branch of Core's Solver. (Whether
+      // the mempool then chooses to relay witness_unknown OUTPUTS is a separate
+      // policy decision; G07 pins hotbuns' current output-gate behaviour.)
+      const v1_16 = Buffer.concat([Buffer.from([0x51, 0x10]), Buffer.alloc(16)]);
+      const v0_16 = Buffer.concat([Buffer.from([0x00, 0x10]), Buffer.alloc(16)]);
+      expect(getScriptType(v1_16)).toBe("witness_unknown");
+      expect(getScriptType(v0_16)).toBe("nonstandard");
+    });
+
+    test("v16 (OP_16) 40-byte witness program → witness_unknown", () => {
+      const v16_40 = Buffer.concat([Buffer.from([0x60, 0x28]), Buffer.alloc(40)]);
+      expect(getScriptType(v16_40)).toBe("witness_unknown");
+    });
+
+    test("v0 30-byte witness program → nonstandard (Core solver.cpp:177), NOT witness_unknown", () => {
+      // A v0 program with a non-{20,32} size is NONSTANDARD per Core. The old
+      // hotbuns code returned witness_unknown for any witness program; this is
+      // the divergence fixed by the port.
+      const v0_30 = Buffer.concat([Buffer.from([0x00, 0x1e]), Buffer.alloc(30)]);
+      expect(getScriptType(v0_30)).toBe("nonstandard");
+    });
+
+    test("control: 50-byte all-OP_1 (not a witness program) → nonstandard", () => {
+      const big = Buffer.alloc(50, 0x51);
+      expect(getScriptType(big)).toBe("nonstandard");
+    });
+  });
+
+  describe("Ported(a11cdd4): bare-multisig classifier accepts PUSHDATA-prefixed pubkeys", () => {
+    // Core MatchMultisig (script/solver.cpp:85-105): each key is read via
+    // GetOp (decodes direct + PUSHDATA1/2/4) and accepted iff CPubKey::ValidSize
+    // (33 or 65). So a pubkey pushed via OP_PUSHDATA1 is as standard as a direct push.
+
+    test("1-of-1 with OP_PUSHDATA1-prefixed 33B pubkey parses as multisig", () => {
+      // OP_1  OP_PUSHDATA1 0x21 <33B>  OP_1  OP_CHECKMULTISIG
+      const ms = Buffer.concat([
+        Buffer.from([0x51, 0x4c, 0x21]), Buffer.alloc(33),
+        Buffer.from([0x51, 0xae]),
+      ]);
+      // Mutation guard: a direct-push-only (0x21/0x41) walk returns null here.
+      expect(getBareMultisigParams(ms)).toEqual({ m: 1, n: 1 });
+      expect(getScriptType(ms)).toBe("multisig");
+    });
+
+    test("PUSHDATA1-prefixed bare-multisig OUTPUT admitted standard (relay)", async () => {
+      const ms = Buffer.concat([
+        Buffer.from([0x51, 0x4c, 0x21]), Buffer.alloc(33),
+        Buffer.from([0x51, 0xae]),
+      ]);
+      const tx = buildTx({
+        outputs: [
+          { value: 9_000_000n, scriptPubKey: ms },
+          { value: 0n, scriptPubKey: OP_RETURN_BARE },
+        ],
+      });
+      const result = await mempool.addTransaction(tx);
+      expect(result.error ?? "").not.toContain("non-standard script type");
+      expect(result.error ?? "").not.toContain("bare multisig exceeds");
+    });
+
+    test("control: OP_PUSHDATA1 32B (not a valid pubkey size) → null / nonstandard", () => {
+      // Proves the matcher keys on CPubKey::ValidSize (33/65), not accept-everything.
+      const bad = Buffer.concat([
+        Buffer.from([0x51, 0x4c, 0x20]), Buffer.alloc(32),
+        Buffer.from([0x51, 0xae]),
+      ]);
+      expect(getBareMultisigParams(bad)).toBeNull();
+      expect(getScriptType(bad)).toBe("nonstandard");
+    });
+
+    test("control: 65B uncompressed pubkey via OP_PUSHDATA1 also accepted", () => {
+      const ms = Buffer.concat([
+        Buffer.from([0x51, 0x4c, 0x41]), Buffer.alloc(65),
+        Buffer.from([0x51, 0xae]),
+      ]);
+      expect(getBareMultisigParams(ms)).toEqual({ m: 1, n: 1 });
+    });
+
+    test("regression: direct-push 33B pubkey still parses (no break of existing path)", () => {
+      const pub33 = Buffer.concat([Buffer.from([0x21]), Buffer.alloc(33)]);
+      const ms = Buffer.concat([Buffer.from([0x51]), pub33, Buffer.from([0x51, 0xae])]);
+      expect(getBareMultisigParams(ms)).toEqual({ m: 1, n: 1 });
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // BUG-10 P3 G25 — bare-multisig m/n not minimally-encoded per Core
   // -------------------------------------------------------------------------
 
