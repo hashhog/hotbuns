@@ -165,6 +165,51 @@ describe("Extended Key Encoding", () => {
 });
 
 // =============================================================================
+// BIP-32 depth-byte overflow guard
+//
+// Behavioral parity with Core's CExtKey::Derive (key.cpp:483) /
+// CExtPubKey::Derive (pubkey.cpp:416):
+//   if (nDepth == std::numeric_limits<unsigned char>::max()) return false;
+// Deriving a child from a parent already at depth 255 must FAIL (the 1-byte
+// depth field would overflow). A parent at depth 254 must still derive to
+// exactly 255 (no off-by-one). The depth field is a single byte, so 255 is the
+// max; a higher value can only arrive via a forged/parsed xpub, which is what
+// this guard defends against.
+// =============================================================================
+
+describe("BIP-32 depth-byte overflow guard", () => {
+  // Use a real, valid extended public key and override only its depth byte so
+  // getPubKey starts derivation from the chosen depth. Index 0 is an unhardened
+  // child (derivable from a public key).
+  test("refuses to derive from a parent already at depth 255", () => {
+    const extkey = decodeExtendedKey(TEST_XPUB);
+    extkey.depth = 255;
+    const provider = new BIP32PubkeyProvider(extkey, [0], DeriveType.NO_RANGE);
+    expect(() => provider.getPubKey(0)).toThrow();
+  });
+
+  test("derives to exactly depth 255 from a depth-254 parent (no off-by-one)", () => {
+    const extkey = decodeExtendedKey(TEST_XPUB);
+    extkey.depth = 254;
+    const provider = new BIP32PubkeyProvider(extkey, [0], DeriveType.NO_RANGE);
+    const pub = provider.getPubKey(0);
+    expect(pub.length).toBe(33); // one derivation step succeeded -> depth 255
+  });
+
+  test("refuses the step that would cross 255 along a multi-step path", () => {
+    // Parent at depth 254: first step -> 255 (ok), second step -> overflow.
+    const extkey = decodeExtendedKey(TEST_XPUB);
+    extkey.depth = 254;
+    const provider = new BIP32PubkeyProvider(
+      extkey,
+      [0, 0],
+      DeriveType.NO_RANGE
+    );
+    expect(() => provider.getPubKey(0)).toThrow();
+  });
+});
+
+// =============================================================================
 // Descriptor Parsing Tests
 // =============================================================================
 

@@ -1248,7 +1248,12 @@ function parseOlder(state: ParserState): OlderNode {
 
 function parseAfter(state: ParserState): AfterNode {
   const locktime = parseNumber(state);
-  if (locktime <= 0 || locktime >= 0x100000000) {
+  // BIP-65 / miniscript: the absolute-locktime value must satisfy
+  // `1 <= n < 2^31`. n == 0 is meaningless and any value with bit 31 set is
+  // outside the range an `after()` can express, so Core rejects both.
+  // Mirrors `*num < 1 || *num >= 0x80000000L` in
+  // bitcoin-core/src/script/miniscript.h:2027 (matching parseOlder above).
+  if (locktime <= 0 || locktime >= 0x80000000) {
     throw new Error(`Invalid locktime: ${locktime}`);
   }
   return { type: "after", locktime };

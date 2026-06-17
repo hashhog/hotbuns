@@ -119,6 +119,28 @@ describe("Miniscript Parsing", () => {
       }
     });
 
+    // BIP-65/BIP-68 + miniscript bound: older(n)/after(n) are valid only for
+    // 1 <= n < 2^31. Core's parser rejects any value with bit 31 set
+    // (`*num < 1 || *num >= 0x80000000L`,
+    // bitcoin-core/src/script/miniscript.h:2027 (after) / :2034 (older)).
+    // For after() bit 31 is simply out of the expressible range; for older()
+    // it collides with the BIP-68 disable flag.
+    test("older(2^31-1) parses, older(2^31)/older(2^32-1) reject", () => {
+      expect(parseMiniscript("older(2147483647)").type).toBe("older"); // 2^31-1
+      expect(() => parseMiniscript("older(2147483648)")).toThrow(); // 2^31
+      expect(() => parseMiniscript("older(4294967295)")).toThrow(); // 2^32-1
+      expect(() => parseMiniscript("older(0)")).toThrow();
+    });
+
+    test("after(2^31-1) parses, after(2^31)/after(2^32-1) reject", () => {
+      expect(parseMiniscript("after(2147483647)").type).toBe("after"); // 2^31-1
+      // Before the fix parseAfter used `>= 0x100000000` (2^32), so after(2^31)
+      // and after(2^32-1) parsed — Core rejects both at `>= 0x80000000`.
+      expect(() => parseMiniscript("after(2147483648)")).toThrow(); // 2^31
+      expect(() => parseMiniscript("after(4294967295)")).toThrow(); // 2^32-1
+      expect(() => parseMiniscript("after(0)")).toThrow();
+    });
+
     test("parses sha256(H)", () => {
       const node = parseMiniscript(`sha256(${TEST_SHA256_HASH})`);
       expect(node.type).toBe("sha256");

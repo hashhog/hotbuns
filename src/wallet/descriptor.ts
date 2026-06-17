@@ -72,6 +72,15 @@ const HARDENED_OFFSET = 0x80000000;
 /** Largest BIP-32 child index (32-bit) */
 const BIP32_MAX_INDEX = 0xffffffff;
 
+/**
+ * Largest BIP-32 depth value (the depth field is a single byte). Deriving a
+ * child from a parent already at this depth would overflow the byte, so Core
+ * refuses it: `CExtKey::Derive` (key.cpp:483) and `CExtPubKey::Derive`
+ * (pubkey.cpp:416) both `if (nDepth == std::numeric_limits<unsigned
+ * char>::max()) return false;`.
+ */
+const BIP32_MAX_DEPTH = 0xff;
+
 /** secp256k1 curve order */
 const CURVE_ORDER = BigInt(
   "0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141"
@@ -420,6 +429,13 @@ export class BIP32PubkeyProvider implements PubkeyProvider {
     let currentChainCode = this.extkey.chainCode;
     let isPrivate = this.extkey.isPrivate;
 
+    // BIP-32 depth byte starts at the parsed extended key's depth and is
+    // incremented by one per derivation step. Core refuses a derivation once
+    // the parent is already at the max depth (the 1-byte field would overflow):
+    // `CExtKey::Derive` (key.cpp:483) / `CExtPubKey::Derive` (pubkey.cpp:416)
+    // `if (nDepth == std::numeric_limits<unsigned char>::max()) return false;`.
+    let depth = this.extkey.depth;
+
     // Derive along the fixed path. BIP-32 spec: on parse256(IL) >= n or
     // k_i == 0, skip to next index (preserving hardened/non-hardened flag).
     const tryDerive = (
@@ -427,6 +443,13 @@ export class BIP32PubkeyProvider implements PubkeyProvider {
       chainCode: Buffer,
       startIndex: number
     ): { key: Buffer; chainCode: Buffer; usedIndex: number } => {
+      // Mirror Core's depth-byte guard: refuse to derive when the parent is
+      // already at depth 255 (key.cpp:483 / pubkey.cpp:416).
+      if (depth >= BIP32_MAX_DEPTH) {
+        throw new Error(
+          `BIP-32 derivation past depth ${BIP32_MAX_DEPTH} (depth byte would overflow)`
+        );
+      }
       const isHardened = startIndex >= HARDENED_OFFSET;
       const maxIndex = isHardened ? BIP32_MAX_INDEX : HARDENED_OFFSET - 1;
       let idx = startIndex;
@@ -453,6 +476,7 @@ export class BIP32PubkeyProvider implements PubkeyProvider {
       const derived = tryDerive(currentKey, currentChainCode, childIndex);
       currentKey = derived.key;
       currentChainCode = derived.chainCode;
+      depth += 1; // one BIP-32 Derive step (Core: out.nDepth = nDepth + 1)
     }
 
     // If range, derive the final index
