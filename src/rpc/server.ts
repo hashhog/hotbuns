@@ -6377,6 +6377,12 @@ export class RPCServer {
         services: peer.versionPayload?.services.toString(16).padStart(16, "0") ?? "0000000000000000",
         servicesnames: this.getServiceNames(peer.versionPayload?.services ?? 0n),
         relaytxes: peer.versionPayload?.relay ?? true,
+        // Core rpc/net.cpp:243-244 emits these two NUM fields between relaytxes
+        // and lastsend. hotbuns does not track per-peer INV sequence / send queue
+        // at the manager layer, so emit 0 (same pattern as addr_processed /
+        // addr_rate_limited below, and matching rustoshi 077eb2f).
+        last_inv_sequence: 0,
+        inv_to_send: 0,
         lastsend: peer.lastSend > 0 ? Math.floor(peer.lastSend / 1000) : 0,
         lastrecv: peer.lastRecv > 0 ? Math.floor(peer.lastRecv / 1000) : 0,
         last_transaction: peer.lastTxTime > 0 ? Math.floor(peer.lastTxTime / 1000) : 0,
@@ -6394,7 +6400,9 @@ export class RPCServer {
         inbound: false,
         bip152_hb_to: false,
         bip152_hb_from: false,
-        startingheight: peer.versionPayload?.startHeight ?? 0,
+        // Core v31.99 removed `startingheight` from getpeerinfo (rpc/net.cpp now
+        // pushes presynced_headers directly after bip152_hb_from). Dropped here
+        // for wire parity (matching rustoshi 528045a).
         presynced_headers: -1,
         synced_headers: -1,
         synced_blocks: -1,
