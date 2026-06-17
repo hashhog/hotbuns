@@ -14,7 +14,7 @@ import type { PeerManager } from "../p2p/manager.js";
 import type { NetworkMessage, InvVector } from "../p2p/messages.js";
 import { InvType } from "../p2p/messages.js";
 import { BanScores } from "../p2p/manager.js";
-import { HeaderSync } from "./headers.js";
+import { HeaderSync, type HeaderChainEntry } from "./headers.js";
 import type { ChainStateManager } from "../chain/state.js";
 import type { Mempool } from "../mempool/mempool.js";
 import {
@@ -250,6 +250,20 @@ const MAX_DOWNLOADED_BUFFER = 32;
  */
 const MIN_BLOCKS_TO_KEEP = 288;
 
+/**
+ * Maximum depth (number of blocks below the active validated tip) the
+ * fork-aware block-download descent will walk to find the fork point and
+ * lower the download floor.  Mirrors the `MAX_REORG_DEPTH = 100` cap used by
+ * `ChainStateManager.reorganize()` (src/chain/state.ts) and
+ * `BlockSync.handleReorgUtxoAndCollect`: a reorg deeper than this would be
+ * refused by the reorg dispatch anyway, so there is no point requesting the
+ * bridging bodies for it.  Bounds the descent so a pathologically deep or
+ * malformed competing fork cannot drag the download floor (and the in-flight
+ * request set) down without limit.  (Bitcoin Core has no fixed reorg-depth
+ * cap, but hashhog bounds it consistently across the reorg machinery.)
+ */
+const MAX_FORK_DOWNLOAD_DEPTH = 100;
+
 /** How often (in connected blocks) to ask the prune manager whether files
  *  should be pruned.  Bitcoin Core checks during chainstate flushes; hotbuns
  *  flushes every FLUSH_INTERVAL (2000) blocks during IBD, but we run the
@@ -329,6 +343,13 @@ export class BlockSync {
 
   /** Whether IBD is complete. */
   private ibdComplete: boolean;
+  // One-way latch: set true the FIRST time initial IBD completes, NEVER flipped
+  // back. ibdComplete is transiently set false again when a heavier competing
+  // fork is discovered (so requestBlocks re-enters the download path), which
+  // would wrongly gate the reorg-drop fork-body storage; this latch records
+  // "the node has synced at least once" so maybeStoreForkBody fires for a
+  // competing fork at an established tip but NOT during genuine initial IBD.
+  private hasCompletedInitialSync: boolean = false;
 
   /** Running flag. */
   private running: boolean;
@@ -348,6 +369,16 @@ export class BlockSync {
    *  site that returns false. Read by the bounded-retry banner so it can
    *  classify the failure as consensus vs chainstate vs unknown. */
   private lastConnectError: string;
+
+  /** GAP3 fix (reorg-drop part 2/2): hashHex of competing-fork ("side-branch")
+   *  bodies BELOW the active frontier that we have already persisted to disk via
+   *  `maybeStoreForkBody`. The request loop consults this set so an evicted-but-
+   *  on-disk bridging body is not endlessly re-requested while we wait for the
+   *  fork tip to arrive and drive the reorg. Cleared whenever the frontier rolls
+   *  back (the bodies may need re-evaluation) and pruned as entries are connected
+   *  on the active chain. Bounded by MAX_FORK_DOWNLOAD_DEPTH-worth of bridging
+   *  bodies per fork. */
+  private forkBodiesOnDisk: Set<string> = new Set();
 
   /**
    * Tracks which peer (peerKey = "host:port") delivered each downloaded block.
@@ -648,6 +679,12 @@ export class BlockSync {
         this.state.pendingBlocks.delete(hex);
       }
     }
+    // GAP3 fix (reorg-drop part 2/2): the frontier moved, so the set of
+    // suppressed competing-fork bodies must be re-evaluated from scratch — clear
+    // the on-disk markers (the bodies themselves stay on disk; only the
+    // re-request-suppression hint is dropped). Purely an optimization marker:
+    // this does NOT alter invalidateblock's rollback/reorg semantics.
+    this.forkBodiesOnDisk.clear();
     console.log(
       `[invalidateblock] block-sync frontier rolled back to height ${tipHeight} ` +
         `(nextHeightToProcess=${newFrontier})`
@@ -1008,7 +1045,22 @@ export class BlockSync {
     // processing headers asynchronously, so bestHeader was stale.
     this.headerSync.onHeadersProcessed((newTipHeight: number) => {
       if (!this.running) return;
-      if (newTipHeight >= this.state.nextHeightToProcess) {
+      // GAP2 fix (reorg-drop part 1/2): a heavier competing branch that forks
+      // BELOW the active validated tip can have a header tip whose HEIGHT is at
+      // or below the processing frontier (more work per block, fewer blocks),
+      // so the height-only `newTipHeight >= nextHeightToProcess` test would miss
+      // it and never re-enter the download path — leaving the fork's bridging
+      // bodies unrequested. Also re-enter when the best header now carries MORE
+      // WORK than the active validated tip (Bitcoin Core moves chain selection
+      // on greater nChainWork, not greater height). `lowerDownloadFloorForFork`
+      // inside `requestBlocks` then lowers the floor to the fork point. For a
+      // normal extension this collapses to the original height condition.
+      const bestHeader = this.headerSync.getBestHeader();
+      const moreWorkThanActiveTip =
+        bestHeader !== null &&
+        this.chainStateManager !== null &&
+        bestHeader.chainWork > this.chainStateManager.getBestBlock().chainWork;
+      if (newTipHeight >= this.state.nextHeightToProcess || moreWorkThanActiveTip) {
         if (this.ibdComplete) {
           this.ibdComplete = false;
         }
@@ -1051,6 +1103,16 @@ export class BlockSync {
         return;
       }
 
+      // GAP3 fix (reorg-drop part 2/2): a below-frontier competing-fork body
+      // delivered unsolicited (inv-driven, post-IBD) must NOT be dropped by the
+      // `height >= nextHeightToProcess` gate below — it is a bridging body the
+      // reorg dispatch needs on disk. Persist it as a side branch; the fork tip
+      // (which is at/above the frontier) then drives the reorg.
+      if (await this.maybeStoreForkBody(block, blockHash, hashHex)) {
+        await this.processOrderedBlocks();
+        return;
+      }
+
       // Store it if it's useful and we have room in the buffer
       if (headerEntry.height >= this.state.nextHeightToProcess &&
           this.state.downloadedBlocks.size < MAX_DOWNLOADED_BUFFER) {
@@ -1083,11 +1145,167 @@ export class BlockSync {
     this.state.downloadedBlocks.set(hashHex, block);
     this.downloadedBlockPeers.set(hashHex, peerKey); // G16: track peer source
 
+    // GAP3 fix (reorg-drop part 2/2): if this is a competing-fork body BELOW
+    // the active processing frontier (a bridging body the fork-aware download
+    // floor of part 1 pulled in), persist it to disk as a side branch and stop
+    // here — the reorg dispatch reads it back from disk when the fork TIP
+    // connects. Post-IBD only; a normal active-chain / fork-tip block returns
+    // false and follows the usual ordered-connect path below unchanged.
+    if (await this.maybeStoreForkBody(block, blockHash, hashHex)) {
+      // The fork tip may already be buffered; let processOrderedBlocks fire the
+      // reorg if so, and request any still-missing bridging/tip bodies.
+      await this.processOrderedBlocks();
+      this.requestBlocks();
+      return;
+    }
+
     // Try to process blocks in order
     await this.processOrderedBlocks();
 
     // Request more blocks if needed
     this.requestBlocks();
+  }
+
+  /**
+   * Persist a competing-fork ("side-branch") block body so a later reorg can
+   * read it back.
+   *
+   * A block whose height is BELOW the active processing frontier is not on the
+   * active chain right now, but a future heavier sibling may trigger a reorg.
+   * The reorg dispatch (`handleReorgUtxoAndCollect`, step 3) reconnects the
+   * intermediate fork blocks by reading their bodies via `db.getBlock` — so the
+   * bridging fork bodies MUST be on disk before the fork tip connects.
+   *
+   * Pre-fix (reorg-drop part 2 gap, GAP3) the submitblock path stored these via
+   * `injectBlock`'s inline side-branch code, but the live P2P receive path
+   * (`handleBlock`) only ever buffered downloaded blocks in the in-memory
+   * `downloadedBlocks` map. A below-tip heavier fork arriving over P2P therefore
+   * had its bridging bodies (forkPoint+1 .. activeTip) live ONLY in RAM; when the
+   * fork tip reached `connectBlock`, the reorg dispatch's `db.getBlock` lookups
+   * returned null → "intermediate block body missing" → fall back to the legacy
+   * in-place connect → permanent `view-out-of-sync` wedge. This helper is the
+   * shared store used by BOTH paths so the bodies reach disk identically.
+   *
+   * Idempotent: `db.putBlock` is hash-keyed, so re-storing the same body is a
+   * no-op except for write amplification. Best-effort: a put failure surfaces
+   * later as a "missing block" reorg-dispatch log line, never chain-state
+   * corruption. Mirrors Bitcoin Core's AcceptBlock, which writes a valid block
+   * body to disk regardless of whether it is on the active chain
+   * (validation.cpp::AcceptBlock → SaveBlockToDisk).
+   */
+  private async storeSideBranchBlock(
+    block: Block,
+    blockHash: Buffer,
+    hashHex: string
+  ): Promise<void> {
+    try {
+      await this.db.putBlock(blockHash, serializeBlock(block));
+      // W109 FIX-33: set BLOCK_HAVE_DATA (8) in the block index after writing
+      // the body so FindMostWorkChain / prune / AssumeUTXO see HAVE_DATA on
+      // these blocks. Mirrors Core blockstorage.cpp::WriteBlock which sets
+      // BLOCK_HAVE_DATA before the dirty-index flush.
+      const sideBranchIdx = await this.db.getBlockIndex(blockHash);
+      if (sideBranchIdx && !(sideBranchIdx.status & 8 /* HAVE_DATA */)) {
+        await this.db.updateBlockStatus(
+          blockHash,
+          sideBranchIdx.status | 8 /* HAVE_DATA */,
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `[side-branch] failed to store side-branch block ${hashHex.slice(0, 16)}: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  }
+
+  /**
+   * GAP3 fix (reorg-drop part 2/2): route a passively-received P2P block that is
+   * a competing-fork body BELOW the active processing frontier through the same
+   * side-branch storage the submitblock path uses, instead of dropping it or
+   * leaving it stranded in the in-memory download buffer.
+   *
+   * Returns true when the block was handled as a side-branch body (the caller
+   * must NOT additionally buffer/connect it on the active frontier); false when
+   * the block is a normal active-frontier block and should follow the usual
+   * download-buffer + `processOrderedBlocks` path unchanged.
+   *
+   * Gated to POST-IBD only (mirrors blockbrew part 2, which keeps raw
+   * ConnectBlock during IBD and only routes through the side-branch-aware
+   * ProcessSubmittedBlock at/after the tip): during initial sync blocks arrive
+   * in order and extend the tip; competing forks below the tip are a
+   * steady-state / at-tip phenomenon, and `requestBlocks`'s fork-aware floor
+   * (part 1) only lowers below the active tip once a heavier header chain is
+   * known. The active-tip EXTENSION path is untouched — a block at/above the
+   * frontier returns false immediately, so normal IBD + steady-state extension
+   * connect exactly as before (invariant 1).
+   *
+   * Once the bridging bodies are on disk, the fork TIP block (which IS at/above
+   * the frontier and so connects through `connectBlock`) drives the existing
+   * pre-connect reorg dispatch (`handleReorgUtxoAndCollect`) which reads those
+   * bodies back and switches the active tip to the heavier branch — the same
+   * reorg machinery `invalidateblock` → `resyncFrontierAfterRollback` exercises.
+   */
+  private async maybeStoreForkBody(
+    block: Block,
+    blockHash: Buffer,
+    hashHex: string
+  ): Promise<boolean> {
+    // Only side-branch a competing fork once the node has synced at least once
+    // (NOT during genuine initial IBD). Use the one-way hasCompletedInitialSync
+    // latch, NOT ibdComplete — the latter is transiently flipped false when a
+    // heavier fork is discovered (onHeadersProcessed), which previously left
+    // every bridging fork body un-persisted -> connectBlock found null on disk
+    // -> view-out-of-sync wedge (the original blocker re-manifesting).
+    if (!this.hasCompletedInitialSync) return false;
+    if (!this.chainStateManager) return false;
+
+    const headerEntry = this.headerSync.getHeader(blockHash);
+    if (!headerEntry) return false;
+
+    // Only below-frontier blocks are side-branch bodies; at/above the frontier
+    // is the normal active-chain (or fork-tip) path → leave it to the caller.
+    if (headerEntry.height >= this.state.nextHeightToProcess) return false;
+
+    // Confirm this is a genuine competing-fork body, NOT a block on the active
+    // validated chain (a re-delivered active-chain body must not be treated as a
+    // side branch). We walk the active validated chain's ancestry down to this
+    // block's height and compare the hash at that height: if it differs, this is
+    // a fork body. (Bitcoin Core CChain::Contains / FindFork.)
+    const activeTip = this.chainStateManager.getBestBlock();
+    let onActiveChain = false;
+    {
+      let cursor: HeaderChainEntry | undefined = this.headerSync.getHeader(
+        activeTip.hash
+      );
+      let steps = 0;
+      while (cursor && steps <= MAX_FORK_DOWNLOAD_DEPTH) {
+        if (cursor.height === headerEntry.height) {
+          onActiveChain = cursor.hash.equals(blockHash);
+          break;
+        }
+        if (cursor.height < headerEntry.height) break; // walked past it
+        if (cursor.height === 0) break;
+        cursor = this.headerSync.getHeader(cursor.header.prevBlock);
+        steps++;
+      }
+    }
+    if (onActiveChain) return false; // active-chain body — normal handling
+
+    // Genuine below-frontier competing-fork body: persist it to disk so the
+    // reorg dispatch can read it when the fork tip connects, then drop the
+    // in-memory copy (it will be re-read from disk during the reorg).
+    await this.storeSideBranchBlock(block, blockHash, hashHex);
+    this.forkBodiesOnDisk.add(hashHex);
+    this.state.downloadedBlocks.delete(hashHex);
+    this.downloadedBlockPeers.delete(hashHex);
+    console.log(
+      `[fork-body] stored competing-fork body height=${headerEntry.height} ` +
+        `hash=${hashHex.slice(0, 16)} below active frontier ` +
+        `${this.state.nextHeightToProcess} as a side branch (reorg pending fork tip)`
+    );
+    return true;
   }
 
   /**
@@ -1124,47 +1342,10 @@ export class BlockSync {
     // Already processed?
     if (headerEntry.height < this.state.nextHeightToProcess) {
       // Side-branch storage: persist the block body even though it's
-      // not on the active chain right now.  A future heavier sibling
-      // may trigger a reorg, and the reorg path needs to be able to
-      // read this block's body via db.getBlock to connect it on the
-      // new chain.  Pre-fix, side-branch bodies were dropped here,
-      // making reorg-via-submitblock impossible to fully execute (it
-      // would advance the tip via the heavier-sibling block but
-      // couldn't fix up the UTXO set across the gap because B1/B2's
-      // bodies were unavailable).
-      //
-      // Idempotent: db.putBlock is a hash-keyed put, so re-storing
-      // the same body is a no-op except for the LevelDB write
-      // amplification.  Bounded by the "duplicate" return below: we
-      // only execute once per sibling per submitblock.
-      try {
-        await this.db.putBlock(blockHash, serializeBlock(block));
-        // W109 FIX-33: set BLOCK_HAVE_DATA (8) in the block index after
-        // writing the body.  Pre-fix the side-branch path stored the raw
-        // block bytes but never updated the index status, so
-        // FindMostWorkChain / prune / AssumeUTXO would not see HAVE_DATA
-        // on these blocks.  Mirrors Core blockstorage.cpp::WriteBlock
-        // which sets BLOCK_HAVE_DATA before the dirty-index flush.
-        // Best-effort: a failure here is non-fatal — the block body is
-        // already on disk; worst case the status bit will be corrected
-        // when the block is eventually connected.
-        const sideBranchIdx = await this.db.getBlockIndex(blockHash);
-        if (sideBranchIdx && !(sideBranchIdx.status & 8 /* HAVE_DATA */)) {
-          await this.db.updateBlockStatus(
-            blockHash,
-            sideBranchIdx.status | 8 /* HAVE_DATA */,
-          );
-        }
-      } catch (err) {
-        // Best-effort: a put failure here surfaces later as a
-        // "missing block" log line during the reorg dispatch, not as
-        // a chain-state corruption.
-        console.warn(
-          `[side-branch] failed to store side-branch block ${hashHex.slice(0, 16)}: ${
-            err instanceof Error ? err.message : String(err)
-          }`
-        );
-      }
+      // not on the active chain right now (see storeSideBranchBlock for
+      // the full rationale — a future heavier sibling reorg reads the
+      // bridging bodies back via db.getBlock).
+      await this.storeSideBranchBlock(block, blockHash, hashHex);
       return "duplicate";
     }
 
@@ -1304,6 +1485,139 @@ export class BlockSync {
   }
 
   /**
+   * GAP2 fix — fork-aware download floor (reorg-drop fix part 1/2).
+   *
+   * Ports the shipped rustoshi Unit-E E3 download floor / blockbrew
+   * StartBlockDownload ancestry descent, which mirror Bitcoin Core's
+   * `FindNextBlocksToDownload` (net_processing.cpp ~1394-1543): the block we
+   * still need on the path from the best header tip back to the fork point is
+   * *every* block whose body we lack and which is NOT already on the active
+   * validated chain — NOT just the blocks strictly above the active tip.
+   *
+   * THE BUG. hotbuns' `requestBlocks` walks the download frontier by HEIGHT
+   * (`getHeaderByHeight`) starting from `nextHeightToRequest`, which is floored
+   * at `chainState.bestHeight + 1` (the active validated tip). When a heavier
+   * competing branch forks BELOW the active tip (active tip A at height H, fork
+   * point F < H, fork tip B at height T with MORE work), HeaderSync makes B the
+   * best header and `updateBestChain` re-points `headersByHeight` along the
+   * fork for heights F+1..T. But the height floor stays at H+1, so only the
+   * fork bodies ABOVE the active tip (H+1..T) are ever requested. The BRIDGING
+   * fork bodies F+1..H — the blocks the reorg needs to rebuild the UTXO view
+   * from the fork point up — are never getdata-d, so the connect fails forever
+   * with "UTXO view best block <F> does not match block prev ... (view-out-of-
+   * sync)" and the node stays stuck on the minority chain. This was the SOLE
+   * disqualifier proven by tools/reorg-hotbuns-proof.sh.
+   *
+   * THE FIX. When the best header tip is a competing fork that diverges at/below
+   * the active validated tip and carries MORE work, descend the fork tip's
+   * ancestry to its fork point (the deepest ancestor already on the active
+   * chain) and lower `nextHeightToRequest` to fork-point+1, with NO active-tip
+   * height floor. The existing height-keyed walk in `requestBlocks` then reads
+   * the FORK branch entries (already re-pointed into `headersByHeight`) at those
+   * heights and requests the bridging bodies. Bounded by
+   * `MAX_FORK_DOWNLOAD_DEPTH` (a deeper reorg would be refused by the reorg
+   * dispatch anyway).
+   *
+   * INVARIANT (no-fork / steady-state unchanged): when the best header tip is a
+   * simple EXTENSION of the active tip (best header is a descendant of the
+   * active tip, the normal IBD / steady-state case), this is a no-op — the fork
+   * point IS the active tip, fork-point+1 == the existing floor, so the floor
+   * is never lowered and the download set is byte-for-byte identical. Only a
+   * genuine below/beside-tip heavier fork moves the floor.
+   *
+   * No-op when no ChainStateManager is wired (the active validated tip can't be
+   * resolved), preserving the legacy floor for stub/test connectors.
+   */
+  private lowerDownloadFloorForFork(bestHeader: HeaderChainEntry): void {
+    if (!this.chainStateManager) return;
+
+    const activeTip = this.chainStateManager.getBestBlock();
+
+    // Fast path / steady-state guard: if the best header tip IS the active tip,
+    // or carries no more work than it, there is no heavier competing branch to
+    // bridge. A simple extension (best header descends from the active tip) has
+    // strictly more work but its fork point is the active tip itself, so the
+    // descent below would stop immediately at H and never lower the floor —
+    // but short-circuiting here keeps the common path allocation-free.
+    if (bestHeader.hash.equals(activeTip.hash)) return;
+    if (bestHeader.chainWork <= activeTip.chainWork) return;
+
+    // Build the active validated chain's ancestor hash-set, walking up from the
+    // active tip, bounded by MAX_FORK_DOWNLOAD_DEPTH. Membership in this set is
+    // our "on the active chain" test (Bitcoin Core CChain::Contains), used to
+    // locate the fork point as the deepest fork ancestor already on-chain.
+    const activeChainHashes = new Set<string>();
+    {
+      let cursor: HeaderChainEntry | undefined = this.headerSync.getHeader(
+        activeTip.hash
+      );
+      let steps = 0;
+      while (cursor && steps <= MAX_FORK_DOWNLOAD_DEPTH) {
+        activeChainHashes.add(cursor.hash.toString("hex"));
+        if (cursor.height === 0) break; // reached genesis
+        cursor = this.headerSync.getHeader(cursor.header.prevBlock);
+        steps++;
+      }
+    }
+    // If the active tip header itself isn't resolvable (pre-init / stub), bail
+    // and leave the legacy floor untouched.
+    if (activeChainHashes.size === 0) return;
+
+    // Descend the fork tip's ancestry until we reach the fork point — the first
+    // ancestor that is on the active chain. The fork point's child (the first
+    // fork-branch block ABOVE it) is the lowest height whose body we must
+    // request. Bounded by MAX_FORK_DOWNLOAD_DEPTH so a malformed/deep fork can't
+    // drive the floor arbitrarily low (a reorg that deep would be refused).
+    let forkChildHeight: number | null = null;
+    let cursor: HeaderChainEntry | undefined = bestHeader;
+    let steps = 0;
+    while (cursor && steps <= MAX_FORK_DOWNLOAD_DEPTH) {
+      if (activeChainHashes.has(cursor.hash.toString("hex"))) {
+        // `cursor` is the fork point (on the active chain). Its child on the
+        // fork branch is height cursor.height + 1.
+        forkChildHeight = cursor.height + 1;
+        break;
+      }
+      if (cursor.height === 0) {
+        // Reached genesis without meeting the active chain — the fork diverges
+        // at genesis (fork point height 0), so the first body we need is
+        // height 1. This is the tools/reorg-hotbuns-proof.sh topology.
+        forkChildHeight = 1;
+        break;
+      }
+      cursor = this.headerSync.getHeader(cursor.header.prevBlock);
+      steps++;
+    }
+
+    if (forkChildHeight === null) {
+      // Did not reach the fork point within MAX_FORK_DOWNLOAD_DEPTH — the
+      // divergence is deeper than the reorg dispatch would accept. Leave the
+      // floor where it is; the reorg would be refused regardless.
+      console.log(
+        `[fork-download] competing fork tip height ${bestHeader.height} forks ` +
+          `deeper than MAX_FORK_DOWNLOAD_DEPTH=${MAX_FORK_DOWNLOAD_DEPTH} below the ` +
+          `active tip (height ${activeTip.height}); not lowering the download floor ` +
+          `(a reorg this deep would be refused)`
+      );
+      return;
+    }
+
+    // Only LOWER the floor — never raise it. For a simple extension the fork
+    // point is the active tip and forkChildHeight == activeTip.height + 1, which
+    // equals the existing floor, so this is a no-op (steady-state unchanged).
+    if (forkChildHeight < this.state.nextHeightToRequest) {
+      console.log(
+        `[fork-download] heavier competing fork (tip height ${bestHeader.height}, ` +
+          `work ${bestHeader.chainWork}) forks below the active tip ` +
+          `(height ${activeTip.height}); lowering block-download floor ` +
+          `from ${this.state.nextHeightToRequest} to ${forkChildHeight} so the ` +
+          `bridging fork bodies are requested`
+      );
+      this.state.nextHeightToRequest = forkChildHeight;
+    }
+  }
+
+  /**
    * Request the next batch of blocks from available peers.
    */
   requestBlocks(): void {
@@ -1315,6 +1629,13 @@ export class BlockSync {
     if (!bestHeader) {
       return;
     }
+
+    // GAP2 fix (reorg-drop part 1/2): before walking the by-height download
+    // frontier, lower the floor to the fork point if the best header tip is a
+    // heavier competing branch forking at/below the active validated tip. This
+    // is the ONLY change to the request path — for a simple extension (normal
+    // IBD / steady state) it is a no-op and the floor is untouched.
+    this.lowerDownloadFloorForFork(bestHeader);
 
     // Hard stop: if downloaded blocks buffer is full, do NOT request more.
     // This prevents unbounded memory growth when processing can't keep up
@@ -1466,6 +1787,16 @@ export class BlockSync {
         this.state.pendingBlocks.has(hashHex) ||
         this.state.downloadedBlocks.has(hashHex)
       ) {
+        this.state.nextHeightToRequest++;
+        continue;
+      }
+
+      // GAP3 fix (reorg-drop part 2/2): skip a competing-fork bridging body we
+      // already persisted to disk as a side branch (it was evicted from the
+      // in-memory buffer to bound memory). Re-requesting it would loop until the
+      // fork tip drives the reorg; the body is already on disk for the reorg
+      // dispatch to read, so there is nothing to fetch.
+      if (this.forkBodiesOnDisk.has(hashHex)) {
         this.state.nextHeightToRequest++;
         continue;
       }
@@ -1920,6 +2251,22 @@ export class BlockSync {
       // Advance to next height
       this.state.nextHeightToProcess++;
       this.blocksProcessed++;
+
+      // GAP3 fix (reorg-drop part 2/2): a successful connect at this height may
+      // have been the fork tip whose pre-connect reorg dispatch incorporated the
+      // bridging side-branch bodies into the active chain. Those bodies are now
+      // on the active chain (or, after a frontier advance, no longer competing),
+      // so drop their stale on-disk markers — they must not keep suppressing
+      // re-requests if a DIFFERENT future fork needs a body at the same height.
+      // Bounded, no-op in the common (no recorded fork bodies) case.
+      if (this.forkBodiesOnDisk.size > 0) {
+        for (const fhex of this.forkBodiesOnDisk) {
+          const fEntry = this.headerSync.getHeader(Buffer.from(fhex, "hex"));
+          if (!fEntry || fEntry.height < this.state.nextHeightToProcess) {
+            this.forkBodiesOnDisk.delete(fhex);
+          }
+        }
+      }
 
       // Flush dirty UTXO entries to disk on memory pressure.
       // The periodic FLUSH_INTERVAL flush is handled inside connectBlock()
@@ -3787,6 +4134,7 @@ export class BlockSync {
     }
 
     this.ibdComplete = true;
+    this.hasCompletedInitialSync = true;
     this.logProgress();
     console.log("IBD complete! Switching to normal operation.");
 
