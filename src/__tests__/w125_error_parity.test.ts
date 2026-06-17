@@ -122,16 +122,23 @@ describe("W125-G5: RPC_INVALID_ADDRESS_OR_KEY (-5) — PRESENT", () => {
 // =============================================================================
 // G6 — RPC_INVALID_PARAMETER (-8) — MISSING (BUG-1, the big one)
 // =============================================================================
-describe("W125-G6: RPC_INVALID_PARAMETER (-8) — MISSING (BUG-1)", () => {
-  it("BUG-1: no INVALID_PARAMETER constant in RPCErrorCodes table", () => {
+describe("W125-G6: RPC_INVALID_PARAMETER (-8) — FIXED (BUG-1)", () => {
+  it("BUG-1 FIXED: INVALID_PARAMETER constant === -8 (Core protocol.h:44)", () => {
     // Core's `protocol.h` reserves -8 = RPC_INVALID_PARAMETER for application-
     // layer parameter errors; -32602 (RPC_INVALID_PARAMS) is JSON-RPC 2.0
     // transport-layer.
-    expect("INVALID_PARAMETER" in RPCErrorCodes).toBe(false);
+    expect(RPCErrorCodes.INVALID_PARAMETER).toBe(-8);
   });
-  it("BUG-1: no call site uses code -8 anywhere", () => {
-    // Sanity: there is NO usage of the right Core code.
-    expect(RPC_SERVER_SRC).not.toContain("RPCErrorCodes.INVALID_PARAMETER");
+  it("BUG-1 FIXED: at least one call site uses code -8 (e.g. getblockhash out-of-range)", () => {
+    expect(RPC_SERVER_SRC).toContain("RPCErrorCodes.INVALID_PARAMETER");
+    // getblockhash out-of-range now throws -8 with Core's exact message
+    // (ported from rustoshi ee86d76). Behavioral coverage in
+    // w125_net_errorcode_port.test.ts.
+    const idx = RPC_SERVER_SRC.indexOf("private async getBlockHash(params: unknown[])");
+    expect(idx).toBeGreaterThan(0);
+    const window = RPC_SERVER_SRC.slice(idx, idx + 1500);
+    expect(window).toContain("RPCErrorCodes.INVALID_PARAMETER");
+    expect(window).toContain("Block height out of range");
   });
   it("BUG-1: INVALID_PARAMS (-32602) is overused for param validation (>= 40 sites)", () => {
     // Count occurrences of the wrong code in throws.
@@ -297,32 +304,37 @@ describe("W125-G17: Batch request partial error handling — MISSING (BUG-13)", 
 });
 
 // =============================================================================
-// G18 — Peer disconnect / setban-remove unknown-node codes — MISSING (BUG-3, BUG-4)
+// G18 — Peer disconnect / setban unknown-node/invalid-IP codes — FIXED (BUG-3, BUG-4)
+//
+// De-staled (ported from rustoshi 845f7e4 + 980a31d): the disconnectnode
+// not-connected path and the setban invalid-IP/subnet path now emit Core's
+// application-layer codes. Behavioral coverage for both lives in
+// w125_net_errorcode_port.test.ts; here we pin the constants + call-site wiring.
 // =============================================================================
-describe("W125-G18: peer/ban unknown-node codes (-29, -30) — MISSING (BUG-3, BUG-4)", () => {
-  it("BUG-3: no CLIENT_NODE_NOT_CONNECTED constant", () => {
-    expect("CLIENT_NODE_NOT_CONNECTED" in RPCErrorCodes).toBe(false);
+describe("W125-G18: peer/ban unknown-node/invalid-IP codes (-29, -30) — FIXED (BUG-3, BUG-4)", () => {
+  it("BUG-3 FIXED: CLIENT_NODE_NOT_CONNECTED constant === -29 (Core protocol.h:62)", () => {
+    expect(RPCErrorCodes.CLIENT_NODE_NOT_CONNECTED).toBe(-29);
   });
-  it("BUG-3: disconnectnode uses MISC_ERROR instead of -29", () => {
+  it("BUG-3 FIXED: disconnectnode uses CLIENT_NODE_NOT_CONNECTED (-29) with Core message", () => {
     const idx = RPC_SERVER_SRC.indexOf(
       "private async disconnectNode(params: unknown[])"
     );
     expect(idx).toBeGreaterThan(0);
     const window = RPC_SERVER_SRC.slice(idx, idx + 2000);
-    expect(window).toMatch(
-      /MISC_ERROR[^)]*Node[^"]*not found/
-    );
+    expect(window).toContain("RPCErrorCodes.CLIENT_NODE_NOT_CONNECTED");
+    expect(window).toContain("Node not found in connected nodes");
+    // The old MISC_ERROR "...not found" throw is gone from this handler.
+    expect(window).not.toMatch(/MISC_ERROR[^)]*Node[^"]*not found/);
   });
-  it("BUG-4: setban remove uses MISC_ERROR instead of -30", () => {
+  it("BUG-4 FIXED: CLIENT_INVALID_IP_OR_SUBNET constant === -30 (Core protocol.h:63)", () => {
+    expect(RPCErrorCodes.CLIENT_INVALID_IP_OR_SUBNET).toBe(-30);
+  });
+  it("BUG-4 FIXED: setban validates the IP/subnet up front and throws -30 with Core message", () => {
     const idx = RPC_SERVER_SRC.indexOf("private async setBan(");
     expect(idx).toBeGreaterThan(0);
-    const window = RPC_SERVER_SRC.slice(idx, idx + 2000);
-    expect(window).toMatch(
-      /MISC_ERROR[^)]*IP\/Subnet[^"]*is not banned/
-    );
-  });
-  it("BUG-4: no CLIENT_INVALID_IP_OR_SUBNET constant", () => {
-    expect("CLIENT_INVALID_IP_OR_SUBNET" in RPCErrorCodes).toBe(false);
+    const window = RPC_SERVER_SRC.slice(idx, idx + 2500);
+    expect(window).toContain("RPCErrorCodes.CLIENT_INVALID_IP_OR_SUBNET");
+    expect(window).toContain("Error: Invalid IP/Subnet");
   });
 });
 
@@ -505,7 +517,8 @@ describe("W125-G29: non-POST HTTP code — PARTIAL (BUG-15)", () => {
 // =============================================================================
 // G30 — RPC_CLIENT_P2P_DISABLED / _NODE_CAPACITY_REACHED / _MEMPOOL_DISABLED — MISSING (BUG-10)
 // =============================================================================
-describe("W125-G30: peer/mempool disabled codes (-31, -33, -34) — MISSING (BUG-10)", () => {
+describe("W125-G30: peer/mempool disabled codes (-31, -33, -34) — PARTIAL (BUG-10)", () => {
+  // Still MISSING (out of scope for the addnode parity port).
   it("BUG-10: no CLIENT_P2P_DISABLED constant", () => {
     expect("CLIENT_P2P_DISABLED" in RPCErrorCodes).toBe(false);
   });
@@ -515,11 +528,24 @@ describe("W125-G30: peer/mempool disabled codes (-31, -33, -34) — MISSING (BUG
   it("BUG-10: no CLIENT_MEMPOOL_DISABLED constant", () => {
     expect("CLIENT_MEMPOOL_DISABLED" in RPCErrorCodes).toBe(false);
   });
-  it("BUG-10: no CLIENT_NODE_ALREADY_ADDED constant", () => {
-    expect("CLIENT_NODE_ALREADY_ADDED" in RPCErrorCodes).toBe(false);
+  // FIXED: addnode "add"/"remove" parity (ported from rustoshi 7b94ef1).
+  // Behavioral coverage in w125_net_errorcode_port.test.ts.
+  it("BUG-10 FIXED: CLIENT_NODE_ALREADY_ADDED constant === -23 (Core protocol.h:60)", () => {
+    expect(RPCErrorCodes.CLIENT_NODE_ALREADY_ADDED).toBe(-23);
   });
-  it("BUG-10: no CLIENT_NODE_NOT_ADDED constant", () => {
-    expect("CLIENT_NODE_NOT_ADDED" in RPCErrorCodes).toBe(false);
+  it("BUG-10 FIXED: CLIENT_NODE_NOT_ADDED constant === -24 (Core protocol.h:61)", () => {
+    expect(RPCErrorCodes.CLIENT_NODE_NOT_ADDED).toBe(-24);
+  });
+  it("BUG-10 FIXED: addnode 'add'/'remove' use the -23/-24 codes with Core messages", () => {
+    const idx = RPC_SERVER_SRC.indexOf("private async addNode(params: unknown[])");
+    expect(idx).toBeGreaterThan(0);
+    const window = RPC_SERVER_SRC.slice(idx, idx + 3000);
+    expect(window).toContain("RPCErrorCodes.CLIENT_NODE_ALREADY_ADDED");
+    expect(window).toContain("Error: Node already added");
+    expect(window).toContain("RPCErrorCodes.CLIENT_NODE_NOT_ADDED");
+    expect(window).toContain(
+      "Error: Node could not be removed. It has not been added previously."
+    );
   });
 });
 
@@ -529,11 +555,14 @@ describe("W125-G30: peer/mempool disabled codes (-31, -33, -34) — MISSING (BUG
 describe("W125 summary", () => {
   it("RPCErrorCodes table size (declared codes)", () => {
     const codes = Object.keys(RPCErrorCodes).length;
-    // 20 of the 32 canonical Core codes (+ a few aliases). When constants
-    // are added in a future FIX wave this number will rise; the assertion
-    // here pins the audit snapshot.
+    // The original W125 audit snapshot pinned 20-25 declared codes. Subsequent
+    // FIX waves added the missing application-layer codes (TYPE_ERROR -3,
+    // INVALID_PARAMETER -8) and this port added the four net codes
+    // (CLIENT_NODE_ALREADY_ADDED -23, CLIENT_NODE_NOT_ADDED -24,
+    // CLIENT_NODE_NOT_CONNECTED -29, CLIENT_INVALID_IP_OR_SUBNET -30), raising
+    // the count. Floor pinned; ceiling relaxed as constants are filled in.
     expect(codes).toBeGreaterThanOrEqual(20);
-    expect(codes).toBeLessThanOrEqual(25);
+    expect(codes).toBeLessThanOrEqual(35);
   });
   it("audit-snapshot tag", () => {
     // Pins the audit summary as a literal string the test runner shows
