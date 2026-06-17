@@ -25,7 +25,7 @@
  *     BUG-4  P3 G11     — NULL_DATA budget tracked cumulative, not decrement
  *     BUG-5  P2 G12     — -datacarrier / -datacarriersize knobs absent
  *     BUG-6  P3 G14     — reason codes diverge from Core canonical strings
- *     BUG-7  P2 G18     — getDustThreshold misses size>10000 IsUnspendable case
+ *     BUG-7  P2 G18     — getDustThreshold misses size>10000 IsUnspendable case (FIXED 3b717c1)
  *     BUG-8  P3 G19     — getDustThreshold uses fixed +1 instead of varint scriptLen
  *     BUG-9  P1 G21     — getStandardFlags misses 6 of 10 policy flags
  *     BUG-10 P3 G25     — bare-multisig m/n not minimally-encoded per Core
@@ -456,19 +456,18 @@ describe("W135 — Standardness rules (IsStandardTx)", () => {
   // BUG-7 P2 G18 — getDustThreshold IsUnspendable size>10000 short-circuit
   // -------------------------------------------------------------------------
 
-  describe("BUG-7 P2: getDustThreshold misses IsUnspendable size>10000 short-circuit", () => {
+  describe("BUG-7 P2 (FIXED): getDustThreshold honors IsUnspendable size>10000 short-circuit", () => {
     test("OP_RETURN script has dust threshold 0 (correct)", () => {
       expect(getDustThreshold(OP_RETURN_BARE)).toBe(0n);
     });
 
-    test("Oversize (>10000 byte) scriptPubKey has dust threshold 0 in Core but NOT in hotbuns", () => {
-      // A 10001-byte garbage script — Core's IsUnspendable returns true.
-      // Hotbuns falls through to non-segwit branch and returns ~30474 sats.
+    test("Oversize (>10000 byte) scriptPubKey has dust threshold 0, matching Core", () => {
+      // A 10001-byte garbage script — Core's CScript::IsUnspendable returns true
+      // because size() > MAX_SCRIPT_SIZE (=10000), so GetDustThreshold returns 0.
+      // bitcoin-core/src/policy/policy.cpp GetDustThreshold + script/script.h:565.
+      // Such an output can never be spent, so it is NEVER dust (threshold 0).
       const oversize = Buffer.alloc(10_001, 0x00);
-      const threshold = getDustThreshold(oversize);
-      // Core would return 0n. Hotbuns currently returns a NON-ZERO value.
-      expect(threshold).toBeGreaterThan(0n);
-      // Once BUG-7 is fixed, this expectation flips to expect(threshold).toBe(0n).
+      expect(getDustThreshold(oversize)).toBe(0n);
     });
   });
 
