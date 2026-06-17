@@ -2068,14 +2068,52 @@ export function getBareMultisigParams(script: Buffer): { m: number; n: number } 
   const m = mOpcode - 0x50;
   if (m < 1 || m > n) return null;
 
-  // Walk through n pubkeys between the m/n opcodes
+  // Walk through n pubkeys between the m/n opcodes.
+  //
+  // Core's MatchMultisig (script/solver.cpp:85-105) reads each key with
+  // `script.GetOp(it, opcode, data)` and accepts it iff `CPubKey::ValidSize(data)`
+  // — i.e. the *decoded* push payload is 33 or 65 bytes (pubkey.h:77). GetOp
+  // (script/script.cpp GetScriptOp) decodes direct 1-byte pushes AND the
+  // PUSHDATA1/2/4 forms, so a pubkey pushed as `OP_PUSHDATA1 0x21 <33B>` is just
+  // as standard as the direct `0x21 <33B>` form. Matching only the direct-push
+  // opcodes over-rejected PUSHDATA-prefixed bare multisig that Core relays as
+  // standard MULTISIG. The push opcode is NOT required to be minimal here — Core's
+  // MatchMultisig does not call CheckMinimalPush on the keys.
+  const end = script.length - 2; // exclusive: OP_n is the second-to-last byte
   let pos = 1;
   for (let i = 0; i < n; i++) {
-    if (pos >= script.length - 2) return null; // ran out of script
-    const pushLen = script[pos];
-    // Valid pubkey push: 33 (compressed) or 65 (uncompressed)
-    if (pushLen !== 33 && pushLen !== 65) return null;
-    pos += 1 + pushLen;
+    if (pos >= end) return null; // ran out of script
+    // Decode one push (GetScriptOp parity) and capture its payload length.
+    const opcode = script[pos];
+    let payloadLen: number;
+    let headerLen: number;
+    if (opcode >= 0x01 && opcode <= 0x4b) {
+      // Direct push of 1..75 bytes.
+      payloadLen = opcode;
+      headerLen = 1;
+    } else if (opcode === 0x4c) {
+      // OP_PUSHDATA1: 1-byte length follows.
+      if (pos + 2 > end) return null;
+      payloadLen = script[pos + 1];
+      headerLen = 2;
+    } else if (opcode === 0x4d) {
+      // OP_PUSHDATA2: 2-byte LE length follows.
+      if (pos + 3 > end) return null;
+      payloadLen = script.readUInt16LE(pos + 1);
+      headerLen = 3;
+    } else if (opcode === 0x4e) {
+      // OP_PUSHDATA4: 4-byte LE length follows.
+      if (pos + 5 > end) return null;
+      payloadLen = script.readUInt32LE(pos + 1);
+      headerLen = 5;
+    } else {
+      // Not a data push → not a pubkey → not a (bare) multisig.
+      return null;
+    }
+    // CPubKey::ValidSize: only 33-byte (compressed) or 65-byte (uncompressed)
+    // payloads are valid public keys.
+    if (payloadLen !== 33 && payloadLen !== 65) return null;
+    pos += headerLen + payloadLen;
   }
 
   // After all pubkeys, we should be at the OP_n byte (second-to-last)
@@ -2219,8 +2257,21 @@ export function getScriptType(script: Buffer): TxoutType {
   if (script.length >= 1 && script[0] === Opcode.OP_RETURN && isPushOnlyFrom(script, 1)) {
     return "nulldata";
   }
-  // Check for unknown witness versions (witness v2-v16)
-  if (isWitnessProgram(script)) return "witness_unknown";
+  // Witness program of an unrecognised shape. The canonical witness types
+  // (P2WPKH/P2WSH for v0, P2TR for v1+32, P2A for the v1 anchor) are handled
+  // above; any *remaining* witness program falls here. Mirrors Bitcoin Core's
+  // Solver() (src/script/solver.cpp:154-178): a witness program with
+  // `version != 0` is WITNESS_UNKNOWN (this includes v1 programs whose size is
+  // not 32 and not the anchor — Core does NOT exclude OP_1 here, so e.g. a v1
+  // 16-byte program is WITNESS_UNKNOWN, not nonstandard). A v0 witness program
+  // with a non-{20,32} program size is NONSTANDARD (Core's trailing
+  // `return TxoutType::NONSTANDARD` at solver.cpp:177), NOT witness_unknown.
+  if (isWitnessProgram(script)) {
+    // First byte is OP_0 (v0) or OP_1..OP_16 (0x51..0x60 → v1..v16).
+    const version = script[0] === 0x00 ? 0 : script[0] - 0x50;
+    if (version !== 0) return "witness_unknown";
+    return "nonstandard";
+  }
   return "nonstandard";
 }
 
