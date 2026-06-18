@@ -31,6 +31,7 @@ import {
   serializeAddrV2Payload,
   deserializeAddrV2Payload,
 } from "./addrv2.js";
+import { parseIPv4, parseIPv6 } from "./asmap.js";
 
 // Re-export addrv2 types for convenience
 export type { AddrV2Payload, NetworkAddressV2, AddrV2Entry } from "./addrv2.js";
@@ -583,6 +584,49 @@ export function ipv4ToBuffer(ip: string): Buffer {
   }
 
   return buf;
+}
+
+/**
+ * Convert a peer host string to the 16-byte legacy network-address buffer used
+ * in the VERSION message's addrRecv/addrFrom fields.
+ *
+ * Unlike {@link ipv4ToBuffer}, this accepts BOTH IPv4 and IPv6 literals:
+ *   - IPv4 ("1.2.3.4")        → IPv4-mapped IPv6 (::ffff:1.2.3.4)
+ *   - IPv6 ("2001:db8::1", "[::1]") → the 16-byte address as-is
+ *   - anything else (onion/i2p/cjdns hostnames, unresolved names) → the
+ *     unspecified address (16 zero bytes), which Core treats as "no addr".
+ *
+ * This never throws on a parseable-or-not host, so an IPv6 peer no longer
+ * surfaces "processRecvBuffer failed: Invalid IPv4 address: <ipv6>" when we
+ * build our VERSION reply. The legacy addr field is informational only (Core
+ * does not validate the peer-reported addrRecv against the socket), so a
+ * best-effort encoding with a zero-addr fallback preserves wire semantics.
+ */
+export function hostToBuffer(host: string): Buffer {
+  // IPv6 literals contain ':' (IPv4 dotted-decimal never does).
+  if (host.includes(":")) {
+    const v6 = parseIPv6(host);
+    if (v6) {
+      return Buffer.from(v6);
+    }
+    // Unparseable v6-looking host (shouldn't happen for a connected peer) —
+    // fall through to the zero-addr fallback rather than throwing.
+    return Buffer.alloc(16, 0);
+  }
+
+  const v4 = parseIPv4(host);
+  if (v4) {
+    const buf = Buffer.alloc(16, 0);
+    // IPv4-mapped IPv6 prefix: ::ffff:
+    buf[10] = 0xff;
+    buf[11] = 0xff;
+    buf.set(v4, 12);
+    return buf;
+  }
+
+  // Non-IP host (onion/i2p/cjdns/hostname): encode as the unspecified address.
+  // These networks ride the addrv2 path; the legacy addr field is unused.
+  return Buffer.alloc(16, 0);
 }
 
 function serializeNetworkAddress(writer: BufferWriter, addr: NetworkAddress): void {
