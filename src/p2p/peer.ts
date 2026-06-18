@@ -17,7 +17,7 @@ import {
   deserializeMessage,
   deserializeV2Message,
   extractCommandAndPayload,
-  ipv4ToBuffer,
+  hostToBuffer,
 } from "./messages.js";
 import {
   V2Transport,
@@ -480,6 +480,25 @@ export class Peer {
       v2HandshakePromise = new Promise<void>((resolve, reject) => {
         this.v2HandshakeResolve = resolve;
         this.v2HandshakeReject = reject;
+      });
+      // Attach a sink handler the instant the gate exists so a rejection from
+      // settleV2HandshakeFail() can never surface as an "Unhandled rejection
+      // at: Promise {<rejected>} ... settleV2HandshakeFail" log line. The
+      // socket close/error/connectError handlers (and the dial-timeout catch
+      // below) can reject this promise BEFORE the `await v2HandshakePromise`
+      // at the end of this method is ever reached — e.g. when connectError
+      // fires while we're still awaiting the TCP connect race, the catch at
+      // line ~565 re-throws and execution never reaches the await, leaving a
+      // rejected-but-unobserved promise. A v2 handshake failure is a normal
+      // dropped-peer outcome (v1-only peer / timeout), not an error; the
+      // real control flow (v1 fallback) is driven by the awaited copy below
+      // and by the caller's try/catch in PeerManager.connectPeer. The sink
+      // only marks the rejection as observed — it does not swallow control
+      // flow, since `await v2HandshakePromise` still rethrows.
+      v2HandshakePromise.catch(() => {
+        // intentionally empty: rejection is handled by the awaiter below /
+        // the PeerManager v1-fallback catch; this just prevents the noisy
+        // unhandled-rejection report on the dropped-peer path.
       });
     }
 
@@ -1061,12 +1080,16 @@ export class Peer {
         timestamp: now,
         addrRecv: {
           services: 0n, // We don't know their services yet
-          ip: ipv4ToBuffer(this.host),
+          // hostToBuffer (not ipv4ToBuffer) so an IPv6 peer host encodes to its
+          // 16-byte address instead of throwing "Invalid IPv4 address: <ipv6>",
+          // which previously bubbled up as a processRecvBuffer failure + peer
+          // drop on the inbound-v1 / v2-version paths.
+          ip: hostToBuffer(this.host),
           port: this.port,
         },
         addrFrom: {
           services: this.config.services,
-          ip: ipv4ToBuffer("0.0.0.0"),
+          ip: hostToBuffer("0.0.0.0"),
           port: 0,
         },
         nonce: this.ourNonce,
