@@ -260,8 +260,15 @@ export function deserializeAddrV2Payload(reader: BufferReader): AddrV2Payload {
     // Timestamp (uint32 LE)
     const timestamp = reader.readUInt32LE();
 
-    // Services (compactSize)
-    const services = reader.readVarIntBig();
+    // Services (compactSize, NOT range-checked).  Bitcoin Core serializes
+    // addrv2 `services` with CompactSizeFormatter<false> (protocol.h:446) —
+    // RangeCheck=false — because it is a 64-bit service-flags bitmask, not a
+    // length.  A flags value with a high bit set encodes a CompactSize above
+    // MAX_SIZE (0x02000000); reading it with the range-checked readVarIntBig()
+    // throws "ReadCompactSize(): size too large" and discards the entire
+    // addrv2 batch, starving addrman so the node cannot replenish reachable
+    // peers and recover from a low-peer state.
+    const services = reader.readCompactSizeNoCheck();
 
     // Network ID (uint8)
     const networkId = reader.readUInt8();
