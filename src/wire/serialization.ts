@@ -377,6 +377,48 @@ export class BufferReader {
   }
 
   /**
+   * Read a CompactSize-encoded value WITHOUT the MAX_SIZE range check.
+   *
+   * Mirrors Bitcoin Core's `CompactSizeFormatter<false>` (RangeCheck=false,
+   * serialize.h) used for fields that are NOT a length/count but a 64-bit
+   * value packed in CompactSize form — notably the BIP-155 addrv2 `services`
+   * bitmask (protocol.h:446 `Using<CompactSizeFormatter<false>>(services_tmp)`).
+   *
+   * Identical to {@link readVarIntBig} (same minimal/canonical-encoding
+   * checks for the 0xfd / 0xfe / 0xff paths) EXCEPT it does not reject values
+   * above MAX_SIZE = 0x02000000.  A service-flags field that sets a high bit
+   * encodes a CompactSize > MAX_SIZE and is perfectly valid; running it
+   * through {@link readVarIntBig} throws "ReadCompactSize(): size too large"
+   * and desyncs the whole addrv2 batch.  Do NOT use this for any length /
+   * count field — those must keep the MAX_SIZE cap via {@link readVarIntBig}.
+   */
+  readCompactSizeNoCheck(): bigint {
+    const first = this.readUInt8();
+    if (first <= 0xfc) {
+      return BigInt(first);
+    } else if (first === 0xfd) {
+      const value = BigInt(this.readUInt16LE());
+      if (value < 253n) {
+        throw new Error("non-canonical CompactSize");
+      }
+      return value;
+    } else if (first === 0xfe) {
+      const value = BigInt(this.readUInt32LE());
+      if (value < 0x10000n) {
+        throw new Error("non-canonical CompactSize");
+      }
+      return value;
+    } else {
+      // 0xff: 8-byte LE field.
+      const value = this.readUInt64LE();
+      if (value < 0x100000000n) {
+        throw new Error("non-canonical CompactSize");
+      }
+      return value;
+    }
+  }
+
+  /**
    * Read a varint length prefix followed by that many bytes.
    *
    * Enforces MAX_SIZE = 0x02000000 before allocation to prevent OOM from
