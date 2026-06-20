@@ -2007,15 +2007,64 @@ export class PeerManager {
   private checkBlockDownloadTimeouts(): void {
     const peerCount = this.peers.size;
 
+    // Gather peers that have a block past the download timeout.
+    const stalled: Array<{ key: string; peer: Peer; block: string; since: number }> = [];
     for (const [key, peer] of this.peers) {
       if (peer.state !== "connected") continue;
 
       const timedOutBlock = peer.getTimedOutBlock(peerCount);
-      if (timedOutBlock) {
-        console.log(`Block download timeout: disconnecting peer ${key} (block ${timedOutBlock.slice(0, 16)}...)`);
-        this.disconnectPeer(key, false, "block download timeout");
+      if (timedOutBlock !== null) {
+        stalled.push({
+          key,
+          peer,
+          block: timedOutBlock,
+          since: peer.blocksInFlight.get(timedOutBlock) ?? 0,
+        });
       }
     }
+    if (stalled.length === 0) return;
+
+    // Count, across ALL connected peers, how many hold each in-flight block.
+    // BlockSync.requestBlocks (sync/blocks.ts) deliberately RACES a slow
+    // critical block by blasting its getdata to every connected peer (the
+    // "parallel critical block request" path), which registers that block in
+    // every peer's in-flight set. A block held by >1 peer is therefore a raced
+    // block, not any single peer's fault — disconnecting all its holders
+    // collapses the entire peer set for ONE slow block (observed live
+    // 2026-06-19: a single slow block disconnected 3 peers in one 45s cycle,
+    // leaving hotbuns stuck on 2 peers). For a raced block we just clear the
+    // stale in-flight marker (so requestBlocks can re-issue) and KEEP the peers.
+    // Only a block in-flight from a SINGLE peer is a genuine single-source stall.
+    const holders = new Map<string, number>();
+    for (const [, peer] of this.peers) {
+      if (peer.state !== "connected") continue;
+      for (const h of peer.blocksInFlight.keys()) {
+        holders.set(h, (holders.get(h) ?? 0) + 1);
+      }
+    }
+
+    const singleSource = stalled.filter((s) => {
+      if ((holders.get(s.block) ?? 0) > 1) {
+        // Raced block: drop this speculative copy, keep the peer connected.
+        s.peer.removeBlockInFlight(s.block);
+        return false;
+      }
+      return true;
+    });
+    if (singleSource.length === 0) return;
+
+    // For genuine single-source stalls, mirror Bitcoin Core
+    // (net_processing.cpp, which disconnects the one stalling peer at the front
+    // of the download queue): drop at most ONE peer per cycle, same as
+    // evictStaleTipPeers ("only one per check cycle to avoid mass
+    // disconnections"). Pick the most-stalled (oldest outstanding request);
+    // the next 45s tick handles any other single-source staller.
+    singleSource.sort((a, b) => a.since - b.since);
+    const worst = singleSource[0];
+    console.log(
+      `Block download timeout: disconnecting peer ${worst.key} (block ${worst.block.slice(0, 16)}...)`
+    );
+    this.disconnectPeer(worst.key, false, "block download timeout");
   }
 
   /**
