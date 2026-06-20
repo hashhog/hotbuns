@@ -110,9 +110,12 @@ describe("Peer.bip324V2Enabled (outbound v2 gate)", () => {
     }
   });
 
-  test("defaults to off when env var unset", () => {
+  test("defaults to ON when env var unset (v2 default-on after interop proof)", () => {
     delete process.env.HOTBUNS_BIP324_V2;
-    expect(Peer.bip324V2Enabled()).toBe(false);
+    // bip324V2Enabled flipped default-ON once the initiator + responder paths
+    // were interop-proven against a real Core v2 peer (see the impl comment).
+    // Only an explicit opt-out (0/false/off) disables it.
+    expect(Peer.bip324V2Enabled()).toBe(true);
   });
 
   test("enables when set to '1'", () => {
