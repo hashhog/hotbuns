@@ -174,6 +174,17 @@ export class Peer {
   handshakeComplete: boolean;
 
   /**
+   * Whether the TCP connection ever established (the socket `open` callback
+   * fired). Distinguishes an unreachable host (connect refused/timed out, open
+   * never fired) from a peer that connected but then dropped a BIP-324 v2
+   * handshake. Only the latter is a v1-fallback candidate — mirrors Bitcoin
+   * Core's `V2Transport::ShouldReconnectV1` (net.cpp:1555), which returns false
+   * unless the session actually got far enough to have sent v1-header-worth of
+   * bytes. See PeerManager.connectPeer.
+   */
+  tcpEstablished: boolean;
+
+  /**
    * Whether this peer holds the NoBan permission (whitelisted).
    * When true, misbehaving() is a no-op.
    * Reference: Bitcoin Core NetPermissionFlags::NoBan.
@@ -363,6 +374,7 @@ export class Peer {
     this.misbehaviorScore = 0;
     this.shouldDisconnect = false;
     this.handshakeComplete = false;
+    this.tcpEstablished = false;
     this.onBan = onBan ?? null;
     this.noban = options?.noban ?? false;
     this.connType = options?.connType ?? "inbound";
@@ -510,6 +522,9 @@ export class Peer {
         open: (socket) => {
           // Store socket immediately - open callback fires before await returns
           this.socket = socket;
+          // TCP is up: any failure from here on is a post-connect handshake
+          // drop (a v1-fallback candidate), not an unreachable host.
+          this.tcpEstablished = true;
           this.state = "handshaking";
           this.events.onConnect(this);
 
