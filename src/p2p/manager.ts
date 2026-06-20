@@ -1413,8 +1413,29 @@ export class PeerManager {
         try {
           await peer.connect(/* useV2 */ true);
         } catch (v2Err) {
-          // Cipher-handshake failure (timeout, decrypt error, peer is v1).
-          // Mark v1-only and retry with a fresh Peer + fresh socket.
+          // Distinguish an unreachable host from a real v2-handshake drop.
+          // If the TCP connection never established (connect refused / timed
+          // out — peer.tcpEstablished is false), this is NOT a v2 failure:
+          // Core's ShouldReconnectV1 (net.cpp:1555) returns false when the
+          // session never got off the ground, so we must NOT fall back to v1.
+          // Re-dialing v1 a dead host wastes a second connect, and worse,
+          // markV1Only would poison the v1-only cache with a dead host (so a
+          // peer that is actually v2-capable, once reachable again, would be
+          // wrongly dialed v1-first until the entry expires). Propagate the
+          // failure like any other dead-host dial.
+          if (!peer.tcpEstablished) {
+            try {
+              peer.disconnect("tcp connect failed");
+            } catch {
+              // ignore — disconnect is idempotent
+            }
+            throw v2Err;
+          }
+          // TCP connected but the BIP-324 cipher handshake failed (a v1-only
+          // peer dropped our ellswift garbage, or it timed out). THIS is the
+          // ShouldReconnectV1 case: mark v1-only and retry on a fresh Peer +
+          // fresh socket (sending v2 garbage to a v1 peer is destructive, so
+          // the same socket cannot be reused).
           this.markV1Only(key);
           try {
             peer.disconnect("v2 handshake failed; falling back to v1");
