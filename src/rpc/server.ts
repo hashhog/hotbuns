@@ -1291,6 +1291,7 @@ export class RPCServer {
     this.registerMethod("getnetworkinfo", () => this.getNetworkInfo());
     this.registerMethod("setnetworkactive", async (params) => this.setNetworkActive(params));
     this.registerMethod("getconnectioncount", async () => this.getConnectionCount());
+    this.registerMethod("ping", async () => this.ping());
     this.registerMethod("getnodeaddresses", (params) => this.getNodeAddresses(params));
     this.registerMethod("addpeeraddress", (params) => this.addPeerAddress(params));
     this.registerMethod("getaddrmaninfo", () => this.getAddrManInfo());
@@ -6416,8 +6417,17 @@ export class RPCServer {
         timeoffset: peer.versionPayload && peer.versionReceivedAt > 0
           ? Number(peer.versionPayload.timestamp) - Math.floor(peer.versionReceivedAt / 1000)
           : 0,
-        pingtime: peer.latency / 1000,
-        minping: 0,
+        // Ping stats mirror Core rpc/net.cpp:253-260. `pingtime` is the last
+        // observed round-trip; `minping` the running minimum (Core
+        // m_min_ping_time, peer.minPing); `pingwait` the elapsed time of an
+        // in-flight ping (Core m_ping_start, peer.pingSentTime). All three are
+        // OPTIONAL in Core — only pushed when populated — so emit them only when
+        // there is a real measurement, matching the `ping` RPC's observable.
+        ...(peer.latency > 0 ? { pingtime: peer.latency / 1000 } : {}),
+        ...(peer.minPing !== null && peer.minPing > 0 ? { minping: peer.minPing / 1000 } : {}),
+        ...(peer.pingOutstanding && peer.pingSentTime > 0
+          ? { pingwait: Math.max(0, Date.now() - peer.pingSentTime) / 1000 }
+          : {}),
         version: peer.versionPayload?.version ?? 0,
         subver: peer.versionPayload?.userAgent ?? "",
         inbound: false,
@@ -7199,6 +7209,58 @@ export class RPCServer {
    */
   private getConnectionCount(): number {
     return this.peerManager.getConnectedPeers().length;
+  }
+
+  /**
+   * ping
+   *
+   * Requests that a ping be sent to all connected peers, to measure ping time.
+   * Results are provided LATER in getpeerinfo (pingtime / minping; pingwait
+   * while a ping is in flight).
+   *
+   * Reference: Bitcoin Core rpc/net.cpp ping (:84-107) ->
+   * PeerManager::SendPings(). ouroboros parity (commit 0fd1ee5, rpc_ping).
+   *
+   * SEMANTICS (faithful to Core):
+   *   - Params: NONE. Any argument is a dispatcher arity error.
+   *   - Side-effect-only control method: iterates EVERY connected peer and
+   *     triggers a BIP-31 PING (with a fresh nonce) via the peer's on-demand
+   *     send primitive (hotbuns Peer.sendPing). It does NOT measure latency
+   *     synchronously and does NOT wait for the PONGs — the round-trip results
+   *     surface later via getpeerinfo (pingtime/minping), and an outstanding
+   *     ping shows transiently as pingwait. Core only sets m_ping_queued per
+   *     peer and returns; hotbuns' sendPing emits immediately on the live
+   *     socket, which is the same observable from the caller's side.
+   *   - With ZERO peers it is a successful no-op (loops over an empty list).
+   *   - Returns JSON null immediately (Core UniValue::VNULL).
+   *
+   * ERROR: a missing peer manager is RPC_CLIENT_P2P_DISABLED (code -31,
+   * Core EnsurePeerman), NOT an empty success.
+   */
+  private ping(): null {
+    // EnsurePeerman parity: missing P2P subsystem is -31, not a silent no-op.
+    if (!this.peerManager || typeof this.peerManager.getConnectedPeers !== "function") {
+      throw this.rpcError(
+        RPCErrorCodes.CLIENT_P2P_DISABLED,
+        "Error: Peer-to-peer functionality missing or disabled",
+      );
+    }
+
+    // Fire a PING to every connected peer (the same set getpeerinfo reports).
+    // Fire-and-forget: do NOT await a pong. A per-peer send failure must not
+    // fail the whole RPC (Core loops over the peer map and returns regardless),
+    // so swallow individual errors. Peerless -> empty loop -> still returns null.
+    for (const peer of this.peerManager.getConnectedPeers()) {
+      try {
+        peer.sendPing();
+      } catch {
+        // A dropped/half-closed peer must not abort the RPC. Ignore and move on.
+      }
+    }
+
+    // Core returns UniValue::VNULL -> JSON null. The dispatcher serialises a
+    // null return as {"result": null}.
+    return null;
   }
 
   // ========== Ban Management ==========

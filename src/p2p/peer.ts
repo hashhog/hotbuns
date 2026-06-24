@@ -163,6 +163,13 @@ export class Peer {
   versionPayload: VersionPayload | null;
   latency: number;
   /**
+   * Running minimum observed pong round-trip in milliseconds (Core
+   * CNode::m_min_ping_time). Stays null until the first pong lands, then
+   * tracks the smallest latency ever seen. getpeerinfo surfaces it as the
+   * optional `minping` field (rpc/net.cpp:256, emitted only when populated).
+   */
+  minPing: number | null;
+  /**
    * Misbehavior score (kept for logging/diagnostics only — NOT used for
    * the discourage decision since Core PR #25974 removed score accumulation).
    * Any call to misbehaving() now immediately sets m_should_discourage = true.
@@ -368,6 +375,7 @@ export class Peer {
     this.pingNonce = null;
     this.lastPingTime = 0;
     this.latency = 0;
+    this.minPing = null;
     this.sentVerack = false;
     this.receivedVerack = false;
     this.receivedVersion = false;
@@ -1375,6 +1383,11 @@ export class Peer {
       if (msg.type === "pong" && this.pingNonce !== null) {
         if (msg.payload.nonce === this.pingNonce) {
           this.latency = Date.now() - this.lastPingTime;
+          // Track the running minimum round-trip (Core m_min_ping_time):
+          // getpeerinfo's `minping` reports this rather than the last sample.
+          if (this.minPing === null || this.latency < this.minPing) {
+            this.minPing = this.latency;
+          }
           this.pingNonce = null;
           this.pingOutstanding = false;
           this.pingSentTime = 0;
