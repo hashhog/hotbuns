@@ -1293,6 +1293,7 @@ export class RPCServer {
     this.registerMethod("getconnectioncount", async () => this.getConnectionCount());
     this.registerMethod("getnodeaddresses", (params) => this.getNodeAddresses(params));
     this.registerMethod("addpeeraddress", (params) => this.addPeerAddress(params));
+    this.registerMethod("getaddrmaninfo", () => this.getAddrManInfo());
     this.registerMethod("addnode", (params) => this.addNode(params));
     this.registerMethod("disconnectnode", (params) => this.disconnectNode(params));
 
@@ -6683,6 +6684,69 @@ export class RPCServer {
       result.error = "failed to add address to address manager table";
     }
     return result;
+  }
+
+  /**
+   * getaddrmaninfo
+   *
+   * Provide information about the node's address manager: the number of
+   * addresses in the `new` and `tried` tables and their sum, per network.
+   *
+   * Reference: Bitcoin Core rpc/net.cpp getaddrmaninfo (:1080-1117) +
+   * `AddrMan::Size(net, in_new)` (addrman.cpp Size_ :1006-1026). ouroboros
+   * parity (commit 215ed61, rpc.py rpc_getaddrmaninfo).
+   *
+   * PARAMS: NONE (pure read-only; no side effects).
+   *
+   * SHAPE: a JSON OBJECT keyed by network name. The key set is FIXED and
+   * ALWAYS present (every routable network emitted unconditionally, even at
+   * count 0), in Core's enum order:
+   *
+   *   ipv4, ipv6, onion, i2p, cjdns, all_networks
+   *
+   * Each value is an object with exactly three integer keys in order:
+   *
+   *   { "new":   <count in new table for this network>,
+   *     "tried": <count in tried table for this network>,
+   *     "total": <new + tried> }
+   *
+   * `all_networks` is the global sum across networks. NET_UNROUTABLE
+   * (not_publicly_routable) and NET_INTERNAL (internal) are NEVER emitted,
+   * matching Core's loop that skips those two enum values.
+   *
+   * Invariants (oracle-free, hold by construction):
+   *   - per network: total == new + tried
+   *   - all_networks.new   == Σ networks.new
+   *   - all_networks.tried == Σ networks.tried
+   *   - all_networks.total == Σ networks.total == new + tried
+   */
+  private async getAddrManInfo(): Promise<Record<string, unknown>> {
+    // Fixed routable-network key order (Core enum NET_IPV4..NET_CJDNS,
+    // skipping NET_UNROUTABLE / NET_INTERNAL). Every key is emitted even when
+    // the count is zero (an IPv4-only node still reports onion/i2p/cjdns as
+    // 0/0/0).
+    const NETWORK_KEYS = ["ipv4", "ipv6", "onion", "i2p", "cjdns"] as const;
+
+    // Per-network {new, tried} split read from the bucketed Core CAddrMan.
+    const counts = this.peerManager.getAddrManInfo();
+
+    const ret: Record<string, unknown> = {};
+    let totalNew = 0;
+    let totalTried = 0;
+    for (const name of NETWORK_KEYS) {
+      const cell = counts[name] ?? { new: 0, tried: 0 };
+      const n = cell.new;
+      const t = cell.tried;
+      ret[name] = { new: n, tried: t, total: n + t };
+      totalNew += n;
+      totalTried += t;
+    }
+    ret.all_networks = {
+      new: totalNew,
+      tried: totalTried,
+      total: totalNew + totalTried,
+    };
+    return ret;
   }
 
   /**

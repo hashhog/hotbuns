@@ -48,6 +48,7 @@ import {
   asmapVersion,
 } from "./asmap.js";
 import type { ProxyManager, NetworkType } from "./proxy.js";
+import { getNetworkTypeFromAddress } from "./proxy.js";
 import { AddrMan } from "./addrman.js";
 
 /**
@@ -1830,6 +1831,52 @@ export class PeerManager {
       port: info.port,
       network: PeerManager.networkIdToCoreName(info.networkId),
     }));
+  }
+
+  /**
+   * Per-network NEW/TRIED counts for the `getaddrmaninfo` RPC (Core:
+   * rpc/net.cpp:1080-1117 + `AddrMan::Size(net, in_new)` addrman.cpp:1006).
+   *
+   * Reads the bucketed Core CAddrMan ({@link addrMan}), NOT the flat
+   * `knownAddresses` pool — that addrman is the one with a real NEW vs TRIED
+   * split (entries land in NEW via {@link mirrorToAddrMan}; a successful
+   * handshake promotes NEW->TRIED via {@link AddrMan.good}). This yields a
+   * faithful per-network `Size(net, in_new=true)` / `Size(net, in_new=false)`
+   * split rather than a lumped count.
+   *
+   * Each entry is classified to its Core network name via
+   * {@link getNetworkTypeFromAddress} (GetNetClass parity: ipv4 / ipv6 / onion
+   * / i2p / cjdns) and counted into the matching (network, table) cell. The
+   * returned map is keyed by the five routable Core network names; entries that
+   * fall outside them (none in practice — addrman only mirrors IP literals) are
+   * dropped, matching Core's loop which skips NET_UNROUTABLE / NET_INTERNAL.
+   * The fixed-key shape + `all_networks` sum are assembled by the RPC layer.
+   *
+   * Pure read-only snapshot — no mutation, no peers/sockets/disk touched.
+   */
+  getAddrManInfo(): Record<string, { new: number; tried: number }> {
+    const counts: Record<string, { new: number; tried: number }> = {
+      ipv4: { new: 0, tried: 0 },
+      ipv6: { new: 0, tried: 0 },
+      onion: { new: 0, tried: 0 },
+      i2p: { new: 0, tried: 0 },
+      cjdns: { new: 0, tried: 0 },
+    };
+
+    // NEW table: addrMan.getEntries(false) (Core Size(net, in_new=true)).
+    for (const info of this.addrMan.getEntries(false)) {
+      const net = getNetworkTypeFromAddress(info.host);
+      const cell = counts[net];
+      if (cell) cell.new += 1;
+    }
+    // TRIED table: addrMan.getEntries(true) (Core Size(net, in_new=false)).
+    for (const info of this.addrMan.getEntries(true)) {
+      const net = getNetworkTypeFromAddress(info.host);
+      const cell = counts[net];
+      if (cell) cell.tried += 1;
+    }
+
+    return counts;
   }
 
   /**
