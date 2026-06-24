@@ -302,6 +302,10 @@ export const RPCErrorCodes = {
   CLIENT_NODE_NOT_CONNECTED: -29,
   // RPC_CLIENT_INVALID_IP_OR_SUBNET (-30): `setban` with an unparseable IP/subnet.
   CLIENT_INVALID_IP_OR_SUBNET: -30,
+  // RPC_CLIENT_P2P_DISABLED (-31): P2P / connection manager unavailable
+  // (Core protocol.h:62, thrown by EnsureConnman, server_util.cpp:100). Used by
+  // setnetworkactive when the peer manager is missing.
+  CLIENT_P2P_DISABLED: -31,
   // Legacy aliases for backward compatibility
   VERIFY_ALREADY_IN_CHAIN: -25,
   VERIFY_REJECTED: -26,
@@ -324,6 +328,21 @@ export const RPCErrorCodes = {
  * Prevents DoS via large batch requests.
  */
 export const MAX_BATCH_SIZE = 1000;
+
+/**
+ * Map a JSON value to Bitcoin Core's UniValue type name (univalue's
+ * `uvTypeName`), used in "JSON value of type X is not of expected type Y"
+ * type-error messages. Core distinguishes null / bool / number / string /
+ * array / object.
+ */
+function jsonTypeName(value: unknown): string {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "boolean") return "bool";
+  if (typeof value === "number") return "number";
+  if (typeof value === "string") return "string";
+  if (Array.isArray(value)) return "array";
+  return "object";
+}
 
 /**
  * Default max fee rate for sendrawtransaction (0.10 BTC/kvB = 10000 sat/vB).
@@ -1270,6 +1289,7 @@ export class RPCServer {
     this.registerMethod("getpeerinfo", () => this.getPeerInfo());
     this.registerMethod("getblockfrompeer", (params) => this.getBlockFromPeer(params));
     this.registerMethod("getnetworkinfo", () => this.getNetworkInfo());
+    this.registerMethod("setnetworkactive", async (params) => this.setNetworkActive(params));
     this.registerMethod("getconnectioncount", async () => this.getConnectionCount());
     this.registerMethod("getnodeaddresses", (params) => this.getNodeAddresses(params));
     this.registerMethod("addpeeraddress", (params) => this.addPeerAddress(params));
@@ -6679,7 +6699,9 @@ export class RPCServer {
       localservicesnames: this.getServiceNames(this.params.services),
       localrelay: true,
       timeoffset: 0,
-      networkactive: true,
+      // Mirror connman's fNetworkActive flag (Core net.cpp:709), toggled by
+      // setnetworkactive. Default true.
+      networkactive: this.peerManager.getNetworkActive(),
       connections: peers.length,
       connections_in: 0,
       connections_out: peers.length,
@@ -6703,6 +6725,52 @@ export class RPCServer {
       // warnings: ARRAY of warning strings (Core v31.99 GetWarningsForRpc).
       warnings: [],
     };
+  }
+
+  /**
+   * setnetworkactive: Disable/enable all p2p network activity.
+   *
+   * Reference: Bitcoin Core rpc/net.cpp setnetworkactive (:889) +
+   * CConnman::SetNetworkActive (net.cpp:3361).
+   *
+   * Param:
+   *   state (bool, REQUIRED): true to enable networking, false to disable.
+   *
+   * Returns the value that was passed in (a bare JSON boolean), read back from
+   * the peer manager after the toggle (Core returns `GetNetworkActive()`, which
+   * absent a race equals `state`). Setting false suppresses NEW connection
+   * establishment only — existing peers are NOT disconnected. The
+   * `networkactive` field of getnetworkinfo mirrors this flag.
+   * @param params [state]
+   */
+  private setNetworkActive(params: unknown[]): boolean {
+    const state = params[0];
+
+    // Required positional bool. Core reads request.params[0].get_bool(): a
+    // missing arg is RPC_INVALID_PARAMETER (-8), a non-bool a JSON type error
+    // (-3). get_bool() is strict — it rejects numbers/strings, so reject any
+    // non-boolean here (do NOT coerce 1/0 or "true").
+    if (state === undefined || state === null) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Missing required argument: state");
+    }
+    if (typeof state !== "boolean") {
+      throw this.rpcError(
+        RPCErrorCodes.TYPE_ERROR,
+        `JSON value of type ${jsonTypeName(state)} is not of expected type bool`,
+      );
+    }
+
+    // EnsureConnman parity (server_util.cpp:100): a missing connection manager
+    // is RPC_CLIENT_P2P_DISABLED (-31), NOT an empty success.
+    if (!this.peerManager || typeof this.peerManager.setNetworkActive !== "function") {
+      throw this.rpcError(
+        RPCErrorCodes.CLIENT_P2P_DISABLED,
+        "Error: Peer-to-peer functionality missing or disabled",
+      );
+    }
+
+    // SetNetworkActive then return the read-back value (Core net.cpp:904-906).
+    return this.peerManager.setNetworkActive(state);
   }
 
   // ========== Node Connection Management ==========

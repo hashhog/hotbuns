@@ -536,6 +536,20 @@ export class PeerManager {
   private messageHandlers: Map<string, Array<(peer: Peer, msg: NetworkMessage) => void>>;
   private maintainInterval: ReturnType<typeof setInterval> | null;
   private running: boolean;
+  /**
+   * Node-global "P2P network active" flag (Core CConnman.fNetworkActive,
+   * net.h:1164 / SetNetworkActive net.cpp:3361, default true). Toggled by the
+   * `setnetworkactive` RPC and surfaced read-only as `networkactive` in
+   * getnetworkinfo. When false we suppress NEW connection establishment ONLY —
+   * existing peers are NOT force-dropped (Core's contract): (a) inbound accepts
+   * are refused (startListener open handler, Core net.cpp:1786), (b) the
+   * outbound auto-dial refill AND any pinned `-connect` reconnect are skipped
+   * (fillConnections, Core net.cpp:2351/3022/3219), and (c) DNS-seed /
+   * fixed-seed re-seeding is held off (maintain / maybeAddFixedSeeds,
+   * Core net.cpp:2351). Health / ping / disconnect sweeps keep running. Not
+   * persisted; resets to enabled on restart.
+   */
+  private networkActive: boolean;
   private lastActivity: Map<string, number>;
   private connectingPeers: Set<string>;
   private banManager: BanManager;
@@ -724,6 +738,8 @@ export class PeerManager {
     this.messageHandlers = new Map();
     this.maintainInterval = null;
     this.running = false;
+    // Core CConnman.fNetworkActive defaults true; reset to enabled every boot.
+    this.networkActive = true;
     this.shuttingDown = false;
     this.lastActivity = new Map();
     this.connectingPeers = new Set();
@@ -809,6 +825,38 @@ export class PeerManager {
    */
   isConnectOnly(): boolean {
     return this.connectPeers.length > 0;
+  }
+
+  /**
+   * Read the node-global "P2P network active" flag (Core
+   * CConnman::GetNetworkActive, net.h:1164). Surfaced as `networkactive` in
+   * getnetworkinfo and read back by the `setnetworkactive` RPC after a toggle.
+   */
+  getNetworkActive(): boolean {
+    return this.networkActive;
+  }
+
+  /**
+   * Enable/disable all NEW P2P network activity (Core
+   * CConnman::SetNetworkActive, net.cpp:3361).
+   *
+   * Mirrors Core: idempotent (logs + early-returns when the flag already equals
+   * *state*, no notification fired), otherwise flips the flag. Does NOT
+   * disconnect existing/established peers — only suppresses establishing new
+   * connections (inbound accept, outbound auto-dial refill incl. any `-connect`
+   * pinned reconnect, and DNS/fixed-seed re-seeding). Returns the read-back
+   * value (`GetNetworkActive()` equivalent), which absent a race equals
+   * *state*. Not persisted; resets to enabled on restart.
+   */
+  setNetworkActive(state: boolean): boolean {
+    state = Boolean(state);
+    if (this.networkActive === state) {
+      console.log(`SetNetworkActive: ${state} (unchanged)`);
+      return this.networkActive;
+    }
+    this.networkActive = state;
+    console.log(`SetNetworkActive: ${state}`);
+    return this.networkActive;
   }
 
   /**
@@ -1903,6 +1951,12 @@ export class PeerManager {
     // One-shot guard (Core: add_fixed_seeds already false).
     if (this.fixedSeedsAdded) return;
 
+    // Network-active gate (Core net.cpp:2351): while networking is disabled
+    // (`setnetworkactive false`) hold off DNS / fixed-seed re-seeding until
+    // reactivated. The one-shot guard is NOT set, so re-seeding resumes
+    // normally once the flag flips back to true.
+    if (!this.networkActive) return;
+
     const seeds = FIXED_SEEDS[this.config.params.networkMagic] ?? [];
 
     // (1) ENABLED: fixed seeds present (mainnet only) and not in connect-only
@@ -2293,6 +2347,14 @@ export class PeerManager {
   private async fillConnections(): Promise<void> {
     if (!this.running) return;
 
+    // Network-active gate (Core net.cpp:2351/3022/3219): while networking is
+    // disabled (`setnetworkactive false`) the outbound connect loop holds off
+    // establishing ANY new connection — the pinned `-connect` reconnect AND
+    // the addrman / anchor auto-outbound refill alike. Existing peers stay up
+    // (the ping / eviction / disconnect sweeps in maintain() run
+    // unconditionally); only NEW establishment is suppressed.
+    if (!this.networkActive) return;
+
     // Connect-only mode (`-connect`): dial ONLY the pinned peers and never
     // touch anchors / addrman candidates / DNS-derived addresses. Mirrors
     // clearbit peer.zig:7050 (maintainOutbound gated on connect_address==null)
@@ -2493,6 +2555,9 @@ export class PeerManager {
    */
   private async maybeOpenFeeler(): Promise<void> {
     if (!this.running) return;
+    // Network-active gate (Core net.cpp:2351): a feeler is a NEW outbound
+    // connection, so hold off while networking is disabled.
+    if (!this.networkActive) return;
     if (this.isConnectOnly()) return;
     if (this.feelerInFlight.size >= MAX_FEELER_CONNECTIONS) return;
     if (Date.now() < this.nextFeelerAt) return;
@@ -3467,6 +3532,14 @@ export class PeerManager {
             const host = socket.remoteAddress;
             // Check if banned
             if (manager.banManager.isBanned(host)) {
+              socket.end();
+              return;
+            }
+            // Network-active gate (Core net.cpp:1786): while networking is
+            // disabled (`setnetworkactive false`) refuse NEW inbound
+            // connections. Existing peers are untouched — only new
+            // establishment is suppressed.
+            if (!manager.networkActive) {
               socket.end();
               return;
             }
