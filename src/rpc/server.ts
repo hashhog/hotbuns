@@ -1336,6 +1336,7 @@ export class RPCServer {
     // Control methods
     this.registerMethod("stop", () => this.stopNode());
     this.registerMethod("uptime", () => this.getUptime());
+    this.registerMethod("getmemoryinfo", async (params) => this.getMemoryInfo(params));
 
     // Multi-wallet management methods (always available if walletManager is present)
     if (this.walletManager) {
@@ -6835,6 +6836,105 @@ export class RPCServer {
 
     // SetNetworkActive then return the read-back value (Core net.cpp:904-906).
     return this.peerManager.setNetworkActive(state);
+  }
+
+  /**
+   * getmemoryinfo
+   *
+   * Returns an object containing information about memory usage.
+   *
+   * Reference: Bitcoin Core rpc/node.cpp getmemoryinfo (:145-198) +
+   * RPCLockedMemoryInfo (:113-124) + RPCMallocInfo (:126-143). ouroboros
+   * parity (commit 1e3bfc2, rpc.py rpc_getmemoryinfo).
+   *
+   * IMPORTANT SEMANTICS: this RPC reports Core's SECURE LOCKED-MEMORY POOL
+   * (`LockedPoolManager` — the `mlock()`-backed allocator that keeps sensitive
+   * data such as wallet private keys OFF swap), NOT general process or heap
+   * memory usage. Do NOT confuse the "locked" memory here with the transaction
+   * "memory pool" (mempool). (The Prometheus `/health` gauges in cli.ts expose
+   * process RSS/heap separately; those are not what this RPC returns.)
+   *
+   * Param:
+   *   mode (string, OPTIONAL, default "stats"): what kind of information is
+   *   returned.
+   *     - "stats": general statistics about memory usage in the daemon.
+   *     - "mallocinfo": an XML string describing low-level heap state (Core:
+   *       only available when compiled with glibc).
+   *
+   * SHAPE (mode-dependent, matching Core exactly):
+   *   - mode == "stats" (default) -> OBJECT:
+   *       { "locked": { "used": int, "free": int, "total": int,
+   *                     "locked": int, "chunks_used": int,
+   *                     "chunks_free": int } }
+   *     All six inner values are non-negative integers (Core `size_t`), in this
+   *     pushKV order. hotbuns is a TypeScript/Bun port with NO Core-style
+   *     `mlock()`-backed secure pool (no LockedPoolManager equivalent — Bun/V8
+   *     manage memory; no mlock/sodium_mlock/VirtualLock anywhere in src/), so
+   *     the honest answer is all zeros — but the keys/structure are ALWAYS
+   *     present and identical to Core (a node with an empty/absent locked pool
+   *     legitimately reports zeros; shape-match parity holds). We do NOT
+   *     fabricate nonzero values from process.memoryUsage().
+   *
+   *   - mode == "mallocinfo" -> Core returns a glibc `malloc_info(3)` XML string
+   *     ONLY when built with glibc (HAVE_MALLOC_INFO); on every other build it
+   *     raises -8 "mallocinfo mode not available". A Bun/TS port has no glibc
+   *     `malloc_info` equivalent, so we faithfully take Core's non-glibc path:
+   *     the exact -8 error (we do NOT fabricate a stub XML string Core never
+   *     emits).
+   *
+   * Errors:
+   *   - Unknown mode -> RPC_INVALID_PARAMETER (-8), message "unknown mode <mode>"
+   *     (Core node.cpp:194, `tfm::format("unknown mode %s", mode)`).
+   *   - Non-string mode -> RPC_TYPE_ERROR (-3): a JSON type error BEFORE the
+   *     handler logic, matching Core's `self.Arg<std::string_view>("mode")`.
+   *
+   * Pure read-only introspection of the daemon's own memory accounting; no side
+   * effects, no chain/mempool/peer locks. Safe at any lifecycle stage.
+   * @param params [mode?]
+   */
+  private getMemoryInfo(params: unknown[]): Record<string, unknown> | string {
+    // Core resolves `mode` as Arg<std::string_view>("mode") with default
+    // "stats" when omitted. An omitted arg defaults; a present non-string is a
+    // JSON type error (-3) before any handler logic runs.
+    const raw = params.length > 0 ? params[0] : "stats";
+    const mode = raw === undefined || raw === null ? "stats" : raw;
+    if (typeof mode !== "string") {
+      throw this.rpcError(
+        RPCErrorCodes.TYPE_ERROR,
+        `JSON value of type ${jsonTypeName(mode)} is not of expected type string`,
+      );
+    }
+
+    if (mode === "stats") {
+      // Core RPCLockedMemoryInfo() reads LockedPoolManager::Instance().stats()
+      // and emits the six counters under "locked" in this exact order. hotbuns
+      // has no mlock'd secure allocator (verified: no LockedPool / mlock /
+      // sodium_mlock / VirtualLock in src/), so every counter is an honest 0.
+      // Keys are always present.
+      return {
+        locked: {
+          used: 0,
+          free: 0,
+          total: 0,
+          locked: 0,
+          chunks_used: 0,
+          chunks_free: 0,
+        },
+      };
+    }
+
+    if (mode === "mallocinfo") {
+      // Core returns glibc malloc_info(3) XML ONLY when built with glibc
+      // (HAVE_MALLOC_INFO); on every other build it raises
+      // -8 "mallocinfo mode not available" (node.cpp:191). A Bun/TS port has no
+      // glibc malloc_info equivalent, so we faithfully take Core's non-glibc
+      // path — the exact -8 error — rather than fabricate a stub XML string
+      // Core never emits.
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "mallocinfo mode not available");
+    }
+
+    // Any other mode is Core's RPC_INVALID_PARAMETER (-8) "unknown mode %s".
+    throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, `unknown mode ${mode}`);
   }
 
   // ========== Node Connection Management ==========
