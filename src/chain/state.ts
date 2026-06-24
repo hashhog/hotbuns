@@ -186,6 +186,15 @@ export class ChainStateManager {
   private params: ConsensusParams;
   private bestBlock: { hash: Buffer; height: number; chainWork: bigint };
   private notificationEmitter: import("events").EventEmitter | null;
+  /** Tip-change notifier backing the wait-family RPCs (waitfornewblock /
+   *  waitforblock / waitforblockheight). Fired on EVERY active-chain tip
+   *  advance — every `this.bestBlock = …` mutation point below: connectBlock
+   *  (tip extension + reorg reconnect), disconnectBlock (reorg / invalidateblock
+   *  rewind), and updateTip (the BlockSync IBD / post-IBD / submitblock /
+   *  generate connect path). Core: KernelNotifications::blockTip /
+   *  Mining::waitTipChanged (rpc/blockchain.cpp). Wired via setTipNotifier()
+   *  from cli.ts and shared with the RPC server through getTipNotifier(). */
+  private tipNotifier: import("./tip_notifier.js").TipNotifier | null = null;
   /** Mempool for conflict removal during invalidation. */
   private mempool: import("../mempool/mempool.js").Mempool | null = null;
   /** Header sync for coordinating header chain state. */
@@ -241,6 +250,38 @@ export class ChainStateManager {
    */
   setNotificationEmitter(emitter: import("events").EventEmitter): void {
     this.notificationEmitter = emitter;
+  }
+
+  /**
+   * Wire the tip-change notifier shared by the wait-family RPCs.  Called once
+   * at startup (cli.ts).  The same instance is read back by the RPC server via
+   * {@link getTipNotifier} so a waitfornewblock / waitforblock /
+   * waitforblockheight handler parks on the same generation counter that this
+   * manager (and the BlockSync connect path, via `updateTip`) bumps.
+   */
+  setTipNotifier(notifier: import("./tip_notifier.js").TipNotifier): void {
+    this.tipNotifier = notifier;
+  }
+
+  /** The wired tip-change notifier, or null if none (degraded boot / tooling). */
+  getTipNotifier(): import("./tip_notifier.js").TipNotifier | null {
+    return this.tipNotifier;
+  }
+
+  /**
+   * Pulse the tip-change notifier (Core KernelNotifications::blockTip).  Called
+   * from every active-chain tip-advance site so a blocked wait-family RPC wakes
+   * promptly.  Best-effort: a notifier fault must NEVER abort a connect /
+   * disconnect / reorg.  The waiter re-reads the authoritative tip on wake, so a
+   * dropped pulse degrades only latency, never correctness.
+   */
+  private notifyTipChanged(): void {
+    if (this.tipNotifier === null) return;
+    try {
+      this.tipNotifier.notify();
+    } catch {
+      /* best-effort; never let a notifier fault stall block processing */
+    }
   }
 
   /**
@@ -592,6 +633,10 @@ export class ChainStateManager {
       chainWork,
     };
 
+    // Tip advanced (extension or reorg reconnect) — wake any wait-family RPC.
+    // Core: ConnectTip fires KernelNotifications::blockTip for every connect.
+    this.notifyTipChanged();
+
     await this.db.putChainState({
       bestBlockHash: blockHash,
       bestHeight: height,
@@ -883,6 +928,11 @@ export class ChainStateManager {
       chainWork: prevChainWork,
     };
 
+    // Tip moved (reorg rewind / invalidateblock) — this is the DISCONNECT half
+    // of a reorg, a tip change too.  Core's KernelNotifications::blockTip fires
+    // on disconnect as well, so wake any blocked wait-family RPC.
+    this.notifyTipChanged();
+
     // ── BIP-157 Phase 2: filter-chain rewind on disconnect ──
     //
     // Symmetric with `BlockSync.connectBlock`, which advances the
@@ -1090,6 +1140,12 @@ export class ChainStateManager {
    */
   updateTip(hash: Buffer, height: number, chainWork: bigint): void {
     this.bestBlock = { hash, height, chainWork };
+    // This is the tip-advance funnel for the BlockSync connect path: IBD and
+    // post-IBD P2P block-connect, submitblock, and generatetoaddress/
+    // generateblock (which all route injectBlock → BlockSync.connectBlock →
+    // updateTip). Pulse the wait-family notifier here so those advances wake a
+    // blocked waitfornewblock / waitforblock / waitforblockheight.
+    this.notifyTipChanged();
   }
 
   /**

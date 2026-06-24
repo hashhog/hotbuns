@@ -1221,6 +1221,9 @@ export class RPCServer {
     this.registerMethod("getblockfilter", (params) => this.getBlockFilter(params));
     this.registerMethod("getblockcount", () => this.getBlockCount());
     this.registerMethod("getbestblockhash", () => this.getBestBlockHash());
+    this.registerMethod("waitfornewblock", (params) => this.waitForNewBlock(params));
+    this.registerMethod("waitforblock", (params) => this.waitForBlock(params));
+    this.registerMethod("waitforblockheight", (params) => this.waitForBlockHeight(params));
     this.registerMethod("getsyncstate", () => this.getSyncState());
     this.registerMethod("getchaintips", () => this.getChainTips());
     this.registerMethod("getchainstates", () => this.getChainStates());
@@ -2810,6 +2813,196 @@ export class RPCServer {
    */
   private async getBestBlockHash(): Promise<string> {
     return Buffer.from(this.chainState.getBestBlock().hash).reverse().toString("hex");
+  }
+
+  // ─────────────────────────── Wait-family RPCs ───────────────────────────
+  //
+  // waitfornewblock / waitforblock / waitforblockheight
+  // (Core rpc/blockchain.cpp:290 / :349 / :410).  Each blocks until its tip
+  // predicate holds — re-checking against the AUTHORITATIVE chain-state tip
+  // after every wake — and returns the current tip { hash, height } on match
+  // OR on timeout.  The wake-up is driven by the shared TipNotifier wired in
+  // ChainStateManager (pulsed on every connect / disconnect / reorg).  The
+  // notifier is only a prompt: correctness comes from re-reading the real tip
+  // each loop, so a coalesced or missed pulse can never yield a wrong answer.
+
+  /**
+   * Map a decoded-JSON value to Bitcoin Core's `uvTypeName` string
+   * (univalue.cpp), used to build RPC_TYPE_ERROR messages byte-identical to
+   * Core: null / bool / object / array / string / number.
+   */
+  private coreUvType(value: unknown): string {
+    if (value === null || value === undefined) return "null";
+    if (typeof value === "boolean") return "bool";
+    if (Array.isArray(value)) return "array";
+    if (typeof value === "object") return "object";
+    if (typeof value === "string") return "string";
+    if (typeof value === "number") return "number";
+    return "null";
+  }
+
+  /**
+   * The authoritative active-chain tip as `{ displayHash, height }`.
+   * `displayHash` is the big-endian hex form Core's RPCs emit (the same order
+   * getbestblockhash returns).  ALWAYS read fresh inside the wait loop so a
+   * coalesced/missed notify can never produce a stale answer.
+   */
+  private currentTip(): { displayHash: string; height: number } {
+    const best = this.chainState.getBestBlock();
+    return {
+      displayHash: Buffer.from(best.hash).reverse().toString("hex"),
+      height: best.height,
+    };
+  }
+
+  /**
+   * Validate the wait-family `timeout` argument (milliseconds), mirroring Core
+   * (rpc/blockchain.cpp): the value is read with getInt<int>() — a non-integral
+   * JSON value throws a type error (-3) — and a negative timeout throws
+   * RPC_MISC_ERROR (-1) "Negative timeout".  null/omitted means 0 = no timeout.
+   */
+  private parseWaitTimeout(timeout: unknown): number {
+    if (timeout === undefined || timeout === null) return 0;
+    if (typeof timeout === "boolean" || typeof timeout !== "number" || !Number.isInteger(timeout)) {
+      // Core's getInt<int>() rejects non-integral JSON with a type error.
+      throw this.rpcError(
+        RPCErrorCodes.TYPE_ERROR,
+        `JSON value of type ${this.coreUvType(timeout)} is not of expected type number`
+      );
+    }
+    if (timeout < 0) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Negative timeout");
+    }
+    return timeout;
+  }
+
+  /**
+   * Read a required integer height argument (Core getInt<int>(): non-integral
+   * JSON throws a type error -3).  Used by waitforblockheight.
+   */
+  private parseWaitHeight(height: unknown): number {
+    if (typeof height === "boolean" || typeof height !== "number" || !Number.isInteger(height)) {
+      throw this.rpcError(
+        RPCErrorCodes.TYPE_ERROR,
+        `JSON value of type ${this.coreUvType(height)} is not of expected type number`
+      );
+    }
+    return height;
+  }
+
+  /**
+   * Core's wait-tip-changed loop shared by all three wait-family RPCs
+   * (the `while (predicate not yet true)` loops in rpc/blockchain.cpp).
+   *
+   * @param predicate `(displayHash, height) -> boolean` — true once the desired
+   *   tip condition holds.  Evaluated against the AUTHORITATIVE tip every loop.
+   * @param timeoutMs milliseconds to wait; 0 = wait indefinitely.
+   * @returns the current tip `{ hash, height }` once the predicate holds OR the
+   *   timeout elapses (Core returns the current block in both cases).
+   */
+  private async waitForTip(
+    predicate: (displayHash: string, height: number) => boolean,
+    timeoutMs: number
+  ): Promise<{ hash: string; height: number }> {
+    let tip = this.currentTip();
+    if (predicate(tip.displayHash, tip.height)) {
+      return { hash: tip.displayHash, height: tip.height };
+    }
+
+    const notifier = this.chainState.getTipNotifier();
+    if (notifier === null) {
+      // No notifier wired (degraded boot / tooling): we cannot block on tip
+      // changes.  Return the current tip rather than hang — a defensive
+      // fallback only; Core always has a kernel notification source.
+      return { hash: tip.displayHash, height: tip.height };
+    }
+
+    // Absolute deadline for the bounded case (Core uses a steady_clock deadline
+    // and re-derives the remaining slice after each wake).
+    const deadline = timeoutMs ? Date.now() + timeoutMs : null;
+
+    for (;;) {
+      // Snapshot the generation BEFORE re-checking the predicate so a notify
+      // that races in between the check and the await is not lost.
+      const gen = notifier.generation;
+      tip = this.currentTip();
+      if (predicate(tip.displayHash, tip.height)) {
+        return { hash: tip.displayHash, height: tip.height };
+      }
+
+      if (deadline !== null) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          // Timed out — return the current tip (Core's behaviour).
+          return { hash: tip.displayHash, height: tip.height };
+        }
+        await notifier.wait(gen, remaining);
+      } else {
+        await notifier.wait(gen, null);
+      }
+    }
+  }
+
+  /**
+   * waitfornewblock ( timeout current_tip )
+   *
+   * Core rpc/blockchain.cpp:290.  Waits until the tip differs from `current_tip`
+   * (or, if omitted, from the tip observed at call entry), then returns
+   * { hash, height }.  `timeout` is in MILLISECONDS; 0 = no timeout.  On timeout
+   * returns the current tip.  A malformed `current_tip` errors -8 (ParseHashV).
+   */
+  private async waitForNewBlock(params: unknown[]): Promise<{ hash: string; height: number }> {
+    const timeoutMs = this.parseWaitTimeout(params[0]);
+
+    // Reference hash the new tip must differ from.  When current_tip is given
+    // it is parsed as a 64-hex uint256 (Core ParseHashV: -8 on malformed); when
+    // omitted, snapshot the live tip at call entry.
+    let refHash: string;
+    if (params[1] === undefined || params[1] === null) {
+      refHash = this.currentTip().displayHash;
+    } else {
+      // parseHashV returns the wire (little-endian) buffer; the display form is
+      // the normalised big-endian hex (lowercased input round-trips through the
+      // parsed bytes so e.g. uppercase input compares correctly).
+      const refBytes = this.parseHashV(params[1], "current_tip");
+      refHash = Buffer.from(refBytes).reverse().toString("hex");
+    }
+
+    return this.waitForTip((h) => h !== refHash, timeoutMs);
+  }
+
+  /**
+   * waitforblock ( blockhash timeout )
+   *
+   * Core rpc/blockchain.cpp:349.  `blockhash` is parsed FIRST (before reading
+   * timeout), so a malformed blockhash errors -8 even when a negative timeout
+   * is also supplied.  Waits until the tip's hash equals `blockhash`; returns
+   * { hash, height }.  `timeout` is in MILLISECONDS; 0 = no timeout.  On timeout
+   * returns the current tip.
+   */
+  private async waitForBlock(params: unknown[]): Promise<{ hash: string; height: number }> {
+    // Core parses blockhash BEFORE reading timeout (rpc/blockchain.cpp:374-377).
+    const targetBytes = this.parseHashV(params[0], "blockhash");
+    const target = Buffer.from(targetBytes).reverse().toString("hex");
+    const timeoutMs = this.parseWaitTimeout(params[1]);
+
+    return this.waitForTip((h) => h === target, timeoutMs);
+  }
+
+  /**
+   * waitforblockheight ( height timeout )
+   *
+   * Core rpc/blockchain.cpp:410.  `height` is read as an int (type error on
+   * non-integral).  Waits until the tip height >= `height`; returns
+   * { hash, height }.  `timeout` is in MILLISECONDS; 0 = no timeout.  On timeout
+   * returns the current tip.
+   */
+  private async waitForBlockHeight(params: unknown[]): Promise<{ hash: string; height: number }> {
+    // Core reads height first (rpc/blockchain.cpp:436), then timeout (:438).
+    const target = this.parseWaitHeight(params[0]);
+    const timeoutMs = this.parseWaitTimeout(params[1]);
+
+    return this.waitForTip((_h, ht) => ht >= target, timeoutMs);
   }
 
   /**

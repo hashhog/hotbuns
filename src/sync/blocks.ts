@@ -2860,6 +2860,22 @@ export class BlockSync {
       }
     }
 
+    // DISCONNECT HALF of the reorg complete (old-chain blocks rolled back to
+    // the fork).  Pulse the wait-family notifier here in addition to the final
+    // connect-half pulse (BlockSync.connectBlock → chainState.updateTip), so a
+    // waiter observes the reorg as a tip change even mid-reorg.  Core's
+    // KernelNotifications::blockTip fires on disconnect as well as connect.
+    // Best-effort: a notifier fault must never abort the reorg.  The waiter
+    // re-reads the authoritative tip on wake, so an extra/early pulse is
+    // harmless (lost-wakeup-safe generation counter).
+    if (this.chainStateManager) {
+      try {
+        this.chainStateManager.getTipNotifier()?.notify();
+      } catch {
+        /* best-effort */
+      }
+    }
+
     // Step 3: connect intermediate new-chain blocks (those between
     // the fork and the newTip).  Each must be present in the DB as
     // a side-branch body (stored by the side-branch path in

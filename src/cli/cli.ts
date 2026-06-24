@@ -14,6 +14,7 @@ import { PruneManager, PRUNE_TARGET_MANUAL } from "../storage/pruning.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { deserializeBlock } from "../validation/block.js";
 import { ChainStateManager } from "../chain/state.js";
+import { TipNotifier } from "../chain/tip_notifier.js";
 import { ChainstateManager } from "../chain/snapshot.js";
 import { UTXOManager } from "../chain/utxo.js";
 import { Mempool } from "../mempool/mempool.js";
@@ -1633,6 +1634,15 @@ async function startNode(config: NodeConfig): Promise<void> {
   // 3. Load chain state from DB
   const chainState = new ChainStateManager(db, params, cacheBytes);
   await chainState.load();
+
+  // Tip-change notifier backing the wait-family RPCs (waitfornewblock /
+  // waitforblock / waitforblockheight).  Wired BEFORE BlockSync starts
+  // connecting so every tip advance (IBD + post-IBD connect, submitblock /
+  // generate, both halves of a reorg) pulses it.  The RPC server reaches the
+  // same instance through chainState.getTipNotifier().  Core analogue:
+  // KernelNotifications::blockTip / Mining::waitTipChanged (rpc/blockchain.cpp).
+  const tipNotifier = new TipNotifier();
+  chainState.setTipNotifier(tipNotifier);
 
   // 4. Initialize UTXO manager, mempool, fee estimator
   const utxo = chainState.getUTXOManager();
