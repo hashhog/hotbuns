@@ -1295,6 +1295,7 @@ export class RPCServer {
     this.registerMethod("addpeeraddress", (params) => this.addPeerAddress(params));
     this.registerMethod("getaddrmaninfo", () => this.getAddrManInfo());
     this.registerMethod("addnode", (params) => this.addNode(params));
+    this.registerMethod("getaddednodeinfo", (params) => this.getAddedNodeInfo(params));
     this.registerMethod("disconnectnode", (params) => this.disconnectNode(params));
 
     // Ban management
@@ -7020,6 +7021,129 @@ export class RPCServer {
     }
 
     return null;
+  }
+
+  /**
+   * getaddednodeinfo: Return information about the persistent added-node list.
+   *
+   * Reference: Bitcoin Core rpc/net.cpp getaddednodeinfo (:486-558) +
+   * CConnman::GetAddedNodeInfo (net.cpp:2914). ouroboros parity (commit
+   * 5c8ee0b, rpc.py rpc_getaddednodeinfo). Mirrors Core's exact shape:
+   *
+   *   [
+   *     {
+   *       "addednode": <str>,               // node as provided to addnode
+   *       "connected": <bool>,              // a current peer matches
+   *       "addresses": [                    // ALWAYS present; [] when not connected
+   *         { "address": <str ip:port>,
+   *           "connected": "inbound" | "outbound" }   // at most ONE entry
+   *       ]
+   *     },
+   *     ...
+   *   ]
+   *
+   * Param:
+   *   node (string, OPTIONAL): if provided, return only the matching added
+   *     node; if it is NOT on the added list, raise -24
+   *     RPC_CLIENT_NODE_NOT_ADDED, message "Error: Node has not been added."
+   *     (Core net.cpp:534, byte-exact: leading "Error: ", trailing period.)
+   *     If omitted, all added nodes are returned ([] when none). `onetry` adds
+   *     are NOT on the list (Core parity — onetry never calls AddNode, see
+   *     addNode above).
+   *
+   * hotbuns keeps the added-node registry as the PeerManager `addedNodes` Set
+   * (Core CConnman::m_added_nodes), populated by `addnode "add"` keyed by the
+   * exact "host:port" string. The `connected`/`addresses` join is computed
+   * against the live peer table (getConnectedPeers), keyed by the same
+   * "host:port" form. Direction is the bare "inbound"/"outbound" from the
+   * manager's authoritative per-peer connection type (Core IsInboundConn() ->
+   * "inbound" : "outbound"; net.cpp:548 — NOT "manual"/"feeler"/full-relay
+   * sub-types). The manager tracks connection direction in `peerConnectionType`
+   * (set to "inbound" for accepted sockets, to the dialed sub-type
+   * full_relay/block_relay/feeler for outbound); the live `Peer.connType` field
+   * is NOT reliable for outbound dials (the Peer ctor defaults it to "inbound"),
+   * so we read `getConnectionType(key)` instead. Pure read; no side effects.
+   *
+   * @param params [node?]
+   */
+  private async getAddedNodeInfo(params: unknown[]): Promise<unknown[]> {
+    // Optional `node` filter. Core matches the RAW string passed to addnode
+    // (m_params.m_added_node == node); hotbuns stores the key in "host:port"
+    // form (addnode appends defaultPort when no ":" was given), so a bare-host
+    // filter like "1.2.3.4" is normalized the SAME way addnode normalizes it
+    // before the exact-string compare.
+    const raw = params.length > 0 ? params[0] : undefined;
+    const normalizeKey = (addr: string): string => {
+      const lastColon = addr.lastIndexOf(":");
+      if (lastColon > 0) {
+        const host = addr.slice(0, lastColon);
+        const port = parseInt(addr.slice(lastColon + 1), 10);
+        if (!Number.isNaN(port)) {
+          return `${host}:${port}`;
+        }
+        return addr; // malformed port — leave as-is; it just won't match
+      }
+      return `${addr}:${this.params.defaultPort}`;
+    };
+
+    // Snapshot the persistent added-node list (Core CConnman::m_added_nodes,
+    // minus onetry which never registers). A Set has no defined order; sort for
+    // deterministic, reproducible output (Core preserves insertion order — see
+    // caveat in the porting notes).
+    const addedKeys = this.peerManager.getAddedNodes().slice().sort();
+    const addedSet = new Set(addedKeys);
+
+    // Build a lookup of currently-connected peers keyed by "host:port".
+    // inbound? is taken from the manager's authoritative connection-type map:
+    // Core net.cpp:548 emits the bare direction (IsInboundConn() ? "inbound" :
+    // "outbound"). The manager records "inbound" for accepted sockets and the
+    // dialed sub-type (full_relay / block_relay / feeler) for outbound, so only
+    // an exact "inbound" is inbound; every other value (or an unknown peer that
+    // is connected but lacks a recorded type) is outbound.
+    const connected = new Map<string, boolean>(); // host:port -> inbound?
+    for (const peer of this.peerManager.getConnectedPeers()) {
+      const key = `${peer.host}:${peer.port}`;
+      connected.set(key, this.peerManager.getConnectionType(key) === "inbound");
+    }
+
+    let keys = addedKeys;
+
+    // Optional `node` filter: exact match against the normalized added list.
+    // Miss -> -24 "Error: Node has not been added." (Core net.cpp:533-535).
+    if (raw !== undefined && raw !== null) {
+      if (typeof raw !== "string") {
+        throw this.rpcError(
+          RPCErrorCodes.TYPE_ERROR,
+          `JSON value of type ${jsonTypeName(raw)} is not of expected type string`,
+        );
+      }
+      const want = normalizeKey(raw);
+      if (!addedSet.has(want)) {
+        throw this.rpcError(
+          RPCErrorCodes.CLIENT_NODE_NOT_ADDED,
+          "Error: Node has not been added.",
+        );
+      }
+      keys = [want];
+    }
+
+    const ret: unknown[] = [];
+    for (const key of keys) {
+      const isConnected = connected.has(key);
+      const addresses: unknown[] = [];
+      if (isConnected) {
+        addresses.push({
+          address: key,
+          connected: connected.get(key) ? "inbound" : "outbound",
+        });
+      }
+      ret.push({
+        addednode: key,
+        connected: isConnected,
+        addresses,
+      });
+    }
+    return ret;
   }
 
   /**
