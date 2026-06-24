@@ -66,6 +66,7 @@ import {
   SIGHASH_ANYONECANPAY,
 } from "../validation/tx.js";
 import { hash256, hash160 } from "../crypto/primitives.js";
+import { getLogger } from "../logger/logger.js";
 import { BufferReader } from "../wire/serialization.js";
 import type { InvPayload, NetworkMessage } from "../p2p/messages.js";
 import { InvType } from "../p2p/messages.js";
@@ -1339,6 +1340,7 @@ export class RPCServer {
     this.registerMethod("stop", () => this.stopNode());
     this.registerMethod("uptime", () => this.getUptime());
     this.registerMethod("getmemoryinfo", async (params) => this.getMemoryInfo(params));
+    this.registerMethod("logging", async (params) => this.logging(params));
 
     // Multi-wallet management methods (always available if walletManager is present)
     if (this.walletManager) {
@@ -6946,6 +6948,117 @@ export class RPCServer {
 
     // Any other mode is Core's RPC_INVALID_PARAMETER (-8) "unknown mode %s".
     throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, `unknown mode ${mode}`);
+  }
+
+  /**
+   * logging: get and set the debug-logging category configuration.
+   *
+   * Reference: Bitcoin Core rpc/node.cpp `logging` (:218-275) +
+   * `EnableOrDisableLogCategories` (:200-216); logging.cpp
+   * `LogCategoriesList` / `EnableCategory` / `DisableCategory`.
+   *
+   * hotbuns has a REAL category-based debug-logging system (src/logger):
+   * `LogDebug`-style emission via `logger.debug(category, ...)` is gated on a
+   * live per-category enable mask. This RPC reads and MUTATES that live mask,
+   * so enabling a category here makes its DEBUG logs actually start flowing
+   * with no restart — exactly like Core's in-memory `m_categories` mutation
+   * (it is NOT a cosmetic snapshot: `Logger.debug` consults
+   * `isCategoryEnabled` on every record).
+   *
+   * The category NAME set legitimately differs from Core's (it is hotbuns'
+   * own `DEBUG_CATEGORIES` — the subsystems hotbuns actually has). What
+   * matches Core EXACTLY is the SHAPE, the param-semantics, and the -8 error:
+   *
+   *   Params (both OPTIONAL, positional, Core order: include THEN exclude):
+   *     - params[0] include (array of category strings): categories to ENABLE.
+   *     - params[1] exclude (array of category strings): categories to DISABLE.
+   *     A param is acted on ONLY if it is an array (Core `isArray()` guard);
+   *     null/omitted is a no-op for that slot, so `logging` with no args is a
+   *     pure read-and-report. include is applied first, then exclude, so a
+   *     category named in both ends up DISABLED ("exclude wins").
+   *
+   *   Special input-only tokens (never emitted as output keys): "all"/"1"/""
+   *   expand to the full mask (enable: turn everything on; exclude: clear
+   *   everything, Core's `logging [], ["all"]` => all-off). hotbuns also
+   *   accepts "none"/"0" as clear tokens.
+   *
+   *   Returns a JSON object mapping every real category in `DEBUG_CATEGORIES`
+   *   -> bool (currently debug-logged or not), in ascending alphabetical key
+   *   order (byte-stable, Core iterates a std::map). all/1/"" are never keys.
+   *
+   *   Errors: an unknown category in either array -> RPC_INVALID_PARAMETER
+   *   (-8) "unknown logging category <cat>" (Core node.cpp:213), thrown as
+   *   soon as the bad name is hit — include scanned fully first, then exclude
+   *   in order; categories BEFORE the bad one in the same call have ALREADY
+   *   been applied (partial application, no rollback — Core parity). A
+   *   non-string array element is a JSON type error (-3), like Core get_str().
+   *
+   * Scope: mutates the running node's in-memory mask immediately; NOT
+   * persisted to config, resets on restart to the `--debug` startup flags.
+   * Idempotent (enabling an already-on / disabling an already-off category
+   * still returns the full list).
+   */
+  private logging(params: unknown[]): Record<string, boolean> {
+    const logger = getLogger();
+
+    // Core's input-only special tokens (logging.cpp): "all"/"1"/"" map to the
+    // whole mask. Accepted as input on either slot, never emitted as a key.
+    const ALL_TOKENS = new Set(["all", "1", ""]);
+    // hotbuns additionally honors its CLI clear tokens on the exclude slot.
+    const NONE_TOKENS = new Set(["none", "0"]);
+
+    const apply = (cats: unknown, enable: boolean): void => {
+      // Core EnableOrDisableLogCategories does cats.get_array() then per-element
+      // get_str(); a non-array param is silently ignored at the call site (only
+      // isArray() triggers processing) — so null/omitted/scalar is a no-op.
+      if (!Array.isArray(cats)) return;
+      for (const item of cats) {
+        if (typeof item !== "string") {
+          // Core get_str() type error on a non-string element (RPC_TYPE_ERROR).
+          throw this.rpcError(
+            RPCErrorCodes.TYPE_ERROR,
+            `JSON value of type ${jsonTypeName(item)} is not of expected type string`,
+          );
+        }
+        const cat = item;
+        const lc = cat.toLowerCase();
+        if (ALL_TOKENS.has(lc) || (!enable && NONE_TOKENS.has(lc))) {
+          // all/1/"" (and none/0 on exclude) -> whole-mask op. Never validated
+          // as a category name and never a no-op error.
+          if (enable) {
+            logger.enableCategory(lc);
+          } else {
+            logger.disableCategory(lc);
+          }
+          continue;
+        }
+        if (!logger.isKnownCategory(lc)) {
+          // Core node.cpp:213 — EnableCategory/DisableCategory return false for
+          // an unknown name -> -8 "unknown logging category <cat>". Message uses
+          // the original (un-lowercased) string, matching how Core echoes the
+          // exact cat the caller passed.
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_PARAMETER,
+            `unknown logging category ${cat}`,
+          );
+        }
+        if (enable) {
+          logger.enableCategory(lc);
+        } else {
+          logger.disableCategory(lc);
+        }
+      }
+    };
+
+    // Core order: include first (params[0]), then exclude (params[1]). Each is
+    // applied in array order; a bad name throws mid-stream after applying the
+    // valid names that preceded it (partial-apply-before-throw).
+    apply(params.length > 0 ? params[0] : undefined, true);
+    apply(params.length > 1 ? params[1] : undefined, false);
+
+    // Emit the full {category: active} map, alphabetically sorted, for every
+    // REAL category in DEBUG_CATEGORIES (all/1/"" are never keys).
+    return logger.getCategoryStatusMap();
   }
 
   // ========== Node Connection Management ==========

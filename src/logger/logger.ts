@@ -58,9 +58,21 @@ export const DEBUG_CATEGORIES = [
 
 export type DebugCategory = (typeof DEBUG_CATEGORIES)[number];
 
-/** Special "enable everything" sentinels recognized by Bitcoin Core. */
-const ALL_TOKENS = new Set(["1", "all"]);
-/** Special "disable everything" sentinels. */
+/** Lowercased known-category set, for membership checks. */
+const KNOWN_CATEGORIES: ReadonlySet<string> = new Set(DEBUG_CATEGORIES);
+
+/**
+ * Special "enable everything" sentinels recognized by Bitcoin Core
+ * (`logging.cpp` maps `"all"`, `"1"`, and the empty string `""` to the ALL
+ * mask). hotbuns accepts `""` as an enable-all token too for Core parity.
+ */
+const ALL_TOKENS = new Set(["1", "all", ""]);
+/**
+ * Special "disable everything" sentinels. Core itself only documents
+ * `all`/`1`/`""` (DisableCategory with any of those clears every bit, which is
+ * how `logging [], ["all"]` turns everything off); hotbuns additionally
+ * recognizes `none`/`0` as clear tokens (its `-debug` CLI already does).
+ */
 const NONE_TOKENS = new Set(["0", "none"]);
 
 export interface LoggerOptions {
@@ -113,9 +125,24 @@ export class Logger {
 
   /**
    * Enable a debug category. Accepts repeated tokens, comma-separated lists,
-   * "all"/"1"/"none"/"0", or a category name.
+   * "all"/"1"/""/"none"/"0", or a category name.
+   *
+   * "all"/"1"/"" expand to EVERY known category (and also flip `allEnabled`,
+   * so an arbitrary not-in-table name like a future subsystem still logs while
+   * ALL is on — matches Core's whole-bitmask semantics). A bare category name
+   * sets just that bit. This mutates the live mask in place; because
+   * {@link debug} consults {@link isCategoryEnabled} on every record, a toggle
+   * here takes effect immediately with no restart (no snapshot trap).
    */
   enableCategory(raw: string): void {
+    // Core's empty-string ALL token: `EnableCategory("")` enables the whole
+    // mask. An empty/whitespace `raw` splits to nothing below, so handle it
+    // up front rather than letting the empty-filter swallow it.
+    if (raw.trim() === "") {
+      this.allEnabled = true;
+      for (const c of DEBUG_CATEGORIES) this.enabledCategories.add(c);
+      return;
+    }
     const tokens = raw
       .split(",")
       .map((t) => t.trim().toLowerCase())
@@ -123,6 +150,7 @@ export class Logger {
     for (const token of tokens) {
       if (ALL_TOKENS.has(token)) {
         this.allEnabled = true;
+        for (const c of DEBUG_CATEGORIES) this.enabledCategories.add(c);
         continue;
       }
       if (NONE_TOKENS.has(token)) {
@@ -134,9 +162,67 @@ export class Logger {
     }
   }
 
+  /**
+   * Disable a debug category — the inverse of {@link enableCategory}, used by
+   * the `logging` RPC's exclude slot. "all"/"1"/""/"none"/"0" clear EVERY
+   * category (Core's DisableCategory("all") clears the whole bitmask). A bare
+   * category name clears just that bit; clearing one bit while ALL was on
+   * also drops `allEnabled` so the per-category map reflects the exclusion
+   * (e.g. `logging [["all"],["net"]]` -> every key true except net). Live —
+   * takes effect immediately on the running logger.
+   */
+  disableCategory(raw: string): void {
+    // Core's empty-string ALL token in the exclude slot clears the whole mask.
+    if (raw.trim() === "") {
+      this.allEnabled = false;
+      this.enabledCategories.clear();
+      return;
+    }
+    const tokens = raw
+      .split(",")
+      .map((t) => t.trim().toLowerCase())
+      .filter((t) => t.length > 0);
+    for (const token of tokens) {
+      if (ALL_TOKENS.has(token) || NONE_TOKENS.has(token)) {
+        this.allEnabled = false;
+        this.enabledCategories.clear();
+        continue;
+      }
+      // Clearing one specific bit while ALL was on: drop the umbrella flag so
+      // arbitrary/unknown names stop logging too, then keep every OTHER known
+      // category on (the map must show all-true-except-this).
+      if (this.allEnabled) {
+        this.allEnabled = false;
+        for (const c of DEBUG_CATEGORIES) this.enabledCategories.add(c);
+      }
+      this.enabledCategories.delete(token);
+    }
+  }
+
   /** Test/operator helper: returns true if a category is currently enabled. */
   isCategoryEnabled(category: string): boolean {
     return this.allEnabled || this.enabledCategories.has(category.toLowerCase());
+  }
+
+  /**
+   * Snapshot the live per-category enable state as a plain `{name: bool}`
+   * object covering EXACTLY the known {@link DEBUG_CATEGORIES}, with keys in
+   * ascending alphabetical order (Core iterates a `std::map`; the RPC's
+   * `logging` result is byte-stable that way). Special tokens
+   * ("all"/"1"/""/"none"/"0") are never keys. Read from the live set, so it
+   * reflects every prior enable/disable.
+   */
+  getCategoryStatusMap(): Record<string, boolean> {
+    const out: Record<string, boolean> = {};
+    for (const cat of [...DEBUG_CATEGORIES].sort()) {
+      out[cat] = this.isCategoryEnabled(cat);
+    }
+    return out;
+  }
+
+  /** Returns true iff `name` is one of the exposed {@link DEBUG_CATEGORIES}. */
+  isKnownCategory(name: string): boolean {
+    return KNOWN_CATEGORIES.has(name.toLowerCase());
   }
 
   setLevel(level: keyof typeof LEVEL_ORDER): void {
