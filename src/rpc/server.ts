@@ -1253,6 +1253,12 @@ export class RPCServer {
     this.registerMethod("signrawtransactionwithkey", (params) =>
       this.signRawTransactionWithKey(params)
     );
+    // combinerawtransaction: merge multiple partially-signed variants of the
+    // SAME tx into one carrying the union of their signature data (single-sig
+    // scope — the dominant case). Core: rpc/rawtransaction.cpp:585.
+    this.registerMethod("combinerawtransaction", (params) =>
+      this.combineRawTransaction(params)
+    );
 
     // Mempool methods
     this.registerMethod("getmempoolinfo", () => this.getMempoolInfo());
@@ -10772,6 +10778,178 @@ export class RPCServer {
       vin: vinArr,
       vout: voutArr,
     };
+  }
+
+  /**
+   * combinerawtransaction ["hexstring", ...]
+   *
+   * Combine multiple partially-signed versions of the SAME transaction into one
+   * carrying the union of their signature data. The result may still be partial
+   * or fully signed. Returns the witness-serialized hex.
+   *
+   * Reference: bitcoin-core/src/rpc/rawtransaction.cpp combinerawtransaction
+   * (RPCHelpMan :585, impl body :605-668) — replicated faithfully for the
+   * single-sig case, matching the ouroboros reference (commit f4c98ee,
+   * src/ouroboros/rpc.py::rpc_combinerawtransaction).
+   *
+   * Flow (Core :605-668):
+   *   1. txs = params[0].get_array(); per element DecodeHexTx (witness-aware).
+   *      On decode failure -> -22 "TX decode failed for tx %d. Make sure the tx
+   *      has at least one input." (0-based idx).
+   *   2. Empty array -> -22 "Missing transactions".
+   *   3. mergedTx = clone of the FIRST variant (the structural template — its
+   *      version/locktime/vin/vout define the result; only each input's
+   *      scriptSig + witness get rebuilt).
+   *   4-7. Per input, merge the signature data across all variants and re-encode
+   *      WITH witness (TX_WITH_WITNESS) to lowercase hex.
+   *
+   * Codec reuse: hotbuns's own witness-aware tx codec (src/validation/tx.ts) —
+   * decodeTxWitnessAware (= Core DecodeHexTx, try_no_witness=false/try_witness=
+   * true) and serializeTx(tx, true) (= EncodeHexTx(CTransaction, TX_WITH_WITNESS);
+   * the marker/flag is emitted iff hasWitness(tx), mirroring CTransaction::
+   * HasWitness). No signing / Solver / UTXO machinery is needed for single-sig
+   * parity.
+   *
+   * MERGE SCOPE (single-sig parity — the dominant, byte-identical case): for
+   * each input, across all variants, pick the variant that actually carries
+   * signature data (non-empty scriptSig or witness), tie-broken by total
+   * sig-data length (longer = more sigs), equal length keeps the earliest
+   * variant. This is BYTE-IDENTICAL to Core for single-key inputs
+   * (P2PKH / P2WPKH / P2SH-P2WPKH): Core's DataFromTransaction returns the
+   * variant's scriptSig + scriptWitness verbatim once VerifyScript marks the
+   * input complete, and MergeSignatureData adopts that complete sigdata
+   * wholesale.
+   *
+   * KNOWN LIMITATION (flagged, NOT faked — matches the ouroboros reference):
+   * the FULL Core behavior also merges PARTIAL multisig signatures WITHIN a
+   * single input (two variants each holding one of M sigs for a bare/P2SH/P2WSH
+   * M-of-N) via SignatureData::Merge over the extracted pubkey->sig map. That
+   * needs Solver / VerifyScript-with-a-signature-extracting-checker / sighash
+   * validation, which this handler does NOT implement — for an input partially
+   * signed in BOTH variants (neither alone complete) we keep the longer
+   * scriptSig rather than splicing the two sig sets; that input is therefore NOT
+   * guaranteed byte-identical to Core.
+   *
+   * DEVIATION (flagged): Core resolves every input's prevout from its own UTXO +
+   * mempool CCoinsViewCache and throws RPC_VERIFY_ERROR (-25) "Input not found
+   * or already spent" for a missing/spent coin. This handler does NOT consult
+   * chainstate — combine is a pure function of the provided variants here — so
+   * it does NOT raise -25 for unresolvable prevouts. Consequence: the
+   * byte-identical SUCCESS vector must be run against a Core oracle whose UTXO
+   * actually resolves the prevouts. The -22 empty / -22 decode-failure / -3
+   * type error paths DO match Core.
+   */
+  private async combineRawTransaction(params: unknown[]): Promise<string> {
+    // Param shape: Core does request.params[0].get_array(); a non-array (incl.
+    // omitted/null) is a JSON type error (RPC_TYPE_ERROR, -3).
+    const txs = params[0];
+    if (!Array.isArray(txs)) {
+      throw this.rpcError(
+        RPCErrorCodes.TYPE_ERROR,
+        `JSON value of type ${jsonTypeName(txs)} is not of expected type array`,
+      );
+    }
+
+    // 1. Decode every variant (witness-aware). Core: DecodeHexTx per idx; on
+    //    failure -> -22 "TX decode failed for tx %d. ..." (0-based idx). Each
+    //    element must be a JSON string (Core reads it with .get_str()).
+    const variants: Transaction[] = [];
+    for (let idx = 0; idx < txs.length; idx++) {
+      const item = txs[idx];
+      if (typeof item !== "string") {
+        throw this.rpcError(
+          RPCErrorCodes.TYPE_ERROR,
+          `JSON value of type ${jsonTypeName(item)} is not of expected type string`,
+        );
+      }
+      let tx: Transaction;
+      try {
+        const bytes = Buffer.from(item, "hex");
+        // Core DecodeHexTx defaults: try_no_witness=false, try_witness=true.
+        tx = decodeTxWitnessAware(bytes, false, true);
+        if (tx.inputs.length === 0) {
+          // Core's "Make sure the tx has at least one input." — a zero-input tx
+          // is the ambiguous segwit-marker case DecodeHexTx rejects.
+          throw new Error("no inputs");
+        }
+      } catch {
+        throw this.rpcError(
+          -22,
+          `TX decode failed for tx ${idx}. Make sure the tx has at least one input.`,
+        );
+      }
+      variants.push(tx);
+    }
+
+    // 2. Empty array -> -22 "Missing transactions". (A required array means a
+    //    null/omitted param errored earlier as a type error; this guards [].)
+    if (variants.length === 0) {
+      throw this.rpcError(-22, "Missing transactions");
+    }
+
+    // 3. mergedTx starts as a clone of the first variant (the template: its
+    //    version / locktime / vin / vout define the result; only each input's
+    //    scriptSig + witness get rebuilt below).
+    const template = variants[0];
+    const mergedInputs: TxIn[] = [];
+
+    for (let i = 0; i < template.inputs.length; i++) {
+      const base = template.inputs[i];
+      let bestScriptSig: Buffer = Buffer.alloc(0);
+      let bestWitness: Buffer[] = [];
+      let bestScore = -1; // rank candidates; higher = more complete
+
+      for (const variant of variants) {
+        if (i >= variant.inputs.length) continue;
+        const vin = variant.inputs[i];
+        const ss = vin.scriptSig ?? Buffer.alloc(0);
+        const wit = vin.witness ?? [];
+        const witNonEmpty = wit.some((x) => x.length > 0);
+        const ssNonEmpty = ss.length > 0;
+
+        // Score the candidate so we deterministically prefer the variant that
+        // actually carries signature data for this input. Tie-break by total
+        // sig-data length (longer = more sigs, matching the partial-multisig
+        // fallback note). Equal length -> keep the earliest variant (Core's
+        // merge is order-stable for the complete single-sig case).
+        let score: number;
+        if (!ssNonEmpty && !witNonEmpty) {
+          score = 0;
+        } else {
+          const witLen = wit.reduce((acc, x) => acc + x.length, 0);
+          score = 1_000_000 + ss.length + witLen;
+        }
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestScriptSig = ss;
+          bestWitness = wit.slice();
+        }
+      }
+
+      mergedInputs.push({
+        prevOut: { txid: base.prevOut.txid, vout: base.prevOut.vout },
+        scriptSig: bestScriptSig,
+        sequence: base.sequence,
+        witness: bestWitness,
+      });
+    }
+
+    const merged: Transaction = {
+      version: template.version,
+      inputs: mergedInputs,
+      outputs: template.outputs.map((o) => ({
+        value: o.value,
+        scriptPubKey: o.scriptPubKey,
+      })),
+      lockTime: template.lockTime,
+    };
+
+    // Core re-encodes WITH witness (TX_WITH_WITNESS) unconditionally;
+    // serializeTx(_, true) emits the marker/flag iff hasWitness(merged) — i.e.
+    // any input has a non-empty witness stack — mirroring CTransaction::
+    // HasWitness, which drives Core's marker.
+    return serializeTx(merged, true).toString("hex");
   }
 
   private async decodeScript(params: unknown[]): Promise<Record<string, unknown>> {
