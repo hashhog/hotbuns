@@ -36,6 +36,7 @@ import {
 import type { Block, BlockHeader } from "../validation/block.js";
 import {
   deserializeBlock,
+  deserializeBlockHeader,
   serializeBlock,
   serializeBlockHeader,
   getBlockHash,
@@ -1323,6 +1324,7 @@ export class RPCServer {
     this.registerMethod("generateblock", (params) => this.generateBlock(params));
     this.registerMethod("generatetodescriptor", (params) => this.generateToDescriptor(params));
     this.registerMethod("submitblock", (params) => this.submitBlock(params));
+    this.registerMethod("submitheader", (params) => this.submitHeader(params));
     this.registerMethod("getmininginfo", () => this.getMiningInfo());
 
     // Pruning methods
@@ -8163,6 +8165,102 @@ export class RPCServer {
     }
 
     throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Block sync not available");
+  }
+
+  /**
+   * submitheader: Decode the given hexdata as a header and submit it as a
+   * candidate chain tip if valid.  Throws when the header is invalid.
+   *
+   * Reference: Bitcoin Core mining.cpp submitheader() (RPCHelpMan).
+   *   - Bad hex / wrong length / undecodable -> RPC_DESERIALIZATION_ERROR (-22)
+   *     "Block header decode failed".
+   *   - Parent (prevBlock) not in the block index -> RPC_VERIFY_ERROR (-25)
+   *     "Must submit previous header (<prevhash>) first" where <prevhash> is the
+   *     big-endian DISPLAY hex (Core's h.hashPrevBlock.GetHex()).
+   *   - Success / already-known -> JSON null.
+   *   - PoW / contextual validation failure -> RPC_VERIFY_ERROR (-25) with the
+   *     reject-reason string.
+   *
+   * Reuses the existing headers-first validation + store path
+   * (HeaderSync.validateHeader for the reject reason, HeaderSync.processHeaders
+   * to admit the header) — no parallel validator.
+   *
+   * @param params [hexdata] - hex-encoded 80-byte block header
+   * @returns null on success, throws on failure
+   */
+  private async submitHeader(params: unknown[]): Promise<null> {
+    // --- Step 1: decode the hex-encoded header --------------------------------
+    // Core: DecodeHexBlockHeader(h, request.params[0].get_str())
+    // Bad hex or non-80-byte payload -> RPC_DESERIALIZATION_ERROR (-22).
+    const [hexdata] = params;
+    if (typeof hexdata !== "string") {
+      throw this.rpcError(-22, "Block header decode failed");
+    }
+
+    let header: BlockHeader;
+    try {
+      const buf = Buffer.from(hexdata, "hex");
+      // A valid block header is exactly 80 bytes.  Buffer.from silently drops a
+      // trailing nibble on odd-length / non-hex input, so length-check the
+      // decoded bytes (Core's DecodeHexBlockHeader requires exactly 80 bytes
+      // and rejects trailing data via the stream-empty check).
+      if (buf.length !== 80) {
+        throw new Error("not 80 bytes");
+      }
+      header = deserializeBlockHeader(new BufferReader(buf));
+    } catch {
+      throw this.rpcError(-22, "Block header decode failed");
+    }
+
+    // Display-order (big-endian) hex of prevBlock for error messages, matching
+    // Core's h.hashPrevBlock.GetHex() which reverses the internal byte order.
+    const prevHashDisplay = Buffer.from(header.prevBlock).reverse().toString("hex");
+
+    // --- Step 2: parent-known check -------------------------------------------
+    // Core: chainman.m_blockman.LookupBlockIndex(h.hashPrevBlock)
+    // The header chain (HeaderSync) is hotbuns's block-index equivalent — it
+    // holds every header we have accepted (active chain + forks).  prev not in
+    // the index -> RPC_VERIFY_ERROR (-25).
+    const parent = this.headerSync.getHeader(header.prevBlock);
+    if (!parent) {
+      throw this.rpcError(
+        RPCErrorCodes.RPC_TRANSACTION_ERROR,
+        `Must submit previous header (${prevHashDisplay}) first`
+      );
+    }
+
+    // --- Step 3: idempotency --------------------------------------------------
+    // Core's ProcessNewBlockHeaders is idempotent — submitting a header already
+    // in the block index is a no-op that returns null.  processHeaders() also
+    // skips already-known headers, but short-circuiting here lets an
+    // already-known header return null even if it would otherwise re-trip a
+    // (now stale) contextual check.
+    const blockHash = getBlockHash(header);
+    if (this.headerSync.getHeader(blockHash)) {
+      return null;
+    }
+
+    // --- Step 4: validation via the REAL header validator ---------------------
+    // Core: ProcessNewBlockHeaders -> AcceptBlockHeader -> CheckBlockHeader
+    // (PoW) + ContextualCheckBlockHeader.  Reuse HeaderSync.validateHeader so we
+    // surface the exact reject reason; on failure -> RPC_VERIFY_ERROR (-25).
+    const validation = this.headerSync.validateHeader(header, parent);
+    if (!validation.valid) {
+      throw this.rpcError(
+        RPCErrorCodes.RPC_TRANSACTION_ERROR,
+        validation.error ?? "rejected"
+      );
+    }
+
+    // --- Step 5: admit the header into the store ------------------------------
+    // Core: AcceptBlockHeader inserts the validated header into the block index.
+    // Reuse the canonical accept-and-store path (same call submitblock uses to
+    // advance the headerSync tip).  processHeaders re-validates and persists;
+    // it is a no-op for a header that fails (we already gated on validateHeader)
+    // or is already present.
+    await this.headerSync.processHeaders([header], null);
+
+    return null;
   }
 
   /**
