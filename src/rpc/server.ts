@@ -3287,12 +3287,21 @@ export class RPCServer {
     // Blocks walked descending from the tip, kept so the level-4 pass can
     // reconnect them in ascending order (Core's CVerifyDB does the same:
     // disconnect down to `pindex`, then Next()-walk forward reconnecting).
+    // Only the contiguous tip-suffix of blocks that HAVE real undo data is
+    // collected here — the disconnect/reconnect view cannot be rolled back
+    // past a block whose undo was never stored (assume-valid IBD / pruned).
     type Walked = {
       height: number;
       hash: Buffer;
       block: Block;
     };
     const walked: Walked[] = [];
+
+    // Set once the descending walk reaches a block with no usable undo data
+    // (Core's `skipped_no_block_data` / pruning break at validation.cpp:4652).
+    // Levels 0/1 keep walking below the gap (they need no undo), but the
+    // level-3 disconnect + level-4 reconnect only cover the suffix above it.
+    let disconnectGap = false;
 
     for (let height = tipHeight; height >= lowestHeight; height--) {
       const hash = await this.db.getBlockHashByHeight(height);
@@ -3343,49 +3352,79 @@ export class RPCServer {
       }
 
       // ── Level 2: verify undo data (ReadBlockUndo) ──
-      // Level 3 also needs the deserialized undo records, so resolve them here.
-      let spentOutputs:
-        | import("../chain/utxo.js").SpentUTXO[]
-        | false
-        | null = null;
+      // Core (validation.cpp:4672-4680) reads the undo ONLY when the block has
+      // a non-null undo position; a null undo position is SKIPPED, never
+      // failed. Present-but-corrupt undo is the only level-2 failure. Level 3
+      // also needs the decoded records, so resolve them here.
       if (checkLevel >= 2) {
-        spentOutputs = await this.loadUndoForVerify(hash, height);
-        if (spentOutputs === false) {
+        const loaded = await this.loadUndoForVerify(hash);
+
+        if (loaded.kind === "corrupt") {
+          // Core ReadBlockUndo == false -> CORRUPTED_BLOCK_DB (4676).
           logger.warn(`verifychain: found bad undo data at ${height}`);
           return false;
         }
-      }
 
-      // ── Level 3: check disconnection of tip blocks ──
-      // Core re-runs DisconnectBlock and reports any inconsistency. The
-      // consistency invariant DisconnectBlock enforces before touching the
-      // UTXO set (validation.cpp:2190-2193, mirrored in
-      // chain/state.ts::disconnectBlock) is that the undo data accounts for
-      // exactly the block's spent inputs. We re-check it without mutating the
-      // live UTXO set (Core uses a throwaway CCoinsViewCache; here the check is
-      // structural and side-effect free).
-      if (checkLevel >= 3) {
-        if (!spentOutputs) {
-          // null (never loaded) or false (corrupt) — both mean we cannot
-          // assert disconnection consistency for this block.
-          logger.warn(`verifychain: missing undo data at ${height}`);
-          return false;
-        }
+        // Expected undo-record count = total non-coinbase inputs in the block
+        // (hotbuns stores one flat SpentUTXO per spent input; Core's
+        // vtxundo.size()+1 == vtx.size() invariant, validation.cpp:2190-2193).
         let expectedUndoEntries = 0;
         for (let i = 1; i < block.transactions.length; i++) {
           expectedUndoEntries += block.transactions[i].inputs.length;
         }
-        if (spentOutputs.length !== expectedUndoEntries) {
-          logger.warn(
-            `verifychain: irrecoverable inconsistency at ${height} ` +
-              `(undo has ${spentOutputs.length} entries, expected ` +
-              `${expectedUndoEntries})`
-          );
-          return false;
+
+        // A null undo position (absent), OR an empty undo record for a block
+        // that DOES spend non-coinbase inputs (the assume-valid case: undo is
+        // intentionally not recorded below the assumevalid height), both mean
+        // "no real undo for this block". Core SKIPS such blocks and stops the
+        // disconnect/reconnect walk there — it does NOT fail. Treat as the gap.
+        const noRealUndo =
+          loaded.kind === "absent" ||
+          (loaded.undo.length === 0 && expectedUndoEntries > 0);
+
+        if (noRealUndo) {
+          if (checkLevel >= 3 && !disconnectGap) {
+            // Core validation.cpp:4655 — log + break (stop going back).
+            logger.info(
+              `verifychain: stopping disconnect at height ${height} ` +
+                `(no undo data; assume-valid IBD or pruning). Heights below ` +
+                `this are not re-disconnected.`
+            );
+            disconnectGap = true;
+          }
+          // Levels 0/1 already passed for this block; with no undo we cannot
+          // disconnect/reconnect it, so it is NOT added to `walked`. Keep
+          // walking lower heights for the level-0/1 read+CheckBlock coverage.
+          continue;
+        }
+
+        // ── Level 3: check disconnection of tip blocks ──
+        // Core re-runs DisconnectBlock and reports any inconsistency. The
+        // consistency invariant DisconnectBlock enforces before touching the
+        // UTXO set (validation.cpp:2190-2193, mirrored in
+        // chain/state.ts::disconnectBlock) is that the undo data accounts for
+        // exactly the block's spent inputs. We re-check it without mutating the
+        // live UTXO set here (level 4 runs the full reconnect).
+        if (checkLevel >= 3 && !disconnectGap) {
+          if (loaded.undo.length !== expectedUndoEntries) {
+            logger.warn(
+              `verifychain: irrecoverable inconsistency at ${height} ` +
+                `(undo has ${loaded.undo.length} entries, expected ` +
+                `${expectedUndoEntries})`
+            );
+            return false;
+          }
         }
       }
 
-      walked.push({ height, hash, block });
+      // Only blocks with real undo on a contiguous tip-suffix are reconnectable
+      // at level 4. Once the disconnect walk has hit a no-undo gap, lower blocks
+      // are read+CheckBlock'd (levels 0/1) but never reconnected — Core verifies
+      // only the suffix it can reach (validation.cpp:4716-4737 walks back up
+      // from `pindex`, which stopped at the gap).
+      if (!disconnectGap) {
+        walked.push({ height, hash, block });
+      }
     }
 
     // ── Level 4: try reconnecting the blocks ──
@@ -3417,25 +3456,46 @@ export class RPCServer {
   }
 
   /**
-   * Load + deserialize the undo data for a block, returning the spent-output
-   * list, `false` on corrupt/unreadable undo data, or `null` when the block
-   * legitimately has no undo data (only valid for the genesis block, which is
-   * never walked by verifychain). Helper for verifychain levels 2-4.
+   * Load + deserialize the undo data for a block. Helper for verifychain
+   * levels 2-4. Returns a discriminated result mirroring Core's three
+   * possible states for `pindex->GetUndoPos()` in CVerifyDB::VerifyDB
+   * (validation.cpp:4672-4680):
+   *
+   *   - { kind: "present", undo }  — undo pos is non-null AND ReadBlockUndo
+   *     succeeded (Core reads + keeps the records; verifychain disconnects /
+   *     reconnects with them).
+   *   - { kind: "absent" }         — undo pos IS null. Core SKIPS the undo
+   *     read entirely (`if (!pindex->GetUndoPos().IsNull())`); a null undo
+   *     pos is NOT a failure. hotbuns's analogue is "getUndoData returns
+   *     null": a coinbase-only block (no spends), an assume-valid IBD block
+   *     (undo intentionally not stored below the assumevalid height,
+   *     sync/blocks.ts only persists undo `atTipForUndo`), or a pruned block.
+   *     The disconnect/reconnect walk stops at the first such block, exactly
+   *     as Core breaks at the `!BLOCK_HAVE_DATA` gate (validation.cpp:4652).
+   *   - { kind: "corrupt" }        — undo pos is non-null but the record fails
+   *     to decode (the ONLY level-2 failure, Core's ReadBlockUndo == false
+   *     CORRUPTED_BLOCK_DB at validation.cpp:4676).
    */
   private async loadUndoForVerify(
-    hash: Buffer,
-    height: number
-  ): Promise<import("../chain/utxo.js").SpentUTXO[] | false | null> {
+    hash: Buffer
+  ): Promise<
+    | { kind: "present"; undo: import("../chain/utxo.js").SpentUTXO[] }
+    | { kind: "absent" }
+    | { kind: "corrupt" }
+  > {
     const undoRaw = await this.db.getUndoData(hash);
     if (!undoRaw) {
-      // A non-genesis block must have undo data. Treat absence as corruption.
-      return height > 0 ? false : null;
+      // No undo recorded for this block — Core's GetUndoPos().IsNull(): SKIP,
+      // never a failure. (coinbase-only / assume-valid IBD / pruned.)
+      return { kind: "absent" };
     }
     try {
       const { deserializeUndoData } = await import("../chain/utxo.js");
-      return deserializeUndoData(undoRaw);
+      return { kind: "present", undo: deserializeUndoData(undoRaw) };
     } catch {
-      return false;
+      // Present-but-corrupt undo IS a fatal inconsistency (Core ReadBlockUndo
+      // returning false at validation.cpp:4676 -> CORRUPTED_BLOCK_DB).
+      return { kind: "corrupt" };
     }
   }
 
@@ -3463,21 +3523,45 @@ export class RPCServer {
     }
 
     // Sandbox UTXO view backed by an ISOLATED in-memory store seeded ONLY with
-    // this block's prevouts (recovered from its undo data). This mirrors Core's
-    // CVerifyDB level-4 reconnect, which reconnects into a throwaway
+    // this block's EXTERNAL prevouts (recovered from its undo data). This mirrors
+    // Core's CVerifyDB level-4 reconnect, which reconnects into a throwaway
     // CCoinsViewCache built AFTER the block's own coins were disconnected from
     // the tip view — i.e. the block's own outputs are NOT present, so the
     // BIP-30 "would this overwrite an existing UTXO?" check passes, while the
     // spends still resolve against the seeded prevouts.
+    //
+    // CRITICAL — intra-block spends. hotbuns's undo data records EVERY
+    // non-coinbase input (connect_block.ts pushes every spent coin), including
+    // a coin that an EARLIER transaction in this very block created and a LATER
+    // transaction in the same block spent. After Core's DisconnectBlock unwinds
+    // the block in reverse, such an intra-block-created coin is NOT in the view
+    // (it was created and spent inside the block, so disconnecting cancels it
+    // out). If we naively seed it, the forward reconnect's BIP-30 check —
+    // which walks every output of every block tx and rejects any that already
+    // exists in the view — false-positives on the earlier tx re-creating that
+    // output ("bad-txns-BIP30: tried to overwrite ..."), making the block look
+    // unconnectable. So we EXCLUDE any undo prevout whose txid is one of the
+    // block's own transactions; the forward walk re-creates those coins via
+    // addTransaction when the earlier tx is connected, exactly as during sync.
     //
     // We deliberately do NOT read through to the live ChainDB: there the block
     // is already connected, so its inputs are spent (spend would fail) and its
     // outputs exist (BIP-30 would false-positive). The stub returns the seeded
     // prevout for an exact match and null for everything else. We never flush,
     // so live chainstate is untouched regardless.
+    const blockTxids = new Set<string>();
+    for (const tx of block.transactions) {
+      blockTxids.add(getTxId(tx).toString("hex"));
+    }
     const seeded = new Map<string, import("../storage/database.js").UTXOEntry>();
     for (const s of spent) {
-      const key = `${s.txid.toString("hex")}:${s.vout}`;
+      const txidHex = s.txid.toString("hex");
+      // Skip prevouts created by a transaction in THIS block (intra-block
+      // spends): they are not present in Core's post-disconnect reconnect view.
+      if (blockTxids.has(txidHex)) {
+        continue;
+      }
+      const key = `${txidHex}:${s.vout}`;
       seeded.set(key, {
         height: s.entry.height,
         coinbase: s.entry.coinbase,
