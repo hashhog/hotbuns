@@ -1300,6 +1300,7 @@ export class RPCServer {
     this.registerMethod("getpeerinfo", () => this.getPeerInfo());
     this.registerMethod("getblockfrompeer", (params) => this.getBlockFromPeer(params));
     this.registerMethod("getnetworkinfo", () => this.getNetworkInfo());
+    this.registerMethod("getnettotals", async () => this.getNetTotals());
     this.registerMethod("setnetworkactive", async (params) => this.setNetworkActive(params));
     this.registerMethod("getconnectioncount", async () => this.getConnectionCount());
     this.registerMethod("ping", async () => this.ping());
@@ -7007,6 +7008,48 @@ export class RPCServer {
   }
 
   /**
+   * getnettotals: Returns information about network traffic, including bytes in,
+   * bytes out, and current system time.
+   *
+   * Reference: Bitcoin Core rpc/net.cpp getnettotals (:560). Core reads the
+   * connman's GLOBAL cumulative counters (GetTotalBytesRecv/GetTotalBytesSent),
+   * which include traffic from connections that have since disconnected. hotbuns
+   * mirrors this with PeerManager.getTotalBytesRecv/Sent() (accumulated bytes
+   * from disconnected peers + the live sum of currently-connected peers; see the
+   * disconnectedBytes* accumulators in manager.ts).
+   *
+   * `uploadtarget` mirrors Core's -maxuploadtarget output. hotbuns has no
+   * upload-target limiter (CConnman::nMaxOutboundLimit == 0), so Core emits the
+   * unlimited shape: timeframe = 86400 (the fixed MAX_UPLOAD_TIMEFRAME of 24h,
+   * count_seconds(GetMaxOutboundTimeframe()) — constant regardless of the
+   * limit), target = 0, target_reached = false, serve_historical_blocks = true
+   * (OutboundTargetReached(true) is false when nMaxOutboundLimit == 0),
+   * bytes_left_in_cycle = 0 (GetOutboundTargetBytesLeft returns 0 when no
+   * limit), time_left_in_cycle = 0. This is Core's exact zero/unlimited shape,
+   * not a fabricated value.
+   *
+   * timemillis = current unix epoch time in milliseconds
+   * (Core TicksSinceEpoch<milliseconds>(SystemClock::now())).
+   */
+  private getNetTotals(): Record<string, unknown> {
+    return {
+      totalbytesrecv: this.peerManager.getTotalBytesRecv(),
+      totalbytessent: this.peerManager.getTotalBytesSent(),
+      timemillis: Date.now(),
+      uploadtarget: {
+        // MAX_UPLOAD_TIMEFRAME (net.h) = 60 * 60 * 24 = 86400s; Core reports it
+        // unconditionally via count_seconds(GetMaxOutboundTimeframe()).
+        timeframe: 86400,
+        target: 0,
+        target_reached: false,
+        serve_historical_blocks: true,
+        bytes_left_in_cycle: 0,
+        time_left_in_cycle: 0,
+      },
+    };
+  }
+
+  /**
    * setnetworkactive: Disable/enable all p2p network activity.
    *
    * Reference: Bitcoin Core rpc/net.cpp setnetworkactive (:889) +
@@ -11308,10 +11351,14 @@ export class RPCServer {
    *                       allows duplicate addresses, matching Core).
    *   params[2] locktime: optional nLockTime (default 0).
    *   params[3] replaceable: optional bool (BIP-125 opt-in). Default behavior
-   *                       matches Core's AddInputs:
+   *                       matches Core's AddInputs (rawtransaction_util.cpp:49,
+   *                       `rbf.value_or(true)`) — when `replaceable` is absent
+   *                       Core treats it as TRUE:
    *                         replaceable === true  → sequence 0xfffffffd
-   *                         replaceable === false → sequence 0xfffffffe
-   *                         replaceable absent    → sequence 0xffffffff
+   *                         replaceable absent    → sequence 0xfffffffd (rbf default true)
+   *                         replaceable === false → sequence depends on locktime:
+   *                            nLockTime != 0 → 0xfffffffe (MAX_SEQUENCE_NONFINAL)
+   *                            nLockTime == 0 → 0xffffffff (SEQUENCE_FINAL)
    *                       A per-input explicit "sequence" always overrides.
    *
    * The txid in each input is in display (big-endian) hex; hotbuns stores
@@ -11339,25 +11386,25 @@ export class RPCServer {
       );
     }
 
-    // Default per-input sequence based on the replaceable flag (Core AddInputs).
     const MAX_BIP125_RBF_SEQUENCE = 0xfffffffd;
     const MAX_SEQUENCE_NONFINAL = 0xfffffffe;
     const SEQUENCE_FINAL = 0xffffffff;
-    let defaultSequence: number;
-    if (replaceableParam === undefined || replaceableParam === null) {
-      defaultSequence = SEQUENCE_FINAL;
-    } else if (replaceableParam === true) {
-      defaultSequence = MAX_BIP125_RBF_SEQUENCE;
-    } else if (replaceableParam === false) {
-      defaultSequence = MAX_SEQUENCE_NONFINAL;
-    } else {
+
+    // Validate the replaceable flag (Core resolves it as std::optional<bool>:
+    // absent → nullopt, then rbf.value_or(true) below).
+    if (
+      replaceableParam !== undefined &&
+      replaceableParam !== null &&
+      typeof replaceableParam !== "boolean"
+    ) {
       throw this.rpcError(
         RPCErrorCodes.INVALID_PARAMS,
         "Invalid parameter, replaceable must be a boolean"
       );
     }
 
-    // locktime (default 0).
+    // locktime (default 0). Parsed BEFORE the default sequence because Core's
+    // AddInputs picks the non-RBF default sequence based on nLockTime.
     let lockTime = 0;
     if (locktimeParam !== undefined && locktimeParam !== null) {
       const lt = Number(locktimeParam);
@@ -11368,6 +11415,26 @@ export class RPCServer {
         );
       }
       lockTime = lt;
+    }
+
+    // Default per-input sequence, mirroring Core AddInputs
+    // (rawtransaction_util.cpp:49-55) exactly:
+    //   if (rbf.value_or(true))     nSequence = MAX_BIP125_RBF_SEQUENCE  (0xfffffffd)
+    //   else if (rawTx.nLockTime)   nSequence = MAX_SEQUENCE_NONFINAL    (0xfffffffe)
+    //   else                        nSequence = SEQUENCE_FINAL           (0xffffffff)
+    // `replaceable` absent ⇒ rbf == nullopt ⇒ value_or(true) == true, so the
+    // default is RBF-signalling (0xfffffffd), matching `createrawtransaction`'s
+    // documented `replaceable` default of true.
+    const rbf = replaceableParam === undefined || replaceableParam === null
+      ? true
+      : (replaceableParam as boolean);
+    let defaultSequence: number;
+    if (rbf) {
+      defaultSequence = MAX_BIP125_RBF_SEQUENCE;
+    } else if (lockTime !== 0) {
+      defaultSequence = MAX_SEQUENCE_NONFINAL;
+    } else {
+      defaultSequence = SEQUENCE_FINAL;
     }
 
     // Build inputs.
@@ -11423,7 +11490,16 @@ export class RPCServer {
       // Amount is in BTC; convert to satoshis. Use a string-safe conversion to
       // avoid float rounding (8 decimal places).
       const sats = this.btcToSats(value);
-      outputs.push({ value: sats, scriptPubKey: this.scriptPubKeyForAddress(key) });
+      // Core throws RPC_INVALID_ADDRESS_OR_KEY (-5) "Invalid Bitcoin address: <addr>"
+      // for an undecodable address (rawtransaction_util.cpp:121); scriptPubKeyForAddress
+      // throws a plain Error, so translate it to the Core RPC error here.
+      let scriptPubKey: Buffer;
+      try {
+        scriptPubKey = this.scriptPubKeyForAddress(key);
+      } catch {
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Invalid Bitcoin address: " + key);
+      }
+      outputs.push({ value: sats, scriptPubKey });
     };
 
     if (Array.isArray(outputsParam)) {

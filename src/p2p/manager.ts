@@ -564,6 +564,19 @@ export class PeerManager {
   /** Track inbound peers for eviction */
   private inboundPeers: Set<string>;
   /**
+   * Node-global cumulative P2P byte totals, mirroring Core's
+   * CConnman::nTotalBytesRecv / nTotalBytesSent (net.h). Core accounts bytes
+   * GLOBALLY across the connman, so a peer's traffic is NOT lost when it
+   * disconnects (RecordBytesRecv/RecordBytesSent are called on the connman, and
+   * getnettotals reads GetTotalBytesRecv/Sent). hotbuns counts bytes per-peer
+   * (Peer.bytesRecv/bytesSent), so we fold a peer's final tallies into these
+   * accumulators when it is removed (handlePeerDisconnect). getTotalBytesRecv/
+   * Sent() then return accumulator + sum(currently-connected peers) for the
+   * full cumulative total, exactly matching Core's semantics.
+   */
+  private disconnectedBytesRecv = 0;
+  private disconnectedBytesSent = 0;
+  /**
    * Manually-added nodes registered via the `addnode "add"` RPC (Core's
    * CConnman::m_added_nodes). Distinct from {@link peers} (the live connection
    * set): a node stays "added" across connect/disconnect cycles. Backs the
@@ -1656,6 +1669,35 @@ export class PeerManager {
    */
   getOutboundCount(): number {
     return this.peers.size;
+  }
+
+  /**
+   * Node-global cumulative bytes received across ALL P2P connections, including
+   * ones that have since disconnected. Mirrors Core
+   * CConnman::GetTotalBytesRecv() (net.cpp), the source for getnettotals'
+   * `totalbytesrecv`. = accumulated bytes from disconnected peers + bytes from
+   * every currently-connected peer.
+   */
+  getTotalBytesRecv(): number {
+    let total = this.disconnectedBytesRecv;
+    for (const peer of this.peers.values()) {
+      total += peer.bytesRecv;
+    }
+    return total;
+  }
+
+  /**
+   * Node-global cumulative bytes sent across ALL P2P connections, including ones
+   * that have since disconnected. Mirrors Core
+   * CConnman::GetTotalBytesSent() (net.cpp), the source for getnettotals'
+   * `totalbytessent`.
+   */
+  getTotalBytesSent(): number {
+    let total = this.disconnectedBytesSent;
+    for (const peer of this.peers.values()) {
+      total += peer.bytesSent;
+    }
+    return total;
   }
 
   /**
@@ -2752,6 +2794,15 @@ export class PeerManager {
    */
   private handlePeerDisconnect(peer: Peer, _error?: Error): void {
     const key = `${peer.host}:${peer.port}`;
+
+    // Fold this peer's final byte tallies into the node-global cumulative
+    // counters before dropping it, so getnettotals (getTotalBytesRecv/Sent)
+    // keeps counting traffic from now-gone connections — matching Core's
+    // CConnman global accounting (a disconnected CNode's bytes stay in
+    // nTotalBytesRecv/nTotalBytesSent).
+    this.disconnectedBytesRecv += peer.bytesRecv;
+    this.disconnectedBytesSent += peer.bytesSent;
+
     this.peers.delete(key);
     this.lastActivity.delete(key);
 
