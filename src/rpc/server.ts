@@ -289,6 +289,10 @@ export const RPCErrorCodes = {
   // RPC_INVALID_PARAMETER (-8): well-formed but semantically invalid argument
   // (e.g. a block not in the active chain, or an out-of-range block count).
   INVALID_PARAMETER: -8,
+  // RPC_DESERIALIZATION_ERROR (-22): error parsing/validating structure in raw
+  // format (Core protocol.h). Thrown by DecodeHexTx failures in the raw-tx RPCs
+  // (rpc/rawtransaction.cpp), e.g. signrawtransactionwithkey "TX decode failed".
+  DESERIALIZATION_ERROR: -22,
   // Transaction-related errors (sendrawtransaction)
   RPC_TRANSACTION_ERROR: -25,
   RPC_TRANSACTION_REJECTED: -26,
@@ -9572,6 +9576,12 @@ export class RPCServer {
     const result = await this.chainState.preciousBlock(blockHash);
 
     if (!result.success) {
+      // Core (rpc/blockchain.cpp preciousblock, line 1701): an unknown block
+      // hash (LookupBlockIndex miss) throws RPC_INVALID_ADDRESS_OR_KEY (-5)
+      // "Block not found", NOT RPC_MISC_ERROR (-1).
+      if (result.error === "Block not found") {
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found");
+      }
       throw this.rpcError(RPCErrorCodes.MISC_ERROR, result.error || "Block marking failed");
     }
 
@@ -12943,10 +12953,13 @@ export class RPCServer {
     let tx: Transaction;
     try {
       tx = deserializeTx(new BufferReader(Buffer.from(hexParam, "hex")));
-    } catch (e) {
+    } catch {
+      // Core (rpc/rawtransaction.cpp signrawtransactionwithkey, line 742): a
+      // DecodeHexTx failure throws RPC_DESERIALIZATION_ERROR (-22) with this
+      // exact message, NOT the JSON-RPC transport code INVALID_PARAMS (-32602).
       throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
-        `TX decode failed: ${(e as Error).message}`
+        RPCErrorCodes.DESERIALIZATION_ERROR,
+        "TX decode failed. Make sure the tx has at least one input."
       );
     }
 
