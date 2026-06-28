@@ -7104,16 +7104,10 @@ export class RPCServer {
     const [blockhashParam, peerIdParam] = params;
 
     // ── blockhash (positional 0) — STR_HEX, required ──────────────────────
-    if (typeof blockhashParam !== "string") {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
-    }
-    // RPC hashes are display-order (reversed bytes); reverse to the internal
-    // byte order used by the header index and the p2p wire (matches
-    // getblockheader / the block-download getdata path).
-    const blockhash = Buffer.from(blockhashParam, "hex").reverse();
-    if (blockhash.length !== 32) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
-    }
+    // ParseHashV (Core rpc/util.cpp:117): a malformed blockhash (non-hex /
+    // wrong-length) -> -8 RPC_INVALID_PARAMETER with Core's message (was -32602).
+    // Returns internal (reversed) bytes, matching getblockheader / the getdata path.
+    const blockhash = this.parseHashV(blockhashParam, "blockhash");
 
     // ── peer_id (positional 1) — NUM, required ────────────────────────────
     if (
@@ -15184,7 +15178,9 @@ export class RPCServer {
     // Find the block containing the first txid
     let blockHashInternal: Buffer;
     if (blockHashHexParam) {
-      blockHashInternal = Buffer.from(blockHashHexParam, "hex").reverse();
+      // ParseHashV: a malformed blockhash -> -8 at the parse boundary (was
+      // -32602); returns internal (reversed) bytes.
+      blockHashInternal = this.parseHashV(blockHashHexParam, "blockhash");
     } else {
       const first = reqTxids[0];
       if (!first) throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "No txids provided");
@@ -15201,7 +15197,9 @@ export class RPCServer {
       // Core's gettxoutproof and return its CMerkleBlock hex verbatim.
       const coreResult = await this.forwardGettxoutproofToCore(txidHexList, blockHashHexParam);
       if (coreResult !== null) return coreResult;
-      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Block not found");
+      // Core gettxoutproof: an unknown block -> -5 RPC_INVALID_ADDRESS_OR_KEY
+      // "Block not found" (was -1 RPC_MISC_ERROR).
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found");
     }
 
     const reader = new BufferReader(blockData);
