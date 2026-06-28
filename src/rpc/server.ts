@@ -1524,6 +1524,12 @@ export class RPCServer {
       case 0x0709110b:
         chain = "test";
         break;
+      case 0x283f161c:
+        chain = "testnet4";
+        break;
+      case 0x0a03cf40:
+        chain = "signet";
+        break;
       case 0xdab5bffa:
         chain = "regtest";
         break;
@@ -10945,6 +10951,29 @@ export class RPCServer {
     }
   }
 
+  /**
+   * Get the Core chain-type string (GetChainTypeString in util/chaintype.cpp).
+   * Distinct from getNetworkType(): this returns "main"/"test"/"testnet4"/
+   * "signet"/"regtest" exactly as Core's RPCs report `chain`, NOT the
+   * address-encoding NetworkType ("mainnet"/"testnet"/...).
+   */
+  private getChainName(): string {
+    switch (this.params.networkMagic) {
+      case 0xd9b4bef9:
+        return "main";
+      case 0x0709110b:
+        return "test";
+      case 0x283f161c:
+        return "testnet4";
+      case 0x0a03cf40:
+        return "signet";
+      case 0xdab5bffa:
+        return "regtest";
+      default:
+        return "unknown";
+    }
+  }
+
   // ========== assumeUTXO Methods ==========
 
   /**
@@ -11984,7 +12013,7 @@ export class RPCServer {
       networkhashps: 0,
       pooledtx: this.mempool.getSize(),
       blockmintxfee: 0.00000001,
-      chain: this.getNetworkType(),
+      chain: this.getChainName(),
       next: {
         height: nextHeight,
         bits: tipBitsHex,
