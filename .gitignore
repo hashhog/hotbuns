@@ -4,3 +4,7 @@ dist/
 *.log
 
 .claude/skills/
+
+# Project-meta audit artifacts live in the meta-repo (audit-archive/).
+audit/
+CORE-PARITY-AUDIT/
