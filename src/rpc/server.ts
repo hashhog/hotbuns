@@ -3879,11 +3879,10 @@ export class RPCServer {
       blockhash = Buffer.from(hashAtHeight);
       height = hashOrHeightParam;
     } else if (typeof hashOrHeightParam === "string") {
-      // Hashes in Bitcoin RPC are display-order (reversed bytes).
-      blockhash = Buffer.from(hashOrHeightParam, "hex").reverse();
-      if (blockhash.length !== 32) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
-      }
+      // ParseHashV (via ParseHashOrHeight): a malformed hash_or_height ->
+      // -8 RPC_INVALID_PARAMETER at the parse boundary (was -32602). Returns
+      // internal (reversed) bytes.
+      blockhash = this.parseHashV(hashOrHeightParam, "hash_or_height");
       const idx = await this.db.getBlockIndex(blockhash);
       if (!idx) {
         throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found");
@@ -9481,25 +9480,22 @@ export class RPCServer {
   private async invalidateBlockRPC(params: unknown[]): Promise<null> {
     const [blockhashParam] = params;
 
-    if (typeof blockhashParam !== "string") {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
-    }
-
-    // Parse and validate hex
-    if (!/^[0-9a-fA-F]{64}$/.test(blockhashParam)) {
-      throw this.rpcError(
-        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
-        "Invalid block hash format"
-      );
-    }
-
-    // Convert to internal byte order (reversed)
-    const blockHash = Buffer.from(blockhashParam, "hex").reverse();
+    // ParseHashV (Core rpc/util.cpp:117): a malformed blockhash (wrong-length /
+    // non-hex) -> -8 RPC_INVALID_PARAMETER with Core's message (was -5
+    // INVALID_ADDRESS_OR_KEY "Invalid block hash format"). Returns the internal
+    // (reversed) bytes; a well-formed-but-absent hash stays -5 "Block not found".
+    const blockHash = this.parseHashV(blockhashParam, "blockhash");
 
     const result = await this.chainState.invalidateBlock(blockHash);
 
     if (!result.success) {
-      throw this.rpcError(RPCErrorCodes.MISC_ERROR, result.error || "Block invalidation failed");
+      // Core (rpc/blockchain.cpp InvalidateBlock): an unknown block hash
+      // (LookupBlockIndex miss) -> -5 RPC_INVALID_ADDRESS_OR_KEY "Block not
+      // found"; other operation failures stay -1 RPC_MISC_ERROR.
+      const code = /not found/i.test(result.error || "")
+        ? RPCErrorCodes.INVALID_ADDRESS_OR_KEY
+        : RPCErrorCodes.MISC_ERROR;
+      throw this.rpcError(code, result.error || "Block invalidation failed");
     }
 
     // Roll the BlockSync IBD frontier back to the now-rolled-back tip.
@@ -9525,25 +9521,22 @@ export class RPCServer {
   private async reconsiderBlockRPC(params: unknown[]): Promise<null> {
     const [blockhashParam] = params;
 
-    if (typeof blockhashParam !== "string") {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
-    }
-
-    // Parse and validate hex
-    if (!/^[0-9a-fA-F]{64}$/.test(blockhashParam)) {
-      throw this.rpcError(
-        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
-        "Invalid block hash format"
-      );
-    }
-
-    // Convert to internal byte order (reversed)
-    const blockHash = Buffer.from(blockhashParam, "hex").reverse();
+    // ParseHashV (Core rpc/util.cpp:117): a malformed blockhash (wrong-length /
+    // non-hex) -> -8 RPC_INVALID_PARAMETER with Core's message (was -5
+    // INVALID_ADDRESS_OR_KEY "Invalid block hash format"). Returns the internal
+    // (reversed) bytes; a well-formed-but-absent hash stays -5 "Block not found".
+    const blockHash = this.parseHashV(blockhashParam, "blockhash");
 
     const result = await this.chainState.reconsiderBlock(blockHash);
 
     if (!result.success) {
-      throw this.rpcError(RPCErrorCodes.MISC_ERROR, result.error || "Block reconsideration failed");
+      // Core (rpc/blockchain.cpp ReconsiderBlock): an unknown block hash
+      // (LookupBlockIndex miss) -> -5 RPC_INVALID_ADDRESS_OR_KEY "Block not
+      // found"; other operation failures stay -1 RPC_MISC_ERROR.
+      const code = /not found/i.test(result.error || "")
+        ? RPCErrorCodes.INVALID_ADDRESS_OR_KEY
+        : RPCErrorCodes.MISC_ERROR;
+      throw this.rpcError(code, result.error || "Block reconsideration failed");
     }
 
     return null;
@@ -9558,20 +9551,11 @@ export class RPCServer {
   private async preciousBlockRPC(params: unknown[]): Promise<null> {
     const [blockhashParam] = params;
 
-    if (typeof blockhashParam !== "string") {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
-    }
-
-    // Parse and validate hex
-    if (!/^[0-9a-fA-F]{64}$/.test(blockhashParam)) {
-      throw this.rpcError(
-        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
-        "Invalid block hash format"
-      );
-    }
-
-    // Convert to internal byte order (reversed)
-    const blockHash = Buffer.from(blockhashParam, "hex").reverse();
+    // ParseHashV (Core rpc/util.cpp:117): a malformed blockhash (wrong-length /
+    // non-hex) -> -8 RPC_INVALID_PARAMETER with Core's message (was -5
+    // INVALID_ADDRESS_OR_KEY "Invalid block hash format"). Returns the internal
+    // (reversed) bytes; a well-formed-but-absent hash stays -5 "Block not found".
+    const blockHash = this.parseHashV(blockhashParam, "blockhash");
 
     const result = await this.chainState.preciousBlock(blockHash);
 
