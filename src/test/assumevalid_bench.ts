@@ -104,7 +104,6 @@ if (!fixtureValid) {
 // Build assumevalid contexts
 // ---------------------------------------------------------------------------
 
-const TWO_WEEKS_PLUS = 60 * 60 * 24 * 7 * 2 + 1;
 const AV_HASH = "aaaa000000000000000000000000000000000000000000000000000000000001";
 const AV_HEIGHT = 938343;
 const ANCESTOR_HASH = "bbbb000000000000000000000000000000000000000000000000000000000002";
@@ -126,12 +125,12 @@ const BEST_HEADER: AssumeValidBlockEntry = {
   chainWork: 9999n,
 };
 
-const PINDEX_TS = 1_600_000_000;
-const BEST_HEADER_TS = PINDEX_TS + TWO_WEEKS_PLUS;
-
 /**
- * SKIP context: shouldSkipScripts → true (all six conditions satisfied).
+ * SKIP context: shouldSkipScripts → true (all five conditions satisfied).
  * pindex is ANCESTOR of AV_HASH, best-header chainwork > min, 2-week guard clears.
+ *
+ * Using bits = 0x207fffff (regtest min difficulty): getBitsProof = 2.
+ * equivTime = (9999 − 600) × 600 / 2 = 2_819_700 s > 2 weeks ✓
  */
 const SKIP_CTX: AssumeValidContext = {
   pindex: { hash: ANCESTOR_HASH, height: ANCESTOR_HEIGHT, chainWork: 600n },
@@ -140,8 +139,8 @@ const SKIP_CTX: AssumeValidContext = {
   getBlockAtHeight: (h) => CANONICAL_BY_HEIGHT.get(h) ?? null,
   bestHeader: BEST_HEADER,
   minimumChainWork: 100n,
-  pindexTimestamp: PINDEX_TS,
-  bestHeaderTimestamp: BEST_HEADER_TS,
+  bestHeaderBits: 0x207fffff,
+  powTargetSpacing: 600,
 };
 
 /**
