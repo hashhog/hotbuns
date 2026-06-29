@@ -770,8 +770,9 @@ export const TESTNET: ConsensusParams = {
     "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8",
     "hex"
   ).reverse(),
-  // Fleet-standard assumevalid hash for testnet3 (Bitcoin Core v28.0, block 123613).
-  assumedValid: "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a",
+  // Bitcoin Core CTestNetParams defaultAssumeValid — testnet3 block 4842348
+  // (kernel/chainparams.cpp:233). Was the testnet4 hash (swapped); corrected.
+  assumedValid: "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4",
   dnsSeed: [
     "testnet-seed.bitcoin.jonasschnelli.ch",
     "seed.tbtc.petertodd.net",
@@ -889,8 +890,10 @@ export const TESTNET4: ConsensusParams = {
   // Skip script/sigop verification for blocks at or below this height.
   // Testnet4 tip as of 2026-03: ~60k blocks, set conservatively.
   assumeValidHeight: 123613,
-  // Fleet-standard assumevalid hash for testnet4 (Bitcoin Core v28.0, block 4842348).
-  assumedValid: "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4",
+  // Bitcoin Core CTestNet4Params defaultAssumeValid — testnet4 block 123613
+  // (kernel/chainparams.cpp:333), matching assumeValidHeight above. Was the
+  // testnet3 hash (swapped); corrected.
+  assumedValid: "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a",
   dnsSeed: [
     "seed.testnet4.bitcoin.sprovoost.nl",
     "seed.testnet4.wiz.biz",

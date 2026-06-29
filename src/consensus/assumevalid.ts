@@ -47,10 +47,10 @@ const TWO_WEEKS_IN_SECONDS = 60 * 60 * 24 * 7 * 2;
 export const ASSUMED_VALID_HASHES = {
   /** Mainnet: block 938343 */
   mainnet: "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac",
-  /** Testnet3: block 123613 */
-  testnet3: "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a",
-  /** Testnet4: block 4842348 */
-  testnet4: "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4",
+  /** Testnet3: block 4842348 (Core CTestNetParams) */
+  testnet3: "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4",
+  /** Testnet4: block 123613 (Core CTestNet4Params) */
+  testnet4: "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a",
   /** Signet: block 293175 */
   signet: "00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329",
 } as const;

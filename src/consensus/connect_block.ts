@@ -282,7 +282,9 @@ export async function coreConnectBlockChecks(
   opts: ConnectBlockOpts = {}
 ): Promise<ConnectBlockResult> {
   const {
-    assumeValid = false,
+    // assumeValid (pure-height) is no longer a skip driver — the faithful
+    // `skipScripts` gate is the sole driver; the opt remains in ConnectBlockOpts
+    // for caller compatibility but is intentionally not consumed here.
     skipScripts = false,
     prevMTP = 0,
     enforceBIP68 = false,
@@ -451,76 +453,12 @@ export async function coreConnectBlockChecks(
     }
   }
 
-  // ── 4a. Assume-valid fast path ────────────────────────────────────────────
-  // Skip: maturity checks, BIP-68, sigops counting, script verification.
-  // Always run: coinbase-value check (consensus-critical, never skipped in Core).
-  // Reference: Bitcoin Core validation.cpp::ConnectBlock —
-  //   fScriptChecks only gates signature/script checking, not arithmetic checks.
-  if (assumeValid) {
-    let avTotalInputValue = 0n;
-    let avTotalOutputValue = 0n;
-
-    for (const tx of block.transactions) {
-      const txid = getTxId(tx);
-      const isCoinbaseTx = isCoinbase(tx);
-
-      if (!isCoinbaseTx) {
-        for (const input of tx.inputs) {
-          // Ensure input is loaded (may not be in the bulk-preload cache if
-          // it was created by an earlier tx in this same block).
-          if (!utxoManager.hasUTXO(input.prevOut)) {
-            const loaded = await utxoManager.preloadUTXO(input.prevOut);
-            if (!loaded) {
-              // W93: match Core's canonical reject reason
-              // (consensus/tx_verify.cpp:168 — bad-txns-inputs-missingorspent).
-              return {
-                ok: false,
-                error: `bad-txns-inputs-missingorspent: input ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout} not in UTXO set at height ${height}`,
-              };
-            }
-          }
-          const spentEntry = utxoManager.spendOutput(input.prevOut);
-          avTotalInputValue += spentEntry.amount;
-        }
-      }
-
-      for (const output of tx.outputs) {
-        avTotalOutputValue += output.value;
-      }
-
-      // addTransaction MUST be called here (not after the loop) so that a tx
-      // at index N can create a UTXO immediately spendable by tx at index N+1
-      // within the same block (block-internal chaining).
-      utxoManager.addTransaction(txid, tx, height, isCoinbaseTx);
-    }
-
-    // Coinbase-value check: consensus-critical, runs even under assumevalid.
-    // Matches full-validation path below and Bitcoin Core ConnectBlock
-    // (validation.cpp:2610-2614).
-    const avCoinbaseTx = block.transactions[0];
-    let avCoinbaseOutputValue = 0n;
-    for (const output of avCoinbaseTx.outputs) {
-      avCoinbaseOutputValue += output.value;
-    }
-    const avSubsidy = getBlockSubsidy(height, params);
-    const avFees = avTotalInputValue - (avTotalOutputValue - avCoinbaseOutputValue);
-    const avMaxCoinbaseValue = avSubsidy + avFees;
-    if (avCoinbaseOutputValue > avMaxCoinbaseValue) {
-      // W93: align with Core's canonical reject reason (validation.cpp:2612).
-      return {
-        ok: false,
-        error: `bad-cb-amount: coinbase pays too much (actual=${avCoinbaseOutputValue} vs limit=${avMaxCoinbaseValue}) at height ${height}`,
-      };
-    }
-
-    return {
-      ok: true,
-      spentOutputs: [], // assume-valid path: no undo data needed
-      totalInputValue: avTotalInputValue,
-      totalOutputValue: avTotalOutputValue,
-      coinbaseOutputValue: avCoinbaseOutputValue,
-    };
-  }
+  // ── 4a. (assume-valid fast path removed) ──────────────────────────
+  // Previously a height-driven fast path skipped maturity/BIP-68/sigops/
+  // CheckTxInputs for assumevalid-window blocks — over-skipping vs Core,
+  // whose fScriptChecks=false skips ONLY signature/script verification. Now
+  // every block runs the full path below; `skipScripts` (the faithful gate)
+  // gates ONLY signature verification (the `if (!skipScripts)` block).
 
   // ── 4b. Full validation path ──────────────────────────────────────────────
   let totalSigOpsCost = 0;

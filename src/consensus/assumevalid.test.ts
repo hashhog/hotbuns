@@ -308,14 +308,18 @@ describe("fleet-standard hashes", () => {
   });
 
   test("testnet4 hash matches Bitcoin Core v28.0", () => {
+    // Core CTestNet4Params defaultAssumeValid (block 123613). Was previously
+    // the testnet3 hash here (swapped); corrected to match Core.
     expect(ASSUMED_VALID_HASHES.testnet4).toBe(
-      "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"
+      "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"
     );
   });
 
   test("testnet3 hash matches Bitcoin Core v28.0", () => {
+    // Core CTestNetParams defaultAssumeValid (block 4842348). Was previously
+    // the testnet4 hash here (swapped); corrected to match Core.
     expect(ASSUMED_VALID_HASHES.testnet3).toBe(
-      "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"
+      "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"
     );
   });
 
