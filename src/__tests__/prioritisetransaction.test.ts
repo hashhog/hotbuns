@@ -170,10 +170,11 @@ describe("prioritisetransaction / getprioritisedtransactions", () => {
     // hotbuns's getmempoolentry keys by the raw (internal-order) param it is
     // given — a pre-existing display-order inconsistency vs getrawmempool that
     // is out of scope here — so we look it up by the internal-order hex. This
-    // assertion targets the modifiedfee wiring (getModifiedFee), not the byte
-    // order of the lookup.
+    // assertion targets the fees.modified wiring (getModifiedFee), not the byte
+    // order of the lookup. Core entryToJSON (mempool.cpp) emits fees as a nested
+    // object only — top-level modifiedfee was removed for Core parity.
     const me = (await rpc("getmempoolentry", [internalHex])).result;
-    expect(me.modifiedfee).toBeCloseTo((Number(fee) + 1000) / 1e8, 12);
+    // fees.modified is the canonical field (Core entryToJSON); no top-level modifiedfee.
     expect(me.fees.modified).toBeCloseTo((Number(fee) + 1000) / 1e8, 12);
 
     // (2) +500 STACKS additively -> 1500.

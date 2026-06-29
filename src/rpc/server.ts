@@ -17,6 +17,7 @@ import { RBFTransactionState } from "../mempool/rbf.js";
 import type { PeerManager } from "../p2p/manager.js";
 import { ServiceFlags } from "../p2p/manager.js";
 import { parseIPv4, parseIPv6 } from "../p2p/asmap.js";
+import { getNetworkTypeFromAddress } from "../p2p/proxy.js";
 import type { FeeEstimator } from "../fees/estimator.js";
 import { Horizon, DECAY, SCALE } from "../fees/estimator.js";
 import type { HeaderSync, HeaderChainEntry } from "../sync/headers.js";
@@ -5810,17 +5811,14 @@ export class RPCServer {
       result[txidHex] = {
         vsize: entry.vsize,
         weight: entry.weight,
-        fee: Number(entry.fee) / 100_000_000, // Convert to BTC
-        modifiedfee: Number(modifiedFeeSats) / 100_000_000,
         time: entry.addedTime,
         height: entry.height,
         descendantcount: entry.spentBy.size + 1,
         descendantsize: entry.vsize, // Simplified
-        descendantfees: Number(modifiedFeeSats),
         ancestorcount: entry.dependsOn.size + 1,
         ancestorsize: entry.vsize, // Simplified
-        ancestorfees: Number(modifiedFeeSats),
         wtxid: txidHex, // Simplified (same as txid for non-witness txs)
+        // Core entryToJSON (mempool.cpp:527-533): fees is nested; no top-level fee/modifiedfee.
         fees: {
           base: Number(entry.fee) / 100_000_000,
           modified: Number(modifiedFeeSats) / 100_000_000,
@@ -5866,17 +5864,14 @@ export class RPCServer {
     return {
       vsize: entry.vsize,
       weight: entry.weight,
-      fee: Number(entry.fee) / 100_000_000,
-      modifiedfee: Number(modifiedFeeSats) / 100_000_000,
       time: entry.addedTime,
       height: entry.height,
       descendantcount: entry.spentBy.size + 1,
       descendantsize: entry.vsize,
-      descendantfees: Number(modifiedFeeSats),
       ancestorcount: entry.dependsOn.size + 1,
       ancestorsize: entry.vsize,
-      ancestorfees: Number(modifiedFeeSats),
       wtxid: txidParam,
+      // Core entryToJSON (mempool.cpp:527-533): fees is nested; no top-level fee/modifiedfee.
       fees: {
         base: Number(entry.fee) / 100_000_000,
         modified: Number(modifiedFeeSats) / 100_000_000,
@@ -6352,19 +6347,23 @@ export class RPCServer {
         result[ancestorHex] = {
           vsize: ancestorEntry.vsize,
           weight: ancestorEntry.weight,
-          fee: Number(ancestorEntry.fee) / 100_000_000,
-          modifiedfee: Number(ancestorEntry.fee) / 100_000_000,
           time: ancestorEntry.addedTime,
           height: ancestorEntry.height,
           descendantcount: ancestorEntry.spentBy.size + 1,
           descendantsize: ancestorEntry.vsize,
-          descendantfees: Number(ancestorEntry.fee),
           ancestorcount: ancestorEntry.dependsOn.size + 1,
           ancestorsize: ancestorEntry.vsize,
-          ancestorfees: Number(ancestorEntry.fee),
+          // Core entryToJSON: fees is nested; no top-level fee/modifiedfee.
+          fees: {
+            base: Number(ancestorEntry.fee) / 100_000_000,
+            modified: Number(this.mempool.getModifiedFee(ancestorTxid)) / 100_000_000,
+            ancestor: Number(ancestorEntry.fee) / 100_000_000,
+            descendant: Number(ancestorEntry.fee) / 100_000_000,
+          },
           depends: Array.from(ancestorEntry.dependsOn),
           spentby: Array.from(ancestorEntry.spentBy),
           "bip125-replaceable": this.mempool.getRBFOptInState(ancestorTxid) === RBFTransactionState.REPLACEABLE_BIP125,
+          unbroadcast: false,
         };
       }
     }
@@ -6431,19 +6430,23 @@ export class RPCServer {
         result[descendantHex] = {
           vsize: descendantEntry.vsize,
           weight: descendantEntry.weight,
-          fee: Number(descendantEntry.fee) / 100_000_000,
-          modifiedfee: Number(descendantEntry.fee) / 100_000_000,
           time: descendantEntry.addedTime,
           height: descendantEntry.height,
           descendantcount: descendantEntry.spentBy.size + 1,
           descendantsize: descendantEntry.vsize,
-          descendantfees: Number(descendantEntry.fee),
           ancestorcount: descendantEntry.dependsOn.size + 1,
           ancestorsize: descendantEntry.vsize,
-          ancestorfees: Number(descendantEntry.fee),
+          // Core entryToJSON: fees is nested; no top-level fee/modifiedfee.
+          fees: {
+            base: Number(descendantEntry.fee) / 100_000_000,
+            modified: Number(this.mempool.getModifiedFee(descendantTxid)) / 100_000_000,
+            ancestor: Number(descendantEntry.fee) / 100_000_000,
+            descendant: Number(descendantEntry.fee) / 100_000_000,
+          },
           depends: Array.from(descendantEntry.dependsOn),
           spentby: Array.from(descendantEntry.spentBy),
           "bip125-replaceable": this.mempool.getRBFOptInState(descendantTxid) === RBFTransactionState.REPLACEABLE_BIP125,
+          unbroadcast: false,
         };
       }
     }
@@ -7017,6 +7020,11 @@ export class RPCServer {
         addr: `${peer.host}:${peer.port}`,
         addrlocal: `127.0.0.1:${this.config.port}`,
         addrbind: `0.0.0.0:${peer.port}`,
+        // Core rpc/net.cpp:235 pushes network derived from stats.m_network (GetNetworkName).
+        // Compute from the peer's address string — matches getNetworkTypeFromAddress()
+        // which resolves: .onion → "onion", .b32.i2p → "i2p", fc::/8 → "cjdns",
+        // IPv6 colons → "ipv6", else → "ipv4". All values match Core's GetNetworkName().
+        network: getNetworkTypeFromAddress(peer.host),
         services: peer.versionPayload?.services.toString(16).padStart(16, "0") ?? "0000000000000000",
         servicesnames: this.getServiceNames(peer.versionPayload?.services ?? 0n),
         relaytxes: peer.versionPayload?.relay ?? true,
