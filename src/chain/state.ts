@@ -475,6 +475,32 @@ export class ChainStateManager {
       verifyNullDummy: height >= this.params.segwitHeight,
       genesisHashHex: genesisHashHexLE,
       utxoBestBlockHashHex: utxoBestBlockHashHexLE,
+      // BUG-2a fix: wire per-coin MTP for time-based BIP-68 sequence lock
+      // enforcement on the reorg-reconnect / regtest / generateblock path.
+      // Without this, coinMTP defaults to 0 for every input, making minTime
+      // trivially satisfiable by any real prevMTP (false-ACCEPT of time-locked txs).
+      //
+      // Mirrors exactly sync/blocks.ts:3329-3332 (the IBD/P2P primary path).
+      // Reads from headersByHeight, which HeaderSync.loadFromDB() populates from
+      // the persistent block-index DB on every startup — correct during IBD AND
+      // post-restart (never an in-memory-only source).
+      //
+      // Partial walk: getMedianTimePast collects up to 11 ancestor timestamps
+      // walking back via prevBlock and returns the median of what it finds; it
+      // never returns 0 on a short walk.  The only 0 path is when coinHeight <= 0
+      // (genesis-ancestor, blocked by coinbase maturity anyway) or when no
+      // header entry at (coinHeight-1) exists (data-integrity issue; conservatively
+      // allows the lock rather than crash-rejecting).
+      getUTXOMTP: this.headerSync
+        ? (coinHeight: number): number => {
+            if (coinHeight <= 0) return 0;
+            const coinPrevHeader =
+              this.headerSync!.getHeaderByHeight(coinHeight - 1);
+            return coinPrevHeader
+              ? this.headerSync!.getMedianTimePast(coinPrevHeader)
+              : 0;
+          }
+        : undefined,
     });
 
     if (!result.ok) {
