@@ -2913,10 +2913,12 @@ export class BlockSync {
         this.params,
         {
           assumeValid: intermAssumeValid,
+          // Reorg/intermediate side branches always fully verify (skipScripts
+          // false) — the safe over-verify default; BIP-68 enforced per Core
+          // regardless of assumevalid.
           skipScripts: false,
           prevMTP: intermPrevMTP,
-          enforceBIP68:
-            !intermAssumeValid && intermediate.height >= this.params.csvHeight,
+          enforceBIP68: intermediate.height >= this.params.csvHeight,
           scriptThreads: this.scriptThreads,
           verifyP2SH: intermediate.height >= this.params.bip16Height,
           verifyWitness: intermediate.height >= this.params.segwitHeight,
@@ -3223,7 +3225,9 @@ export class BlockSync {
     }
 
     // BIP68 (CSV) activation check
-    const enforceBIP68 = !assumeValid && height >= this.params.csvHeight;
+    // BIP-68 SequenceLocks are enforced regardless of assumevalid (Core
+    // validation.cpp:2552-2561 — only signature/script checks are skipped).
+    const enforceBIP68 = height >= this.params.csvHeight;
 
     // Get the previous block's MTP for BIP-68 time-based locks and IsFinalTx.
     // IsFinalTx always needs MTP when CSV is active (BIP-113), even under assumevalid.
