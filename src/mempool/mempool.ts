@@ -1799,9 +1799,24 @@ export class Mempool {
           // Unconfirmed parent: treat as mined at tipHeight + 1 with currentMTP.
           return { height: nextHeight, medianTimePast: currentMTP };
         } else {
-          // Confirmed UTXO: height from DB; use currentMTP conservatively for MTP.
+          // Confirmed UTXO: use MTP at (coinHeight-1) for parity with Core's
+          // CheckSequenceLocksAtTip (validation.cpp), which indexes into a
+          // pre-built mediants[] array keyed by coin creation height.
+          // Falls back to currentMTP when headerSync is absent or the header
+          // is not found — tipMTP is conservative (may over-reject near the
+          // boundary, never false-accept).  Relay divergence only (BUG-5);
+          // does NOT affect block-validation consensus.
           const confirmedUtxo = utxo as UTXOEntry;
-          return { height: confirmedUtxo.height, medianTimePast: currentMTP };
+          let coinMTP = currentMTP;
+          if (this.headerSync && confirmedUtxo.height > 0) {
+            const coinPrevHeader = this.headerSync.getHeaderByHeight(
+              confirmedUtxo.height - 1
+            );
+            if (coinPrevHeader) {
+              coinMTP = this.headerSync.getMedianTimePast(coinPrevHeader);
+            }
+          }
+          return { height: confirmedUtxo.height, medianTimePast: coinMTP };
         }
       });
       if (!checkSequenceLocks(tx, enforceBIP68, nextHeight, currentMTP, utxoConfirmations)) {

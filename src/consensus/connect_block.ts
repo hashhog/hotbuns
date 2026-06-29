@@ -264,10 +264,14 @@ export interface ConnectBlockOpts {
    * Called with the block height at which a UTXO was created; should return
    * the Median Time Past of the block at (utxoHeight - 1).
    *
-   * If not supplied, the helper defaults to 0 for all coins.  This is
-   * conservative: block-height-based sequence locks are still checked
-   * correctly; time-based ones may be slightly loose.  Only supply this
-   * when HeaderSync is available (sync/blocks.ts path).
+   * Supply this whenever HeaderSync is wired (both the IBD/P2P path via
+   * sync/blocks.ts AND the reorg-reconnect/regtest path via chain/state.ts).
+   * Without it, time-based relative locks default to coinMTP=0, making
+   * minTime trivially satisfiable — a false-ACCEPT for time-locked txs.
+   *
+   * The callback MUST read from the persistent header store (loaded by
+   * HeaderSync.loadFromDB() on startup) so it is correct post-restart.
+   * The getMedianTimePast partial walk never returns 0 on a short walk.
    */
   getUTXOMTP?: (utxoHeight: number) => number;
 

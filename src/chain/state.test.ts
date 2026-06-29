@@ -11,7 +11,10 @@ import { REGTEST } from "../consensus/params.js";
 import { ChainStateManager } from "./state.js";
 import type { Block, BlockHeader } from "../validation/block.js";
 import { getBlockHash } from "../validation/block.js";
-import { getTxId } from "../validation/tx.js";
+import {
+  getTxId,
+  SEQUENCE_LOCKTIME_TYPE_FLAG,
+} from "../validation/tx.js";
 import type { Transaction, TxIn, TxOut } from "../validation/tx.js";
 import { hash256 } from "../crypto/primitives.js";
 
@@ -702,6 +705,217 @@ describe("ChainStateManager", () => {
         }
         // The synthetic block does NOT have the canonical hash, so BIP-30 fires.
         expect(threwBip30).toBe(true);
+      } finally {
+        await testDb.close();
+        await rm(testDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // ── BUG-2a fix: time-based BIP-68 sequence lock enforcement on the
+  //    reorg-reconnect / regtest / generateblock path (chain/state.ts::connectBlock).
+  //
+  // Before this fix, coreConnectBlockChecks was called WITHOUT getUTXOMTP on
+  // the chain/state.ts path, so coinMTP defaulted to 0 for every input.
+  // With coinMTP=0 and any real prevMTP (e.g. 1.3 billion from 2011 genesis),
+  // minTime = 0+511 = 511 << prevMTP — the lock was trivially satisfied,
+  // false-accepting every v2 tx regardless of its time-based sequence lock.
+  //
+  // After the fix, getUTXOMTP reads coinMTP from the HeaderSync's persistent
+  // block-index (loaded by loadFromDB on startup), so time-based locks are
+  // evaluated against the ACTUAL MTP at the coin's creation height minus one.
+  //
+  // The test exercises the consensus-critical reorg path (connectBlock in
+  // chain/state.ts, which reorganize() calls for every reconnected block)
+  // by asserting:
+  //   REJECT — block containing a v2 tx with an unsatisfied time-based
+  //             BIP-68 lock is rejected even through this path.
+  //   ACCEPT — same tx is accepted after enough blocks have advanced the
+  //             MTP past the lock's minTime.
+  describe("BIP-68 time-based sequence lock on reorg/connectBlock path (BUG-2a fix)", () => {
+    test("rejects tx with unsatisfied time-based BIP-68 lock and accepts after MTP advance", async () => {
+      // Use coinbaseMaturity=1 so we can spend block-1 coinbase at block 2+
+      // without connecting 100 dummy blocks.
+      const customParams = { ...REGTEST, coinbaseMaturity: 1 };
+
+      const testDir = await mkdtemp(join(tmpdir(), "bip68-time-lock-"));
+      const testDb = new ChainDB(testDir);
+      await testDb.open();
+      const testChainState = new ChainStateManager(testDb, customParams);
+      await testChainState.load();
+
+      // Genesis timestamp from REGTEST/buildRegtestGenesisBlock.
+      const T0 = 1296688602;
+
+      // Minimal mock HeaderSync: only getHeaderByHeight + getMedianTimePast are
+      // used by ChainStateManager (for prevMTP and getUTXOMTP).  The mock walks
+      // back by height (valid for our sequential test chain) and mirrors
+      // getMedianTimePast's "partial walk → median of what we have" semantics.
+      const blockTimestamps = new Map<number, number>();
+      blockTimestamps.set(0, T0); // genesis
+
+      type FakeEntry = { height: number; header: { timestamp: number } };
+      const mockHeaderSync = {
+        getHeaderByHeight(h: number): FakeEntry | undefined {
+          const ts = blockTimestamps.get(h);
+          if (ts === undefined) return undefined;
+          return { height: h, header: { timestamp: ts } };
+        },
+        getMedianTimePast(entry: FakeEntry): number {
+          const timestamps: number[] = [];
+          let h = entry.height;
+          for (let i = 0; i < 11; i++) {
+            const ts = blockTimestamps.get(h);
+            if (ts === undefined) break;
+            timestamps.push(ts);
+            h--;
+          }
+          if (timestamps.length === 0) return 0;
+          timestamps.sort((a, b) => a - b);
+          return timestamps[Math.floor(timestamps.length / 2)];
+        },
+      // Chain/state.ts holds the reference as HeaderSync; structural cast is
+      // safe here because only getHeaderByHeight + getMedianTimePast are called.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as unknown as any;
+
+      testChainState.setHeaderSync(mockHeaderSync);
+
+      try {
+        // Helper: create a block with a specific timestamp (deterministic hash).
+        function makeBlock(prevBlock: Buffer, txs: Transaction[], ts: number): Block {
+          const txids = txs.map((tx) => getTxId(tx));
+          // Reuse computeMerkleRoot from outer scope.
+          const merkleRoot = computeMerkleRoot(txids);
+          const header: BlockHeader = {
+            version: 0x20000000,
+            prevBlock,
+            merkleRoot,
+            timestamp: ts,
+            bits: customParams.powLimitBits,
+            nonce: 0,
+          };
+          return { header, transactions: txs };
+        }
+
+        // Helper: coinbase with an OP_1 (0x51) output — spendable by an empty
+        // scriptSig.  Using OP_1 avoids the need for a real secp256k1 key/sig
+        // while still exercising the full connectBlock consensus path.
+        function makeCoinbaseOp1(height: number, value: bigint): Transaction {
+          const scriptSig = Buffer.concat([
+            Buffer.from([0x03]),
+            Buffer.alloc(3, height),
+          ]);
+          return {
+            version: 1,
+            inputs: [
+              {
+                prevOut: { txid: Buffer.alloc(32, 0), vout: 0xffffffff },
+                scriptSig,
+                sequence: 0xffffffff,
+                witness: [],
+              },
+            ],
+            outputs: [
+              {
+                value,
+                // OP_1: push 1 onto stack; combined with empty scriptSig the
+                // final stack is [1] which is truthy → script passes.
+                scriptPubKey: Buffer.from([0x51]),
+              },
+            ],
+            lockTime: 0,
+          };
+        }
+
+        // ── Block 1: coinbase creates a UTXO at height 1.
+        const T1 = T0 + 1; // barely above genesis MTP
+        blockTimestamps.set(1, T1);
+        const coinbase1 = makeCoinbaseOp1(1, 50_00000000n);
+        const cb1Txid = getTxId(coinbase1);
+        const block1 = makeBlock(customParams.genesisBlockHash, [coinbase1], T1);
+        await testChainState.connectBlock(block1, 1);
+
+        // ── Spending tx: v2 with time-based BIP-68 lock (1 time unit = 512 sec).
+        //    coinMTP = MTP(height 0) = T0 = 1296688602.
+        //    minTime = coinMTP + (1 << 9) - 1 = T0 + 511 = 1296689113.
+        //    Satisfied when prevMTP > T0 + 511.
+        //
+        //    scriptSig is empty: satisfies the OP_1 (always-true) scriptPubKey
+        //    above without requiring a real signature.
+        const spendingTx: Transaction = {
+          version: 2,
+          inputs: [
+            {
+              prevOut: { txid: cb1Txid, vout: 0 },
+              scriptSig: Buffer.alloc(0),
+              sequence: SEQUENCE_LOCKTIME_TYPE_FLAG | 1, // 1 × 512 s
+              witness: [],
+            },
+          ],
+          outputs: [
+            {
+              value: 49_99990000n,
+              scriptPubKey: Buffer.from([0x51]), // OP_1
+            },
+          ],
+          lockTime: 0,
+        };
+
+        // ── REJECT: block 2 includes the spending tx but prevMTP is too low.
+        //    prevMTP = MTP(block 1) = median([T1, T0]) = sorted([T0, T1])[1] = T1 = T0+1.
+        //    T0+1 > T0+511? NO → must reject.
+        //
+        //    Use a different coinbase value (49 BTC) so coinbase2r has a different
+        //    txid than the 50-BTC coinbases used for the ACCEPT path (which start
+        //    at height 2 again after the REJECT).  Without this, coreConnectBlockChecks
+        //    adds coinbase2r's output to the in-memory UTXO cache before hitting
+        //    the BIP-68 gate; when the ACCEPT path re-uses height 2 with the
+        //    50-BTC coinbase, BIP-30 would fire on the stale cache entry.
+        //    After the REJECT we also call clearCache to discard the partial
+        //    in-memory mutations from the failed block, restoring the cache to
+        //    the persisted block-1 state.
+        const T2_reject = T0 + 60; // well above T1 for header-timestamp validity
+        const coinbase2r = makeCoinbaseOp1(2, 49_00000000n); // distinct txid from accept-path coinbases
+        const block2Reject = makeBlock(
+          getBlockHash(block1.header),
+          [coinbase2r, spendingTx],
+          T2_reject
+        );
+        await expect(
+          testChainState.connectBlock(block2Reject, 2)
+        ).rejects.toThrow(/bad-txns-nonfinal|Sequence locks not satisfied/);
+
+        // Roll back any partial in-memory UTXO mutations from the failed block
+        // (coreConnectBlockChecks may have addTransaction'd coinbase2r before
+        // hitting the BIP-68 gate). Reset to the persisted block-1 tip.
+        testChainState.getUTXOManager().clearCache(getBlockHash(block1.header));
+
+        // ── Advance MTP: connect blocks 2–12 (coinbase only) with timestamps
+        //    all set to T0 + 600.  After 11 such blocks (heights 2-12), the
+        //    MTP of block 12 = median(11 × (T0+600)) = T0+600 = 1296689202.
+        //    T0+600 > T0+511 → lock satisfied.
+        let prevHash = getBlockHash(block1.header);
+        const HIGH_TS = T0 + 600; // > T0 + 511 (minTime)
+        for (let h = 2; h <= 12; h++) {
+          blockTimestamps.set(h, HIGH_TS);
+          const cbH = makeCoinbaseOp1(h, 50_00000000n);
+          const blk = makeBlock(prevHash, [cbH], HIGH_TS);
+          await testChainState.connectBlock(blk, h);
+          prevHash = getBlockHash(blk.header);
+        }
+
+        // ── ACCEPT: block 13 includes the spending tx and prevMTP > minTime.
+        //    prevMTP = MTP(block 12) = T0+600 = 1296689202 > T0+511 = 1296689113.
+        const T13 = HIGH_TS + 1; // strictly above MTP(12) = HIGH_TS
+        blockTimestamps.set(13, T13);
+        const coinbase13 = makeCoinbaseOp1(13, 50_00000000n);
+        const block13Accept = makeBlock(prevHash, [coinbase13, spendingTx], T13);
+        await expect(
+          testChainState.connectBlock(block13Accept, 13)
+        ).resolves.toBeUndefined();
+
+        expect(testChainState.getBestBlock().height).toBe(13);
       } finally {
         await testDb.close();
         await rm(testDir, { recursive: true, force: true });
