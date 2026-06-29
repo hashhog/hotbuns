@@ -89,6 +89,34 @@ export interface ConsensusParams {
    */
   readonly bip30ExceptionHeights: readonly number[];
   /**
+   * Per-block script-flag exceptions for historical blocks that violate
+   * normally-active consensus rules.  Mirrors Bitcoin Core
+   * `Consensus::Params::script_flag_exceptions`
+   * (kernel/chainparams.cpp:85-88, 210-211; validation.cpp:2262-2266
+   * GetBlockScriptFlags).
+   *
+   * When the block hash matches, the override flags value is returned DIRECTLY
+   * and the normal height-computed flag set is NOT used (matching blockbrew /
+   * beamchain canonical approach).  This is observationally equivalent to Core
+   * because the real exception blocks satisfy every flag anyway.
+   *
+   * Override values (SCRIPT_VERIFY_* bitmask, from Core chainparams.cpp):
+   *   0 = SCRIPT_VERIFY_NONE           — BIP16 violator (P2SH, WITNESS, TAPROOT OFF)
+   *   3 = SCRIPT_VERIFY_P2SH | WITNESS — Taproot violator (TAPROOT OFF only)
+   *
+   * Mainnet: 2 exceptions (BIP16 + Taproot violators).
+   * Testnet3: 1 exception (BIP16 violator).
+   * Testnet4 / Signet / Regtest: empty (no exceptions).
+   *
+   * blockHashHex is in display/RPC byte order (big-endian), the same
+   * convention as bip30ExceptionBlocks.  Mirror the BIP-30 byte-order
+   * check pattern: getBlockHash() → .reverse().toString("hex") → compare.
+   *
+   * Reference: Bitcoin Core kernel/chainparams.cpp:85-88, 210-211;
+   *            src/validation.cpp:2262-2266.
+   */
+  readonly scriptFlagExceptions: ReadonlyArray<{ blockHashHex: string; flags: number }>;
+  /**
    * The block hash at BIP34 activation height on the canonical chain (internal
    * little-endian byte order, same as genesisBlockHash). Used by the BIP-30
    * skip optimisation: BIP-30 is skipped between bip34Height and 1,983,702
@@ -460,6 +488,24 @@ export const MAINNET: ConsensusParams = {
   ],
   // Kept for backward compat; bip30ExceptionBlocks is the authoritative field.
   bip30ExceptionHeights: [91842, 91880],
+  // Script-flag exceptions: historical mainnet blocks that violate normally-active
+  // consensus rules.  Mirrors Bitcoin Core kernel/chainparams.cpp:85-88.
+  // Flags are raw SCRIPT_VERIFY_* bitmask values (0 = NONE; 3 = P2SH|WITNESS).
+  // Hashes in display (RPC/big-endian) order — same convention as bip30ExceptionBlocks.
+  scriptFlagExceptions: [
+    {
+      // BIP16 violator: mined before P2SH enforcement; contains a script that
+      // would fail P2SH validation.  Core override: SCRIPT_VERIFY_NONE (0).
+      blockHashHex: "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22",
+      flags: 0, // SCRIPT_VERIFY_NONE
+    },
+    {
+      // Taproot violator: mined after Taproot activation but contains a script
+      // that would fail TAPROOT verification.  Core override: P2SH | WITNESS (3).
+      blockHashHex: "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad",
+      flags: 3, // SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS
+    },
+  ],
   // BIP34Hash: block hash at h=227931 on mainnet canonical chain (display byte order).
   // Reference: Bitcoin Core kernel/chainparams.cpp:89-90, validation.cpp:2462.
   // Internal (LE) form stored here for direct comparison with getBlockHash() output.
@@ -764,6 +810,14 @@ export const TESTNET: ConsensusParams = {
   bip30ExceptionBlocks: [], // No BIP-30 exceptions on testnet3
   bip30DisconnectExceptionBlocks: [], // No BIP-30 disconnect-side exceptions on testnet3
   bip30ExceptionHeights: [], // No BIP-30 exceptions on testnet3
+  // Script-flag exceptions for testnet3: one BIP16 violator block.
+  // Mirrors Bitcoin Core kernel/chainparams.cpp:210-211.
+  scriptFlagExceptions: [
+    {
+      blockHashHex: "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105",
+      flags: 0, // SCRIPT_VERIFY_NONE
+    },
+  ],
   // BIP34Hash: block hash at h=21111 on testnet3 canonical chain (display byte order, reversed to LE).
   // Reference: Bitcoin Core kernel/chainparams.cpp:213.
   bip34Hash: Buffer.from(
@@ -885,6 +939,7 @@ export const TESTNET4: ConsensusParams = {
   bip30ExceptionBlocks: [], // No BIP-30 exceptions on testnet4
   bip30DisconnectExceptionBlocks: [], // No BIP-30 disconnect-side exceptions on testnet4
   bip30ExceptionHeights: [], // No BIP-30 exceptions on testnet4
+  scriptFlagExceptions: [], // No script-flag exceptions on testnet4
   // BIP34 active from height 1 on testnet4; no canonical BIP34Hash needed.
   bip34Hash: null,
   // Skip script/sigop verification for blocks at or below this height.
@@ -998,6 +1053,7 @@ export const SIGNET: ConsensusParams = {
   bip30ExceptionBlocks: [], // No BIP-30 exceptions on signet
   bip30DisconnectExceptionBlocks: [], // No BIP-30 disconnect-side exceptions on signet
   bip30ExceptionHeights: [], // No BIP-30 exceptions on signet
+  scriptFlagExceptions: [], // No script-flag exceptions on signet
   // BIP34 active from height 1 on signet; no canonical BIP34Hash needed.
   bip34Hash: null,
   dnsSeed: [
@@ -1047,6 +1103,7 @@ export const REGTEST: ConsensusParams = {
   bip30ExceptionBlocks: [], // No BIP-30 exceptions on regtest
   bip30DisconnectExceptionBlocks: [], // No BIP-30 disconnect-side exceptions on regtest
   bip30ExceptionHeights: [], // No BIP-30 exceptions on regtest
+  scriptFlagExceptions: [], // No script-flag exceptions on regtest
   // BIP34 active from height 1 on regtest; no canonical BIP34Hash needed.
   bip34Hash: null,
   coinbaseMaturity: 100,
