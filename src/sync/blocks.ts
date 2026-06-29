@@ -2904,19 +2904,17 @@ export class BlockSync {
       if (intermPrevHeaderEntry) {
         intermPrevMTP = this.headerSync.getMedianTimePast(intermPrevHeaderEntry);
       }
-      const intermAssumeValid =
-        this.params.assumeValidHeight > 0 &&
-        intermediate.height <= this.params.assumeValidHeight;
       const intermResult = await coreConnectBlockChecks(
         intermBlock,
         intermediate.height,
         this.utxoManager,
         this.params,
         {
-          assumeValid: intermAssumeValid,
-          // Reorg/intermediate side branches always fully verify (skipScripts
-          // false) — the safe over-verify default; BIP-68 enforced per Core
-          // regardless of assumevalid.
+          // Reorg/intermediate side branches always fully verify scripts
+          // (skipScripts: false) — safe over-verify default.  Core does
+          // apply assumevalid on reorg-reconnect paths but the ancestor
+          // check requires the active chain which is mid-transition here;
+          // verifying everything is always correct and simpler.
           skipScripts: false,
           prevMTP: intermPrevMTP,
           enforceBIP68: intermediate.height >= this.params.csvHeight,
@@ -3211,11 +3209,6 @@ export class BlockSync {
       return false;
     }
 
-    // assumeValid is used only to gate per-input script verification (see
-    // coreConnectBlockChecks / skipScripts).  Structural checks above are
-    // unconditional.
-    const assumeValid = this.params.assumeValidHeight > 0 && height <= this.params.assumeValidHeight;
-
     // Verify the block connects to the header chain
     const headerEntry = this.headerSync.getHeaderByHeight(height);
     if (!headerEntry || !headerEntry.hash.equals(blockHash)) {
@@ -3240,14 +3233,15 @@ export class BlockSync {
       }
     }
 
-    // ── P2-OPT-ROUND-2: assumevalid gate for script verification ──
-    // Build the context once per block and check whether scripts should be
-    // skipped.  On regtest assumedValid is undefined, so every script fires
-    // (good for tests).  On mainnet the 6-condition check applies.
+    // ── assumevalid gate for script verification ──
+    // Build the context once per block and run the full 5-condition
+    // shouldSkipScripts() check (Core validation.cpp:2346-2382).
+    // On regtest assumedValid is undefined → every script fires.
+    // On mainnet all 5 conditions must hold: AV hash configured, AV in
+    // header index, pindex on active chain AND ancestor of AV, best-header
+    // chainwork >= minimum, and > 2 weeks of equivalent PoW past pindex.
     const bestHeader = this.headerSync.getBestHeader();
     const currentHeaderEntry = this.headerSync.getHeaderByHeight(height);
-    const pindexTimestamp = currentHeaderEntry?.header.timestamp ?? 0;
-    const bestHeaderTimestamp = bestHeader?.header.timestamp ?? 0;
 
     const avCtx: AssumeValidContext = {
       pindex: {
@@ -3270,8 +3264,13 @@ export class BlockSync {
         ? { hash: bestHeader.hash.toString("hex"), height: bestHeader.height, chainWork: bestHeader.chainWork }
         : null,
       minimumChainWork: this.params.nMinimumChainWork,
-      pindexTimestamp,
-      bestHeaderTimestamp,
+      // Condition 5 (DoS defense): GetBlockProofEquivalentTime requires
+      // GetBlockProof(best_header.bits).  Sourced from the live best header's
+      // nBits field; 0 is a safe default (getBitsProof(0)=0 → equivTime=0 →
+      // "too recent" → scripts verified, fail-safe).
+      bestHeaderBits: bestHeader?.header.bits ?? 0,
+      // nPowTargetSpacing for the equivalent-time formula (600 s on mainnet).
+      powTargetSpacing: this.params.targetSpacing,
     };
 
     const skipScriptsResult = shouldSkipScripts(avCtx);
@@ -3310,7 +3309,6 @@ export class BlockSync {
       this.utxoManager,
       this.params,
       {
-        assumeValid,
         skipScripts,
         prevMTP: blockPrevMTP,
         enforceBIP68,

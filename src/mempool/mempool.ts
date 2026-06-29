@@ -2144,8 +2144,11 @@ export class Mempool {
           ? { hash: bestHeader.hash.toString("hex"), height: bestHeader.height, chainWork: bestHeader.chainWork }
           : null,
         minimumChainWork: this.params.nMinimumChainWork,
-        pindexTimestamp: Math.floor(Date.now() / 1000),
-        bestHeaderTimestamp: bestHeader ? bestHeader.header.timestamp : 0,
+        // Condition 5 (DoS defense): GetBlockProofEquivalentTime uses the
+        // best header's bits.  0 is a safe default → tipProof=0 → equivTime=0
+        // → "too recent" → scripts verified (fail-safe).
+        bestHeaderBits: bestHeader ? bestHeader.header.bits : 0,
+        powTargetSpacing: this.params.targetSpacing,
       });
       skipScripts = skipResult.skip;
     }

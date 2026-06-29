@@ -545,8 +545,8 @@ describe("P2-OPT-ROUND-2: parallel script verify in IBD ConnectBlock", () => {
         getBlockAtHeight: () => null,
         bestHeader: null,
         minimumChainWork: 0n,
-        pindexTimestamp: 0,
-        bestHeaderTimestamp: 0,
+        bestHeaderBits: 0,
+        powTargetSpacing: 600,
       });
 
       expect(result.skip).toBe(false);

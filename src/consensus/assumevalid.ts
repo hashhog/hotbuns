@@ -1,16 +1,22 @@
 /**
  * Assumevalid policy — Bitcoin Core v28.0 compatible ancestor-check semantics.
  *
- * POLICY SUMMARY (from ASSUMEVALID-REFERENCE.md):
- * Script verification is SKIPPED if and only if ALL six conditions hold:
- *  1. assumed_valid hash is configured (non-zero).
- *  2. The assumed-valid hash is present in the local block index.
+ * POLICY SUMMARY (Core validation.cpp:2346-2382):
+ * Script verification is SKIPPED if and only if ALL five conditions hold:
+ *  1. assumed_valid hash is configured (non-zero / non-empty).
+ *  2. The assumed-valid block hash IS in the local block-header index.
  *  3. The block being connected is an ancestor of the assumed-valid block on
- *     the active chain (ancestor check — NOT a height check).
- *  4. The block is an ancestor of the best known header.
- *  5. The best-known-header's chainwork >= minimum chainwork.
- *  6. The best-known-header is at least 2 weeks of equivalent-work past the
- *     block being connected.
+ *     the ACTIVE chain (ancestor check — NOT a height check):
+ *       active_chain.hash_at(pindex.height) == pindex.hash
+ *       AND pindex.height <= av_height
+ *       AND active_chain.hash_at(av_height)  == av_hash
+ *     A fork block at height <= av_height fails this test.
+ *  4. best_header.chainWork >= minimum_chain_work (eclipse / eclipse-split defense).
+ *  5. GetBlockProofEquivalentTime(best_header, pindex, best_header, params) > 2 weeks
+ *     (DoS defense):
+ *       equiv_time = (best_header.chainWork − pindex.chainWork)
+ *                    × powTargetSpacing / GetBlockProof(best_header.bits)
+ *     Uses exact 256-bit chainwork; NOT a float, NOT a timestamp approximation.
  *
  * What assumevalid does NOT skip: PoW, merkle root, coinbase, BIP30, block
  * size/weight, UTXO application — only script/signature verification is skipped.
@@ -32,7 +38,7 @@
  */
 
 /** Two weeks in seconds — the equivalent-work delay safety guard. */
-const TWO_WEEKS_IN_SECONDS = 60 * 60 * 24 * 7 * 2;
+const TWO_WEEKS_IN_SECONDS_BIGINT = 1_209_600n; // 60 * 60 * 24 * 14
 
 /**
  * Fleet-standard assumevalid hashes from Bitcoin Core v28.0.
@@ -71,12 +77,12 @@ export interface AssumeValidBlockEntry {
 }
 
 /**
- * Context passed to shouldSkipScripts for the 6-condition evaluation.
+ * Context passed to shouldSkipScripts for the 5-condition evaluation.
  */
 export interface AssumeValidContext {
   /**
    * The block being connected (pindex in Bitcoin Core parlance).
-   * Needs: hash (hex), height.
+   * Needs: hash (hex), height, chainWork.
    */
   pindex: AssumeValidBlockEntry;
 
@@ -95,43 +101,106 @@ export interface AssumeValidContext {
   getBlockByHash: (hashHex: string) => AssumeValidBlockEntry | null;
 
   /**
-   * Callback to look up the block at a given height on the best known chain.
-   * Returns null if no block is known at that height.
+   * Callback to look up the active-chain (best-header-chain) block at a given height.
+   * Returns null if no block/header is known at that height.
    *
-   * Used for:
-   *  - Condition 3: ancestor check  (getBlockAtHeight(pindex.height).hash === pindex.hash)
-   *  - Condition 4: best-header ancestor check
+   * Used for condition 3:
+   *   getBlockAtHeight(pindex.height).hash === pindex.hash  (pindex on active chain)
+   *   getBlockAtHeight(av_height).hash    === av_hash       (av block on active chain)
    */
   getBlockAtHeight: (height: number) => AssumeValidBlockEntry | null;
 
   /**
    * The best known header (most chainwork).
-   * Used for conditions 4, 5, and 6.
+   * Used for conditions 4 and 5.
    */
   bestHeader: AssumeValidBlockEntry | null;
 
   /**
-   * Minimum chain work required for the network.
-   * Used for condition 5.
+   * Minimum chain work required for the network (condition 4).
    */
   minimumChainWork: bigint;
 
   /**
-   * Get block equivalent-work time between two entries relative to best header.
+   * Compact nBits encoding of the best known header.
    *
-   * Bitcoin Core computes this as:
-   *   GetBlockProofEquivalentTime(bestHeader, pindex, bestHeader, params)
+   * Used for condition 5 (DoS defense): GetBlockProofEquivalentTime requires
+   * GetBlockProof(best_header) = 2^256 / (target+1) where target is decoded
+   * from bestHeaderBits.  This is the "tip" parameter in Core's
+   * GetBlockProofEquivalentTime(bestHeader, pindex, bestHeader, params).
    *
-   * This returns the estimated time (in seconds) of work represented by
-   * the proof between pindex and bestHeader. We approximate this as the
-   * block timestamp difference: bestHeader.timestamp - pindex.timestamp,
-   * which is safe and correct when the chain is far ahead of pindex.
-   *
-   * For the hotbuns implementation, we pass the pindex timestamp and
-   * bestHeader timestamp directly so this callback can compute the delta.
+   * Sourced from headerSync.getBestHeader().header.bits in blocks.ts.
    */
-  pindexTimestamp: number;
-  bestHeaderTimestamp: number;
+  bestHeaderBits: number;
+
+  /**
+   * Proof-of-work target spacing in seconds (nPowTargetSpacing).
+   *
+   * Bitcoin mainnet: 600 s (10 minutes).  Used in condition 5:
+   *   equiv_time = workDiff * powTargetSpacing / GetBlockProof(bestHeaderBits)
+   * Sourced from params.targetSpacing.
+   */
+  powTargetSpacing: number;
+}
+
+/**
+ * Compute block proof from compact bits encoding.
+ *
+ * Mirrors Bitcoin Core GetBitsProof (src/chain.cpp:121-134).
+ * Returns 2^256 / (target + 1) using the identity
+ *   (~target / (target+1)) + 1 = 2^256 / (target+1).
+ * Returns 0n for zero, negative, or overflow targets.
+ */
+function getBitsProof(bits: number): bigint {
+  const exponent = bits >>> 24;
+  const isNegative = (bits & 0x800000) !== 0;
+  const mantissa = bits & 0x7fffff;
+
+  let target: bigint;
+  if (exponent <= 3) {
+    target = BigInt(mantissa) >> BigInt(8 * (3 - exponent));
+  } else {
+    target = BigInt(mantissa) << BigInt(8 * (exponent - 3));
+  }
+
+  if (isNegative && target !== 0n) return 0n;
+  if (target === 0n) return 0n;
+
+  // 2^256 / (target + 1)
+  return (1n << 256n) / (target + 1n);
+}
+
+/**
+ * Compute equivalent time between bestHeader and pindex.
+ *
+ * Mirrors Bitcoin Core GetBlockProofEquivalentTime (src/chain.cpp:136-151)
+ * called as:
+ *   GetBlockProofEquivalentTime(bestHeader, pindex, bestHeader, params)
+ *
+ * Formula:
+ *   r = (bestHeader.chainWork − pindex.chainWork) × powTargetSpacing
+ *       / GetBlockProof(bestHeader.bits)
+ *
+ * Returns 0n if bestHeaderChainWork ≤ pindexChainWork or if bestHeaderBits
+ * decodes to a zero/overflow target (neither should occur under normal operation).
+ * Returns INT64_MAX (9_223_372_036_854_775_807n) if the result would overflow
+ * int64, mirroring Core's r.bits() > 63 guard.
+ */
+function getBlockProofEquivalentTime(
+  bestHeaderChainWork: bigint,
+  pindexChainWork: bigint,
+  bestHeaderBits: number,
+  powTargetSpacing: number,
+): bigint {
+  if (bestHeaderChainWork <= pindexChainWork) return 0n;
+  const tipProof = getBitsProof(bestHeaderBits);
+  if (tipProof === 0n) return 0n;
+  const r =
+    ((bestHeaderChainWork - pindexChainWork) * BigInt(powTargetSpacing)) /
+    tipProof;
+  // Mirror Core: if r.bits() > 63 → return INT64_MAX
+  const INT64_MAX = 9_223_372_036_854_775_807n;
+  return r > INT64_MAX ? INT64_MAX : r;
 }
 
 /**
@@ -155,31 +224,42 @@ export interface SkipScriptsResult {
  * Once script verification is added to the IBD path (P2-OPT-ROUND-2), this
  * function will fire there automatically — no changes needed here.
  *
- * @returns SkipScriptsResult with skip=true iff ALL six conditions hold.
+ * @returns SkipScriptsResult with skip=true iff ALL five conditions hold.
  */
 export function shouldSkipScripts(ctx: AssumeValidContext): SkipScriptsResult {
   // Condition 1: assumedValid hash must be configured (non-null/empty).
+  // Core: m_chainman.AssumedValidBlock().IsNull()
   if (!ctx.assumedValidHash) {
     return { skip: false, reason: "assumevalid=0 (always verify)" };
   }
 
   // Condition 2: The assumed-valid block must be in the local header index.
+  // Core: it == m_blockman.m_block_index.end()
   const assumedValidEntry = ctx.getBlockByHash(ctx.assumedValidHash);
   if (!assumedValidEntry) {
     return { skip: false, reason: "assumevalid hash not in headers" };
   }
 
   // Condition 3: The block being connected must be an ancestor of the
-  // assumed-valid block (on the assumed-valid block's chain).
+  // assumed-valid block on the ACTIVE chain.
   //
-  // Bitcoin Core: it->second.GetAncestor(pindex->nHeight) == pindex
+  // Core checks two things (validation.cpp:2358-2361):
+  //   (a) it->second.GetAncestor(pindex->nHeight) == pindex
+  //       — pindex is on AV's chain
+  //   (b) m_chainman.m_best_header->GetAncestor(pindex->nHeight) == pindex
+  //       — pindex is also on the best-header chain
   //
-  // In hotbuns: look up what block the assumed-valid chain has at pindex.height.
-  // If that block's hash matches pindex.hash, pindex is an ancestor.
+  // In hotbuns, getBlockAtHeight(h) returns the active/best-header-chain
+  // block at height h. We check:
+  //   (a) active_chain.hash_at(pindex.height) == pindex.hash
+  //       — pindex is on the active chain (covers Core's check (b))
+  //   (b) pindex.height <= av_height
+  //       — pindex is not above AV
+  //   (c) active_chain.hash_at(av_height) == av_hash
+  //       — AV itself is on the active chain (ensures (a) implies ancestorship)
   //
-  // NOTE: This is the ANCESTOR check, not a height check. A block at the same
-  // height as pindex on a *different* fork will fail this test, which is exactly
-  // the security property we need.
+  // A fork block at height <= av_height fails check (a) because the active
+  // chain at that height has a DIFFERENT hash.
   if (ctx.pindex.height > assumedValidEntry.height) {
     return { skip: false, reason: "block height above assumevalid height" };
   }
@@ -189,32 +269,47 @@ export function shouldSkipScripts(ctx: AssumeValidContext): SkipScriptsResult {
     return { skip: false, reason: "block not in assumevalid chain" };
   }
 
-  // Condition 4: The block must be an ancestor of the best known header.
-  // (Same logic: check if best-header chain at pindex.height matches pindex.)
-  // In practice, since getBlockAtHeight returns the best-chain block at that
-  // height, condition 3 already ensures this when the assumed-valid block IS
-  // the best header or an ancestor of it. We check explicitly for safety.
+  // Check that AV is itself on the active chain (condition 3c above).
+  // Without this check a stale AV entry from a discarded fork could cause
+  // an active-chain block to skip scripts incorrectly.
+  const avAtItsHeight = ctx.getBlockAtHeight(assumedValidEntry.height);
+  if (!avAtItsHeight || avAtItsHeight.hash !== ctx.assumedValidHash) {
+    return { skip: false, reason: "assumevalid block not on active chain" };
+  }
+
+  // Conditions 4 and 5 require a valid best header.
   if (!ctx.bestHeader) {
     return { skip: false, reason: "no best header available" };
   }
 
-  // Condition 5: Best-known-header chainwork >= minimum chainwork.
+  // Condition 4: Best-known-header chainwork >= minimum chainwork (eclipse defense).
+  // Core: m_chainman.m_best_header->nChainWork < m_chainman.MinimumChainWork()
   if (ctx.bestHeader.chainWork < ctx.minimumChainWork) {
     return { skip: false, reason: "best header chainwork below minimumchainwork" };
   }
 
-  // Condition 6: The best-known-header is at least 2 weeks of equivalent-work
-  // past the block being connected.
+  // Condition 5: Equivalent work time from pindex to best header > 2 weeks (DoS defense).
   //
-  // Bitcoin Core uses GetBlockProofEquivalentTime which computes work-equivalent
-  // time. We approximate with timestamp difference (safe; the chain must be
-  // at least 2 weeks old in real time for this block to be assumed-valid).
-  const equivalentTimeDelta = ctx.bestHeaderTimestamp - ctx.pindexTimestamp;
-  if (equivalentTimeDelta <= TWO_WEEKS_IN_SECONDS) {
+  // Core (validation.cpp:2364):
+  //   GetBlockProofEquivalentTime(bestHeader, pindex, bestHeader, params) > TWO_WEEKS
+  //
+  // Formula (chain.cpp:136-151):
+  //   equiv_time = (bestHeader.chainWork − pindex.chainWork)
+  //                × nPowTargetSpacing / GetBlockProof(bestHeader.nBits)
+  //
+  // We use exact 256-bit BigInt chainwork — no float, no timestamp approximation.
+  // The DoS defense: if a chain of ~two weeks of PoW cannot be shown, verify scripts.
+  const equivTime = getBlockProofEquivalentTime(
+    ctx.bestHeader.chainWork,
+    ctx.pindex.chainWork,
+    ctx.bestHeaderBits,
+    ctx.powTargetSpacing,
+  );
+  if (equivTime <= TWO_WEEKS_IN_SECONDS_BIGINT) {
     return { skip: false, reason: "block too recent relative to best header" };
   }
 
-  // All six conditions satisfied: skip script verification.
+  // All five conditions satisfied: skip script verification.
   return {
     skip: true,
     reason:
