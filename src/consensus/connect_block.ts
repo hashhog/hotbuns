@@ -80,6 +80,58 @@ import type { UTXOEntry } from "../storage/database.js";
 import { UTXOManager, type SpentUTXO } from "../chain/utxo.js";
 import { isFinalTx } from "../mining/template.js";
 
+// ─── Script-flag exception helper ─────────────────────────────────────────────
+
+/**
+ * Compute the consensus script-verify flags bitmask for a specific block.
+ *
+ * Mirrors Bitcoin Core validation.cpp::GetBlockScriptFlags (2250-2289):
+ *   1. Check params.scriptFlagExceptions: if the block hash matches an
+ *      exception entry, return the override flags DIRECTLY without additionally
+ *      ORing in height-based DERSIG/CLTV/CSV/NULLDUMMY flags.  This matches
+ *      the blockbrew/beamchain canonical approach and is observationally
+ *      equivalent to Core because the real exception blocks satisfy every
+ *      flag anyway.
+ *   2. Otherwise compute flags from the per-height activation booleans.
+ *
+ * blockHashHex MUST be in display/RPC byte order (big-endian), computed as:
+ *   Buffer.from(getBlockHash(block.header)).reverse().toString("hex")
+ * — the same convention used by bip30ExceptionBlocks.
+ *
+ * Reference: Bitcoin Core kernel/chainparams.cpp:85-88, 210-211;
+ *            src/validation.cpp:2262-2266 GetBlockScriptFlags.
+ */
+export function getScriptFlagsForBlock(
+  params: ConsensusParams,
+  blockHashHex: string,
+  verifyP2SH: boolean,
+  verifyWitness: boolean,
+  verifyTaproot: boolean,
+  verifyDERSig: boolean,
+  verifyCLTV: boolean,
+  verifyCSV: boolean,
+  verifyNullDummy: boolean,
+): number {
+  // Exception table lookup — mirrors Core GetBlockScriptFlags:2263-2265.
+  // If matched, return the override flags DIRECTLY (no height-based OR).
+  const exception = params.scriptFlagExceptions.find(
+    (ex) => ex.blockHashHex === blockHashHex
+  );
+  if (exception !== undefined) {
+    return exception.flags;
+  }
+  // Normal height-driven computation.
+  return (
+    (verifyP2SH      ? ScriptFlags.VERIFY_P2SH                  : ScriptFlags.VERIFY_NONE) |
+    (verifyWitness   ? ScriptFlags.VERIFY_WITNESS                : ScriptFlags.VERIFY_NONE) |
+    (verifyTaproot   ? ScriptFlags.VERIFY_TAPROOT                : ScriptFlags.VERIFY_NONE) |
+    (verifyDERSig    ? ScriptFlags.VERIFY_DERSIG                 : ScriptFlags.VERIFY_NONE) |
+    (verifyCLTV      ? ScriptFlags.VERIFY_CHECKLOCKTIMEVERIFY    : ScriptFlags.VERIFY_NONE) |
+    (verifyCSV       ? ScriptFlags.VERIFY_CHECKSEQUENCEVERIFY    : ScriptFlags.VERIFY_NONE) |
+    (verifyNullDummy ? ScriptFlags.VERIFY_NULLDUMMY              : ScriptFlags.VERIFY_NONE)
+  );
+}
+
 // ─── Public types ─────────────────────────────────────────────────────────────
 
 /**
@@ -566,23 +618,26 @@ export async function coreConnectBlockChecks(
 
       // ── Script verification (skipped when skipScripts=true).
       if (!skipScripts) {
-        // Assemble the per-block consensus script-verify bitmask to match
-        // Bitcoin Core validation.cpp GetBlockScriptFlags (2250-2289):
-        //   P2SH | WITNESS | TAPROOT  — always on (modulo 2 historical
-        //     script_flag_exceptions blocks, which hotbuns does not need to
-        //     model: those are the BIP16 violator and the TAPROOT violator,
-        //     and they predate / are off the chains hotbuns validates).
-        //   DERSIG (BIP66), CLTV (BIP65), CSV (BIP112), NULLDUMMY (BIP147)
-        //     — each gated by its own activation height in chainparams.
+        // Assemble the per-block consensus script-verify bitmask.
+        // getScriptFlagsForBlock mirrors Bitcoin Core
+        // validation.cpp::GetBlockScriptFlags (2250-2289):
+        //   — Checks params.scriptFlagExceptions first (2263-2265): two mainnet
+        //     blocks (BIP16 violator + Taproot violator) and one testnet3 block
+        //     (BIP16 violator) receive override flags returned DIRECTLY.
+        //   — Otherwise assembles flags from per-height activation booleans:
+        //     DERSIG (BIP66), CLTV (BIP65), CSV (BIP112), NULLDUMMY (BIP147).
         // NO STANDARD/policy flags are ever set here (consensus only).
-        const scriptFlags =
-          (verifyP2SH      ? ScriptFlags.VERIFY_P2SH                  : ScriptFlags.VERIFY_NONE) |
-          (verifyWitness   ? ScriptFlags.VERIFY_WITNESS              : ScriptFlags.VERIFY_NONE) |
-          (verifyTaproot   ? ScriptFlags.VERIFY_TAPROOT             : ScriptFlags.VERIFY_NONE) |
-          (verifyDERSig    ? ScriptFlags.VERIFY_DERSIG              : ScriptFlags.VERIFY_NONE) |
-          (verifyCLTV      ? ScriptFlags.VERIFY_CHECKLOCKTIMEVERIFY : ScriptFlags.VERIFY_NONE) |
-          (verifyCSV       ? ScriptFlags.VERIFY_CHECKSEQUENCEVERIFY : ScriptFlags.VERIFY_NONE) |
-          (verifyNullDummy ? ScriptFlags.VERIFY_NULLDUMMY          : ScriptFlags.VERIFY_NONE);
+        const scriptFlags = getScriptFlagsForBlock(
+          params,
+          blockHashHexForGate,
+          verifyP2SH,
+          verifyWitness,
+          verifyTaproot,
+          verifyDERSig,
+          verifyCLTV,
+          verifyCSV,
+          verifyNullDummy,
+        );
 
         let scriptResult;
         if (scriptThreads === 1) {
