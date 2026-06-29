@@ -434,27 +434,27 @@ describe("W92: DisconnectBlock + ApplyTxInUndo + chain reorg", () => {
   });
 
   // ── Gate #11: reorganize() depth cap ──────────────────────────────────────
-  describe("reorganize() bounded by MAX_REORG_DEPTH (validation.cpp)", () => {
-    test("rejects reorgs deeper than 100 blocks", async () => {
+  describe("reorganize() bounded by MAX_REORG_DEPTH (impl-specific memory-safety)", () => {
+    test("rejects reorgs deeper than 288 blocks", async () => {
       const chainState = new ChainStateManager(db, REGTEST);
       await chainState.load();
 
-      // Simulate a current tip at height=200 and a newTip at height=350
+      // Simulate a current tip at height=400 and a newTip at height=700
       // with no common ancestor reachable (which would translate to a
-      // 150-block oldBlocks list once findForkPoint runs).  We don't
-      // actually need a real chain — just inject a stub state and a
-      // newTip that will exceed the depth cap.
+      // 400-block oldBlocks list once findForkPoint runs — exceeds the
+      // 288 cap).  Bitcoin Core has no reorg-depth cap; 288 =
+      // MIN_BLOCKS_TO_KEEP, the impl-specific memory-safety bound.
       (chainState as any).bestBlock = {
         hash: Buffer.alloc(32, 0xff),
-        height: 200,
+        height: 400,
         chainWork: 1n,
       };
 
-      // Fake findForkPoint to return a 150-block oldBlocks list.  We
+      // Fake findForkPoint to return a 400-block oldBlocks list.  We
       // patch the private method directly to keep the test focused.
-      const fakeOldBlocks = Array.from({ length: 150 }, (_, i) => ({
-        block: createBlock(Buffer.alloc(32, i), [createCoinbaseTx(200 - i, 50n)]),
-        height: 200 - i,
+      const fakeOldBlocks = Array.from({ length: 400 }, (_, i) => ({
+        block: createBlock(Buffer.alloc(32, i), [createCoinbaseTx(400 - i, 50n)]),
+        height: 400 - i,
       }));
       const fakeNewBlocks: any[] = [];
       (chainState as any).findForkPoint = async () => ({
@@ -464,7 +464,7 @@ describe("W92: DisconnectBlock + ApplyTxInUndo + chain reorg", () => {
 
       const newTip = {
         hash: Buffer.alloc(32, 0xaa),
-        height: 350,
+        height: 700,
         header: createBlockHeader(Buffer.alloc(32, 0), Buffer.alloc(32, 0)),
         chainWork: 2n,
       } as any;

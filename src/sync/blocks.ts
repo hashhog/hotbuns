@@ -253,16 +253,17 @@ const MIN_BLOCKS_TO_KEEP = 288;
 /**
  * Maximum depth (number of blocks below the active validated tip) the
  * fork-aware block-download descent will walk to find the fork point and
- * lower the download floor.  Mirrors the `MAX_REORG_DEPTH = 100` cap used by
+ * lower the download floor.  Mirrors the `MAX_REORG_DEPTH = 288` cap used by
  * `ChainStateManager.reorganize()` (src/chain/state.ts) and
  * `BlockSync.handleReorgUtxoAndCollect`: a reorg deeper than this would be
  * refused by the reorg dispatch anyway, so there is no point requesting the
  * bridging bodies for it.  Bounds the descent so a pathologically deep or
  * malformed competing fork cannot drag the download floor (and the in-flight
  * request set) down without limit.  (Bitcoin Core has no fixed reorg-depth
- * cap, but hashhog bounds it consistently across the reorg machinery.)
+ * cap, but hashhog bounds it consistently across the reorg machinery.
+ * 288 = MIN_BLOCKS_TO_KEEP, the pruned-node undo-retention floor.)
  */
-const MAX_FORK_DOWNLOAD_DEPTH = 100;
+const MAX_FORK_DOWNLOAD_DEPTH = 288;
 
 /** How often (in connected blocks) to ask the prune manager whether files
  *  should be pruned.  Bitcoin Core checks during chainstate flushes; hotbuns
@@ -2736,13 +2737,13 @@ export class BlockSync {
     disconnectedTxsOut: Transaction[],
     pendingOps?: BatchOperation[]
   ): Promise<boolean> {
-    // Bitcoin Core's `nMaxReorgDepth` default is 100 (validation.cpp).
-    // The pre-Pattern-D value (10000) was an internal walk-depth guard
-    // that long predated the audit and effectively unbounded; lower it
-    // to the Core default so a runaway reorg attempt aborts cleanly
-    // instead of blowing up memory.  See the multi-block-atomicity
-    // refactor commit message for the audit reference.
-    const MAX_REORG_DEPTH = 100;
+    // Implementation-specific memory-safety bound: the entire reorg is
+    // staged into one in-memory batch, so depth must be capped to bound
+    // peak memory.  Bitcoin Core has NO fixed reorg-depth cap — it follows
+    // most-work bounded only by undo-data retention.  288 = Core's
+    // MIN_BLOCKS_TO_KEEP (the pruned-node undo-retention floor), chosen
+    // so hashhog accepts any reorg a non-pruned peer could present.
+    const MAX_REORG_DEPTH = 288;
     // Memory cap on the accumulated batch buffer.  100 reorged blocks
     // × ~hundreds of txindex ops + a handful of undo/chain-state ops
     // tops out near ~250k entries on regtest fixtures; production
@@ -3063,10 +3064,10 @@ export class BlockSync {
     oldTipHash: Buffer,
     newChainAncestorHashes: Set<string>
   ): Promise<Transaction[]> {
-    // Lowered from 10000 to 100 in the Pattern-D multi-block atomicity
-    // refactor so this legacy refill walk matches the dispatch-side
-    // bound in `handleReorgUtxoAndCollect` (Bitcoin Core's nMaxReorgDepth).
-    const MAX_REORG_DEPTH = 100;
+    // Implementation-specific bound: legacy tx-refill walk must not
+    // exceed the dispatch-side cap in handleReorgUtxoAndCollect.
+    // Bitcoin Core has no reorg-depth cap; 288 = MIN_BLOCKS_TO_KEEP.
+    const MAX_REORG_DEPTH = 288;
     const collected: Transaction[] = [];
     let cursor: Buffer | null = oldTipHash;
     let steps = 0;

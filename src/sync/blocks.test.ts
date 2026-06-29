@@ -1452,16 +1452,16 @@ describe("BlockSync reorg multi-block atomicity (Pattern D)", () => {
     expect(batchWriteCalls).toBe(1);
   });
 
-  test("MAX_REORG_DEPTH is the Bitcoin Core default of 100 (memory cap)", async () => {
-    // Defence-in-depth: the dispatch-side cap matches Bitcoin Core's
-    // nMaxReorgDepth default.  Pre-Pattern-D this was 10000 — an
-    // unbounded internal-walk guard inherited from earlier scaffolding
-    // that would let a malicious peer drive the in-memory ops buffer
-    // arbitrarily large.  Lowering to 100 mirrors Core's cap.
+  test("MAX_REORG_DEPTH is 288 (impl-specific memory-safety cap, aligned with MIN_BLOCKS_TO_KEEP)", async () => {
+    // Defence-in-depth: the dispatch-side cap matches MIN_BLOCKS_TO_KEEP
+    // (Core's pruned-node undo-retention floor).  Pre-Pattern-D this was
+    // 10000 — an unbounded internal-walk guard.  Bitcoin Core itself has
+    // NO fixed reorg-depth cap (no nMaxReorgDepth); 288 is an
+    // implementation-specific bound to cap in-memory batch growth.
     //
     // We assert the constant via source inspection rather than
-    // observable behaviour because driving 101 valid blocks through
-    // the dispatch in a unit test would require ~100 calls to
+    // observable behaviour because driving 289 valid blocks through
+    // the dispatch in a unit test would require ~289 calls to
     // coreConnectBlockChecks — too heavy for a regression test.
     // The diff-test corpus exercises the dispatch end-to-end.
     const blocksTs = (
@@ -1473,17 +1473,13 @@ describe("BlockSync reorg multi-block atomicity (Pattern D)", () => {
         "utf8"
       )
     ).toString();
-    // The dispatch uses MAX_REORG_DEPTH = 100.  The legacy
-    // collectDisconnectedTxs path is also lowered to 100 for
-    // consistency.  Either occurrence pinned at 100 confirms.
+    // The dispatch uses MAX_REORG_DEPTH = 288.  The legacy
+    // collectDisconnectedTxs path uses the same value for consistency.
     const matches = src.match(/MAX_REORG_DEPTH\s*=\s*(\d+)/g) ?? [];
     expect(matches.length).toBeGreaterThanOrEqual(1);
     for (const m of matches) {
       const n = Number(m.split("=")[1].trim());
-      // Allow either the dispatch's 100 or the per-batch overflow
-      // cap MAX_REORG_BATCH_OPS (a different constant entirely);
-      // we look only at MAX_REORG_DEPTH matches.
-      expect(n).toBe(100);
+      expect(n).toBe(288);
     }
   });
 });
