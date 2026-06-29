@@ -1024,20 +1024,17 @@ export class ChainStateManager {
     newTip: HeaderChainEntry,
     getBlock: (hash: Buffer) => Promise<Block | null>
   ): Promise<void> {
-    // ── W92 Core gate: bound reorg depth ──
+    // ── W92 memory-safety gate: bound reorg depth ──
     //
-    // Mirrors bitcoin-core/src/validation.cpp's reorg dispatcher which
-    // caps any single reorg at 100 blocks via nMaxReorgDepth.  The
-    // BlockSync path (sync/blocks.ts::handleReorgUtxoAndCollect) already
-    // applies this cap; the chain/state.ts reorganize() path (generateblock,
-    // dumptxoutset rollback, invalidateblock RPC) previously walked
-    // unbounded, allowing a buggy caller or malicious sub-chain to OOM
-    // by passing a deep newTip.
-    //
-    // Use the same value as handleReorgUtxoAndCollect for fleet-wide
-    // consistency.  100 blocks is conservative; testnet reorgs of this
-    // depth have never been observed on mainnet outside testing.
-    const MAX_REORG_DEPTH = 100;
+    // Implementation-specific bound: the entire reorg is staged into one
+    // in-memory batch, so depth must be capped to bound peak memory.
+    // Bitcoin Core has NO fixed reorg-depth cap — it follows most-work
+    // bounded only by undo-data retention; there is no nMaxReorgDepth in
+    // validation.cpp.  288 = Core's MIN_BLOCKS_TO_KEEP (pruned-node undo
+    // retention floor), so hashhog accepts any reorg a non-pruned peer
+    // could present.  The BlockSync path (handleReorgUtxoAndCollect) uses
+    // the same value; keep them in sync.
+    const MAX_REORG_DEPTH = 288;
 
     // Find the fork point
     const { oldBlocks, newBlocks } = await this.findForkPoint(newTip, getBlock);
