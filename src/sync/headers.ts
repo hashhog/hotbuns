@@ -721,19 +721,52 @@ export class HeaderSync {
    * @param blockTimestamp - Timestamp of the new block (for testnet min-diff check)
    */
   getNextTarget(parent: HeaderChainEntry, blockTimestamp?: number): bigint {
-    // Create block lookup function that uses our header chain
+    // Resolve blocks by height via a hash-linked ancestor walk from parent.
+    //
+    // Pre-fix this closure used this.headersByHeight.get(height) — the
+    // best-chain height index written only for the ACTIVE tip — so fork
+    // headers resolved ancestors from the wrong (best) chain.  Bitcoin Core
+    // always uses pindexLast->GetAncestor(nHeightFirst) (pow.cpp:44,72),
+    // which follows the validated block's own pprev links regardless of
+    // which chain is currently active.  We mirror that by walking
+    // parent.header.prevBlock backwards through this.headerChain (which
+    // holds ALL known headers, not just the best chain).
+    //
+    // This fixes both call-sites inside getNextWorkRequired / calculateNextWorkRequired:
+    //   1. The retarget first-block timestamp lookup (pow.cpp:44):
+    //        const firstBlock = getBlockByHeight(firstHeight)  →  firstBlockTime
+    //   2. The BIP94 base-bits lookup (pow.cpp:72):
+    //        const firstBlock = getBlockByHeight(firstHeight)  →  firstBlock.nBits
+    //   3. The testnet min-diff walk-back (pow.cpp:32-34):
+    //        prevBlock = getBlockByHeight(walkHeight - 1)  →  pprev.nBits
+    //
+    // Reference: bitcoin-core/src/pow.cpp:32-47, 67-76.
     const getBlockByHeight: BlockLookup = (height: number): BlockInfo | undefined => {
-      const entry = this.headersByHeight.get(height);
-      if (!entry) {
+      if (height > parent.height) {
+        // Can't look forward from parent's ancestry.
         return undefined;
       }
-      return {
-        height: entry.height,
-        header: {
-          timestamp: entry.header.timestamp,
-          bits: entry.header.bits,
-        },
-      };
+      // Walk backwards from parent via prevBlock hash links.
+      // Maximum depth is one difficulty period (≤ 2015 hops), same as Core.
+      let current: HeaderChainEntry | undefined = parent;
+      while (current !== undefined) {
+        if (current.height === height) {
+          return {
+            height: current.height,
+            header: {
+              timestamp: current.header.timestamp,
+              bits: current.header.bits,
+            },
+          };
+        }
+        if (current.height < height) {
+          // Shouldn't happen when height ≤ parent.height, but be safe.
+          return undefined;
+        }
+        const parentHashHex = current.header.prevBlock.toString("hex");
+        current = this.headerChain.get(parentHashHex);
+      }
+      return undefined;
     };
 
     // Create parent block info
