@@ -987,22 +987,70 @@ function canonicalPushScript(data: Buffer): Buffer {
 }
 
 /**
+ * Return the byte position immediately after the opcode (and its push data) at `pos`.
+ *
+ * Mirrors Bitcoin Core's CScript::GetOp() stepping used in FindAndDelete
+ * (interpreter.cpp:229-255). CScript::GetOp advances pc past the entire push
+ * payload; bytes inside a push payload are therefore NEVER at an opcode boundary
+ * and are invisible to FindAndDelete's match check.
+ *
+ * Returns -1 when the script is truncated at pos (GetOp would return false).
+ */
+function opcodeEndPos(script: Buffer, pos: number): number {
+  if (pos >= script.length) return pos;
+  const opcode = script[pos];
+  if (opcode >= 0x01 && opcode <= 0x4b) {
+    // OP_PUSHBYTES_1..75: 1-byte opcode + opcode bytes of data
+    const end = pos + 1 + opcode;
+    return end <= script.length ? end : -1;
+  } else if (opcode === 0x4c) { // OP_PUSHDATA1: 1 + 1 (len) + len
+    if (pos + 1 >= script.length) return -1;
+    const end = pos + 2 + script[pos + 1];
+    return end <= script.length ? end : -1;
+  } else if (opcode === 0x4d) { // OP_PUSHDATA2: 1 + 2 (len LE) + len
+    if (pos + 2 >= script.length) return -1;
+    const end = pos + 3 + (script[pos + 1] | (script[pos + 2] << 8));
+    return end <= script.length ? end : -1;
+  } else if (opcode === 0x4e) { // OP_PUSHDATA4: 1 + 4 (len LE) + len
+    if (pos + 4 >= script.length) return -1;
+    const end =
+      pos + 5 +
+      (script[pos + 1] |
+        (script[pos + 2] << 8) |
+        (script[pos + 3] << 16) |
+        (script[pos + 4] << 24));
+    return end <= script.length ? end : -1;
+  } else {
+    // OP_0 (0x00) and all non-push opcodes: 1 byte
+    return pos + 1;
+  }
+}
+
+/**
  * Remove all occurrences of a signature from scriptCode (FindAndDelete).
  * ONLY for legacy (BASE) signature version.
  *
+ * Matches Core's FindAndDelete (interpreter.cpp:229-255) exactly: the scan
+ * advances pc via CScript::GetOp(), so a match attempt is made ONLY at opcode
+ * boundaries. A pushSig occurrence that begins inside a push data payload is
+ * NEVER deleted. The old byte-by-byte fallback (advance by 1 on no-match) was
+ * wrong — it could match pushSig bytes that happen to appear inside a larger
+ * OP_PUSHDATA payload, giving a spurious found>0 and triggering
+ * SCRIPT_VERIFY_CONST_SCRIPTCODE rejection for valid scripts.
+ *
  * Returns both the rewritten script AND the number of occurrences removed.
- * Core's FindAndDelete (interpreter.cpp:229) returns the match count so the
- * caller can enforce SCRIPT_VERIFY_CONST_SCRIPTCODE — if a signature push was
- * actually deleted from the scriptCode while that flag is set, the script is
- * rejected with SCRIPT_ERR_SIG_FINDANDDELETE (interpreter.cpp:330-332 for
- * CHECKSIG, :1146-1148 for CHECKMULTISIG).
+ * Core's FindAndDelete returns the match count so the caller can enforce
+ * SCRIPT_VERIFY_CONST_SCRIPTCODE — if a signature push was actually deleted
+ * from the scriptCode while that flag is set, the script is rejected with
+ * SCRIPT_ERR_SIG_FINDANDDELETE (interpreter.cpp:330-332 for CHECKSIG,
+ * :1146-1148 for CHECKMULTISIG).
  */
 function findAndDelete(script: Buffer, sig: Buffer): { result: Buffer; found: number } {
   if (sig.length === 0) {
     return { result: script, found: 0 };
   }
 
-  // Build the push-encoded signature to search for
+  // Build the canonical push-encoded signature to search for.
   let pushSig: Buffer;
   if (sig.length < 76) {
     pushSig = Buffer.concat([Buffer.from([sig.length]), sig]);
@@ -1015,22 +1063,45 @@ function findAndDelete(script: Buffer, sig: Buffer): { result: Buffer; found: nu
     ]);
   }
 
-  // Find and remove all occurrences
-  const parts: Buffer[] = [];
+  // Opcode-aligned scan, mirroring Core interpreter.cpp:229-255.
+  //
+  // Core's do-while calls CScript::GetOp(pc, opcode) to advance pc past each
+  // opcode boundary; the match check `std::equal(b.begin(), b.end(), pc)` fires
+  // only BEFORE that GetOp call — i.e., always at an opcode boundary. Bytes
+  // inside a push payload are never at an opcode boundary, so they are invisible.
+  //
+  // We replicate this by using opcodeEndPos() to advance pc, matching Core's
+  // per-boundary semantics. `segStart` tracks the start of the current "keep"
+  // segment so we build the output incrementally without copying unchanged bytes.
   let found = 0;
-  let i = 0;
-  while (i < script.length) {
-    // Check if pushSig appears at position i
-    if (i + pushSig.length <= script.length && script.subarray(i, i + pushSig.length).equals(pushSig)) {
-      // Skip this occurrence
-      i += pushSig.length;
+  const parts: Buffer[] = [];
+  let segStart = 0; // start of the current kept segment
+  let pc = 0;       // current opcode boundary (mirrors Core's `pc` iterator)
+
+  while (pc < script.length) {
+    // Delete all consecutive occurrences of pushSig starting at pc
+    // (mirrors Core's inner while at interpreter.cpp:240-244).
+    while (
+      pc + pushSig.length <= script.length &&
+      script.subarray(pc, pc + pushSig.length).equals(pushSig)
+    ) {
+      parts.push(script.subarray(segStart, pc)); // flush kept segment
+      pc += pushSig.length;
+      segStart = pc;
       found++;
-    } else {
-      parts.push(script.subarray(i, i + 1));
-      i++;
     }
+    // Advance pc past the current opcode (mirrors CScript::GetOp(pc, opcode)).
+    const next = opcodeEndPos(script, pc);
+    if (next < 0) break; // truncated script — stop (GetOp returned false)
+    pc = next;
   }
 
+  if (found === 0) {
+    return { result: script, found: 0 };
+  }
+
+  // Flush the final kept segment (mirrors Core's post-loop insert at line 250).
+  parts.push(script.subarray(segStart));
   return { result: Buffer.concat(parts), found };
 }
 
@@ -2535,17 +2606,18 @@ export function verifyScript(
       return verifyTaproot(scriptPubKey, witness, flags, taprootCtx, txContext);
     }
 
-    // P2A (Pay-to-Anchor): anyone-can-spend with empty witness
-    // This is a witness v1 program with a 2-byte program (0x4e73)
-    // Reference: Bitcoin Core interpreter.cpp VerifyWitnessProgram
+    // P2A (Pay-to-Anchor): anyone-can-spend, witness ignored at consensus.
+    // Core VerifyWitnessProgram (interpreter.cpp:1990-1991):
+    //   `} else if (!is_p2sh && CScript::IsPayToAnchor(witversion, program)) { return true; }`
+    // Core returns true UNCONDITIONALLY — the witness stack is never inspected.
+    // Requiring an empty witness was wrong: it is a POLICY/standardness rule
+    // only, not a consensus rule. A P2A input with a non-empty witness is
+    // valid at the block level (direction: false-reject fixed).
     if (flags.verifyTaproot && isP2A(scriptPubKey)) {
       if (scriptSig.length !== 0) {
         return false;
       }
-      // P2A requires empty witness (anyone can spend)
-      if (witness.length !== 0) {
-        return false;
-      }
+      // Witness is not checked — empty or non-empty both succeed (anyone-can-spend).
       return true;
     }
 
