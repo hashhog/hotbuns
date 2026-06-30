@@ -1401,3 +1401,167 @@ describe("WITNESS_MALLEATED_P2SH — P2SH-wrapped witness scriptSig byte-exact c
     expect(caughtCode).not.toBe("WITNESS_MALLEATED_P2SH");
   });
 });
+
+// ---------------------------------------------------------------------------
+// FindAndDelete: opcode-aligned scan (Core parity, wave-2 fix)
+// ---------------------------------------------------------------------------
+//
+// Bitcoin Core's FindAndDelete (interpreter.cpp:229-255) advances pc via
+// CScript::GetOp(), which skips the entire push payload. A pushSig occurrence
+// that begins INSIDE a push data payload is therefore NEVER deleted.
+//
+// The old raw byte-by-byte scan (advance by 1 when no match) would incorrectly
+// find a match inside an OP_PUSHDATA1 payload, incrementing `found` and —
+// when SCRIPT_VERIFY_CONST_SCRIPTCODE is set — triggering SIG_FINDANDDELETE
+// for a script that Core would accept unchanged.
+//
+// Test vector:
+//   sig     = [0x01, 0x02]          (2 bytes)
+//   pushSig = [0x02, 0x01, 0x02]   (PUSH_2 encoding: length-byte + sig)
+//   scriptCode (raw) = [0x4c, 0x04, 0xaa, 0x02, 0x01, 0x02, 0xac]
+//     = OP_PUSHDATA1(4 bytes: [0xaa, 0x02, 0x01, 0x02])  OP_CHECKSIG
+//   pushSig bytes appear at raw offset 3 — INSIDE the PUSHDATA1 payload.
+//   Opcode boundaries: 0 (OP_PUSHDATA1), 6 (OP_CHECKSIG), 7 (end).
+//   No opcode boundary at offset 3, so opcode-aligned scan finds nothing.
+describe("FindAndDelete — opcode-aligned scan (Core interpreter.cpp:229-255 parity)", () => {
+  test("sig bytes embedded inside OP_PUSHDATA1 payload are NOT deleted", () => {
+    const sig = Buffer.from([0x01, 0x02]); // 2-byte dummy sig
+    const pubkey = Buffer.alloc(33, 0x02); // dummy 33-byte pubkey
+
+    // Script: OP_PUSHDATA1 <4 bytes [0xaa 0x02 0x01 0x02]> OP_CHECKSIG
+    // pushSig = [0x02, 0x01, 0x02] appears at byte offset 3 (inside push payload).
+    const rawScript = Buffer.from([
+      0x4c, 0x04,             // OP_PUSHDATA1, length=4
+      0xaa, 0x02, 0x01, 0x02, // 4 payload bytes — contains pushSig at offset 1
+      0xac,                   // OP_CHECKSIG
+    ]);
+
+    const parsed = parseScript(rawScript);
+    const ctx: ExecutionContext = {
+      // CHECKSIG pops pubkey (top), then sig. Stack: [sig (bottom), pubkey (top)].
+      stack: [sig, pubkey],
+      altStack: [],
+      flags: {
+        verifyP2SH: false,
+        verifyWitness: false,
+        verifyTaproot: false,
+        verifyStrictEncoding: false,
+        verifyDERSignatures: false, // no DER check — avoid SIG_DER on dummy sig
+        verifyLowS: false,
+        verifyNullDummy: false,
+        verifyNullFail: false,      // avoid NULLFAIL when CHECKSIG fails
+        verifyCheckLockTimeVerify: false,
+        verifyCheckSequenceVerify: false,
+        verifyWitnessPubkeyType: false,
+        verifyConstScriptCode: true, // KEY: throws SIG_FINDANDDELETE if found > 0
+      },
+      sigHasher: dummySigHasher,
+      sigVersion: SigVersion.BASE,
+    };
+
+    // Correct (post-fix) behavior: opcode-aligned scan skips OP_PUSHDATA1's
+    // payload entirely → found=0 → SIG_FINDANDDELETE NOT thrown.
+    // Buggy (pre-fix) behavior: byte-by-byte scan finds [0x02,0x01,0x02] at
+    // offset 3 → found=1 → throws SIG_FINDANDDELETE (false-reject).
+    expect(() => executeScript(parsed, ctx)).not.toThrow();
+  });
+
+  test("sig at a genuine opcode boundary IS deleted (alignment still fires)", () => {
+    // sig=[0x01, 0x02], so pushSig=[0x02, 0x01, 0x02] (PUSH_2 encoding).
+    // Script: PUSH_2[0x01,0x02]  PUSH_33[pubkey]  OP_CHECKSIG
+    //   - empty initial stack; script itself pushes sig then pubkey.
+    //   - CHECKSIG pops pubkey (top), then sig (second).
+    //   - scriptCode = serialized full script, which contains pushSig at opcode
+    //     boundary 0. findAndDelete MUST delete it → found=1 → SIG_FINDANDDELETE.
+    const pubkey = Buffer.alloc(33, 0x02); // 33-byte dummy pubkey
+
+    // Build rawScript: PUSH_2 [0x01, 0x02]  PUSH_33 [pubkey bytes]  OP_CHECKSIG
+    const rawScript = Buffer.concat([
+      Buffer.from([0x02, 0x01, 0x02]), // PUSH_2 sig — pushSig at opcode boundary 0
+      Buffer.from([0x21]),              // PUSH_33
+      pubkey,                           // 33 bytes of pubkey
+      Buffer.from([0xac]),              // OP_CHECKSIG
+    ]);
+
+    const parsed = parseScript(rawScript);
+    const ctx: ExecutionContext = {
+      stack: [], // script sets up its own stack
+      altStack: [],
+      flags: {
+        verifyP2SH: false,
+        verifyWitness: false,
+        verifyTaproot: false,
+        verifyStrictEncoding: false,
+        verifyDERSignatures: false,
+        verifyLowS: false,
+        verifyNullDummy: false,
+        verifyNullFail: false,
+        verifyCheckLockTimeVerify: false,
+        verifyCheckSequenceVerify: false,
+        verifyWitnessPubkeyType: false,
+        verifyConstScriptCode: true, // SIG_FINDANDDELETE fires when found > 0
+      },
+      sigHasher: dummySigHasher,
+      sigVersion: SigVersion.BASE,
+    };
+
+    // Execution: PUSH_2 pushes [0x01,0x02]; PUSH_33 pushes pubkey;
+    // CHECKSIG pops pubkey (top) and sig=[0x01,0x02].
+    // scriptCode = full serialized script = [0x02, 0x01, 0x02, 0x21, ...pubkey, 0xac].
+    // findAndDelete finds pushSig=[0x02,0x01,0x02] at boundary 0 → found=1
+    // → verifyConstScriptCode=true → throws SIG_FINDANDDELETE.
+    let caughtCode: string | undefined;
+    try {
+      executeScript(parsed, ctx);
+    } catch (e) {
+      if (e instanceof ScriptError) caughtCode = e.code;
+    }
+    expect(caughtCode).toBe("SIG_FINDANDDELETE");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2A (Pay-to-Anchor): non-empty witness accepted at consensus (Core parity)
+// ---------------------------------------------------------------------------
+//
+// Core VerifyWitnessProgram (interpreter.cpp:1990-1991):
+//   `} else if (!is_p2sh && CScript::IsPayToAnchor(witversion, program)) { return true; }`
+// Core returns true UNCONDITIONALLY for P2A — witness stack is never inspected.
+// Empty vs non-empty witness is a POLICY/standardness distinction, not consensus.
+//
+// The old hotbuns code had `if (witness.length !== 0) return false;` which
+// consensus-rejected P2A spends with non-empty witnesses (false-reject).
+describe("P2A (Pay-to-Anchor) — non-empty witness accepted at consensus", () => {
+  const p2aScript = Buffer.from([0x51, 0x02, 0x4e, 0x73]); // OP_1 <2-byte 0x4e73>
+  const emptyScriptSig = Buffer.alloc(0);
+  const flags: ScriptFlags = {
+    verifyP2SH: true,
+    verifyWitness: true,
+    verifyTaproot: true,
+    verifyStrictEncoding: false,
+    verifyDERSignatures: false,
+    verifyLowS: false,
+    verifyNullDummy: false,
+    verifyNullFail: false,
+    verifyCheckLockTimeVerify: false,
+    verifyCheckSequenceVerify: false,
+    verifyWitnessPubkeyType: false,
+  };
+
+  test("P2A with empty witness succeeds (anyone-can-spend)", () => {
+    expect(verifyScript(emptyScriptSig, p2aScript, [], flags, dummySigHasher)).toBe(true);
+  });
+
+  test("P2A with non-empty witness also succeeds (consensus, Core parity)", () => {
+    // Pre-fix: hotbuns returned false for witness.length !== 0.
+    // Post-fix: witness ignored at consensus → returns true.
+    const nonEmptyWitness = [Buffer.from([0xde, 0xad, 0xbe, 0xef])];
+    expect(verifyScript(emptyScriptSig, p2aScript, nonEmptyWitness, flags, dummySigHasher)).toBe(true);
+  });
+
+  test("P2A with non-empty scriptSig fails (BIP141 rule: scriptSig must be empty)", () => {
+    // Core also rejects non-empty scriptSig for native witness programs.
+    const nonEmptyScriptSig = Buffer.from([0x01]);
+    expect(verifyScript(nonEmptyScriptSig, p2aScript, [], flags, dummySigHasher)).toBe(false);
+  });
+});
