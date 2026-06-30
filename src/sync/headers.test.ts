@@ -10,7 +10,7 @@ import { mkdtemp, rm } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { ChainDB } from "../storage/database.js";
-import { REGTEST, compactToBigInt, bigIntToCompact } from "../consensus/params.js";
+import { REGTEST, TESTNET, compactToBigInt, bigIntToCompact } from "../consensus/params.js";
 import { BlockHeader, serializeBlockHeader, getBlockHash } from "../validation/block.js";
 import { hash256 } from "../crypto/primitives.js";
 import { HeaderSync, type HeaderChainEntry } from "./headers.js";
@@ -825,4 +825,172 @@ describe("HeaderSync version checks", () => {
       expect(exceededA).toBe(true);
     });
   });
+});
+
+// ─── Wave-3: getNextTarget ancestor walk (difficulty-retarget-exact fix) ─────
+//
+// Pre-fix: getNextTarget built getBlockByHeight as this.headersByHeight.get(height),
+// the BEST-CHAIN-only height index filled by updateBestChain.  For fork headers
+// this resolved ancestors from the wrong (best) chain, exactly the active-chain
+// height-index anti-pattern described in the wave-3 cluster note.
+//
+// Post-fix: getBlockByHeight walks parent.header.prevBlock links through
+// this.headerChain (ALL known headers), mirroring Core's
+// CBlockIndex::GetAncestor / pprev walk (bitcoin-core/src/pow.cpp:32-47, 67-76).
+//
+// EFFECTIVE: assert below fails against the pre-fix closure and passes post-fix.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("wave-3 getNextTarget: walks fork hash-linked ancestry not best-chain map", () => {
+  let dbPath: string;
+  let db: ChainDB;
+  let tnSync: HeaderSync;
+
+  beforeEach(async () => {
+    dbPath = await mkdtemp(join(tmpdir(), "hotbuns-retarget-fork-test-"));
+    db = new ChainDB(dbPath);
+    await db.open();
+    // Use TESTNET params: fPowAllowMinDifficultyBlocks=true, fPowNoRetargeting=false.
+    // This exercises the testnet min-diff walk-back path where getBlockByHeight
+    // is called to find the last non-min-diff ancestor.  (REGTEST has
+    // fPowNoRetargeting=true which bypasses the retarget formula entirely.)
+    tnSync = new HeaderSync(db, TESTNET);
+  });
+
+  afterEach(async () => {
+    await db.close();
+    await rm(dbPath, { recursive: true, force: true });
+  });
+
+  test("EFFECTIVE: getNextTarget follows fork ancestry not best-chain height map (testnet walk-back)", () => {
+    // Scenario
+    // --------
+    // Best chain:  genesis ──► H1 (height 1, bits=realBits, HIGH chainWork)
+    // Fork:        genesis ──► F1 (height 1, bits=powLimitBits, low chainWork)
+    //                    ──► F2 (height 2, bits=powLimitBits)
+    //
+    // headersByHeight[1] = H1  (best chain's entry, realBits).
+    //
+    // When computing getNextTarget(F2, blockTimestamp) for a height-3 block
+    // on the fork, the testnet min-diff walk-back fires because blockTimestamp
+    // is within 20 min of F2.  The walk-back calls getBlockByHeight(1):
+    //
+    //   Pre-fix:  headersByHeight.get(1) = H1 (realBits) → walk stops
+    //             → returns compactToBigInt(realBits)         ← WRONG
+    //
+    //   Post-fix: walks F2 → F1 (prevBlock link, powLimitBits) → keeps walking
+    //             → F1 → genesis (height 0) → loop exits
+    //             → returns compactToBigInt(powLimitBits) = TESTNET.powLimit  ← CORRECT
+    //
+    // Reference: bitcoin-core/src/pow.cpp:32-38 (pprev walk-back for testnet
+    // min-diff rule) and :44 (pindexLast->GetAncestor for retarget first-block).
+
+    const T = 1296688602; // testnet genesis timestamp
+
+    // ── Genesis (shared by both chains) ─────────────────────────────────────
+    const genesisHeader: BlockHeader = {
+      version: 1,
+      prevBlock: Buffer.alloc(32, 0),
+      merkleRoot: Buffer.alloc(32, 0xaa),
+      timestamp: T,
+      bits: TESTNET.powLimitBits,
+      nonce: 0,
+    };
+    const genesisHash = getBlockHash(genesisHeader);
+    const genesisEntry: HeaderChainEntry = {
+      hash: genesisHash,
+      header: genesisHeader,
+      height: 0,
+      chainWork: 1n,
+      status: "valid-header",
+    };
+
+    // ── H1: best-chain block at height 1, non-min-diff bits ─────────────────
+    // realBits = 0x1b0404cb is a mainnet-like hard target (non-min-diff).
+    // H1 is on the best chain (very high chainWork so updateBestChain picks it).
+    const realBits = 0x1b0404cb;
+    const h1Header: BlockHeader = {
+      version: 1,
+      prevBlock: genesisHash,
+      merkleRoot: Buffer.alloc(32, 0xbb), // different from F1's merkle root
+      timestamp: T + 100,
+      bits: realBits,
+      nonce: 7,
+    };
+    const h1Hash = getBlockHash(h1Header);
+    const H1entry: HeaderChainEntry = {
+      hash: h1Hash,
+      header: h1Header,
+      height: 1,
+      chainWork: 1_000_000n, // enormous chainWork → wins best-chain election
+      status: "valid-header",
+    };
+
+    // ── F1: fork block at height 1, min-diff bits (different from H1) ───────
+    const f1Header: BlockHeader = {
+      version: 1,
+      prevBlock: genesisHash,
+      merkleRoot: Buffer.alloc(32, 0xcc), // different merkle root → different hash
+      timestamp: T + 101,
+      bits: TESTNET.powLimitBits, // min-diff
+      nonce: 0,
+    };
+    const f1Hash = getBlockHash(f1Header);
+    const F1entry: HeaderChainEntry = {
+      hash: f1Hash,
+      header: f1Header,
+      height: 1,
+      chainWork: 2n, // low chainWork → fork, not best chain
+      status: "valid-fork",
+    };
+
+    // ── F2: fork block at height 2, min-diff bits, parent = F1 ──────────────
+    const f2Header: BlockHeader = {
+      version: 1,
+      prevBlock: f1Hash,
+      merkleRoot: Buffer.alloc(32, 0xdd),
+      timestamp: T + 202,
+      bits: TESTNET.powLimitBits, // min-diff
+      nonce: 0,
+    };
+    const f2Hash = getBlockHash(f2Header);
+    const F2entry: HeaderChainEntry = {
+      hash: f2Hash,
+      header: f2Header,
+      height: 2,
+      chainWork: 3n,
+      status: "valid-fork",
+    };
+
+    // ── Inject entries into HeaderSync's in-memory maps ─────────────────────
+    // headerChain holds ALL known headers (best chain + forks).
+    (tnSync as any).headerChain.set(genesisHash.toString("hex"), genesisEntry);
+    (tnSync as any).headerChain.set(h1Hash.toString("hex"), H1entry);
+    (tnSync as any).headerChain.set(f1Hash.toString("hex"), F1entry);
+    (tnSync as any).headerChain.set(f2Hash.toString("hex"), F2entry);
+
+    // headersByHeight reflects the BEST CHAIN ONLY (H1 wins at height 1).
+    (tnSync as any).headersByHeight.set(0, genesisEntry);
+    (tnSync as any).headersByHeight.set(1, H1entry); // best-chain wins
+
+    // ── Validate: block at height 3 with parent = F2 ────────────────────────
+    // blockTimestamp = T+502, which is within 20 min (1200 s) of F2.timestamp=T+202
+    // → testnet min-diff walk-back fires (Core pow.cpp:30: pblock->GetBlockTime()
+    //   <= pindexLast->GetBlockTime() + 2*nPowTargetSpacing).
+    const blockTimestamp = T + 502;
+
+    // Sanity: confirm walk-back path is taken (not the >20-min powLimit return)
+    const twiceSpacing = TESTNET.targetSpacing * 2; // 1200 s
+    expect(blockTimestamp).toBeLessThan(f2Header.timestamp + twiceSpacing);
+
+    const result = tnSync.getNextTarget(F2entry, blockTimestamp);
+
+    // Post-fix: walk-back follows F2 → F1 (min-diff) → genesis (min-diff, height 0)
+    // loop exits at height 0 → returns compactToBigInt(powLimitBits) = TESTNET.powLimit.
+    expect(result).toBe(TESTNET.powLimit);
+
+    // Pre-fix would return compactToBigInt(realBits) — different from TESTNET.powLimit
+    // (realBits=0x1b0404cb encodes a target far smaller than powLimit).
+    expect(result).not.toBe(compactToBigInt(realBits));
+  });
+
 });
