@@ -386,6 +386,22 @@ export class BlockSync {
    *  by the caller. Null when the last connect performed no reorg-abort. */
   private reorgAbortRestoredTip: Buffer | null;
 
+  /** Reorg-deferral signal (Core AcceptBlock/ActivateBestChain parity). A
+   *  heavier competing fork tip (e.g. B105) can reach `connectBlock` BEFORE its
+   *  bridging bodies (fork+1 .. old active tip = B102..B104) have been persisted
+   *  to disk as side branches — they are still in flight / being stored on the
+   *  P2P path. The reorg dispatch cannot rebuild the UTXO view from the fork
+   *  point without those bodies. This is a TRANSIENT ordering condition, NOT a
+   *  validation failure: Core's AcceptBlock stores the block and ActivateBestChain
+   *  simply waits until every block on the most-work path has BLOCK_HAVE_DATA
+   *  before connecting it — it never rejects the block or punishes the peer.
+   *  When `handleReorgUtxoAndCollect` detects a missing bridging body it sets this
+   *  flag and returns WITHOUT mutating the view; `connectBlock` then aborts the
+   *  connect cleanly (no view mutation, no consensus error) and the caller
+   *  (`processOrderedBlocksInner`) keeps the fork-tip block buffered, re-requests
+   *  the missing bodies, and NEVER bans the peer. Consumed + reset by the caller. */
+  private reorgDeferredMissingBodies: boolean = false;
+
   /** GAP3 fix (reorg-drop part 2/2): hashHex of competing-fork ("side-branch")
    *  bodies BELOW the active frontier that we have already persisted to disk via
    *  `maybeStoreForkBody`. The request loop consults this set so an evicted-but-
@@ -2108,6 +2124,34 @@ export class BlockSync {
       const success = await this.connectBlock(block, height);
 
       if (!success) {
+        // Core AcceptBlock / ActivateBestChain parity — DEFERRAL, not failure.
+        //
+        // `connectBlock` reported that a heavier competing fork tip could not be
+        // connected yet because a bridging body (fork+1 .. old active tip) is
+        // not on disk — the fork tip arrived over P2P ahead of its bridge. This
+        // is a transient ordering condition, NOT a validation failure: the block
+        // is perfectly valid, the peer is honest, and no view was mutated.
+        //
+        // Core keeps the block on disk and waits for ActivateBestChainStep to
+        // find every block on the most-work path with BLOCK_HAVE_DATA before
+        // connecting. We mirror that here: KEEP the fork tip buffered (do NOT
+        // discard it), leave the peer alone (NO block-mutated punishment, NO
+        // header invalidation, NO consecutive-failure escalation), re-request
+        // the still-missing bridging bodies, and stop processing at this height.
+        // When the bridge lands (side-branch stored by `maybeStoreForkBody`, which
+        // re-enters `processOrderedBlocks`) the fork-tip connect is retried and
+        // the reorg completes. Without this, a valid competing block was rejected
+        // and the honest peer was banned as "block-mutated" — the reorg wedge.
+        if (this.reorgDeferredMissingBodies) {
+          this.reorgDeferredMissingBodies = false;
+          console.log(
+            `[reorg] fork tip at height ${height} deferred pending bridging bodies; ` +
+              `keeping it buffered and re-requesting the bridge (peer NOT punished)`
+          );
+          this.requestBlocks();
+          break;
+        }
+
         // Capture the failure reason BEFORE any retry-recovery work mutates
         // state — the classifier needs the raw error string to pick the
         // right banner.
@@ -2157,15 +2201,34 @@ export class BlockSync {
           this.lastFailedHeight = height;
         }
 
-        // G16 fix: score the peer that delivered this invalid block.
-        // Core: ProcessBlock sets BLOCK_MUTATED and calls Misbehaving(pfrom, 100).
-        // We look up the delivering peer by peerKey stored at download time.
+        // G16 fix: score the peer that delivered this invalid block — but ONLY
+        // for a genuine CONSENSUS violation, mirroring Core's
+        // MaybePunishNodeForBlock (net_processing.cpp:1906), which punishes only
+        // BLOCK_CONSENSUS / BLOCK_MUTATED (and header/prev-invalid), and NEVER a
+        // transient internal condition such as a missing bridging body or the
+        // `view-out-of-sync` coordination gate (in Core the latter is an
+        // assert that never surfaces from a peer).
+        //
+        // Pre-fix this ban fired unconditionally on ANY connect-false, so a
+        // VALID competing block that merely lost a download race with its own
+        // bridge (classified "unknown", not "consensus") got the honest peer
+        // disconnected as "block-mutated" — the P2P-robustness bug. The deferral
+        // path above already returns early for the specific missing-bridge case;
+        // this gate is the defence-in-depth generalisation: a non-consensus
+        // connect failure must never punish the delivering peer.
         const blockPeerKey = this.downloadedBlockPeers.get(hashHex);
-        if (blockPeerKey && this.peerManager) {
+        if (
+          blockPeerKey &&
+          this.peerManager &&
+          classifyCallbackError(failureMsg) === "consensus"
+        ) {
           const deliverer = this.peerManager.getConnectedPeers()
             .find((p) => `${p.host}:${p.port}` === blockPeerKey);
           if (deliverer) {
-            deliverer.misbehaving(100, "block-mutated");
+            // Map the reject reason to Core's block-level punishment token so
+            // the log names the real rule, not a blanket "block-mutated".
+            const rejectToken = bip22FromConnectError(failureMsg);
+            deliverer.misbehaving(100, rejectToken);
           }
         }
 
@@ -2874,6 +2937,72 @@ export class BlockSync {
       }
     }
 
+    // ── Step 1.5: bridging-body presence pre-flight (Core AcceptBlock /
+    //    ActivateBestChain parity) ──
+    //
+    // The fork-tip block (e.g. B105) can reach `connectBlock` BEFORE its
+    // bridging bodies (fork+1 .. old active tip, e.g. B102..B104) have been
+    // persisted to disk as side branches — on the live P2P path those bodies
+    // are still in flight / being stored by `maybeStoreForkBody`. Step 2 below
+    // would disconnect the old chain (mutating the in-memory UTXO view back to
+    // the fork point) and step 3 would then find the intermediate bodies
+    // missing on disk, leaving the view stranded at the fork point. The
+    // fork-tip connect that follows would then fail the `view-out-of-sync` gate
+    // — a valid block wrongly rejected, and (pre-fix) the honest peer banned as
+    // "block-mutated".
+    //
+    // Core never does this: AcceptBlock persists every valid block to disk
+    // unconditionally, and ActivateBestChainStep only connects a block on the
+    // most-work path once EVERY block on that path carries BLOCK_HAVE_DATA —
+    // otherwise it simply waits (the missing bodies are (re)requested) and
+    // retries later. It never rejects the tip or punishes the peer for a
+    // transient "we don't have the bridge yet" condition.
+    //
+    // So: find the fork point via a read-only HEADER walk of the old chain,
+    // filter `newConnectQueue` to the intermediates strictly above it, and
+    // verify each intermediate body is already on disk. If ANY is missing, set
+    // the deferral signal and return WITHOUT mutating the view. `connectBlock`
+    // aborts the connect cleanly and the caller keeps the fork tip buffered,
+    // re-requests the bridging bodies, and retries once they land — no
+    // consensus error, no peer ban. (The old chain's own bodies are validated
+    // in step 2; this pre-flight only guards the NEW branch's bridge.)
+    {
+      let forkHeight: number | null = null;
+      let hcursor: Buffer | null = oldTipHash;
+      let hsteps = 0;
+      while (hcursor !== null && hsteps < MAX_REORG_DEPTH) {
+        if (newAncestorHashes.has(hcursor.toString("hex"))) {
+          const forkEntry = this.headerSync.getHeader(hcursor);
+          forkHeight = forkEntry ? forkEntry.height : null;
+          break;
+        }
+        const hEntry = this.headerSync.getHeader(hcursor);
+        if (!hEntry) break;
+        if (hEntry.height === 0) break;
+        hcursor = hEntry.header.prevBlock;
+        hsteps++;
+      }
+      if (forkHeight !== null) {
+        for (const interm of newConnectQueue) {
+          if (interm.height <= forkHeight) continue; // fork + shared prefix
+          const body = await this.db.getBlock(interm.hash);
+          if (!body) {
+            console.log(
+              `[reorg] deferring reorg to ${newTipBlock.header.prevBlock
+                .toString("hex")
+                .slice(0, 16)}… (fork tip height ${newTipHeight}): bridging body ` +
+                `for height ${interm.height} (${interm.hash
+                  .toString("hex")
+                  .slice(0, 16)}) not yet on disk — keeping fork tip buffered, ` +
+                `re-requesting the bridge (no view mutation, no peer punishment)`
+            );
+            this.reorgDeferredMissingBodies = true;
+            return false;
+          }
+        }
+      }
+    }
+
     // Step 2: walk back OLD chain from oldTipHash, disconnecting
     // each block (UTXO restore) until we hit a hash already in
     // newAncestorHashes (the fork).  Collect non-coinbase txs along
@@ -3247,6 +3376,10 @@ export class BlockSync {
     // ActivateBestChainStep parity — see the field doc + the reorg-abort
     // restore below).
     this.reorgAbortRestoredTip = null;
+    // Reset the reorg-deferral signal for this attempt (Core AcceptBlock /
+    // ActivateBestChain parity — set by the reorg dispatch when a bridging body
+    // is not yet on disk; see the field doc + the deferral handling below).
+    this.reorgDeferredMissingBodies = false;
 
     // Snapshot the OLD tip BEFORE the connect mutates chain state.  Used
     // by the post-connect mempool-refill check (Pattern B): if the
@@ -3322,6 +3455,24 @@ export class BlockSync {
         reorgDisconnectedTxs,
         reorgPendingOps
       );
+
+      // Core AcceptBlock / ActivateBestChain parity — DEFER, don't reject.
+      //
+      // The reorg dispatch detected that a bridging body (fork+1 .. old active
+      // tip) is not yet on disk, so the competing branch cannot be rebuilt from
+      // the fork point RIGHT NOW.  It returned WITHOUT mutating the UTXO view.
+      // This is a transient ordering condition on the live P2P path (the fork
+      // tip arrived before its bridge), exactly the case Core handles by leaving
+      // the block on disk and waiting for the missing path bodies — never by
+      // rejecting the tip or punishing the peer.
+      //
+      // Abort this connect cleanly: no view was touched (return before step 2),
+      // so there is nothing to roll back; record no consensus error; return
+      // false with `reorgDeferredMissingBodies` still set so the caller keeps the
+      // fork tip buffered, re-requests the bridge, and does NOT ban the peer.
+      if (this.reorgDeferredMissingBodies) {
+        return false;
+      }
     }
 
     // Core ActivateBestChainStep parity — atomic rollback of a failed reorg.
@@ -3545,11 +3696,33 @@ export class BlockSync {
     // so a crash window between the undo write and the final flush
     // could leave the chainstate inconsistent.  Now they ride one
     // ClassicLevel batch.
+    // ── Reorg-retention window (Core AcceptBlock + MIN_BLOCKS_TO_KEEP parity) ──
+    //
+    // Bitcoin Core writes EVERY block's body (AcceptBlock → SaveBlockToDisk) and
+    // undo data (ConnectBlock → WriteUndoDataForBlock) to disk unconditionally,
+    // and only prunes them once they fall MIN_BLOCKS_TO_KEEP (288) below the tip.
+    // hotbuns skips those writes for blocks connected below the best-header tip
+    // as an IBD I/O optimization (`atTip`). But headers-first sync means ALL
+    // headers arrive before the bodies, so during the final catch-up EVERY block
+    // is "below the header tip" and its body+undo were never persisted. A
+    // competing chain that then triggers a reorg must disconnect those recent
+    // blocks — but `handleReorgUtxoAndCollect`'s `db.getBlock` / the
+    // disconnect-side `db.getUndoData` return null, so the reorg aborts partway
+    // and strands the UTXO view mid-old-chain → the `view-out-of-sync` wedge that
+    // fails EVERY live-P2P reorg (harness height 105).
+    //
+    // Fix: persist body + undo for any block within MIN_BLOCKS_TO_KEEP of the
+    // best header — the exact window a peer could present a reorg for (and the
+    // same bound the reorg dispatch itself enforces, MAX_REORG_DEPTH=288). Deep
+    // IBD blocks (>288 below the target) are still skipped, so IBD throughput is
+    // unchanged; only the ~288-block tail persists per-block, which is where
+    // reorgs actually happen. This mirrors Core's retention floor exactly.
+    const withinReorgWindow =
+      !bestHeader || height > bestHeader.height - MIN_BLOCKS_TO_KEEP;
+
     let newTipUndoOp: BatchOperation | null = null;
     {
-      const bestHeaderForUndo = bestHeader;
-      const atTipForUndo = !bestHeaderForUndo || height >= bestHeaderForUndo.height;
-      if (atTipForUndo) {
+      if (withinReorgWindow) {
         try {
           const { serializeUndoData } = await import("../chain/utxo.js");
           const undoData = serializeUndoData(coreResult.spentOutputs);
@@ -3574,7 +3747,12 @@ export class BlockSync {
     this.utxoManager.setBestBlock(blockHash);
     // bestHeader was already fetched in the preamble for the assumevalid gate.
     const atTip = !bestHeader || height >= bestHeader.height;
-    const shouldFlush = atTip || height % FLUSH_INTERVAL === 0;
+    // Flush whenever we persist reorg-window body/undo so those ops actually
+    // reach disk this call (the batch below / the force-flush else-branch commit
+    // newTipUndoOp + newTipTxIndexOps). Deep-IBD blocks fall outside the window,
+    // so their flush cadence (FLUSH_INTERVAL) is unchanged.
+    const shouldFlush =
+      atTip || withinReorgWindow || height % FLUSH_INTERVAL === 0;
 
     // Store raw block data when near the tip so we can serve blocks to
     // peers via getdata.  During deep IBD this is skipped for performance.
@@ -3590,7 +3768,7 @@ export class BlockSync {
     // `blocks/blk*.dat` (body, written first) and the LevelDB
     // chainstate batch (validation.cpp:WriteBlockToDisk).
     let newTipTxIndexOps: BatchOperation[] = [];
-    if (atTip) {
+    if (withinReorgWindow) {
       const rawBlock = serializeBlock(block);
       await this.db.putBlock(blockHash, rawBlock);
 
@@ -3777,8 +3955,11 @@ export class BlockSync {
         header: serializeBlockHeader(block.header),
         nTx: block.transactions.length,
         // 1=HEADER_VALID, 2=TXS_KNOWN, 4=TXS_VALID, 8=HAVE_DATA, 16=HAVE_UNDO.
-        status: 1 | 2 | 4 | (atTip ? 8 : 0) | haveUndo,
-        dataPos: atTip ? 1 : 0,
+        // HAVE_DATA / dataPos track the body write above, which now covers the
+        // whole reorg-retention window (not just the strict tip), so a
+        // reorg-disconnect that reads this bit finds the body actually on disk.
+        status: 1 | 2 | 4 | (withinReorgWindow ? 8 : 0) | haveUndo,
+        dataPos: withinReorgWindow ? 1 : 0,
       };
       const indexValue = this.serializeBlockIndex(blockRecord);
       extraOps.push(
