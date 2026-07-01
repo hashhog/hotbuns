@@ -371,6 +371,19 @@ export class BlockSync {
    *  classify the failure as consensus vs chainstate vs unknown. */
   private lastConnectError: string;
 
+  /** Reorg-atomicity signal (Core ActivateBestChainStep parity). When a
+   *  reorg-tip connect FAILS after the competing chain was partially connected
+   *  in-memory (old chain disconnected, B1/B2 reconnected), `connectBlock`
+   *  atomically restores the ORIGINAL active-chain tip via
+   *  `utxoManager.clearCache(oldTip)` and records that original tip hash here.
+   *  The caller's generic failure-cleanup (`processOrderedBlocks`) reads this to
+   *  SKIP its own `clearCache(getHeaderByHeight(lastFlushed))` — which, mid-reorg,
+   *  would re-point the UTXO view at the COMPETING branch (the best-header chain's
+   *  height entry is the losing fork B2, not the active-chain tip A2) and settle
+   *  the node on the wrong branch. Set on a reorg-abort restore, consumed + reset
+   *  by the caller. Null when the last connect performed no reorg-abort. */
+  private reorgAbortRestoredTip: Buffer | null;
+
   /** GAP3 fix (reorg-drop part 2/2): hashHex of competing-fork ("side-branch")
    *  bodies BELOW the active frontier that we have already persisted to disk via
    *  `maybeStoreForkBody`. The request loop consults this set so an evicted-but-
@@ -503,6 +516,7 @@ export class BlockSync {
     this.consecutiveFailures = 0;
     this.lastFailedHeight = -1;
     this.lastConnectError = "";
+    this.reorgAbortRestoredTip = null;
     this.downloadedBlockPeers = new Map();
 
     this.state = {
@@ -2157,6 +2171,22 @@ export class BlockSync {
         // retry then sees a consistent view and re-processes from
         // `lastFlushedHeight + 1` correctly.  Falls back to a bare clear
         // (old behaviour) only if that header can't be resolved.
+        //
+        // REORG-ABORT EXCEPTION (Core ActivateBestChainStep parity): if the
+        // failed connect was a REORG whose new tip was invalid, connectBlock
+        // has ALREADY atomically restored the UTXO view to the original
+        // active-chain tip (`reorgAbortRestoredTip`).  We MUST NOT re-run the
+        // `getHeaderByHeight(lastFlushed)` clearCache here: mid-reorg, the
+        // best-header chain's height entry is the LOSING competing fork (B2),
+        // so this clear would re-point the view at the wrong branch and settle
+        // the node there — the exact Reorg-wave-3 bug.  Skip + reset the signal.
+        if (this.reorgAbortRestoredTip !== null) {
+          console.log(
+            `[reorg] connect-fail cleanup skipped — active chain already restored ` +
+              `to ${this.reorgAbortRestoredTip.toString("hex").slice(0, 16)} by connectBlock`
+          );
+          this.reorgAbortRestoredTip = null;
+        } else {
         const flushedTipEntry = this.headerSync.getHeaderByHeight(
           this.lastFlushedHeight
         );
@@ -2178,6 +2208,7 @@ export class BlockSync {
               `${this.lastFlushedHeight}; UTXO view best-block left unreconciled`
           );
           this.utxoManager.clearCache();
+        }
         }
 
         if (this.consecutiveFailures >= 3) {
@@ -3185,6 +3216,10 @@ export class BlockSync {
     // Reset captured error for this attempt; populated by recordConnectError()
     // at every warn/error → return-false site below.
     this.lastConnectError = "";
+    // Reset the reorg-atomicity restore signal for this attempt (Core
+    // ActivateBestChainStep parity — see the field doc + the reorg-abort
+    // restore below).
+    this.reorgAbortRestoredTip = null;
 
     // Snapshot the OLD tip BEFORE the connect mutates chain state.  Used
     // by the post-connect mempool-refill check (Pattern B): if the
@@ -3237,12 +3272,22 @@ export class BlockSync {
     // mix.  Mirrors Bitcoin Core's `CDBBatch` pattern in
     // `validation.cpp::ActivateBestChainStep`.
     const reorgPendingOps: BatchOperation[] = [];
+    // `reorgAttempted` records whether the pre-connect reorg dispatch ran and
+    // therefore may have MUTATED the in-memory UTXO view (old chain
+    // disconnected, competing intermediates B1/B2 reconnected, view best-block
+    // advanced to the last intermediate).  Any failure AFTER this point must
+    // atomically restore the ORIGINAL active-chain tip, or the node settles on
+    // the losing competing branch (Core ActivateBestChainStep: the competing
+    // chain is connected against a throwaway view that is DROPPED on any
+    // ConnectTip failure, leaving the active chain unchanged).
+    let reorgAttempted = false;
     if (
       oldTipBeforeConnect !== null &&
       this.chainStateManager !== null &&
       this.chainStateManager.getBestBlock().height > 0 &&
       !block.header.prevBlock.equals(oldTipBeforeConnect)
     ) {
+      reorgAttempted = true;
       reorgUtxoFixed = await this.handleReorgUtxoAndCollect(
         block,
         height,
@@ -3251,6 +3296,41 @@ export class BlockSync {
         reorgPendingOps
       );
     }
+
+    // Core ActivateBestChainStep parity — atomic rollback of a failed reorg.
+    //
+    // The reorg dispatch above mutated the in-memory UTXO view IN PLACE
+    // (disconnected the old active chain back to the fork, reconnected the
+    // competing intermediates B1/B2, advanced the view best-block).  NOTHING
+    // has been flushed to disk yet (`reorgPendingOps` only rides the final
+    // success flush), so the on-disk UTXO set still reflects the ORIGINAL
+    // active tip (`oldTipBeforeConnect`).  If the new tip (or an intermediate)
+    // is invalid — e.g. B3 with bad-cb-amount — every failure return below must
+    // FIRST drop the throwaway in-memory mutations and re-point the view at the
+    // original active tip, exactly as Core discards the throwaway
+    // CCoinsViewCache and leaves `m_chain` on the original branch.
+    //
+    // Without this, `connectBlock` returned false with the view stranded on the
+    // competing branch (B2), and the caller's generic clearCache — keyed on
+    // `getHeaderByHeight(lastFlushed)`, which is the BEST-HEADER chain entry =
+    // the losing fork B2, not the active-chain tip A2 — cemented the wrong
+    // branch (Reorg wave 3: settled at h103 on B2 instead of restoring A2).
+    const abortFailedReorg = (): void => {
+      if (!reorgAttempted || oldTipBeforeConnect === null) return;
+      // Discard the dirty reorg mutations and re-point the view (cache +
+      // CoinsViewDB) at the on-disk active tip.  `reorgPendingOps` is dropped
+      // on the floor by returning before the flush — no disk write occurred.
+      this.utxoManager.clearCache(oldTipBeforeConnect);
+      // Signal the caller (processOrderedBlocks) to SKIP its own clearCache,
+      // which would otherwise re-point to the competing branch.
+      this.reorgAbortRestoredTip = oldTipBeforeConnect;
+      console.warn(
+        `[reorg] failed reorg to ${hashHex.slice(0, 16)} at height ${height}; ` +
+          `atomically restored active chain to ${oldTipBeforeConnect
+            .toString("hex")
+            .slice(0, 16)} (no partial switch)`
+      );
+    };
 
     // Structural block validation (CheckBlock equivalent) always runs regardless
     // of assumevalid.  Bitcoin Core's assumevalid optimization ONLY skips
@@ -3266,6 +3346,7 @@ export class BlockSync {
       const m = `Block ${hashHex.slice(0, 16)}... at height ${height} failed validation: ${validation.error}`;
       console.warn(m);
       this.recordConnectError(m);
+      abortFailedReorg();
       return false;
     }
 
@@ -3275,6 +3356,7 @@ export class BlockSync {
       const m = `Block ${hashHex.slice(0, 16)}... does not match expected header at height ${height}`;
       console.warn(m);
       this.recordConnectError(m);
+      abortFailedReorg();
       return false;
     }
 
@@ -3396,6 +3478,11 @@ export class BlockSync {
       const m = coreResult.error;
       console.warn(m);
       this.recordConnectError(m);
+      // Core ActivateBestChainStep parity: the competing chain's new tip failed
+      // ConnectBlock (e.g. bad-cb-amount).  Drop the throwaway in-memory reorg
+      // mutations and restore the original active chain — never settle on the
+      // partially-connected competing branch.
+      abortFailedReorg();
       return false;
     }
 

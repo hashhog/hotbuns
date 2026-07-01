@@ -30304,6 +30304,7 @@ class BlockSync {
   consecutiveFailures;
   lastFailedHeight;
   lastConnectError;
+  reorgAbortRestoredTip;
   forkBodiesOnDisk = new Set;
   downloadedBlockPeers;
   chainStateManager;
@@ -30335,6 +30336,7 @@ class BlockSync {
     this.consecutiveFailures = 0;
     this.lastFailedHeight = -1;
     this.lastConnectError = "";
+    this.reorgAbortRestoredTip = null;
     this.downloadedBlockPeers = new Map;
     this.state = {
       pendingBlocks: new Map,
@@ -31109,14 +31111,19 @@ class BlockSync {
         console.error(`Block validation failed at height ${height} (attempt ${this.consecutiveFailures})${coords}, discarding and re-requesting: ${failureMsg}`);
         this.state.downloadedBlocks.delete(hashHex);
         this.downloadedBlockPeers.delete(hashHex);
-        const flushedTipEntry = this.headerSync.getHeaderByHeight(this.lastFlushedHeight);
-        if (flushedTipEntry && this.lastFlushedHeight > 0) {
-          this.utxoManager.clearCache(flushedTipEntry.hash);
-        } else if (this.lastFlushedHeight === 0) {
-          this.utxoManager.clearCache();
+        if (this.reorgAbortRestoredTip !== null) {
+          console.log(`[reorg] connect-fail cleanup skipped — active chain already restored ` + `to ${this.reorgAbortRestoredTip.toString("hex").slice(0, 16)} by connectBlock`);
+          this.reorgAbortRestoredTip = null;
         } else {
-          console.warn(`[connect-fail] could not resolve header for lastFlushedHeight=` + `${this.lastFlushedHeight}; UTXO view best-block left unreconciled`);
-          this.utxoManager.clearCache();
+          const flushedTipEntry = this.headerSync.getHeaderByHeight(this.lastFlushedHeight);
+          if (flushedTipEntry && this.lastFlushedHeight > 0) {
+            this.utxoManager.clearCache(flushedTipEntry.hash);
+          } else if (this.lastFlushedHeight === 0) {
+            this.utxoManager.clearCache();
+          } else {
+            console.warn(`[connect-fail] could not resolve header for lastFlushedHeight=` + `${this.lastFlushedHeight}; UTXO view best-block left unreconciled`);
+            this.utxoManager.clearCache();
+          }
         }
         if (this.consecutiveFailures >= 3) {
           const cls = classifyCallbackError(failureMsg);
@@ -31551,18 +31558,29 @@ class BlockSync {
     const blockHash = getBlockHash(block.header);
     const hashHex = blockHash.toString("hex");
     this.lastConnectError = "";
+    this.reorgAbortRestoredTip = null;
     const oldTipBeforeConnect = this.chainStateManager ? this.chainStateManager.getBestBlock().hash : null;
     let reorgDisconnectedTxs = [];
     let reorgUtxoFixed = false;
     const reorgPendingOps = [];
+    let reorgAttempted = false;
     if (oldTipBeforeConnect !== null && this.chainStateManager !== null && this.chainStateManager.getBestBlock().height > 0 && !block.header.prevBlock.equals(oldTipBeforeConnect)) {
+      reorgAttempted = true;
       reorgUtxoFixed = await this.handleReorgUtxoAndCollect(block, height, oldTipBeforeConnect, reorgDisconnectedTxs, reorgPendingOps);
     }
+    const abortFailedReorg = () => {
+      if (!reorgAttempted || oldTipBeforeConnect === null)
+        return;
+      this.utxoManager.clearCache(oldTipBeforeConnect);
+      this.reorgAbortRestoredTip = oldTipBeforeConnect;
+      console.warn(`[reorg] failed reorg to ${hashHex.slice(0, 16)} at height ${height}; atomically restored active chain to ${oldTipBeforeConnect.toString("hex").slice(0, 16)} (no partial switch)`);
+    };
     const validation = validateBlock(block, height, this.params);
     if (!validation.valid) {
       const m = `Block ${hashHex.slice(0, 16)}... at height ${height} failed validation: ${validation.error}`;
       console.warn(m);
       this.recordConnectError(m);
+      abortFailedReorg();
       return false;
     }
     const headerEntry = this.headerSync.getHeaderByHeight(height);
@@ -31570,6 +31588,7 @@ class BlockSync {
       const m = `Block ${hashHex.slice(0, 16)}... does not match expected header at height ${height}`;
       console.warn(m);
       this.recordConnectError(m);
+      abortFailedReorg();
       return false;
     }
     const enforceBIP68 = height >= this.params.csvHeight;
@@ -31642,6 +31661,7 @@ class BlockSync {
       const m = coreResult.error;
       console.warn(m);
       this.recordConnectError(m);
+      abortFailedReorg();
       return false;
     }
     let newTipUndoOp = null;
