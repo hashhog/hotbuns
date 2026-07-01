@@ -9068,11 +9068,17 @@ function executeScript(script, ctx) {
         }
         stack.push(chunk.data);
       }
+      if (stack.length + altStack.length > MAX_STACK_SIZE) {
+        return false;
+      }
       continue;
     }
     if (opcode === 79 /* OP_1NEGATE */) {
       if (executing) {
         stack.push(scriptNumEncode(-1));
+      }
+      if (stack.length + altStack.length > MAX_STACK_SIZE) {
+        return false;
       }
       continue;
     }
@@ -9080,6 +9086,9 @@ function executeScript(script, ctx) {
       if (executing) {
         const n = opcode - 81 /* OP_1 */ + 1;
         stack.push(scriptNumEncode(n));
+      }
+      if (stack.length + altStack.length > MAX_STACK_SIZE) {
+        return false;
       }
       continue;
     }
