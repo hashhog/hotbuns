@@ -1176,6 +1176,12 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
         }
         stack.push(chunk.data);
       }
+      // MAX_STACK_SIZE is enforced after EVERY loop iteration in Core,
+      // including data pushes (interpreter.cpp:1221). The size check at the
+      // bottom of this loop is skipped by the `continue` below, so re-check here.
+      if (stack.length + altStack.length > MAX_STACK_SIZE) {
+        return false;
+      }
       continue;
     }
 
@@ -1184,6 +1190,10 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
       if (executing) {
         stack.push(scriptNumEncode(-1));
       }
+      // MAX_STACK_SIZE enforced after every iteration incl. pushes (Core interpreter.cpp:1221).
+      if (stack.length + altStack.length > MAX_STACK_SIZE) {
+        return false;
+      }
       continue;
     }
 
@@ -1191,6 +1201,10 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
       if (executing) {
         const n = opcode - Opcode.OP_1 + 1;
         stack.push(scriptNumEncode(n));
+      }
+      // MAX_STACK_SIZE enforced after every iteration incl. pushes (Core interpreter.cpp:1221).
+      if (stack.length + altStack.length > MAX_STACK_SIZE) {
+        return false;
       }
       continue;
     }

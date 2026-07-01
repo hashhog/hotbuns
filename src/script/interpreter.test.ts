@@ -1618,3 +1618,44 @@ describe("P2A (Pay-to-Anchor) — non-empty witness accepted at consensus", () =
     expect(verifyScript(nonEmptyScriptSig, p2aScript, [], flags, dummySigHasher)).toBe(false);
   });
 });
+
+describe("MAX_STACK_SIZE enforced after push opcodes (Core interpreter.cpp:1221)", () => {
+  // Core runs `stack.size()+altstack.size() > MAX_STACK_SIZE (1000)` at the END
+  // of EVERY loop iteration, INCLUDING pushes. Pre-fix, hotbuns skipped this
+  // check on the data-push / OP_1..OP_16 / OP_1NEGATE branches (they `continue`
+  // before the bottom-of-loop check), so an oversized stack was accepted.
+
+  test("1001 OP_1 pushes -> executeScript returns false (stack exceeds 1000)", () => {
+    // scriptPubKey = 1001 x OP_1 (0x51). Core rejects at the 1001st push.
+    const script = parseScript(Buffer.alloc(1001, Opcode.OP_1));
+    const ctx = createContext();
+    expect(executeScript(script, ctx)).toBe(false);
+  });
+
+  test("exactly 1000 OP_1 pushes -> executeScript returns true (boundary OK)", () => {
+    // stack.size()==1000 is NOT > MAX_STACK_SIZE, so this must still pass.
+    const script = parseScript(Buffer.alloc(1000, Opcode.OP_1));
+    const ctx = createContext();
+    expect(executeScript(script, ctx)).toBe(true);
+  });
+
+  test("1001 data pushes -> executeScript returns false", () => {
+    // 1001 minimal 1-byte pushes (0x01 0x01) => 1001 stack elements.
+    const raw = Buffer.alloc(2002);
+    for (let i = 0; i < 1001; i++) {
+      raw[i * 2] = 0x01; // push 1 byte
+      raw[i * 2 + 1] = 0x01; // the byte
+    }
+    const script = parseScript(raw);
+    const ctx = createContext();
+    expect(executeScript(script, ctx)).toBe(false);
+  });
+
+  test("verifyScript: 1001 OP_1 scriptSig + empty scriptPubKey -> reject (Core parity)", () => {
+    // Exact failing input from the findings doc: prevout scriptPubKey empty,
+    // scriptSig = 1001 x OP_1, no witness, consensus flags (CLEANSTACK off).
+    const scriptSig = Buffer.alloc(1001, Opcode.OP_1);
+    const scriptPubKey = Buffer.alloc(0);
+    expect(verifyScript(scriptSig, scriptPubKey, [], defaultFlags(), dummySigHasher)).toBe(false);
+  });
+});
