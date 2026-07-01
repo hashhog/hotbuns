@@ -30635,6 +30635,7 @@ class BlockSync {
   async injectBlock(block) {
     const blockHash = getBlockHash(block.header);
     const hashHex = blockHash.toString("hex");
+    this.lastConnectError = "";
     let headerEntry = this.headerSync.getHeader(blockHash);
     if (!headerEntry) {
       const accepted = await this.headerSync.processHeaders([block.header], null, false);
