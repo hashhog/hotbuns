@@ -1318,6 +1318,26 @@ export class BlockSync {
     const blockHash = getBlockHash(block.header);
     const hashHex = blockHash.toString("hex");
 
+    // Per-submission reset of the shared connect-error scratchpad.
+    //
+    // `lastConnectError` is a BlockSync-instance field that `connectBlock`
+    // populates on a failed connect (validation.cpp-style reject reason) and
+    // the BIP-22 classifier at the tail of this method reads back to map into
+    // a submitblock result string ("bad-txns-nonfinal", etc).  `connectBlock`
+    // clears it at its own start (line ~3127), so the *connect decision* is
+    // always per-block.  But when a submitted block never reaches
+    // `connectBlock` — e.g. its header is a competing sibling that is not the
+    // active header at its height, so `processOrderedBlocksInner` can't find
+    // its body and breaks without connecting — the classifier below would read
+    // the STALE reason left by a PREVIOUS rejected block and wrongly report it
+    // for THIS block.  A single non-final-locktime rejection would then poison
+    // every subsequent submitblock with "bad-txns-nonfinal".  Finality is a
+    // pure per-tx property in Core (IsFinalTx, consensus/tx_verify.cpp — no
+    // persisted state), so this scratchpad must be scoped per submission.
+    // Reset it here, mirroring the per-block reset connectBlock already does
+    // for the P2P/connect path.
+    this.lastConnectError = "";
+
     let headerEntry = this.headerSync.getHeader(blockHash);
     if (!headerEntry) {
       // Header not known yet — try to accept it directly from the block.
