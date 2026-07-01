@@ -103,6 +103,8 @@ export function classifyCallbackError(
     "bip34 requires height",
     "bad-txns",
     "bad-blk",
+    "bad-cb-amount",
+    "pays too much",
     "non-final",
     "bad sigops",
     "sigops cost",
@@ -2119,6 +2121,31 @@ export class BlockSync {
           inputMatch || txMatch
             ? ` [tx=${txMatch?.[1] ?? "?"} input=${inputMatch?.[1] ?? "?"}]`
             : "";
+
+        // Bitcoin Core InvalidBlockFound parity (validation.cpp): when a block
+        // on the best-header chain fails a genuine CONSENSUS rule, flag its
+        // header invalid and re-seat the best-header / by-height index on the
+        // active tip we're actually on.  Without this, the invalid block's
+        // header stays selected as getHeaderByHeight(height), so a competing
+        // VALID sibling at the same height that only TIES it on work can never
+        // be adopted (processOrderedBlocks keeps looking up the invalid block's
+        // absent body and breaks) — the tip lags Core by one block after an
+        // invalid-mid-reorg or an invalid direct child of the active tip.
+        //
+        // Gated on the CONSENSUS class only: a transient chainstate/undo error
+        // must NOT brand a valid header invalid (Core only calls
+        // InvalidBlockFound for state.IsInvalid(), never for system errors).
+        // In both the reorg-abort and the direct-extension cases the active
+        // chain tip is `chainStateManager.getBestBlock()` (the reorg dispatch
+        // never advanced it, since the connect failed).
+        if (
+          this.chainStateManager &&
+          headerEntry &&
+          classifyCallbackError(failureMsg) === "consensus"
+        ) {
+          const activeTip = this.chainStateManager.getBestBlock();
+          this.headerSync.invalidateHeader(headerEntry.hash, activeTip.hash);
+        }
 
         // Track consecutive failures at the same height to detect permanent
         // UTXO corruption (e.g. a coin was DELETEd from LevelDB during a
