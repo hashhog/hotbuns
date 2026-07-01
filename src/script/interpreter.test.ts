@@ -666,6 +666,59 @@ describe("executeScript - disabled opcodes", () => {
     const script = parseScript(Buffer.from([Opcode.OP_MUL]));
     expect(executeScript(script, ctx)).toBe(false);
   });
+
+  // Fuzz wave-2 divergence (CVE-2010-5137 parity): Bitcoin Core checks for
+  // disabled opcodes at the TOP of the opcode loop (interpreter.cpp ~457-472),
+  // BEFORE the fExec/branch gate (~478). A disabled opcode is therefore rejected
+  // (SCRIPT_ERR_DISABLED_OPCODE) even inside an UNEXECUTED IF/ELSE branch. If the
+  // check were (wrongly) gated behind the executing flag, hotbuns would ACCEPT a
+  // script Core rejects — a consensus fork on the P2SH/script path (p2p-reachable).
+  test("OP_CAT in an unexecuted IF branch is rejected (Core parity)", () => {
+    // OP_0 OP_IF OP_CAT OP_ENDIF OP_1  — OP_CAT sits in the dead (never-run) branch.
+    const script = parseScript(
+      Buffer.from([Opcode.OP_0, Opcode.OP_IF, Opcode.OP_CAT, Opcode.OP_ENDIF, Opcode.OP_1])
+    );
+    const ctx = createContext([]);
+    expect(executeScript(script, ctx)).toBe(false);
+  });
+
+  test("all disabled opcodes are rejected in an unexecuted branch", () => {
+    const disabled = [
+      Opcode.OP_CAT, Opcode.OP_SUBSTR, Opcode.OP_LEFT, Opcode.OP_RIGHT,
+      Opcode.OP_INVERT, Opcode.OP_AND, Opcode.OP_OR, Opcode.OP_XOR,
+      Opcode.OP_2MUL, Opcode.OP_2DIV, Opcode.OP_MUL, Opcode.OP_DIV,
+      Opcode.OP_MOD, Opcode.OP_LSHIFT, Opcode.OP_RSHIFT,
+    ];
+    for (const op of disabled) {
+      const script = parseScript(
+        Buffer.from([Opcode.OP_0, Opcode.OP_IF, op, Opcode.OP_ENDIF, Opcode.OP_1])
+      );
+      expect(executeScript(script, createContext([]))).toBe(false);
+    }
+  });
+
+  test("full P2SH spend with OP_CAT in a dead redeem-script branch is rejected", () => {
+    // redeemScript: OP_0 OP_IF OP_CAT OP_ENDIF OP_1  (dead branch holds OP_CAT)
+    const redeem = Buffer.from([
+      Opcode.OP_0, Opcode.OP_IF, Opcode.OP_CAT, Opcode.OP_ENDIF, Opcode.OP_1,
+    ]);
+    const h = hash160(redeem);
+    const scriptPubKey = Buffer.concat([
+      Buffer.from([Opcode.OP_HASH160, h.length]), h, Buffer.from([Opcode.OP_EQUAL]),
+    ]);
+    const scriptSig = Buffer.concat([Buffer.from([redeem.length]), redeem]);
+    expect(
+      verifyScript(scriptSig, scriptPubKey, [], defaultFlags(), dummySigHasher)
+    ).toBe(false);
+  });
+
+  test("control: a non-disabled opcode in a dead branch still succeeds", () => {
+    // OP_0 OP_IF OP_ADD OP_ENDIF OP_1  — OP_ADD is skipped (dead), result stays true.
+    const script = parseScript(
+      Buffer.from([Opcode.OP_0, Opcode.OP_IF, Opcode.OP_ADD, Opcode.OP_ENDIF, Opcode.OP_1])
+    );
+    expect(executeScript(script, createContext([]))).toBe(true);
+  });
 });
 
 describe("executeScript - CHECKSIG", () => {
