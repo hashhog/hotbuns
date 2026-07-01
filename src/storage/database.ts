@@ -344,7 +344,11 @@ export class ChainDB {
 
   // Block index operations
 
-  async putBlockIndex(hash: Buffer, record: BlockIndexRecord): Promise<void> {
+  async putBlockIndex(
+    hash: Buffer,
+    record: BlockIndexRecord,
+    opts?: { writeHeightIndex?: boolean }
+  ): Promise<void> {
     // Belt-and-suspenders: if shutdown is in progress, skip the write rather
     // than racing db.close() and surfacing LEVEL_DATABASE_NOT_OPEN as noise.
     // Caller (saveHeaderEntry) is best-effort during IBD; any header dropped
@@ -356,9 +360,74 @@ export class ChainDB {
     const value = serializeBlockIndex(record);
     await this.db.put(key, value);
 
-    // Also store height -> hash mapping
-    const heightKey = makeKey(DBPrefix.HEADER, encodeHeight(record.height));
-    await this.db.put(heightKey, hash);
+    // Also store the height -> hash (active-chain) mapping — hotbuns's analogue
+    // of Bitcoin Core's `CChain m_chain` (the height-indexed active chain),
+    // which is kept STRICTLY SEPARATE from `mapBlockIndex` (all headers by
+    // hash).  Core only mutates `m_chain` via `CChain::SetTip` inside
+    // ActivateBestChain's connect/disconnect — never during header reception
+    // (`AcceptBlockHeader` touches only `mapBlockIndex`).  Callers that are NOT
+    // on the active-connect path (notably `saveHeaderEntry`, which fires for
+    // EVERY header including competing forks) MUST pass
+    // `writeHeightIndex: false`; otherwise a fork header at the same height as
+    // the active tip overwrites the height->hash entry and getblockhash(h)
+    // returns an abandoned-branch block while getbestblockhash returns the
+    // active tip (the stale-index bug this parameter closes).
+    if (opts?.writeHeightIndex !== false) {
+      const heightKey = makeKey(DBPrefix.HEADER, encodeHeight(record.height));
+      await this.db.put(heightKey, hash);
+    }
+  }
+
+  /**
+   * Build a {@link BatchOperation} that sets the active-chain height -> hash
+   * mapping (Core `CChain::SetTip`).  Used by the multi-block reorg dispatch
+   * (sync/blocks.ts) so each reconnected intermediate block's active-chain
+   * index entry rides the same atomic batch as the UTXO/undo/txindex writes.
+   * Header reception no longer writes these entries, so the reorg-reconnect
+   * path is the authority for the [fork+1 .. newTip-1] heights.
+   */
+  buildHeightHashPutOp(height: number, hash: Buffer): BatchOperation {
+    return {
+      type: 'put',
+      prefix: DBPrefix.HEADER,
+      key: encodeHeight(height),
+      value: hash,
+    };
+  }
+
+  /**
+   * Build a {@link BatchOperation} that deletes the active-chain height -> hash
+   * mapping at `height`.  Used to clear stale entries ABOVE the new tip after a
+   * reorg to a shorter (heavier) chain, and on pure disconnect
+   * (invalidateblock), mirroring `CChain::SetTip`'s `vChain.resize(tip+1)`
+   * which drops every entry above the new active tip.
+   */
+  buildHeightHashDeleteOp(height: number): BatchOperation {
+    return {
+      type: 'del',
+      prefix: DBPrefix.HEADER,
+      key: encodeHeight(height),
+    };
+  }
+
+  /** Delete the active-chain height -> hash mapping at `height` (standalone,
+   *  non-batch path). Counterpart to {@link buildHeightHashDeleteOp}. */
+  async deleteBlockHashByHeight(height: number): Promise<void> {
+    if (this.closing) {
+      return;
+    }
+    const key = makeKey(DBPrefix.HEADER, encodeHeight(height));
+    await this.db.del(key);
+  }
+
+  /** Set the active-chain height -> hash mapping at `height` (standalone,
+   *  non-batch path). Counterpart to {@link buildHeightHashPutOp}. */
+  async putBlockHashByHeight(height: number, hash: Buffer): Promise<void> {
+    if (this.closing) {
+      return;
+    }
+    const key = makeKey(DBPrefix.HEADER, encodeHeight(height));
+    await this.db.put(key, hash);
   }
 
   async getBlockIndex(hash: Buffer): Promise<BlockIndexRecord | null> {
@@ -807,7 +876,12 @@ export class ChainDB {
     const record = await this.getBlockIndex(hash);
     if (record) {
       record.status = status;
-      await this.putBlockIndex(hash, record);
+      // Metadata-only update on the per-hash block index (Core raises/lowers
+      // nStatus on a CBlockIndex without ever calling CChain::SetTip).  Must
+      // NOT rewrite the active height->hash index, or a side-branch/fork block
+      // whose status is bumped (e.g. storeSideBranchBlock setting HAVE_DATA)
+      // would clobber the active tip's height entry.
+      await this.putBlockIndex(hash, record, { writeHeightIndex: false });
     }
   }
 
@@ -849,7 +923,11 @@ export class ChainDB {
     const record = await this.getBlockIndex(hash);
     if (record && record.nTx === 0 && nTx > 0) {
       record.nTx = nTx;
-      await this.putBlockIndex(hash, record);
+      // Metadata-only nTx backfill — never a CChain::SetTip event, so it must
+      // not touch the active height->hash index.  Active-connect callers that
+      // rely on the height index being advanced write it explicitly (see
+      // BlockSync.connectBlock's non-flush path).
+      await this.putBlockIndex(hash, record, { writeHeightIndex: false });
     }
   }
 }

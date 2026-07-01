@@ -2773,6 +2773,14 @@ export class BlockSync {
     // legacy in-place connect.
     const MAX_REORG_BATCH_OPS = 250_000;
 
+    // Snapshot the OLD active-tip height BEFORE any disconnect mutates it, so
+    // the post-reorg CChain::SetTip stale-entry sweep (below) knows the top of
+    // the range of height->hash entries the old chain may have occupied above
+    // the new tip.
+    const oldTipHeightAtEntry = this.chainStateManager
+      ? this.chainStateManager.getBestBlock().height
+      : newTipHeight;
+
     // Step 1: walk back NEW chain from newTipBlock's prevBlock to
     // find the fork point.  We keep both the hash list (in
     // connect order: fork+1, fork+2, … newTip-1) and the set
@@ -3055,9 +3063,41 @@ export class BlockSync {
         return false;
       }
       this.utxoManager.setBestBlock(intermediate.hash);
+      // CChain::SetTip parity — the reconnected intermediate is now on the
+      // ACTIVE chain, so update the height->hash active-chain index.  Header
+      // reception no longer writes this entry (headers.ts saveHeaderEntry
+      // passes writeHeightIndex:false), so the reorg-reconnect path is the
+      // sole authority for the [fork+1 .. newTip-1] heights.  Without this,
+      // getblockhash(h) for every reconnected intermediate would return the
+      // just-disconnected old-chain block (stale) or null.  Rides the same
+      // atomic pendingOps batch as the rest of the reorg.
+      if (pendingOps) {
+        pendingOps.push(
+          this.db.buildHeightHashPutOp(intermediate.height, intermediate.hash)
+        );
+      } else {
+        await this.db.putBlockHashByHeight(intermediate.height, intermediate.hash);
+      }
       console.log(
         `[reorg] reconnected intermediate block ${intermediate.hash.toString("hex").slice(0, 16)} at height ${intermediate.height}`
       );
+    }
+
+    // CChain::SetTip parity — clear stale height->hash entries ABOVE the new
+    // tip.  When the new (heavier) chain is SHORTER than the old chain, the
+    // disconnected old-chain blocks left active-chain index entries at heights
+    // > newTipHeight.  Core's `CChain::SetTip` resizes `vChain` to
+    // `newTip.height + 1`, dropping every entry above the new tip; we mirror
+    // that by deleting HEADER[newTipHeight+1 .. oldTipHeight].  (The new tip's
+    // own HEADER[newTipHeight] entry is written by the outer connectBlock.)
+    if (oldTipHeightAtEntry > newTipHeight) {
+      for (let h = newTipHeight + 1; h <= oldTipHeightAtEntry; h++) {
+        if (pendingOps) {
+          pendingOps.push(this.db.buildHeightHashDeleteOp(h));
+        } else {
+          await this.db.deleteBlockHashByHeight(h);
+        }
+      }
     }
     return true;
   }
@@ -3574,6 +3614,13 @@ export class BlockSync {
     // shouldFlush batch below; this covers the non-flush IBD path.
     if (!shouldFlush) {
       await this.db.updateBlockIndexNTx(blockHash, block.transactions.length);
+      // CChain::SetTip parity for the non-flush IBD path.  This block is being
+      // connected on the ACTIVE chain, so its height->hash active-chain index
+      // entry must advance now.  Previously updateBlockIndexNTx wrote this as a
+      // side effect (putBlockIndex), but that write is now gated off (it also
+      // fired for fork/metadata updates and clobbered the active tip); write it
+      // explicitly here so getblockhash(h) resolves every connected IBD height.
+      await this.db.putBlockHashByHeight(height, blockHash);
     }
 
     if (shouldFlush) {
