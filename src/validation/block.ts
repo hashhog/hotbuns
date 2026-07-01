@@ -638,6 +638,32 @@ export function validateBlock(
     return { valid: false, error: "Block weight exceeds maximum" };
   }
 
+  // Contextual header-version floor (BIP34 / BIP66 / BIP65).
+  // Core validation.cpp:4113-4118 (ContextualCheckBlockHeader):
+  //   nVersion<2 && DeploymentActiveAfter(HEIGHTINCB)  -> bad-version
+  //   nVersion<3 && DeploymentActiveAfter(DERSIG/BIP66) -> bad-version
+  //   nVersion<4 && DeploymentActiveAfter(CLTV/BIP65)   -> bad-version
+  // DeploymentActiveAfter(pindexPrev, ...) ≡ (parent.height+1) >= deployHeight,
+  // i.e. height >= deployHeight. This gate lives in HeaderSync.validateHeader
+  // for the P2P/headers path; it MUST also run here so blocks admitted via the
+  // submitblock RPC (server.ts -> validateBlock -> injectBlock, which never
+  // touches the headers-first validator) are held to the same contextual
+  // nVersion floor. Mirrors headers.ts:568-585. Error string matches Core's
+  // "bad-version(0x%08x)".
+  const badVersion = (): { valid: false; error: string } => ({
+    valid: false,
+    error: `bad-version(0x${block.header.version.toString(16).padStart(8, "0")}): rejected nVersion=0x${block.header.version.toString(16).padStart(8, "0")} block`,
+  });
+  if (height >= params.bip34Height && block.header.version < 2) {
+    return badVersion();
+  }
+  if (height >= params.bip66Height && block.header.version < 3) {
+    return badVersion();
+  }
+  if (height >= params.bip65Height && block.header.version < 4) {
+    return badVersion();
+  }
+
   // BIP34: coinbase scriptSig must start with byte-exact canonical encoding of
   // the block height. Core validation.cpp:4151-4159, script.h:433-448.
   if (height >= params.bip34Height) {

@@ -788,6 +788,44 @@ describe("validateBlock", () => {
     const result = validateBlock(block, 1, REGTEST);
     expect(result.error).not.toBe("bad-cb-length");
   });
+
+  // Contextual header-version floor (BIP34/66/65) via the submitblock path.
+  // Core validation.cpp:4113-4118 (ContextualCheckBlockHeader): a block with
+  // nVersion<4 at a height where BIP65/CLTV is active is rejected bad-version.
+  // submitblock routes through validateBlock (server.ts:8613), so validateBlock
+  // MUST enforce this — otherwise a v3 block at a v4-mandatory height is
+  // false-ACCEPTed via submitblock while the P2P/headers path rejects it.
+  // REGTEST.bip65Height = 1351.
+  function makeVersionedBlock(version: number, height: number): Block {
+    const coinbase = createCoinbaseTx(height); // canonical BIP-34 height enc.
+    return {
+      header: {
+        version,
+        prevBlock: Buffer.alloc(32, 0),
+        merkleRoot: getTxId(coinbase),
+        timestamp: Math.floor(Date.now() / 1000),
+        bits: REGTEST.powLimitBits,
+        nonce: 0,
+      },
+      transactions: [coinbase],
+    };
+  }
+
+  test("rejects v3 block at a v4-mandatory height (bad-version, BIP65)", () => {
+    const height = REGTEST.bip65Height; // 1351 — CLTV/v4 mandatory
+    const block = makeVersionedBlock(3, height);
+    const result = validateBlock(block, height, REGTEST);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("bad-version");
+  });
+
+  test("accepts v4 block at the same v4-mandatory height", () => {
+    const height = REGTEST.bip65Height;
+    const block = makeVersionedBlock(4, height);
+    const result = validateBlock(block, height, REGTEST);
+    // version gate must NOT fire for v4; block is otherwise well-formed.
+    expect(result.valid).toBe(true);
+  });
 });
 
 describe("block weight", () => {
