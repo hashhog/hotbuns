@@ -8939,6 +8939,32 @@ function canonicalPushScript(data) {
   data.copy(out, 5);
   return out;
 }
+function opcodeEndPos(script, pos) {
+  if (pos >= script.length)
+    return pos;
+  const opcode = script[pos];
+  if (opcode >= 1 && opcode <= 75) {
+    const end = pos + 1 + opcode;
+    return end <= script.length ? end : -1;
+  } else if (opcode === 76) {
+    if (pos + 1 >= script.length)
+      return -1;
+    const end = pos + 2 + script[pos + 1];
+    return end <= script.length ? end : -1;
+  } else if (opcode === 77) {
+    if (pos + 2 >= script.length)
+      return -1;
+    const end = pos + 3 + (script[pos + 1] | script[pos + 2] << 8);
+    return end <= script.length ? end : -1;
+  } else if (opcode === 78) {
+    if (pos + 4 >= script.length)
+      return -1;
+    const end = pos + 5 + (script[pos + 1] | script[pos + 2] << 8 | script[pos + 3] << 16 | script[pos + 4] << 24);
+    return end <= script.length ? end : -1;
+  } else {
+    return pos + 1;
+  }
+}
 function findAndDelete(script, sig) {
   if (sig.length === 0) {
     return { result: script, found: 0 };
@@ -8954,18 +8980,26 @@ function findAndDelete(script, sig) {
       sig
     ]);
   }
-  const parts = [];
   let found = 0;
-  let i = 0;
-  while (i < script.length) {
-    if (i + pushSig.length <= script.length && script.subarray(i, i + pushSig.length).equals(pushSig)) {
-      i += pushSig.length;
+  const parts = [];
+  let segStart = 0;
+  let pc = 0;
+  while (pc < script.length) {
+    while (pc + pushSig.length <= script.length && script.subarray(pc, pc + pushSig.length).equals(pushSig)) {
+      parts.push(script.subarray(segStart, pc));
+      pc += pushSig.length;
+      segStart = pc;
       found++;
-    } else {
-      parts.push(script.subarray(i, i + 1));
-      i++;
     }
+    const next = opcodeEndPos(script, pc);
+    if (next < 0)
+      break;
+    pc = next;
   }
+  if (found === 0) {
+    return { result: script, found: 0 };
+  }
+  parts.push(script.subarray(segStart));
   return { result: Buffer.concat(parts), found };
 }
 function executeScript(script, ctx) {
@@ -9975,9 +10009,6 @@ function verifyScript(scriptSig, scriptPubKey, witness, flags, sigHasher, taproo
     }
     if (flags.verifyTaproot && isP2A(scriptPubKey)) {
       if (scriptSig.length !== 0) {
-        return false;
-      }
-      if (witness.length !== 0) {
         return false;
       }
       return true;
@@ -29421,17 +29452,27 @@ class HeaderSync {
   }
   getNextTarget(parent, blockTimestamp) {
     const getBlockByHeight = (height) => {
-      const entry = this.headersByHeight.get(height);
-      if (!entry) {
+      if (height > parent.height) {
         return;
       }
-      return {
-        height: entry.height,
-        header: {
-          timestamp: entry.header.timestamp,
-          bits: entry.header.bits
+      let current = parent;
+      while (current !== undefined) {
+        if (current.height === height) {
+          return {
+            height: current.height,
+            header: {
+              timestamp: current.header.timestamp,
+              bits: current.header.bits
+            }
+          };
         }
-      };
+        if (current.height < height) {
+          return;
+        }
+        const parentHashHex = current.header.prevBlock.toString("hex");
+        current = this.headerChain.get(parentHashHex);
+      }
+      return;
     };
     const parentInfo = {
       height: parent.height,
