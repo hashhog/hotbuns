@@ -464,6 +464,15 @@ export class HeaderSync {
       if (this.bestHeader && chainWork < this.bestHeader.chainWork) {
         status = "valid-fork";
       }
+      // Bitcoin Core BLOCK_FAILED_CHILD (validation.cpp): a header that builds
+      // on a consensus-invalid ancestor is itself invalid and must never be
+      // selected as the best chain.  `invalidateHeader` flags a failed block's
+      // header "invalid"; propagating that down any extension keeps a later
+      // heavier-but-invalid fork from re-capturing the best-header / by-height
+      // index and re-driving a doomed reorg into the same failure.
+      if (parent.status === "invalid") {
+        status = "invalid";
+      }
 
       // Create entry
       const entry: HeaderChainEntry = {
@@ -477,8 +486,12 @@ export class HeaderSync {
       // Store in memory
       this.headerChain.set(hashHex, entry);
 
-      // Update best header if this chain has more work
-      if (!this.bestHeader || chainWork > this.bestHeader.chainWork) {
+      // Update best header if this chain has more work.  Never promote an
+      // invalid header (Core FindMostWorkChain skips BLOCK_FAILED_MASK).
+      if (
+        status !== "invalid" &&
+        (!this.bestHeader || chainWork > this.bestHeader.chainWork)
+      ) {
         this.bestHeader = entry;
         this.updateBestChain(entry);
       }
@@ -527,6 +540,81 @@ export class HeaderSync {
       const parentHashHex = entry.header.prevBlock.toString("hex");
       entry = this.headerChain.get(parentHashHex);
     }
+  }
+
+  /**
+   * Mark a header invalid after its block failed CONSENSUS validation, then
+   * re-seat the best-header chain on `newBestHash` (the active-chain tip the
+   * caller has validated / restored to).
+   *
+   * Bitcoin Core parity — InvalidBlockFound + FindMostWorkChain
+   * (validation.cpp): when ConnectBlock rejects a block, Core sets
+   * BLOCK_FAILED_VALID on its index and thereafter FindMostWorkChain skips any
+   * candidate carrying BLOCK_FAILED_MASK, so a competing valid branch can be
+   * adopted.  hotbuns models "the best chain" with `bestHeader` plus the
+   * `headersByHeight` active index.  Without this, a consensus-invalid
+   * best-header block (e.g. a reorg tip that failed `bad-cb-amount`, or an
+   * invalid direct child of the active tip) stays selected as
+   * `getHeaderByHeight(h)`; a competing VALID sibling at the same height that
+   * only TIES it on work (regtest / equal difficulty — a new sibling is not
+   * strictly heavier, so it never displaces the tip) can then never be
+   * adopted, and the connect loop keeps looking up the invalid block's absent
+   * body — the tip lags Core by one block (the invalid-mid-reorg follow-up
+   * bug).
+   *
+   * We flag the failed header "invalid" (BLOCK_FAILED_CHILD then propagates to
+   * any extension via processHeaders), re-seat `bestHeader` on `newBestHash`,
+   * and rebuild the by-height index down that chain — dropping the stale
+   * entries the invalid fork occupied ABOVE the restored tip.  A later valid
+   * extension that out-works the restored tip is promoted normally.
+   *
+   * In-memory only: the persisted block index is maintained by the
+   * connect/reorg paths (`writeHeightIndex`), and the reorg re-evaluates on
+   * restart, so the runtime selection state is the load-bearing surface.
+   */
+  invalidateHeader(badHash: Buffer, newBestHash: Buffer): void {
+    const badEntry = this.headerChain.get(badHash.toString("hex"));
+    if (!badEntry) return;
+
+    badEntry.status = "invalid";
+
+    const newBest = this.headerChain.get(newBestHash.toString("hex"));
+    if (!newBest) {
+      // Can't resolve the restored active tip — leave the by-height index
+      // untouched rather than corrupt it; the failed header is at least
+      // flagged invalid so it won't be re-promoted.
+      console.warn(
+        `[invalidate-header] flagged ${badHash
+          .toString("hex")
+          .slice(0, 16)} invalid but restored tip ${newBestHash
+          .toString("hex")
+          .slice(0, 16)} is unknown; by-height index left as-is`
+      );
+      return;
+    }
+
+    const oldBestHeight = this.bestHeader
+      ? this.bestHeader.height
+      : newBest.height;
+    this.bestHeader = newBest;
+
+    // Drop by-height entries the invalid fork occupied ABOVE the restored tip.
+    // updateBestChain only rewrites heights <= newBest.height as it walks down,
+    // so the stale higher entries (the invalid chain's tip) must be cleared
+    // explicitly or `getHeaderByHeight` would keep returning them.
+    for (let h = newBest.height + 1; h <= oldBestHeight; h++) {
+      this.headersByHeight.delete(h);
+    }
+    this.updateBestChain(newBest);
+
+    console.log(
+      `[invalidate-header] ${badHash
+        .toString("hex")
+        .slice(0, 16)} (height ${badEntry.height}) marked invalid; ` +
+        `best header re-seated on ${newBestHash
+          .toString("hex")
+          .slice(0, 16)} (height ${newBest.height})`
+    );
   }
 
   /**

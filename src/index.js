@@ -29376,6 +29376,9 @@ class HeaderSync {
       if (this.bestHeader && chainWork < this.bestHeader.chainWork) {
         status = "valid-fork";
       }
+      if (parent.status === "invalid") {
+        status = "invalid";
+      }
       const entry = {
         hash,
         header,
@@ -29384,7 +29387,7 @@ class HeaderSync {
         status
       };
       this.headerChain.set(hashHex, entry);
-      if (!this.bestHeader || chainWork > this.bestHeader.chainWork) {
+      if (status !== "invalid" && (!this.bestHeader || chainWork > this.bestHeader.chainWork)) {
         this.bestHeader = entry;
         this.updateBestChain(entry);
       }
@@ -29413,6 +29416,24 @@ class HeaderSync {
       const parentHashHex = entry.header.prevBlock.toString("hex");
       entry = this.headerChain.get(parentHashHex);
     }
+  }
+  invalidateHeader(badHash, newBestHash) {
+    const badEntry = this.headerChain.get(badHash.toString("hex"));
+    if (!badEntry)
+      return;
+    badEntry.status = "invalid";
+    const newBest = this.headerChain.get(newBestHash.toString("hex"));
+    if (!newBest) {
+      console.warn(`[invalidate-header] flagged ${badHash.toString("hex").slice(0, 16)} invalid but restored tip ${newBestHash.toString("hex").slice(0, 16)} is unknown; by-height index left as-is`);
+      return;
+    }
+    const oldBestHeight = this.bestHeader ? this.bestHeader.height : newBest.height;
+    this.bestHeader = newBest;
+    for (let h = newBest.height + 1;h <= oldBestHeight; h++) {
+      this.headersByHeight.delete(h);
+    }
+    this.updateBestChain(newBest);
+    console.log(`[invalidate-header] ${badHash.toString("hex").slice(0, 16)} (height ${badEntry.height}) marked invalid; ` + `best header re-seated on ${newBestHash.toString("hex").slice(0, 16)} (height ${newBest.height})`);
   }
   validateHeader(header, parent, opts) {
     const height = parent.height + 1;
@@ -30208,6 +30229,8 @@ function classifyCallbackError(err) {
     "bip34 requires height",
     "bad-txns",
     "bad-blk",
+    "bad-cb-amount",
+    "pays too much",
     "non-final",
     "bad sigops",
     "sigops cost",
@@ -31095,6 +31118,10 @@ class BlockSync {
         const inputMatch = failureMsg.match(/input (\d+)/);
         const txMatch = failureMsg.match(/tx ([0-9a-fA-F]+)/);
         const coords = inputMatch || txMatch ? ` [tx=${txMatch?.[1] ?? "?"} input=${inputMatch?.[1] ?? "?"}]` : "";
+        if (this.chainStateManager && headerEntry && classifyCallbackError(failureMsg) === "consensus") {
+          const activeTip = this.chainStateManager.getBestBlock();
+          this.headerSync.invalidateHeader(headerEntry.hash, activeTip.hash);
+        }
         if (height === this.lastFailedHeight) {
           this.consecutiveFailures++;
         } else {
