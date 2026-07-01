@@ -1225,7 +1225,18 @@ export class HeaderSync {
       dataPos,
     };
 
-    await this.db.putBlockIndex(entry.hash, record);
+    // Header reception updates only the per-hash block index (Core's
+    // `mapBlockIndex`), NEVER the height->hash active-chain index (Core's
+    // `CChain m_chain`).  Passing `writeHeightIndex: false` prevents a
+    // competing-fork header — which arrives here as readily as an
+    // active-chain header (P2P `headers` message OR the submitblock
+    // `processHeaders` call) — from overwriting the active tip's height->hash
+    // entry.  Before this guard, submitting/receiving an equal-work sibling
+    // at the active tip height left getblockhash(h) pointing at the abandoned
+    // branch while getbestblockhash stayed on the active tip.  The active
+    // height->hash index is maintained exclusively by the block-connect /
+    // reorg-reconnect paths (Core `CChain::SetTip`).
+    await this.db.putBlockIndex(entry.hash, record, { writeHeightIndex: false });
   }
 
   /**

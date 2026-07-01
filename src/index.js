@@ -3828,15 +3828,46 @@ class ChainDB {
   getBlockCacheBytes() {
     return COINS_DB_BLOCK_CACHE_BYTES;
   }
-  async putBlockIndex(hash, record) {
+  async putBlockIndex(hash, record, opts) {
     if (this.closing) {
       return;
     }
     const key = makeKey(98 /* BLOCK_INDEX */, hash);
     const value = serializeBlockIndex(record);
     await this.db.put(key, value);
-    const heightKey = makeKey(104 /* HEADER */, encodeHeight(record.height));
-    await this.db.put(heightKey, hash);
+    if (opts?.writeHeightIndex !== false) {
+      const heightKey = makeKey(104 /* HEADER */, encodeHeight(record.height));
+      await this.db.put(heightKey, hash);
+    }
+  }
+  buildHeightHashPutOp(height, hash) {
+    return {
+      type: "put",
+      prefix: 104 /* HEADER */,
+      key: encodeHeight(height),
+      value: hash
+    };
+  }
+  buildHeightHashDeleteOp(height) {
+    return {
+      type: "del",
+      prefix: 104 /* HEADER */,
+      key: encodeHeight(height)
+    };
+  }
+  async deleteBlockHashByHeight(height) {
+    if (this.closing) {
+      return;
+    }
+    const key = makeKey(104 /* HEADER */, encodeHeight(height));
+    await this.db.del(key);
+  }
+  async putBlockHashByHeight(height, hash) {
+    if (this.closing) {
+      return;
+    }
+    const key = makeKey(104 /* HEADER */, encodeHeight(height));
+    await this.db.put(key, hash);
   }
   async getBlockIndex(hash) {
     const key = makeKey(98 /* BLOCK_INDEX */, hash);
@@ -4114,7 +4145,7 @@ class ChainDB {
     const record = await this.getBlockIndex(hash);
     if (record) {
       record.status = status;
-      await this.putBlockIndex(hash, record);
+      await this.putBlockIndex(hash, record, { writeHeightIndex: false });
     }
   }
   async* iterateBlockIndexEntries() {
@@ -4145,7 +4176,7 @@ class ChainDB {
     const record = await this.getBlockIndex(hash);
     if (record && record.nTx === 0 && nTx > 0) {
       record.nTx = nTx;
-      await this.putBlockIndex(hash, record);
+      await this.putBlockIndex(hash, record, { writeHeightIndex: false });
     }
   }
 }
@@ -18243,6 +18274,7 @@ class ChainStateManager {
       bestHeight: prevHeight,
       totalWork: prevChainWork
     }));
+    extraOps.push(this.db.buildHeightHashDeleteOp(height));
     await this.utxo.flush(extraOps);
     this.bestBlock = {
       hash: prevHash,
@@ -29720,7 +29752,7 @@ class HeaderSync {
       status,
       dataPos
     };
-    await this.db.putBlockIndex(entry.hash, record);
+    await this.db.putBlockIndex(entry.hash, record, { writeHeightIndex: false });
   }
   async saveHeaderTip(entry) {
     if (this.db.isClosing()) {
@@ -31324,6 +31356,7 @@ class BlockSync {
   async handleReorgUtxoAndCollect(newTipBlock, newTipHeight, oldTipHash, disconnectedTxsOut, pendingOps) {
     const MAX_REORG_DEPTH = 288;
     const MAX_REORG_BATCH_OPS = 250000;
+    const oldTipHeightAtEntry = this.chainStateManager ? this.chainStateManager.getBestBlock().height : newTipHeight;
     const newAncestorHashes = new Set;
     const newConnectQueue = [];
     {
@@ -31465,7 +31498,21 @@ class BlockSync {
         return false;
       }
       this.utxoManager.setBestBlock(intermediate.hash);
+      if (pendingOps) {
+        pendingOps.push(this.db.buildHeightHashPutOp(intermediate.height, intermediate.hash));
+      } else {
+        await this.db.putBlockHashByHeight(intermediate.height, intermediate.hash);
+      }
       console.log(`[reorg] reconnected intermediate block ${intermediate.hash.toString("hex").slice(0, 16)} at height ${intermediate.height}`);
+    }
+    if (oldTipHeightAtEntry > newTipHeight) {
+      for (let h = newTipHeight + 1;h <= oldTipHeightAtEntry; h++) {
+        if (pendingOps) {
+          pendingOps.push(this.db.buildHeightHashDeleteOp(h));
+        } else {
+          await this.db.deleteBlockHashByHeight(h);
+        }
+      }
     }
     return true;
   }
@@ -31654,6 +31701,7 @@ class BlockSync {
     }
     if (!shouldFlush) {
       await this.db.updateBlockIndexNTx(blockHash, block.transactions.length);
+      await this.db.putBlockHashByHeight(height, blockHash);
     }
     if (shouldFlush) {
       const extraOps = [];

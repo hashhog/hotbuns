@@ -943,6 +943,15 @@ export class ChainStateManager {
       })
     );
 
+    // CChain::SetTip parity — the disconnected block is no longer on the active
+    // chain, so drop its height->hash active-chain index entry.  Core's
+    // `CChain::SetTip` resizes `vChain` down past the disconnected height.  The
+    // reorg-reconnect path re-writes the [fork+1 .. newTip] entries for the new
+    // branch, but a pure disconnect (invalidateblock, which shrinks the chain
+    // with no replacement) must clear the entry here so getblockhash(height)
+    // stops returning the now-orphaned block.  Rides the same atomic batch.
+    extraOps.push(this.db.buildHeightHashDeleteOp(height));
+
     // Single atomic flush: UTXO changes + txindex deletes + chain state.
     await this.utxo.flush(extraOps);
 
