@@ -30328,6 +30328,7 @@ class BlockSync {
   lastFailedHeight;
   lastConnectError;
   reorgAbortRestoredTip;
+  reorgDeferredMissingBodies = false;
   forkBodiesOnDisk = new Set;
   downloadedBlockPeers;
   chainStateManager;
@@ -31114,6 +31115,12 @@ class BlockSync {
       }
       const success = await this.connectBlock(block, height);
       if (!success) {
+        if (this.reorgDeferredMissingBodies) {
+          this.reorgDeferredMissingBodies = false;
+          console.log(`[reorg] fork tip at height ${height} deferred pending bridging bodies; ` + `keeping it buffered and re-requesting the bridge (peer NOT punished)`);
+          this.requestBlocks();
+          break;
+        }
         const failureMsg = this.lastConnectError;
         const inputMatch = failureMsg.match(/input (\d+)/);
         const txMatch = failureMsg.match(/tx ([0-9a-fA-F]+)/);
@@ -31129,10 +31136,11 @@ class BlockSync {
           this.lastFailedHeight = height;
         }
         const blockPeerKey = this.downloadedBlockPeers.get(hashHex);
-        if (blockPeerKey && this.peerManager) {
+        if (blockPeerKey && this.peerManager && classifyCallbackError(failureMsg) === "consensus") {
           const deliverer = this.peerManager.getConnectedPeers().find((p) => `${p.host}:${p.port}` === blockPeerKey);
           if (deliverer) {
-            deliverer.misbehaving(100, "block-mutated");
+            const rejectToken = bip22FromConnectError(failureMsg);
+            deliverer.misbehaving(100, rejectToken);
           }
         }
         console.error(`Block validation failed at height ${height} (attempt ${this.consecutiveFailures})${coords}, discarding and re-requesting: ${failureMsg}`);
@@ -31413,6 +31421,37 @@ class BlockSync {
       }
     }
     {
+      let forkHeight = null;
+      let hcursor = oldTipHash;
+      let hsteps = 0;
+      while (hcursor !== null && hsteps < MAX_REORG_DEPTH) {
+        if (newAncestorHashes.has(hcursor.toString("hex"))) {
+          const forkEntry = this.headerSync.getHeader(hcursor);
+          forkHeight = forkEntry ? forkEntry.height : null;
+          break;
+        }
+        const hEntry = this.headerSync.getHeader(hcursor);
+        if (!hEntry)
+          break;
+        if (hEntry.height === 0)
+          break;
+        hcursor = hEntry.header.prevBlock;
+        hsteps++;
+      }
+      if (forkHeight !== null) {
+        for (const interm of newConnectQueue) {
+          if (interm.height <= forkHeight)
+            continue;
+          const body = await this.db.getBlock(interm.hash);
+          if (!body) {
+            console.log(`[reorg] deferring reorg to ${newTipBlock.header.prevBlock.toString("hex").slice(0, 16)}… (fork tip height ${newTipHeight}): bridging body for height ${interm.height} (${interm.hash.toString("hex").slice(0, 16)}) not yet on disk — keeping fork tip buffered, ` + `re-requesting the bridge (no view mutation, no peer punishment)`);
+            this.reorgDeferredMissingBodies = true;
+            return false;
+          }
+        }
+      }
+    }
+    {
       let cursor = oldTipHash;
       let cursorHeight = this.chainStateManager.getBestBlock().height;
       let steps = 0;
@@ -31586,6 +31625,7 @@ class BlockSync {
     const hashHex = blockHash.toString("hex");
     this.lastConnectError = "";
     this.reorgAbortRestoredTip = null;
+    this.reorgDeferredMissingBodies = false;
     const oldTipBeforeConnect = this.chainStateManager ? this.chainStateManager.getBestBlock().hash : null;
     let reorgDisconnectedTxs = [];
     let reorgUtxoFixed = false;
@@ -31594,6 +31634,9 @@ class BlockSync {
     if (oldTipBeforeConnect !== null && this.chainStateManager !== null && this.chainStateManager.getBestBlock().height > 0 && !block.header.prevBlock.equals(oldTipBeforeConnect)) {
       reorgAttempted = true;
       reorgUtxoFixed = await this.handleReorgUtxoAndCollect(block, height, oldTipBeforeConnect, reorgDisconnectedTxs, reorgPendingOps);
+      if (this.reorgDeferredMissingBodies) {
+        return false;
+      }
     }
     const abortFailedReorg = () => {
       if (!reorgAttempted || oldTipBeforeConnect === null)
@@ -31691,11 +31734,10 @@ class BlockSync {
       abortFailedReorg();
       return false;
     }
+    const withinReorgWindow = !bestHeader || height > bestHeader.height - MIN_BLOCKS_TO_KEEP2;
     let newTipUndoOp = null;
     {
-      const bestHeaderForUndo = bestHeader;
-      const atTipForUndo = !bestHeaderForUndo || height >= bestHeaderForUndo.height;
-      if (atTipForUndo) {
+      if (withinReorgWindow) {
         try {
           const { serializeUndoData: serializeUndoData2 } = await Promise.resolve().then(() => (init_utxo(), exports_utxo));
           const undoData = serializeUndoData2(coreResult.spentOutputs);
@@ -31707,9 +31749,9 @@ class BlockSync {
     }
     this.utxoManager.setBestBlock(blockHash);
     const atTip = !bestHeader || height >= bestHeader.height;
-    const shouldFlush = atTip || height % FLUSH_INTERVAL === 0;
+    const shouldFlush = atTip || withinReorgWindow || height % FLUSH_INTERVAL === 0;
     let newTipTxIndexOps = [];
-    if (atTip) {
+    if (withinReorgWindow) {
       const rawBlock = serializeBlock(block);
       await this.db.putBlock(blockHash, rawBlock);
       if (shouldFlush) {
@@ -31766,8 +31808,8 @@ class BlockSync {
         height,
         header: serializeBlockHeader(block.header),
         nTx: block.transactions.length,
-        status: 7 | (atTip ? 8 : 0) | haveUndo,
-        dataPos: atTip ? 1 : 0
+        status: 7 | (withinReorgWindow ? 8 : 0) | haveUndo,
+        dataPos: withinReorgWindow ? 1 : 0
       };
       const indexValue = this.serializeBlockIndex(blockRecord);
       extraOps.push({
