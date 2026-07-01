@@ -11903,6 +11903,19 @@ function validateBlock(block, height, params) {
   if (totalWeight > params.maxBlockWeight) {
     return { valid: false, error: "Block weight exceeds maximum" };
   }
+  const badVersion = () => ({
+    valid: false,
+    error: `bad-version(0x${block.header.version.toString(16).padStart(8, "0")}): rejected nVersion=0x${block.header.version.toString(16).padStart(8, "0")} block`
+  });
+  if (height >= params.bip34Height && block.header.version < 2) {
+    return badVersion();
+  }
+  if (height >= params.bip66Height && block.header.version < 3) {
+    return badVersion();
+  }
+  if (height >= params.bip65Height && block.header.version < 4) {
+    return badVersion();
+  }
   if (height >= params.bip34Height) {
     if (!validateBip34Height(coinbaseTx, height)) {
       return { valid: false, error: "bad-cb-height" };
