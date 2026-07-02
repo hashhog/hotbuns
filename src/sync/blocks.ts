@@ -402,6 +402,19 @@ export class BlockSync {
    *  the missing bodies, and NEVER bans the peer. Consumed + reset by the caller. */
   private reorgDeferredMissingBodies: boolean = false;
 
+  /** Reorg-to-ancestor HALT signal (crash-recovery / reorg-integrity class).
+   *  Set by {@link haltSync} when the sync loop detects an IMPOSSIBLE reorg —
+   *  the block it keeps being asked to (re)connect at `nextHeightToProcess` is
+   *  already an ANCESTOR of the active validated tip (no reorg is possible / the
+   *  target is already connected), so every retry re-trips the `view-out-of-sync`
+   *  gate forever. Without this, the loop rewinds to `lastFlushedHeight+1` and
+   *  spins at 100% CPU re-requesting + re-serving the same block indefinitely
+   *  (observed 174k+ retries after a spurious header invalidation on the modern
+   *  replay). When set, `requestBlocks`/`processOrderedBlocks` early-return so the
+   *  node stops spinning and hard-fails loudly (RPC stays up for triage). Non-null
+   *  value is the human-readable halt reason. */
+  private syncHalted: string | null = null;
+
   /** GAP3 fix (reorg-drop part 2/2): hashHex of competing-fork ("side-branch")
    *  bodies BELOW the active frontier that we have already persisted to disk via
    *  `maybeStoreForkBody`. The request loop consults this set so an evicted-but-
@@ -669,6 +682,72 @@ export class BlockSync {
    * activated by a later block (validation.cpp::InvalidateBlock →
    * ActivateBestChain). No-op when no ChainStateManager is wired.
    */
+  /**
+   * True iff `hash` (at `height`) is already ON the active validated chain —
+   * i.e. it is the active-chain block at that height, an ANCESTOR of (or equal
+   * to) the current active tip.  Walks the header chain back from the active tip
+   * via `prevBlock` down to `height` and compares hashes (Bitcoin Core
+   * CChain::Contains / GetAncestor).  Bounded by `MAX_FORK_DOWNLOAD_DEPTH`.
+   *
+   * Used to detect the "reorg-to-ancestor" impossible-reorg livelock: after a
+   * (spurious or real) header invalidation the loop can end up being asked to
+   * (re)connect a block that is already an ancestor of the active tip — there is
+   * nothing to reorg to, the `view-out-of-sync` gate rejects it on every attempt,
+   * and a naive rewind+retry spins forever.  Returns false when no
+   * ChainStateManager is wired (the guard simply doesn't fire).
+   */
+  private isAncestorOfActiveTip(hash: Buffer, height: number): boolean {
+    if (!this.chainStateManager) return false;
+    const tip = this.chainStateManager.getBestBlock();
+    // A block strictly above the active tip cannot be an ancestor of it.
+    if (height > tip.height) return false;
+    if (tip.hash.equals(hash)) return true;
+    let cursor: HeaderChainEntry | undefined = this.headerSync.getHeader(tip.hash);
+    let steps = 0;
+    while (cursor && steps <= MAX_FORK_DOWNLOAD_DEPTH) {
+      if (cursor.height === height) {
+        return cursor.hash.equals(hash);
+      }
+      if (cursor.height < height) return false; // walked past it
+      if (cursor.height === 0) return false;
+      cursor = this.headerSync.getHeader(cursor.header.prevBlock);
+      steps++;
+    }
+    return false;
+  }
+
+  /**
+   * Hard-halt the block-sync loop with a loud, actionable error and STOP
+   * spinning.  Crash-recovery / reorg-integrity safety valve: a stuck node that
+   * fails loudly is far better than a silent 100%-CPU livelock that re-requests
+   * and re-serves the same block 18k times/minute (the reorg-to-ancestor wedge).
+   *
+   * Clears the running flag + the stall/log timers so no further
+   * `requestBlocks` / `processOrderedBlocks` work is scheduled, and latches
+   * `syncHalted` so the two hot entrypoints early-return.  Deliberately does NOT
+   * `process.exit` — the RPC server keeps serving so an operator can inspect the
+   * chain state, `reconsiderblock`, or trigger a reindex.
+   */
+  private haltSync(reason: string): void {
+    if (this.syncHalted !== null) return;
+    this.syncHalted = reason;
+    this.running = false;
+    if (this.stallCheckInterval) {
+      clearInterval(this.stallCheckInterval);
+      this.stallCheckInterval = null;
+    }
+    if (this.logInterval) {
+      clearInterval(this.logInterval);
+      this.logInterval = null;
+    }
+    console.error(
+      `\n*** [SYNC-HALTED] Block sync stopped — ${reason} ***\n` +
+        `The node has stopped advancing the chain to avoid a 100%-CPU retry\n` +
+        `livelock. RPC remains available for triage. Investigate the invalidated\n` +
+        `/ competing header state (getchaintips, reconsiderblock) or reindex.\n`
+    );
+  }
+
   resyncFrontierAfterRollback(): void {
     if (!this.chainStateManager) return;
     const tip = this.chainStateManager.getBestBlock();
@@ -1674,7 +1753,7 @@ export class BlockSync {
    * Request the next batch of blocks from available peers.
    */
   requestBlocks(): void {
-    if (!this.running || !this.peerManager) {
+    if (this.syncHalted !== null || !this.running || !this.peerManager) {
       return;
     }
 
@@ -1985,6 +2064,11 @@ export class BlockSync {
    * Process downloaded blocks in height order.
    */
   private async processOrderedBlocks(): Promise<void> {
+    // Reorg-to-ancestor HALT (crash-recovery / reorg-integrity class): once the
+    // sync loop has hard-failed on an impossible reorg it must NOT keep spinning.
+    if (this.syncHalted !== null) {
+      return;
+    }
     // Prevent concurrent block processing - multiple handleBlock calls can
     // interleave at await points, causing UTXO cache corruption.
     if (this.processing) {
@@ -2156,6 +2240,39 @@ export class BlockSync {
         // state — the classifier needs the raw error string to pick the
         // right banner.
         const failureMsg = this.lastConnectError;
+
+        // ── Reorg-to-ancestor HALT (crash-recovery / reorg-integrity class) ──
+        //
+        // The block we keep being asked to connect at this height is ALREADY an
+        // ancestor of the active validated tip — it is on the active chain, so
+        // there is nothing to reorg to and the connect is an IMPOSSIBLE target.
+        // Its prevBlock necessarily differs from the (higher) active tip the UTXO
+        // view points at, so the `view-out-of-sync` gate rejects it on every
+        // attempt; the normal rewind-to-`lastFlushedHeight+1` recovery just
+        // re-selects the SAME ancestor and retries forever (174k+ spins observed
+        // after a spurious header invalidation: invalidate 255587 → the loop
+        // fixated on reconnecting 255556, an already-connected ancestor).
+        //
+        // Core never reaches this state — ActivateBestChainStep only connects
+        // blocks NOT already in m_chain. Here we detect the impossible target and
+        // HARD-HALT loudly instead of livelocking. Gated to the view-out-of-sync
+        // signal so a genuine reorg (whose target is NOT an active ancestor) is
+        // unaffected.
+        if (
+          /view-out-of-sync/i.test(failureMsg) &&
+          this.isAncestorOfActiveTip(headerEntry.hash, height)
+        ) {
+          const activeTip = this.chainStateManager!.getBestBlock();
+          this.haltSync(
+            `impossible reorg: block ${hashHex.slice(0, 16)} at height ${height} ` +
+              `is already an ancestor of the active tip ` +
+              `${activeTip.hash.toString("hex").slice(0, 16)} (height ${activeTip.height}); ` +
+              `the reconnect target can never satisfy the view-out-of-sync gate`
+          );
+          this.state.downloadedBlocks.delete(hashHex);
+          this.downloadedBlockPeers.delete(hashHex);
+          break;
+        }
 
         // Try to extract failing input/tx coordinates from the error string
         // for faster forensic triage. Mirrors lunarblock d9d9af4.
