@@ -36,7 +36,7 @@ import { InventoryRelay } from "../p2p/relay.js";
 import { getTxId, getTxVSize } from "../validation/tx.js";
 import { InvType, type NetworkMessage, type InvVector } from "../p2p/messages.js";
 import { Wallet, WalletManager } from "../wallet/wallet.js";
-import { MAINNET, TESTNET, TESTNET4, REGTEST, type ConsensusParams } from "../consensus/params.js";
+import { MAINNET, TESTNET, TESTNET4, REGTEST, disableAssumeValid, type ConsensusParams } from "../consensus/params.js";
 import { Logger, setLogger } from "../logger/logger.js";
 
 /**
@@ -62,6 +62,16 @@ export interface NodeConfig {
    * skips DNS regardless). Plumbed into PeerManager as `dnsSeed`.
    */
   dnsSeed?: boolean;
+  /**
+   * Force FULL script verification of all history by disabling assume-valid.
+   * Mirrors Bitcoin Core `-assumevalid=0`. Set true by `--noassumevalid`,
+   * `--assumevalid=0`, or env `HOTBUNS_ASSUMEVALID=0`. When true, the base
+   * consensus params are passed through `disableAssumeValid()` (zeroes
+   * assumeValidHeight + clears the assumedValid hash), so the shouldSkipScripts
+   * gate always falls through to full verification. Used by the mainnet-replay
+   * harness.
+   */
+  noAssumeValid?: boolean;
   addnode?: string[];
   /** Prune target in MiB (0 = disabled, minimum 550 MiB if enabled). */
   prune?: number;
@@ -429,6 +439,17 @@ export function parseArgs(argv: string[]): ParsedArgs {
           // Mirrors Bitcoin Core `-nodnsseed` (bare flag). clearbit
           // main.zig:267 sets config.dns_seed=false.
           config.dnsSeed = false;
+          break;
+        case "assumevalid":
+          // Mirrors Bitcoin Core `-assumevalid=<hex>`. Only the disable form
+          // (`=0`) is honored here — used by the mainnet-replay harness to
+          // force FULL script verification of all history. Any non-zero value
+          // leaves the fleet-standard params hash in place.
+          if (value === "0") config.noAssumeValid = true;
+          break;
+        case "noassumevalid":
+          // Bare flag form of `--assumevalid=0`.
+          config.noAssumeValid = true;
           break;
         case "addnode":
           if (value) {
@@ -1508,7 +1529,22 @@ async function startNode(config: NodeConfig): Promise<void> {
 
   console.log("hotbuns v0.1.0 starting...");
 
-  const baseParams = getParams(config.network);
+  // Env-var form of the assume-valid disable knob (CLI `--noassumevalid` /
+  // `--assumevalid=0` sets config.noAssumeValid directly). Honored here so the
+  // mainnet-replay harness can flip it without editing argv.
+  const envAssumeValid = process.env.HOTBUNS_ASSUMEVALID;
+  const disableAV =
+    config.noAssumeValid === true ||
+    envAssumeValid === "0" ||
+    envAssumeValid === "false";
+  const baseParams = disableAV
+    ? disableAssumeValid(getParams(config.network))
+    : getParams(config.network);
+  if (disableAV) {
+    console.log(
+      "assumevalid DISABLED (--assumevalid=0): verifying ALL scripts from genesis",
+    );
+  }
 
   // 1. Load or create config file (honors --conf override).
   const fileConfig = await loadConfig(config.datadir, config.conf);
