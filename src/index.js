@@ -18483,6 +18483,10 @@ class ChainStateManager {
       if (drifted) {
         console.log(`[chainstate] reconciled UTXO view best-block to persisted tip ` + `${this.bestBlock.hash.toString("hex")} at height ${this.bestBlock.height}`);
       }
+      const aheadHash = await this.db.getBlockHashByHeight(this.bestBlock.height + 1);
+      if (aheadHash !== null) {
+        throw new Error(`chainstate incomplete: durable UTXO tip is height ${this.bestBlock.height} ` + `(${this.bestBlock.hash.toString("hex")}) but the active-chain height ` + `index already contains height ${this.bestBlock.height + 1} ` + `(${aheadHash.toString("hex")}). This datadir was shut down UNCLEANLY ` + `mid-IBD: the UTXO set for blocks above ${this.bestBlock.height} was ` + `never flushed and is lost, so the view has holes. Refusing to run ` + `with a corrupt UTXO set (it would spuriously reject valid blocks ` + `later). Reindex / re-sync from the last durable tip: stop the node, ` + `wipe the datadir, and restart. (chainstate-incomplete, reindex needed)`);
+      }
     } else {
       const genesisWork = this.calculateWork(this.params.powLimitBits);
       this.bestBlock = {
@@ -30345,6 +30349,7 @@ class BlockSync {
   lastConnectError;
   reorgAbortRestoredTip;
   reorgDeferredMissingBodies = false;
+  syncHalted = null;
   forkBodiesOnDisk = new Set;
   downloadedBlockPeers;
   chainStateManager;
@@ -30399,6 +30404,49 @@ class BlockSync {
   }
   setTxoSpenderIndex(txoSpenderIndex) {
     this.txoSpenderIndex = txoSpenderIndex;
+  }
+  isAncestorOfActiveTip(hash, height) {
+    if (!this.chainStateManager)
+      return false;
+    const tip = this.chainStateManager.getBestBlock();
+    if (height > tip.height)
+      return false;
+    if (tip.hash.equals(hash))
+      return true;
+    let cursor = this.headerSync.getHeader(tip.hash);
+    let steps = 0;
+    while (cursor && steps <= MAX_FORK_DOWNLOAD_DEPTH) {
+      if (cursor.height === height) {
+        return cursor.hash.equals(hash);
+      }
+      if (cursor.height < height)
+        return false;
+      if (cursor.height === 0)
+        return false;
+      cursor = this.headerSync.getHeader(cursor.header.prevBlock);
+      steps++;
+    }
+    return false;
+  }
+  haltSync(reason) {
+    if (this.syncHalted !== null)
+      return;
+    this.syncHalted = reason;
+    this.running = false;
+    if (this.stallCheckInterval) {
+      clearInterval(this.stallCheckInterval);
+      this.stallCheckInterval = null;
+    }
+    if (this.logInterval) {
+      clearInterval(this.logInterval);
+      this.logInterval = null;
+    }
+    console.error(`
+*** [SYNC-HALTED] Block sync stopped — ${reason} ***
+` + `The node has stopped advancing the chain to avoid a 100%-CPU retry
+` + `livelock. RPC remains available for triage. Investigate the invalidated
+` + `/ competing header state (getchaintips, reconsiderblock) or reindex.
+`);
   }
   resyncFrontierAfterRollback() {
     if (!this.chainStateManager)
@@ -30861,7 +30909,7 @@ class BlockSync {
     }
   }
   requestBlocks() {
-    if (!this.running || !this.peerManager) {
+    if (this.syncHalted !== null || !this.running || !this.peerManager) {
       return;
     }
     const bestHeader = this.headerSync.getBestHeader();
@@ -31057,6 +31105,9 @@ class BlockSync {
     }
   }
   async processOrderedBlocks() {
+    if (this.syncHalted !== null) {
+      return;
+    }
     if (this.processing) {
       return;
     }
@@ -31138,6 +31189,13 @@ class BlockSync {
           break;
         }
         const failureMsg = this.lastConnectError;
+        if (/view-out-of-sync/i.test(failureMsg) && this.isAncestorOfActiveTip(headerEntry.hash, height)) {
+          const activeTip = this.chainStateManager.getBestBlock();
+          this.haltSync(`impossible reorg: block ${hashHex.slice(0, 16)} at height ${height} ` + `is already an ancestor of the active tip ` + `${activeTip.hash.toString("hex").slice(0, 16)} (height ${activeTip.height}); ` + `the reconnect target can never satisfy the view-out-of-sync gate`);
+          this.state.downloadedBlocks.delete(hashHex);
+          this.downloadedBlockPeers.delete(hashHex);
+          break;
+        }
         const inputMatch = failureMsg.match(/input (\d+)/);
         const txMatch = failureMsg.match(/tx ([0-9a-fA-F]+)/);
         const coords = inputMatch || txMatch ? ` [tx=${txMatch?.[1] ?? "?"} input=${inputMatch?.[1] ?? "?"}]` : "";
