@@ -7961,6 +7961,13 @@ function buildSignetGenesisBlock() {
   writer.writeUInt32LE(0);
   return writer.toBuffer();
 }
+function disableAssumeValid(params) {
+  return {
+    ...params,
+    assumeValidHeight: 0,
+    assumedValid: undefined
+  };
+}
 function getBlockSubsidy(height, params) {
   const halvings = Math.floor(height / params.subsidyHalvingInterval);
   if (halvings >= 64) {
@@ -52376,6 +52383,13 @@ function parseArgs(argv) {
         case "nodnsseed":
           config.dnsSeed = false;
           break;
+        case "assumevalid":
+          if (value === "0")
+            config.noAssumeValid = true;
+          break;
+        case "noassumevalid":
+          config.noAssumeValid = true;
+          break;
         case "addnode":
           if (value) {
             config.addnode = config.addnode || [];
@@ -53051,7 +53065,12 @@ async function startNode(config) {
     daemonizeAndExit(Bun.argv);
   }
   console.log("hotbuns v0.1.0 starting...");
-  const baseParams = getParams(config.network);
+  const envAssumeValid = process.env.HOTBUNS_ASSUMEVALID;
+  const disableAV = config.noAssumeValid === true || envAssumeValid === "0" || envAssumeValid === "false";
+  const baseParams = disableAV ? disableAssumeValid(getParams(config.network)) : getParams(config.network);
+  if (disableAV) {
+    console.log("assumevalid DISABLED (--assumevalid=0): verifying ALL scripts from genesis");
+  }
   const fileConfig = await loadConfig(config.datadir, config.conf);
   const mergedConfig = { ...config, ...fileConfig };
   mergedConfig.daemon = config.daemon;

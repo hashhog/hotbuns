@@ -1123,6 +1123,31 @@ export const REGTEST: ConsensusParams = {
 };
 
 /**
+ * Return a copy of `params` with assume-valid fully DISABLED, so that every
+ * script in all of history is verified (mirrors Bitcoin Core `-assumevalid=0`,
+ * which sets the assumed-valid block to a null hash — see validation.cpp, where
+ * a null/Nothing assumed-valid block makes the skip gate always fall through to
+ * full verification).
+ *
+ * Concretely this zeroes `assumeValidHeight` and clears `assumedValid` (the
+ * hash). The canonical gate `shouldSkipScripts()` short-circuits to
+ * `skip=false, reason="assumevalid=0 (always verify)"` the moment
+ * `assumedValidHash` is undefined, and the two live callers
+ * (`sync/blocks.ts`, `mempool/mempool.ts`) both source it from
+ * `params.assumedValid` — so clearing it here disables the skip everywhere.
+ *
+ * Used by the mainnet-replay harness (`--assumevalid=0` / `--noassumevalid` /
+ * `HOTBUNS_ASSUMEVALID=0`).
+ */
+export function disableAssumeValid(params: ConsensusParams): ConsensusParams {
+  return {
+    ...params,
+    assumeValidHeight: 0,
+    assumedValid: undefined,
+  };
+}
+
+/**
  * Calculate the block subsidy (mining reward) for a given block height.
  *
  * Initial reward is 50 BTC (5,000,000,000 satoshis).
