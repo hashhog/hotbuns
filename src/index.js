@@ -18020,6 +18020,7 @@ class ChainStateManager {
   preciousBlockHash = null;
   blockSequenceId = 0;
   lastPreciousChainwork = 0n;
+  pruningEnabled = false;
   constructor(db, params, maxCacheBytes) {
     this.db = db;
     this.utxo = new UTXOManager(db, maxCacheBytes);
@@ -18059,6 +18060,9 @@ class ChainStateManager {
   }
   setMempool(mempool) {
     this.mempool = mempool;
+  }
+  setPruningEnabled(enabled) {
+    this.pruningEnabled = enabled;
   }
   setBlockFilterIndex(filterIndex) {
     this.filterIndex = filterIndex;
@@ -18328,7 +18332,8 @@ class ChainStateManager {
     }
   }
   async reorganize(newTip, getBlock) {
-    const MAX_REORG_DEPTH = 288;
+    const MIN_BLOCKS_TO_KEEP2 = 288;
+    const MAX_REORG_DEPTH = this.pruningEnabled ? MIN_BLOCKS_TO_KEEP2 : Number.MAX_SAFE_INTEGER;
     const { oldBlocks, newBlocks } = await this.findForkPoint(newTip, getBlock);
     if (oldBlocks.length > MAX_REORG_DEPTH || newBlocks.length > MAX_REORG_DEPTH) {
       throw new Error(`reorganize(): reorg depth exceeds MAX_REORG_DEPTH=${MAX_REORG_DEPTH} ` + `(old=${oldBlocks.length}, new=${newBlocks.length})`);
@@ -30396,6 +30401,9 @@ class BlockSync {
   setPruneManager(pruneManager) {
     this.pruneManager = pruneManager;
   }
+  reorgDepthCap() {
+    return this.pruneManager?.isPruneMode() ? MIN_BLOCKS_TO_KEEP2 : Number.MAX_SAFE_INTEGER;
+  }
   setBlockFilterIndex(filterIndex) {
     this.filterIndex = filterIndex;
   }
@@ -30415,7 +30423,7 @@ class BlockSync {
       return true;
     let cursor = this.headerSync.getHeader(tip.hash);
     let steps = 0;
-    while (cursor && steps <= MAX_FORK_DOWNLOAD_DEPTH) {
+    while (cursor && steps <= this.reorgDepthCap()) {
       if (cursor.height === height) {
         return cursor.hash.equals(hash);
       }
@@ -30745,7 +30753,7 @@ class BlockSync {
     {
       let cursor = this.headerSync.getHeader(activeTip.hash);
       let steps = 0;
-      while (cursor && steps <= MAX_FORK_DOWNLOAD_DEPTH) {
+      while (cursor && steps <= this.reorgDepthCap()) {
         if (cursor.height === headerEntry.height) {
           onActiveChain = cursor.hash.equals(blockHash);
           break;
@@ -30874,7 +30882,7 @@ class BlockSync {
     {
       let cursor2 = this.headerSync.getHeader(activeTip.hash);
       let steps2 = 0;
-      while (cursor2 && steps2 <= MAX_FORK_DOWNLOAD_DEPTH) {
+      while (cursor2 && steps2 <= this.reorgDepthCap()) {
         activeChainHashes.add(cursor2.hash.toString("hex"));
         if (cursor2.height === 0)
           break;
@@ -30887,7 +30895,7 @@ class BlockSync {
     let forkChildHeight = null;
     let cursor = bestHeader;
     let steps = 0;
-    while (cursor && steps <= MAX_FORK_DOWNLOAD_DEPTH) {
+    while (cursor && steps <= this.reorgDepthCap()) {
       if (activeChainHashes.has(cursor.hash.toString("hex"))) {
         forkChildHeight = cursor.height + 1;
         break;
@@ -31470,7 +31478,7 @@ class BlockSync {
     return true;
   }
   async handleReorgUtxoAndCollect(newTipBlock, newTipHeight, oldTipHash, disconnectedTxsOut, pendingOps) {
-    const MAX_REORG_DEPTH = 288;
+    const MAX_REORG_DEPTH = this.reorgDepthCap();
     const MAX_REORG_BATCH_OPS = 250000;
     const oldTipHeightAtEntry = this.chainStateManager ? this.chainStateManager.getBestBlock().height : newTipHeight;
     const newAncestorHashes = new Set;
@@ -31664,7 +31672,7 @@ class BlockSync {
     return true;
   }
   async collectDisconnectedTxs(oldTipHash, newChainAncestorHashes) {
-    const MAX_REORG_DEPTH = 288;
+    const MAX_REORG_DEPTH = this.reorgDepthCap();
     const collected = [];
     let cursor = oldTipHash;
     let steps = 0;
@@ -53300,6 +53308,7 @@ async function startNode(config) {
   if (pruneManager) {
     blockSync.setPruneManager(pruneManager);
   }
+  chainState.setPruningEnabled(pruneManager !== undefined);
   let filterIndex;
   if (mergedConfig.blockfilterindex) {
     filterIndex = new BlockFilterIndex(db, true);
