@@ -1452,34 +1452,39 @@ describe("BlockSync reorg multi-block atomicity (Pattern D)", () => {
     expect(batchWriteCalls).toBe(1);
   });
 
-  test("MAX_REORG_DEPTH is 288 (impl-specific memory-safety cap, aligned with MIN_BLOCKS_TO_KEEP)", async () => {
-    // Defence-in-depth: the dispatch-side cap matches MIN_BLOCKS_TO_KEEP
-    // (Core's pruned-node undo-retention floor).  Pre-Pattern-D this was
-    // 10000 — an unbounded internal-walk guard.  Bitcoin Core itself has
-    // NO fixed reorg-depth cap (no nMaxReorgDepth); 288 is an
-    // implementation-specific bound to cap in-memory batch growth.
+  test("reorg-depth bound is gated on pruning via reorgDepthCap() (Core parity, unbounded on archive)", async () => {
+    // Bitcoin Core has NO fixed reorg-depth cap (no nMaxReorgDepth):
+    // ActivateBestChainStep follows the most-work valid chain to the fork
+    // point at ANY depth.  MIN_BLOCKS_TO_KEEP=288 is a PRUNING-only
+    // undo-retention floor, so the reorg/fork-download bound is now supplied
+    // by reorgDepthCap(): Number.MAX_SAFE_INTEGER on an archive node
+    // (default), MIN_BLOCKS_TO_KEEP on a pruned node.
     //
-    // We assert the constant via source inspection rather than
-    // observable behaviour because driving 289 valid blocks through
-    // the dispatch in a unit test would require ~289 calls to
-    // coreConnectBlockChecks — too heavy for a regression test.
-    // The diff-test corpus exercises the dispatch end-to-end.
-    const blocksTs = (
-      await import("node:fs/promises")
-    ).readFile;
+    // We assert the gate via source inspection rather than observable
+    // behaviour because driving 289 valid blocks through the dispatch in a
+    // unit test would require ~289 calls to coreConnectBlockChecks — too heavy
+    // for a regression test.  The regtest deep-reorg proof
+    // (tools/reorg-hotbuns-deepfork-proof.sh) exercises the archive path
+    // end-to-end: a mid-chain fork 300 blocks below the tip pre-fix reorged to
+    // the correct TIP but a CORRUPT UTXO set (truncated at 288); post-fix the
+    // UTXO hash matches the cleanly-built chain.  The diff-test corpus
+    // exercises the shallow dispatch.
+    const readFile = (await import("node:fs/promises")).readFile;
     const src = (
-      await blocksTs(
-        new URL("./blocks.ts", import.meta.url),
-        "utf8"
-      )
+      await readFile(new URL("./blocks.ts", import.meta.url), "utf8")
     ).toString();
-    // The dispatch uses MAX_REORG_DEPTH = 288.  The legacy
-    // collectDisconnectedTxs path uses the same value for consistency.
-    const matches = src.match(/MAX_REORG_DEPTH\s*=\s*(\d+)/g) ?? [];
-    expect(matches.length).toBeGreaterThanOrEqual(1);
-    for (const m of matches) {
-      const n = Number(m.split("=")[1].trim());
-      expect(n).toBe(288);
-    }
+    // The gate helper exists and keys off pruning mode.
+    expect(src).toMatch(/private reorgDepthCap\(\)/);
+    expect(src).toMatch(
+      /this\.pruneManager\?\.isPruneMode\(\)\s*\?\s*MIN_BLOCKS_TO_KEEP\s*:\s*Number\.MAX_SAFE_INTEGER/
+    );
+    // The dispatch + refill walks derive their bound from reorgDepthCap().
+    const capUses = src.match(/MAX_REORG_DEPTH\s*=\s*this\.reorgDepthCap\(\)/g) ?? [];
+    expect(capUses.length).toBeGreaterThanOrEqual(2);
+    // The pruned-node window is still MIN_BLOCKS_TO_KEEP = 288.
+    expect(src).toMatch(/const MIN_BLOCKS_TO_KEEP = 288;/);
+    // No bare `const MAX_REORG_DEPTH = <number>` declaration remains (the cap
+    // is no longer a hard constant; it is derived from reorgDepthCap()).
+    expect(src).not.toMatch(/const\s+MAX_REORG_DEPTH\s*=\s*\d+/);
   });
 });

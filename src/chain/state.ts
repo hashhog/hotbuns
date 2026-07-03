@@ -231,6 +231,12 @@ export class ChainStateManager {
   private blockSequenceId: number = 0;
   /** Last chain work when preciousblock was set. Used to reset sequence IDs. */
   private lastPreciousChainwork: bigint = 0n;
+  /** Whether block pruning is enabled (`--prune=N`). Gates the reorg-depth
+   *  bound in `reorganize()`: an archive node follows the most-work chain to
+   *  the fork point at ANY depth (Core parity, no cap); a pruned node retains
+   *  only the MIN_BLOCKS_TO_KEEP (288) undo window. Wired from cli.ts via
+   *  `setPruningEnabled()`. Defaults to archive (unbounded). */
+  private pruningEnabled: boolean = false;
 
   constructor(db: ChainDB, params: ConsensusParams, maxCacheBytes?: number) {
     this.db = db;
@@ -323,6 +329,17 @@ export class ChainStateManager {
    */
   setMempool(mempool: import("../mempool/mempool.js").Mempool): void {
     this.mempool = mempool;
+  }
+
+  /**
+   * Declare whether block pruning is enabled (`--prune=N`). Gates the
+   * reorg-depth bound in `reorganize()`: archive (default) follows the
+   * most-work chain to the fork point at any depth (Core parity); a pruned
+   * node retains only the MIN_BLOCKS_TO_KEEP (288) undo window. Wired from
+   * cli.ts alongside `BlockSync.setPruneManager()`.
+   */
+  setPruningEnabled(enabled: boolean): void {
+    this.pruningEnabled = enabled;
   }
 
   /**
@@ -1059,17 +1076,24 @@ export class ChainStateManager {
     newTip: HeaderChainEntry,
     getBlock: (hash: Buffer) => Promise<Block | null>
   ): Promise<void> {
-    // ── W92 memory-safety gate: bound reorg depth ──
+    // ── Core-parity reorg-depth bound ──
     //
-    // Implementation-specific bound: the entire reorg is staged into one
-    // in-memory batch, so depth must be capped to bound peak memory.
-    // Bitcoin Core has NO fixed reorg-depth cap — it follows most-work
-    // bounded only by undo-data retention; there is no nMaxReorgDepth in
-    // validation.cpp.  288 = Core's MIN_BLOCKS_TO_KEEP (pruned-node undo
-    // retention floor), so hashhog accepts any reorg a non-pruned peer
-    // could present.  The BlockSync path (handleReorgUtxoAndCollect) uses
-    // the same value; keep them in sync.
-    const MAX_REORG_DEPTH = 288;
+    // Bitcoin Core has NO fixed reorg-depth cap: ActivateBestChainStep
+    // (validation.cpp) follows the most-work valid chain back to the fork point
+    // at ANY depth; there is no nMaxReorgDepth.  MIN_BLOCKS_TO_KEEP=288 is a
+    // PRUNING-only undo-retention floor, not a consensus reorg cap — refusing a
+    // >288 reorg on an archive node is a Class-A consensus divergence (the node
+    // stays on the losing minority chain = split).  So the bound is gated on
+    // pruning:
+    //   • archive node (default, undo always present) → UNBOUNDED (Core parity).
+    //   • pruned node (`--prune=N`) → MIN_BLOCKS_TO_KEEP (288) retained undo
+    //     window; a deeper reorg cannot be serviced (undo bodies deleted).
+    // Kept in sync with the BlockSync live path (`reorgDepthCap()` in
+    // sync/blocks.ts).
+    const MIN_BLOCKS_TO_KEEP = 288;
+    const MAX_REORG_DEPTH = this.pruningEnabled
+      ? MIN_BLOCKS_TO_KEEP
+      : Number.MAX_SAFE_INTEGER;
 
     // Find the fork point
     const { oldBlocks, newBlocks } = await this.findForkPoint(newTip, getBlock);
