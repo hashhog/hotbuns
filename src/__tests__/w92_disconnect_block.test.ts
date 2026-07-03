@@ -434,44 +434,60 @@ describe("W92: DisconnectBlock + ApplyTxInUndo + chain reorg", () => {
   });
 
   // ── Gate #11: reorganize() depth cap ──────────────────────────────────────
-  describe("reorganize() bounded by MAX_REORG_DEPTH (impl-specific memory-safety)", () => {
-    test("rejects reorgs deeper than 288 blocks", async () => {
+  describe("reorganize() reorg-depth bound is gated on pruning (Core parity)", () => {
+    // Helper: build a ChainStateManager whose findForkPoint is stubbed to
+    // report a 400-block old chain to disconnect (deeper than the 288
+    // pruned-node window).
+    async function deepReorgFixture() {
       const chainState = new ChainStateManager(db, REGTEST);
       await chainState.load();
-
-      // Simulate a current tip at height=400 and a newTip at height=700
-      // with no common ancestor reachable (which would translate to a
-      // 400-block oldBlocks list once findForkPoint runs — exceeds the
-      // 288 cap).  Bitcoin Core has no reorg-depth cap; 288 =
-      // MIN_BLOCKS_TO_KEEP, the impl-specific memory-safety bound.
       (chainState as any).bestBlock = {
         hash: Buffer.alloc(32, 0xff),
         height: 400,
         chainWork: 1n,
       };
-
-      // Fake findForkPoint to return a 400-block oldBlocks list.  We
-      // patch the private method directly to keep the test focused.
       const fakeOldBlocks = Array.from({ length: 400 }, (_, i) => ({
         block: createBlock(Buffer.alloc(32, i), [createCoinbaseTx(400 - i, 50n)]),
         height: 400 - i,
       }));
-      const fakeNewBlocks: any[] = [];
       (chainState as any).findForkPoint = async () => ({
         oldBlocks: fakeOldBlocks,
-        newBlocks: fakeNewBlocks,
+        newBlocks: [] as any[],
       });
-
       const newTip = {
         hash: Buffer.alloc(32, 0xaa),
         height: 700,
         header: createBlockHeader(Buffer.alloc(32, 0), Buffer.alloc(32, 0)),
         chainWork: 2n,
       } as any;
+      return { chainState, newTip };
+    }
 
+    test("PRUNED node: rejects reorgs deeper than 288 blocks (retained undo window)", async () => {
+      // On a pruned node the undo bodies beyond MIN_BLOCKS_TO_KEEP=288 have
+      // been deleted, so a deeper reorg cannot be serviced and is bounded.
+      const { chainState, newTip } = await deepReorgFixture();
+      chainState.setPruningEnabled(true);
       await expect(
         chainState.reorganize(newTip, async () => null)
       ).rejects.toThrow(/MAX_REORG_DEPTH/);
+    });
+
+    test("ARCHIVE node (default): does NOT refuse a >288 reorg (Core has no reorg-depth cap)", async () => {
+      // Core's ActivateBestChainStep follows the most-work valid chain to the
+      // fork point at ANY depth; capping at 288 on an archive node is a
+      // Class-A consensus divergence.  The depth check must NOT fire — the
+      // reorg proceeds past the bound (and fails later only because this
+      // fixture's disconnect bodies are synthetic, never with MAX_REORG_DEPTH).
+      const { chainState, newTip } = await deepReorgFixture();
+      // pruningEnabled defaults to false (archive).
+      let threw: unknown = null;
+      try {
+        await chainState.reorganize(newTip, async () => null);
+      } catch (e) {
+        threw = e;
+      }
+      expect(String(threw)).not.toMatch(/MAX_REORG_DEPTH/);
     });
   });
 });

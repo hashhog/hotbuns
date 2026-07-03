@@ -1904,6 +1904,12 @@ async function startNode(config: NodeConfig): Promise<void> {
     blockSync.setPruneManager(pruneManager);
   }
 
+  // Declare pruning to the chain-state manager so its reorg-depth bound
+  // (reorganize()) matches the BlockSync live path: archive (no --prune)
+  // follows the most-work chain to the fork point at any depth (Core parity),
+  // a pruned node retains only the MIN_BLOCKS_TO_KEEP (288) undo window.
+  chainState.setPruningEnabled(pruneManager !== undefined);
+
   // 7a-bis. Wire BIP-157/158 compact-block-filter index when
   // `--blockfilterindex=1`. The index ships in src/storage/indexes.ts
   // (`BlockFilterIndex`) but was previously never instantiated outside
