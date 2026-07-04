@@ -469,7 +469,8 @@ describe("Gate 3 — time-timewarp-attack: BIP-94 enforce_BIP94 (val.cpp:4097-41
 
 describe("Gates 5/6/7 — bad-version: rejected version blocks (val.cpp:4113-4118)", () => {
   // Use params where BIP34/66/65 activate at height 1/1/1 (TESTNET4 / REGTEST).
-  // REGTEST: bip34Height=1, bip65Height=1351, bip66Height=1251.
+  // REGTEST: bip34Height=1, bip65Height=1, bip66Height=1 (Core parity,
+  // kernel/chainparams.cpp:536-539).
   // TESTNET4: all at height 1.
 
   // For simplicity use REGTEST-like params where all activate at height 1.

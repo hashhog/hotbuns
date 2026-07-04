@@ -795,7 +795,8 @@ describe("validateBlock", () => {
   // submitblock routes through validateBlock (server.ts:8613), so validateBlock
   // MUST enforce this — otherwise a v3 block at a v4-mandatory height is
   // false-ACCEPTed via submitblock while the P2P/headers path rejects it.
-  // REGTEST.bip65Height = 1351.
+  // Core regtest (kernel/chainparams.cpp:536-539) activates BIP34/66/65 all at
+  // height 1, so REGTEST.bip34Height == bip66Height == bip65Height == 1.
   function makeVersionedBlock(version: number, height: number): Block {
     const coinbase = createCoinbaseTx(height); // canonical BIP-34 height enc.
     return {
@@ -812,7 +813,7 @@ describe("validateBlock", () => {
   }
 
   test("rejects v3 block at a v4-mandatory height (bad-version, BIP65)", () => {
-    const height = REGTEST.bip65Height; // 1351 — CLTV/v4 mandatory
+    const height = REGTEST.bip65Height; // 1 — CLTV/v4 mandatory from height 1
     const block = makeVersionedBlock(3, height);
     const result = validateBlock(block, height, REGTEST);
     expect(result.valid).toBe(false);
@@ -824,6 +825,33 @@ describe("validateBlock", () => {
     const block = makeVersionedBlock(4, height);
     const result = validateBlock(block, height, REGTEST);
     // version gate must NOT fire for v4; block is otherwise well-formed.
+    expect(result.valid).toBe(true);
+  });
+
+  // Regression (Core-parity): on regtest, BIP34/66/65 all activate at height 1
+  // (bitcoin-core/src/kernel/chainparams.cpp:536-539). A previous misconfig set
+  // REGTEST bip66Height=1251 / bip65Height=1351, so v2/v3 blocks below those
+  // heights were false-ACCEPTed on regtest — hotbuns advanced past Core (e.g. to
+  // height 111 with a bad v2 block Core rejects) and skipped DERSIG/CLTV script
+  // enforcement. These cases pin the fixed heights at a mid-range height (111)
+  // well inside the old buggy window.
+  test("regtest v2 block at height 111 is rejected bad-version (BIP66, Core parity)", () => {
+    const block = makeVersionedBlock(2, 111);
+    const result = validateBlock(block, 111, REGTEST);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("bad-version");
+  });
+
+  test("regtest v3 block at height 111 is rejected bad-version (BIP65, Core parity)", () => {
+    const block = makeVersionedBlock(3, 111);
+    const result = validateBlock(block, 111, REGTEST);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("bad-version");
+  });
+
+  test("regtest v4 block at height 111 is still accepted (no version-floor over-reject)", () => {
+    const block = makeVersionedBlock(4, 111);
+    const result = validateBlock(block, 111, REGTEST);
     expect(result.valid).toBe(true);
   });
 });

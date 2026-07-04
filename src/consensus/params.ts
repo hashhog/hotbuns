@@ -1095,8 +1095,8 @@ export const REGTEST: ConsensusParams = {
   enforce_BIP94: false,
   bip16Height: 1,
   bip34Height: 1, // Bitcoin Core kernel/chainparams.cpp:536: consensus.BIP34Height = 1
-  bip65Height: 1351,
-  bip66Height: 1251,
+  bip65Height: 1, // Bitcoin Core kernel/chainparams.cpp:538: consensus.BIP65Height = 1 (always active unless overridden)
+  bip66Height: 1, // Bitcoin Core kernel/chainparams.cpp:539: consensus.BIP66Height = 1 (always active unless overridden)
   csvHeight: 0, // BIP68/112/113 always active on regtest
   segwitHeight: 0,
   taprootHeight: 0,
