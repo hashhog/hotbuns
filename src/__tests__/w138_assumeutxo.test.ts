@@ -970,7 +970,12 @@ describe("W138 cross-cutting: hardcoded assumeutxo entries (chainparams parity)"
     );
     expect(e840).toBeDefined();
     expect(e840!.height).toBe(840000);
-    expect(e840!.hashSerialized.toString("hex")).toBe(
+    // hashSerialized is stored in INTERNAL (little-endian) byte order — the raw
+    // SHA256d digest computeUTXOSetHash produces and the assumeutxo gate compares
+    // (see params.ts). Core's chainparams.cpp m_assumeutxo_data prints it in
+    // DISPLAY order (uint256::ToString), so reverse the stored bytes to compare
+    // parity with the Core source string — exactly as one would for blockHash.
+    expect(Buffer.from(e840!.hashSerialized).reverse().toString("hex")).toBe(
       "a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96",
     );
     expect(e840!.nChainTx).toBe(991_032_194n);
@@ -978,21 +983,21 @@ describe("W138 cross-cutting: hardcoded assumeutxo entries (chainparams parity)"
     const e880 = MAINNET.assumeutxo!.get(
       "8028ca5cec8220cf1dfd2a9c9a960705403c3c28170b01000000000000000000",
     );
-    expect(e880!.hashSerialized.toString("hex")).toBe(
+    expect(Buffer.from(e880!.hashSerialized).reverse().toString("hex")).toBe(
       "dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9",
     );
 
     const e910 = MAINNET.assumeutxo!.get(
       "21a894914616bdb1dccd7ae1ea16d5ff2295cb0a970801000000000000000000",
     );
-    expect(e910!.hashSerialized.toString("hex")).toBe(
+    expect(Buffer.from(e910!.hashSerialized).reverse().toString("hex")).toBe(
       "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568",
     );
 
     const e935 = MAINNET.assumeutxo!.get(
       "eeb50f6fa5725eccea7b60ba1bb9b25216af5849034701000000000000000000",
     );
-    expect(e935!.hashSerialized.toString("hex")).toBe(
+    expect(Buffer.from(e935!.hashSerialized).reverse().toString("hex")).toBe(
       "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050",
     );
   });

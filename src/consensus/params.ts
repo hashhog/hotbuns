@@ -700,10 +700,25 @@ export const MAINNET: ConsensusParams = {
       "a583da1c3ff29b687248ff737822f8ce4827033a282003000000000000000000",
       {
         height: 840000,
+        // hashSerialized is the raw SHA256d-of-TxOutSer digest in INTERNAL
+        // (little-endian) byte order — exactly what computeUTXOSetHash
+        // produces and what the assumeutxo strict gate compares against
+        // (snapshot.ts: `computedHash.equals(auData.hashSerialized)`). This is
+        // Core's uint256 INTERNAL representation: validation.cpp compares
+        // AssumeutxoHash uint256s by their internal bytes, and uint256{"<hex>"}
+        // reverses the display hex on construction. The literal below is copied
+        // verbatim from Core chainparams.cpp (DISPLAY order, as dumptxoutset
+        // prints it), so it MUST be `.reverse()`d to internal order — the same
+        // reversal already applied to `blockHash` in every entry. Without it,
+        // loading the official Core AssumeUTXO snapshot fails with
+        // "Bad snapshot content hash" against the byte-reversed digest.
+        // (The h=944183 hashhog-local entry needs no `.reverse()` because its
+        // literal came from compute-snapshot-hash.py, which already emits the
+        // raw internal-order digest.)
         hashSerialized: Buffer.from(
           "a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96",
           "hex"
-        ),
+        ).reverse(),
         nChainTx: 991_032_194n,
         blockHash: Buffer.from(
           "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
@@ -716,10 +731,12 @@ export const MAINNET: ConsensusParams = {
       "8028ca5cec8220cf1dfd2a9c9a960705403c3c28170b01000000000000000000",
       {
         height: 880000,
+        // DISPLAY-order Core chainparams literal → `.reverse()` to internal
+        // (see 840000 above for the full rationale).
         hashSerialized: Buffer.from(
           "dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9",
           "hex"
-        ),
+        ).reverse(),
         nChainTx: 1_145_604_538n,
         blockHash: Buffer.from(
           "000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880",
@@ -732,10 +749,12 @@ export const MAINNET: ConsensusParams = {
       "21a894914616bdb1dccd7ae1ea16d5ff2295cb0a970801000000000000000000",
       {
         height: 910000,
+        // DISPLAY-order Core chainparams literal → `.reverse()` to internal
+        // (see 840000 above for the full rationale).
         hashSerialized: Buffer.from(
           "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568",
           "hex"
-        ),
+        ).reverse(),
         nChainTx: 1_226_586_151n,
         blockHash: Buffer.from(
           "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
@@ -748,10 +767,12 @@ export const MAINNET: ConsensusParams = {
       "eeb50f6fa5725eccea7b60ba1bb9b25216af5849034701000000000000000000",
       {
         height: 935000,
+        // DISPLAY-order Core chainparams literal → `.reverse()` to internal
+        // (see 840000 above for the full rationale).
         hashSerialized: Buffer.from(
           "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050",
           "hex"
-        ),
+        ).reverse(),
         nChainTx: 1_305_397_408n,
         blockHash: Buffer.from(
           "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee",
