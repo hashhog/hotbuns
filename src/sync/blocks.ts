@@ -230,6 +230,13 @@ const MAX_STALL_TIMEOUT = 300000;
 /** Interval for progress logging (milliseconds). */
 const LOG_INTERVAL = 10000;
 
+/** Minimum interval (milliseconds) between forced getheaders re-polls once the
+ *  block frontier has drained every known header. See the "header-sync idle
+ *  catch-all" in handleStalled(). Keeps a truly-at-tip node from spamming
+ *  getheaders while still recovering a wedged header sync within a few
+ *  seconds. */
+const HEADER_DRAIN_POLL_MS = 5000;
+
 /** Maximum items per getdata message.
  *  Mirrors Bitcoin Core net_processing.cpp:128 MAX_GETDATA_SZ = 1000.
  *  Using the INV cap (50000) here caused 50× bandwidth amplification on
@@ -335,6 +342,11 @@ export class BlockSync {
 
   /** Timer for progress logging. */
   private logInterval: ReturnType<typeof setInterval> | null;
+
+  /** Last time we force-polled peers for more headers after draining the
+   *  known-header frontier. See the "header-sync idle catch-all" in
+   *  handleStalled(). Rate-limits the forced getheaders. */
+  private lastHeaderDrainPoll: number = 0;
 
   /** Timestamp when sync started. */
   private startTime: number;
@@ -4620,6 +4632,42 @@ export class BlockSync {
         this.state.nextHeightToRequest = this.state.nextHeightToProcess;
       }
       this.requestBlocks();
+    }
+
+    // ── Header-sync idle catch-all ──
+    //
+    // `headers.ts:requestHeaders` gates the normal getheaders on
+    // `needsMoreHeaders(peerBestHeight)`, where `peerBestHeight` is the peer's
+    // version-handshake `startHeight` — a value captured ONCE at connect and
+    // never refreshed.  A peer can legitimately have more headers than it
+    // advertised: it appended blocks after the handshake, or (as in the
+    // Track-B forward-replay feeder) it under-reports its height on purpose.
+    // Bitcoin Core keeps discovering such headers because peers proactively
+    // announce new blocks (inv / unsolicited headers), which drives a forced
+    // getheaders (block-sync's inv-for-unknown-header path).  A feeder that
+    // only answers requests and never announces gives no such trigger — so
+    // once our header tip passes the stale advertised height, header sync
+    // stops, and because block forward-sync can only chase known headers, the
+    // whole pipeline wedges (symptom: `height=N/N (100%) 0 blk/s pend=0 dl=0`
+    // with the feeder able to serve far past N).
+    //
+    // Fix: when the block frontier has DRAINED every known header
+    // (`nextHeightToProcess > bestHeader.height`, nothing left to download)
+    // and no block requests are outstanding, force a fresh getheaders from
+    // every peer (bypassing the stale-height gate).  On a node genuinely at
+    // the chain tip the peer returns an empty batch — a no-op.  If the peer
+    // has more, header sync resumes and block download follows.  Rate-limited
+    // so a truly-at-tip node only re-polls every HEADER_DRAIN_POLL_MS.
+    if (
+      bestHeader &&
+      this.state.nextHeightToProcess > bestHeader.height &&
+      this.state.pendingBlocks.size === 0 &&
+      now - this.lastHeaderDrainPoll > HEADER_DRAIN_POLL_MS
+    ) {
+      this.lastHeaderDrainPoll = now;
+      for (const peer of this.peerManager.getConnectedPeers()) {
+        this.headerSync.requestHeaders(peer, true);
+      }
     }
 
     // ── Critical-block parallel-blast trigger ──
