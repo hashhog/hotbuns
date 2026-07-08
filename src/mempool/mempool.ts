@@ -847,19 +847,22 @@ export function preCheckEphemeralTx(tx: Transaction, fee: bigint): { valid: bool
     return { valid: true };
   }
 
-  // A transaction with dust outputs must have 0 fee
+  // A transaction with dust outputs must have 0 fee (ephemeral-dust rule).
+  // Core reject token is the bare "dust" (ephemeral_policy.cpp:26-27, surfaced
+  // via rpc/mempool.cpp); the "must be 0-fee" detail is Core's debug string only.
   if (fee !== 0n) {
     return {
       valid: false,
-      error: "tx with dust output must be 0-fee"
+      error: "dust"
     };
   }
 
-  // Only one dust output allowed per tx
+  // Only MAX_DUST_OUTPUTS_PER_TX (=1) dust output permitted (Core IsStandardTx
+  // policy.cpp:158-162, GetDust(tx).size() > MAX_DUST_OUTPUTS_PER_TX). Bare token.
   if (dustOutputs.length > MAX_DUST_OUTPUTS_PER_TX) {
     return {
       valid: false,
-      error: `too many dust outputs: ${dustOutputs.length} > ${MAX_DUST_OUTPUTS_PER_TX}`
+      error: "dust"
     };
   }
 

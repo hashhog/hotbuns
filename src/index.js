@@ -20188,13 +20188,13 @@ function preCheckEphemeralTx(tx, fee) {
   if (fee !== 0n) {
     return {
       valid: false,
-      error: "tx with dust output must be 0-fee"
+      error: "dust"
     };
   }
   if (dustOutputs.length > MAX_DUST_OUTPUTS_PER_TX) {
     return {
       valid: false,
-      error: `too many dust outputs: ${dustOutputs.length} > ${MAX_DUST_OUTPUTS_PER_TX}`
+      error: "dust"
     };
   }
   return { valid: true };

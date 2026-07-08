@@ -56,6 +56,7 @@ import {
   getDustThreshold,
   isDust,
   getDustOutputs,
+  preCheckEphemeralTx,
 } from "../mempool/mempool.js";
 import {
   getScriptType,
@@ -265,12 +266,28 @@ describe("W135 — Standardness rules (IsStandardTx)", () => {
       expect(dust.length).toBeGreaterThan(MAX_DUST_OUTPUTS_PER_TX);
     });
 
-    test.todo(
-      "BUG-1 FIX: tx with 2 dust outputs and POSITIVE fee should reject with reason 'dust' (Core policy.cpp:159)",
-      // Today hotbuns rejects this for "tx with dust output must be 0-fee" via
-      // preCheckEphemeralTx, not the IsStandardTx dust-cap gate. The reason
-      // string should be Core's bare "dust" once BUG-1 is fixed.
-    );
+    // BUG-1 FIXED: both ephemeral-dust gates now emit Core's bare "dust" token
+    // (ephemeral_policy.cpp:26-27 fee!=0 gate; policy.cpp:158-162 count gate).
+    test("BUG-1 FIX: dust output with POSITIVE fee rejects with bare token 'dust'", () => {
+      const tx = buildTx({
+        outputs: [{ value: 100n, scriptPubKey: P2WPKH_SCRIPT }],
+      });
+      const r = preCheckEphemeralTx(tx, 1_000n);
+      expect(r.valid).toBe(false);
+      expect(r.error).toBe("dust");
+    });
+
+    test("BUG-1 FIX: >MAX_DUST_OUTPUTS_PER_TX dust outputs (0-fee) reject with bare token 'dust'", () => {
+      const tx = buildTx({
+        outputs: [
+          { value: 100n, scriptPubKey: P2WPKH_SCRIPT },
+          { value: 100n, scriptPubKey: P2WPKH_SCRIPT },
+        ],
+      });
+      const r = preCheckEphemeralTx(tx, 0n);
+      expect(r.valid).toBe(false);
+      expect(r.error).toBe("dust");
+    });
   });
 
   // -------------------------------------------------------------------------
