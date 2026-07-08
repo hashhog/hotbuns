@@ -30326,6 +30326,8 @@ var BASE_STALL_TIMEOUT = 120000;
 var MAX_STALL_TIMEOUT = 300000;
 var LOG_INTERVAL = 1e4;
 var MAX_GETDATA_ITEMS = 1000;
+var TX_REQUEST_EXPIRY_MS = 60000;
+var MAX_RECENT_REJECTED_TXS = 10000;
 var MAX_DOWNLOADED_BUFFER = 32;
 var MIN_BLOCKS_TO_KEEP2 = 288;
 var MAX_FORK_DOWNLOAD_DEPTH = 288;
@@ -30359,6 +30361,8 @@ class BlockSync {
   downloadedBlockPeers;
   chainStateManager;
   mempool = null;
+  requestedTxInFlight = new Map;
+  recentlyRejectedTxs = new Set;
   pruneManager = null;
   blocksSincePruneCheck = 0;
   filterIndex = null;
@@ -30830,6 +30834,7 @@ class BlockSync {
       return;
     }
     const blocksToRequest = [];
+    const txsToRequest = [];
     let needHeaders = false;
     for (const inv of inventory) {
       if (inv.type === 2 /* MSG_BLOCK */ || inv.type === 1073741826 /* MSG_WITNESS_BLOCK */) {
@@ -30846,16 +30851,34 @@ class BlockSync {
         if (!this.state.pendingBlocks.has(hashHex) && !this.state.downloadedBlocks.has(hashHex)) {
           blocksToRequest.push(inv.hash);
         }
+      } else if (inv.type === 1 /* MSG_TX */ || inv.type === 5 /* MSG_WTX */) {
+        // Classic tx announcement -> getdata (BIP-339 aware). Erlay
+        // (src/p2p/erlay.ts) is a separate mechanism, not consulted here.
+        if (peer.connType === "block_relay") {
+          continue;
+        }
+        if (peer.wtxidRelay && inv.type === 1) continue;
+        if (!peer.wtxidRelay && inv.type === 5) continue;
+        const hashHex = inv.hash.toString("hex");
+        if (this.mempoolHasInv(inv)) continue;
+        if (this.recentlyRejectedTxs.has(hashHex)) continue;
+        if (this.isTxRequestInFlight(hashHex)) continue;
+        this.requestedTxInFlight.set(hashHex, Date.now());
+        txsToRequest.push({ type: inv.type, hash: inv.hash });
       }
     }
     if (blocksToRequest.length > 0) {
       this.sendGetData(peer, blocksToRequest);
+    }
+    if (txsToRequest.length > 0) {
+      this.sendTxGetData(peer, txsToRequest);
     }
     if (needHeaders) {
       this.headerSync.requestHeaders(peer, true);
     }
   }
   async handleGetData(peer, inventory) {
+    const notFound = [];
     for (const inv of inventory) {
       if (inv.type === 2 /* MSG_BLOCK */ || inv.type === 1073741826 /* MSG_WITNESS_BLOCK */) {
         const rawBlock = await this.db.getBlock(inv.hash);
@@ -30867,7 +30890,64 @@ class BlockSync {
           };
           peer.send(blockMsg);
         }
+      } else if (inv.type === 1 /* MSG_TX */ || inv.type === 5 /* MSG_WTX */ || inv.type === 1073741825 /* MSG_WITNESS_TX */) {
+        const tx = this.findMempoolTxForInv(inv);
+        if (tx) {
+          peer.send({ type: "tx", payload: { tx } });
+        } else {
+          notFound.push({ type: inv.type, hash: inv.hash });
+        }
       }
+    }
+    if (notFound.length > 0) {
+      peer.send({ type: "notfound", payload: { inventory: notFound } });
+    }
+  }
+  mempoolHasInv(inv) {
+    return this.findMempoolTxForInv(inv) !== null;
+  }
+  findMempoolTxForInv(inv) {
+    if (!this.mempool) return null;
+    if (inv.type === 1 /* MSG_TX */ || inv.type === 1073741825 /* MSG_WITNESS_TX */) {
+      const entry = this.mempool.getTransaction(inv.hash);
+      return entry ? entry.tx : null;
+    }
+    if (inv.type === 5 /* MSG_WTX */) {
+      const wtxidHex = inv.hash.toString("hex");
+      for (const txid of this.mempool.getAllTxids()) {
+        const entry = this.mempool.getTransaction(txid);
+        if (entry && getWTxId(entry.tx).toString("hex") === wtxidHex) {
+          return entry.tx;
+        }
+      }
+    }
+    return null;
+  }
+  isTxRequestInFlight(hashHex) {
+    const at = this.requestedTxInFlight.get(hashHex);
+    if (at === undefined) return false;
+    if (Date.now() - at > TX_REQUEST_EXPIRY_MS) {
+      this.requestedTxInFlight.delete(hashHex);
+      return false;
+    }
+    return true;
+  }
+  markTxRejected(hashHex) {
+    this.requestedTxInFlight.delete(hashHex);
+    if (this.recentlyRejectedTxs.has(hashHex)) return;
+    this.recentlyRejectedTxs.add(hashHex);
+    if (this.recentlyRejectedTxs.size > MAX_RECENT_REJECTED_TXS) {
+      const oldest = this.recentlyRejectedTxs.values().next().value;
+      if (oldest !== undefined) this.recentlyRejectedTxs.delete(oldest);
+    }
+  }
+  clearTxRequestInFlight(...hashHexes) {
+    for (const h of hashHexes) this.requestedTxInFlight.delete(h);
+  }
+  sendTxGetData(peer, items) {
+    for (let i = 0; i < items.length; i += MAX_GETDATA_ITEMS) {
+      const batch = items.slice(i, i + MAX_GETDATA_ITEMS);
+      peer.send({ type: "getdata", payload: { inventory: batch } });
     }
   }
   lowerDownloadFloorForFork(bestHeader) {

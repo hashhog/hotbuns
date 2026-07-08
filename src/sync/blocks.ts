@@ -25,7 +25,7 @@ import {
   serializeBlockHeader,
   validateBlock,
 } from "../validation/block.js";
-import { isCoinbase } from "../validation/tx.js";
+import { isCoinbase, getWTxId } from "../validation/tx.js";
 import type { Transaction } from "../validation/tx.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { UTXOManager } from "../chain/utxo.js";
@@ -243,6 +243,15 @@ const HEADER_DRAIN_POLL_MS = 5000;
  *  inv→getdata fan-out. */
 const MAX_GETDATA_ITEMS = 1000;
 
+/** How long a tx-request in-flight marker is honored before we allow a
+ *  re-request from another announcing peer. Roughly Core's GETDATA_TX_INTERVAL
+ *  (60s) — long enough that a serving peer has time to deliver, short enough
+ *  that a dropped/never-served tx can be re-fetched from someone else. */
+const TX_REQUEST_EXPIRY_MS = 60_000;
+
+/** FIFO bound on {@link BlockSync.recentlyRejectedTxs}. */
+const MAX_RECENT_REJECTED_TXS = 10_000;
+
 /** Maximum downloaded blocks buffered in memory before throttling requests.
  *  At mainnet heights (500K+), blocks average 2-4MB serialized but expand to
  *  10-20MB as JS objects (transactions, witnesses, Buffers).  32 blocks keeps
@@ -456,6 +465,28 @@ export class BlockSync {
    *  loop completes).  Cross-impl audit:
    *  CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md. */
   private mempool: Mempool | null = null;
+
+  /**
+   * Transaction-request dedup map (classic inv→getdata relay, W-txrelay).
+   * Keyed by the inv hash hex we requested (txid for MSG_TX, wtxid for
+   * MSG_WTX) → wall-clock ms of the request. When multiple peers announce
+   * the same tx we only `getdata` it once until the entry expires
+   * (TX_REQUEST_EXPIRY_MS) — mirrors the effect of Bitcoin Core's
+   * TxRequestTracker in-flight bookkeeping (net_processing.cpp
+   * m_txdownloadman.AddTxAnnouncement), collapsed to a single-attempt
+   * time-boxed dedup since hotbuns has no per-peer request scheduler.
+   * Entries are opportunistically pruned in {@link isTxRequestInFlight}.
+   */
+  private requestedTxInFlight: Map<string, number> = new Map();
+
+  /**
+   * Small bounded set of inv-hash hex (txid/wtxid) we recently declined to
+   * request because we already saw them rejected. hotbuns has no global
+   * recent-rejects filter (Core's m_recent_rejects); this is a best-effort
+   * local guard so a rejected-tx re-announce storm doesn't cause repeated
+   * getdata churn. Populated via {@link markTxRejected}; bounded FIFO.
+   */
+  private recentlyRejectedTxs: Set<string> = new Set();
 
   /** Prune manager — wired via setPruneManager() from cli.ts when the
    *  operator passes `--prune=N`.  After every successful connectBlock,
@@ -1592,6 +1623,9 @@ export class BlockSync {
     }
 
     const blocksToRequest: Buffer[] = [];
+    // Transaction inv items to fetch, preserving the announced inv type so the
+    // getdata echoes MSG_WTX/MSG_TX per the peer's wtxidrelay negotiation.
+    const txsToRequest: InvVector[] = [];
     let needHeaders = false;
 
     for (const inv of inventory) {
@@ -1622,11 +1656,52 @@ export class BlockSync {
         ) {
           blocksToRequest.push(inv.hash);
         }
+      } else if (inv.type === InvType.MSG_TX || inv.type === InvType.MSG_WTX) {
+        // Classic transaction announcement → getdata (BIP-339 aware).
+        // Reference: bitcoin-core net_processing.cpp ProcessMessage(INV),
+        // the `inv.IsGenTxMsg()` branch (~L4079): outside IBD, feed the
+        // announcement into the tx-download manager which decides whether to
+        // request. hotbuns collapses that to: request unless we already have
+        // the tx, recently rejected it, or already have a request in flight.
+        //
+        // NOTE: the Erlay set-reconciliation path (src/p2p/erlay.ts) is a
+        // SEPARATE mechanism and is intentionally not consulted here — this is
+        // the classic fluff/inv→getdata loop.
+
+        // Block-relay-only peers must never relay transactions to us
+        // (Core RejectIncomingTxs → reject_tx_invs, net_processing.cpp:5601).
+        if (peer.connType === "block_relay") {
+          continue;
+        }
+
+        // Honor the wtxidrelay negotiation: ignore inv items that don't match
+        // (Core net_processing.cpp:4059-4063 — MSG_TX ignored for wtxid peers
+        // and vice-versa).
+        if (peer.wtxidRelay && inv.type === InvType.MSG_TX) continue;
+        if (!peer.wtxidRelay && inv.type === InvType.MSG_WTX) continue;
+
+        const hashHex = inv.hash.toString("hex");
+
+        // Already have it in the mempool? (AlreadyHaveTx)
+        if (this.mempoolHasInv(inv)) continue;
+
+        // Recently rejected — don't churn on a re-announce storm.
+        if (this.recentlyRejectedTxs.has(hashHex)) continue;
+
+        // In-flight request from another peer? (single-attempt dedup)
+        if (this.isTxRequestInFlight(hashHex)) continue;
+
+        this.requestedTxInFlight.set(hashHex, Date.now());
+        txsToRequest.push({ type: inv.type, hash: inv.hash });
       }
     }
 
     if (blocksToRequest.length > 0) {
       this.sendGetData(peer, blocksToRequest);
+    }
+
+    if (txsToRequest.length > 0) {
+      this.sendTxGetData(peer, txsToRequest);
     }
 
     // If we saw block inv(s) with unknown headers, ask the peer for headers.
@@ -1643,6 +1718,11 @@ export class BlockSync {
    * Handle getdata requests from peers — serve blocks we have stored.
    */
   private async handleGetData(peer: Peer, inventory: InvVector[]): Promise<void> {
+    // notfound accumulator for tx items we can't serve — lets the peer stop
+    // waiting and re-request the tx elsewhere (Core ProcessGetData →
+    // NetMsgType::NOTFOUND, net_processing.cpp:2570-2585).
+    const notFound: InvVector[] = [];
+
     for (const inv of inventory) {
       if (inv.type === InvType.MSG_BLOCK || inv.type === InvType.MSG_WITNESS_BLOCK) {
         const rawBlock = await this.db.getBlock(inv.hash);
@@ -1654,7 +1734,117 @@ export class BlockSync {
           };
           peer.send(blockMsg);
         }
+      } else if (
+        inv.type === InvType.MSG_TX ||
+        inv.type === InvType.MSG_WTX ||
+        inv.type === InvType.MSG_WITNESS_TX
+      ) {
+        // Serve an unconfirmed transaction from the mempool by txid/wtxid.
+        // Reference: bitcoin-core net_processing.cpp ProcessGetData →
+        // FindTxForGetData (L2494) → MakeAndPushMessage(TX). On a miss we
+        // append to notfound rather than silently dropping.
+        const tx = this.findMempoolTxForInv(inv);
+        if (tx) {
+          const txMsg: NetworkMessage = {
+            type: "tx",
+            payload: { tx },
+          };
+          peer.send(txMsg);
+        } else {
+          notFound.push({ type: inv.type, hash: inv.hash });
+        }
       }
+    }
+
+    if (notFound.length > 0) {
+      peer.send({ type: "notfound", payload: { inventory: notFound } });
+    }
+  }
+
+  /**
+   * True if the tx named by this inv item (txid for MSG_TX/MSG_WITNESS_TX,
+   * wtxid for MSG_WTX) is already in the mempool.
+   */
+  private mempoolHasInv(inv: InvVector): boolean {
+    return this.findMempoolTxForInv(inv) !== null;
+  }
+
+  /**
+   * Look up the mempool transaction referenced by an inv item. MSG_TX and
+   * MSG_WITNESS_TX carry a txid (direct map lookup); MSG_WTX carries a wtxid
+   * (linear scan computing getWTxId — the mempool is keyed by txid only).
+   * Returns null if absent or if there is no mempool wired.
+   */
+  private findMempoolTxForInv(inv: InvVector): Transaction | null {
+    if (!this.mempool) return null;
+
+    if (inv.type === InvType.MSG_TX || inv.type === InvType.MSG_WITNESS_TX) {
+      const entry = this.mempool.getTransaction(inv.hash);
+      return entry ? entry.tx : null;
+    }
+
+    if (inv.type === InvType.MSG_WTX) {
+      const wtxidHex = inv.hash.toString("hex");
+      for (const txid of this.mempool.getAllTxids()) {
+        const entry = this.mempool.getTransaction(txid);
+        if (entry && getWTxId(entry.tx).toString("hex") === wtxidHex) {
+          return entry.tx;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * True if we already have a getdata in flight for this tx (by inv-hash hex)
+   * within the expiry window. Opportunistically prunes expired markers.
+   */
+  private isTxRequestInFlight(hashHex: string): boolean {
+    const at = this.requestedTxInFlight.get(hashHex);
+    if (at === undefined) return false;
+    if (Date.now() - at > TX_REQUEST_EXPIRY_MS) {
+      this.requestedTxInFlight.delete(hashHex);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Record that an announced/received tx was rejected so we stop re-requesting
+   * it on subsequent announcements. Bounded FIFO. Also clears any in-flight
+   * request marker. Best-effort local stand-in for Core's m_recent_rejects.
+   */
+  markTxRejected(hashHex: string): void {
+    this.requestedTxInFlight.delete(hashHex);
+    if (this.recentlyRejectedTxs.has(hashHex)) return;
+    this.recentlyRejectedTxs.add(hashHex);
+    if (this.recentlyRejectedTxs.size > MAX_RECENT_REJECTED_TXS) {
+      // Drop oldest insertion (Set preserves insertion order).
+      const oldest = this.recentlyRejectedTxs.values().next().value;
+      if (oldest !== undefined) this.recentlyRejectedTxs.delete(oldest);
+    }
+  }
+
+  /**
+   * Clear the in-flight request marker for a tx once it arrives (called from
+   * the tx message handler). Keyed by both txid and wtxid hex so either the
+   * MSG_TX or MSG_WTX request marker is cleared.
+   */
+  clearTxRequestInFlight(...hashHexes: string[]): void {
+    for (const h of hashHexes) this.requestedTxInFlight.delete(h);
+  }
+
+  /**
+   * Send a getdata for transaction inv items, echoing the announced inv type
+   * (MSG_WTX vs MSG_TX) so the request matches the peer's wtxidrelay setting.
+   * Reference: bitcoin-core net_processing.cpp SendMessages tx-request loop
+   * (~L6206): `gtxid.IsWtxid() ? MSG_WTX : (MSG_TX | fetch flags)`.
+   */
+  private sendTxGetData(peer: Peer, items: InvVector[]): void {
+    for (let i = 0; i < items.length; i += MAX_GETDATA_ITEMS) {
+      const batch = items.slice(i, i + MAX_GETDATA_ITEMS);
+      peer.send({ type: "getdata", payload: { inventory: batch } });
     }
   }
 
