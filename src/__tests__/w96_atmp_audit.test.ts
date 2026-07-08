@@ -250,8 +250,9 @@ describe("W96 — ATMP comprehensive gates", () => {
 
       const result = await mempool.addTransaction(tx);
       expect(result.accepted).toBe(false);
-      // Mirrors Core: "tx with dust output must be 0-fee".
-      expect(result.error).toContain("0-fee");
+      // Core reject token is the bare "dust" (ephemeral_policy.cpp:26-27,
+      // surfaced via rpc/mempool.cpp); the "0-fee" detail is Core's debug string.
+      expect(result.error).toBe("dust");
     });
   });
 
