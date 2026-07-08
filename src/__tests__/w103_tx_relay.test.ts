@@ -254,31 +254,28 @@ describe("G1: MAX_INV_SZ = 50000 enforced on wire", () => {
 // G2 — getdata dispatch does NOT serve tx types (BUG-1)
 // ---------------------------------------------------------------------------
 
-describe("G2: getdata for tx types — BUG: silently ignored (BUG-1)", () => {
-  test("BUG-1: handleGetData in blocks.ts only handles block types", () => {
+describe("G2: getdata for tx types — FIXED (BUG-1 closed: serve txs from mempool)", () => {
+  test("FIX-1: handleGetData now serves tx types (MSG_TX/MSG_WTX)", () => {
     // Core net_processing.cpp serves MSG_TX/MSG_WITNESS_TX getdata from mempool.
-    // hotbuns handleGetData (blocks.ts ~line 951) only branches on:
-    //   InvType.MSG_BLOCK || InvType.MSG_WITNESS_BLOCK
-    // A getdata for MSG_TX is silently dropped — peer never receives the tx.
+    // hotbuns handleGetData now branches on tx inv types and serves the tx from
+    // the mempool (message-level behavior asserted in tx_inv_getdata_relay.test).
     const { BlockSync } = require("../sync/blocks.js");
     const proto = BlockSync.prototype as any;
     const src = proto.handleGetData?.toString() ?? "";
-    // The function must handle MSG_TX (= 1) or MSG_WITNESS_TX (= 0x40000001)
+    // The function must handle MSG_TX (= 1) or MSG_WTX (= 5).
     const handlesTx =
       src.includes("MSG_TX") ||
-      src.includes("InvType.MSG_TX") ||
       src.includes("=== 1") ||
-      src.includes("=== 0x40000001");
-    // BUG-1: This is expected to be false — no tx serving
-    expect(handlesTx).toBe(false);
+      src.includes("=== 5");
+    expect(handlesTx).toBe(true);
   });
 
-  test("handleGetData source does not call mempool.getTransaction for inv items", () => {
+  test("handleGetData serve path reaches into the mempool for tx items", () => {
+    // Serving a tx requires a mempool lookup; findMempoolTxForInv performs it.
     const { BlockSync } = require("../sync/blocks.js");
     const proto = BlockSync.prototype as any;
-    const src = proto.handleGetData?.toString() ?? "";
-    // If it served txs it would need to call getTransaction or similar
-    expect(src.includes("getTransaction")).toBe(false);
+    const src = proto.findMempoolTxForInv?.toString() ?? "";
+    expect(src.includes("getTransaction")).toBe(true);
   });
 });
 
@@ -883,17 +880,17 @@ describe("G26: CanRequestTxFrom — MISSING (BUG-16)", () => {
 // G27 — wtxid-keyed getdata for tx requests (BUG: tx getdata never sent)
 // ---------------------------------------------------------------------------
 
-describe("G27: wtxid-keyed getdata for tx requests — MISSING", () => {
-  test("BlockSync.handleInv ignores MSG_TX inv types", () => {
-    // Core sends getdata after receiving tx inv from a peer. hotbuns handleInv
-    // (blocks.ts:894) only processes MSG_BLOCK/MSG_WITNESS_BLOCK — tx invs are
-    // silently ignored (same gap as BUG-1 on getdata serving side).
+describe("G27: wtxid-keyed getdata for tx requests — FIXED", () => {
+  test("BlockSync.handleInv now requests tx inv types via getdata", () => {
+    // Core sends getdata after receiving a tx inv from a peer. hotbuns handleInv
+    // now branches on MSG_TX (=1) / MSG_WTX (=5) and emits a getdata echoing the
+    // announced inv type (message-level behavior asserted in
+    // tx_inv_getdata_relay.test).
     const { BlockSync } = require("../sync/blocks.js");
     const proto = BlockSync.prototype as any;
     const src = proto.handleInv?.toString() ?? "";
-    // handleInv checks: inv.type === InvType.MSG_BLOCK || inv.type === InvType.MSG_WITNESS_BLOCK
-    // There is no branch for MSG_TX (=1) or MSG_WITNESS_TX (=0x40000001):
-    expect(src.includes("MSG_TX")).toBe(false);
+    const handlesTx = src.includes("MSG_TX") || src.includes("=== 1") || src.includes("=== 5");
+    expect(handlesTx).toBe(true);
   });
 });
 
