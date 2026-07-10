@@ -8228,7 +8228,7 @@ var init_params = __esm(() => {
         "a583da1c3ff29b687248ff737822f8ce4827033a282003000000000000000000",
         {
           height: 840000,
-          hashSerialized: Buffer.from("a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96", "hex"),
+          hashSerialized: Buffer.from("a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96", "hex").reverse(),
           nChainTx: 991032194n,
           blockHash: Buffer.from("0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5", "hex").reverse()
         }
@@ -8237,7 +8237,7 @@ var init_params = __esm(() => {
         "8028ca5cec8220cf1dfd2a9c9a960705403c3c28170b01000000000000000000",
         {
           height: 880000,
-          hashSerialized: Buffer.from("dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9", "hex"),
+          hashSerialized: Buffer.from("dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9", "hex").reverse(),
           nChainTx: 1145604538n,
           blockHash: Buffer.from("000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880", "hex").reverse()
         }
@@ -8246,7 +8246,7 @@ var init_params = __esm(() => {
         "21a894914616bdb1dccd7ae1ea16d5ff2295cb0a970801000000000000000000",
         {
           height: 910000,
-          hashSerialized: Buffer.from("4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568", "hex"),
+          hashSerialized: Buffer.from("4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568", "hex").reverse(),
           nChainTx: 1226586151n,
           blockHash: Buffer.from("0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821", "hex").reverse()
         }
@@ -8255,7 +8255,7 @@ var init_params = __esm(() => {
         "eeb50f6fa5725eccea7b60ba1bb9b25216af5849034701000000000000000000",
         {
           height: 935000,
-          hashSerialized: Buffer.from("e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050", "hex"),
+          hashSerialized: Buffer.from("e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050", "hex").reverse(),
           nChainTx: 1305397408n,
           blockHash: Buffer.from("0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee", "hex").reverse()
         }
@@ -30325,9 +30325,10 @@ var MAX_IN_FLIGHT_PER_PEER = 4;
 var BASE_STALL_TIMEOUT = 120000;
 var MAX_STALL_TIMEOUT = 300000;
 var LOG_INTERVAL = 1e4;
+var HEADER_DRAIN_POLL_MS = 5000;
 var MAX_GETDATA_ITEMS = 1000;
 var TX_REQUEST_EXPIRY_MS = 60000;
-var MAX_RECENT_REJECTED_TXS = 10000;
+var MAX_RECENT_REJECTED_TXS = 1e4;
 var MAX_DOWNLOADED_BUFFER = 32;
 var MIN_BLOCKS_TO_KEEP2 = 288;
 var MAX_FORK_DOWNLOAD_DEPTH = 288;
@@ -30344,6 +30345,7 @@ class BlockSync {
   utxoManager;
   stallCheckInterval;
   logInterval;
+  lastHeaderDrainPoll = 0;
   startTime;
   blocksProcessed;
   ibdComplete;
@@ -30852,17 +30854,20 @@ class BlockSync {
           blocksToRequest.push(inv.hash);
         }
       } else if (inv.type === 1 /* MSG_TX */ || inv.type === 5 /* MSG_WTX */) {
-        // Classic tx announcement -> getdata (BIP-339 aware). Erlay
-        // (src/p2p/erlay.ts) is a separate mechanism, not consulted here.
         if (peer.connType === "block_relay") {
           continue;
         }
-        if (peer.wtxidRelay && inv.type === 1) continue;
-        if (!peer.wtxidRelay && inv.type === 5) continue;
+        if (peer.wtxidRelay && inv.type === 1 /* MSG_TX */)
+          continue;
+        if (!peer.wtxidRelay && inv.type === 5 /* MSG_WTX */)
+          continue;
         const hashHex = inv.hash.toString("hex");
-        if (this.mempoolHasInv(inv)) continue;
-        if (this.recentlyRejectedTxs.has(hashHex)) continue;
-        if (this.isTxRequestInFlight(hashHex)) continue;
+        if (this.mempoolHasInv(inv))
+          continue;
+        if (this.recentlyRejectedTxs.has(hashHex))
+          continue;
+        if (this.isTxRequestInFlight(hashHex))
+          continue;
         this.requestedTxInFlight.set(hashHex, Date.now());
         txsToRequest.push({ type: inv.type, hash: inv.hash });
       }
@@ -30893,7 +30898,11 @@ class BlockSync {
       } else if (inv.type === 1 /* MSG_TX */ || inv.type === 5 /* MSG_WTX */ || inv.type === 1073741825 /* MSG_WITNESS_TX */) {
         const tx = this.findMempoolTxForInv(inv);
         if (tx) {
-          peer.send({ type: "tx", payload: { tx } });
+          const txMsg = {
+            type: "tx",
+            payload: { tx }
+          };
+          peer.send(txMsg);
         } else {
           notFound.push({ type: inv.type, hash: inv.hash });
         }
@@ -30907,7 +30916,8 @@ class BlockSync {
     return this.findMempoolTxForInv(inv) !== null;
   }
   findMempoolTxForInv(inv) {
-    if (!this.mempool) return null;
+    if (!this.mempool)
+      return null;
     if (inv.type === 1 /* MSG_TX */ || inv.type === 1073741825 /* MSG_WITNESS_TX */) {
       const entry = this.mempool.getTransaction(inv.hash);
       return entry ? entry.tx : null;
@@ -30925,7 +30935,8 @@ class BlockSync {
   }
   isTxRequestInFlight(hashHex) {
     const at = this.requestedTxInFlight.get(hashHex);
-    if (at === undefined) return false;
+    if (at === undefined)
+      return false;
     if (Date.now() - at > TX_REQUEST_EXPIRY_MS) {
       this.requestedTxInFlight.delete(hashHex);
       return false;
@@ -30934,18 +30945,21 @@ class BlockSync {
   }
   markTxRejected(hashHex) {
     this.requestedTxInFlight.delete(hashHex);
-    if (this.recentlyRejectedTxs.has(hashHex)) return;
+    if (this.recentlyRejectedTxs.has(hashHex))
+      return;
     this.recentlyRejectedTxs.add(hashHex);
     if (this.recentlyRejectedTxs.size > MAX_RECENT_REJECTED_TXS) {
       const oldest = this.recentlyRejectedTxs.values().next().value;
-      if (oldest !== undefined) this.recentlyRejectedTxs.delete(oldest);
+      if (oldest !== undefined)
+        this.recentlyRejectedTxs.delete(oldest);
     }
   }
   clearTxRequestInFlight(...hashHexes) {
-    for (const h of hashHexes) this.requestedTxInFlight.delete(h);
+    for (const h of hashHexes)
+      this.requestedTxInFlight.delete(h);
   }
   sendTxGetData(peer, items) {
-    for (let i = 0; i < items.length; i += MAX_GETDATA_ITEMS) {
+    for (let i = 0;i < items.length; i += MAX_GETDATA_ITEMS) {
       const batch = items.slice(i, i + MAX_GETDATA_ITEMS);
       peer.send({ type: "getdata", payload: { inventory: batch } });
     }
@@ -30989,6 +31003,9 @@ class BlockSync {
     }
     if (forkChildHeight === null) {
       console.log(`[fork-download] competing fork tip height ${bestHeader.height} forks ` + `deeper than MAX_FORK_DOWNLOAD_DEPTH=${MAX_FORK_DOWNLOAD_DEPTH} below the ` + `active tip (height ${activeTip.height}); not lowering the download floor ` + `(a reorg this deep would be refused)`);
+      return;
+    }
+    if (forkChildHeight > activeTip.height) {
       return;
     }
     if (forkChildHeight < this.state.nextHeightToRequest) {
@@ -32203,6 +32220,12 @@ class BlockSync {
         this.state.nextHeightToRequest = this.state.nextHeightToProcess;
       }
       this.requestBlocks();
+    }
+    if (bestHeader && this.state.nextHeightToProcess > bestHeader.height && this.state.pendingBlocks.size === 0 && now - this.lastHeaderDrainPoll > HEADER_DRAIN_POLL_MS) {
+      this.lastHeaderDrainPoll = now;
+      for (const peer of this.peerManager.getConnectedPeers()) {
+        this.headerSync.requestHeaders(peer, true);
+      }
     }
     if (bestHeader && this.state.nextHeightToProcess <= bestHeader.height && this.state.pendingBlocks.size > 0) {
       this.requestBlocks();

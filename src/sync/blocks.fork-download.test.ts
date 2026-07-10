@@ -326,4 +326,79 @@ describe("BlockSync fork-aware download (GAP2)", () => {
 
     await bs.stop();
   });
+
+  test("extension with request pointer ahead of frontier: no floor lowering, no fork-download spin", async () => {
+    // Live CPU-spin repro (mainnet tip): the best header simply EXTENDS the
+    // active tip (fork point == active tip), but the request pointer has already
+    // advanced past the frontier (the ordinary "headers ahead of blocks" state
+    // near the tip). Pre-fix `lowerDownloadFloorForFork` re-lowered the floor and
+    // re-logged "[fork-download] ... forks below the active tip" on EVERY
+    // requestBlocks call, flooding the log and pegging CPU. The fix makes an
+    // extension a true no-op.
+    const genesis = headerSync.getBestHeader()!;
+    const g = { header: genesis.header };
+
+    // Single chain: genesis -> 1..12. Active validated tip = 10; 11,12 are
+    // header-only extensions of the active tip.
+    const chain = buildChain(g, 0, 12, /*branch*/ 1, genesis.header.timestamp + 600);
+    await headerSync.processHeaders(chain.map((b) => b.header), createMockPeer());
+    expect(headerSync.getBestHeader()!.height).toBe(12);
+
+    const activeTipEntry = headerSync.getHeaderByHeight(10)!;
+    const activeTip = {
+      hash: activeTipEntry.hash,
+      height: activeTipEntry.height,
+      chainWork: activeTipEntry.chainWork,
+    };
+    const peers = Array.from({ length: 16 }, (_, i) =>
+      createMockPeer("127.0.0.1", 9200 + i)
+    );
+    const peerManager = createMockPeerManager(peers);
+    const bs = new BlockSync(
+      db,
+      REGTEST,
+      headerSync,
+      peerManager,
+      createMockChainStateManager(activeTip)
+    );
+
+    // Frontier stuck at 11 (block 11 not yet connected) but the request pointer
+    // already ran ahead to 13 (11 and 12 requested) — the exact live geometry:
+    // nextHeightToRequest (13) > forkChildHeight for the extension (11).
+    bs.getState().nextHeightToProcess = 11;
+    bs.getState().nextHeightToRequest = 13;
+    (bs as any).running = true;
+
+    // Capture the fork-download log flood signature.
+    const origLog = console.log;
+    let forkDownloadLines = 0;
+    console.log = (...args: any[]) => {
+      if (
+        typeof args[0] === "string" &&
+        args[0].includes("[fork-download]") &&
+        args[0].includes("forks below the active tip")
+      ) {
+        forkDownloadLines++;
+      }
+    };
+    try {
+      // Several cycles, mirroring repeated requestBlocks / onHeadersProcessed.
+      for (let i = 0; i < 5; i++) bs.requestBlocks();
+    } finally {
+      console.log = origLog;
+    }
+
+    // The extension must NOT be treated as a below-tip fork: no floor lowering,
+    // no "forks below the active tip" log line on any cycle.
+    expect(forkDownloadLines).toBe(0);
+    // The request pointer must not be dragged back down below the frontier.
+    expect(bs.getState().nextHeightToRequest).toBeGreaterThanOrEqual(13);
+    // No below-tip body (heights 1..10, already on the active chain) requested.
+    for (let i = 0; i < 10; i++) {
+      const hashHex = getBlockHash(chain[i].header).toString("hex");
+      expect(bs.getState().pendingBlocks.has(hashHex)).toBe(false);
+    }
+
+    await bs.stop();
+  });
 });

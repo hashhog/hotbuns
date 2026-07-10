@@ -1966,9 +1966,35 @@ export class BlockSync {
       return;
     }
 
-    // Only LOWER the floor — never raise it. For a simple extension the fork
-    // point is the active tip and forkChildHeight == activeTip.height + 1, which
-    // equals the existing floor, so this is a no-op (steady-state unchanged).
+    // Extension guard (Core parity + CPU-spin fix). A best header that simply
+    // EXTENDS the active tip has its fork point AT the active tip, so
+    // forkChildHeight == activeTip.height + 1. That is NOT a below-tip reorg:
+    // there are no bridging bodies at/below the frontier to pull in, and the
+    // ordinary height-ascending download already handles it. Only a fork whose
+    // fork point is STRICTLY BELOW the active tip (forkChildHeight <=
+    // activeTip.height, i.e. fork point height < activeTip.height) needs the
+    // floor lowered below the frontier.
+    //
+    // The pre-fix code only gated on `forkChildHeight < nextHeightToRequest`,
+    // so whenever the request pointer had already advanced past an extension
+    // tip (nextHeightToRequest > activeTip.height + 1 — the normal "headers
+    // ahead of blocks" / near-tip state), it re-lowered the floor and re-logged
+    // "[fork-download] ... forks below the active tip" on EVERY requestBlocks /
+    // onHeadersProcessed call. With headers streaming in near the tip this
+    // became an unbounded log flood that pegged the event loop, starved the P2P
+    // keep-alive (peers timed out to zero), and wedged RPC — observed live at
+    // the chain tip where the fork point equalled the active tip in every
+    // occurrence (a mislabelled extension, never a real below-tip fork). Making
+    // the extension case a true no-op — as this function's own contract already
+    // promised — eliminates the spin while leaving genuine below-tip reorgs
+    // (forkChildHeight <= activeTip.height) fully handled.
+    if (forkChildHeight > activeTip.height) {
+      return;
+    }
+
+    // Only LOWER the floor — never raise it. A genuine below-tip fork lowers the
+    // floor to the fork point + 1 so the bridging bodies (fork point + 1 ..
+    // active tip) are requested.
     if (forkChildHeight < this.state.nextHeightToRequest) {
       console.log(
         `[fork-download] heavier competing fork (tip height ${bestHeader.height}, ` +
