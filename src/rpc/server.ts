@@ -43,6 +43,9 @@ import {
   getBlockHash,
   computeMerkleRoot,
   validateBlock,
+  getLegacySigOpCount,
+  WITNESS_SCALE_FACTOR,
+  MAX_BLOCK_SIGOPS_COST,
 } from "../validation/block.js";
 import { bip22Result } from "../validation/errors.js";
 import { checkProofOfWork } from "../consensus/pow.js";
@@ -8580,6 +8583,23 @@ export class RPCServer {
       if (block.header.timestamp <= mtp) {
         return "time-too-old";
       }
+
+      // MAX_FUTURE_BLOCK_TIME gate (Core ContextualCheckBlockHeader,
+      // validation.cpp:4108): reject a block whose timestamp is more than
+      // 2h ahead of wall-clock now. Core runs this for EVERY block before
+      // AcceptBlock's side-branch storage; hotbuns' submitblock pre-validation
+      // ran high-hash + time-too-old but NOT time-too-new, and injectBlock
+      // then stored a future-timestamped non-tip-extending sibling as a
+      // side-branch (returning "inconclusive"/"duplicate") that Core rejects
+      // outright. Wall-clock-dependent (like Core's GetAdjustedTime), so it is
+      // NOT re-checked on a deterministic connect/reorg re-validation. Scoped
+      // to the submitblock RPC path; the P2P/connect path is untouched.
+      // See CORE-PARITY-AUDIT/submitblock-path-differential-2026-07-11.md.
+      const MAX_FUTURE_BLOCK_TIME = 7200; // chain.h:29 (2 hours)
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (block.header.timestamp > nowSec + MAX_FUTURE_BLOCK_TIME) {
+        return "time-too-new";
+      }
     } else {
       // Parent unknown — can't check PoW target; fall through to injectBlock
       // which will return "inconclusive" for orphan blocks.
@@ -8614,6 +8634,29 @@ export class RPCServer {
     if (!structCheck.valid) {
       const reason = structCheck.error ?? "rejected";
       return bip22Result(reason);
+    }
+
+    // Context-free legacy sigop budget (Core CheckBlock, validation.cpp:3969-
+    // 3977): sum getLegacySigOpCount over EVERY transaction INCLUDING the
+    // coinbase, scale by WITNESS_SCALE_FACTOR, reject if it exceeds
+    // MAX_BLOCK_SIGOPS_COST. validateBlock (above) omits this — its comment
+    // defers ALL sigop counting to connectBlock (which adds the UTXO-dependent
+    // P2SH/witness terms). But the LEGACY term needs no UTXO view and Core runs
+    // it context-free in CheckBlock before storing ANY block. Without it a
+    // coinbase-sigop-bomb side-branch sibling passed validateBlock and was
+    // STORED by injectBlock as a side-branch (returning "duplicate") instead of
+    // rejected — the sigops->duplicate admission anomaly. Same leniency class
+    // as the other side-branch gaps. Legacy count uses inaccurate
+    // CHECKMULTISIG=20, matching Core GetLegacySigOpCount. Scoped to the
+    // submitblock RPC path; the P2P/connect path is untouched (its full sigop
+    // check in connectBlock subsumes this).
+    // See CORE-PARITY-AUDIT/submitblock-path-differential-2026-07-11.md.
+    let legacyBlockSigOpCost = 0;
+    for (const tx of block.transactions) {
+      legacyBlockSigOpCost += getLegacySigOpCount(tx) * WITNESS_SCALE_FACTOR;
+    }
+    if (legacyBlockSigOpCost > MAX_BLOCK_SIGOPS_COST) {
+      return "bad-blk-sigops";
     }
 
     // If we have a BlockSync instance, inject the block directly.
