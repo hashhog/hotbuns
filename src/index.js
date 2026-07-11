@@ -47583,6 +47583,11 @@ class RPCServer {
       if (block.header.timestamp <= mtp) {
         return "time-too-old";
       }
+      const MAX_FUTURE_BLOCK_TIME = 7200;
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (block.header.timestamp > nowSec + MAX_FUTURE_BLOCK_TIME) {
+        return "time-too-new";
+      }
     } else {}
     let approxHeight;
     if (parentEntry) {
@@ -47595,6 +47600,13 @@ class RPCServer {
     if (!structCheck.valid) {
       const reason = structCheck.error ?? "rejected";
       return bip22Result(reason);
+    }
+    let legacyBlockSigOpCost = 0;
+    for (const tx of block.transactions) {
+      legacyBlockSigOpCost += getLegacySigOpCount(tx) * WITNESS_SCALE_FACTOR;
+    }
+    if (legacyBlockSigOpCost > MAX_BLOCK_SIGOPS_COST) {
+      return "bad-blk-sigops";
     }
     if (this.blockSync) {
       const result = await this.blockSync.injectBlock(block);
