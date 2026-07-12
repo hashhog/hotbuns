@@ -181,8 +181,13 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
   if (s === "bad-cb-length") return "bad-cb-length"; // already canonical
   if (s === "bad-txns-vin-empty") return "bad-txns-vin-empty";
   if (s === "bad-txns-vout-empty") return "bad-txns-vout-empty";
-  if (s === "bad-txns-vout-negative") return "bad-txns-vout-negative";
-  if (s === "bad-txns-vout-toolarge") return "bad-txns-vout-toolarge";
+  // validateBlock wraps a tx-level CheckTransaction failure as
+  // "Transaction N: <token>" (validation/block.ts), so the canonical token
+  // arrives as a substring, not an exact match. Match it as a substring so the
+  // negative-output / output-too-large blocks emit Core's exact BIP-22 token
+  // instead of collapsing to the generic "rejected" fallback.
+  if (s.includes("bad-txns-vout-negative")) return "bad-txns-vout-negative";
+  if (s.includes("bad-txns-vout-toolarge")) return "bad-txns-vout-toolarge";
   if (s === "bad-txns-txouttotal-toolarge") return "bad-txns-txouttotal-toolarge";
   if (s === "bad-txns-inputs-duplicate") return "bad-txns-inputs-duplicate";
   if (s === "bad-txns-prevout-null") return "bad-txns-prevout-null";
@@ -207,6 +212,14 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
   }
   if (s.includes("witness commitment") || s.includes("bad-witness-merkle-match")) {
     return "bad-witness-merkle-match";
+  }
+  // Segwit spend present but coinbase carries no witness commitment: Core
+  // CheckBlock rejects with "unexpected-witness" (validation.cpp). validateBlock
+  // (validation/block.ts) emits the bare token; surface it verbatim instead of
+  // collapsing to the generic "rejected" fallback. Placed after the
+  // commitment-match branch so a real commitment mismatch still wins.
+  if (s.includes("unexpected-witness")) {
+    return "unexpected-witness";
   }
   if (s.includes("coinbase value") || s.includes("bad-cb-amount") || s.includes("subsidy")) {
     return "bad-cb-amount";

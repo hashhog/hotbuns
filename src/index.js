@@ -16685,7 +16685,7 @@ var init_cfilter_handlers = __esm(() => {
 init_database();
 import * as os from "os";
 import * as path3 from "path";
-import * as fs2 from "fs";
+import * as fs3 from "fs";
 import { EventEmitter } from "events";
 
 // src/storage/pruning.ts
@@ -17079,9 +17079,9 @@ function bip22Result(code) {
     return "bad-txns-vin-empty";
   if (s === "bad-txns-vout-empty")
     return "bad-txns-vout-empty";
-  if (s === "bad-txns-vout-negative")
+  if (s.includes("bad-txns-vout-negative"))
     return "bad-txns-vout-negative";
-  if (s === "bad-txns-vout-toolarge")
+  if (s.includes("bad-txns-vout-toolarge"))
     return "bad-txns-vout-toolarge";
   if (s === "bad-txns-txouttotal-toolarge")
     return "bad-txns-txouttotal-toolarge";
@@ -17112,6 +17112,9 @@ function bip22Result(code) {
   }
   if (s.includes("witness commitment") || s.includes("bad-witness-merkle-match")) {
     return "bad-witness-merkle-match";
+  }
+  if (s.includes("unexpected-witness")) {
+    return "unexpected-witness";
   }
   if (s.includes("coinbase value") || s.includes("bad-cb-amount") || s.includes("subsidy")) {
     return "bad-cb-amount";
@@ -30304,6 +30307,8 @@ function bip22FromConnectError(err) {
     return "bad-txns-accumulated-fee-outofrange";
   if (s.includes("bad-blk-sigops") || s.includes("sigops"))
     return "bad-blk-sigops";
+  if (s.includes("bad-txns-bip30") || s.includes("overwrite transaction"))
+    return "bad-txns-BIP30";
   if (s.includes("merkle"))
     return "bad-txnmrklroot";
   if (s.includes("witness commitment"))
@@ -32328,6 +32333,7 @@ class BlockSync {
 // src/rpc/server.ts
 init_database();
 import * as path2 from "path";
+import * as fs2 from "fs";
 init_asmap();
 init_params();
 init_block();
@@ -43259,6 +43265,8 @@ class RPCServer {
   currentWalletName = null;
   cookiePassword = null;
   cookiePath = null;
+  sizeOnDiskCache = 0;
+  sizeOnDiskCacheAt = 0;
   latchedIsIBD = true;
   blockSubmissionPaused = false;
   startedAt = Math.floor(Date.now() / 1000);
@@ -43782,7 +43790,7 @@ class RPCServer {
     const tipBitsNum = headerEntry ? headerEntry.header.bits : 486604799;
     const tipBitsHex = tipBitsNum.toString(16).padStart(8, "0");
     const tipTargetHex = compactToBigInt(tipBitsNum).toString(16).padStart(64, "0");
-    const sizeOnDisk = this.pruneManager?.calculateCurrentUsage?.() ?? 0;
+    const sizeOnDisk = this.computeSizeOnDisk();
     const result = {
       chain,
       blocks: bestBlock.height,
@@ -43810,6 +43818,33 @@ class RPCServer {
     }
     result.warnings = [];
     return result;
+  }
+  static SIZE_ON_DISK_TTL_MS = 30000;
+  computeSizeOnDisk() {
+    const tracked = this.pruneManager?.calculateCurrentUsage?.() ?? 0;
+    if (tracked > 0) {
+      return tracked;
+    }
+    const now = Date.now();
+    if (this.sizeOnDiskCache > 0 && now - this.sizeOnDiskCacheAt < RPCServer.SIZE_ON_DISK_TTL_MS) {
+      return this.sizeOnDiskCache;
+    }
+    let total = 0;
+    try {
+      const dir = this.db.path();
+      for (const entry of fs2.readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isFile())
+          continue;
+        try {
+          total += fs2.statSync(path2.join(dir, entry.name)).size;
+        } catch {}
+      }
+    } catch {
+      return this.sizeOnDiskCache;
+    }
+    this.sizeOnDiskCache = total;
+    this.sizeOnDiskCacheAt = now;
+    return total;
   }
   buildDeploymentState(height) {
     const p = this.params;
@@ -52776,7 +52811,7 @@ function parseFlag(arg) {
 async function loadConfig(datadir, confOverride) {
   const configPath = confOverride ? path3.isAbsolute(confOverride) ? confOverride : path3.join(datadir, confOverride) : path3.join(datadir, "hotbuns.conf");
   const config = {};
-  await fs2.promises.mkdir(datadir, { recursive: true });
+  await fs3.promises.mkdir(datadir, { recursive: true });
   const file = Bun.file(configPath);
   if (await file.exists()) {
     const content = await file.text();
@@ -53150,7 +53185,7 @@ function daemonizeAndExit(originalArgv) {
 }
 async function writePidFile(pidPath) {
   try {
-    await fs2.promises.writeFile(pidPath, `${process.pid}
+    await fs3.promises.writeFile(pidPath, `${process.pid}
 `, { flag: "w" });
   } catch (e) {
     console.error(`Failed to write PID file ${pidPath}:`, e.message);
@@ -53160,7 +53195,7 @@ function removePidFileSync(pidPath) {
   if (!pidPath)
     return;
   try {
-    fs2.unlinkSync(pidPath);
+    fs3.unlinkSync(pidPath);
   } catch {}
 }
 var activePidPath = null;
@@ -53273,7 +53308,7 @@ async function startNode(config) {
   setLogger(logger);
   const pidPath = mergedConfig.pid === "" ? null : mergedConfig.pid && path3.isAbsolute(mergedConfig.pid) ? mergedConfig.pid : mergedConfig.pid ? path3.join(mergedConfig.datadir, mergedConfig.pid) : path3.join(mergedConfig.datadir, "hotbuns.pid");
   if (pidPath) {
-    await fs2.promises.mkdir(mergedConfig.datadir, { recursive: true });
+    await fs3.promises.mkdir(mergedConfig.datadir, { recursive: true });
     await writePidFile(pidPath);
     activePidPath = pidPath;
   }
@@ -53856,7 +53891,7 @@ bitcoin_mem_arraybuffers_bytes ${mem.arrayBuffers}
   }
   if (typeof mergedConfig.readyFd === "number" && mergedConfig.readyFd >= 0) {
     try {
-      fs2.writeSync(mergedConfig.readyFd, `ready
+      fs3.writeSync(mergedConfig.readyFd, `ready
 `);
     } catch (e) {
       console.error(`Failed to write to --ready-fd=${mergedConfig.readyFd}:`, e.message);
@@ -54001,7 +54036,7 @@ async function cmdWalletCreate(config, args) {
     console.error("Usage: hotbuns wallet create --password=<password>");
     process.exit(1);
   }
-  await fs2.promises.mkdir(config.datadir, { recursive: true });
+  await fs3.promises.mkdir(config.datadir, { recursive: true });
   const walletPath = path3.join(config.datadir, "wallet.dat");
   const walletFile = Bun.file(walletPath);
   if (await walletFile.exists()) {

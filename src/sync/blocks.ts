@@ -167,6 +167,12 @@ function bip22FromConnectError(err: string): string {
   // W93: accumulated fee out-of-range is its own canonical token.
   if (s.includes("accumulated-fee-outofrange")) return "bad-txns-accumulated-fee-outofrange";
   if (s.includes("bad-blk-sigops") || s.includes("sigops")) return "bad-blk-sigops";
+  // BIP-30 duplicate-txid overwrite: connect_block emits
+  // "bad-txns-BIP30: tried to overwrite transaction ...". Core
+  // (validation.cpp:2471) rejects with "bad-txns-BIP30"; surface the exact
+  // token instead of collapsing to the generic "rejected" fallback. Placed
+  // before the merkle/script catch-alls so the specific token wins.
+  if (s.includes("bad-txns-bip30") || s.includes("overwrite transaction")) return "bad-txns-BIP30";
   if (s.includes("merkle")) return "bad-txnmrklroot";
   if (s.includes("witness commitment")) return "bad-witness-merkle-match";
   if (s.includes("coinbase scriptsig") || s.includes("bad-cb-length")) return "bad-cb-length";
