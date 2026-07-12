@@ -6,6 +6,7 @@
  */
 
 import * as path from "path";
+import * as fs from "fs";
 import type { ChainStateManager } from "../chain/state.js";
 import type { ChainDB } from "../storage/database.js";
 import { DBPrefix, BlockStatus } from "../storage/database.js";
@@ -600,6 +601,12 @@ export class RPCServer {
   private cookiePassword: string | null = null;
   /** Absolute path to the .cookie file written on startup. */
   private cookiePath: string | null = null;
+  /** Cached size_on_disk byte count + its capture time (ms), for the
+   *  block-store directory fallback in getblockchaininfo. TTL-bounded so a
+   *  full readdir walk of the (large) block store runs at most once per
+   *  SIZE_ON_DISK_TTL_MS window. */
+  private sizeOnDiskCache = 0;
+  private sizeOnDiskCacheAt = 0;
   /** Latched IBD state. Once false, cannot go back to true. */
   private latchedIsIBD: boolean = true;
 
@@ -1559,7 +1566,7 @@ export class RPCServer {
     const tipTargetHex = compactToBigInt(tipBitsNum).toString(16).padStart(64, "0");
 
     // size_on_disk: total block-storage bytes (Core m_blockman.CalculateCurrentUsage).
-    const sizeOnDisk = this.pruneManager?.calculateCurrentUsage?.() ?? 0;
+    const sizeOnDisk = this.computeSizeOnDisk();
 
     // Core v31.99 getblockchaininfo pushKV order (rpc/blockchain.cpp):
     //   chain, blocks, headers, bestblockhash, bits, target, difficulty, time,
@@ -1602,6 +1609,59 @@ export class RPCServer {
     result.warnings = [];
 
     return result;
+  }
+
+  /** TTL for the block-store directory size walk (ms). */
+  private static readonly SIZE_ON_DISK_TTL_MS = 30_000;
+
+  /**
+   * size_on_disk: actual on-disk bytes consumed by block storage, mirroring
+   * Core's `CBlockIndexWorkComparator`-independent `CalculateCurrentUsage()`
+   * (blockstorage.cpp), which sums the sizes of its block/undo files.
+   *
+   * hotbuns stores blocks in a LevelDB directory rather than Core's flat
+   * blk*.dat/rev*.dat files, so the flat-file accounting in
+   * PruneManager.calculateCurrentUsage() is 0 unless pruning's file tracker is
+   * active. When it reports a positive value (pruning/flat-file scheme in use)
+   * we trust it; otherwise we fall back to summing the byte sizes of the files
+   * in the block-store directory (`this.db.path()`), TTL-cached so the
+   * readdir/stat walk of the (large) store runs at most once per window.
+   *
+   * Cosmetic RPC-completeness only: no consensus/decision path reads this.
+   */
+  private computeSizeOnDisk(): number {
+    const tracked = this.pruneManager?.calculateCurrentUsage?.() ?? 0;
+    if (tracked > 0) {
+      return tracked;
+    }
+
+    const now = Date.now();
+    if (
+      this.sizeOnDiskCache > 0 &&
+      now - this.sizeOnDiskCacheAt < RPCServer.SIZE_ON_DISK_TTL_MS
+    ) {
+      return this.sizeOnDiskCache;
+    }
+
+    let total = 0;
+    try {
+      const dir = this.db.path();
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isFile()) continue;
+        try {
+          total += fs.statSync(path.join(dir, entry.name)).size;
+        } catch {
+          // File vanished mid-walk (LevelDB compaction) — skip it.
+        }
+      }
+    } catch {
+      // Block-store path unavailable — fall back to the last known value (or 0).
+      return this.sizeOnDiskCache;
+    }
+
+    this.sizeOnDiskCache = total;
+    this.sizeOnDiskCacheAt = now;
+    return total;
   }
 
   /**
