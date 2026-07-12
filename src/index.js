@@ -53579,27 +53579,49 @@ async function startNode(config) {
       console.log(`[orphan-pool] erased ${dropped} orphans on disconnect of ${peerKey(peer)}`);
     }
   });
+  let txAcceptThrowCount = 0;
+  let txAcceptThrowLastLog = 0;
+  const logTxAcceptThrow = (err) => {
+    txAcceptThrowCount++;
+    const now = Date.now();
+    if (now - txAcceptThrowLastLog < 30000)
+      return;
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[mempool] dropped tx: accept threw (${msg}); ${txAcceptThrowCount} such since last log`);
+    txAcceptThrowLastLog = now;
+    txAcceptThrowCount = 0;
+  };
   peerManager.onMessage("tx", async (peer, msg) => {
     if (msg.type !== "tx")
       return;
     if (!blockSync.isIBDComplete())
       return;
     const tx = msg.payload.tx;
-    const result = await mempool.acceptToMemoryPool(tx);
-    if (result.accepted) {
-      const txid = getTxId(tx);
-      const txidHex = txid.toString("hex");
-      const entry = mempool.getTransaction(txid);
-      const feeRate = entry ? entry.feeRate : 0;
-      txRelay.queueTxToAllFiltered(txidHex, feeRate);
-      console.log(`[mempool] Accepted tx ${txidHex.slice(0, 16)}... from ${peer.host}`);
-      feeEstimator.trackTransaction(txid, chainState.getBestBlock().height);
-      await processOrphanCascade(tx);
-    } else if (isMissingInputError(result.error)) {
-      const admit = orphanPool.add(tx, peerKey(peer));
-      if (admit.ok) {
-        console.log(`[orphan-pool] held ${admit.entry.txid.toString("hex").slice(0, 16)}... from ${peer.host} (pool=${orphanPool.size()})`);
+    let result;
+    try {
+      result = await mempool.acceptToMemoryPool(tx);
+    } catch (err) {
+      logTxAcceptThrow(err);
+      return;
+    }
+    try {
+      if (result.accepted) {
+        const txid = getTxId(tx);
+        const txidHex = txid.toString("hex");
+        const entry = mempool.getTransaction(txid);
+        const feeRate = entry ? entry.feeRate : 0;
+        txRelay.queueTxToAllFiltered(txidHex, feeRate);
+        console.log(`[mempool] Accepted tx ${txidHex.slice(0, 16)}... from ${peer.host}`);
+        feeEstimator.trackTransaction(txid, chainState.getBestBlock().height);
+        await processOrphanCascade(tx);
+      } else if (isMissingInputError(result.error)) {
+        const admit = orphanPool.add(tx, peerKey(peer));
+        if (admit.ok) {
+          console.log(`[orphan-pool] held ${admit.entry.txid.toString("hex").slice(0, 16)}... from ${peer.host} (pool=${orphanPool.size()})`);
+        }
       }
+    } catch (err) {
+      logTxAcceptThrow(err);
     }
   });
   async function processOrphanCascade(parent) {
@@ -54267,8 +54289,17 @@ async function main() {
 }
 
 // src/index.ts
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("Unhandled rejection at:", promise, "reason:", reason);
+var unhandledRejCount = 0;
+var unhandledRejLastLog = 0;
+process.on("unhandledRejection", (reason) => {
+  unhandledRejCount++;
+  const now = Date.now();
+  if (now - unhandledRejLastLog < 30000)
+    return;
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  console.error(`Unhandled rejection: ${msg} (${unhandledRejCount} since last log)`);
+  unhandledRejLastLog = now;
+  unhandledRejCount = 0;
 });
 process.on("uncaughtException", (err) => {
   console.error("Uncaught exception:", err);

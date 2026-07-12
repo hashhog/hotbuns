@@ -2187,6 +2187,25 @@ async function startNode(config: NodeConfig): Promise<void> {
     }
   });
 
+  // Rate-limited logger for exceptions thrown out of the mempool-accept path
+  // (see the INFRA GUARD note in the "tx" handler). Emits at most one compact
+  // one-line message per 30s with a suppressed-count, instead of one full
+  // source-mapped stack trace per offending tx. Never renders the Error object
+  // (that is what triggers Bun's expensive source-frame reads).
+  let txAcceptThrowCount = 0;
+  let txAcceptThrowLastLog = 0;
+  const logTxAcceptThrow = (err: unknown): void => {
+    txAcceptThrowCount++;
+    const now = Date.now();
+    if (now - txAcceptThrowLastLog < 30000) return;
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `[mempool] dropped tx: accept threw (${msg}); ${txAcceptThrowCount} such since last log`
+    );
+    txAcceptThrowLastLog = now;
+    txAcceptThrowCount = 0;
+  };
+
   // Handle incoming tx messages: validate via AcceptToMemoryPool and relay
   // Reference: bitcoin-core/src/net_processing.cpp ProcessMessage(NetMsgType::TX)
   // Core returns early at line 4395: if (m_chainman.IsInitialBlockDownload()) return;
@@ -2198,34 +2217,58 @@ async function startNode(config: NodeConfig): Promise<void> {
     // IBD skip gate — mirrors Core net_processing.cpp:4395
     if (!blockSync.isIBDComplete()) return;
     const tx = msg.payload.tx;
-    const result = await mempool.acceptToMemoryPool(tx);
-    if (result.accepted) {
-      // Successful admission. Relay to peers and cascade-promote any orphans
-      // that were waiting on this tx as a parent.
-      const txid = getTxId(tx);
-      const txidHex = txid.toString("hex");
-      const entry = mempool.getTransaction(txid);
-      const feeRate = entry ? entry.feeRate : 0;
-      txRelay.queueTxToAllFiltered(txidHex, feeRate);
-      console.log(`[mempool] Accepted tx ${txidHex.slice(0, 16)}... from ${peer.host}`);
-      // Track the newly-admitted tx in the fee estimator so processBlock can
-      // record its confirmation time later (Core: CBlockPolicyEstimator::
-      // processTransaction). Only called post-IBD (guarded above).
-      feeEstimator.trackTransaction(txid, chainState.getBestBlock().height);
-      await processOrphanCascade(tx);
-    } else if (isMissingInputError(result.error)) {
-      // Missing input — try the orphan pool. Core's net_processing.cpp
-      // routes TX_MISSING_INPUTS into AddTx() instead of marking the tx
-      // recently-rejected, so the real parent can still be requested
-      // (it will arrive via a peer's INV/HEADERS/getdata flow).
-      const admit = orphanPool.add(tx, peerKey(peer));
-      if (admit.ok) {
-        console.log(
-          `[orphan-pool] held ${admit.entry.txid.toString("hex").slice(0, 16)}... ` +
-            `from ${peer.host} (pool=${orphanPool.size()})`
-        );
+    // INFRA GUARD (not a consensus change): mempool script validation can THROW
+    // (e.g. a taproot key-path spend reaches verifyScript without a taproot
+    // context and raises TAPROOT_CONTEXT_MISSING). This async handler had no
+    // try/catch, so the throw escaped as an *unhandled promise rejection*. Bun's
+    // process-level handler then rendered a full stack trace with source-map
+    // code frames (synchronous source-file reads) on every such tx — flooding
+    // the log (132MB) and starving the single-threaded event loop, which made
+    // the RPC server (Bun.serve) time out (observed as UNREACHABLE in the
+    // attestation harness at --max-time 90). Catching here converts the crash
+    // into the SAME accept/reject outcome that already occurred (the tx was
+    // dropped when it threw — no relay, no orphan-add) but without the flood.
+    // The accept/reject DECISION is unchanged; only error handling + logging is.
+    let result: { accepted: boolean; error?: string };
+    try {
+      result = await mempool.acceptToMemoryPool(tx);
+    } catch (err) {
+      logTxAcceptThrow(err);
+      return;
+    }
+    try {
+      if (result.accepted) {
+        // Successful admission. Relay to peers and cascade-promote any orphans
+        // that were waiting on this tx as a parent.
+        const txid = getTxId(tx);
+        const txidHex = txid.toString("hex");
+        const entry = mempool.getTransaction(txid);
+        const feeRate = entry ? entry.feeRate : 0;
+        txRelay.queueTxToAllFiltered(txidHex, feeRate);
+        console.log(`[mempool] Accepted tx ${txidHex.slice(0, 16)}... from ${peer.host}`);
+        // Track the newly-admitted tx in the fee estimator so processBlock can
+        // record its confirmation time later (Core: CBlockPolicyEstimator::
+        // processTransaction). Only called post-IBD (guarded above).
+        feeEstimator.trackTransaction(txid, chainState.getBestBlock().height);
+        await processOrphanCascade(tx);
+      } else if (isMissingInputError(result.error)) {
+        // Missing input — try the orphan pool. Core's net_processing.cpp
+        // routes TX_MISSING_INPUTS into AddTx() instead of marking the tx
+        // recently-rejected, so the real parent can still be requested
+        // (it will arrive via a peer's INV/HEADERS/getdata flow).
+        const admit = orphanPool.add(tx, peerKey(peer));
+        if (admit.ok) {
+          console.log(
+            `[orphan-pool] held ${admit.entry.txid.toString("hex").slice(0, 16)}... ` +
+              `from ${peer.host} (pool=${orphanPool.size()})`
+          );
+        }
+        // ok=false is a quiet drop — duplicate / oversize / peer-cap bounds.
       }
-      // ok=false is a quiet drop — duplicate / oversize / peer-cap bounds.
+    } catch (err) {
+      // Post-acceptance work (relay / orphan cascade) threw — again, catch so it
+      // cannot escape as an unhandled rejection and flood the event loop.
+      logTxAcceptThrow(err);
     }
   });
 
