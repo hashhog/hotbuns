@@ -411,30 +411,34 @@ function encodeStrictDER(r: bigint, s: bigint): Buffer {
 }
 
 /**
- * Verify an ECDSA signature using lax DER parsing.
- * This matches Bitcoin Core's behavior when SCRIPT_VERIFY_DERSIG is not set:
- * non-strict DER encodings are accepted as long as the (r,s) values are valid.
- * Also handles hybrid pubkeys (0x06/0x07 prefix).
+ * @noble/curves fallback for ecdsaVerifyLax, used only when the libsecp256k1
+ * FFI is unavailable. Exported so it can be exercised directly (the FFI branch
+ * shadows it whenever the C library loads).
  *
- * Uses libsecp256k1 FFI when available (default, ~30x faster than @noble).
- * Falls back to @noble/curves when FFI is unavailable.
+ * @noble does not understand hybrid pubkey tags (0x06/0x07), so we rewrite them
+ * to 0x04 before parsing — but we FIRST validate the tag's parity against the
+ * actual parity of Y, exactly as libsecp256k1 does
+ * (bitcoin-core/src/secp256k1/src/eckey_impl.h:28-31): a HYBRID_EVEN (0x06) /
+ * HYBRID_ODD (0x07) tag whose low bit disagrees with is_odd(y) is an invalid
+ * key. Y is the trailing 32 bytes (big-endian); once @noble's assertValidity
+ * confirms Y < p, is_odd(y) is exactly its least-significant bit (pk[64] & 1).
+ * A mismatch means the key is invalid -> return false (CHECKSIG pushes false),
+ * matching Core. Rewriting the tag unconditionally would false-accept a
+ * wrong-parity hybrid key (hotbuns#7 chain-split bug).
  */
-export function ecdsaVerifyLax(
+export function ecdsaVerifyLaxNoble(
   signature: Buffer,
   msgHash: Buffer,
   publicKey: Buffer
 ): boolean {
-  // Consensus hot path: use libsecp256k1 FFI when available
-  if (FFI_AVAILABLE) {
-    return ecdsaVerifyLaxFFICounted(signature, msgHash, publicKey);
-  }
-
-  // Fallback to @noble/curves with JS lax DER parser
-  // Handle hybrid pubkeys (0x06/0x07) by converting to uncompressed (0x04)
   let pk = publicKey;
   if (pk.length === 65 && (pk[0] === 0x06 || pk[0] === 0x07)) {
+    // Reject wrong-parity hybrid keys before discarding the tag.
+    const tagIsOdd = pk[0] === 0x07;
+    const yIsOdd = (pk[64] & 1) === 1;
+    if (tagIsOdd !== yIsOdd) return false;
     pk = Buffer.from(pk);
-    pk[0] = 0x04;
+    pk[0] = 0x04; // @noble parses/validates uncompressed; on-curve + Y<p checks apply
   }
 
   try {
@@ -450,6 +454,29 @@ export function ecdsaVerifyLax(
   } catch {
     return false;
   }
+}
+
+/**
+ * Verify an ECDSA signature using lax DER parsing.
+ * This matches Bitcoin Core's behavior when SCRIPT_VERIFY_DERSIG is not set:
+ * non-strict DER encodings are accepted as long as the (r,s) values are valid.
+ * Hybrid pubkeys (0x06/0x07 prefix) are parity-validated, matching Core.
+ *
+ * Uses libsecp256k1 FFI when available (default, ~30x faster than @noble).
+ * Falls back to @noble/curves when FFI is unavailable.
+ */
+export function ecdsaVerifyLax(
+  signature: Buffer,
+  msgHash: Buffer,
+  publicKey: Buffer
+): boolean {
+  // Consensus hot path: use libsecp256k1 FFI when available
+  if (FFI_AVAILABLE) {
+    return ecdsaVerifyLaxFFICounted(signature, msgHash, publicKey);
+  }
+
+  // Fallback to @noble/curves with JS lax DER parser
+  return ecdsaVerifyLaxNoble(signature, msgHash, publicKey);
 }
 
 /**

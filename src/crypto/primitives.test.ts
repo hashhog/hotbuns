@@ -6,6 +6,7 @@ import {
   ecdsaSign,
   ecdsaVerify,
   ecdsaVerifyBatch,
+  ecdsaVerifyLaxNoble,
   privateKeyToPublicKey,
   privateKeyToXOnlyPubKey,
   isValidPrivateKey,
@@ -160,6 +161,36 @@ describe("ecdsaVerifyBatch", () => {
 
     expect(results).toEqual([true, true, false]);
   });
+});
+
+// hotbuns#7: the @noble fallback for ecdsaVerifyLax (used only when the
+// libsecp256k1 FFI is unavailable) must validate the hybrid pubkey parity tag
+// (0x06 even-Y / 0x07 odd-Y) against the actual parity of Y, matching Core /
+// libsecp256k1 (eckey_impl.h:28-31). It previously rewrote the tag to 0x04
+// unconditionally, false-accepting a wrong-parity hybrid key.
+describe("ecdsaVerifyLaxNoble — hybrid pubkey parity (hotbuns#7)", () => {
+  for (let i = 0; i < 8; i++) {
+    test(`key #${i}: correct parity verifies, wrong parity rejected`, () => {
+      const priv = sha256Hash(Buffer.from(`hotbuns7-noble-${i}`));
+      const pub = privateKeyToPublicKey(priv, false); // 0x04 || X || Y
+      const msg = sha256Hash(Buffer.from(`m${i}`));
+      const sig = ecdsaSign(msg, priv);
+      const yIsOdd = (pub[64] & 1) === 1;
+
+      // Compressed + uncompressed keys are unaffected.
+      const compressed = privateKeyToPublicKey(priv, true);
+      expect(ecdsaVerifyLaxNoble(sig, msg, compressed)).toBe(true);
+      expect(ecdsaVerifyLaxNoble(sig, msg, pub)).toBe(true);
+
+      const correct = Buffer.from(pub);
+      correct[0] = yIsOdd ? 0x07 : 0x06;
+      expect(ecdsaVerifyLaxNoble(sig, msg, correct)).toBe(true);
+
+      const wrong = Buffer.from(pub);
+      wrong[0] = yIsOdd ? 0x06 : 0x07;
+      expect(ecdsaVerifyLaxNoble(sig, msg, wrong)).toBe(false);
+    });
+  }
 });
 
 describe("isValidPrivateKey", () => {
