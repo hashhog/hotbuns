@@ -384,7 +384,14 @@ export function ecdsaVerifyFFI(
  *
  * Matches Bitcoin Core's behavior when SCRIPT_VERIFY_DERSIG is NOT set:
  * non-strict DER encodings are accepted as long as (r,s) are valid scalars.
- * Also handles hybrid pubkeys (0x06/0x07 prefix).
+ *
+ * Hybrid pubkeys (0x06/0x07 prefix) are passed through UNMODIFIED to
+ * secp256k1_ec_pubkey_parse, exactly as Core does (src/pubkey.cpp
+ * CPubKey::Verify). libsecp256k1 validates the parity tag against the actual
+ * parity of Y (eckey_impl.h:28-31: a HYBRID_EVEN/HYBRID_ODD tag whose low bit
+ * disagrees with is_odd(y) fails to parse). We must NOT rewrite the tag to
+ * 0x04 — doing so discards the parity check and false-accepts a wrong-parity
+ * hybrid key (hotbuns#7 chain-split bug).
  *
  * Low-S is NOT enforced here — the script interpreter enforces SCRIPT_VERIFY_LOW_S
  * by checking the high bit of S before calling this function.
@@ -402,14 +409,9 @@ export function ecdsaVerifyLaxFFI(
   if (!FFI_AVAILABLE) return false;
   if (msgHash.length !== 32) return false;
 
-  // Handle hybrid pubkeys (0x06/0x07) — convert to uncompressed (0x04)
-  let pk = publicKey as Uint8Array;
-  if (pk.length === 65 && (pk[0] === 0x06 || pk[0] === 0x07)) {
-    pk = new Uint8Array(pk);
-    pk[0] = 0x04;
-  }
-
-  if (!_parsePubkey(pk)) return false;
+  // Pass raw bytes (incl. hybrid 0x06/0x07) straight to libsecp, which parses
+  // and parity-validates hybrid keys natively — matching Core's CHECKSIG.
+  if (!_parsePubkey(publicKey as Uint8Array)) return false;
 
   // Lax DER parse: tolerate non-canonical encodings, extract raw (r,s)
   const compact = _laxDerToCompact(signature as Uint8Array);

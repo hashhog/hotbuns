@@ -311,17 +311,40 @@ describe("ecdsaVerifyLaxFFI — lax DER handling", () => {
     expect(ecdsaVerifyLaxFFI(sig, msg, pubKey)).toBe(true);
   });
 
-  test("hybrid pubkey (0x06 prefix) is accepted", () => {
-    const privKey = deterministicPrivKey(1);
-    const msg = Buffer.alloc(32, 0x11);
-    const sig = Buffer.from(nobleSecp.sign(msg, privKey, { prehash: false, format: "der" }));
-    const uncompressed = Buffer.from(nobleSecp.getPublicKey(privKey, false));
-    const hybrid06 = Buffer.from(uncompressed);
-    hybrid06[0] = 0x06; // hybrid, even y
-    // Verify that the lax path handles the hybrid prefix
-    const result = ecdsaVerifyLaxFFI(sig, msg, hybrid06);
-    // hybrid06 may or may not verify depending on y parity — just check no crash
-    expect(typeof result).toBe("boolean");
+  // hotbuns#7: a hybrid pubkey tag (0x06 = even-Y, 0x07 = odd-Y) is valid ONLY
+  // if its low bit matches the actual parity of Y. libsecp256k1 enforces this
+  // (eckey_impl.h:28-31); Core's CHECKSIG hands raw bytes to
+  // secp256k1_ec_pubkey_parse, so a wrong-parity hybrid key fails to parse ->
+  // CHECKSIG false. The lax path used to rewrite the tag to 0x04, bypassing the
+  // check and false-accepting. These tests pin both correct- and wrong-parity
+  // behavior against parsePubkeyFFI (the same libsecp parse Core uses).
+  test("hybrid pubkey with CORRECT parity verifies (matches Core)", () => {
+    for (let i = 0; i < 8; i++) {
+      const privKey = deterministicPrivKey(i);
+      const msg = Buffer.alloc(32, 0x11 + i);
+      const sig = Buffer.from(nobleSecp.sign(msg, privKey, { prehash: false, format: "der" }));
+      const uncompressed = Buffer.from(nobleSecp.getPublicKey(privKey, false));
+      const yIsOdd = (uncompressed[64] & 1) === 1;
+      const correct = Buffer.from(uncompressed);
+      correct[0] = yIsOdd ? 0x07 : 0x06; // tag matches Y parity
+      expect(parsePubkeyFFI(correct)).toBe(true); // libsecp/Core accepts the key
+      expect(ecdsaVerifyLaxFFI(sig, msg, correct)).toBe(true);
+    }
+  });
+
+  test("hybrid pubkey with WRONG parity is rejected (matches Core, hotbuns#7)", () => {
+    for (let i = 0; i < 8; i++) {
+      const privKey = deterministicPrivKey(i);
+      const msg = Buffer.alloc(32, 0x11 + i);
+      const sig = Buffer.from(nobleSecp.sign(msg, privKey, { prehash: false, format: "der" }));
+      const uncompressed = Buffer.from(nobleSecp.getPublicKey(privKey, false));
+      const yIsOdd = (uncompressed[64] & 1) === 1;
+      const wrong = Buffer.from(uncompressed);
+      wrong[0] = yIsOdd ? 0x06 : 0x07; // tag disagrees with Y parity
+      expect(parsePubkeyFFI(wrong)).toBe(false); // libsecp/Core rejects the key
+      // Pre-fix this false-accepted (returned true); post-fix it matches Core.
+      expect(ecdsaVerifyLaxFFI(sig, msg, wrong)).toBe(false);
+    }
   });
 
   test("tampered signature fails via lax path", () => {
