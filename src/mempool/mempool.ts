@@ -47,7 +47,12 @@ import {
   getBareMultisigParams,
   type ScriptFlags,
 } from "../script/interpreter.js";
-import { sigHashLegacy, sigHashWitnessV0 } from "../validation/tx.js";
+import {
+  sigHashLegacy,
+  sigHashWitnessV0,
+  buildTaprootContext,
+  type TaprootSigHashCache,
+} from "../validation/tx.js";
 import {
   shouldSkipScripts,
   type AssumeValidBlockEntry,
@@ -2159,6 +2164,25 @@ export class Mempool {
     // Mempool uses standard (policy) flags — stricter than consensus block flags.
     const flags = getStandardFlags(this.tipHeight);
 
+    // All-prevouts (scriptPubKey, amount) of EVERY input, in input order —
+    // already resolved above in step 4 (confirmed UTXO set + mempool
+    // parents). The BIP-341 sighash commits to sha_amounts /
+    // sha_scriptpubkeys over ALL prevouts, so taproot verification needs the
+    // full array, not just the input being checked. Mirrors Core
+    // CheckInputScripts (validation.cpp:2086-2097), which gathers every
+    // spent coin into PrecomputedTransactionData::Init(tx, spent_outputs)
+    // before any signature check — on the mempool path just like the block
+    // path.
+    const prevOuts = inputUtxos.map(({ utxo }) => ({
+      scriptPubKey: utxo.scriptPubKey,
+      value: utxo.amount,
+    }));
+    // Shared per-tx taproot sighash cache, reused across the policy and
+    // consensus verifyAllInputs passes below — sighashes do not depend on
+    // script flags. Core likewise reuses ws.m_precomputed_txdata "across
+    // PolicyScriptChecks and ConsensusScriptChecks" (validation.cpp:660-661).
+    const taprootSigHashCache: TaprootSigHashCache = {};
+
     // Helper to verify all inputs under a given flag set. Used twice: once
     // for PolicyScriptChecks (standard flags) and once for
     // ConsensusScriptChecks (consensus block flags).
@@ -2180,17 +2204,38 @@ export class Mempool {
             return sigHashLegacy(tx, i, subscript, hashType);
           }
         };
-        const valid = verifyScript(
-          input.scriptSig,
-          utxo.scriptPubKey,
-          input.witness,
-          flagSet,
-          sigHasher,
-          undefined,
-          { txVersion: tx.version, txLockTime: tx.lockTime, txSequence: input.sequence }
-        );
-        if (!valid) {
-          return { ok: false, reason: `Script validation failed for input ${i}` };
+        // BIP-341 taproot context: key-path AND script-path sighash closures
+        // over all prevouts, built by the same helper the block path uses
+        // (validation/tx.ts verifyInputSignature). DIV-hotbuns-044: this
+        // argument was literally `undefined`, so every P2TR key-path relay
+        // spend threw SCRIPT_ERR_TAPROOT_CONTEXT_MISSING and was dropped
+        // from the mempool. The interpreter only consults taprootCtx for
+        // P2TR scriptPubKeys, so passing it unconditionally is harmless for
+        // every other script type.
+        const taprootCtx = buildTaprootContext(tx, i, prevOuts, taprootSigHashCache);
+        try {
+          const valid = verifyScript(
+            input.scriptSig,
+            utxo.scriptPubKey,
+            input.witness,
+            flagSet,
+            sigHasher,
+            taprootCtx,
+            { txVersion: tx.version, txLockTime: tx.lockTime, txSequence: input.sequence }
+          );
+          if (!valid) {
+            return { ok: false, reason: `Script validation failed for input ${i}` };
+          }
+        } catch (e) {
+          // ScriptError (e.g. SCRIPT_ERR_SCHNORR_SIG on an invalid taproot
+          // signature) → clean reject reason, mirroring the try/catch the
+          // block path keeps around its verifyScript/verifyTaproot calls in
+          // validation/tx.ts. Core maps script failures to a
+          // TxValidationState reject reason, never an escaping exception.
+          return {
+            ok: false,
+            reason: `Script validation failed for input ${i}: ${(e as Error).message}`,
+          };
         }
       }
       return { ok: true };

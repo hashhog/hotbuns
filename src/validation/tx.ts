@@ -13,6 +13,9 @@ import { BufferReader, BufferWriter, varIntSize } from "../wire/serialization.js
 import { hash256, sha256Hash, ecdsaVerify, schnorrVerify, taggedHash } from "../crypto/primitives.js";
 import type { UTXOEntry } from "../storage/database.js";
 import { globalSigCache } from "./sig_cache.js";
+// Type-only import — erased at compile time, so it does NOT create the
+// runtime interpreter.ts ↔ tx.ts cycle that the lazy require()s below avoid.
+import type { TaprootContext } from "../script/interpreter.js";
 
 /**
  * Script verification flags.
@@ -1613,6 +1616,63 @@ export function sigHashTaprootScriptPath(
 }
 
 /**
+ * Build the BIP-341 TaprootContext — key-path AND script-path sighash
+ * closures over ALL prevouts — for one input of `tx`.
+ *
+ * Shared by block validation (`verifyInputSignature`: both the dedicated
+ * P2TR branch and the catch-all `verifyScript` branch) and by mempool ATMP
+ * (`mempool.ts` verifyAllInputs), so both paths compute identical BIP-341
+ * sighashes from the same all-prevouts data. This mirrors Bitcoin Core,
+ * where the mempool and block paths share one PrecomputedTransactionData:
+ * MemPoolAccept keeps `ws.m_precomputed_txdata` ("Reused across
+ * PolicyScriptChecks and ConsensusScriptChecks", validation.cpp:660-661),
+ * CheckInputScripts gathers EVERY spent coin into
+ * `txdata.Init(tx, std::move(spent_outputs))` (validation.cpp:2086-2097),
+ * and SignatureHashSchnorr consumes the resulting
+ * m_spent_amounts_single_hash / m_spent_scripts_single_hash precomputations
+ * (interpreter.cpp:1447-1449, 1483-1503).
+ *
+ * Detects the BIP-341 annex on this input's witness (last element tagged
+ * 0x50 when the stack has >= 2 items) and bakes
+ * sha_annex = sha256(compact_size(len(annex)) || annex) into both closures.
+ *
+ * @param prevOuts - (scriptPubKey, value) of EVERY input's prevout, in
+ *   input order — length MUST equal tx.inputs.length (sigMsgTaproot throws
+ *   otherwise).
+ * @param cache - shared per-tx TaprootSigHashCache so multiple taproot
+ *   inputs in one tx don't recompute sha_prevouts/amounts/scriptpubkeys.
+ */
+export function buildTaprootContext(
+  tx: Transaction,
+  inputIndex: number,
+  prevOuts: { scriptPubKey: Buffer; value: bigint }[],
+  cache: TaprootSigHashCache
+): TaprootContext {
+  const witness = tx.inputs[inputIndex].witness;
+
+  // Detect annex (last witness element starting with 0x50 when stack has >= 2 items).
+  // BIP-341 sha_annex = sha256(compact_size(annex_len) || annex).
+  let annexHash: Buffer | undefined = undefined;
+  if (witness.length >= 2) {
+    const last = witness[witness.length - 1];
+    if (last.length > 0 && last[0] === 0x50) {
+      const annexW = new BufferWriter();
+      annexW.writeVarBytes(last);
+      annexHash = sha256Hash(annexW.toBuffer());
+    }
+  }
+
+  return {
+    keyPathSigHasher: (hashType: number) =>
+      sigHashTaproot(tx, inputIndex, prevOuts, hashType, 0,
+        annexHash, undefined, undefined, 0xffffffff, cache),
+    scriptPathSigHasher: (hashType: number, leafHash: Buffer, codeSepPos: number) =>
+      sigHashTaproot(tx, inputIndex, prevOuts, hashType, 1,
+        annexHash, leafHash, 0x00, codeSepPos, cache),
+  };
+}
+
+/**
  * Verify a single input script (P2PKH / P2WPKH / P2TR — others fall through).
  *
  * For P2WPKH: witness[0] = signature (DER + sighash), witness[1] = pubkey
@@ -1703,35 +1763,17 @@ export function verifyInputSignature(
       return { valid: false, inputIndex, error: "Taproot verify requires all prev-outputs" };
     }
 
-    // Detect annex (last witness element starting with 0x50 when stack has >= 2 items)
-    let annexHash: Buffer | undefined = undefined;
-    if (input.witness.length >= 2) {
-      const last = input.witness[input.witness.length - 1];
-      if (last.length > 0 && last[0] === 0x50) {
-        // BIP-341 sha_annex = sha256(compact_size(annex_len) || annex)
-        const annexW = new BufferWriter();
-        annexW.writeVarBytes(last);
-        annexHash = sha256Hash(annexW.toBuffer());
-      }
-    }
-
     const prevOuts = utxos.map(u => ({
       scriptPubKey: u.scriptPubKey,
       value: u.amount,
     }));
     const tprCache = taprootCache ?? {};
 
-    // Build TaprootContext closures over this input's prevouts + annex.
+    // Build TaprootContext closures over this input's prevouts + annex via
+    // the shared builder (also used by the mempool ATMP path).
     // verifyTaproot in the interpreter handles BIP-341 dispatch (key-path
     // vs script-path) + control-block walk + tapscript exec.
-    const taprootCtx = {
-      keyPathSigHasher: (hashType: number) =>
-        sigHashTaproot(tx, inputIndex, prevOuts, hashType, 0,
-          annexHash, undefined, undefined, 0xffffffff, tprCache),
-      scriptPathSigHasher: (hashType: number, leafHash: Buffer, codeSepPos: number) =>
-        sigHashTaproot(tx, inputIndex, prevOuts, hashType, 1,
-          annexHash, leafHash, 0x00, codeSepPos, tprCache),
-    };
+    const taprootCtx = buildTaprootContext(tx, inputIndex, prevOuts, tprCache);
 
     // Lazy require to avoid a circular import (interpreter.ts ↔ tx.ts).
     const interp = require("../script/interpreter.js") as typeof import("../script/interpreter.js");
@@ -1790,32 +1832,16 @@ export function verifyInputSignature(
     value: u.amount,
   }));
 
-  // Detect annex (Taproot only — harmless for non-Taproot scripts since
-  // the interpreter ignores taprootCtx unless scriptPubKey is P2TR).
-  let annexHash: Buffer | undefined = undefined;
-  if (input.witness.length >= 2) {
-    const last = input.witness[input.witness.length - 1];
-    if (last.length > 0 && last[0] === 0x50) {
-      const annexW = new BufferWriter();
-      annexW.writeVarBytes(last);
-      annexHash = sha256Hash(annexW.toBuffer());
-    }
-  }
-
   const legacySigHasher = (subscript: Buffer, hashType: number) =>
     sigHashLegacy(tx, inputIndex, subscript, hashType);
 
   const witnessSigHasher = (scriptCode: Buffer, hashType: number) =>
     sigHashWitnessV0Cached(tx, inputIndex, scriptCode, utxo.amount, hashType, cache);
 
-  const taprootCtx = {
-    keyPathSigHasher: (hashType: number) =>
-      sigHashTaproot(tx, inputIndex, prevOuts, hashType, 0,
-        annexHash, undefined, undefined, 0xffffffff, tprCache),
-    scriptPathSigHasher: (hashType: number, leafHash: Buffer, codeSepPos: number) =>
-      sigHashTaproot(tx, inputIndex, prevOuts, hashType, 1,
-        annexHash, leafHash, 0x00, codeSepPos, tprCache),
-  };
+  // Shared TaprootContext builder (annex detection + key/script-path sighash
+  // closures). Harmless for non-Taproot scripts since the interpreter ignores
+  // taprootCtx unless scriptPubKey is P2TR.
+  const taprootCtx = buildTaprootContext(tx, inputIndex, prevOuts, tprCache);
 
   const txContext = {
     txVersion: tx.version,
