@@ -7229,12 +7229,7 @@ function ecdsaVerifyLaxFFI(signature, msgHash, publicKey) {
     return false;
   if (msgHash.length !== 32)
     return false;
-  let pk = publicKey;
-  if (pk.length === 65 && (pk[0] === 6 || pk[0] === 7)) {
-    pk = new Uint8Array(pk);
-    pk[0] = 4;
-  }
-  if (!_parsePubkey(pk))
+  if (!_parsePubkey(publicKey))
     return false;
   const compact = _laxDerToCompact(signature);
   if (!compact)
@@ -7314,6 +7309,7 @@ __export(exports_primitives, {
   hash256: () => hash256,
   hash160: () => hash160,
   getSha256Implementation: () => getSha256Implementation,
+  ecdsaVerifyLaxNoble: () => ecdsaVerifyLaxNoble,
   ecdsaVerifyLax: () => ecdsaVerifyLax,
   ecdsaVerifyBatch: () => ecdsaVerifyBatch,
   ecdsaVerify: () => ecdsaVerify,
@@ -7535,12 +7531,13 @@ function encodeStrictDER(r, s) {
     sDer
   ]);
 }
-function ecdsaVerifyLax(signature, msgHash, publicKey) {
-  if (FFI_AVAILABLE) {
-    return ecdsaVerifyLaxFFICounted(signature, msgHash, publicKey);
-  }
+function ecdsaVerifyLaxNoble(signature, msgHash, publicKey) {
   let pk = publicKey;
   if (pk.length === 65 && (pk[0] === 6 || pk[0] === 7)) {
+    const tagIsOdd = pk[0] === 7;
+    const yIsOdd = (pk[64] & 1) === 1;
+    if (tagIsOdd !== yIsOdd)
+      return false;
     pk = Buffer.from(pk);
     pk[0] = 4;
   }
@@ -7553,6 +7550,12 @@ function ecdsaVerifyLax(signature, msgHash, publicKey) {
   } catch {
     return false;
   }
+}
+function ecdsaVerifyLax(signature, msgHash, publicKey) {
+  if (FFI_AVAILABLE) {
+    return ecdsaVerifyLaxFFICounted(signature, msgHash, publicKey);
+  }
+  return ecdsaVerifyLaxNoble(signature, msgHash, publicKey);
 }
 function ecdsaVerifyBatch(signatures) {
   const results = new Array(signatures.length);
@@ -10616,6 +10619,7 @@ __export(exports_tx, {
   decodeTxWitnessAware: () => decodeTxWitnessAware,
   checkSequenceLocks: () => checkSequenceLocks,
   calculateSequenceLocks: () => calculateSequenceLocks,
+  buildTaprootContext: () => buildTaprootContext,
   bip68VersionActive: () => bip68VersionActive,
   ScriptFlags: () => ScriptFlags,
   SIGHASH_SINGLE: () => SIGHASH_SINGLE,
@@ -11467,6 +11471,22 @@ function sigHashTaprootKeyPath(tx, inputIndex, prevOuts, hashType, annexHash, ca
 function sigHashTaprootScriptPath(tx, inputIndex, prevOuts, hashType, annexHash, tapLeafHash, codeSepPos, cache) {
   return sigHashTaproot(tx, inputIndex, prevOuts, hashType, 1, annexHash, tapLeafHash, 0, codeSepPos, cache);
 }
+function buildTaprootContext(tx, inputIndex, prevOuts, cache) {
+  const witness = tx.inputs[inputIndex].witness;
+  let annexHash = undefined;
+  if (witness.length >= 2) {
+    const last = witness[witness.length - 1];
+    if (last.length > 0 && last[0] === 80) {
+      const annexW = new BufferWriter;
+      annexW.writeVarBytes(last);
+      annexHash = sha256Hash(annexW.toBuffer());
+    }
+  }
+  return {
+    keyPathSigHasher: (hashType) => sigHashTaproot(tx, inputIndex, prevOuts, hashType, 0, annexHash, undefined, undefined, 4294967295, cache),
+    scriptPathSigHasher: (hashType, leafHash, codeSepPos) => sigHashTaproot(tx, inputIndex, prevOuts, hashType, 1, annexHash, leafHash, 0, codeSepPos, cache)
+  };
+}
 function verifyInputSignature(tx, inputIndex, utxo, cache, utxos, taprootCache, scriptVerifyFlags = 1 /* VERIFY_P2SH */ | 2 /* VERIFY_WITNESS */ | 512 /* VERIFY_TAPROOT */) {
   const input = tx.inputs[inputIndex];
   const scriptPubKey = utxo.scriptPubKey;
@@ -11492,24 +11512,12 @@ function verifyInputSignature(tx, inputIndex, utxo, cache, utxos, taprootCache, 
     if (!utxos || utxos.length !== tx.inputs.length) {
       return { valid: false, inputIndex, error: "Taproot verify requires all prev-outputs" };
     }
-    let annexHash2 = undefined;
-    if (input.witness.length >= 2) {
-      const last = input.witness[input.witness.length - 1];
-      if (last.length > 0 && last[0] === 80) {
-        const annexW = new BufferWriter;
-        annexW.writeVarBytes(last);
-        annexHash2 = sha256Hash(annexW.toBuffer());
-      }
-    }
     const prevOuts2 = utxos.map((u) => ({
       scriptPubKey: u.scriptPubKey,
       value: u.amount
     }));
     const tprCache2 = taprootCache ?? {};
-    const taprootCtx2 = {
-      keyPathSigHasher: (hashType) => sigHashTaproot(tx, inputIndex, prevOuts2, hashType, 0, annexHash2, undefined, undefined, 4294967295, tprCache2),
-      scriptPathSigHasher: (hashType, leafHash, codeSepPos) => sigHashTaproot(tx, inputIndex, prevOuts2, hashType, 1, annexHash2, leafHash, 0, codeSepPos, tprCache2)
-    };
+    const taprootCtx2 = buildTaprootContext(tx, inputIndex, prevOuts2, tprCache2);
     const interp2 = (init_interpreter(), __toCommonJS(exports_interpreter));
     const flags2 = interp2.scriptFlagsFromBitmask(scriptVerifyFlags);
     const txContext2 = {
@@ -11542,21 +11550,9 @@ function verifyInputSignature(tx, inputIndex, utxo, cache, utxos, taprootCache, 
     scriptPubKey: u.scriptPubKey,
     value: u.amount
   }));
-  let annexHash = undefined;
-  if (input.witness.length >= 2) {
-    const last = input.witness[input.witness.length - 1];
-    if (last.length > 0 && last[0] === 80) {
-      const annexW = new BufferWriter;
-      annexW.writeVarBytes(last);
-      annexHash = sha256Hash(annexW.toBuffer());
-    }
-  }
   const legacySigHasher = (subscript, hashType) => sigHashLegacy(tx, inputIndex, subscript, hashType);
   const witnessSigHasher = (scriptCode, hashType) => sigHashWitnessV0Cached(tx, inputIndex, scriptCode, utxo.amount, hashType, cache);
-  const taprootCtx = {
-    keyPathSigHasher: (hashType) => sigHashTaproot(tx, inputIndex, prevOuts, hashType, 0, annexHash, undefined, undefined, 4294967295, tprCache),
-    scriptPathSigHasher: (hashType, leafHash, codeSepPos) => sigHashTaproot(tx, inputIndex, prevOuts, hashType, 1, annexHash, leafHash, 0, codeSepPos, tprCache)
-  };
+  const taprootCtx = buildTaprootContext(tx, inputIndex, prevOuts, tprCache);
   const txContext = {
     txVersion: tx.version,
     txLockTime: tx.lockTime,
@@ -20831,6 +20827,11 @@ class Mempool {
       skipScripts = skipResult.skip;
     }
     const flags = getStandardFlags(this.tipHeight);
+    const prevOuts = inputUtxos.map(({ utxo }) => ({
+      scriptPubKey: utxo.scriptPubKey,
+      value: utxo.amount
+    }));
+    const taprootSigHashCache = {};
     const verifyAllInputs = (flagSet) => {
       for (let i = 0;i < tx.inputs.length; i++) {
         const { utxo, input } = inputUtxos[i];
@@ -20843,9 +20844,17 @@ class Mempool {
             return sigHashLegacy(tx, i, subscript, hashType);
           }
         };
-        const valid = verifyScript(input.scriptSig, utxo.scriptPubKey, input.witness, flagSet, sigHasher, undefined, { txVersion: tx.version, txLockTime: tx.lockTime, txSequence: input.sequence });
-        if (!valid) {
-          return { ok: false, reason: `Script validation failed for input ${i}` };
+        const taprootCtx = buildTaprootContext(tx, i, prevOuts, taprootSigHashCache);
+        try {
+          const valid = verifyScript(input.scriptSig, utxo.scriptPubKey, input.witness, flagSet, sigHasher, taprootCtx, { txVersion: tx.version, txLockTime: tx.lockTime, txSequence: input.sequence });
+          if (!valid) {
+            return { ok: false, reason: `Script validation failed for input ${i}` };
+          }
+        } catch (e) {
+          return {
+            ok: false,
+            reason: `Script validation failed for input ${i}: ${e.message}`
+          };
         }
       }
       return { ok: true };
