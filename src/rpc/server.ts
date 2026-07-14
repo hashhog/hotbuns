@@ -11173,6 +11173,35 @@ export class RPCServer {
         dataPos: 0,
       });
     }
+    // Unconditionally (re-)point the active-chain height->hash index
+    // (DBPrefix.HEADER, read by getblockhash / getBlockHashByHeight) at the
+    // snapshot base, regardless of the branch above. If a BLOCK_INDEX record
+    // for this hash already existed (e.g. its header arrived earlier via
+    // `submitheader`/P2P headers-first sync, BEFORE this snapshot activation),
+    // `putBlockIndex` was skipped just above — but that prior write was a
+    // non-active-chain header (`saveHeaderEntry` passes
+    // `writeHeightIndex: false` for exactly this reason: a header alone is
+    // not yet part of the active chain, see `putBlockIndex`'s doc comment in
+    // storage/database.ts). Activating the snapshot makes this block the
+    // active tip NOW (Core's `CChain::SetTip` semantics), so the height
+    // index must be set here regardless of whether the header predates the
+    // snapshot load — otherwise `getblockhash(baseHeight)` keeps returning
+    // null after a `submitheader`-then-`loadtxoutset` sequence even though
+    // `getblockcount`/`getbestblockhash` are already correct.
+    await this.db.putBlockHashByHeight(loadResult.baseHeight, loadResult.baseBlockHash);
+
+    // Re-sync the RPC server's in-memory ChainStateManager from the DB write
+    // above. `this.chainState` (the same instance `getBlockCount` /
+    // `getBestBlockHash` / etc. read via `getBestBlock()`) was initialized at
+    // startup from a genesis-tip DB and is NOT auto-refreshed by the direct
+    // `putChainState` call — without this it keeps reporting the pre-snapshot
+    // tip (height 0) even though the DB now has the snapshot base, so every
+    // post-`loadtxoutset` RPC (getblockcount, getbestblockhash, ...) would be
+    // stale until a restart. Mirrors the CLI `--load-snapshot` path's
+    // identical fix (cli.ts `runSnapshotLoad` caller: "Without re-loading it
+    // here, the node keeps an in-memory tip of height 0" — same root cause,
+    // same fix, now applied to the RPC-triggered load path too).
+    await this.chainState.load();
 
     // (2) REAL background dual-chainstate validation (Core AddChainstate +
     //     MaybeValidateSnapshot). The background validator owns a SEPARATE

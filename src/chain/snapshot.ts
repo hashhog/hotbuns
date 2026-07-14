@@ -1695,6 +1695,150 @@ export function clearRegtestAssumeutxo(params: ConsensusParams): void {
 }
 
 /**
+ * One entry of a campaign-assumeutxo fixture file (DISPLAY-order hex, as
+ * printed by Bitcoin Core / `dumptxoutset`). See
+ * `receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md` for the shared cross-impl
+ * schema. `base_mtp` / `base_header` / `chainwork` are accepted (other
+ * impls need them for post-snapshot connect) but hotbuns's
+ * {@link AssumeutxoData} shape does not carry them yet, so they are
+ * validated-if-present and otherwise ignored here.
+ */
+interface CampaignAssumeutxoEntry {
+  height: number;
+  blockhash: string;
+  hash_serialized: string;
+  m_chain_tx_count: number;
+  base_mtp?: number;
+  base_header?: string;
+  chainwork?: string;
+}
+
+const HASH_HEX_RE = /^[0-9a-fA-F]{64}$/;
+
+/**
+ * Load `HASHHOG_CAMPAIGN_ASSUMEUTXO=<abs-path.json>` (read ONCE, here) and
+ * append its entries to the RUNNING network's assumeutxo allowlist.
+ *
+ * Design: `receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md`. Unset (the common
+ * case, including every production launch today) does exactly one
+ * `process.env` read and returns — bit-identical to before this function
+ * existed. When set, the campaign entries are APPEND-ONLY: any collision
+ * with an existing entry (same internal-order block hash OR same height,
+ * built-in or previously-loaded-campaign) is refused with a thrown Error,
+ * which aborts startup (`main().catch` in index.ts logs "Fatal error" and
+ * exits 1) — campaign data may never override a production hash. Callable
+ * against ANY network's params (mainnet included: the M2 campaign boots
+ * "mainnet params" by design), unlike {@link registerRegtestAssumeutxo},
+ * which stays regtest-only and untouched by this function.
+ *
+ * Fixture hex is DISPLAY order (Core convention); converted to hotbuns's
+ * INTERNAL (byte-reversed) convention on load, mirroring every hardcoded
+ * entry in consensus/params.ts.
+ */
+export async function loadCampaignAssumeutxo(params: ConsensusParams): Promise<void> {
+  const fixturePath = process.env.HASHHOG_CAMPAIGN_ASSUMEUTXO;
+  if (!fixturePath) return;
+
+  let raw: string;
+  try {
+    raw = await fsp.readFile(fixturePath, "utf8");
+  } catch (err) {
+    throw new Error(
+      `loadCampaignAssumeutxo: failed to read HASHHOG_CAMPAIGN_ASSUMEUTXO=${fixturePath}: ${
+        (err as Error).message
+      }`,
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(
+      `loadCampaignAssumeutxo: invalid JSON in ${fixturePath}: ${(err as Error).message}`,
+    );
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(
+      `loadCampaignAssumeutxo: ${fixturePath} must contain a top-level JSON array`,
+    );
+  }
+
+  let assumeutxo = (params as any).assumeutxo as Map<string, AssumeutxoData> | undefined;
+  if (!assumeutxo) {
+    assumeutxo = new Map<string, AssumeutxoData>();
+    (params as any).assumeutxo = assumeutxo;
+  }
+
+  const loadedHeights: number[] = [];
+  for (const [i, entry] of (parsed as CampaignAssumeutxoEntry[]).entries()) {
+    if (typeof entry !== "object" || entry === null) {
+      throw new Error(`loadCampaignAssumeutxo: entry ${i} in ${fixturePath} is not an object`);
+    }
+    if (typeof entry.height !== "number" || !Number.isInteger(entry.height) || entry.height <= 0) {
+      throw new Error(
+        `loadCampaignAssumeutxo: entry ${i} has invalid height ${JSON.stringify(entry.height)}`,
+      );
+    }
+    if (typeof entry.blockhash !== "string" || !HASH_HEX_RE.test(entry.blockhash)) {
+      throw new Error(
+        `loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) has invalid blockhash`,
+      );
+    }
+    if (typeof entry.hash_serialized !== "string" || !HASH_HEX_RE.test(entry.hash_serialized)) {
+      throw new Error(
+        `loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) has invalid hash_serialized`,
+      );
+    }
+    if (
+      (typeof entry.m_chain_tx_count !== "number" && typeof entry.m_chain_tx_count !== "string") ||
+      BigInt(entry.m_chain_tx_count) <= 0n
+    ) {
+      throw new Error(
+        `loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) has invalid m_chain_tx_count`,
+      );
+    }
+    if (entry.base_header !== undefined && !/^[0-9a-fA-F]+$/.test(entry.base_header)) {
+      throw new Error(
+        `loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) has non-hex base_header`,
+      );
+    }
+
+    const blockHash = Buffer.from(entry.blockhash, "hex").reverse();
+    const hashSerialized = Buffer.from(entry.hash_serialized, "hex").reverse();
+    const key = blockHash.toString("hex");
+
+    if (assumeutxo.has(key)) {
+      throw new Error(
+        `loadCampaignAssumeutxo: entry ${i} blockhash ${entry.blockhash} collides with an ` +
+          `existing assumeutxo entry — refusing to override a production/loaded hash`,
+      );
+    }
+    for (const existing of assumeutxo.values()) {
+      if (existing.height === entry.height) {
+        throw new Error(
+          `loadCampaignAssumeutxo: entry ${i} height ${entry.height} collides with an ` +
+            `existing assumeutxo entry — refusing to override a production/loaded hash`,
+        );
+      }
+    }
+
+    assumeutxo.set(key, {
+      height: entry.height,
+      hashSerialized,
+      nChainTx: BigInt(entry.m_chain_tx_count),
+      blockHash,
+    });
+    loadedHeights.push(entry.height);
+  }
+
+  console.log(
+    `[CAMPAIGN-ASSUMEUTXO] loaded ${loadedHeights.length} entries from ${fixturePath} ` +
+      `heights=[${loadedHeights.join(",")}]`,
+  );
+}
+
+/**
  * Get assumeUTXO data for a height from chain parameters.
  */
 export function getAssumeutxoDataByHeight(

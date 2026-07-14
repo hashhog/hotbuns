@@ -1047,14 +1047,48 @@ describe("W138 cross-cutting: hardcoded assumeutxo entries (chainparams parity)"
 });
 
 // =============================================================================
-// Cross-cutting: REGTEST has no assumeutxo entries (correct)
+// Cross-cutting: REGTEST carries Core's regtest m_assumeutxo_data (110/200/299)
 // =============================================================================
+//
+// Updated for the boot-smoke porter wave (receipts/PORTER-WAVE-WORKORDER.md):
+// Bitcoin Core's regtest chainparams DO carry m_assumeutxo_data entries
+// (heights 110/200/299, kernel/chainparams.cpp CRegTestParams — "for use by
+// test/functional/feature_assumeutxo.py" and the boot-smoke fixture at
+// tools/boot-smoke-fixtures/). hotbuns now mirrors those 3 entries verbatim
+// (Core-parity, byte-reversed to internal order like every other entry in
+// this table) instead of shipping an empty regtest table. Runtime
+// registrations via registerRegtestAssumeutxo() still work ADDITIVELY on top
+// of these built-ins (see registerRegtestAssumeutxo tests elsewhere in this
+// file), and never clear/replace them except via clearRegtestAssumeutxo().
 
-describe("W138 cross-cutting: REGTEST has no assumeutxo entries", () => {
-  it("PRESENT: REGTEST.assumeutxo is an empty Map (no hardcoded snapshots on regtest)", () => {
+describe("W138 cross-cutting: REGTEST carries Core's regtest assumeutxo entries", () => {
+  it("PRESENT: REGTEST.assumeutxo has exactly Core's 3 regtest entries (110/200/299)", () => {
     expect(REGTEST.assumeutxo).toBeDefined();
-    expect(REGTEST.assumeutxo!.size).toBe(0);
-    expect(getAvailableSnapshotHeights(REGTEST)).toEqual([]);
-    expect(getLatestSnapshotHeightForRollback(REGTEST, 1_000_000)).toBeNull();
+    expect(REGTEST.assumeutxo!.size).toBe(3);
+    expect(getAvailableSnapshotHeights(REGTEST)).toEqual([110, 200, 299]);
+    expect(getLatestSnapshotHeightForRollback(REGTEST, 1_000_000)).toBe(299);
+  });
+
+  it("PRESENT: REGTEST height=299 entry matches Core's CRegTestParams / boot-smoke fixture", () => {
+    const au = getAssumeutxoDataByHeight(REGTEST, 299);
+    expect(au).not.toBeNull();
+    expect(au!.height).toBe(299);
+    expect(au!.nChainTx).toBe(334n);
+    // Internal (byte-reversed) order — display order is
+    // 7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2 per
+    // Core's chainparams.cpp and tools/boot-smoke-fixtures/fixture-meta.env.
+    expect(au!.blockHash.toString("hex")).toBe(
+      "a26e91a7faa10f7668bb7709c23afd811ef828f9b694938c9f70ec6f0495c67c",
+    );
+    expect(au!.hashSerialized.toString("hex")).toBe(
+      "e2631a75792ee917d9018e7a44630a71dd00416f7750035246ef8e5eff51b0d2",
+    );
+  });
+
+  it("PRESENT: REGTEST heights 110 and 200 resolve too (Core's other 2 regtest entries)", () => {
+    expect(getAssumeutxoDataByHeight(REGTEST, 110)?.nChainTx).toBe(111n);
+    expect(getAssumeutxoDataByHeight(REGTEST, 200)?.nChainTx).toBe(201n);
+    // Negative case — no entry between the Core-pinned heights.
+    expect(getAssumeutxoDataByHeight(REGTEST, 150)).toBeNull();
   });
 });

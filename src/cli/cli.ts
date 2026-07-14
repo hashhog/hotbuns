@@ -15,7 +15,7 @@ import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { deserializeBlock } from "../validation/block.js";
 import { ChainStateManager } from "../chain/state.js";
 import { TipNotifier } from "../chain/tip_notifier.js";
-import { ChainstateManager } from "../chain/snapshot.js";
+import { ChainstateManager, loadCampaignAssumeutxo } from "../chain/snapshot.js";
 import { UTXOManager } from "../chain/utxo.js";
 import { Mempool } from "../mempool/mempool.js";
 import { OrphanPool } from "../mempool/orphan_pool.js";
@@ -1619,6 +1619,11 @@ async function startNode(config: NodeConfig): Promise<void> {
     paramsServices === baseParams.services
       ? baseParams
       : { ...baseParams, services: paramsServices };
+
+  // 1c. Campaign-only assumeutxo entries (HASHHOG_CAMPAIGN_ASSUMEUTXO). A
+  // single getenv when unset — bit-identical to before this call existed.
+  // See receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md.
+  await loadCampaignAssumeutxo(params);
 
   // 2. Open the database
   const dbPath = path.join(mergedConfig.datadir, "blocks.db");

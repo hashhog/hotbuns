@@ -3033,7 +3033,7 @@ var require_node_gyp_build2 = __commonJS((exports, module) => {
 
 // node_modules/classic-level/binding.js
 var require_binding = __commonJS((exports, module) => {
-  var __dirname = "/home/work/hashhog/hotbuns/node_modules/classic-level";
+  var __dirname = "/home/work/hashhog/.claude/worktrees/agent-af037f4792ef06e2a/hotbuns/node_modules/classic-level";
   module.exports = require_node_gyp_build2()(__dirname);
 });
 
@@ -8433,7 +8433,35 @@ var init_params = __esm(() => {
     nMinimumChainWork: 0n,
     assumeValidHeight: 0,
     assumedValid: undefined,
-    assumeutxo: new Map
+    assumeutxo: new Map([
+      [
+        "97c3b70d08be1371f54a141c1ddcb749816cf56ea520f838b55a96b730e0ff6a",
+        {
+          height: 110,
+          hashSerialized: Buffer.from("b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327", "hex").reverse(),
+          nChainTx: 111n,
+          blockHash: Buffer.from("6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397", "hex").reverse()
+        }
+      ],
+      [
+        "b9f6dcb1f98438447203fe7cdede64e4a9b81fd06500d0bbf6df69bdcc015938",
+        {
+          height: 200,
+          hashSerialized: Buffer.from("17dcc016d188d16068907cdeb38b75691a118d43053b8cd6a25969419381d13a", "hex").reverse(),
+          nChainTx: 201n,
+          blockHash: Buffer.from("385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9", "hex").reverse()
+        }
+      ],
+      [
+        "a26e91a7faa10f7668bb7709c23afd811ef828f9b694938c9f70ec6f0495c67c",
+        {
+          height: 299,
+          hashSerialized: Buffer.from("d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2", "hex").reverse(),
+          nChainTx: 334n,
+          blockHash: Buffer.from("7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2", "hex").reverse()
+        }
+      ]
+    ])
   };
 });
 
@@ -19677,6 +19705,72 @@ function getAssumeutxoData(params, blockHash) {
     return null;
   const key = blockHash.toString("hex");
   return assumeutxo.get(key) ?? null;
+}
+var HASH_HEX_RE = /^[0-9a-fA-F]{64}$/;
+async function loadCampaignAssumeutxo(params) {
+  const fixturePath = process.env.HASHHOG_CAMPAIGN_ASSUMEUTXO;
+  if (!fixturePath)
+    return;
+  let raw;
+  try {
+    raw = await fsp2.readFile(fixturePath, "utf8");
+  } catch (err) {
+    throw new Error(`loadCampaignAssumeutxo: failed to read HASHHOG_CAMPAIGN_ASSUMEUTXO=${fixturePath}: ${err.message}`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`loadCampaignAssumeutxo: invalid JSON in ${fixturePath}: ${err.message}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`loadCampaignAssumeutxo: ${fixturePath} must contain a top-level JSON array`);
+  }
+  let assumeutxo = params.assumeutxo;
+  if (!assumeutxo) {
+    assumeutxo = new Map;
+    params.assumeutxo = assumeutxo;
+  }
+  const loadedHeights = [];
+  for (const [i, entry] of parsed.entries()) {
+    if (typeof entry !== "object" || entry === null) {
+      throw new Error(`loadCampaignAssumeutxo: entry ${i} in ${fixturePath} is not an object`);
+    }
+    if (typeof entry.height !== "number" || !Number.isInteger(entry.height) || entry.height <= 0) {
+      throw new Error(`loadCampaignAssumeutxo: entry ${i} has invalid height ${JSON.stringify(entry.height)}`);
+    }
+    if (typeof entry.blockhash !== "string" || !HASH_HEX_RE.test(entry.blockhash)) {
+      throw new Error(`loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) has invalid blockhash`);
+    }
+    if (typeof entry.hash_serialized !== "string" || !HASH_HEX_RE.test(entry.hash_serialized)) {
+      throw new Error(`loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) has invalid hash_serialized`);
+    }
+    if (typeof entry.m_chain_tx_count !== "number" && typeof entry.m_chain_tx_count !== "string" || BigInt(entry.m_chain_tx_count) <= 0n) {
+      throw new Error(`loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) has invalid m_chain_tx_count`);
+    }
+    if (entry.base_header !== undefined && !/^[0-9a-fA-F]+$/.test(entry.base_header)) {
+      throw new Error(`loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) has non-hex base_header`);
+    }
+    const blockHash = Buffer.from(entry.blockhash, "hex").reverse();
+    const hashSerialized = Buffer.from(entry.hash_serialized, "hex").reverse();
+    const key = blockHash.toString("hex");
+    if (assumeutxo.has(key)) {
+      throw new Error(`loadCampaignAssumeutxo: entry ${i} blockhash ${entry.blockhash} collides with an ` + `existing assumeutxo entry — refusing to override a production/loaded hash`);
+    }
+    for (const existing of assumeutxo.values()) {
+      if (existing.height === entry.height) {
+        throw new Error(`loadCampaignAssumeutxo: entry ${i} height ${entry.height} collides with an ` + `existing assumeutxo entry — refusing to override a production/loaded hash`);
+      }
+    }
+    assumeutxo.set(key, {
+      height: entry.height,
+      hashSerialized,
+      nChainTx: BigInt(entry.m_chain_tx_count),
+      blockHash
+    });
+    loadedHeights.push(entry.height);
+  }
+  console.log(`[CAMPAIGN-ASSUMEUTXO] loaded ${loadedHeights.length} entries from ${fixturePath} ` + `heights=[${loadedHeights.join(",")}]`);
 }
 function getAvailableSnapshotHeights(params) {
   const assumeutxo = params.assumeutxo;
@@ -49108,6 +49202,8 @@ class RPCServer {
         dataPos: 0
       });
     }
+    await this.db.putBlockHashByHeight(loadResult.baseHeight, loadResult.baseBlockHash);
+    await this.chainState.load();
     manager.setBackgroundDataDir(`${this.db.path()}-bgvalidate-${Date.now()}`);
     const getBlock = async (height) => {
       const hash = await this.db.getBlockHashByHeight(height);
@@ -53335,6 +53431,7 @@ async function startNode(config) {
     paramsServices |= NODE_COMPACT_FILTERS_BIT2;
   }
   const params = paramsServices === baseParams.services ? baseParams : { ...baseParams, services: paramsServices };
+  await loadCampaignAssumeutxo(params);
   const dbPath = path3.join(mergedConfig.datadir, "blocks.db");
   const db = new ChainDB(dbPath);
   await db.open();
