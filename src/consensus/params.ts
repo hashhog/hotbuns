@@ -1139,8 +1139,74 @@ export const REGTEST: ConsensusParams = {
   // so that assumeValid = (0 > 0 && ...) = false and all scripts run.
   assumeValidHeight: 0,
   assumedValid: undefined,
-  // assumeUTXO: regtest allows any snapshot for testing
-  assumeutxo: new Map(),
+  // assumeUTXO: regtest allows any snapshot for testing.
+  //
+  // These 3 entries mirror Bitcoin Core's regtest m_assumeutxo_data
+  // (bitcoin-core/src/kernel/chainparams.cpp CRegTestParams, heights 110 /
+  // 200 / 299 — "for use by test/functional/feature_assumeutxo.py"). They are
+  // Core-parity fixtures for hashhog's own deterministic regtest mining
+  // chain (boot-smoke), copied verbatim from Core's DISPLAY-order literals
+  // and byte-reversed to INTERNAL order for the Map key / blockHash /
+  // hashSerialized fields, exactly like the MAINNET table above (see the
+  // 840000 entry's comment for the full byte-order rationale). Runtime
+  // registrations via registerRegtestAssumeutxo() (chain/snapshot.ts) add to
+  // this map without disturbing these built-ins.
+  assumeutxo: new Map([
+    // 110 display: 6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397
+    [
+      "97c3b70d08be1371f54a141c1ddcb749816cf56ea520f838b55a96b730e0ff6a",
+      {
+        height: 110,
+        // DISPLAY-order Core chainparams literal → `.reverse()` to internal
+        // (see MAINNET 840000 above for the full rationale).
+        hashSerialized: Buffer.from(
+          "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327",
+          "hex"
+        ).reverse(),
+        nChainTx: 111n,
+        blockHash: Buffer.from(
+          "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397",
+          "hex"
+        ).reverse(),
+      },
+    ],
+    // 200 display: 385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9
+    [
+      "b9f6dcb1f98438447203fe7cdede64e4a9b81fd06500d0bbf6df69bdcc015938",
+      {
+        height: 200,
+        // DISPLAY-order Core chainparams literal → `.reverse()` to internal
+        // (see MAINNET 840000 above for the full rationale).
+        hashSerialized: Buffer.from(
+          "17dcc016d188d16068907cdeb38b75691a118d43053b8cd6a25969419381d13a",
+          "hex"
+        ).reverse(),
+        nChainTx: 201n,
+        blockHash: Buffer.from(
+          "385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9",
+          "hex"
+        ).reverse(),
+      },
+    ],
+    // 299 display: 7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2
+    [
+      "a26e91a7faa10f7668bb7709c23afd811ef828f9b694938c9f70ec6f0495c67c",
+      {
+        height: 299,
+        // DISPLAY-order Core chainparams literal → `.reverse()` to internal
+        // (see MAINNET 840000 above for the full rationale).
+        hashSerialized: Buffer.from(
+          "d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2",
+          "hex"
+        ).reverse(),
+        nChainTx: 334n,
+        blockHash: Buffer.from(
+          "7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2",
+          "hex"
+        ).reverse(),
+      },
+    ],
+  ]),
 };
 
 /**

@@ -67,6 +67,21 @@ import {
 import { createTestBlock, mineRegtestBlock } from "../test/helpers.js";
 import { getBlockHash } from "../validation/block.js";
 
+// `REGTEST.assumeutxo` is a process-wide singleton Map (module-level object,
+// shared across every test FILE in one `bun test` invocation, not just this
+// one). REGTEST now ships with 3 permanent Core-parity built-in entries
+// (heights 110/200/299 — see consensus/params.ts). Snapshot them once at
+// module load, BEFORE any test in this file registers/clears anything, so
+// `afterEach`'s `clearRegtestAssumeutxo(REGTEST)` — which wipes the WHOLE
+// map, not just what this file added — can restore them afterward. Without
+// this, the first test in this file to run would permanently blank the
+// built-ins for the rest of the process, silently breaking any later test
+// file's REGTEST.assumeutxo assertions (observed: w138_assumeutxo.test.ts's
+// REGTEST-built-in checks failing only in the full-suite run, never in
+// isolation — a `bun test` file-run-order artifact of this shared mutable
+// singleton, not a bug in either file).
+const REGTEST_BUILTIN_ASSUMEUTXO = new Map(REGTEST.assumeutxo ?? []);
+
 class MockPeerManager {
   getConnectedPeers() { return []; }
   getPeerCount() { return 0; }
@@ -171,6 +186,13 @@ describe("loadtxoutset LIVE dual-chainstate wiring", () => {
 
   afterEach(async () => {
     clearRegtestAssumeutxo(REGTEST);
+    // Restore the permanent Core-parity built-ins clearRegtestAssumeutxo just
+    // wiped along with this test's temporary registration(s) — see the
+    // REGTEST_BUILTIN_ASSUMEUTXO comment above.
+    for (const [key, au] of REGTEST_BUILTIN_ASSUMEUTXO) {
+      registerRegtestAssumeutxo(REGTEST, au);
+      void key; // keyed by au.blockHash internally; iterate for the value only
+    }
     await db.close().catch(() => {});
     await rm(tempDir, { recursive: true, force: true }).catch(() => {});
     await rm(dumpDir, { recursive: true, force: true }).catch(() => {});
