@@ -822,8 +822,8 @@ export class RESTServer {
         loaded: true,
         size: info.size,
         bytes: info.bytes,
-        usage: info.bytes, // Approximate memory usage
-        maxmempool: 300000000, // Default 300MB
+        usage: info.usage, // Estimated real heap retention (Core: DynamicMemoryUsage)
+        maxmempool: info.maxmempool,
         mempoolminfee: info.minFeeRate / 100000, // Convert to BTC/kvB
         minrelaytxfee: 0.000001, // 0.1 sat/vB = Core's minrelaytxfee default (0.00000100 BTC/kvB)
       };

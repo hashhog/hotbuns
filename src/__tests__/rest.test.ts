@@ -69,6 +69,10 @@ class MockMempool implements Partial<Mempool> {
     return {
       size: this.entries.size,
       bytes,
+      // Mirror Mempool.getInfo(): usage = estimated heap retention (>= bytes),
+      // maxmempool = the bound usage is trimmed against.
+      usage: bytes,
+      maxmempool: 300_000_000,
       minFeeRate: 1,
     };
   }

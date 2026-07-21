@@ -551,6 +551,60 @@ export const MAX_STANDARD_TX_WEIGHT = 400_000n;
 const DEFAULT_MAX_SIZE = 300_000_000;
 
 /**
+ * Estimate the real JS-heap retention of a mempool entry, in bytes.
+ *
+ * Mirrors Bitcoin Core's per-entry `nUsageSize = RecursiveDynamicUsage(tx)`
+ * (kernel/mempool_entry.h:94, core_memusage.h) which measures actual
+ * allocation, NOT serialized size. Core's TrimToSize compares
+ * `DynamicMemoryUsage()` against -maxmempool (txmempool.cpp:778,868);
+ * before 2026-07 hotbuns compared raw vsize instead, so the "300 MB"
+ * knob admitted a tx graph that retained 10-20x that in JS heap
+ * (parsed object graphs, Buffers, hex-string map keys) — the S3 finding
+ * in receipts/BUG-hotbuns-memleak-2026-07-20.md.
+ *
+ * Cost model (64-bit V8/JSC, deliberately on the conservative/high side —
+ * overestimating shrinks the pool, underestimating re-opens the OOM):
+ *   - plain JS object: ~64 B header+slack
+ *   - Buffer: ~96 B (view + backing ArrayBuffer headers) + payload
+ *   - Map/Set entry: ~64 B; 64-char hex key string: ~88 B
+ *
+ * Deterministic in (tx, vsize) so add/remove sites can recompute it
+ * symmetrically without storing a new field on MempoolEntry (avoids
+ * rotting test fixtures that hard-code every entry field).
+ */
+export function estimateEntryUsage(tx: Transaction, vsize: number): number {
+  const OBJ = 64;
+  const BUF = 96;
+  const MAP_ENTRY = 64;
+  const HEX_KEY = 88;
+
+  // MempooEntry object (~20 fields) + entries-Map slot + txid-hex key +
+  // txid Buffer + three (usually small) Sets + cluster/linearization refs.
+  let usage = OBJ * 4 + MAP_ENTRY + HEX_KEY + (BUF + 32) + 256;
+
+  for (const input of tx.inputs) {
+    usage += OBJ * 2; // input object + prevOut object
+    usage += BUF + 32; // prevOut.txid Buffer
+    usage += BUF + input.scriptSig.length;
+    usage += 32; // witness array header
+    for (const item of input.witness) {
+      usage += BUF + item.length;
+    }
+    // outpointIndex entry: "txidhex:vout" key + map slot
+    usage += MAP_ENTRY + HEX_KEY + 16;
+  }
+
+  for (const output of tx.outputs) {
+    usage += OBJ; // output object
+    usage += BUF + output.scriptPubKey.length;
+    usage += 24; // bigint amount
+  }
+
+  // Usage can never be less than the serialized footprint itself.
+  return Math.max(usage, vsize);
+}
+
+/**
  * Default mempool expiry in seconds (336 hours = 14 days).
  * kernel/mempool_options.h: DEFAULT_MEMPOOL_EXPIRY_HOURS = 336.
  * Reference: bitcoin-core/src/txmempool.cpp:811-827 (Expire)
@@ -1209,6 +1263,14 @@ export class Mempool {
   /** Current total vsize of all entries. */
   private currentSize: number;
 
+  /**
+   * Current estimated JS-heap usage of all entries (bytes).
+   * Analogue of Core's CTxMemPool::DynamicMemoryUsage() (txmempool.cpp:778).
+   * `maxSize` bounds THIS value (like Core's -maxmempool), not raw vsize —
+   * see estimateEntryUsage() and BUG-hotbuns-memleak-2026-07-20 (S3).
+   */
+  private currentUsage: number;
+
   /** UTXO manager for checking confirmed outputs. */
   private utxo: UTXOManager;
 
@@ -1290,6 +1352,7 @@ export class Mempool {
     this.mapDeltas = new Map();
     this.maxSize = maxSize;
     this.currentSize = 0;
+    this.currentUsage = 0;
     this.utxo = utxo;
     this.params = params;
     this.minFeeRate = DEFAULT_MIN_FEE_RATE;
@@ -2326,6 +2389,7 @@ export class Mempool {
     // Add to mempool
     this.entries.set(txidHex, entry);
     this.currentSize += vsize;
+    this.currentUsage += estimateEntryUsage(tx, vsize);
 
     // Update parent entries' spentBy and descendant stats
     for (const parentTxidHex of parentTxids) {
@@ -2347,8 +2411,10 @@ export class Mempool {
       this.outpointIndex.set(outpointKey, txidHex);
     }
 
-    // Evict if over size limit
-    if (this.currentSize > this.maxSize) {
+    // Evict if over size limit. Core trims on DynamicMemoryUsage()
+    // (txmempool.cpp:868); the vsize check is kept as a belt-and-braces
+    // lower bound (usage >= vsize always, so it is normally redundant).
+    if (this.currentUsage > this.maxSize || this.currentSize > this.maxSize) {
       this.evict();
     }
 
@@ -2435,6 +2501,7 @@ export class Mempool {
     // Remove from entries
     this.entries.delete(txidHex);
     this.currentSize -= entry.vsize;
+    this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
 
     // Mark cluster cache as dirty
     this.clusterCacheDirty = true;
@@ -2488,6 +2555,7 @@ export class Mempool {
         // Remove from entries
         this.entries.delete(txidHex);
         this.currentSize -= entry.vsize;
+        this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
       }
     }
 
@@ -2729,6 +2797,7 @@ export class Mempool {
 
       this.entries.set(txidHex, entry);
       this.currentSize += vsize;
+      this.currentUsage += estimateEntryUsage(tx, vsize);
 
       // Index spent outpoints so a later RBF / double-spend would
       // surface this entry as a conflict (defence-in-depth).
@@ -3398,6 +3467,7 @@ export class Mempool {
     // Remove from entries
     this.entries.delete(txidHex);
     this.currentSize -= entry.vsize;
+    this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
   }
 
   /**
@@ -3561,9 +3631,11 @@ export class Mempool {
       // Choose halflife based on how full the pool is.
       // Reference: txmempool.cpp:836-841
       let halflife = ROLLING_FEE_HALFLIFE;
-      if (this.currentSize < this.maxSize / 4) {
+      // Core compares DynamicMemoryUsage() (real allocation), not vsize,
+      // against sizelimit here — txmempool.cpp:836-841.
+      if (this.currentUsage < this.maxSize / 4) {
         halflife /= 4;
-      } else if (this.currentSize < this.maxSize / 2) {
+      } else if (this.currentUsage < this.maxSize / 2) {
         halflife /= 2;
       }
 
@@ -3613,7 +3685,10 @@ export class Mempool {
     let nTxnRemoved = 0;
     let maxFeeRateRemovedKvB = 0;
 
-    while (this.currentSize > this.maxSize && this.entries.size > 0) {
+    while (
+      (this.currentUsage > this.maxSize || this.currentSize > this.maxSize) &&
+      this.entries.size > 0
+    ) {
       // Find the worst chunk across all clusters.
       // "Worst" = lowest chunk fee rate in the last (tail) position of some
       // cluster's linearization, since linearizations are sorted best-first.
@@ -3682,12 +3757,16 @@ export class Mempool {
   /**
    * Get mempool statistics.
    */
-  getInfo(): { size: number; bytes: number; minFeeRate: number } {
+  getInfo(): { size: number; bytes: number; usage: number; maxmempool: number; minFeeRate: number } {
     // Expose the dynamic minimum (rolling + static floor) as sat/vB.
     const dynamicMinSatPerVB = Math.max(this.minFeeRate, this.getMinFee() / 1000);
     return {
       size: this.entries.size,
       bytes: this.currentSize,
+      // Estimated real heap retention — the value `maxmempool` bounds
+      // (Core getmempoolinfo "usage" = DynamicMemoryUsage()).
+      usage: this.currentUsage,
+      maxmempool: this.maxSize,
       minFeeRate: dynamicMinSatPerVB,
     };
   }
@@ -3747,6 +3826,7 @@ export class Mempool {
     this.entries.clear();
     this.outpointIndex.clear();
     this.currentSize = 0;
+    this.currentUsage = 0;
     this.minFeeRate = DEFAULT_MIN_FEE_RATE;
     this.clusters.clear();
     this.clusterCache.clear();

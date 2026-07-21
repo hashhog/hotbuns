@@ -68,6 +68,16 @@ export const MAX_CMPCTBLOCK_DEPTH = 5;
  */
 export const MAX_BLOCKTXN_DEPTH = 10;
 
+/**
+ * Maximum partially-downloaded blocks retained per peer while awaiting
+ * blocktxn. Each PartiallyDownloadedBlock can be MBs (prefilled txs +
+ * short-ID maps); before 2026-07 entries were only deleted on successful
+ * completion, so unanswered getblocktxn requests accumulated forever
+ * (BUG-hotbuns-memleak-2026-07-20 S2). Sized to Core's per-peer in-flight
+ * block bound, MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16 (net_processing.cpp).
+ */
+export const MAX_PENDING_BLOCKS_PER_PEER = 16;
+
 /** Mask for extracting 6-byte short ID from SipHash result */
 const SHORT_ID_MASK = 0xffffffffffffn;
 
@@ -886,8 +896,20 @@ export class CompactBlockManager {
       return null;
     }
 
-    // Store in pending state for this peer
+    // Store in pending state for this peer.
+    // Bound the per-peer pending map (BUG-hotbuns-memleak-2026-07-20 S2):
+    // a PartiallyDownloadedBlock holds prefilled txs + short-ID maps (MBs
+    // each) and was previously deleted only on successful completion, so a
+    // peer that never answered getblocktxn stranded block-sized garbage
+    // forever. Evict the oldest pending entry once the cap is hit (Map
+    // preserves insertion order). Core bounds in-flight blocks per peer at
+    // MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16 (net_processing.cpp).
     const state = this.getState(peerId);
+    while (state.pendingBlockTxn.size >= MAX_PENDING_BLOCKS_PER_PEER) {
+      const oldest = state.pendingBlockTxn.keys().next().value;
+      if (oldest === undefined) break;
+      state.pendingBlockTxn.delete(oldest);
+    }
     state.pendingBlockTxn.set(blockHash, partial);
 
     return partial;
@@ -972,6 +994,39 @@ export class CompactBlockManager {
   removePeer(peerId: string): void {
     this.peerStates.delete(peerId);
     this.highBandwidthPeers.delete(peerId);
+  }
+
+  /**
+   * Number of peers with compact-block state.
+   * Exposed for leak monitoring / tests (BUG-hotbuns-memleak-2026-07-20 S2).
+   */
+  getPeerStateCount(): number {
+    return this.peerStates.size;
+  }
+
+  /**
+   * Reap state for peers no longer in `activePeerIds` ("host:port" keys).
+   *
+   * Belt-and-braces sweeper from BUG-hotbuns-memleak-2026-07-20 (S2,
+   * fix-plan item 2): every disconnect path MUST call removePeer(), but if
+   * an integration forgets to, each stale CompactBlockState (and its
+   * pendingBlockTxn partial blocks) leaks forever under peer churn.
+   * Running this periodically against the peer-manager's live key set turns
+   * any such regression into bounded staleness instead of an OOM.
+   *
+   * @param activePeerIds - "host:port" keys of currently-connected peers
+   * @returns number of stale peer states reaped
+   */
+  sweep(activePeerIds: Iterable<string>): number {
+    const active = new Set(activePeerIds);
+    let reaped = 0;
+    for (const peerId of this.peerStates.keys()) {
+      if (active.has(peerId)) continue;
+      this.peerStates.delete(peerId);
+      this.highBandwidthPeers.delete(peerId);
+      reaped++;
+    }
+    return reaped;
   }
 
   /**

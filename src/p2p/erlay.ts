@@ -360,6 +360,45 @@ export class TxReconciliationTracker {
   }
 
   /**
+   * Number of peers with reconciliation state (pre-registered or full).
+   * Exposed for leak monitoring / tests (BUG-hotbuns-memleak-2026-07-20 S1).
+   */
+  getStateCount(): number {
+    return this.states.size;
+  }
+
+  /**
+   * Reap state for peers no longer in `activePeerIds` ("host:port" keys).
+   *
+   * Belt-and-braces sweeper from BUG-hotbuns-memleak-2026-07-20 (S1,
+   * fix-plan item 2): every disconnect path MUST call forgetPeer(), but if
+   * an integration forgets to, a leaked entry pins a live setInterval whose
+   * closure retains the whole Peer object (recvBuffer, in-flight maps,
+   * socket wrappers) — unbounded growth under inbound ephemeral-port churn.
+   * Running this periodically against the peer-manager's live key set turns
+   * any such regression into bounded staleness instead of an OOM.
+   *
+   * @param activePeerIds - "host:port" keys of currently-connected peers
+   * @returns number of stale peer states reaped
+   */
+  sweep(activePeerIds: Iterable<string>): number {
+    const active = new Set(activePeerIds);
+    let reaped = 0;
+    for (const [peerId, state] of this.states) {
+      if (active.has(peerId)) continue;
+      if (typeof state !== "bigint" && state.reconTimer) {
+        clearInterval(state.reconTimer);
+      }
+      this.states.delete(peerId);
+      reaped++;
+    }
+    if (reaped > 0) {
+      this.log(`Sweeper reaped ${reaped} stale peer state(s)`);
+    }
+    return reaped;
+  }
+
+  /**
    * Check if a peer is fully registered for reconciliation.
    *
    * @param peer - The peer to check
