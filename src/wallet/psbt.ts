@@ -24,6 +24,8 @@ import {
   getTxVSize,
   sigHashWitnessV0,
   sigHashLegacy,
+  sigHashTaproot,
+  type TaprootSigHashCache,
   SIGHASH_ALL,
   hasWitness,
 } from "../validation/tx.js";
@@ -34,7 +36,9 @@ import {
   ecdsaSign,
   ecdsaVerify,
   taggedHash,
+  tweakPrivateKey,
 } from "../crypto/primitives.js";
+import { schnorr } from "@noble/curves/secp256k1.js";
 import { base58CheckEncode, bech32Encode } from "../address/encoding.js";
 import { addChecksum } from "./descriptor.js";
 
@@ -1509,6 +1513,87 @@ export function signPSBTInput(
   const scriptPubKey = utxo.scriptPubKey;
   let sighash: Buffer;
 
+  // Check for P2TR (segwit v1): OP_1 <32-byte x-only output key>.
+  // Taproot key-path spends are NOT ECDSA — they use a BIP-340 Schnorr
+  // signature over the BIP-341 TapSighash, which commits to the scriptPubKey
+  // AND amount of EVERY input's prevout (sha_scriptPubKeys / sha_amounts).
+  // This branch therefore gathers ALL prevouts from the PSBT (each input's
+  // witnessUtxo must be populated), applies the BIP-86 output-key tweak to the
+  // signing key, and produces the 64-byte SIGHASH_DEFAULT witness. It returns
+  // early — the ECDSA path below does not apply.
+  if (
+    scriptPubKey.length === 34 &&
+    scriptPubKey[0] === 0x51 &&
+    scriptPubKey[1] === 0x20
+  ) {
+    // BIP-341 commits to every prevout; collect the full spent-outputs vector.
+    // Any input whose UTXO is not yet wired makes the sighash uncomputable, so
+    // fail loudly rather than sign a hash Core will reject.
+    const prevOuts: { scriptPubKey: Buffer; value: bigint }[] = [];
+    for (let j = 0; j < psbt.inputs.length; j++) {
+      const u = getInputUTXO(psbt, j);
+      if (!u) {
+        throw new Error(
+          `Cannot sign taproot input ${inputIndex}: missing UTXO for input ${j} ` +
+            `(BIP-341 sighash commits to all prevouts)`
+        );
+      }
+      prevOuts.push({ scriptPubKey: u.scriptPubKey, value: u.value });
+    }
+
+    // Internal x-only pubkey P (32 bytes) from the 33-byte compressed pubkey.
+    const xOnlyPubkey = publicKey.subarray(1, 33);
+    // BIP-86 key-path (no script tree): tweak = TaggedHash("TapTweak", x(P)).
+    const tweak = taggedHash("TapTweak", xOnlyPubkey);
+    // Apply BIP-341 even-y negation + tweak so tweakedPriv*G == the on-chain
+    // output key Q. tweakPrivateKey handles the parity negation.
+    const tweakedPrivateKey = tweakPrivateKey(privateKey, tweak);
+
+    // Sanity: the tweaked key's x-only pubkey MUST equal the scriptPubKey
+    // output key, otherwise this wallet key does not own this output and any
+    // signature would be rejected. schnorr.getPublicKey returns the 32-byte
+    // x-only form directly.
+    const tweakedX = Buffer.from(schnorr.getPublicKey(tweakedPrivateKey));
+    if (!tweakedX.equals(scriptPubKey.subarray(2, 34))) {
+      throw new Error(
+        "Public key does not match P2TR output key (BIP-86 tweak mismatch)"
+      );
+    }
+
+    // Taproot key-path default is SIGHASH_DEFAULT (0x00), which yields the
+    // canonical 64-byte witness. Map the ECDSA-style SIGHASH_ALL default the
+    // callers pass onto SIGHASH_DEFAULT; honor any other explicit hash type.
+    const tapHashType = sighashType === SIGHASH_ALL ? 0x00 : sighashType;
+
+    const cache: TaprootSigHashCache = {};
+    const tapSighash = sigHashTaproot(
+      psbt.tx,
+      inputIndex,
+      prevOuts,
+      tapHashType,
+      0, // ext_flag = 0 (key-path)
+      undefined, // no annex
+      undefined, // no tap leaf hash (key-path)
+      undefined, // no key version (key-path)
+      0xffffffff, // codeSepPos unused for key-path
+      cache
+    );
+
+    const rawSig = Buffer.from(schnorr.sign(tapSighash, tweakedPrivateKey));
+    // Witness encoding (BIP-341): SIGHASH_DEFAULT -> bare 64 bytes; any other
+    // hash type -> 65 bytes (sig || hashType).
+    const tapKeySig =
+      tapHashType === 0x00
+        ? rawSig
+        : Buffer.concat([rawSig, Buffer.from([tapHashType])]);
+
+    input.tapKeySig = tapKeySig;
+    if (input.sighashType === undefined) {
+      input.sighashType = tapHashType;
+    }
+    return;
+  }
+
   // Check for P2WPKH: OP_0 <20 bytes>
   if (
     scriptPubKey.length === 22 &&
@@ -2257,6 +2342,21 @@ export function finalizePSBTInput(psbt: PSBT, inputIndex: number): boolean {
 
     input.finalScriptSig = Buffer.alloc(0);
     input.finalScriptWitness = witness;
+
+    clearSigningData(input);
+    return true;
+  }
+
+  // P2TR key-path (segwit v1): OP_1 <32 bytes>. The witness is the single
+  // BIP-341 Schnorr key-spend signature (64 or 65 bytes); scriptSig is empty.
+  if (
+    scriptPubKey.length === 34 &&
+    scriptPubKey[0] === 0x51 &&
+    scriptPubKey[1] === 0x20 &&
+    input.tapKeySig
+  ) {
+    input.finalScriptSig = Buffer.alloc(0);
+    input.finalScriptWitness = [input.tapKeySig];
 
     clearSigningData(input);
     return true;

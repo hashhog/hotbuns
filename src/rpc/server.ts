@@ -85,6 +85,7 @@ import type {
   WalletTxRecord,
   WalletTxDetail,
   WalletUTXO,
+  WalletAddressType,
 } from "../wallet/wallet.js";
 import { COINBASE_SPENDABLE_DEPTH } from "../wallet/wallet.js";
 import {
@@ -12241,7 +12242,35 @@ export class RPCServer {
         "Error: This wallet has no available keys"
       );
     }
-    const address = wallet.getNewAddress();
+    // getnewaddress ( "label" "address_type" ). params[0] is the (ignored-here)
+    // label; params[1] selects the output type. Core defaults to the wallet's
+    // -addresstype ("bech32"/P2WPKH). We accept the same four string values Core
+    // does and map them straight onto the wallet's WalletAddressType. An
+    // unknown value is a -5 INVALID_PARAMETER, matching Core's
+    // ParseOutputType failure (wallet/rpc/addresses.cpp getnewaddress).
+    const addressTypeParam = params[1];
+    let addressType: WalletAddressType = "bech32";
+    if (addressTypeParam !== undefined && addressTypeParam !== null) {
+      if (typeof addressTypeParam !== "string") {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          "Address type must be a string"
+        );
+      }
+      if (
+        addressTypeParam !== "legacy" &&
+        addressTypeParam !== "p2sh-segwit" &&
+        addressTypeParam !== "bech32" &&
+        addressTypeParam !== "bech32m"
+      ) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          `Unknown address type '${addressTypeParam}'`
+        );
+      }
+      addressType = addressTypeParam;
+    }
+    const address = wallet.getNewAddress(addressType);
     // Advancing the receive-index keypool is state-changing: persist so a
     // SIGKILL before the next block doesn't reissue the same index.
     this.markWalletDirty();
@@ -12965,6 +12994,14 @@ export class RPCServer {
     const utxoManager = this.chainState.getUTXOManager();
     const errors: Array<Record<string, unknown>> = [];
 
+    // PASS 1: wire EVERY input's prevout (scriptPubKey + amount) into the PSBT
+    // and resolve its wallet key, BEFORE signing any input. Taproot key-path
+    // (BIP-341) commits its sighash to the scriptPubKey and amount of ALL
+    // prevouts, so signPSBTInput must see every input's witnessUtxo already
+    // populated — signing input-by-input as we discover prevouts would compute
+    // the taproot sighash over an incomplete spent-outputs vector.
+    const signable: Array<{ privateKey: Buffer; publicKey: Buffer } | null> =
+      new Array(tx.inputs.length).fill(null);
     for (let i = 0; i < tx.inputs.length; i++) {
       const txin = tx.inputs[i];
       // Skip inputs that already have final scripts (from convertToPSBT path).
@@ -13032,13 +13069,19 @@ export class RPCServer {
         });
         continue;
       }
+      signable[i] = { privateKey: key.privateKey, publicKey: key.publicKey };
+    }
 
+    // PASS 2: now that every prevout is wired, sign each resolvable input.
+    for (let i = 0; i < tx.inputs.length; i++) {
+      const s = signable[i];
+      if (!s) continue;
       try {
-        signPSBTInput(psbt, i, key.privateKey, key.publicKey, /*sighashType=*/ 0x01);
+        signPSBTInput(psbt, i, s.privateKey, s.publicKey, /*sighashType=*/ 0x01);
       } catch (e) {
         errors.push({
-          txid: Buffer.from(txin.prevOut.txid).reverse().toString("hex"),
-          vout: txin.prevOut.vout,
+          txid: Buffer.from(tx.inputs[i].prevOut.txid).reverse().toString("hex"),
+          vout: tx.inputs[i].prevOut.vout,
           error: (e as Error).message,
         });
       }

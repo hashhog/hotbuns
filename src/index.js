@@ -3033,7 +3033,7 @@ var require_node_gyp_build2 = __commonJS((exports, module) => {
 
 // node_modules/classic-level/binding.js
 var require_binding = __commonJS((exports, module) => {
-  var __dirname = "/home/work/hashhog/.claude/worktrees/agent-af037f4792ef06e2a/hotbuns/node_modules/classic-level";
+  var __dirname = "/home/work/hashhog/hotbuns/node_modules/classic-level";
   module.exports = require_node_gyp_build2()(__dirname);
 });
 
@@ -20220,6 +20220,29 @@ var MAX_PACKAGE_COUNT = 25;
 var MAX_PACKAGE_WEIGHT = 404000;
 var MAX_STANDARD_TX_WEIGHT = 400000n;
 var DEFAULT_MAX_SIZE = 300000000;
+function estimateEntryUsage(tx, vsize) {
+  const OBJ = 64;
+  const BUF = 96;
+  const MAP_ENTRY = 64;
+  const HEX_KEY = 88;
+  let usage = OBJ * 4 + MAP_ENTRY + HEX_KEY + (BUF + 32) + 256;
+  for (const input of tx.inputs) {
+    usage += OBJ * 2;
+    usage += BUF + 32;
+    usage += BUF + input.scriptSig.length;
+    usage += 32;
+    for (const item of input.witness) {
+      usage += BUF + item.length;
+    }
+    usage += MAP_ENTRY + HEX_KEY + 16;
+  }
+  for (const output of tx.outputs) {
+    usage += OBJ;
+    usage += BUF + output.scriptPubKey.length;
+    usage += 24;
+  }
+  return Math.max(usage, vsize);
+}
 var MEMPOOL_EXPIRY_SECONDS = 336 * 60 * 60;
 var ROLLING_FEE_HALFLIFE = 60 * 60 * 12;
 var DEFAULT_MIN_FEE_RATE = 0.1;
@@ -20433,6 +20456,7 @@ class Mempool {
   mapDeltas;
   maxSize;
   currentSize;
+  currentUsage;
   utxo;
   params;
   minFeeRate;
@@ -20454,6 +20478,7 @@ class Mempool {
     this.mapDeltas = new Map;
     this.maxSize = maxSize;
     this.currentSize = 0;
+    this.currentUsage = 0;
     this.utxo = utxo;
     this.params = params;
     this.minFeeRate = DEFAULT_MIN_FEE_RATE;
@@ -21007,6 +21032,7 @@ class Mempool {
     }
     this.entries.set(txidHex, entry);
     this.currentSize += vsize;
+    this.currentUsage += estimateEntryUsage(tx, vsize);
     for (const parentTxidHex of parentTxids) {
       const parent = this.entries.get(parentTxidHex);
       if (parent) {
@@ -21019,7 +21045,7 @@ class Mempool {
       const outpointKey2 = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
       this.outpointIndex.set(outpointKey2, txidHex);
     }
-    if (this.currentSize > this.maxSize) {
+    if (this.currentUsage > this.maxSize || this.currentSize > this.maxSize) {
       this.evict();
     }
     if (this.notificationEmitter) {
@@ -21080,6 +21106,7 @@ class Mempool {
     }
     this.entries.delete(txidHex);
     this.currentSize -= entry.vsize;
+    this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
     this.clusterCacheDirty = true;
     if (this.notificationEmitter) {
       const seq = this.mempoolSequence;
@@ -21108,6 +21135,7 @@ class Mempool {
         }
         this.entries.delete(txidHex);
         this.currentSize -= entry.vsize;
+        this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
       }
     }
     const conflictingTxids = [];
@@ -21235,6 +21263,7 @@ class Mempool {
       };
       this.entries.set(txidHex, entry);
       this.currentSize += vsize;
+      this.currentUsage += estimateEntryUsage(tx, vsize);
       for (const input of tx.inputs) {
         const outpointKey2 = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
         this.outpointIndex.set(outpointKey2, txidHex);
@@ -21586,6 +21615,7 @@ class Mempool {
     }
     this.entries.delete(txidHex);
     this.currentSize -= entry.vsize;
+    this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
   }
   getRBFOptInState(txid) {
     const txidHex = txid.toString("hex");
@@ -21656,9 +21686,9 @@ class Mempool {
     const now = Math.floor(Date.now() / 1000);
     if (now > this.lastRollingFeeUpdate + 10) {
       let halflife = ROLLING_FEE_HALFLIFE;
-      if (this.currentSize < this.maxSize / 4) {
+      if (this.currentUsage < this.maxSize / 4) {
         halflife /= 4;
-      } else if (this.currentSize < this.maxSize / 2) {
+      } else if (this.currentUsage < this.maxSize / 2) {
         halflife /= 2;
       }
       this.rollingMinimumFeeRate = this.rollingMinimumFeeRate / Math.pow(2, (now - this.lastRollingFeeUpdate) / halflife);
@@ -21676,7 +21706,7 @@ class Mempool {
     this.rebuildClusterCache();
     let nTxnRemoved = 0;
     let maxFeeRateRemovedKvB = 0;
-    while (this.currentSize > this.maxSize && this.entries.size > 0) {
+    while ((this.currentUsage > this.maxSize || this.currentSize > this.maxSize) && this.entries.size > 0) {
       let worstChunkTxids = [];
       let worstChunkFeeRate = Infinity;
       let worstChunkTotalVsize = 0;
@@ -21722,6 +21752,8 @@ class Mempool {
     return {
       size: this.entries.size,
       bytes: this.currentSize,
+      usage: this.currentUsage,
+      maxmempool: this.maxSize,
       minFeeRate: dynamicMinSatPerVB
     };
   }
@@ -21746,6 +21778,7 @@ class Mempool {
     this.entries.clear();
     this.outpointIndex.clear();
     this.currentSize = 0;
+    this.currentUsage = 0;
     this.minFeeRate = DEFAULT_MIN_FEE_RATE;
     this.clusters.clear();
     this.clusterCache.clear();
@@ -29940,6 +29973,7 @@ var COMPACT_BLOCK_VERSION_2 = 2n;
 var MAX_HIGH_BANDWIDTH_PEERS = 3;
 var MAX_CMPCTBLOCK_DEPTH = 5;
 var MAX_BLOCKTXN_DEPTH = 10;
+var MAX_PENDING_BLOCKS_PER_PEER = 16;
 var SHORT_ID_MASK = 0xffffffffffffn;
 function createCompactBlockState() {
   return {
@@ -30270,6 +30304,12 @@ class CompactBlockManager {
       return null;
     }
     const state = this.getState(peerId);
+    while (state.pendingBlockTxn.size >= MAX_PENDING_BLOCKS_PER_PEER) {
+      const oldest = state.pendingBlockTxn.keys().next().value;
+      if (oldest === undefined)
+        break;
+      state.pendingBlockTxn.delete(oldest);
+    }
     state.pendingBlockTxn.set(blockHash, partial);
     return partial;
   }
@@ -30309,6 +30349,21 @@ class CompactBlockManager {
   removePeer(peerId) {
     this.peerStates.delete(peerId);
     this.highBandwidthPeers.delete(peerId);
+  }
+  getPeerStateCount() {
+    return this.peerStates.size;
+  }
+  sweep(activePeerIds) {
+    const active = new Set(activePeerIds);
+    let reaped = 0;
+    for (const peerId of this.peerStates.keys()) {
+      if (active.has(peerId))
+        continue;
+      this.peerStates.delete(peerId);
+      this.highBandwidthPeers.delete(peerId);
+      reaped++;
+    }
+    return reaped;
   }
   getStats() {
     return { ...this.stats };
@@ -39121,6 +39176,37 @@ class Wallet {
   getUTXOs() {
     return Array.from(this.utxos.values());
   }
+  getUTXOByOutpoint(displayTxid, vout) {
+    let internalHex;
+    try {
+      internalHex = Buffer.from(displayTxid, "hex").reverse().toString("hex");
+    } catch {
+      return;
+    }
+    return this.utxos.get(`${internalHex}:${vout}`);
+  }
+  estimateTxVBytes(inputTypes, outputScriptLens, includeChange) {
+    let wu = 40;
+    if (inputTypes.some((t) => t !== "p2pkh" /* P2PKH */))
+      wu += 2;
+    for (const t of inputTypes)
+      wu += this.getInputWeight(t);
+    for (const len of outputScriptLens) {
+      wu += (8 + this.varIntLen(len) + len) * 4;
+    }
+    if (includeChange)
+      wu += this.getOutputWeight("p2wpkh" /* P2WPKH */);
+    return Math.ceil(wu / 4);
+  }
+  varIntLen(n) {
+    if (n < 253)
+      return 1;
+    if (n <= 65535)
+      return 3;
+    if (n <= 4294967295)
+      return 5;
+    return 9;
+  }
   async rescan(getBlockAt, startHeight, stopHeight) {
     const lo = Math.max(0, startHeight | 0);
     const hi = stopHeight | 0;
@@ -39763,6 +39849,7 @@ class WalletManager {
 init_serialization();
 init_tx();
 init_primitives();
+init_secp256k1();
 init_encoding();
 var PSBT_MAGIC = Buffer.from("70736274ff", "hex");
 var PSBT_SEPARATOR = 0;
@@ -40645,6 +40732,33 @@ function signPSBTInput(psbt, inputIndex, privateKey, publicKey, sighashType = SI
   }
   const scriptPubKey = utxo.scriptPubKey;
   let sighash;
+  if (scriptPubKey.length === 34 && scriptPubKey[0] === 81 && scriptPubKey[1] === 32) {
+    const prevOuts = [];
+    for (let j = 0;j < psbt.inputs.length; j++) {
+      const u = getInputUTXO(psbt, j);
+      if (!u) {
+        throw new Error(`Cannot sign taproot input ${inputIndex}: missing UTXO for input ${j} ` + `(BIP-341 sighash commits to all prevouts)`);
+      }
+      prevOuts.push({ scriptPubKey: u.scriptPubKey, value: u.value });
+    }
+    const xOnlyPubkey = publicKey.subarray(1, 33);
+    const tweak = taggedHash2("TapTweak", xOnlyPubkey);
+    const tweakedPrivateKey = tweakPrivateKey(privateKey, tweak);
+    const tweakedX = Buffer.from(schnorr.getPublicKey(tweakedPrivateKey));
+    if (!tweakedX.equals(scriptPubKey.subarray(2, 34))) {
+      throw new Error("Public key does not match P2TR output key (BIP-86 tweak mismatch)");
+    }
+    const tapHashType = sighashType === SIGHASH_ALL ? 0 : sighashType;
+    const cache = {};
+    const tapSighash = sigHashTaproot(psbt.tx, inputIndex, prevOuts, tapHashType, 0, undefined, undefined, undefined, 4294967295, cache);
+    const rawSig = Buffer.from(schnorr.sign(tapSighash, tweakedPrivateKey));
+    const tapKeySig = tapHashType === 0 ? rawSig : Buffer.concat([rawSig, Buffer.from([tapHashType])]);
+    input.tapKeySig = tapKeySig;
+    if (input.sighashType === undefined) {
+      input.sighashType = tapHashType;
+    }
+    return;
+  }
   if (scriptPubKey.length === 22 && scriptPubKey[0] === 0 && scriptPubKey[1] === 20) {
     const pubKeyHash = hash160(publicKey);
     if (!scriptPubKey.subarray(2).equals(pubKeyHash)) {
@@ -41089,6 +41203,12 @@ function finalizePSBTInput(psbt, inputIndex) {
     }
     input.finalScriptSig = Buffer.alloc(0);
     input.finalScriptWitness = witness;
+    clearSigningData(input);
+    return true;
+  }
+  if (scriptPubKey.length === 34 && scriptPubKey[0] === 81 && scriptPubKey[1] === 32 && input.tapKeySig) {
+    input.finalScriptSig = Buffer.alloc(0);
+    input.finalScriptWitness = [input.tapKeySig];
     clearSigningData(input);
     return true;
   }
@@ -46304,9 +46424,9 @@ class RPCServer {
       loaded: true,
       size: info.size,
       bytes: info.bytes,
-      usage: info.bytes,
+      usage: info.usage,
       total_fee: totalFee / 1e8,
-      maxmempool: 300000000,
+      maxmempool: info.maxmempool,
       mempoolminfee: info.minFeeRate / 1e5,
       minrelaytxfee: 0.000001,
       incrementalrelayfee: 0.000001,
@@ -49767,7 +49887,18 @@ class RPCServer {
     if (wallet.isPrivateKeysDisabled() || wallet.isBlank()) {
       throw this.rpcError(RPCErrorCodes.WALLET_ERROR, "Error: This wallet has no available keys");
     }
-    const address = wallet.getNewAddress();
+    const addressTypeParam = params[1];
+    let addressType = "bech32";
+    if (addressTypeParam !== undefined && addressTypeParam !== null) {
+      if (typeof addressTypeParam !== "string") {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Address type must be a string");
+      }
+      if (addressTypeParam !== "legacy" && addressTypeParam !== "p2sh-segwit" && addressTypeParam !== "bech32" && addressTypeParam !== "bech32m") {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, `Unknown address type '${addressTypeParam}'`);
+      }
+      addressType = addressTypeParam;
+    }
+    const address = wallet.getNewAddress(addressType);
     this.markWalletDirty();
     return address;
   }
@@ -50193,6 +50324,7 @@ class RPCServer {
     const psbt = convertToPSBT(tx);
     const utxoManager = this.chainState.getUTXOManager();
     const errors = [];
+    const signable = new Array(tx.inputs.length).fill(null);
     for (let i = 0;i < tx.inputs.length; i++) {
       const txin = tx.inputs[i];
       if (isInputFinalized(psbt.inputs[i]))
@@ -50247,12 +50379,18 @@ class RPCServer {
         });
         continue;
       }
+      signable[i] = { privateKey: key.privateKey, publicKey: key.publicKey };
+    }
+    for (let i = 0;i < tx.inputs.length; i++) {
+      const s = signable[i];
+      if (!s)
+        continue;
       try {
-        signPSBTInput(psbt, i, key.privateKey, key.publicKey, 1);
+        signPSBTInput(psbt, i, s.privateKey, s.publicKey, 1);
       } catch (e) {
         errors.push({
-          txid: Buffer.from(txin.prevOut.txid).reverse().toString("hex"),
-          vout: txin.prevOut.vout,
+          txid: Buffer.from(tx.inputs[i].prevOut.txid).reverse().toString("hex"),
+          vout: tx.inputs[i].prevOut.vout,
           error: e.message
         });
       }
@@ -50949,17 +51087,53 @@ class RPCServer {
     } else if (typeof options.feeRate === "number" && options.feeRate > 0) {
       feeRate = options.feeRate * 1e8 / 1000;
     }
+    let selectedInputs;
     if (inputsParam.length > 0) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Manual `inputs` aren't supported yet; pass [] to auto-select from wallet");
+      selectedInputs = [];
+      for (const rawIn of inputsParam) {
+        const inTxid = rawIn?.txid;
+        const inVout = rawIn?.vout;
+        if (typeof inTxid !== "string" || typeof inVout !== "number") {
+          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "each input needs a txid (hex string) and vout (number)");
+        }
+        const u = wallet.getUTXOByOutpoint(inTxid, inVout);
+        if (!u) {
+          throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Input not found in wallet or already spent: ${inTxid}:${inVout}`);
+        }
+        selectedInputs.push(u);
+      }
+    } else {
+      let selection;
+      try {
+        selection = wallet.selectCoinsAdvanced(totalOutputSats, feeRate);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        throw this.rpcError(RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS, msg);
+      }
+      selectedInputs = selection.inputs;
     }
-    let selection;
-    try {
-      selection = wallet.selectCoinsAdvanced(totalOutputSats, feeRate);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      throw this.rpcError(RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS, msg);
+    const totalInputSats = selectedInputs.reduce((a, u) => a + u.amount, 0n);
+    const inputTypes = selectedInputs.map((u) => u.addressType);
+    const outLens = outputsList.map((o) => o.scriptPubKey.length);
+    const feeWithChange = BigInt(Math.ceil(wallet.estimateTxVBytes(inputTypes, outLens, true) * feeRate));
+    const feeNoChange = BigInt(Math.ceil(wallet.estimateTxVBytes(inputTypes, outLens, false) * feeRate));
+    const DUST_THRESHOLD = 546n;
+    let feeSats;
+    let changeSats = 0n;
+    const changeCandidate = totalInputSats - totalOutputSats - feeWithChange;
+    if (changeCandidate > DUST_THRESHOLD) {
+      feeSats = feeWithChange;
+      changeSats = changeCandidate;
+    } else {
+      feeSats = totalInputSats - totalOutputSats;
+      if (feeSats < feeNoChange) {
+        throw this.rpcError(RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS, "Insufficient funds: selected inputs do not cover outputs + fee");
+      }
     }
-    const txInputs = selection.inputs.map((u) => ({
+    if (totalInputSats < totalOutputSats + feeSats) {
+      throw this.rpcError(RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS, "Insufficient funds: selected inputs do not cover outputs + fee");
+    }
+    const txInputs = selectedInputs.map((u) => ({
       prevOut: u.outpoint,
       scriptSig: Buffer.alloc(0),
       sequence: sequenceDefault,
@@ -50970,14 +51144,13 @@ class RPCServer {
       scriptPubKey: o.scriptPubKey
     }));
     let changePos = -1;
-    const DUST_THRESHOLD = 546n;
-    if (selection.change > DUST_THRESHOLD) {
+    if (changeSats > 0n) {
       const changeAddr = typeof options.changeAddress === "string" && options.changeAddress.length > 0 ? options.changeAddress : wallet.getChangeAddress();
       const decoded = decodeAddress(changeAddr);
       const scriptHex = this.buildScriptPubKeyHex(decoded.type, decoded.hash);
       changePos = txOutputs.length;
       txOutputs.push({
-        value: selection.change,
+        value: changeSats,
         scriptPubKey: Buffer.from(scriptHex, "hex")
       });
     }
@@ -50988,15 +51161,15 @@ class RPCServer {
       lockTime
     };
     const psbt = createPSBT(tx);
-    for (let i = 0;i < selection.inputs.length; i++) {
-      const u = selection.inputs[i];
+    for (let i = 0;i < selectedInputs.length; i++) {
+      const u = selectedInputs[i];
       const decoded = decodeAddress(u.address);
       const scriptPubKey = Buffer.from(this.buildScriptPubKeyHex(decoded.type, decoded.hash), "hex");
       updateInputUTXO(psbt, i, { value: u.amount, scriptPubKey }, true);
     }
     return {
       psbt: encodePSBTBase64(psbt),
-      fee: Number(selection.fee) / 1e8,
+      fee: Number(feeSats) / 1e8,
       changepos: changePos
     };
   }
@@ -52192,8 +52365,8 @@ class RESTServer {
         loaded: true,
         size: info.size,
         bytes: info.bytes,
-        usage: info.bytes,
-        maxmempool: 300000000,
+        usage: info.usage,
+        maxmempool: info.maxmempool,
         mempoolminfee: info.minFeeRate / 1e5,
         minrelaytxfee: 0.000001
       };
