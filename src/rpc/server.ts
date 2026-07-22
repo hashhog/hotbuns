@@ -84,6 +84,7 @@ import type {
   CreateWalletOptions,
   WalletTxRecord,
   WalletTxDetail,
+  WalletUTXO,
 } from "../wallet/wallet.js";
 import { COINBASE_SPENDABLE_DEPTH } from "../wallet/wallet.js";
 import {
@@ -14190,26 +14191,85 @@ export class RPCServer {
       feeRate = ((options.feeRate as number) * 100_000_000) / 1000;
     }
 
-    // Pre-supplied inputs are not coin-selected; for now we require
-    // inputs=[] and let the wallet choose. Manual prevouts are a follow-up.
+    // Resolve the input set. Caller-supplied manual `inputs` are MANDATORY and
+    // used verbatim (Core's `add_inputs` defaults to false when inputs are
+    // given, so no extra coin selection is layered on). An empty `inputs` array
+    // delegates to automatic coin selection.
+    let selectedInputs: WalletUTXO[];
     if (inputsParam.length > 0) {
+      selectedInputs = [];
+      for (const rawIn of inputsParam as Array<Record<string, unknown>>) {
+        const inTxid = rawIn?.txid;
+        const inVout = rawIn?.vout;
+        if (typeof inTxid !== "string" || typeof inVout !== "number") {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_PARAMS,
+            "each input needs a txid (hex string) and vout (number)"
+          );
+        }
+        const u = wallet.getUTXOByOutpoint(inTxid, inVout);
+        if (!u) {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+            `Input not found in wallet or already spent: ${inTxid}:${inVout}`
+          );
+        }
+        selectedInputs.push(u);
+      }
+    } else {
+      let selection;
+      try {
+        selection = wallet.selectCoinsAdvanced(totalOutputSats, feeRate);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        throw this.rpcError(RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS, msg);
+      }
+      selectedInputs = selection.inputs;
+    }
+
+    const totalInputSats = selectedInputs.reduce((a, u) => a + u.amount, 0n);
+
+    // Fee is sized over the FULL virtual size of the tx actually built — base
+    // overhead + every input (per-type, segwit-discounted) + every payment
+    // output + the change output — via wallet.estimateTxVBytes. The previous
+    // path reported only the summed input weight, which undercounts a real tx
+    // by the output + base bytes and fails Core fee-target parity.
+    const inputTypes = selectedInputs.map((u) => u.addressType);
+    const outLens = outputsList.map((o) => o.scriptPubKey.length);
+    const feeWithChange = BigInt(
+      Math.ceil(wallet.estimateTxVBytes(inputTypes, outLens, true) * feeRate)
+    );
+    const feeNoChange = BigInt(
+      Math.ceil(wallet.estimateTxVBytes(inputTypes, outLens, false) * feeRate)
+    );
+
+    const DUST_THRESHOLD = 546n;
+    let feeSats: bigint;
+    let changeSats = 0n;
+    const changeCandidate = totalInputSats - totalOutputSats - feeWithChange;
+    if (changeCandidate > DUST_THRESHOLD) {
+      feeSats = feeWithChange;
+      changeSats = changeCandidate;
+    } else {
+      // No economical change output: any sub-dust remainder is absorbed into
+      // the fee (matches Core). Require at least the change-less fee.
+      feeSats = totalInputSats - totalOutputSats;
+      if (feeSats < feeNoChange) {
+        throw this.rpcError(
+          RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS,
+          "Insufficient funds: selected inputs do not cover outputs + fee"
+        );
+      }
+    }
+    if (totalInputSats < totalOutputSats + feeSats) {
       throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
-        "Manual `inputs` aren't supported yet; pass [] to auto-select from wallet"
+        RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS,
+        "Insufficient funds: selected inputs do not cover outputs + fee"
       );
     }
 
-    // Coin selection.
-    let selection;
-    try {
-      selection = wallet.selectCoinsAdvanced(totalOutputSats, feeRate);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      throw this.rpcError(RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS, msg);
-    }
-
     // Build inputs.
-    const txInputs: TxIn[] = selection.inputs.map((u) => ({
+    const txInputs: TxIn[] = selectedInputs.map((u) => ({
       prevOut: u.outpoint,
       scriptSig: Buffer.alloc(0),
       sequence: sequenceDefault,
@@ -14222,8 +14282,7 @@ export class RPCServer {
       scriptPubKey: o.scriptPubKey,
     }));
     let changePos = -1;
-    const DUST_THRESHOLD = 546n;
-    if (selection.change > DUST_THRESHOLD) {
+    if (changeSats > 0n) {
       const changeAddr = (typeof options.changeAddress === "string"
         && options.changeAddress.length > 0)
         ? options.changeAddress as string
@@ -14232,7 +14291,7 @@ export class RPCServer {
       const scriptHex = this.buildScriptPubKeyHex(decoded.type, decoded.hash);
       changePos = txOutputs.length;
       txOutputs.push({
-        value: selection.change,
+        value: changeSats,
         scriptPubKey: Buffer.from(scriptHex, "hex"),
       });
     }
@@ -14247,8 +14306,8 @@ export class RPCServer {
     // Build PSBT and attach witness UTXOs so a signer/finalizer downstream
     // has everything it needs.
     const psbt = createPSBT(tx);
-    for (let i = 0; i < selection.inputs.length; i++) {
-      const u = selection.inputs[i];
+    for (let i = 0; i < selectedInputs.length; i++) {
+      const u = selectedInputs[i];
       const decoded = decodeAddress(u.address);
       const scriptPubKey = Buffer.from(
         this.buildScriptPubKeyHex(decoded.type, decoded.hash),
@@ -14259,7 +14318,7 @@ export class RPCServer {
 
     return {
       psbt: encodePSBTBase64(psbt),
-      fee: Number(selection.fee) / 100_000_000,
+      fee: Number(feeSats) / 100_000_000,
       changepos: changePos,
     };
   }
