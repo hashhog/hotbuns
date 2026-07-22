@@ -3085,6 +3085,62 @@ export class Wallet {
   }
 
   /**
+   * Look up a single wallet UTXO by its outpoint, keyed on the DISPLAY txid
+   * (big-endian, as emitted by listunspent / accepted by RPC params). The
+   * internal `utxos` map is keyed on the wire (little-endian) txid hex, so we
+   * reverse the display txid before probing the map. Returns undefined when the
+   * outpoint is not a wallet coin. Used by walletcreatefundedpsbt to resolve
+   * caller-supplied manual inputs to their value + scriptPubKey.
+   */
+  getUTXOByOutpoint(displayTxid: string, vout: number): WalletUTXO | undefined {
+    let internalHex: string;
+    try {
+      internalHex = Buffer.from(displayTxid, "hex").reverse().toString("hex");
+    } catch {
+      return undefined;
+    }
+    return this.utxos.get(`${internalHex}:${vout}`);
+  }
+
+  /**
+   * Estimate the virtual size (vbytes) of a transaction spending the given
+   * input types and paying the given output scriptPubKey byte-lengths, with an
+   * optional native-segwit change output. Uses the same per-type, segwit-
+   * discounted input/output weights as coin selection (INPUT_WEIGHT /
+   * OUTPUT_WEIGHT are WU = vbytes*4). Callers (walletcreatefundedpsbt) size the
+   * fee as `ceil(vbytes * feeRate)` so the reported/embedded fee covers the WHOLE
+   * tx, not just the inputs.
+   */
+  estimateTxVBytes(
+    inputTypes: AddressType[],
+    outputScriptLens: number[],
+    includeChange: boolean
+  ): number {
+    // Accumulate WEIGHT UNITS and divide once at the end so the sub-vbyte
+    // segwit discount (marker/flag = 2 WU = 0.5 vB) rounds up correctly — the
+    // per-input /4 division would otherwise silently drop it, undercounting a
+    // 1-in/2-out P2WPKH tx by a whole vbyte and tripping Core's fee target.
+    // Base non-witness: version(4)+locktime(4)+in-count(1)+out-count(1) = 40 WU.
+    let wu = 40;
+    // Segwit marker+flag (2 WU) is present whenever any input carries a witness.
+    if (inputTypes.some((t) => t !== AddressType.P2PKH)) wu += 2;
+    for (const t of inputTypes) wu += this.getInputWeight(t); // already WU
+    for (const len of outputScriptLens) {
+      wu += (8 + this.varIntLen(len) + len) * 4; // value(8)+scriptlen+script
+    }
+    if (includeChange) wu += this.getOutputWeight(AddressType.P2WPKH); // WU
+    return Math.ceil(wu / 4);
+  }
+
+  /** Byte-length of a Bitcoin CompactSize (varint) encoding of `n`. */
+  private varIntLen(n: number): number {
+    if (n < 0xfd) return 1;
+    if (n <= 0xffff) return 3;
+    if (n <= 0xffffffff) return 5;
+    return 9;
+  }
+
+  /**
    * Rescan a range of EXISTING active-chain blocks for outputs paying
    * wallet-owned scripts, crediting them into the wallet UTXO set + history
    * and debiting any wallet coins those blocks spent. This is the BACKWARD
