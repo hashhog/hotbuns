@@ -44,14 +44,27 @@ describe("network constants", () => {
     expect(MAINNET.maxCoins).toBe(2_100_000_000_000_000n);
   });
 
-  test("services field defaults to NETWORK | WITNESS (NETWORK_LIMITED is conditional)", () => {
+  test("services advertises NETWORK | WITNESS | NETWORK_LIMITED, plus P2P_V2 when v2 is on", () => {
     // NODE_NETWORK (1) | NODE_WITNESS (8) | NODE_NETWORK_LIMITED (1024) = 0x409.
     // Core advertises NODE_NETWORK_LIMITED UNCONDITIONALLY for a full node
     // (init.cpp:863 base g_local_services; NODE_NETWORK added for non-prune at
     // init.cpp:1950), so it is part of the base services, not prune-gated.
-    // NODE_P2P_V2 (0x800) is NOT set — BIP-324 v2 is default-off for hotbuns.
-    expect(MAINNET.services).toBe(0x409n);
-    expect(MAINNET.services).toBe(1n | 8n | 1024n);
+    //
+    // NODE_P2P_V2 (0x800, Core protocol.h:330) is advertised iff the BIP-324 v2
+    // transport is actually offered on the wire — advertising it without
+    // offering it (or vice-versa) would mis-claim a capability. v2 was flipped
+    // default-ON in 9c446e0 after an interop proof, gated by HOTBUNS_BIP324_V2
+    // (unset -> on; "0"/"false"/"off" -> off), so the default bitset is 0xc09.
+    // Mirror that gate here rather than hard-coding, so the test tracks the
+    // env the suite actually runs under.
+    const envV2 = process.env.HOTBUNS_BIP324_V2?.toLowerCase();
+    const v2Enabled =
+      envV2 === undefined || (envV2 !== "0" && envV2 !== "false" && envV2 !== "off");
+    const expected = 0x409n | (v2Enabled ? 0x800n : 0n);
+
+    expect(MAINNET.services).toBe(expected);
+    // The three base flags are always present, regardless of the v2 gate.
+    expect(MAINNET.services & (1n | 8n | 1024n)).toBe(1n | 8n | 1024n);
   });
 
   test("difficulty adjustment interval is 2016 blocks", () => {
