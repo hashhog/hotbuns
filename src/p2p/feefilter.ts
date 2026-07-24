@@ -24,15 +24,23 @@ export const AVG_FEEFILTER_BROADCAST_INTERVAL_MS = 10 * 60 * 1000;
 export const MAX_FEEFILTER_CHANGE_DELAY_MS = 5 * 60 * 1000;
 
 /**
- * Default minimum relay fee rate (1000 sat/kvB = 1 sat/vB).
+ * Default minimum relay fee rate (100 sat/kvB = 0.1 sat/vB).
+ *
+ * Core v31 `policy/policy.h:70 DEFAULT_MIN_RELAY_TX_FEE{100}` — LOWERED from the
+ * historical 1000. This value is the floor of the BIP-133 `feefilter` we
+ * advertise, so holding 1000 asked peers to withhold transactions Core relays
+ * and drifted our mempool from Core's. mempool.ts and the RPC layer already
+ * used 100; this module was the odd one out.
  */
-export const DEFAULT_MIN_RELAY_FEE_RATE = 1000n;
+export const DEFAULT_MIN_RELAY_FEE_RATE = 100n;
 
 /**
- * Default incremental relay fee rate (1000 sat/kvB = 1 sat/vB).
+ * Default incremental relay fee rate (100 sat/kvB = 0.1 sat/vB).
  * For RBF, new fee must exceed old by at least this * newVsize.
+ * Core v31 `policy/policy.h:48 DEFAULT_INCREMENTAL_RELAY_FEE{100}` — also
+ * lowered from 1000; at 1000 we demanded a 10x-too-large bump.
  */
-export const DEFAULT_INCREMENTAL_RELAY_FEE = 1000n;
+export const DEFAULT_INCREMENTAL_RELAY_FEE = 100n;
 
 /**
  * Maximum money value (used during IBD to tell peers not to send txs).
