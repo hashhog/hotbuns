@@ -1012,12 +1012,21 @@ describe("wire-decode caps (DoS protection)", () => {
   });
 
   test("inv: count = 0xFEFFFFFFFF (~1.1e9) attacker payload throws before alloc", () => {
-    // Reproducer from the audit doc: varint 0xFEFFFFFFFF -> 4-byte 0xFFFFFFFF
+    // Reproducer from the audit doc: varint 0xFEFFFFFFFF -> 4-byte 0xFFFFFFFF.
+    // This payload IS rejected before allocating — but by the OUTER guard, not
+    // MAX_INV_SZ: 0xFFFFFFFF exceeds CompactSize MAX_SIZE (0x02000000), so the
+    // varint read itself throws (Core's ReadCompactSize range check, added in
+    // 0ce752b) before the count is ever returned to the inv deserializer. That
+    // is strictly earlier and stronger than the MAX_INV_SZ cap. The
+    // MAX_INV_SZ layer still covers the 50_000 < count <= MAX_SIZE band — see
+    // the adjacent `count > MAX_INV_SZ` tests, which use MAX_INV_SZ + 1 and do
+    // reach it. (The original /MAX_INV_SZ/ expectation here predated the
+    // MAX_SIZE guard and went stale when it landed.)
     const writer = new BufferWriter();
     writer.writeVarInt(0xffffffff);
     const payload = writer.toBuffer();
     const header = makeHeader("inv", payload);
-    expect(() => deserializeMessage(header, payload)).toThrow(/MAX_INV_SZ/);
+    expect(() => deserializeMessage(header, payload)).toThrow(/size too large/);
   });
 
   test("getdata: count > MAX_INV_SZ throws (shares deserializer)", () => {
