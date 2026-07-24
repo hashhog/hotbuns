@@ -193,15 +193,26 @@ describe("P2A script verification", () => {
     expect(result).toBe(true);
   });
 
-  test("P2A with non-empty witness fails", () => {
+  test("P2A with non-empty witness still succeeds (anyone-can-spend, Core parity)", () => {
     const scriptPubKey = P2A_SCRIPT;
     const scriptSig = Buffer.alloc(0);
-    // P2A must have empty witness
     const witness = [Buffer.from([0x01])];
     const sigHasher = (_subscript: Buffer, _ht: number) => Buffer.alloc(32);
 
+    // P2A is anyone-can-spend and the witness is NEVER inspected at consensus
+    // level. Core returns true for it unconditionally, BEFORE the
+    // DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM check and without looking at the
+    // witness at all:
+    //   } else if (!is_p2sh && CScript::IsPayToAnchor(witversion, program)) {
+    //       return true;
+    //   }
+    // (bitcoin-core/src/script/interpreter.cpp:1990-1991)
+    // So a non-empty witness does NOT invalidate the spend. "P2A spends carry
+    // an empty witness" is a policy/convention statement, not a consensus rule,
+    // and verifyScript() here is the consensus path. The earlier expectation of
+    // `false` asserted a rule Core does not have.
     const result = verifyScript(scriptSig, scriptPubKey, witness, taprootFlags(), sigHasher);
-    expect(result).toBe(false);
+    expect(result).toBe(true);
   });
 
   test("P2A with non-empty scriptSig fails", () => {
