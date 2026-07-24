@@ -110,16 +110,41 @@ export function serializeBlockFileInfo(info: BlockFileInfo): Buffer {
 /**
  * Deserialize BlockFileInfo from bytes.
  */
+/**
+ * Read one BlockFileInfo field.
+ *
+ * These fields are VALUES, not length prefixes, and they legitimately exceed
+ * CompactSize MAX_SIZE (0x02000000 = 33.5 MB): `nSize`/`nUndoSize` grow to
+ * MAX_BLOCKFILE_SIZE (128 MiB) and `nTimeFirst`/`nTimeLast` are UNIX timestamps
+ * (~1.7e9). `readVarInt()` applies Core's ReadCompactSize range check, which is
+ * correct for a length prefix but rejects every one of these — it made
+ * `deserializeBlockFileInfo` throw "size too large" on any real record, and
+ * PruningManager.loadBlockFileInfo() does not catch it, so a pruned node failed
+ * to start once block-file info had been persisted.
+ *
+ * Core does not use CompactSize here at all: CBlockFileInfo is serialized with
+ * VARINT (node/blockstorage.h:69-73), which has no range check. The unchecked
+ * reader is the faithful equivalent — same value-vs-size distinction drawn in
+ * 37cf27b for the BIP-155 addrv2 services bitmask.
+ */
+function readInfoField(reader: BufferReader): number {
+  const value = reader.readCompactSizeNoCheck();
+  if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error("BlockFileInfo: field exceeds Number.MAX_SAFE_INTEGER");
+  }
+  return Number(value);
+}
+
 export function deserializeBlockFileInfo(data: Buffer): BlockFileInfo {
   const reader = new BufferReader(data);
   return {
-    nBlocks: reader.readVarInt(),
-    nSize: reader.readVarInt(),
-    nUndoSize: reader.readVarInt(),
-    nHeightFirst: reader.readVarInt(),
-    nHeightLast: reader.readVarInt(),
-    nTimeFirst: reader.readVarInt(),
-    nTimeLast: reader.readVarInt(),
+    nBlocks: readInfoField(reader),
+    nSize: readInfoField(reader),
+    nUndoSize: readInfoField(reader),
+    nHeightFirst: readInfoField(reader),
+    nHeightLast: readInfoField(reader),
+    nTimeFirst: readInfoField(reader),
+    nTimeLast: readInfoField(reader),
   };
 }
 
