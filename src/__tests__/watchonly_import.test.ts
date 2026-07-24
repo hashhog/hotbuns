@@ -29,7 +29,11 @@ import type { Block } from "../validation/block.js";
 
 const TEST_DATADIR = "/tmp/hotbuns-watchonly-import-test";
 
-let portCounter = 28600;
+// Randomised per-run base. A FIXED base collides with long-running processes on
+// the dev box: 28601-28610 are held by the phaseb python harnesses and a regtest
+// bitcoind, which made these tests fail with "Failed to start server. Is port
+// 28601 in use?" and masked the real assertion failures underneath.
+let portCounter = 41000 + Math.floor(Math.random() * 20000);
 function getTestPort(): number {
   return portCounter++;
 }
