@@ -321,9 +321,13 @@ describe("W102 AssumeUTXO snapshot loading gate audit", () => {
       err = e as Error;
     }
 
-    // BUG-3: hotbuns does NOT throw — MoneyRange gate is absent.
-    // When fixed this should be: expect(err).not.toBeNull() and error matches /MoneyRange|bad.*value/i
-    expect(err).toBeNull(); // Documents the missing gate
+    // FIXED: the per-coin MoneyRange gate is now enforced during loadSnapshot,
+    // matching Core (a coin with value > MAX_MONEY is rejected rather than
+    // admitted into the UTXO set). Flipped per this test's own instruction:
+    // "When fixed this should be: expect(err).not.toBeNull() and error matches
+    // /MoneyRange|bad.*value/i".
+    expect(err).not.toBeNull();
+    expect(err!.message).toMatch(/MoneyRange|bad.*value/i);
     await db.close();
   });
 
@@ -374,9 +378,11 @@ describe("W102 AssumeUTXO snapshot loading gate audit", () => {
       err = e as Error;
     }
 
-    // BUG-2: hotbuns does NOT throw — trailing bytes are silently ignored.
-    // When fixed this should be: expect(err).not.toBeNull() and error matches /coins left over|trailing|unexpected/i
-    expect(err).toBeNull(); // Documents the missing gate
+    // FIXED: trailing bytes after the declared coinsCount are now rejected,
+    // matching Core (which reads one extra byte and errors if the file is not
+    // exhausted). Flipped per this test's own instruction.
+    expect(err).not.toBeNull();
+    expect(err!.message).toMatch(/coins left over|trailing|unexpected/i);
     await db.close();
   });
 
@@ -479,8 +485,11 @@ describe("W102 AssumeUTXO snapshot loading gate audit", () => {
     } catch (e) {
       secondErr = e as Error;
     }
-    // When fixed: expect(secondErr).not.toBeNull() + error matches /more than once|already active/i
-    expect(secondErr).toBeNull(); // Documents the missing gate
+    // FIXED: the already-active precondition is now enforced, matching Core's
+    // "Can't activate a snapshot-based chainstate more than once". Flipped per
+    // this test's own instruction.
+    expect(secondErr).not.toBeNull();
+    expect(secondErr!.message).toMatch(/more than once|already active/i);
 
     await db.close();
   });
