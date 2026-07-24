@@ -43,18 +43,26 @@ class MockPeerManager {
   broadcast(_msg: unknown) {
     // No-op in tests
   }
+  // Mirrors PeerManager.getNetworkActive (manager.ts:849), read by
+  // getnetworkinfo for Core's `networkactive` field. Without it the RPC threw
+  // "getNetworkActive is not a function".
+  getNetworkActive() {
+    return true;
+  }
 }
 
 // Mock HeaderSync for testing
 class MockHeaderSync {
-  private bestHeader: { height: number; hash: Buffer; chainWork: bigint; header: { timestamp: number } } | null = null;
+  private bestHeader:
+    | { height: number; hash: Buffer; chainWork: bigint; header: { timestamp: number; bits: number } }
+    | null = null;
 
   constructor(genesisHash: Buffer) {
     this.bestHeader = {
       height: 0,
       hash: genesisHash,
       chainWork: 1n,
-      header: { timestamp: 1296688602 },
+      header: { timestamp: 1296688602, bits: REGTEST.powLimitBits },
     };
   }
 
@@ -67,7 +75,12 @@ class MockHeaderSync {
       hash,
       height: 0,
       chainWork: 1n,
-      header: { timestamp: 1296688602 },
+      // `bits` is REQUIRED: getblockchaininfo/getchainstates derive the tip's
+      // bits/target from it (server.ts:1566, :3226). A real header always
+      // carries it (BlockHeader.bits, and even the synthesized genesis entry
+      // at sync/headers.ts sets it); omitting it here made the RPC throw
+      // "undefined is not an object (evaluating 'tipBitsNum.toString')".
+      header: { timestamp: 1296688602, bits: REGTEST.powLimitBits },
       status: "valid-header" as const,
     };
   }
@@ -81,7 +94,12 @@ class MockHeaderSync {
   }
 
   updateTip(height: number, hash: Buffer, chainWork: bigint) {
-    this.bestHeader = { height, hash, chainWork, header: { timestamp: Math.floor(Date.now() / 1000) } };
+    this.bestHeader = {
+      height,
+      hash,
+      chainWork,
+      header: { timestamp: Math.floor(Date.now() / 1000), bits: REGTEST.powLimitBits },
+    };
   }
 }
 
