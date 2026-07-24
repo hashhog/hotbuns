@@ -969,7 +969,8 @@ export class ChainStateManager {
     // stops returning the now-orphaned block.  Rides the same atomic batch.
     extraOps.push(this.db.buildHeightHashDeleteOp(height));
 
-    // Single atomic flush: UTXO changes + txindex deletes + chain state.
+    // Single atomic flush: UTXO changes + chain state + height->hash delete.
+    // (No txindex deletes — see the Core-parity note above.)
     await this.utxo.flush(extraOps);
 
     // In-memory tip update happens AFTER the batch lands so a thrown

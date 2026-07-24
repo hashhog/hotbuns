@@ -332,11 +332,15 @@ describe("ChainStateManager", () => {
     //   2. db.deleteTxIndex(txid)  (per-tx loop)
     //   3. db.putChainState(...)
     // A crash between any two left the chainstate inconsistent.  After
-    // the Pattern D fix all three write categories must funnel through
+    // the Pattern D fix the remaining write categories must funnel through
     // a single ChainDB.batch() call so they land atomically (Bitcoin Core
     // CDBBatch parity).  This test spies on db.batch and the per-call
     // direct-write paths to assert that contract.
-    test("commits utxo + chain-state + txindex revert via a single atomic batch", async () => {
+    //
+    // Step (2) was later REMOVED entirely for Core parity (6056a4c): Core's
+    // TxIndex has no CustomRemove override, so txindex entries survive a
+    // disconnect.  This test therefore asserts zero txindex deletes.
+    test("commits utxo + chain-state via one atomic batch, keeping txindex (Core parity)", async () => {
       // Build + connect block 1.
       const coinbase = createCoinbaseTx(1, 50_00000000n);
       const block = createBlock(REGTEST.genesisBlockHash, [coinbase]);
@@ -398,12 +402,19 @@ describe("ChainStateManager", () => {
       );
       expect(chainStatePuts.length).toBe(1);
 
-      // 4) That single batch must also carry the txindex delete for the
-      //    coinbase tx (Pattern C0 revert riding inside the same batch).
+      // 4) txindex entries must NOT be deleted on disconnect (Core parity,
+      //    fixed in 6056a4c). Bitcoin Core's TxIndex does not override
+      //    BaseIndex::CustomRemove, whose default (index/base.h:136) is a
+      //    no-op returning true — so Core keeps txid->block entries for
+      //    disconnected blocks. Correctness comes from the READ side instead:
+      //    getrawtransaction reports confirmations 0 (and getblock -1) when
+      //    the block is not on the active chain, which hotbuns implements at
+      //    rpc/server.ts:4483 / :2426. Deleting here would diverge from Core
+      //    and lose the ability to resolve a tx from an orphaned block.
       const txIndexDels = ops.filter(
         (o) => o.type === "del" && o.prefix === TX_INDEX_PREFIX
       );
-      expect(txIndexDels.length).toBe(block.transactions.length);
+      expect(txIndexDels.length).toBe(0);
     });
   });
 

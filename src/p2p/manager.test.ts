@@ -568,6 +568,12 @@ describe("PeerManager address persistence", () => {
   // v1-only mock fixture; pin v1 (see PeerManager block note).
   let prevV2Env: string | undefined;
 
+  // A publicly-routable IPv4 literal: outside every range isRoutable() rejects
+  // (loopback, RFC1918, CGNAT, link-local, RFC2544, and the RFC5737
+  // documentation blocks). Only routable addresses can enter the bucketed
+  // AddrMan, which is what peers.dat persists.
+  const ROUTABLE_HOST = "8.8.8.8";
+
   beforeEach(async () => {
     prevV2Env = process.env.HOTBUNS_BIP324_V2;
     process.env.HOTBUNS_BIP324_V2 = "0";
@@ -597,21 +603,55 @@ describe("PeerManager address persistence", () => {
     const manager1 = new PeerManager(config);
     const peer = await manager1.connectPeer("127.0.0.1", mockServer.port);
     await waitFor(() => peer.state === "connected");
+
+    // Seed one ROUTABLE address (as an addr message / addnode would). Only
+    // routable addresses can round-trip through peers.dat — see the assertions
+    // below — so the mock server's 127.0.0.1 alone cannot exercise this.
+    expect(
+      manager1.injectKnownAddress(
+        ROUTABLE_HOST,
+        8333,
+        9n, // NODE_NETWORK | NODE_WITNESS
+        Math.floor(Date.now() / 1000)
+      )
+    ).toBe(true);
+
     await manager1.stop();
 
     mockServer.stop();
 
     // Second manager: should load saved addresses
-    const manager2 = new PeerManager(config);
+    // Second manager: loads peers.dat on start(). Outbound dialing is disabled
+    // so the restored routable address is not actually dialed — start() would
+    // otherwise open a real socket to it and stall the test for the full
+    // connect timeout. Loading is independent of the outbound limits.
+    const manager2 = new PeerManager({
+      ...config,
+      maxOutbound: 0,
+      maxOutboundFullRelay: 0,
+      maxOutboundBlockRelay: 0,
+    });
     await manager2.start();
 
     const addresses = manager2.getKnownAddresses();
-    const key = `127.0.0.1:${mockServer.port}`;
 
-    expect(addresses.has(key)).toBe(true);
-    const info = addresses.get(key);
-    expect(info?.host).toBe("127.0.0.1");
-    expect(info?.port).toBe(mockServer.port);
+    // The ROUTABLE address survives the restart: peers.dat persists the
+    // bucketed AddrMan (35c1e44), and loadAddresses() re-hydrates the flat
+    // live store from it.
+    const routableKey = `${ROUTABLE_HOST}:8333`;
+    expect(addresses.has(routableKey)).toBe(true);
+    const info = addresses.get(routableKey);
+    expect(info?.host).toBe(ROUTABLE_HOST);
+    expect(info?.port).toBe(8333);
+
+    // The loopback peer we actually connected to is intentionally NOT
+    // persisted. peers.dat holds the bucketed AddrMan, and — like Core's
+    // AddrMan::AddSingle (`if (!addr.IsRoutable()) return false`, addrman.cpp)
+    // — non-routable addresses never enter it. 127.0.0.0/8 is loopback, so it
+    // is dropped by design. (Before the 2026-06-17 addrman-persistence rework
+    // peers.dat held the unfiltered flat map, which is why this test used to
+    // assert the opposite.)
+    expect(addresses.has(`127.0.0.1:${mockServer.port}`)).toBe(false);
 
     await manager2.stop();
   }, TEST_TIMEOUT);
