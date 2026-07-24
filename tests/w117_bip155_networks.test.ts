@@ -851,6 +851,9 @@ describe("G30 — BUG-3: getnetworkinfo missing onion/i2p/cjdns in networks arra
 
     class MockPeerManager {
       getConnectedPeers() { return []; }
+      // getnetworkinfo reads this for Core's `networkactive` field
+      // (PeerManager.getNetworkActive, manager.ts:849).
+      getNetworkActive() { return true; }
       getPeerCount() { return 0; }
       broadcast() {}
     }
@@ -898,6 +901,9 @@ describe("G30 — BUG-3: getnetworkinfo missing onion/i2p/cjdns in networks arra
 
     class MockPeerManager {
       getConnectedPeers() { return []; }
+      // getnetworkinfo reads this for Core's `networkactive` field
+      // (PeerManager.getNetworkActive, manager.ts:849).
+      getNetworkActive() { return true; }
       getPeerCount() { return 0; }
       broadcast() {}
     }
@@ -923,13 +929,14 @@ describe("G30 — BUG-3: getnetworkinfo missing onion/i2p/cjdns in networks arra
 
     const info = await rpc.getNetworkInfo();
     const names = (info.networks as any[]).map((n: any) => n.name);
-    // BUG-3: onion/i2p/cjdns are absent from the networks array.
+    // FIXED (BUG-3): Core's getnetworkinfo lists all five networks, and
+    // hotbuns now emits onion/i2p/cjdns alongside ipv4/ipv6.
     // Core always returns all 5 network types.
-    expect(names).not.toContain("onion");
-    expect(names).not.toContain("i2p");
-    expect(names).not.toContain("cjdns");
-    // Only 2 entries currently (ipv4, ipv6)
-    expect(names.length).toBe(2);
+    expect(names).toContain("onion");
+    expect(names).toContain("i2p");
+    expect(names).toContain("cjdns");
+    // Core always returns all 5 network types.
+    expect(names.length).toBe(5);
   });
 });
 

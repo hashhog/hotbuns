@@ -589,19 +589,16 @@ describe("W137-G18: PSBT_IN_TAP_KEY_SIG = 0x13 (parse-only, BUG-8 P0-CDIV)", () 
     expect(src).toMatch(/Invalid taproot signature length/);
   });
 
-  it("BUG-8: signPSBTInput has NO P2TR branch — refuses to sign taproot inputs", () => {
+  it("FIXED (BUG-8): signPSBTInput detects P2TR and signs taproot inputs", () => {
     const src = readSrc("wallet/psbt.ts");
-    // The signPSBTInput function body covers P2WPKH, P2PKH, P2SH-* and
-    // P2WSH but has no IsPayToTaproot / 0x51 0x20 branch.
     const signBody = src
       .split("export function signPSBTInput")[1]
       ?.split("export function combinePSBTs")[0] ?? "";
-    // No P2TR script template detection: OP_1 (0x51) <32 bytes>
-    expect(signBody).not.toMatch(/scriptPubKey\[0\]\s*===\s*0x51/);
-    expect(signBody).not.toMatch(/witness_v1_taproot/);
-    // The final "Unsupported script type for signing" branch is what fires
-    // on a taproot input.
-    expect(signBody).toMatch(/Unsupported script type for signing/);
+    // P2TR script template detection: OP_1 (0x51) <32 bytes>. Taproot key-path
+    // signing was wired in 687f1a1, so taproot inputs no longer fall through to
+    // the "Unsupported script type" branch (which remains, for genuinely
+    // unsupported templates).
+    expect(signBody).toMatch(/scriptPubKey\[0\]\s*===\s*0x51/);
   });
 });
 
@@ -804,13 +801,14 @@ describe("W137-G28: SIGNER — signPSBTInput script template coverage", () => {
     expect(signBody).toMatch(/scriptPubKey\[1\]\s*===\s*0x20/);
   });
 
-  it("BUG-8 (recorded under G18): no P2TR (witness_v1_taproot) signing branch", () => {
+  it("FIXED (BUG-8): signPSBTInput has a P2TR (witness_v1_taproot) branch", () => {
     const src = readSrc("wallet/psbt.ts");
     const signBody = src
       .split("export function signPSBTInput")[1]
       ?.split("export function combinePSBTs")[0] ?? "";
-    // OP_1 (0x51) = SegWit v1 / P2TR — not present in signPSBTInput
-    expect(signBody).not.toMatch(/===\s*0x51/);
+    // OP_1 (0x51) = SegWit v1 / P2TR. Taproot key-path signing was wired in
+    // 687f1a1, so the branch is now present.
+    expect(signBody).toMatch(/===\s*0x51/);
   });
 });
 
@@ -905,14 +903,11 @@ describe("W137-G33: utxoupdatepsbt RPC (BUG-15, P1-API)", () => {
 // =============================================================================
 
 describe("W137-G34: walletcreatefundedpsbt rejects manual inputs (BUG-16, P2)", () => {
-  it("BUG-16: server.ts explicitly throws on inputsParam.length > 0", () => {
+  it("FIXED (BUG-16): walletcreatefundedpsbt no longer refuses manual inputs", () => {
+    // Manual-input support landed in 1e84984, so the "Manual inputs aren't
+    // supported yet" throw is gone.
     const src = readSrc("rpc/server.ts");
-    expect(src).toMatch(/Manual\s+`?inputs`?\s+aren'?t\s+supported\s+yet/);
-    // Confirm the throw is inside walletCreateFundedPSBT.
-    const fn = src
-      .split("private async walletCreateFundedPSBT")[1]
-      ?.split("private async help")[0] ?? "";
-    expect(fn).toMatch(/inputsParam\.length\s*>\s*0/);
+    expect(src).not.toMatch(/Manual\s+`?inputs`?\s+aren'?t\s+supported\s+yet/);
   });
 });
 
