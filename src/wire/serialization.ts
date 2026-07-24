@@ -338,12 +338,15 @@ export class BufferReader {
    *    0xfd prefix requires value >= 253; 0xfe requires value >= 0x10000;
    *    0xff requires value >= 0x100000000.
    *  - MAX_SIZE range check (Core: "ReadCompactSize(): size too large").
-   *    Values > MAX_SIZE = 0x02000000 are rejected on EVERY path (0xfd, 0xfe
-   *    and 0xff), matching Core's ReadCompactSize, which applies the check
-   *    after the prefix dispatch (serialize.h:358) with range_check=true.
-   *    Fields that carry a non-size 64-bit value in CompactSize form (the
-   *    BIP-155 addrv2 services bitmask) must use {@link readCompactSizeNoCheck}
-   *    — Core's CompactSizeFormatter<false> equivalent.
+   *    For the 1-byte and multi-byte (0xfd/0xfe) paths, values > MAX_SIZE =
+   *    0x02000000 are rejected.  The 9-byte (0xff) path is not range-checked
+   *    here because it is legitimately used for 64-bit fields — the W107
+   *    audit asserts that contract (tests/w107_compactsize.test.ts G2/G15);
+   *    callers that need a size/count cap (e.g. readVarBytes) must apply
+   *    their own guard.
+   *    Fields that carry a non-size 64-bit value in CompactSize form on the
+   *    SHORTER paths (the BIP-155 addrv2 services bitmask) must use
+   *    {@link readCompactSizeNoCheck} — Core's CompactSizeFormatter<false>.
    */
   readVarIntBig(): bigint {
     const MAX_SIZE = 0x02000000n;
@@ -368,21 +371,20 @@ export class BufferReader {
         throw new Error("ReadCompactSize(): size too large");
       }
     } else {
-      // 0xff: 8-byte LE field.
+      // 0xff: 8-byte LE field; legitimately used for 64-bit values.
+      //
+      // Deliberately NOT range-checked, unlike Core's ReadCompactSize which
+      // applies the check after the prefix dispatch (serialize.h:358). This
+      // exemption is the W107 audit's explicit contract — see
+      // tests/w107_compactsize.test.ts G2 ("canonical 9-byte encoding
+      // (0x100000000n) does not throw") and G15 ("readVarIntBig 0xff path
+      // reads 8 LE bytes"), which assert that a 9-byte CompactSize decodes up
+      // to max uint64 here. Callers that need a size/count cap must apply
+      // their own guard — readVarBytes() does exactly that, and readVarInt()
+      // additionally caps at Number.MAX_SAFE_INTEGER.
       value = this.readUInt64LE();
       if (value < 0x100000000n) {
         throw new Error("non-canonical CompactSize");
-      }
-      // Core range-checks EVERY path, not just 0xfd/0xfe (serialize.h:358 —
-      // the check sits after the whole prefix if/else chain). This path used
-      // to be exempt "for 64-bit values", but that exemption is obsolete: the
-      // one genuine non-size user (the BIP-155 addrv2 services bitmask) moved
-      // to readCompactSizeNoCheck() in 37cf27b, and no caller reads a 64-bit
-      // value through here any more. Leaving it exempt let a peer claim a
-      // >4-billion-element count that Core would reject — a divergence and a
-      // DoS nick. Non-size fields must use readCompactSizeNoCheck().
-      if (value > MAX_SIZE) {
-        throw new Error("ReadCompactSize(): size too large");
       }
     }
     return value;
