@@ -249,13 +249,12 @@ describe("BufferReader", () => {
       expect(reader.readCompactSizeNoCheck()).toBe(0xffffffffn);
     });
 
-    test("reads 9-byte varint (0xFF prefix) as a non-size value", () => {
+    test("reads 9-byte varint (0xFF prefix)", () => {
       const bytes = Buffer.from([0xff, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]);
-      // 0x100000000 exceeds MAX_SIZE, so as a size it is rejected on the 0xff
-      // path too (Core checks every path, serialize.h:358); as a non-size
-      // 64-bit field it decodes normally.
-      expect(() => new BufferReader(bytes).readVarIntBig()).toThrow("size too large");
-      expect(new BufferReader(bytes).readCompactSizeNoCheck()).toBe(0x100000000n);
+      // The 9-byte path is deliberately NOT range-checked — it carries 64-bit
+      // values, a contract the W107 audit asserts (w107_compactsize G2/G15).
+      // Size/count callers cap separately (readVarBytes / readVarInt).
+      expect(new BufferReader(bytes).readVarIntBig()).toBe(0x100000000n);
     });
 
     test("rejects non-canonical 0xFF encoding", () => {
@@ -375,17 +374,24 @@ describe("round-trip tests", () => {
   });
 
   test("above-MAX_SIZE varints encode, but decode only as non-size values", () => {
-    for (const v of [0xffffffff, 0x100000000n]) {
-      const writer = new BufferWriter();
-      writer.writeVarInt(v); // writer is unrestricted, like Core's WriteCompactSize
-      const buf = writer.toBuffer();
+    // 0xffffffff takes the 0xfe (5-byte) path, which IS range-checked.
+    const writer = new BufferWriter();
+    writer.writeVarInt(0xffffffff); // writer is unrestricted, like Core's WriteCompactSize
+    const buf = writer.toBuffer();
 
-      // As a length/count: rejected (MAX_SIZE guard, Core serialize.h:358).
-      expect(() => new BufferReader(buf).readVarIntBig()).toThrow("size too large");
+    // As a length/count: rejected by the MAX_SIZE guard.
+    expect(() => new BufferReader(buf).readVarIntBig()).toThrow("size too large");
+    // As a non-size field (e.g. addrv2 services): decodes fine.
+    expect(new BufferReader(buf).readCompactSizeNoCheck()).toBe(0xffffffffn);
 
-      // As a non-size 64-bit field (e.g. addrv2 services): decodes fine.
-      expect(new BufferReader(buf).readCompactSizeNoCheck()).toBe(BigInt(v));
-    }
+    // The 0xff (9-byte) path is deliberately exempt from the range check — it
+    // carries 64-bit values (W107 contract) — so it decodes through BOTH
+    // readers. Size/count callers cap separately (readVarBytes / readVarInt).
+    const w64 = new BufferWriter();
+    w64.writeVarInt(0x100000000n);
+    const buf64 = w64.toBuffer();
+    expect(new BufferReader(buf64).readVarIntBig()).toBe(0x100000000n);
+    expect(new BufferReader(buf64).readCompactSizeNoCheck()).toBe(0x100000000n);
   });
 
   test("compound message round-trip", () => {
