@@ -65,6 +65,12 @@ class MockPeerManager {
     return [];
   }
 
+  // getnetworkinfo reads this for Core's `networkactive` field
+  // (PeerManager.getNetworkActive, manager.ts:849).
+  getNetworkActive() {
+    return true;
+  }
+
   broadcast(_msg: any) {}
 
   listBanned() {

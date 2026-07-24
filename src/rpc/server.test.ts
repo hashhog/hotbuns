@@ -196,6 +196,12 @@ class MockPeerManager {
     return this.peers;
   }
 
+  // getnetworkinfo reads this for Core's `networkactive` field
+  // (PeerManager.getNetworkActive, manager.ts:849).
+  getNetworkActive() {
+    return true;
+  }
+
   broadcast(_msg: any) {
     // No-op for tests
   }
