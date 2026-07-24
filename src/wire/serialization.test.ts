@@ -393,3 +393,41 @@ describe("round-trip tests", () => {
     expect(reader.eof).toBe(true);
   });
 });
+
+describe("BufferReader — no backing-buffer retention (hotbuns OOM leak guard)", () => {
+  // 2026-07-24 OOM root cause: readBytes returned a subarray VIEW, so any parsed
+  // field kept long-term (a UTXO-cache coin's scriptPubKey, a headerChain hash, a
+  // mempool tx field) pinned the ENTIRE multi-MB block/message buffer it was sliced
+  // from. Repro: 50 KB of stored 32-byte views retained 800 MB (200 x 4 MB blocks);
+  // coinMemoryUsage() counts the view length not the pinned buffer, so the 512 MB
+  // dbcache bound never fired -> 10-16 GB / 18-36 h climb-to-OOM. readBytes MUST
+  // return an independent copy so a stored field can never pin its source buffer.
+  test("readBytes returns an independent copy, not a view into the source", () => {
+    const src = Buffer.alloc(4 * 1024 * 1024, 0xab); // a "4 MB block" buffer
+    const field = new BufferReader(src).readBytes(32);
+    expect(field).toEqual(src.subarray(0, 32)); // content is correct
+    expect(field.buffer).not.toBe(src.buffer); // must NOT share the 4 MB backing store
+    expect(field.buffer.byteLength).toBeLessThan(src.buffer.byteLength);
+  });
+
+  test("readHash and readVarBytes results are copies too", () => {
+    const src = Buffer.concat([
+      Buffer.alloc(32, 0x11), // 32-byte hash
+      Buffer.from([0x03, 0x22, 0x22, 0x22]), // varbytes: varint len 3 + 3 bytes
+    ]);
+    const reader = new BufferReader(src);
+    const hash = reader.readHash();
+    const vb = reader.readVarBytes();
+    expect(hash.buffer).not.toBe(src.buffer);
+    expect(vb.buffer).not.toBe(src.buffer);
+    expect(hash).toEqual(Buffer.alloc(32, 0x11));
+    expect(vb).toEqual(Buffer.alloc(3, 0x22));
+  });
+
+  test("mutating the source after a read does not affect the parsed copy", () => {
+    const src = Buffer.alloc(64, 0x01);
+    const field = new BufferReader(src).readBytes(32);
+    src.fill(0xff); // overwrite the source in place
+    expect(field.every((b) => b === 0x01)).toBe(true); // copy is unaffected
+  });
+});

@@ -449,9 +449,20 @@ export class BufferReader {
    */
   readBytes(length: number): Buffer {
     this.ensureAvailable(length);
-    const data = this.buffer.subarray(this.offset, this.offset + length);
+    // Return an INDEPENDENT COPY, never a subarray VIEW. A subarray shares the
+    // reader's backing ArrayBuffer, so any parsed field kept long-term — a
+    // UTXO-cache coin's scriptPubKey, a headerChain hash, a mempool tx field —
+    // would pin the ENTIRE multi-MB block/message buffer it was sliced from.
+    // That was the hotbuns OOM leak: ~10-16 GB / 18-36 h at tip, because each
+    // cached coin pinned its 4 MB source block (repro: 50 KB of stored 32-byte
+    // views retained 800 MB). coinMemoryUsage() counts the view length, not the
+    // pinned buffer, so the 512 MB dbcache bound never fired. A copy costs one
+    // small allocation at parse time (the data is retained anyway) and severs
+    // the retention. See receipts/hotbuns-buffer-view-leak-2026-07-24.md.
+    const out = Buffer.allocUnsafe(length);
+    this.buffer.copy(out, 0, this.offset, this.offset + length);
     this.offset += length;
-    return data;
+    return out;
   }
 
   /**
