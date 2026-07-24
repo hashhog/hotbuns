@@ -222,18 +222,46 @@ describe("BufferReader", () => {
     });
 
     test("reads 5-byte varint (0xFE prefix)", () => {
-      const reader = new BufferReader(
-        Buffer.from([0xfe, 0x00, 0x00, 0x01, 0x00, 0xfe, 0xff, 0xff, 0xff, 0xff])
-      );
+      const reader = new BufferReader(Buffer.from([0xfe, 0x00, 0x00, 0x01, 0x00]));
       expect(reader.readVarInt()).toBe(65536);
-      expect(reader.readVarInt()).toBe(0xffffffff);
     });
 
-    test("reads 9-byte varint (0xFF prefix)", () => {
-      const reader = new BufferReader(
-        Buffer.from([0xff, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00])
-      );
-      expect(reader.readVarIntBig()).toBe(0x100000000n);
+    // A CompactSize read as a length/count is range-checked against
+    // MAX_SIZE = 0x02000000, exactly as Bitcoin Core's ReadCompactSize does
+    // (serialize.h:358, range_check defaulting to true). This guard is the
+    // W107 DoS hardening (0ce752b) — an adversarial peer must not be able to
+    // claim a 4-billion-element array. Values above MAX_SIZE that are NOT a
+    // size (e.g. the BIP-155 addrv2 services bitmask) must be read with
+    // readCompactSizeNoCheck() instead — see 37cf27b.
+    test("rejects a 0xFE varint above MAX_SIZE (Core range check)", () => {
+      const reader = new BufferReader(Buffer.from([0xfe, 0xff, 0xff, 0xff, 0xff]));
+      expect(() => reader.readVarInt()).toThrow("size too large");
+    });
+
+    test("accepts exactly MAX_SIZE (boundary is inclusive, as in Core)", () => {
+      // 0x02000000 little-endian = 00 00 00 02
+      const reader = new BufferReader(Buffer.from([0xfe, 0x00, 0x00, 0x00, 0x02]));
+      expect(reader.readVarInt()).toBe(0x02000000);
+    });
+
+    test("readCompactSizeNoCheck decodes above-MAX_SIZE values (non-size fields)", () => {
+      const reader = new BufferReader(Buffer.from([0xfe, 0xff, 0xff, 0xff, 0xff]));
+      expect(reader.readCompactSizeNoCheck()).toBe(0xffffffffn);
+    });
+
+    test("reads 9-byte varint (0xFF prefix) as a non-size value", () => {
+      const bytes = Buffer.from([0xff, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]);
+      // 0x100000000 exceeds MAX_SIZE, so as a size it is rejected on the 0xff
+      // path too (Core checks every path, serialize.h:358); as a non-size
+      // 64-bit field it decodes normally.
+      expect(() => new BufferReader(bytes).readVarIntBig()).toThrow("size too large");
+      expect(new BufferReader(bytes).readCompactSizeNoCheck()).toBe(0x100000000n);
+    });
+
+    test("rejects non-canonical 0xFF encoding", () => {
+      // 0xff-prefixed value below 0x100000000 must use a shorter encoding.
+      const bytes = Buffer.from([0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+      expect(() => new BufferReader(bytes).readVarIntBig()).toThrow("non-canonical");
     });
   });
 
@@ -326,18 +354,12 @@ describe("round-trip tests", () => {
   });
 
   test("varint values round-trip correctly", () => {
-    const testValues = [
-      0,
-      1,
-      252,
-      253,
-      254,
-      255,
-      65535,
-      65536,
-      0xffffffff,
-      0x100000000n,
-    ];
+    // Every value here is a valid SIZE (<= MAX_SIZE 0x02000000), so it
+    // round-trips through the range-checked reader. Above-MAX_SIZE values are
+    // covered separately below: writeVarInt encodes them (Core's
+    // WriteCompactSize has no range check either), but reading them back as a
+    // size is rejected by design.
+    const testValues = [0, 1, 252, 253, 254, 255, 65535, 65536, 0x02000000];
 
     const writer = new BufferWriter();
     for (const v of testValues) {
@@ -350,6 +372,20 @@ describe("round-trip tests", () => {
       expect(actual).toBe(BigInt(expected));
     }
     expect(reader.eof).toBe(true);
+  });
+
+  test("above-MAX_SIZE varints encode, but decode only as non-size values", () => {
+    for (const v of [0xffffffff, 0x100000000n]) {
+      const writer = new BufferWriter();
+      writer.writeVarInt(v); // writer is unrestricted, like Core's WriteCompactSize
+      const buf = writer.toBuffer();
+
+      // As a length/count: rejected (MAX_SIZE guard, Core serialize.h:358).
+      expect(() => new BufferReader(buf).readVarIntBig()).toThrow("size too large");
+
+      // As a non-size 64-bit field (e.g. addrv2 services): decodes fine.
+      expect(new BufferReader(buf).readCompactSizeNoCheck()).toBe(BigInt(v));
+    }
   });
 
   test("compound message round-trip", () => {
