@@ -84,12 +84,16 @@ describe("W125-G2: RPC_MISC_ERROR (-1) — PRESENT", () => {
 // =============================================================================
 // G3 — RPC_TYPE_ERROR (-3) — MISSING (BUG-6)
 // =============================================================================
-describe("W125-G3: RPC_TYPE_ERROR (-3) — MISSING (BUG-6)", () => {
-  it("BUG-6: no TYPE_ERROR constant in RPCErrorCodes", () => {
-    expect(("TYPE_ERROR" in RPCErrorCodes)).toBe(false);
+describe("W125-G3: RPC_TYPE_ERROR (-3) — PRESENT (BUG-6 FIXED)", () => {
+  // BUG-6 is fixed: RPCErrorCodes.TYPE_ERROR now exists (server.ts:294) and is
+  // thrown for wrong-type arguments (e.g. server.ts:2724, "Expected type object
+  // for options"). Flipped from asserting the defect to guarding the fix.
+  it("TYPE_ERROR is defined as -3 (Core RPC_TYPE_ERROR)", () => {
+    expect("TYPE_ERROR" in RPCErrorCodes).toBe(true);
+    expect(RPCErrorCodes.TYPE_ERROR).toBe(-3);
   });
-  it("BUG-6: no call site uses code -3", () => {
-    expect(RPC_SERVER_SRC).not.toContain("RPCErrorCodes.TYPE_ERROR");
+  it("call sites use RPCErrorCodes.TYPE_ERROR", () => {
+    expect(RPC_SERVER_SRC).toContain("RPCErrorCodes.TYPE_ERROR");
   });
 });
 
@@ -436,9 +440,14 @@ describe("W125-G24: WALLET_ALREADY_UNLOCKED dead-helper — PARTIAL (BUG-18)", (
 // =============================================================================
 // G25 — RPC_DESERIALIZATION_ERROR (-22) — MISSING (BUG-2)
 // =============================================================================
-describe("W125-G25: RPC_DESERIALIZATION_ERROR (-22) — MISSING (BUG-2)", () => {
-  it("BUG-2: no DESERIALIZATION_ERROR constant", () => {
-    expect("DESERIALIZATION_ERROR" in RPCErrorCodes).toBe(false);
+describe("W125-G25: RPC_DESERIALIZATION_ERROR (-22) — PARTIAL (BUG-2)", () => {
+  // The CONSTANT has since been added (server.ts:302). The call sites have NOT
+  // been migrated yet, so BUG-2 remains partially open — the two assertions
+  // below still document that gap and must keep failing-as-designed only if the
+  // migration happens.
+  it("DESERIALIZATION_ERROR constant exists as -22", () => {
+    expect("DESERIALIZATION_ERROR" in RPCErrorCodes).toBe(true);
+    expect(RPCErrorCodes.DESERIALIZATION_ERROR).toBe(-22);
   });
   it("BUG-2: sendrawtransaction TX-decode uses RPC_TRANSACTION_REJECTED (should be -22)", () => {
     const idx = RPC_SERVER_SRC.indexOf(
@@ -518,9 +527,11 @@ describe("W125-G29: non-POST HTTP code — PARTIAL (BUG-15)", () => {
 // G30 — RPC_CLIENT_P2P_DISABLED / _NODE_CAPACITY_REACHED / _MEMPOOL_DISABLED — MISSING (BUG-10)
 // =============================================================================
 describe("W125-G30: peer/mempool disabled codes (-31, -33, -34) — PARTIAL (BUG-10)", () => {
-  // Still MISSING (out of scope for the addnode parity port).
-  it("BUG-10: no CLIENT_P2P_DISABLED constant", () => {
-    expect("CLIENT_P2P_DISABLED" in RPCErrorCodes).toBe(false);
+  // CLIENT_P2P_DISABLED has since been added (server.ts:323) and is thrown
+  // (server.ts:7571). The other two remain missing — assertions below.
+  it("CLIENT_P2P_DISABLED constant exists as -31", () => {
+    expect("CLIENT_P2P_DISABLED" in RPCErrorCodes).toBe(true);
+    expect(RPCErrorCodes.CLIENT_P2P_DISABLED).toBe(-31);
   });
   it("BUG-10: no CLIENT_NODE_CAPACITY_REACHED constant", () => {
     expect("CLIENT_NODE_CAPACITY_REACHED" in RPCErrorCodes).toBe(false);

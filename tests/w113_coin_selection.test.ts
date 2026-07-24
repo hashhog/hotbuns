@@ -637,7 +637,7 @@ describe("G25: DiscourageFeeSniping / nLockTime = block height — absent", () =
   });
 });
 
-describe("G26: nSequence = 0xFFFFFFFE for wallet transactions — BUG", () => {
+describe("G26: wallet nSequence is below SEQUENCE_FINAL — BUG-10 FIXED", () => {
   test("FAIL BUG-10: sequence = 0xFFFFFFFF (SEQUENCE_FINAL) disables nLockTime enforcement", () => {
     // Bitcoin Core transaction.h:76: SEQUENCE_FINAL = 0xffffffff.
     // IsFinalTx(): if (txin.nSequence == SEQUENCE_FINAL) ignores nLockTime.
@@ -651,8 +651,12 @@ describe("G26: nSequence = 0xFFFFFFFE for wallet transactions — BUG", () => {
     const addr = wallet.getNewAddress("bech32");
     const tx = wallet.createTransaction([{ address: addr, amount: 100000n }], 1.0);
     for (const input of tx.inputs) {
-      // BUG: should be 0xFFFFFFFE (MAX_SEQUENCE_NONFINAL) for locktime to work
-      expect(input.sequence).toBe(0xffffffff); // Confirms the bug
+      // FIXED: the wallet now signals BIP-125 opt-in RBF, matching Core's
+      // wallet default (-walletrbf=1 -> MAX_BIP125_RBF_SEQUENCE = 0xFFFFFFFD,
+      // util/rbf.h). Crucially it is BELOW SEQUENCE_FINAL (0xFFFFFFFF), so
+      // nLockTime IS enforced — which was the whole point of BUG-10.
+      expect(input.sequence).toBe(0xfffffffd);
+      expect(input.sequence).toBeLessThan(0xffffffff); // locktime not disabled
     }
   });
 });

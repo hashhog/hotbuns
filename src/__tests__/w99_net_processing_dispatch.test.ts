@@ -34,7 +34,7 @@ import {
   PING_TIMEOUT_MS,
 } from "../p2p/peer.js";
 import { BanManager, DEFAULT_BAN_TIME } from "../p2p/banman.js";
-import { OrphanPool, MAX_ORPHAN_TRANSACTIONS, MAX_ORPHAN_TX_SIZE, MAX_PEER_ORPHAN_TX } from "../mempool/orphan_pool.js";
+import { OrphanPool, MAX_ORPHAN_TRANSACTIONS, MAX_ORPHAN_TX_SIZE, MAX_PEER_ORPHAN_TX, ORPHAN_TX_EXPIRE_TIME } from "../mempool/orphan_pool.js";
 import { MAX_MESSAGE_SIZE, MAX_ADDR_TO_SEND, MAX_HEADERS_RESULTS } from "../p2p/messages.js";
 import type { Transaction } from "../validation/tx.js";
 
@@ -364,24 +364,31 @@ describe("G12: Orphan expiry (BUG — no time-based eviction)", () => {
    * even after the 5-minute window expires, preventing honest orphans
    * from being accepted and potentially stalling tx resolution.
    */
-  test("BUG-G12: addedAt timestamp is recorded but no expiry sweep exists", () => {
+  test("FIXED: addedAt is recorded and expireOldOrphans() exists", () => {
     const pool = new OrphanPool();
     const tx = makeTx(1, 42);
     const result = pool.add(tx, "peer-X");
     expect(result.ok).toBe(true);
     if (result.ok) {
-      // Entry has addedAt but there is no expireOldOrphans() method
       expect(result.entry.addedAt).toBeLessThanOrEqual(Date.now());
-      expect(typeof (pool as any).expireOldOrphans).toBe("undefined"); // BUG: should exist
+      expect(typeof (pool as any).expireOldOrphans).toBe("function");
     }
   });
 
-  test("orphan stays after 'expiry' window (no sweep)", () => {
+  test("FIXED: expireOldOrphans() sweeps entries past ORPHAN_TX_EXPIRE_TIME", () => {
     const pool = new OrphanPool();
-    const tx = makeTx(1, 7);
-    pool.add(tx, "peer-Z");
-    // Simulate that time has passed (we can't call a sweep that doesn't exist)
-    expect(pool.size()).toBe(1); // still in pool — documents missing expiry
+    pool.add(makeTx(1, 7), "peer-Z");
+    expect(pool.size()).toBe(1);
+
+    // Not yet expired: a sweep at insertion time must remove nothing.
+    expect(pool.expireOldOrphans(Date.now())).toBe(0);
+    expect(pool.size()).toBe(1);
+
+    // Past the expiry window: the sweep evicts it (Core LimitOrphans ->
+    // EraseOrphansFor over ORPHAN_TX_EXPIRE_TIME).
+    const wellPastExpiry = Date.now() + (ORPHAN_TX_EXPIRE_TIME + 1) * 1000;
+    expect(pool.expireOldOrphans(wellPastExpiry)).toBe(1);
+    expect(pool.size()).toBe(0);
   });
 });
 

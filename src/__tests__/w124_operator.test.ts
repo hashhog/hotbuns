@@ -269,8 +269,8 @@ describe("W124 G14: --debuglogfile flag (MISSING — BUG-5 P0)", () => {
   });
 });
 
-describe("W124 G15: getLogger() consumed by production modules (MISSING — BUG-6 P0)", () => {
-  test("MISSING: no production module imports getLogger from logger/logger", () => {
+describe("W124 G15: getLogger() consumed by production modules (BUG-6 FIXED)", () => {
+  test("FIXED: production modules import getLogger from logger/logger", () => {
     const srcDir = path.resolve(__dirname, "..");
     // Collect every .ts file under src/ excluding test files and the logger
     // module itself. Walk the tree manually (no glob dep available).
@@ -303,8 +303,9 @@ describe("W124 G15: getLogger() consumed by production modules (MISSING — BUG-
         getLoggerImporters++;
       }
     }
-    // BUG-6: zero production importers
-    expect(getLoggerImporters).toBe(0);
+    // FIXED: the logger singleton is now actually consumed by production code
+    // (BUG-6 was "the singleton exists but nothing reads it").
+    expect(getLoggerImporters).toBeGreaterThan(0);
   });
 
   test("MISSING: setLogger is called once (cli.ts startup) — no consumer reads the singleton", () => {

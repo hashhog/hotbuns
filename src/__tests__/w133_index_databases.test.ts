@@ -630,12 +630,13 @@ describe("W133-G24: CopyHeightIndexToHashIndex on reorg (BUG-22, P0)", () => {
 // G25 — m_synced latch (BUG-23)
 // =============================================================================
 
-describe("W133-G25: m_synced sync-then-stream latch (BUG-23)", () => {
-  it("BUG-23: no m_synced equivalent on any of the three index classes", () => {
+describe("W133-G25: m_synced sync-then-stream latch (BUG-23 FIXED)", () => {
+  it("FIXED: an m_synced equivalent (isSynced) exists on the index classes", () => {
+    // Core's BaseIndex::m_synced latch answers "has this index caught up to the
+    // chain tip?". hotbuns implements it as isSynced(chainTipHeight)
+    // (storage/indexes.ts:2209).
     const src = readSrc("storage/indexes.ts");
-    expect(src.toLowerCase()).not.toContain("m_synced");
-    expect(src.toLowerCase()).not.toContain("issynced");
-    expect(src.toLowerCase()).not.toContain("synced latch");
+    expect(src.toLowerCase()).toContain("issynced");
   });
 });
 
