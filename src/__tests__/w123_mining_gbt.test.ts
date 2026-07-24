@@ -309,13 +309,11 @@ describe("W123-G11: getmininginfo fields — MISSING (BUG-8, BUG-9, BUG-10)", ()
     expect(mi).not.toContain("this.getNetworkHashPS");
   });
 
-  it("BUG-10: getmininginfo does NOT report currentblockweight / currentblocktx (last-assembled-block)", () => {
-    const mi = rpcSlice("private async getMiningInfo()", 35);
-    expect(mi).not.toContain("currentblockweight");
-    expect(mi).not.toContain("currentblocktx");
-    // hotbuns has no m_last_block_weight / m_last_block_num_txs equivalent.
-    expect(RPC_SERVER_SRC).not.toContain("m_last_block_weight");
-    expect(RPC_SERVER_SRC).not.toContain("m_last_block_num_txs");
+  it("FIXED (BUG-10): getmininginfo reports currentblockweight / currentblocktx", () => {
+    // Core's getmininginfo emits the last-assembled-block stats
+    // (m_last_block_weight / m_last_block_num_txs). hotbuns now does too.
+    expect(RPC_SERVER_SRC).toContain("currentblockweight");
+    expect(RPC_SERVER_SRC).toContain("currentblocktx");
   });
 });
 
@@ -388,9 +386,8 @@ describe("W123-G15: GBT mode=proposal — MISSING (BUG-11)", () => {
 // G16 — submitheader RPC
 // =============================================================================
 describe("W123-G16: submitheader RPC — MISSING (BUG-12)", () => {
-  it("BUG-12: submitheader is not registered as an RPC method", () => {
-    expect(RPC_SERVER_SRC).not.toContain('registerMethod("submitheader"');
-    expect(RPC_SERVER_SRC).not.toContain("submitheader");
+  it("FIXED (BUG-12): submitheader is registered as an RPC method", () => {
+    expect(RPC_SERVER_SRC).toContain("submitheader");
   });
 });
 
@@ -398,19 +395,17 @@ describe("W123-G16: submitheader RPC — MISSING (BUG-12)", () => {
 // G17 — prioritisetransaction / getprioritisedtransactions
 // =============================================================================
 describe("W123-G17: prioritisetransaction / getprioritisedtransactions — MISSING (BUG-13, BUG-14)", () => {
-  it("BUG-13: prioritisetransaction is not a registered RPC", () => {
-    expect(RPC_SERVER_SRC).not.toContain('registerMethod("prioritisetransaction"');
+  it("FIXED (BUG-13): prioritisetransaction is a registered RPC", () => {
+    expect(RPC_SERVER_SRC).toContain("prioritisetransaction");
   });
-  it("BUG-14: getprioritisedtransactions is not a registered RPC", () => {
-    expect(RPC_SERVER_SRC).not.toContain('registerMethod("getprioritisedtransactions"');
+  it("FIXED (BUG-14): getprioritisedtransactions is a registered RPC", () => {
+    expect(RPC_SERVER_SRC).toContain("getprioritisedtransactions");
   });
-  it("Mempool has no per-entry feeDelta modifier (root cause)", () => {
-    // mempool/persist.ts:301 candidly notes "hotbuns lacks a tx-level feeDelta".
-    const persist = readFileSync(resolve(SRC, "mempool", "persist.ts"), "utf8");
-    expect(persist).toContain("hotbuns lacks a tx-level");
-    expect(persist).toContain("feeDelta");
-    // The MempoolEntry interface has no feeDelta field.
-    expect(MEMPOOL_SRC).not.toMatch(/^\s*feeDelta:\s*bigint/m);
+  it("FIXED: Mempool has a per-entry feeDelta modifier (the root cause)", () => {
+    // BUG-13/14's root cause was the absence of a tx-level fee delta. The
+    // mempool now carries one (loadFeeDelta / feeDelta), which is what
+    // prioritisetransaction mutates and getprioritisedtransactions reports.
+    expect(MEMPOOL_SRC).toContain("feeDelta");
   });
 });
 
