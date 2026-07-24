@@ -242,9 +242,13 @@ describe("Mempool eviction — W86 audit", () => {
 
     test("getMinFeeRateKvB() returns the static min-relay floor when nothing has been evicted", () => {
       // The feefilter floor is max(rolling, static min-relay). With no eviction
-      // the rolling rate is 0, so the floor is the static min-relay: 1 sat/vB =
-      // 1000 sat/kvB (Core advertises minRelayTxFee in BIP133 feefilter).
-      expect(mempool.getMinFeeRateKvB()).toBe(1000n);
+      // the rolling rate is 0, so the floor is the static min-relay:
+      // 100 sat/kvB (Core advertises minRelayTxFee in BIP133 feefilter).
+      // NB Core LOWERED this default from 1000 to 100 —
+      // bitcoin-core/src/policy/policy.h:70 DEFAULT_MIN_RELAY_TX_FEE{100} —
+      // and hotbuns tracks it (mempool.ts:631-637). These assertions used to
+      // encode the old 1000 value.
+      expect(mempool.getMinFeeRateKvB()).toBe(100n);
     });
 
     test("getMinFee() decays rolling rate after blockSinceLastRollingFeeBump=true", () => {
@@ -434,9 +438,9 @@ describe("Mempool eviction — W86 audit", () => {
       mempool.clear();
 
       // After clear, the rolling fee resets to 0; the feefilter floor falls back
-      // to the static min-relay (1000 sat/kvB).
+      // to the static min-relay (100 sat/kvB — policy.h:70).
       expect(mempool.getMinFee()).toBe(0);
-      expect(mempool.getMinFeeRateKvB()).toBe(1000n);
+      expect(mempool.getMinFeeRateKvB()).toBe(100n);
     });
   });
 
@@ -445,8 +449,8 @@ describe("Mempool eviction — W86 audit", () => {
   // ==========================================================================
   describe("getMinFeeRateKvB() always valid", () => {
     test("returns the static min-relay floor (bigint) by default", () => {
-      // Default feefilter floor is the static min-relay: 1000 sat/kvB (1 sat/vB).
-      expect(mempool.getMinFeeRateKvB()).toBe(1000n);
+      // Default feefilter floor is the static min-relay: 100 sat/kvB (policy.h:70).
+      expect(mempool.getMinFeeRateKvB()).toBe(100n);
     });
 
     test("returns non-negative bigint after addTransaction", async () => {
