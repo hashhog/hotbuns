@@ -3688,8 +3688,6 @@ export class RPCServer {
         prevMTP,
         enforceBIP68: csvActive,
         scriptThreads: 1,
-        verifyP2SH: height >= this.params.bip16Height,
-        verifyWitness: height >= this.params.segwitHeight,
         verifyDERSig: height >= this.params.bip66Height,
         verifyCLTV: height >= this.params.bip65Height,
         verifyCSV: height >= this.params.csvHeight,

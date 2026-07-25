@@ -1,14 +1,24 @@
 /**
  * Unit tests for getScriptFlagsForBlock — the script-flag exception table.
  *
- * Covers Bitcoin Core's script_flag_exceptions (validation.cpp:2262-2266):
- *   • mainnet BIP16 violator  → VERIFY_NONE (0)
- *   • mainnet Taproot violator → VERIFY_P2SH | VERIFY_WITNESS (3)
- *   • testnet3 BIP16 violator  → VERIFY_NONE (0)
- *   • non-exception hash at same height → normal height-driven flags
+ * Pins Bitcoin Core's GetBlockScriptFlags (validation.cpp:2249-2289) as a
+ * THREE-step sequence, which is the whole point of these tests:
+ *
+ *   1. BASE      — P2SH | WITNESS | TAPROOT, unconditional, every block (:2262)
+ *   2. EXCEPTION — REPLACE the whole set on a block-hash hit (:2264-2267)
+ *   3. HEIGHT    — OR DERSIG/CLTV/CSV/NULLDUMMY on top of step 2 (:2268-2286)
+ *
+ * Step 3 running AFTER step 2 is the property most easily got wrong: an
+ * early-return on the exception drops all four height flags, which at block
+ * 692261 (exception value P2SH|WITNESS, with all four active at that height)
+ * is a FALSE-ACCEPT. Several tests below exist specifically to fail if anyone
+ * reintroduces the early return.
+ *
+ * The six boolean parameters are ONLY the height-gated four; the base trio
+ * takes no caller input by design.
  *
  * Reference: Bitcoin Core kernel/chainparams.cpp:85-88, 210-211;
- *            src/validation.cpp:2262-2266.
+ *            src/validation.cpp:2249-2289.
  */
 
 import { describe, it, expect } from "bun:test";
@@ -16,125 +26,125 @@ import { getScriptFlagsForBlock } from "../consensus/connect_block.js";
 import { MAINNET, TESTNET } from "../consensus/params.js";
 import { ScriptFlags } from "../validation/tx.js";
 
+const BASE_TRIO =
+  ScriptFlags.VERIFY_P2SH |
+  ScriptFlags.VERIFY_WITNESS |
+  ScriptFlags.VERIFY_TAPROOT;
+
+const HEIGHT_FOUR =
+  ScriptFlags.VERIFY_DERSIG |
+  ScriptFlags.VERIFY_CHECKLOCKTIMEVERIFY |
+  ScriptFlags.VERIFY_CHECKSEQUENCEVERIFY |
+  ScriptFlags.VERIFY_NULLDUMMY;
+
 describe("getScriptFlagsForBlock — script_flag_exceptions", () => {
   // ── Mainnet BIP16 violator ─────────────────────────────────────────────────
   // Hash: 00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22
-  // This block is at a height before BIP16 activation (bip16Height = 173805)
-  // so the height-driven booleans are all false except for those active from
-  // genesis.  The exception should override to SCRIPT_VERIFY_NONE (0)
-  // regardless of what the height booleans would produce.
+  // Block 170060. Core override: SCRIPT_VERIFY_NONE (0).
   const MAINNET_BIP16_VIOLATOR =
     "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22";
 
-  it("mainnet BIP16 violator → VERIFY_NONE regardless of height booleans", () => {
-    // All flags false (pre-BIP16 height).
+  it("mainnet BIP16 violator at its real height → VERIFY_NONE", () => {
+    // Block 170060 predates every height gate on mainnet (bip66=363725,
+    // bip65=388381, csv=419328, segwit=481824), so all four are false and the
+    // exception's replacement of the base trio is the entire result.
     const flags = getScriptFlagsForBlock(
       MAINNET,
       MAINNET_BIP16_VIOLATOR,
-      /* verifyP2SH      */ false,
-      /* verifyWitness   */ false,
-      /* verifyTaproot   */ false,
       /* verifyDERSig    */ false,
       /* verifyCLTV      */ false,
       /* verifyCSV       */ false,
       /* verifyNullDummy */ false,
-    );
-    expect(flags).toBe(ScriptFlags.VERIFY_NONE);
-  });
-
-  it("mainnet BIP16 violator → VERIFY_NONE even if height booleans would add flags", () => {
-    // All flags true (simulate a post-segwit height) — exception must still win.
-    const flags = getScriptFlagsForBlock(
-      MAINNET,
-      MAINNET_BIP16_VIOLATOR,
-      /* verifyP2SH      */ true,
-      /* verifyWitness   */ true,
-      /* verifyTaproot   */ true,
-      /* verifyDERSig    */ true,
-      /* verifyCLTV      */ true,
-      /* verifyCSV       */ true,
-      /* verifyNullDummy */ true,
     );
     expect(flags).toBe(ScriptFlags.VERIFY_NONE);
     expect(flags).toBe(0);
   });
 
-  // ── Mainnet Taproot violator ───────────────────────────────────────────────
-  // Hash: 0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad
-  // Core override: SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS = 3.
-  const MAINNET_TAPROOT_VIOLATOR =
-    "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad";
-
-  it("mainnet Taproot violator → VERIFY_P2SH | VERIFY_WITNESS only", () => {
-    const expected = ScriptFlags.VERIFY_P2SH | ScriptFlags.VERIFY_WITNESS;
-    // Height booleans as they would be at post-taproot height.
+  it("mainnet BIP16 violator REPLACES the base trio, but height flags still OR on", () => {
+    // Counterfactual: the same hash with all four height gates active. Core's
+    // step 2 replaces the trio with 0, then step 3 ORs the four on top — it
+    // does NOT return 0. An early-return implementation returns VERIFY_NONE
+    // here and fails this test, which is exactly what it is for.
     const flags = getScriptFlagsForBlock(
       MAINNET,
-      MAINNET_TAPROOT_VIOLATOR,
-      /* verifyP2SH      */ true,
-      /* verifyWitness   */ true,
-      /* verifyTaproot   */ true,
+      MAINNET_BIP16_VIOLATOR,
       /* verifyDERSig    */ true,
       /* verifyCLTV      */ true,
       /* verifyCSV       */ true,
       /* verifyNullDummy */ true,
     );
-    expect(flags).toBe(expected);
-    // Taproot flag must NOT be set.
-    expect(flags & ScriptFlags.VERIFY_TAPROOT).toBe(0);
-    // P2SH and Witness must be set.
-    expect(flags & ScriptFlags.VERIFY_P2SH).toBeTruthy();
-    expect(flags & ScriptFlags.VERIFY_WITNESS).toBeTruthy();
+    expect(flags).toBe(HEIGHT_FOUR);
+    // The exception stripped every base-trio bit...
+    expect(flags & BASE_TRIO).toBe(0);
+    // ...but did not swallow the height-gated four.
+    expect(flags).not.toBe(ScriptFlags.VERIFY_NONE);
   });
 
-  // ── NON-exception hash at the BIP16-violator's effective height ───────────
-  // A different hash at the same height must produce normal by-height flags.
-  // This proves the exception does NOT over-trigger.
-  it("non-exception hash at same height → normal height-driven flags", () => {
-    const NON_EXCEPTION_HASH =
-      "0000000000000000000000000000000000000000000000000000000000abcdef";
-    // Use the height-boolean inputs that match the BIP16 violator's era
-    // (pre-BIP16: all false).
-    const flags = getScriptFlagsForBlock(
-      MAINNET,
-      NON_EXCEPTION_HASH,
-      /* verifyP2SH      */ false,
-      /* verifyWitness   */ false,
-      /* verifyTaproot   */ false,
-      /* verifyDERSig    */ false,
-      /* verifyCLTV      */ false,
-      /* verifyCSV       */ false,
-      /* verifyNullDummy */ false,
-    );
-    // All booleans false → result should be VERIFY_NONE (but for the right
-    // reason: all flags disabled by height, NOT by the exception table).
-    expect(flags).toBe(ScriptFlags.VERIFY_NONE);
-  });
+  // ── Mainnet Taproot violator ───────────────────────────────────────────────
+  // Hash: 0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad
+  // Block 692261. Core override: SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS.
+  const MAINNET_TAPROOT_VIOLATOR =
+    "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad";
 
-  it("non-exception hash post-taproot → all flags set", () => {
-    const NON_EXCEPTION_HASH =
-      "0000000000000000000000000000000000000000000000000000000000abcdef";
-    // All post-taproot flags active.
+  it("mainnet Taproot violator → P2SH|WITNESS from the table PLUS its era's height flags", () => {
+    // This is the case the early return got wrong. At height 692261 all four
+    // of DERSIG/CLTV/CSV/NULLDUMMY are long active on mainnet, so Core's
+    // result is the table value OR those four. Returning P2SH|WITNESS alone
+    // would accept scripts Core rejects under BIP-66/65/112/147.
     const flags = getScriptFlagsForBlock(
       MAINNET,
-      NON_EXCEPTION_HASH,
-      /* verifyP2SH      */ true,
-      /* verifyWitness   */ true,
-      /* verifyTaproot   */ true,
+      MAINNET_TAPROOT_VIOLATOR,
       /* verifyDERSig    */ true,
       /* verifyCLTV      */ true,
       /* verifyCSV       */ true,
       /* verifyNullDummy */ true,
     );
     const expected =
-      ScriptFlags.VERIFY_P2SH |
-      ScriptFlags.VERIFY_WITNESS |
-      ScriptFlags.VERIFY_TAPROOT |
-      ScriptFlags.VERIFY_DERSIG |
-      ScriptFlags.VERIFY_CHECKLOCKTIMEVERIFY |
-      ScriptFlags.VERIFY_CHECKSEQUENCEVERIFY |
-      ScriptFlags.VERIFY_NULLDUMMY;
+      ScriptFlags.VERIFY_P2SH | ScriptFlags.VERIFY_WITNESS | HEIGHT_FOUR;
     expect(flags).toBe(expected);
+    // TAPROOT is the bit the exception exists to remove — it must be clear.
+    expect(flags & ScriptFlags.VERIFY_TAPROOT).toBe(0);
+    // P2SH and WITNESS survive because the table value contains them.
+    expect(flags & ScriptFlags.VERIFY_P2SH).toBeTruthy();
+    expect(flags & ScriptFlags.VERIFY_WITNESS).toBeTruthy();
+    // Regression guard against the early return, stated directly.
+    expect(flags).not.toBe(
+      ScriptFlags.VERIFY_P2SH | ScriptFlags.VERIFY_WITNESS
+    );
+  });
+
+  // ── NON-exception hash ─────────────────────────────────────────────────────
+  // A different hash must get the unconditional base trio — proving the
+  // exception does not over-trigger AND that the trio is not height-gated.
+  const NON_EXCEPTION_HASH =
+    "0000000000000000000000000000000000000000000000000000000000abcdef";
+
+  it("non-exception hash with no height flags → base trio, NOT zero", () => {
+    // Core sets P2SH|WITNESS|TAPROOT on EVERY block regardless of height
+    // (:2262). A height-gated implementation returns 0 here at an early
+    // height and fails this test.
+    const flags = getScriptFlagsForBlock(
+      MAINNET,
+      NON_EXCEPTION_HASH,
+      /* verifyDERSig    */ false,
+      /* verifyCLTV      */ false,
+      /* verifyCSV       */ false,
+      /* verifyNullDummy */ false,
+    );
+    expect(flags).toBe(BASE_TRIO);
+    expect(flags).not.toBe(ScriptFlags.VERIFY_NONE);
+  });
+
+  it("non-exception hash with all height flags → trio plus all four", () => {
+    const flags = getScriptFlagsForBlock(
+      MAINNET,
+      NON_EXCEPTION_HASH,
+      /* verifyDERSig    */ true,
+      /* verifyCLTV      */ true,
+      /* verifyCSV       */ true,
+      /* verifyNullDummy */ true,
+    );
+    expect(flags).toBe(BASE_TRIO | HEIGHT_FOUR);
   });
 
   // ── Testnet3 BIP16 violator ────────────────────────────────────────────────
@@ -143,13 +153,10 @@ describe("getScriptFlagsForBlock — script_flag_exceptions", () => {
   const TESTNET3_BIP16_VIOLATOR =
     "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105";
 
-  it("testnet3 BIP16 violator → VERIFY_NONE", () => {
+  it("testnet3 BIP16 violator at its real height → VERIFY_NONE", () => {
     const flags = getScriptFlagsForBlock(
       TESTNET,
       TESTNET3_BIP16_VIOLATOR,
-      /* verifyP2SH      */ false,
-      /* verifyWitness   */ false,
-      /* verifyTaproot   */ false,
       /* verifyDERSig    */ false,
       /* verifyCLTV      */ false,
       /* verifyCSV       */ false,
@@ -158,51 +165,32 @@ describe("getScriptFlagsForBlock — script_flag_exceptions", () => {
     expect(flags).toBe(ScriptFlags.VERIFY_NONE);
   });
 
-  it("testnet3 BIP16 violator NOT in mainnet exception table", () => {
-    // The testnet3 exception hash should NOT trigger on mainnet params.
+  it("testnet3 BIP16 violator is NOT in the mainnet exception table", () => {
+    // Same hash, mainnet params → no match, so the base trio stands.
     const flags = getScriptFlagsForBlock(
       MAINNET,
       TESTNET3_BIP16_VIOLATOR,
-      /* verifyP2SH      */ true,
-      /* verifyWitness   */ true,
-      /* verifyTaproot   */ false,
       /* verifyDERSig    */ true,
       /* verifyCLTV      */ true,
       /* verifyCSV       */ true,
       /* verifyNullDummy */ true,
     );
-    // No exception match on mainnet → normal flag assembly.
-    const expected =
-      ScriptFlags.VERIFY_P2SH |
-      ScriptFlags.VERIFY_WITNESS |
-      ScriptFlags.VERIFY_DERSIG |
-      ScriptFlags.VERIFY_CHECKLOCKTIMEVERIFY |
-      ScriptFlags.VERIFY_CHECKSEQUENCEVERIFY |
-      ScriptFlags.VERIFY_NULLDUMMY;
-    expect(flags).toBe(expected);
+    expect(flags).toBe(BASE_TRIO | HEIGHT_FOUR);
+    // Specifically: the testnet3 exception must not have stripped the trio.
+    expect(flags & BASE_TRIO).toBe(BASE_TRIO);
   });
 
-  // ── Mainnet exceptions not in testnet3 table ──────────────────────────────
-  it("mainnet Taproot violator hash NOT in testnet3 exception table", () => {
-    // testnet3 only has the BIP16 violator; mainnet Taproot hash is NOT an
-    // exception on testnet3.
+  it("mainnet Taproot violator hash is NOT in the testnet3 exception table", () => {
+    // testnet3 carries only the BIP16 violator.
     const flags = getScriptFlagsForBlock(
       TESTNET,
       MAINNET_TAPROOT_VIOLATOR,
-      /* verifyP2SH      */ true,
-      /* verifyWitness   */ true,
-      /* verifyTaproot   */ true,
       /* verifyDERSig    */ true,
       /* verifyCLTV      */ false,
       /* verifyCSV       */ false,
       /* verifyNullDummy */ false,
     );
-    // No exception → normal flags.
-    const expected =
-      ScriptFlags.VERIFY_P2SH |
-      ScriptFlags.VERIFY_WITNESS |
-      ScriptFlags.VERIFY_TAPROOT |
-      ScriptFlags.VERIFY_DERSIG;
-    expect(flags).toBe(expected);
+    expect(flags).toBe(BASE_TRIO | ScriptFlags.VERIFY_DERSIG);
+    expect(flags & ScriptFlags.VERIFY_TAPROOT).toBeTruthy();
   });
 });

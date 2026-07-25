@@ -85,51 +85,71 @@ import { isFinalTx } from "../mining/template.js";
 /**
  * Compute the consensus script-verify flags bitmask for a specific block.
  *
- * Mirrors Bitcoin Core validation.cpp::GetBlockScriptFlags (2250-2289):
- *   1. Check params.scriptFlagExceptions: if the block hash matches an
- *      exception entry, return the override flags DIRECTLY without additionally
- *      ORing in height-based DERSIG/CLTV/CSV/NULLDUMMY flags.  This matches
- *      the blockbrew/beamchain canonical approach and is observationally
- *      equivalent to Core because the real exception blocks satisfy every
- *      flag anyway.
- *   2. Otherwise compute flags from the per-height activation booleans.
+ * A literal port of Bitcoin Core validation.cpp::GetBlockScriptFlags
+ * (2249-2289), which is a three-step sequence:
+ *
+ *   1. BASE — seed P2SH | WITNESS | TAPROOT **unconditionally, for every
+ *      block** (:2262). Core has had no BIP16Height / taprootHeight gate on
+ *      these since v23; the historical violator blocks are handled entirely
+ *      by the exception table in step 2, not by a height comparison.
+ *   2. EXCEPTION — on a block-hash hit in `params.scriptFlagExceptions`,
+ *      **REPLACE** the whole set with the table's value (:2264-2267).
+ *   3. HEIGHT GATES — **OR** the four flags Core still gates by activation
+ *      on top of step 2's result (:2268-2286): DERSIG (BIP66), CLTV (BIP65),
+ *      CSV (BIP68/112/113), NULLDUMMY (BIP147, rides SegWit activation).
+ *
+ * Step 3 running AFTER step 2 is load-bearing. The previous implementation
+ * early-returned the exception value, which drops all four. At block 692261
+ * the table value is P2SH|WITNESS, so the early return yielded P2SH|WITNESS
+ * alone while Core also has DERSIG|CLTV|CSV|NULLDUMMY active at that height —
+ * a FALSE-ACCEPT (hotbuns would accept scripts Core rejects under those four
+ * rules). The old comment defended this as "observationally equivalent ...
+ * because the real exception blocks satisfy every flag anyway" and cited the
+ * blockbrew/beamchain implementations as canonical; both of those have since
+ * been corrected to Core's shape (blockbrew 9f35879, beamchain c138cad), and
+ * "the one block with this hash happens to pass anyway" is a coincidence of
+ * that block's contents, not a property of the algorithm.
  *
  * blockHashHex MUST be in display/RPC byte order (big-endian), computed as:
  *   Buffer.from(getBlockHash(block.header)).reverse().toString("hex")
  * — the same convention used by bip30ExceptionBlocks.
  *
+ * NOTE: no STANDARD/policy flag is ever set here. NULLFAIL, CLEANSTACK,
+ * LOW_S, STRICTENC, MINIMALDATA, MINIMALIF and WITNESS_PUBKEYTYPE are
+ * policy-only (Core policy/policy.h:125) and must not reach block validation.
+ *
  * Reference: Bitcoin Core kernel/chainparams.cpp:85-88, 210-211;
- *            src/validation.cpp:2262-2266 GetBlockScriptFlags.
+ *            src/validation.cpp:2249-2289 GetBlockScriptFlags.
  */
 export function getScriptFlagsForBlock(
   params: ConsensusParams,
   blockHashHex: string,
-  verifyP2SH: boolean,
-  verifyWitness: boolean,
-  verifyTaproot: boolean,
   verifyDERSig: boolean,
   verifyCLTV: boolean,
   verifyCSV: boolean,
   verifyNullDummy: boolean,
 ): number {
-  // Exception table lookup — mirrors Core GetBlockScriptFlags:2263-2265.
-  // If matched, return the override flags DIRECTLY (no height-based OR).
+  // ── Step 1: BASE. Unconditional for every block (Core :2262).
+  let flags =
+    ScriptFlags.VERIFY_P2SH |
+    ScriptFlags.VERIFY_WITNESS |
+    ScriptFlags.VERIFY_TAPROOT;
+
+  // ── Step 2: EXCEPTION. REPLACE the whole set on a hash hit (Core :2264-2267).
   const exception = params.scriptFlagExceptions.find(
     (ex) => ex.blockHashHex === blockHashHex
   );
   if (exception !== undefined) {
-    return exception.flags;
+    flags = exception.flags;
   }
-  // Normal height-driven computation.
-  return (
-    (verifyP2SH      ? ScriptFlags.VERIFY_P2SH                  : ScriptFlags.VERIFY_NONE) |
-    (verifyWitness   ? ScriptFlags.VERIFY_WITNESS                : ScriptFlags.VERIFY_NONE) |
-    (verifyTaproot   ? ScriptFlags.VERIFY_TAPROOT                : ScriptFlags.VERIFY_NONE) |
-    (verifyDERSig    ? ScriptFlags.VERIFY_DERSIG                 : ScriptFlags.VERIFY_NONE) |
-    (verifyCLTV      ? ScriptFlags.VERIFY_CHECKLOCKTIMEVERIFY    : ScriptFlags.VERIFY_NONE) |
-    (verifyCSV       ? ScriptFlags.VERIFY_CHECKSEQUENCEVERIFY    : ScriptFlags.VERIFY_NONE) |
-    (verifyNullDummy ? ScriptFlags.VERIFY_NULLDUMMY              : ScriptFlags.VERIFY_NONE)
-  );
+
+  // ── Step 3: HEIGHT GATES, OR-ed on top of step 2 (Core :2268-2286).
+  if (verifyDERSig) flags |= ScriptFlags.VERIFY_DERSIG;
+  if (verifyCLTV) flags |= ScriptFlags.VERIFY_CHECKLOCKTIMEVERIFY;
+  if (verifyCSV) flags |= ScriptFlags.VERIFY_CHECKSEQUENCEVERIFY;
+  if (verifyNullDummy) flags |= ScriptFlags.VERIFY_NULLDUMMY;
+
+  return flags;
 }
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -205,23 +225,12 @@ export interface ConnectBlockOpts {
    */
   scriptThreads?: number;
 
-  /**
-   * Whether to verify P2SH redeem scripts (BIP-16).
-   * True when height >= params.bip16Height.
-   */
-  verifyP2SH?: boolean;
-
-  /**
-   * Whether to verify witness scripts (BIP-141/143).
-   * True when height >= params.segwitHeight.
-   */
-  verifyWitness?: boolean;
-
-  /**
-   * Whether to verify Taproot scripts (BIP-341/342).
-   * True when height >= params.taprootHeight.
-   */
-  verifyTaproot?: boolean;
+  // NOTE: there are deliberately no verifyP2SH / verifyWitness / verifyTaproot
+  // options here. Core sets SCRIPT_VERIFY_P2SH | WITNESS | TAPROOT
+  // unconditionally on every block (validation.cpp:2262) and handles the
+  // historical violator blocks through script_flag_exceptions, so there is no
+  // height (or caller) input for them to take. Accepting them would recreate
+  // the hash-blind second flag source that this wave exists to remove.
 
   /**
    * Whether to enforce strict-DER signatures (BIP-66 / DERSIG).
@@ -345,9 +354,6 @@ export async function coreConnectBlockChecks(
     prevMTP = 0,
     enforceBIP68 = false,
     scriptThreads = 4,
-    verifyP2SH = height >= params.bip16Height,
-    verifyWitness = height >= params.segwitHeight,
-    verifyTaproot = height >= params.taprootHeight,
     // MANDATORY height-gated consensus flags (Core GetBlockScriptFlags).
     // Default each from its own activation height in chainparams, exactly as
     // Core's GetBlockScriptFlags gates on the per-deployment activation.
@@ -380,6 +386,31 @@ export async function coreConnectBlockChecks(
       coinbaseOutputValue: 0n,
     };
   }
+
+  // ── Per-block consensus script-verify flags, resolved ONCE for the whole
+  // block (they depend only on the block, never on the transaction).
+  //
+  // Computed here — OUTSIDE the `skipScripts` guard — because sigop accounting
+  // below consumes it too, and sigops are counted on every connect regardless
+  // of whether scripts are verified (assumevalid IBD, reorg replay, import).
+  // Core does the same: GetBlockScriptFlags feeds both CheckInputScripts and
+  // GetTransactionSigOpCost(tx, inputs, flags) (consensus/tx_verify.cpp:143-162).
+  const blockScriptFlags = getScriptFlagsForBlock(
+    params,
+    blockHashHexForGate,
+    verifyDERSig,
+    verifyCLTV,
+    verifyCSV,
+    verifyNullDummy,
+  );
+  // Sigop counting gates on the FINAL, exception-aware flag set, not on the
+  // raw height booleans — Core gates P2SH sigops on SCRIPT_VERIFY_P2SH
+  // (tx_verify.cpp:150-152) and returns 0 witness sigops when
+  // SCRIPT_VERIFY_WITNESS is clear (script/interpreter.cpp:2141-2143). At the
+  // BIP-16 exception block the flags are SCRIPT_VERIFY_NONE, so Core counts
+  // ZERO P2SH and witness sigops there.
+  const sigopsP2SH = (blockScriptFlags & ScriptFlags.VERIFY_P2SH) !== 0;
+  const sigopsWitness = (blockScriptFlags & ScriptFlags.VERIFY_WITNESS) !== 0;
 
   // ── W93 Gate 0b: View consistency — the UTXO view's best block hash MUST
   // match this block's prevBlock.  Core validation.cpp:2333 asserts:
@@ -622,26 +653,8 @@ export async function coreConnectBlockChecks(
 
       // ── Script verification (skipped when skipScripts=true).
       if (!skipScripts) {
-        // Assemble the per-block consensus script-verify bitmask.
-        // getScriptFlagsForBlock mirrors Bitcoin Core
-        // validation.cpp::GetBlockScriptFlags (2250-2289):
-        //   — Checks params.scriptFlagExceptions first (2263-2265): two mainnet
-        //     blocks (BIP16 violator + Taproot violator) and one testnet3 block
-        //     (BIP16 violator) receive override flags returned DIRECTLY.
-        //   — Otherwise assembles flags from per-height activation booleans:
-        //     DERSIG (BIP66), CLTV (BIP65), CSV (BIP112), NULLDUMMY (BIP147).
-        // NO STANDARD/policy flags are ever set here (consensus only).
-        const scriptFlags = getScriptFlagsForBlock(
-          params,
-          blockHashHexForGate,
-          verifyP2SH,
-          verifyWitness,
-          verifyTaproot,
-          verifyDERSig,
-          verifyCLTV,
-          verifyCSV,
-          verifyNullDummy,
-        );
+        // Per-block bitmask, resolved once above (see blockScriptFlags).
+        const scriptFlags = blockScriptFlags;
 
         let scriptResult;
         if (scriptThreads === 1) {
@@ -701,8 +714,8 @@ export async function coreConnectBlockChecks(
     const txSigOpsCost = getTransactionSigOpCost(
       tx,
       prevOutputs,
-      verifyP2SH,
-      verifyWitness
+      sigopsP2SH,
+      sigopsWitness
     );
     totalSigOpsCost += txSigOpsCost;
 
