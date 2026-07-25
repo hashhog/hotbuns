@@ -3654,9 +3654,10 @@ class BufferReader {
   }
   readBytes(length) {
     this.ensureAvailable(length);
-    const data = this.buffer.subarray(this.offset, this.offset + length);
+    const out = Buffer.allocUnsafe(length);
+    this.buffer.copy(out, 0, this.offset, this.offset + length);
     this.offset += length;
-    return data;
+    return out;
   }
   readHash() {
     return this.readBytes(32);
@@ -16740,16 +16741,23 @@ function serializeBlockFileInfo(info) {
   writer.writeVarInt(info.nTimeLast);
   return writer.toBuffer();
 }
+function readInfoField(reader) {
+  const value = reader.readCompactSizeNoCheck();
+  if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error("BlockFileInfo: field exceeds Number.MAX_SAFE_INTEGER");
+  }
+  return Number(value);
+}
 function deserializeBlockFileInfo(data) {
   const reader = new BufferReader(data);
   return {
-    nBlocks: reader.readVarInt(),
-    nSize: reader.readVarInt(),
-    nUndoSize: reader.readVarInt(),
-    nHeightFirst: reader.readVarInt(),
-    nHeightLast: reader.readVarInt(),
-    nTimeFirst: reader.readVarInt(),
-    nTimeLast: reader.readVarInt()
+    nBlocks: readInfoField(reader),
+    nSize: readInfoField(reader),
+    nUndoSize: readInfoField(reader),
+    nHeightFirst: readInfoField(reader),
+    nHeightLast: readInfoField(reader),
+    nTimeFirst: readInfoField(reader),
+    nTimeLast: readInfoField(reader)
   };
 }
 
@@ -25410,7 +25418,7 @@ init_addrv2();
 // src/p2p/feefilter.ts
 var AVG_FEEFILTER_BROADCAST_INTERVAL_MS = 10 * 60 * 1000;
 var MAX_FEEFILTER_CHANGE_DELAY_MS = 5 * 60 * 1000;
-var DEFAULT_MIN_RELAY_FEE_RATE = 1000n;
+var DEFAULT_MIN_RELAY_FEE_RATE = 100n;
 var MAX_MONEY2 = 2100000000000000n;
 var FEEFILTER_VERSION = 70013;
 
