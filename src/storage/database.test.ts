@@ -5,12 +5,39 @@ import { join } from 'path';
 import {
   ChainDB,
   DBPrefix,
+  COINS_DB_MAX_FILE_SIZE_BYTES,
+  COINS_DB_MAX_OPEN_FILES,
   type BlockIndexRecord,
   type UTXOEntry,
   type ChainState,
   type BatchOperation,
   type TxIndexEntry,
 } from './database.js';
+
+// These two are a MATCHED PAIR and both are pinned to Bitcoin Core's values.
+// A 31 GB store at LevelDB's 2 MB default max_file_size becomes ~17,000 tables;
+// a table cache of 256 then covers ~1.5% of them, so nearly every read evicts
+// and re-opens a table. That was measured on the live mainnet node as ~2,650
+// pread64/s with the main JS thread pegged at 98% and the RPC server starved
+// off the event loop. Lowering either value "to save RSS" reintroduces it.
+describe('LevelDB tuning parity with Bitcoin Core', () => {
+  test('maxFileSize matches Core DBWRAPPER_MAX_FILE_SIZE (dbwrapper.h:24)', () => {
+    expect(COINS_DB_MAX_FILE_SIZE_BYTES).toBe(32 << 20);
+  });
+
+  test('maxOpenFiles is the 64-bit default Core uses (dbwrapper.cpp:114-137)', () => {
+    // Core drops to 64 only on 32-bit builds; on 64-bit it keeps LevelDB's
+    // 1000, and warns that going ABOVE 1000 falls off the mmap path.
+    expect(COINS_DB_MAX_OPEN_FILES).toBe(1000);
+  });
+
+  test('store is sized so the table cache can cover it', () => {
+    // ~31 GB of tables at 32 MiB each is ~992 tables — within the cache.
+    const storeBytes = 31 * 1024 * 1024 * 1024;
+    const tables = storeBytes / COINS_DB_MAX_FILE_SIZE_BYTES;
+    expect(tables).toBeLessThanOrEqual(COINS_DB_MAX_OPEN_FILES);
+  });
+});
 
 describe('ChainDB', () => {
   let dbPath: string;
