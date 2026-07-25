@@ -483,8 +483,6 @@ export class ChainStateManager {
       prevMTP: computedPrevMTP,
       enforceBIP68: csvActive,
       scriptThreads: 1, // this path is not IBD-hot; serial is fine
-      verifyP2SH: height >= this.params.bip16Height,
-      verifyWitness: height >= this.params.segwitHeight,
       // MANDATORY height-gated consensus flags (Core GetBlockScriptFlags).
       verifyDERSig: height >= this.params.bip66Height,
       verifyCLTV: height >= this.params.bip65Height,

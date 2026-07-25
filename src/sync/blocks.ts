@@ -3515,8 +3515,6 @@ export class BlockSync {
           prevMTP: intermPrevMTP,
           enforceBIP68: intermediate.height >= this.params.csvHeight,
           scriptThreads: this.scriptThreads,
-          verifyP2SH: intermediate.height >= this.params.bip16Height,
-          verifyWitness: intermediate.height >= this.params.segwitHeight,
           // MANDATORY height-gated consensus flags (Core GetBlockScriptFlags).
           // Side-branch blocks are connected through the SAME full-validation
           // connect path the main chain uses, so reorg revalidates scripts
@@ -4015,8 +4013,6 @@ export class BlockSync {
         prevMTP: blockPrevMTP,
         enforceBIP68,
         scriptThreads: this.scriptThreads,
-        verifyP2SH: height >= this.params.bip16Height,
-        verifyWitness: height >= this.params.segwitHeight,
         // MANDATORY height-gated consensus flags (Core GetBlockScriptFlags).
         verifyDERSig: height >= this.params.bip66Height,
         verifyCLTV: height >= this.params.bip65Height,
