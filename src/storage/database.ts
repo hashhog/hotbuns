@@ -27,6 +27,43 @@ const IBD_BATCH_SIZE = 50000;
  */
 export const COINS_DB_BLOCK_CACHE_BYTES = 256 * 1024 * 1024;
 
+/**
+ * Maximum size of a single on-disk SST table, mirroring Bitcoin Core's
+ * `DBWRAPPER_MAX_FILE_SIZE` (dbwrapper.h:24) — which exists precisely to
+ * override LevelDB's 2 MB default:
+ *
+ *     options.max_file_size = std::max(options.max_file_size,
+ *                                      DBWRAPPER_MAX_FILE_SIZE);   // :152
+ *
+ * At LevelDB's 2 MB default a chain-sized store is split into tens of
+ * thousands of tables (measured: 17,336 `.ldb` files for a 31 GB store), which
+ * no reasonable table cache can cover. At 32 MiB the same store is ~1,000
+ * tables — which is exactly the file count {@link COINS_DB_MAX_OPEN_FILES}
+ * is sized to hold. The two constants are a MATCHED PAIR; changing one
+ * without the other is what produces table-cache thrash.
+ */
+export const COINS_DB_MAX_FILE_SIZE_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Table-cache size (open table handles). This is LevelDB's default and the
+ * value Bitcoin Core uses on 64-bit hosts — Core reduces it to 64 ONLY on
+ * 32-bit builds, where handles consume real fds (dbwrapper.cpp:114-137).
+ *
+ * Do NOT lower this to save RSS. Core's own comment explains why that trade
+ * is illusory on 64-bit Unix: "up to that amount LevelDB will use an mmap
+ * implementation that does not use extra file descriptors (the fds are closed
+ * after being mmap'ed)" — and mmap'd table pages are reclaimable page cache,
+ * not anonymous memory. Measured on the live mainnet node while it was pegged:
+ * of 3,951,808 kB RSS, 3,887,180 kB was Anonymous — i.e. ALL file-backed
+ * mappings together accounted for ~63 MB, not the "1-2 GB" a previous clamp
+ * to 256 attributed to them.
+ *
+ * Do NOT raise it above 1000 either: Core warns that "increasing the value
+ * beyond the default is dangerous because LevelDB will fall back to a non-mmap
+ * implementation when the file count is too large" (PR #12495).
+ */
+export const COINS_DB_MAX_OPEN_FILES = 1000;
+
 /** Key prefixes for database namespaces. */
 export const enum DBPrefix {
   BLOCK_INDEX = 0x62, // 'b' - block hash -> block index record
@@ -295,12 +332,14 @@ export class ChainDB {
       cacheSize: COINS_DB_BLOCK_CACHE_BYTES,
       // 16 MB write buffer
       writeBufferSize: 16 * 1024 * 1024,
-      // Limit open file handles to cap mmap RSS overhead.
-      // LevelDB opens table files with mmap; at 380K+ blocks the UTXO
-      // SST files number in the thousands, each consuming kernel page
-      // cache counted in RSS. 256 files * ~2MB = ~512MB mmap ceiling.
-      // Default (1000) was contributing ~1-2GB of RSS.
-      maxOpenFiles: 256,
+      // 32 MiB tables, matching Core's DBWRAPPER_MAX_FILE_SIZE, so the store
+      // stays at a table count the cache below can actually hold.
+      maxFileSize: COINS_DB_MAX_FILE_SIZE_BYTES,
+      // LevelDB/Core default for 64-bit hosts. See the constant's doc comment:
+      // a previous clamp to 256 here traded a phantom RSS saving for constant
+      // table-cache eviction (~2,650 pread64/s measured, main thread pegged
+      // at 98% with the RPC server starved off the event loop).
+      maxOpenFiles: COINS_DB_MAX_OPEN_FILES,
     });
     this.closing = false;
   }
