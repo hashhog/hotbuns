@@ -45,24 +45,39 @@ export const COINS_DB_BLOCK_CACHE_BYTES = 256 * 1024 * 1024;
 export const COINS_DB_MAX_FILE_SIZE_BYTES = 32 * 1024 * 1024;
 
 /**
- * Table-cache size (open table handles). This is LevelDB's default and the
- * value Bitcoin Core uses on 64-bit hosts — Core reduces it to 64 ONLY on
- * 32-bit builds, where handles consume real fds (dbwrapper.cpp:114-137).
+ * Table-cache size (open table handles).
  *
- * Do NOT lower this to save RSS. Core's own comment explains why that trade
- * is illusory on 64-bit Unix: "up to that amount LevelDB will use an mmap
- * implementation that does not use extra file descriptors (the fds are closed
- * after being mmap'ed)" — and mmap'd table pages are reclaimable page cache,
- * not anonymous memory. Measured on the live mainnet node while it was pegged:
- * of 3,951,808 kB RSS, 3,887,180 kB was Anonymous — i.e. ALL file-backed
- * mappings together accounted for ~63 MB, not the "1-2 GB" a previous clamp
- * to 256 attributed to them.
+ * Do NOT lower this to save RSS. A previous clamp to 256 did exactly that and
+ * took the node offline: with a table cache far smaller than the table count,
+ * nearly every read misses and must open a table, read its index block and
+ * evict another. Measured on the live mainnet node while it was pegged, that
+ * cost ~2,650 pread64/s with the main JS thread at 98% and the RPC server
+ * starved off the event loop. The RSS the clamp was buying back was a phantom:
+ * of 3,951,808 kB RSS, 3,887,180 kB was Anonymous, so every file-backed
+ * mapping in the process together came to ~63 MB, not the "1-2 GB" claimed.
  *
- * Do NOT raise it above 1000 either: Core warns that "increasing the value
- * beyond the default is dangerous because LevelDB will fall back to a non-mmap
- * implementation when the file count is too large" (PR #12495).
+ * WHY THIS IS NOT BITCOIN CORE'S 1000. Core keeps LevelDB's 1000 default on
+ * 64-bit and warns against exceeding it, because past that LevelDB "will fall
+ * back to a non-mmap implementation" (dbwrapper.cpp:114-137, PR #12495). That
+ * warning is calibrated to Core's store SHAPE: with max_file_size at 32 MiB a
+ * chain-sized store is ~1,000 tables, so 1000 handles covers all of them AND
+ * stays inside LevelDB's mmap limit (kDefaultMmapLimit, 1000 on 64-bit).
+ *
+ * hotbuns is not in that regime. Its store was written at LevelDB's 2 MB
+ * default before {@link COINS_DB_MAX_FILE_SIZE_BYTES} was set, so it still
+ * holds >10,000 tables and is converging only as compaction rewrites them
+ * (measured: 17,336 -> 11,387 tables in the first hour after the 32 MiB
+ * setting took effect). At that count the mmap path is exhausted no matter
+ * what this value is — so capping at 1000 buys none of the benefit Core's
+ * warning protects, and costs ~94% table-cache miss rate. Setting 1000 was
+ * measured to restore RPC for roughly an hour before the node wedged again.
+ *
+ * So this is sized to COVER THE ACTUAL TABLE COUNT. Handles are real fds here;
+ * the process limit is 524,288 and steady-state usage is <50, so the headroom
+ * is ample. Once compaction converges the store to ~1,000 tables, LevelDB will
+ * simply hold fewer than this ceiling and the value becomes inert.
  */
-export const COINS_DB_MAX_OPEN_FILES = 1000;
+export const COINS_DB_MAX_OPEN_FILES = 16384;
 
 /** Key prefixes for database namespaces. */
 export const enum DBPrefix {

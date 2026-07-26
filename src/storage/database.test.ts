@@ -25,17 +25,27 @@ describe('LevelDB tuning parity with Bitcoin Core', () => {
     expect(COINS_DB_MAX_FILE_SIZE_BYTES).toBe(32 << 20);
   });
 
-  test('maxOpenFiles is the 64-bit default Core uses (dbwrapper.cpp:114-137)', () => {
-    // Core drops to 64 only on 32-bit builds; on 64-bit it keeps LevelDB's
-    // 1000, and warns that going ABOVE 1000 falls off the mmap path.
-    expect(COINS_DB_MAX_OPEN_FILES).toBe(1000);
+  test('maxOpenFiles covers the legacy 2 MB-era table count, not just Core’s 1000', () => {
+    // Core's 1000 is calibrated to a store of ~1,000 32 MiB tables. hotbuns'
+    // store predates COINS_DB_MAX_FILE_SIZE_BYTES and still holds >10,000
+    // 2 MB tables, so 1000 covers ~6% of it — measured to restore RPC for
+    // about an hour before the node wedged again. Must cover the real count.
+    const legacyTableCount = 31 * 1024 / 2; // 31 GB of 2 MB tables ≈ 15,872
+    expect(COINS_DB_MAX_OPEN_FILES).toBeGreaterThanOrEqual(legacyTableCount);
   });
 
-  test('store is sized so the table cache can cover it', () => {
-    // ~31 GB of tables at 32 MiB each is ~992 tables — within the cache.
+  test('a converged store is comfortably within the cache', () => {
+    // ~31 GB of tables at 32 MiB each is ~992 tables — far inside the ceiling,
+    // so the value goes inert once compaction finishes rewriting them.
     const storeBytes = 31 * 1024 * 1024 * 1024;
     const tables = storeBytes / COINS_DB_MAX_FILE_SIZE_BYTES;
     expect(tables).toBeLessThanOrEqual(COINS_DB_MAX_OPEN_FILES);
+  });
+
+  test('handle ceiling stays well inside the process fd limit', () => {
+    // Handles are real fds beyond LevelDB's mmap limit. The process limit on
+    // maxbox is 524,288 and steady-state usage is <50.
+    expect(COINS_DB_MAX_OPEN_FILES).toBeLessThan(100_000);
   });
 });
 
