@@ -11,7 +11,7 @@ import { UTXOManager } from "../chain/utxo.js";
 import { REGTEST } from "../consensus/params.js";
 import { Mempool, MempoolEntry, MAX_STANDARD_TX_WEIGHT } from "./mempool.js";
 import type { Transaction, OutPoint } from "../validation/tx.js";
-import { getTxId, getTxVSize } from "../validation/tx.js";
+import { getTxId, getTxVSize, getWTxId } from "../validation/tx.js";
 import type { Block } from "../validation/block.js";
 
 describe("Mempool", () => {
@@ -774,6 +774,133 @@ describe("Mempool", () => {
       expect(mempool.hasTransaction(Buffer.alloc(32, 0xff))).toBe(false);
     });
   });
+
+  // The BIP-339 wtxid index backs the p2p relay loop's O(1) "do we already
+  // have this wtxid?" question (BlockSync.alreadyHaveTx / findMempoolTxForInv).
+  // If it ever drifts out of step with `entries` we would either re-download
+  // txs we hold, or claim to hold txs we have already evicted — so pin the
+  // invariant on both the add and the remove side.
+  // Core keeps the same index as `index_by_wtxid` on
+  // CTxMemPool::indexed_transaction_set (bitcoin-core/src/txmempool.h).
+  describe("wtxid index", () => {
+    test("tracks entries on add and drops them on remove", async () => {
+      const inputTxid = Buffer.alloc(32, 0xc1);
+      await setupUTXO(inputTxid, 0, 10000n);
+
+      const tx = createTestTx(
+        [{ txid: inputTxid, vout: 0 }],
+        [{ value: 9000n }]
+      );
+      const txidHex = getTxId(tx).toString("hex");
+      const wtxidHex = getWTxId(tx).toString("hex");
+
+      expect(mempool.hasWtxidHex(wtxidHex)).toBe(false);
+      expect(await mempool.addTransaction(tx)).toMatchObject({ accepted: true });
+
+      expect(mempool.hasTxidHex(txidHex)).toBe(true);
+      expect(mempool.hasWtxidHex(wtxidHex)).toBe(true);
+      expect(mempool.getTransactionByWtxidHex(wtxidHex)?.tx).toEqual(tx);
+
+      mempool.removeTransaction(getTxId(tx), true);
+
+      expect(mempool.hasTxidHex(txidHex)).toBe(false);
+      expect(mempool.hasWtxidHex(wtxidHex)).toBe(false);
+      expect(mempool.getTransactionByWtxidHex(wtxidHex)).toBeNull();
+    });
+
+    test("clear() empties the wtxid index too", async () => {
+      const inputTxid = Buffer.alloc(32, 0xc2);
+      await setupUTXO(inputTxid, 0, 10000n);
+      const tx = createTestTx(
+        [{ txid: inputTxid, vout: 0 }],
+        [{ value: 9000n }]
+      );
+      await mempool.addTransaction(tx);
+      const wtxidHex = getWTxId(tx).toString("hex");
+      expect(mempool.hasWtxidHex(wtxidHex)).toBe(true);
+
+      mempool.clear();
+      expect(mempool.hasWtxidHex(wtxidHex)).toBe(false);
+    });
+
+    test("CHARACTERIZATION: concurrent submissions of one tx all report accepted", async () => {
+      // Documents the hazard that forced the relay-layer validation latch in
+      // cli.ts (`txValidationInFlight`).
+      //
+      // Bitcoin Core holds cs_main across the whole of AcceptToMemoryPool, so
+      // two peers' copies of a transaction are validated strictly one after
+      // the other and the second is rejected `txn-already-in-mempool`
+      // (validation.cpp:823-830). hotbuns' addTransaction is async and yields
+      // at every `await this.utxo.getUTXOAsync(...)` — all of which are AFTER
+      // its duplicate check — so N concurrent submissions of the same txid all
+      // clear the duplicate check before any of them inserts, and all N report
+      // `accepted: true` while only ONE entry exists.
+      //
+      // Observed in production before the latch: 20,000 `[mempool] Accepted
+      // tx` log lines covering 16,887 distinct txids (mean 1.18, max 4), the
+      // duplicates arriving from four different peers within a handful of
+      // consecutive lines. Each spurious "accept" cost a full re-validation, a
+      // re-announcement to every peer, and a double fee-estimator entry.
+      //
+      // The fix is at the relay layer (a per-txid latch around the call), so
+      // this test pins the underlying mempool behavior rather than asserting
+      // it has changed. If a future wave serializes inside the mempool, this
+      // test SHOULD start failing — update it then.
+      const inputTxid = Buffer.alloc(32, 0xc4);
+      await setupUTXO(inputTxid, 0, 10000n);
+      const tx = createTestTx(
+        [{ txid: inputTxid, vout: 0 }],
+        [{ value: 9000n }]
+      );
+
+      const results = await Promise.all([
+        mempool.acceptToMemoryPool(tx),
+        mempool.acceptToMemoryPool(tx),
+        mempool.acceptToMemoryPool(tx),
+        mempool.acceptToMemoryPool(tx),
+      ]);
+
+      // All four "succeed"...
+      expect(results.filter((r) => r.accepted).length).toBe(4);
+      // ...but the pool holds exactly one copy. That gap is the bug.
+      expect(mempool.getSize()).toBe(1);
+      expect(mempool.hasTxidHex(getTxId(tx).toString("hex"))).toBe(true);
+
+      // Sequentially, the second submission is correctly rejected — proving
+      // the difference is purely the concurrent interleaving.
+      const again = await mempool.acceptToMemoryPool(tx);
+      expect(again.accepted).toBe(false);
+      expect(again.error).toBe("txn-already-in-mempool");
+    });
+
+    test("removeForBlock drops mined txs from the wtxid index", async () => {
+      const inputTxid = Buffer.alloc(32, 0xc3);
+      await setupUTXO(inputTxid, 0, 10000n);
+      const tx = createTestTx(
+        [{ txid: inputTxid, vout: 0 }],
+        [{ value: 9000n }]
+      );
+      await mempool.addTransaction(tx);
+      const wtxidHex = getWTxId(tx).toString("hex");
+      expect(mempool.hasWtxidHex(wtxidHex)).toBe(true);
+
+      const block: Block = {
+        header: {
+          version: 1,
+          prevBlock: Buffer.alloc(32, 0),
+          merkleRoot: Buffer.alloc(32, 0),
+          timestamp: Math.floor(Date.now() / 1000),
+          bits: 0x207fffff,
+          nonce: 0,
+        },
+        transactions: [createCoinbaseTx(50n * 100_000_000n), tx],
+      };
+      mempool.removeForBlock(block);
+
+      expect(mempool.hasWtxidHex(wtxidHex)).toBe(false);
+      expect(mempool.hasTxidHex(getTxId(tx).toString("hex"))).toBe(false);
+    });
+  });
 });
 
 describe("Mempool ancestor/descendant limits", () => {
@@ -909,5 +1036,65 @@ describe("Mempool ancestor/descendant limits", () => {
     const result = await mempool.addTransaction(extraChild);
     expect(result.accepted).toBe(false);
     expect(result.error).toContain("descendants");
+  });
+});
+
+// ─── wtxid index must not retain a stale key on witness re-index ────────────
+// Found by adversarial review of the AlreadyHaveTx change: indexWtxid set the
+// new wtxid without retiring the previous one, so re-indexing the same txid
+// with a different witness left wtxidIndex[oldWtxid] -> txidHex behind. That
+// makes alreadyHaveInv report a false "already have" for the stale wtxid, and
+// a getdata MSG_WTX for it answer with the wrong-witness transaction.
+describe("wtxid index — stale-key retirement", () => {
+  let tempDir2: string;
+  let db2: ChainDB;
+  let utxo2: UTXOManager;
+  let mp: Mempool;
+
+  beforeEach(async () => {
+    tempDir2 = await mkdtemp(join(tmpdir(), "mempool-wtxidx-"));
+    db2 = new ChainDB(tempDir2);
+    await db2.open();
+    utxo2 = new UTXOManager(db2);
+    mp = new Mempool(utxo2, REGTEST);
+  });
+
+  afterEach(async () => {
+    await db2.close();
+    await rm(tempDir2, { recursive: true, force: true });
+  });
+
+  test("re-indexing a txid with a different witness retires the old wtxid", () => {
+    const tx: Transaction = {
+      version: 2,
+      inputs: [{
+        prevOut: { txid: Buffer.alloc(32, 0x07), vout: 0 },
+        scriptSig: Buffer.alloc(0),
+        sequence: 0xffffffff,
+        witness: [Buffer.from("aa".repeat(8), "hex")],
+      }],
+      outputs: [{ value: 1000n, scriptPubKey: Buffer.from([0x51]) }],
+      lockTime: 0,
+    } as unknown as Transaction;
+
+    const txidHex = getTxId(tx).toString("hex");
+    const originalWtxid = getWTxId(tx).toString("hex");
+    (mp as any).indexWtxid(txidHex, tx);
+    expect((mp as any).wtxidIndex.get(originalWtxid)).toBe(txidHex);
+
+    // Same txid (witness is not covered by txid), different wtxid.
+    const malleated = {
+      ...tx,
+      inputs: [{ ...(tx as any).inputs[0], witness: [Buffer.from("bb".repeat(9), "hex")] }],
+    } as unknown as Transaction;
+    expect(getTxId(malleated).toString("hex")).toBe(txidHex);
+    const newWtxid = getWTxId(malleated).toString("hex");
+    expect(newWtxid).not.toBe(originalWtxid);
+
+    (mp as any).indexWtxid(txidHex, malleated);
+
+    expect((mp as any).wtxidIndex.has(originalWtxid)).toBe(false);
+    expect((mp as any).wtxidIndex.get(newWtxid)).toBe(txidHex);
+    expect((mp as any).txidToWtxid.get(txidHex)).toBe(newWtxid);
   });
 });

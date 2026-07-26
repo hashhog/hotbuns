@@ -45,10 +45,17 @@ function makeTx(seq: number): Transaction {
   };
 }
 
-// Fake mempool exposing just the surface findMempoolTxForInv/hasTransaction use.
+// Fake mempool exposing just the surface findMempoolTxForInv / alreadyHaveTx
+// use. Mirrors the real Mempool's txid map AND its wtxid index — the wtxid
+// lookup is an O(1) index probe now, not a linear rescan of every entry.
 function makeMempool(txs: Transaction[]) {
   const byTxid = new Map<string, Transaction>();
-  for (const tx of txs) byTxid.set(getTxId(tx).toString("hex"), tx);
+  const byWtxid = new Map<string, string>();
+  for (const tx of txs) {
+    const txidHex = getTxId(tx).toString("hex");
+    byTxid.set(txidHex, tx);
+    byWtxid.set(getWTxId(tx).toString("hex"), txidHex);
+  }
   return {
     getTransaction(txid: Buffer) {
       const tx = byTxid.get(txid.toString("hex"));
@@ -56,6 +63,18 @@ function makeMempool(txs: Transaction[]) {
     },
     getAllTxids(): Buffer[] {
       return Array.from(byTxid.keys()).map((h) => Buffer.from(h, "hex"));
+    },
+    hasTxidHex(txidHex: string): boolean {
+      return byTxid.has(txidHex);
+    },
+    hasWtxidHex(wtxidHex: string): boolean {
+      return byWtxid.has(wtxidHex);
+    },
+    getTransactionByWtxidHex(wtxidHex: string) {
+      const txidHex = byWtxid.get(wtxidHex);
+      if (txidHex === undefined) return null;
+      const tx = byTxid.get(txidHex);
+      return tx ? { tx } : null;
     },
   };
 }

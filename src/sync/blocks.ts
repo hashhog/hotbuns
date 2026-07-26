@@ -25,7 +25,7 @@ import {
   serializeBlockHeader,
   validateBlock,
 } from "../validation/block.js";
-import { isCoinbase, getWTxId } from "../validation/tx.js";
+import { isCoinbase } from "../validation/tx.js";
 import type { Transaction } from "../validation/tx.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { UTXOManager } from "../chain/utxo.js";
@@ -255,8 +255,30 @@ const MAX_GETDATA_ITEMS = 1000;
  *  that a dropped/never-served tx can be re-fetched from someone else. */
 const TX_REQUEST_EXPIRY_MS = 60_000;
 
-/** FIFO bound on {@link BlockSync.recentlyRejectedTxs}. */
+/** FIFO bound on {@link BlockSync.recentlyRejectedTxs}.
+ *  Core sizes m_lazy_recent_rejects at 120_000 entries
+ *  (txdownloadman_impl.h:68); ours is an exact Set rather than a rolling
+ *  bloom filter, so we keep a tighter bound to cap memory. */
 const MAX_RECENT_REJECTED_TXS = 10_000;
+
+/** FIFO bound on {@link BlockSync.recentlyConfirmedTxs}. Core's
+ *  RecentConfirmedTransactionsFilter is a 48_000-entry rolling bloom
+ *  (txdownloadman_impl.h:125); we hold both txid and wtxid hex per tx, so
+ *  48_000 keys is roughly 24_000 transactions — about two mainnet blocks. */
+const MAX_RECENT_CONFIRMED_TXS = 48_000;
+
+/** Minimum interval between unconditional expiry sweeps of
+ *  {@link BlockSync.requestedTxInFlight}. The sweep is driven from the
+ *  existing 1s stall tick, not a new timer. */
+const TX_INFLIGHT_SWEEP_INTERVAL_MS = 5_000;
+
+/** Hard ceiling on {@link BlockSync.requestedTxInFlight}. The time-based
+ *  sweep is the primary bound; this is the backstop for the case where the
+ *  event loop is starved and the 1s tick does not run — an inv storm must
+ *  never be able to grow the map without limit. Sized well above the
+ *  steady-state working set (Core caps announcements per peer at
+ *  MAX_PEER_TX_ANNOUNCEMENTS = 5000). */
+const MAX_TX_INFLIGHT = 50_000;
 
 /** Maximum downloaded blocks buffered in memory before throttling requests.
  *  At mainnet heights (500K+), blocks average 2-4MB serialized but expand to
@@ -494,6 +516,28 @@ export class BlockSync {
    */
   private recentlyRejectedTxs: Set<string> = new Set();
 
+  /**
+   * Bounded set of inv-hash hex (BOTH txid and wtxid) for transactions we saw
+   * confirmed in a recently connected block. Mirrors Bitcoin Core's
+   * RecentConfirmedTransactionsFilter (txdownloadman_impl.h:122-127): once a
+   * tx is mined it leaves the mempool, so without this filter every peer that
+   * re-announces it makes us issue a fresh getdata and re-run
+   * acceptToMemoryPool only to reject it. Populated by
+   * {@link markTxsConfirmed}, reset by {@link onBlockDisconnected} (Core
+   * resets on reorg for exactly the same reason — see
+   * TxDownloadManagerImpl::BlockDisconnected).
+   */
+  private recentlyConfirmedTxs: Set<string> = new Set();
+
+  /** Wall-clock ms of the last unconditional {@link sweepTxRequestsInFlight}. */
+  private lastTxInFlightSweep: number = 0;
+
+  /** Orphan pool — wired via {@link setOrphanPool} from cli.ts. Consulted by
+   *  {@link alreadyHaveTx} so a tx already parked in the orphanage is neither
+   *  re-requested nor re-validated. Core does the same inside AlreadyHaveTx
+   *  (txdownloadman_impl.cpp:139, `m_orphanage->HaveTx`). */
+  private orphanPool: import("../mempool/orphan_pool.js").OrphanPool | null = null;
+
   /** Prune manager — wired via setPruneManager() from cli.ts when the
    *  operator passes `--prune=N`.  After every successful connectBlock,
    *  we call `pruneManager.maybePrune(height)` which is a no-op outside
@@ -615,6 +659,19 @@ export class BlockSync {
    */
   setMempool(mempool: Mempool): void {
     this.mempool = mempool;
+  }
+
+  /**
+   * Wire the orphan pool so {@link alreadyHaveTx} can consult it.
+   *
+   * Core checks the orphanage first inside AlreadyHaveTx
+   * (txdownloadman_impl.cpp:139). Without it, a tx parked in our orphanage
+   * awaiting its parent is re-requested from every peer that announces it and
+   * re-run through acceptToMemoryPool on every delivery, only to be
+   * missing-inputs-rejected and dropped as a duplicate orphan add.
+   */
+  setOrphanPool(orphanPool: import("../mempool/orphan_pool.js").OrphanPool): void {
+    this.orphanPool = orphanPool;
   }
 
   /**
@@ -908,8 +965,10 @@ export class BlockSync {
       this.registerWithPeerManager(this.peerManager);
     }
 
-    // Start stall detection timer
+    // Start stall detection timer. Also drives the unconditional tx-request
+    // expiry sweep — reusing this tick rather than adding a second timer.
     this.stallCheckInterval = setInterval(() => {
+      this.sweepTxRequestsInFlight();
       this.handleStalled();
     }, 1000);
 
@@ -1031,6 +1090,19 @@ export class BlockSync {
       if (msg.type === "notfound" && msg.payload?.inventory) {
         const peerKey = `${peer.host}:${peer.port}`;
         for (const inv of msg.payload.inventory) {
+          if (
+            inv.type === InvType.MSG_TX ||
+            inv.type === InvType.MSG_WTX ||
+            inv.type === InvType.MSG_WITNESS_TX
+          ) {
+            // The peer can't serve a tx we asked for. Free the in-flight
+            // marker immediately so the next announcer can be asked, instead
+            // of stalling relay for the full TX_REQUEST_EXPIRY_MS.
+            // Core: TxDownloadManagerImpl::ReceivedNotFound →
+            // m_txrequest.ReceivedResponse (txdownloadman_impl.cpp:288-296).
+            this.requestedTxInFlight.delete(inv.hash.toString("hex"));
+            continue;
+          }
           if (inv.type === 2 || inv.type === 0x40000002) { // MSG_BLOCK or MSG_WITNESS_BLOCK
             const hashHex = inv.hash.toString("hex");
             const pending = this.state.pendingBlocks.get(hashHex);
@@ -1688,11 +1760,11 @@ export class BlockSync {
 
         const hashHex = inv.hash.toString("hex");
 
-        // Already have it in the mempool? (AlreadyHaveTx)
-        if (this.mempoolHasInv(inv)) continue;
-
-        // Recently rejected — don't churn on a re-announce storm.
-        if (this.recentlyRejectedTxs.has(hashHex)) continue;
+        // AlreadyHaveTx: orphanage / recent-rejects / recent-confirmed /
+        // mempool — all O(1). Core: txdownloadman_impl.cpp:199, the
+        // `if (AlreadyHaveTx(gtxid, ...)) return true;` early-out inside
+        // AddTxAnnouncement.
+        if (this.alreadyHaveInv(inv, hashHex)) continue;
 
         // In-flight request from another peer? (single-attempt dedup)
         if (this.isTxRequestInFlight(hashHex)) continue;
@@ -1777,9 +1849,17 @@ export class BlockSync {
 
   /**
    * Look up the mempool transaction referenced by an inv item. MSG_TX and
-   * MSG_WITNESS_TX carry a txid (direct map lookup); MSG_WTX carries a wtxid
-   * (linear scan computing getWTxId — the mempool is keyed by txid only).
-   * Returns null if absent or if there is no mempool wired.
+   * MSG_WITNESS_TX carry a txid; MSG_WTX carries a wtxid. Both are now O(1)
+   * map probes.
+   *
+   * PREVIOUSLY the MSG_WTX branch was a full linear scan of the mempool that
+   * re-serialized and double-SHA256'd every entry to recompute its wtxid —
+   * O(mempool) hashes for EVERY announced or requested wtxid inv item, and
+   * `getAllTxids()` additionally allocated one 32-byte Buffer per pool entry
+   * per call. Since essentially every modern peer negotiates `wtxidrelay`,
+   * that scan ran on the majority of inv items. Bitcoin Core answers the same
+   * question from `index_by_wtxid` on its indexed_transaction_set
+   * (txmempool.h), i.e. O(1); the mempool now carries the same index.
    */
   private findMempoolTxForInv(inv: InvVector): Transaction | null {
     if (!this.mempool) return null;
@@ -1790,16 +1870,29 @@ export class BlockSync {
     }
 
     if (inv.type === InvType.MSG_WTX) {
-      const wtxidHex = inv.hash.toString("hex");
-      for (const txid of this.mempool.getAllTxids()) {
-        const entry = this.mempool.getTransaction(txid);
-        if (entry && getWTxId(entry.tx).toString("hex") === wtxidHex) {
-          return entry.tx;
-        }
-      }
+      const entry = this.mempool.getTransactionByWtxidHex(inv.hash.toString("hex"));
+      return entry ? entry.tx : null;
     }
 
     return null;
+  }
+
+  /**
+   * O(1) "already have this inv item's tx?" probe for the announcement path.
+   *
+   * Same set of sources as {@link alreadyHaveTx}, but an inv carries only ONE
+   * hash — whichever form the announcing peer chose — so we can only probe the
+   * source that understands that form. Mirrors Core's AlreadyHaveTx being
+   * called with a GenTxid on the announcement path
+   * (txdownloadman_impl.cpp:199).
+   */
+  private alreadyHaveInv(inv: InvVector, hashHex: string): boolean {
+    if (this.orphanPool !== null && this.orphanPool.hasHex(hashHex, hashHex)) {
+      return true;
+    }
+    if (this.recentlyRejectedTxs.has(hashHex)) return true;
+    if (this.recentlyConfirmedTxs.has(hashHex)) return true;
+    return this.mempoolHasInv(inv);
   }
 
   /**
@@ -1817,18 +1910,197 @@ export class BlockSync {
   }
 
   /**
+   * Unconditional expiry sweep of the tx-request in-flight map.
+   *
+   * `isTxRequestInFlight` only ever prunes the ONE key it is asked about, so a
+   * marker for a tx that is announced once and never announced again is never
+   * revisited and stays in the map forever. Core has no such hazard: its
+   * TxRequestTracker expires announcements on every `GetRequestable` pass
+   * (txrequest.cpp, the `expired` out-param plumbed through
+   * TxDownloadManagerImpl::GetRequestsToSend) regardless of whether a
+   * particular hash is looked up again.
+   *
+   * Driven from the existing 1s stall tick — deliberately NOT a new timer —
+   * and rate-limited to TX_INFLIGHT_SWEEP_INTERVAL_MS. Also enforces
+   * MAX_TX_INFLIGHT as a backstop for a starved event loop, evicting the
+   * oldest insertions first (Map preserves insertion order, and entries are
+   * only ever inserted with `Date.now()`, so insertion order IS age order).
+   *
+   * @returns number of markers dropped.
+   */
+  sweepTxRequestsInFlight(now: number = Date.now()): number {
+    if (now - this.lastTxInFlightSweep < TX_INFLIGHT_SWEEP_INTERVAL_MS) return 0;
+    this.lastTxInFlightSweep = now;
+
+    let dropped = 0;
+    for (const [hashHex, at] of this.requestedTxInFlight) {
+      if (now - at > TX_REQUEST_EXPIRY_MS) {
+        this.requestedTxInFlight.delete(hashHex);
+        dropped++;
+      }
+    }
+
+    // Backstop: if the tick has been starved, time-based expiry alone may not
+    // have run recently enough. Never let the map exceed the hard cap.
+    if (this.requestedTxInFlight.size > MAX_TX_INFLIGHT) {
+      const excess = this.requestedTxInFlight.size - MAX_TX_INFLIGHT;
+      let n = 0;
+      for (const hashHex of this.requestedTxInFlight.keys()) {
+        if (n++ >= excess) break;
+        this.requestedTxInFlight.delete(hashHex);
+        dropped++;
+      }
+    }
+
+    return dropped;
+  }
+
+  /**
+   * AlreadyHaveTx — O(1) "do we already know about this transaction?" probe.
+   *
+   * Mirrors the SHAPE of Bitcoin Core's
+   * `TxDownloadManagerImpl::AlreadyHaveTx` (txdownloadman_impl.cpp:125-147):
+   * orphanage, then recent-rejects, then recent-confirmed, then mempool.
+   * Core's filters are rolling bloom filters (approximate, self-expiring);
+   * ours are exact bounded FIFO Sets, which trades a little memory for zero
+   * false positives — a false positive here would silently drop a real tx.
+   *
+   * Used on BOTH sides of the relay loop, exactly as Core does:
+   *  - announcement side (`handleInv`) so we never getdata something we have;
+   *  - receipt side (the cli.ts `tx` handler) so a duplicate that slipped
+   *    through announcement dedup costs a map probe instead of a full
+   *    acceptToMemoryPool with its UTXO reads and script verification.
+   *
+   * Callers pass both hashes; either matching is a hit. (Core prefers the
+   * wtxid on the receipt path to dodge witness malleation, but it can only do
+   * that because its mempool is indexed by both. hotbuns' mempool is keyed by
+   * txid only, so we check the wtxid against the hash-set filters and the
+   * txid against the mempool.)
+   */
+  alreadyHaveTx(txidHex: string, wtxidHex: string): boolean {
+    if (this.orphanPool !== null && this.orphanPool.hasHex(wtxidHex, txidHex)) {
+      return true;
+    }
+    if (
+      this.recentlyRejectedTxs.has(wtxidHex) ||
+      this.recentlyRejectedTxs.has(txidHex)
+    ) {
+      return true;
+    }
+    if (
+      this.recentlyConfirmedTxs.has(wtxidHex) ||
+      this.recentlyConfirmedTxs.has(txidHex)
+    ) {
+      return true;
+    }
+    return this.mempool !== null && this.mempool.hasTxidHex(txidHex);
+  }
+
+  /**
+   * Record that a transaction was accepted into the mempool.
+   *
+   * Core: `TxDownloadManagerImpl::MempoolAcceptedTx`
+   * (txdownloadman_impl.cpp:323-333) — `ForgetTxHash` for both the txid and
+   * the wtxid, so the request tracker stops holding a slot for a tx we now
+   * have. The orphanage side of Core's function is handled in cli.ts
+   * (`processOrphanCascade`), which owns the orphan pool.
+   */
+  onMempoolAcceptedTx(txidHex: string, wtxidHex: string): void {
+    this.requestedTxInFlight.delete(txidHex);
+    this.requestedTxInFlight.delete(wtxidHex);
+  }
+
+  /**
+   * Record every transaction in a newly connected block as recently confirmed.
+   *
+   * Core: `TxDownloadManagerImpl::BlockConnected` (txdownloadman_impl.cpp:
+   * 95-108) inserts the txid — and the wtxid when it differs — into
+   * RecentConfirmedTransactionsFilter, and forgets any outstanding request.
+   * Without this, a mined tx leaves the mempool and every subsequent
+   * announcement of it triggers a fresh getdata plus a full
+   * acceptToMemoryPool that can only end in rejection.
+   *
+   * @param hashes one `{txidHex, wtxidHex}` per transaction in the block
+   *               (callers should skip the coinbase; it is never relayed).
+   */
+  markTxsConfirmed(hashes: Iterable<{ txidHex: string; wtxidHex: string }>): void {
+    for (const { txidHex, wtxidHex } of hashes) {
+      this.requestedTxInFlight.delete(txidHex);
+      this.requestedTxInFlight.delete(wtxidHex);
+      this.addRecentlyConfirmed(txidHex);
+      if (wtxidHex !== txidHex) this.addRecentlyConfirmed(wtxidHex);
+    }
+  }
+
+  /** Bounded-FIFO insert into {@link recentlyConfirmedTxs}. */
+  private addRecentlyConfirmed(hashHex: string): void {
+    if (this.recentlyConfirmedTxs.has(hashHex)) return;
+    this.recentlyConfirmedTxs.add(hashHex);
+    while (this.recentlyConfirmedTxs.size > MAX_RECENT_CONFIRMED_TXS) {
+      const oldest = this.recentlyConfirmedTxs.values().next().value;
+      if (oldest === undefined) break;
+      this.recentlyConfirmedTxs.delete(oldest);
+    }
+  }
+
+  /**
+   * Reset the recently-confirmed filter on a chain reorg.
+   *
+   * Core: `TxDownloadManagerImpl::BlockDisconnected`
+   * (txdownloadman_impl.cpp:112-123) — transactions from a disconnected block
+   * go back to being relayable, and keeping them in the filter would make us
+   * refuse to re-download them.
+   */
+  onBlockDisconnected(): void {
+    this.recentlyConfirmedTxs.clear();
+    this.onActiveTipChange();
+  }
+
+  /**
+   * Drop the recent-rejects filter whenever the active tip moves.
+   *
+   * Core: `TxDownloadManagerImpl::ActiveTipChange`
+   * (txdownloadman_impl.cpp:88-92) — `RecentRejectsFilter().reset()` on EVERY
+   * tip change, connect or disconnect.
+   *
+   * This matters more than it looks. Most mempool rejections are transient
+   * policy calls, not verdicts: below the rolling minimum fee, non-final
+   * locktime, ancestor/descendant limits, mempool full. A tx rejected for any
+   * of those at height N is very often perfectly acceptable at height N+1, and
+   * a filter that never forgets would blacklist it from ever being downloaded
+   * again. Core solves that by wiping the filter on each new tip; our filter
+   * only had FIFO eviction, which is not the same thing at all.
+   *
+   * (This was latent rather than harmful before this wave only because
+   * `markTxRejected` had no callers anywhere in the tree, so the filter was
+   * never populated. Wiring the drainers makes the reset mandatory.)
+   */
+  onActiveTipChange(): void {
+    this.recentlyRejectedTxs.clear();
+  }
+
+  /**
    * Record that an announced/received tx was rejected so we stop re-requesting
    * it on subsequent announcements. Bounded FIFO. Also clears any in-flight
    * request marker. Best-effort local stand-in for Core's m_recent_rejects.
+   *
+   * Callers pass every hash form they hold (txid and wtxid); an inv may have
+   * named either. Must NOT be called for a missing-inputs rejection — Core
+   * routes TX_MISSING_INPUTS into the orphanage instead of the rejects filter
+   * (net_processing.cpp / txdownloadman_impl.cpp MempoolRejectedTx) precisely
+   * so the tx can still be reconsidered once its parent arrives.
    */
-  markTxRejected(hashHex: string): void {
-    this.requestedTxInFlight.delete(hashHex);
-    if (this.recentlyRejectedTxs.has(hashHex)) return;
-    this.recentlyRejectedTxs.add(hashHex);
-    if (this.recentlyRejectedTxs.size > MAX_RECENT_REJECTED_TXS) {
-      // Drop oldest insertion (Set preserves insertion order).
-      const oldest = this.recentlyRejectedTxs.values().next().value;
-      if (oldest !== undefined) this.recentlyRejectedTxs.delete(oldest);
+  markTxRejected(...hashHexes: string[]): void {
+    for (const hashHex of hashHexes) {
+      this.requestedTxInFlight.delete(hashHex);
+      if (this.recentlyRejectedTxs.has(hashHex)) continue;
+      this.recentlyRejectedTxs.add(hashHex);
+      while (this.recentlyRejectedTxs.size > MAX_RECENT_REJECTED_TXS) {
+        // Drop oldest insertion (Set preserves insertion order).
+        const oldest = this.recentlyRejectedTxs.values().next().value;
+        if (oldest === undefined) break;
+        this.recentlyRejectedTxs.delete(oldest);
+      }
     }
   }
 
@@ -1836,9 +2108,21 @@ export class BlockSync {
    * Clear the in-flight request marker for a tx once it arrives (called from
    * the tx message handler). Keyed by both txid and wtxid hex so either the
    * MSG_TX or MSG_WTX request marker is cleared.
+   *
+   * Core equivalent: `m_txrequest.ReceivedResponse` from
+   * `TxDownloadManagerImpl::ReceivedTx` (txdownloadman_impl.cpp:510-512) —
+   * note Core drains the tracker BEFORE the AlreadyHaveTx drop check, so a
+   * duplicate delivery still frees the slot. Callers must do the same.
    */
   clearTxRequestInFlight(...hashHexes: string[]): void {
     for (const h of hashHexes) this.requestedTxInFlight.delete(h);
+  }
+
+  /**
+   * Test/observability hook: current in-flight tx-request marker count.
+   */
+  getTxRequestInFlightCount(): number {
+    return this.requestedTxInFlight.size;
   }
 
   /**
