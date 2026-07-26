@@ -1,17 +1,40 @@
 /**
- * Tests for mempool ancestor/descendant/cluster limits.
+ * Tests for mempool CLUSTER limits.
  *
- * Bitcoin Core enforces (policy/policy.h + kernel/mempool_limits.h):
- *   Gate A — ancestor count:   ≤ DEFAULT_ANCESTOR_LIMIT = 25  (incl. self)
- *   Gate B — ancestor size:    ≤ 101,000 vB                   (incl. self)
- *   Gate C — descendant count: ≤ DEFAULT_DESCENDANT_LIMIT = 25 (incl. self)
- *   Gate D — descendant size:  ≤ 101,000 vB                   (incl. self)
- *   Gate E — cluster count:    ≤ DEFAULT_CLUSTER_LIMIT = 64
- *   Gate F — cluster vbytes:   ≤ 101,000 vB (DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000)
+ * Bitcoin Core v31 REPLACED the ancestor/descendant limits with cluster limits.
+ * The old gates — ancestor count 25, ancestor size 101,000 vB, descendant count
+ * 25, descendant size 101,000 vB — are gone, along with their reject token
+ * `too-long-mempool-chain`, which no longer appears anywhere in the Core tree.
+ *
+ * What Core enforces now, in WEIGHT UNITS throughout:
+ *
+ *   per-tx contribution := max(tx_weight, tx_sigops_cost * 20)
+ *                          GetSigOpsAdjustedWeight, policy/policy.cpp:390,
+ *                          fed to TxGraph at txmempool.cpp:1017
+ *   cluster_size        := Σ (per-tx contribution)   — NO per-tx division,
+ *                                                      NO per-tx rounding
+ *   reject if cluster_size  > 404,000  (= 101,000 vB * WITNESS_SCALE_FACTOR,
+ *                                        txmempool.cpp:181)
+ *   reject if cluster_count > 64       (DEFAULT_CLUSTER_LIMIT, policy.h:72)
+ *
+ * Both comparisons are strictly `>` — the single oversize test at
+ * txgraph.cpp:2059 — so 64 ACCEPTS and 65 REJECTS.
+ *
+ * Reject token is the bare "too-large-cluster" with an EMPTY debug string
+ * (validation.cpp:1024, :1116, :1343, :1521).
+ *
+ * Scope: this is mempool POLICY. None of it affects block validation.
+ *
+ * Still enforced and deliberately untouched by these tests:
+ *   - TRUC/v3 2-ancestor / 2-descendant limits (see truc.test.ts)
+ *   - MAX_PACKAGE_COUNT = 25, a DIFFERENT limit (see package.test.ts)
  *
  * References:
- *   bitcoin-core/src/policy/policy.h:72-90
- *   bitcoin-core/src/kernel/mempool_limits.h
+ *   bitcoin-core/src/policy/policy.h:50,72,74
+ *   bitcoin-core/src/kernel/mempool_limits.h:20-22
+ *   bitcoin-core/src/txmempool.cpp:181, :1017
+ *   bitcoin-core/src/policy/policy.cpp:390
+ *   bitcoin-core/src/txgraph.cpp:2059
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
@@ -21,9 +44,18 @@ import { join } from "node:path";
 import { ChainDB, type UTXOEntry } from "../storage/database.js";
 import { UTXOManager } from "../chain/utxo.js";
 import { REGTEST } from "../consensus/params.js";
-import { Mempool, MAX_CLUSTER_COUNT, MAX_CLUSTER_SIZE_VBYTES } from "../mempool/mempool.js";
+import {
+  Mempool,
+  MAX_CLUSTER_COUNT,
+  MAX_CLUSTER_SIZE_VBYTES,
+  MAX_CLUSTER_SIZE_WEIGHT,
+  MAX_PACKAGE_COUNT,
+  TRUC_ANCESTOR_LIMIT,
+  TRUC_DESCENDANT_LIMIT,
+  DEFAULT_BYTES_PER_SIGOP,
+} from "../mempool/mempool.js";
 import type { Transaction } from "../validation/tx.js";
-import { getTxId, getTxVSize } from "../validation/tx.js";
+import { getTxId, getTxVSize, getSigOpsAdjustedWeight } from "../validation/tx.js";
 
 describe("Mempool ancestor/descendant limits", () => {
   let tempDir: string;
@@ -56,6 +88,21 @@ describe("Mempool ancestor/descendant limits", () => {
     };
   }
 
+  // A standard bare 1-of-1 multisig scriptPubKey:
+  //   OP_1 <33-byte pubkey> OP_1 OP_CHECKMULTISIG
+  // Standard because DEFAULT_PERMIT_BAREMULTISIG is true (policy.h:52). Used as a
+  // sigop-dense but small-weight output so that max(weight, sigops*20) is
+  // dominated by the sigop term.
+  function bareMultisigScript(): Buffer {
+    const pubkey = Buffer.alloc(33, 0x02);
+    pubkey[0] = 0x02;
+    return Buffer.concat([
+      Buffer.from([0x51, 0x21]), // OP_1, PUSH33
+      pubkey,
+      Buffer.from([0x51, 0xae]), // OP_1, OP_CHECKMULTISIG
+    ]);
+  }
+
   async function setupUTXO(
     txid: Buffer,
     vout: number,
@@ -84,7 +131,7 @@ describe("Mempool ancestor/descendant limits", () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  describe("ancestor count limit (25)", () => {
+  describe("ancestor count (no longer a gate — cluster count is)", () => {
     test("accepts chain of exactly 25 transactions", async () => {
       const initialTxid = Buffer.alloc(32, 0x01);
       await setupUTXO(initialTxid, 0, 1_000_000n);
@@ -105,7 +152,13 @@ describe("Mempool ancestor/descendant limits", () => {
       expect(mempool.getSize()).toBe(25);
     });
 
-    test("rejects 26th transaction in chain (exceeds ancestor limit)", async () => {
+    test("ACCEPTS the 26th transaction in a chain (Core v31 removed the 25-ancestor gate)", async () => {
+      // Regression pin for Wave A. Before the cluster-limit change this tx was
+      // rejected with `too-long-mempool-chain`. Core v31 deleted that gate
+      // outright — a 26-long chain is only 26 txs and ~7,700 WU, far inside both
+      // cluster bounds (64 / 404,000), so Core accepts it.
+      //
+      // Matches diff-test corpus entry `cluster-linear-26` (all 26 accept).
       const initialTxid = Buffer.alloc(32, 0x02);
       await setupUTXO(initialTxid, 0, 1_000_000n);
 
@@ -122,14 +175,14 @@ describe("Mempool ancestor/descendant limits", () => {
         prevTxid = Buffer.from(getTxId(tx));
       }
 
-      // The 26th should fail
+      // The 26th now succeeds.
       const finalTx = createTestTx(
         [{ txid: prevTxid, vout: 0 }],
         [{ value: 800_000n }]
       );
       const result = await mempool.addTransaction(finalTx);
-      expect(result.accepted).toBe(false);
-      expect(result.error).toContain("ancestor");
+      expect(result.accepted).toBe(true);
+      expect(mempool.getSize()).toBe(26);
     });
 
     test("cached ancestorCount is accurate", async () => {
@@ -155,7 +208,7 @@ describe("Mempool ancestor/descendant limits", () => {
     });
   });
 
-  describe("descendant count limit (25)", () => {
+  describe("descendant count (no longer a gate — cluster count is)", () => {
     test("accepts parent with exactly 24 children (25 descendants including self)", async () => {
       // Create parent with multiple outputs
       const parentInput = Buffer.alloc(32, 0x10);
@@ -189,8 +242,13 @@ describe("Mempool ancestor/descendant limits", () => {
       expect(parentEntry!.descendantCount).toBe(25);
     });
 
-    test("rejects child when parent already has 25 descendants", async () => {
-      // Create parent with multiple outputs
+    test("ACCEPTS a 25th child (Core v31 removed the 25-descendant gate)", async () => {
+      // Regression pin for Wave A. Before the cluster-limit change this was
+      // rejected with `too-long-mempool-chain`. The resulting cluster is
+      // 1 parent + 25 children = 26 txs, well inside the 64 cluster-count bound,
+      // so Core accepts.
+      //
+      // Matches diff-test corpus entry `cluster-fan-26` (all accept).
       const parentInput = Buffer.alloc(32, 0x30);
       await setupUTXO(parentInput, 0, 10_000_000n);
 
@@ -217,7 +275,7 @@ describe("Mempool ancestor/descendant limits", () => {
         expect(result.accepted).toBe(true);
       }
 
-      // The 25th child should fail
+      // The 25th child now succeeds.
       const extraInput = Buffer.alloc(32, 0x60);
       await setupUTXO(extraInput, 0, 100_000n);
 
@@ -229,8 +287,11 @@ describe("Mempool ancestor/descendant limits", () => {
         [{ value: 350_000n }]
       );
       const result = await mempool.addTransaction(extraChild);
-      expect(result.accepted).toBe(false);
-      expect(result.error).toContain("descendant");
+      expect(result.accepted).toBe(true);
+
+      // Parent now has 26 descendants (itself + 25 children) — no longer a gate.
+      const parentEntry = mempool.getTransaction(parentTxid);
+      expect(parentEntry!.descendantCount).toBe(26);
     });
 
     test("cached descendantCount is accurate", async () => {
@@ -411,69 +472,41 @@ describe("Mempool ancestor/descendant limits", () => {
   // Reference: bitcoin-core/src/policy/policy.h:74 (DEFAULT_CLUSTER_SIZE_LIMIT_KVB=101)
   // Previously enforced via -limitdescendantsize in legacy Core (pre-cluster).
   // ============================================================================
-  describe("descendant size limit (101,000 vbytes)", () => {
-    test("rejects child when parent descendant vsize would exceed 101,000", async () => {
-      // Create a parent tx
-      const parentInput = Buffer.alloc(32, 0xf0);
-      await setupUTXO(parentInput, 0, 50_000_000n);
+  describe("descendant size (no longer a gate — cluster weight is)", () => {
+    test("a long chain is bounded, and the bound is the CLUSTER gate", async () => {
+      // The per-ancestor descendant-vsize gate is gone. What still bounds an
+      // unbounded chain is checkClusterSizeLimit. With these small fixtures
+      // (~296 WU each) the count bound (64) is reached long before the weight
+      // bound (404,000 WU), so the chain terminates at exactly 64 entries with
+      // the bare `too-large-cluster` token.
+      //
+      // This test exists to prove the deletion of the descendant gates did NOT
+      // leave the chain unbounded.
+      const rootTxid = Buffer.alloc(32, 0xf0);
+      await setupUTXO(rootTxid, 0, 50_000_000n);
 
-      const parent = createTestTx(
-        [{ txid: parentInput, vout: 0 }],
-        Array(3).fill({ value: 10_000_000n })
-      );
-      await mempool.addTransaction(parent);
-      const parentTxid = getTxId(parent);
+      let prevTxid: Buffer = rootTxid;
+      let accepted = 0;
+      let firstError: string | undefined;
 
-      const parentEntry = mempool.getTransaction(parentTxid);
-      const parentVsize = parentEntry!.vsize;
-
-      // Add children until we are just under the 101,000 vB descendant-size limit.
-      // Each createTestTx produces a transaction of fixed size.
-      // We'll add children one at a time until the next one would push over the limit.
-      let totalDescendantVsize = parentVsize; // parent counts as its own descendant
-      let childIndex = 0;
-      let lastParentTxid: Buffer = parentTxid;
-
-      // Build a chain; stop before reaching the size limit.
-      // Each tx has 1 input + 2 outputs (one value + one OP_RETURN) ~ ~130 vbytes.
-      // We add children until descendant size is ≥ 100,800 vB (leaving < 400 vB headroom).
-      const TARGET_NEAR_LIMIT = 100_800;
-
-      while (totalDescendantVsize < TARGET_NEAR_LIMIT) {
-        const childInput = Buffer.alloc(32, 0xf0 + childIndex + 1);
-        await setupUTXO(childInput, 0, 100_000n);
-
-        const child = createTestTx(
-          [{ txid: lastParentTxid, vout: 0 }],
-          [{ value: 90_000n }]
+      for (let i = 0; i < 200; i++) {
+        const tx = createTestTx(
+          [{ txid: prevTxid, vout: 0 }],
+          [{ value: 40_000_000n - BigInt(i * 100_000) }]
         );
-        const result = await mempool.addTransaction(child);
-        if (!result.accepted) break;
-
-        const childTxid = getTxId(child);
-        const childEntry = mempool.getTransaction(childTxid);
-        totalDescendantVsize += childEntry!.vsize;
-        lastParentTxid = childTxid;
-        childIndex++;
-
-        // Safety: don't loop more than 500 times
-        if (childIndex > 500) break;
+        const result = await mempool.addTransaction(tx);
+        if (!result.accepted) {
+          firstError = result.error;
+          break;
+        }
+        accepted++;
+        prevTxid = Buffer.from(getTxId(tx));
       }
 
-      // Now the next child should either be rejected by descendant-size or ancestor-count.
-      // If we hit ancestor count first (25), that's fine — size limit is also enforced.
-      const overflowInput = Buffer.alloc(32, 0xff);
-      await setupUTXO(overflowInput, 0, 100_000n);
-
-      const overflowChild = createTestTx(
-        [{ txid: lastParentTxid, vout: 0 }],
-        [{ value: 90_000n }]
-      );
-      const result = await mempool.addTransaction(overflowChild);
-
-      // Should be rejected by descendant-size OR ancestor-count gate
-      expect(result.accepted).toBe(false);
-      expect(result.error).toBeDefined();
+      // Bounded, and bounded by the cluster-count gate at exactly 64.
+      expect(accepted).toBe(MAX_CLUSTER_COUNT);
+      expect(firstError).toBe("too-large-cluster");
+      expect(mempool.getSize()).toBe(MAX_CLUSTER_COUNT);
     });
 
     test("descendantSize tracks cumulative size correctly", async () => {
@@ -513,14 +546,13 @@ describe("Mempool ancestor/descendant limits", () => {
   });
 
   // ============================================================================
-  // Gate E: cluster count limit (MAX_CLUSTER_COUNT = 64)
+  // Cluster count limit (MAX_CLUSTER_COUNT = 64)
   // Reference: bitcoin-core/src/policy/policy.h:72 (DEFAULT_CLUSTER_LIMIT = 64)
-  //            bitcoin-core/src/txmempool.cpp:1072-1079 (CheckMemPoolPolicyLimits)
+  //            bitcoin-core/src/txgraph.cpp:2059 (strict `>` oversize test)
   //
-  // Bug fixed: hotbuns had MAX_CLUSTER_SIZE = 100 instead of Core's value of 64.
-  // Note: in a simple star topology, the descendant-count gate (25) fires before
-  // the cluster-count gate (64) because 25 < 64.  The cluster gate is the binding
-  // constraint only for wider topologies (e.g. many parallel chains sharing a root).
+  // Since Core v31 removed the ancestor/descendant gates, the cluster count is
+  // the binding constraint for EVERY topology — chain, star and sibling-fan
+  // alike — not just for wide ones.
   // ============================================================================
   describe("cluster count limit (64)", () => {
     test("MAX_CLUSTER_COUNT constant equals Core DEFAULT_CLUSTER_LIMIT = 64", () => {
@@ -536,86 +568,136 @@ describe("Mempool ancestor/descendant limits", () => {
       expect(MAX_CLUSTER_SIZE).toBe(64);
     });
 
-    test("cluster count check fires before ancestor check for star topology", async () => {
-      // In a star topology (1 parent + N children), checkClusterSizeLimit runs
-      // before checkAncestorLimits (mempool.ts:1637 vs 1643).
-      // The descendant-count gate (MAX_DESCENDANTS=25) will fire at child 25,
-      // and since checkClusterSizeLimit runs first, the rejected tx triggers
-      // "too-large-cluster" only if cluster count > 64. With 25 children, the
-      // cluster count is 26 — well under 64 — so the error comes from the
-      // descendant-count gate inside checkAncestorLimits.
+    test("BOUNDARY: a 64-tx chain is accepted, the 65th is rejected", async () => {
+      // The core boundary assertion. Core's oversize test (txgraph.cpp:2059) is
+      // `total_count > m_max_cluster_count`, i.e. strictly greater — so a cluster
+      // of exactly 64 is legal and 65 is not. An implementation using `>=` would
+      // reject tx[63]; one with no count bound at all (or one that merely bumped
+      // MAX_PACKAGE_COUNT to 64) would accept all 65.
       //
-      // This test documents that for a star, the effective limit is 25 (descendant
-      // count), NOT 64 (cluster count). This is correct behaviour.
-      const parentInput = Buffer.alloc(32, 0xc1);
-      await setupUTXO(parentInput, 0, 100_000_000n);
-
-      const parent = createTestTx(
-        [{ txid: parentInput, vout: 0 }],
-        Array(30).fill({ value: 2_000_000n })
-      );
-      await mempool.addTransaction(parent);
-      const parentTxid = getTxId(parent);
-
-      // Add 24 children (total descendants = 25 incl. parent)
-      for (let i = 0; i < 24; i++) {
-        const childInput = Buffer.alloc(32, 0xc2 + i);
-        await setupUTXO(childInput, 0, 100_000n);
-        const child = createTestTx(
-          [
-            { txid: parentTxid, vout: i },
-            { txid: childInput, vout: 0 },
-          ],
-          [{ value: 1_900_000n }]
-        );
-        const r = await mempool.addTransaction(child);
-        expect(r.accepted).toBe(true);
-      }
-
-      // 25th child: cluster count = 26 (< 64) so cluster gate passes; descendant
-      // gate fires because parent would have 26 descendants (> MAX_DESCENDANTS=25).
-      const extra = Buffer.alloc(32, 0xfe);
-      await setupUTXO(extra, 0, 100_000n);
-      const overChild = createTestTx(
-        [
-          { txid: parentTxid, vout: 24 },
-          { txid: extra, vout: 0 },
-        ],
-        [{ value: 1_900_000n }]
-      );
-      const result = await mempool.addTransaction(overChild);
-      expect(result.accepted).toBe(false);
-      // Error comes from descendant-count gate (checkAncestorLimits), not cluster gate.
-      expect(result.error).toContain("descendant");
-    });
-
-    test("accepts chain of exactly 25 (ancestor count is the binding limit)", async () => {
-      // For a pure chain, ancestor count fires at 26 (not cluster at 64).
+      // Matches diff-test corpus entries `cluster-linear-64` and `cluster-linear-65`.
       const initialTxid = Buffer.alloc(32, 0xc0);
-      await setupUTXO(initialTxid, 0, 10_000_000n);
+      await setupUTXO(initialTxid, 0, 100_000_000n);
 
       let prevTxid: Buffer = initialTxid;
-      for (let i = 0; i < 25; i++) {
+      for (let i = 0; i < MAX_CLUSTER_COUNT; i++) {
         const tx = createTestTx(
           [{ txid: prevTxid, vout: 0 }],
-          [{ value: 9_000_000n - BigInt(i * 10_000) }]
+          [{ value: 90_000_000n - BigInt(i * 100_000) }]
         );
         const result = await mempool.addTransaction(tx);
+        // Every one of the first 64 must be accepted — including the 64th.
         expect(result.accepted).toBe(true);
         prevTxid = Buffer.from(getTxId(tx));
       }
-      expect(mempool.getSize()).toBe(25);
+      expect(mempool.getSize()).toBe(64);
+
+      // The 65th makes the cluster 65 > 64 and must be rejected.
+      const overflow = createTestTx(
+        [{ txid: prevTxid, vout: 0 }],
+        [{ value: 80_000_000n }]
+      );
+      const result = await mempool.addTransaction(overflow);
+      expect(result.accepted).toBe(false);
+      expect(result.error).toBe("too-large-cluster");
+      expect(mempool.getSize()).toBe(64);
+    });
+
+    test("count is scoped to the CONNECTED COMPONENT, not the ancestor set", async () => {
+      // Sibling fan-out: one root, then N children each spending a distinct root
+      // output. Every child has only 2 ancestors (itself + root), so an
+      // implementation that scoped the count to the ancestor set would accept
+      // arbitrarily many. The connected component, however, grows by 1 per child
+      // and must stop at 64 total.
+      //
+      // Matches diff-test corpus entry `cluster-sibling-72`.
+      const rootInput = Buffer.alloc(32, 0xc1);
+      await setupUTXO(rootInput, 0, 200_000_000n);
+
+      const root = createTestTx(
+        [{ txid: rootInput, vout: 0 }],
+        Array(80).fill({ value: 2_000_000n })
+      );
+      expect((await mempool.addTransaction(root)).accepted).toBe(true);
+      const rootTxid = getTxId(root);
+
+      let accepted = 0;
+      let firstError: string | undefined;
+      for (let i = 0; i < 80; i++) {
+        const child = createTestTx(
+          [{ txid: rootTxid, vout: i }],
+          [{ value: 1_900_000n }]
+        );
+        const r = await mempool.addTransaction(child);
+        if (!r.accepted) {
+          firstError = r.error;
+          break;
+        }
+        accepted++;
+      }
+
+      // root + 63 children = 64 in the component; the 64th child would make 65.
+      expect(accepted).toBe(MAX_CLUSTER_COUNT - 1);
+      expect(firstError).toBe("too-large-cluster");
+      expect(mempool.getSize()).toBe(MAX_CLUSTER_COUNT);
+    });
+
+    test("independent clusters are counted separately", async () => {
+      // Two disjoint 40-tx chains total 80 transactions but form two clusters of
+      // 40 each, so neither trips the 64 bound. Guards against a gate that
+      // accidentally measures the whole mempool.
+      for (const [seed, tag] of [[0xd0, "a"], [0xd1, "b"]] as const) {
+        const rootTxid = Buffer.alloc(32, seed);
+        await setupUTXO(rootTxid, 0, 100_000_000n);
+        let prevTxid: Buffer = rootTxid;
+        for (let i = 0; i < 40; i++) {
+          const tx = createTestTx(
+            [{ txid: prevTxid, vout: 0 }],
+            [{ value: 90_000_000n - BigInt(i * 100_000) }]
+          );
+          const r = await mempool.addTransaction(tx);
+          expect(`${tag}${i}:${r.accepted}`).toBe(`${tag}${i}:true`);
+          prevTxid = Buffer.from(getTxId(tx));
+        }
+      }
+      expect(mempool.getSize()).toBe(80);
     });
   });
 
   // ============================================================================
-  // Gate F: cluster vbytes limit (MAX_CLUSTER_SIZE_VBYTES = 101,000 vB)
+  // Cluster size limit — enforced in WEIGHT units (404,000 WU)
   // Reference: bitcoin-core/src/policy/policy.h:74 (DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101)
   //            bitcoin-core/src/kernel/mempool_limits.h:22
+  //            bitcoin-core/src/txmempool.cpp:181  (* WITNESS_SCALE_FACTOR)
+  //            bitcoin-core/src/policy/policy.cpp:390 (GetSigOpsAdjustedWeight)
   // ============================================================================
-  describe("cluster vbytes limit (101,000 vB)", () => {
+  describe("cluster size limit (404,000 weight units)", () => {
     test("MAX_CLUSTER_SIZE_VBYTES constant equals Core DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 = 101,000", () => {
+      // This is the CONFIG-facing value, reported by getmempoolinfo.limitclustersize
+      // (Core rpc/mempool.cpp:1062). It is not the enforcement unit.
       expect(MAX_CLUSTER_SIZE_VBYTES).toBe(101_000);
+    });
+
+    test("UNITS: enforcement constant is 404,000 WEIGHT units, = vbytes * WITNESS_SCALE_FACTOR", () => {
+      // Core scales the vbyte config into weight exactly once, at
+      // txmempool.cpp:181:
+      //     max_cluster_size = cluster_size_vbytes * WITNESS_SCALE_FACTOR
+      expect(MAX_CLUSTER_SIZE_WEIGHT).toBe(404_000);
+      expect(MAX_CLUSTER_SIZE_WEIGHT).toBe(MAX_CLUSTER_SIZE_VBYTES * 4);
+    });
+
+    test("UNITS: per-tx contribution is max(weight, sigops * 20), not ceil(w/4)", () => {
+      // policy.h:50 DEFAULT_BYTES_PER_SIGOP{20}
+      // policy.cpp:390 GetSigOpsAdjustedWeight -> std::max(weight, sigop_cost * bytes_per_sigop)
+      expect(DEFAULT_BYTES_PER_SIGOP).toBe(20);
+
+      // Weight-dominated: sigops are cheap, weight wins.
+      expect(getSigOpsAdjustedWeight(4000, 10, DEFAULT_BYTES_PER_SIGOP)).toBe(4000);
+      // Sigop-dominated: 400 sigops * 20 = 8000 > 1216 weight (the exact numbers
+      // produced by the 5-bare-multisig-output fixture used below).
+      expect(getSigOpsAdjustedWeight(1216, 400, DEFAULT_BYTES_PER_SIGOP)).toBe(8000);
+      // Boundary: equal — max() returns the shared value, no double counting.
+      expect(getSigOpsAdjustedWeight(2000, 100, DEFAULT_BYTES_PER_SIGOP)).toBe(2000);
     });
 
     test("accepts two independent transactions (different clusters, no vbyte issue)", async () => {
@@ -664,76 +746,182 @@ describe("Mempool ancestor/descendant limits", () => {
       // ancestorSize of child = parent.vsize + child.vsize
       expect(childEntry!.ancestorSize).toBe(parentEntry!.vsize + childEntry!.vsize);
     });
+
+    test("SIGOP-BOUND: max(weight, sigops*20) is what trips the size limit", async () => {
+      // The decisive test that cluster size is accumulated as sigop-adjusted
+      // WEIGHT and not as raw weight.
+      //
+      // Fixture: each tx carries 5 bare 1-of-1 multisig outputs, which are
+      // standard (DEFAULT_PERMIT_BAREMULTISIG) and sigop-dense. Measured on this
+      // implementation, each such tx has:
+      //     weight     = 1,216 WU
+      //     sigOpCost  =   400
+      //     adjWeight  = max(1216, 400 * 20) = 8,000 WU   <- sigop-dominated, 6.6x
+      //
+      // Therefore the cluster trips the 404,000 WU bound at:
+      //     50 txs -> 400,000 <= 404,000   ACCEPT
+      //     51 txs -> 408,000 >  404,000   REJECT
+      //
+      // Three ways an implementation gets this wrong, all caught here:
+      //   * summing RAW weight    -> 51 * 1,216 = 62,016, accepts all 51+
+      //   * count gate only       -> 51 < 64, accepts
+      //   * bound in vbytes (101,000) against raw vsize -> also accepts
+      // Only max(weight, sigops*20) summed in weight units stops at 50.
+      const rootTxid = Buffer.alloc(32, 0xe0);
+      await setupUTXO(rootTxid, 0, 100_000_000n);
+
+      let prevTxid: Buffer = rootTxid;
+      let value = 100_000_000n;
+      let accepted = 0;
+      let firstError: string | undefined;
+      let perTxWeight = 0;
+      let perTxSigOps = 0;
+
+      for (let i = 0; i < 70; i++) {
+        const next = value - 600_000n;
+        const tx: Transaction = {
+          version: 2,
+          inputs: [
+            {
+              prevOut: { txid: prevTxid, vout: 0 },
+              scriptSig: Buffer.alloc(0),
+              sequence: 0xffffffff,
+              witness: [],
+            },
+          ],
+          outputs: [
+            { value: next, scriptPubKey: Buffer.from([0x51, 0x02, 0x4e, 0x73]) },
+            ...Array(5)
+              .fill(0)
+              .map(() => ({ value: 100_000n, scriptPubKey: bareMultisigScript() })),
+            { value: 0n, scriptPubKey: Buffer.from([0x6a]) },
+          ],
+          lockTime: 0,
+        };
+        const r = await mempool.addTransaction(tx);
+        if (!r.accepted) {
+          firstError = r.error;
+          break;
+        }
+        const entry = mempool.getTransaction(getTxId(tx))!;
+        perTxWeight = entry.weight;
+        perTxSigOps = entry.sigOpCost;
+        accepted++;
+        value = next;
+        prevTxid = Buffer.from(getTxId(tx));
+      }
+
+      // Pin the fixture's own arithmetic so a change in sigop counting shows up
+      // here as a fixture failure rather than silently moving the boundary.
+      expect(perTxWeight).toBe(1216);
+      expect(perTxSigOps).toBe(400);
+      const adjWeight = getSigOpsAdjustedWeight(
+        perTxWeight,
+        perTxSigOps,
+        DEFAULT_BYTES_PER_SIGOP
+      );
+      expect(adjWeight).toBe(8000);
+      expect(adjWeight).toBeGreaterThan(perTxWeight); // sigop-dominated
+
+      // The boundary itself, derived from the constants rather than hardcoded.
+      const expectedAccepts = Math.floor(MAX_CLUSTER_SIZE_WEIGHT / adjWeight); // 50
+      expect(expectedAccepts).toBe(50);
+      expect(accepted).toBe(expectedAccepts);
+      expect(accepted * adjWeight).toBeLessThanOrEqual(MAX_CLUSTER_SIZE_WEIGHT);
+      expect((accepted + 1) * adjWeight).toBeGreaterThan(MAX_CLUSTER_SIZE_WEIGHT);
+      expect(firstError).toBe("too-large-cluster");
+
+      // Crucially, the COUNT gate did not fire — 51 is well under 64. The weight
+      // gate is provably what rejected, and only sigop adjustment gets it there.
+      expect(accepted + 1).toBeLessThan(MAX_CLUSTER_COUNT);
+      expect(accepted * perTxWeight).toBeLessThan(MAX_CLUSTER_SIZE_WEIGHT);
+    });
   });
 
   // ============================================================================
-  // Error message format tests
+  // Reject-token format
   // ============================================================================
-  describe("error message formats", () => {
-    test("ancestor count rejection includes 'ancestor' keyword", async () => {
+  describe("reject token format", () => {
+    test("token is exactly 'too-large-cluster' with an EMPTY debug string", async () => {
+      // Core: state.Invalid(TX_MEMPOOL_POLICY, "too-large-cluster", "")
+      //   validation.cpp:1024, :1116, :1343, :1521
+      // The debug argument is the empty string at all four call sites, so the
+      // surfaced error carries NO count, NO size and NO txid. Asserting exact
+      // equality (not `toContain`) is what pins that.
       const initialTxid = Buffer.alloc(32, 0xa1);
-      await setupUTXO(initialTxid, 0, 1_000_000n);
+      await setupUTXO(initialTxid, 0, 100_000_000n);
 
       let prevTxid: Buffer = initialTxid;
-      for (let i = 0; i < 25; i++) {
+      for (let i = 0; i < MAX_CLUSTER_COUNT; i++) {
         const tx = createTestTx(
           [{ txid: prevTxid, vout: 0 }],
-          [{ value: 900_000n - BigInt(i * 1000) }]
+          [{ value: 90_000_000n - BigInt(i * 100_000) }]
         );
-        await mempool.addTransaction(tx);
+        const r = await mempool.addTransaction(tx);
+        expect(r.accepted).toBe(true);
         prevTxid = Buffer.from(getTxId(tx));
       }
 
       const overTx = createTestTx(
         [{ txid: prevTxid, vout: 0 }],
-        [{ value: 800_000n }]
+        [{ value: 80_000_000n }]
       );
       const result = await mempool.addTransaction(overTx);
       expect(result.accepted).toBe(false);
-      expect(result.error).toContain("ancestor");
+      expect(result.error).toBe("too-large-cluster");
+      // No debug detail appended.
+      expect(result.error).not.toContain("64");
+      expect(result.error).not.toContain("count");
+      expect(result.error).not.toContain(":");
     });
 
-    test("descendant count rejection includes 'descendant' keyword", async () => {
-      const parentInput = Buffer.alloc(32, 0xa2);
-      await setupUTXO(parentInput, 0, 100_000_000n);
+    test("'too-long-mempool-chain' is never emitted (Core v31 deleted the token)", async () => {
+      // The old ancestor/descendant token must not survive anywhere in the
+      // acceptance path. Drive a 70-long chain and a wide fan and assert no
+      // rejection ever carries it.
+      const seen: string[] = [];
 
-      const parent = createTestTx(
-        [{ txid: parentInput, vout: 0 }],
-        Array(30).fill({ value: 2_000_000n })
-      );
-      await mempool.addTransaction(parent);
-      const parentTxid = getTxId(parent);
-
-      // Add 24 children to reach parent's descendant count = 25 (including self)
-      for (let i = 0; i < 24; i++) {
-        const childInput = Buffer.alloc(32, 0xa3 + i);
-        await setupUTXO(childInput, 0, 100_000n);
-
-        const child = createTestTx(
-          [
-            { txid: parentTxid, vout: i },
-            { txid: childInput, vout: 0 },
-          ],
-          [{ value: 1_900_000n }]
+      const chainRoot = Buffer.alloc(32, 0xa2);
+      await setupUTXO(chainRoot, 0, 100_000_000n);
+      let prevTxid: Buffer = chainRoot;
+      for (let i = 0; i < 70; i++) {
+        const tx = createTestTx(
+          [{ txid: prevTxid, vout: 0 }],
+          [{ value: 90_000_000n - BigInt(i * 100_000) }]
         );
-        const result = await mempool.addTransaction(child);
-        expect(result.accepted).toBe(true);
+        const r = await mempool.addTransaction(tx);
+        if (!r.accepted) {
+          seen.push(r.error ?? "");
+          break;
+        }
+        prevTxid = Buffer.from(getTxId(tx));
       }
 
-      // 25th child should fail
-      const extraInput = Buffer.alloc(32, 0xfe);
-      await setupUTXO(extraInput, 0, 100_000n);
+      expect(seen.length).toBeGreaterThan(0);
+      for (const e of seen) {
+        expect(e).not.toContain("too-long-mempool-chain");
+        expect(e).toBe("too-large-cluster");
+      }
+    });
+  });
 
-      const extraChild = createTestTx(
-        [
-          { txid: parentTxid, vout: 24 },
-          { txid: extraInput, vout: 0 },
-        ],
-        [{ value: 1_900_000n }]
-      );
-      const result = await mempool.addTransaction(extraChild);
-      expect(result.accepted).toBe(false);
-      expect(result.error).toContain("descendant");
+  // ============================================================================
+  // Limits that must NOT have changed in this wave
+  // ============================================================================
+  describe("adjacent limits are untouched", () => {
+    test("MAX_PACKAGE_COUNT stays 25 — it is NOT the cluster count", () => {
+      // A package is what may be submitted in one submitpackage call
+      // (mempool.ts MAX_PACKAGE_COUNT). Raising it to 64 to "match" the cluster
+      // limit would conflate two different limits.
+      expect(MAX_PACKAGE_COUNT).toBe(25);
+      expect(MAX_PACKAGE_COUNT).not.toBe(MAX_CLUSTER_COUNT);
+    });
+
+    test("TRUC 2-ancestor / 2-descendant limits stay 2/2", () => {
+      // BIP 431. These are the ONLY surviving ancestor/descendant enforcement
+      // after Core v31 and are unaffected by the cluster-limit change.
+      expect(TRUC_ANCESTOR_LIMIT).toBe(2);
+      expect(TRUC_DESCENDANT_LIMIT).toBe(2);
     });
   });
 });

@@ -957,44 +957,39 @@ describe("Mempool ancestor/descendant limits", () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  test("rejects transaction exceeding ancestor count limit", async () => {
-    // Create a long chain of 26 transactions (exceeds 25 ancestor limit)
+  test("ACCEPTS a 26-long chain — Core v31 removed the 25-ancestor limit", async () => {
+    // Was: "rejects transaction exceeding ancestor count limit".
+    // Bitcoin Core v31 replaced the ancestor/descendant limits with cluster
+    // limits; `too-long-mempool-chain` no longer exists in the Core tree. A
+    // 26-long chain is 26 txs (<= 64) and a few thousand weight units
+    // (<= 404,000), so Core accepts every one of them.
+    // Boundary coverage for the replacement gate lives in
+    // src/__tests__/mempool_limits.test.ts.
     const initialTxid = Buffer.alloc(32, 0x01);
     await setupUTXO(initialTxid, 0, 1000000n);
 
     let prevTxid: Buffer = initialTxid;
 
-    // Create 25 chained transactions
-    for (let i = 0; i < 25; i++) {
+    for (let i = 0; i < 26; i++) {
       const tx = createTestTx(
         [{ txid: prevTxid, vout: 0 }],
         [{ value: 900000n - BigInt(i * 1000) }]
       );
       const result = await mempool.addTransaction(tx);
-      if (!result.accepted) {
-        // Should fail at some point due to ancestor limit
-        expect(result.error).toContain("ancestors");
-        return;
-      }
+      expect(result.accepted).toBe(true);
       prevTxid = Buffer.from(getTxId(tx));
     }
 
-    // The 26th should definitely fail
-    const finalTx = createTestTx(
-      [{ txid: prevTxid, vout: 0 }],
-      [{ value: 800000n }]
-    );
-    const result = await mempool.addTransaction(finalTx);
-    expect(result.accepted).toBe(false);
-    expect(result.error).toContain("ancestors");
+    expect(mempool.getSize()).toBe(26);
   });
 
-  test("rejects transaction when parent has too many descendants", async () => {
-    // Create a parent with many children
+  test("ACCEPTS a parent with 26 children — Core v31 removed the 25-descendant limit", async () => {
+    // Was: "rejects transaction when parent has too many descendants".
+    // The resulting cluster is 1 parent + 26 children = 27 txs, inside the 64
+    // cluster-count bound, so Core accepts.
     const parentInput = Buffer.alloc(32, 0x02);
     await setupUTXO(parentInput, 0, 1000000n);
 
-    // Parent has multiple outputs
     const parent = createTestTx(
       [{ txid: parentInput, vout: 0 }],
       Array(26).fill({ value: 30000n })
@@ -1002,9 +997,7 @@ describe("Mempool ancestor/descendant limits", () => {
     await mempool.addTransaction(parent);
     const parentTxid = getTxId(parent);
 
-    // Create 25 children spending different outputs of parent
-    for (let i = 0; i < 25; i++) {
-      // Each child needs its own input (from parent or confirmed)
+    for (let i = 0; i < 26; i++) {
       const childInput = Buffer.alloc(32, 0x10 + i);
       await setupUTXO(childInput, 0, 50000n);
 
@@ -1016,26 +1009,12 @@ describe("Mempool ancestor/descendant limits", () => {
         [{ value: 70000n }]
       );
       const result = await mempool.addTransaction(child);
-      if (!result.accepted) {
-        expect(result.error).toContain("descendants");
-        return;
-      }
+      expect(result.accepted).toBe(true);
     }
 
-    // One more child should fail
-    const extraInput = Buffer.alloc(32, 0x40);
-    await setupUTXO(extraInput, 0, 50000n);
-
-    const extraChild = createTestTx(
-      [
-        { txid: parentTxid, vout: 25 },
-        { txid: extraInput, vout: 0 },
-      ],
-      [{ value: 70000n }]
-    );
-    const result = await mempool.addTransaction(extraChild);
-    expect(result.accepted).toBe(false);
-    expect(result.error).toContain("descendants");
+    // Parent now has 27 descendants (itself + 26 children) — no longer gated.
+    const parentEntry = mempool.getTransaction(parentTxid);
+    expect(parentEntry!.descendantCount).toBe(27);
   });
 });
 

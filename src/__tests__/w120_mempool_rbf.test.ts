@@ -530,10 +530,10 @@ describe("W120 — mempool strict RBF rules 1-5 (BIP-125)", () => {
     });
 
     test("G19: Rule 4 uses replacement's sigop-adjusted vsize (not raw byte size)", () => {
-      // Sigop-adjustment is computed at mempool.ts:1685-1686:
+      // Sigop-adjustment is computed in the mempool accept path as:
       //   adjWeight = max(weight, sigOpCost * DEFAULT_BYTES_PER_SIGOP)
-      //   vsize = ceil(adjWeight / WITNESS_SCALE_FACTOR)
-      // Then incremental fee gate uses `vsize` directly. Asserting via static
+      //   vsize     = ceil(adjWeight / WITNESS_SCALE_FACTOR)
+      // Then the incremental fee gate uses `vsize` directly. Asserting via static
       // structural check rather than wire-end since constructing a sigop-heavy
       // tx is brittle.
       const src = require("node:fs").readFileSync(
@@ -543,7 +543,13 @@ describe("W120 — mempool strict RBF rules 1-5 (BIP-125)", () => {
       // Look at the rule-4 gate.
       expect(src).toMatch(/incrementalRelayFee \* vsize/);
       // Confirm the same vsize is the sigop-adjusted one — derived from adjWeight.
-      expect(src).toMatch(/adjWeight\s*=\s*Math\.max\(weight,\s*sigOpCost\s*\*\s*DEFAULT_BYTES_PER_SIGOP\)/);
+      // Accept either spelling of GetSigOpsAdjustedWeight (policy/policy.cpp:390):
+      // the inline Math.max, or the shared getSigOpsAdjustedWeight() helper that
+      // the cluster-limit accounting also uses. Both are the identical formula;
+      // pinning one spelling made this test rot when the helper was adopted.
+      expect(src).toMatch(
+        /adjWeight\s*=\s*(?:Math\.max\(weight,\s*sigOpCost\s*\*\s*DEFAULT_BYTES_PER_SIGOP\)|getSigOpsAdjustedWeight\(\s*weight,\s*sigOpCost,\s*DEFAULT_BYTES_PER_SIGOP,?\s*\))/,
+      );
       expect(src).toMatch(/const vsize\s*=\s*Math\.ceil\(adjWeight \/ WITNESS_SCALE_FACTOR\)/);
     });
 
