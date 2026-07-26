@@ -1248,6 +1248,25 @@ export class Mempool {
   private outpointIndex: Map<string, string>;
 
   /**
+   * BIP-339 witness-txid index: wtxid hex -> txid hex, plus its inverse.
+   *
+   * The pool is keyed by txid, but the p2p relay loop announces and requests
+   * by WTXID against every peer that negotiated `wtxidrelay` — i.e. nearly all
+   * of them. Without this index the only way to answer "is this wtxid in the
+   * mempool?" is a full scan that re-serializes and double-SHA256s every
+   * entry (that is precisely what `BlockSync.findMempoolTxForInv` used to do,
+   * once per announced inv item). Bitcoin Core keeps the equivalent index as
+   * the `index_by_wtxid` hashed index on CTxMemPool::indexed_transaction_set
+   * (txmempool.h), which is what makes its `exists(GenTxid)` O(1) for both
+   * hash forms.
+   *
+   * Maintained ONLY through {@link indexWtxid} / {@link unindexWtxid} so the
+   * two maps cannot drift apart.
+   */
+  private wtxidIndex: Map<string, string>;
+  private txidToWtxid: Map<string, string>;
+
+  /**
    * User-created fee-priority deltas keyed by internal-order txid hex.
    * Mirrors Core's CTxMemPool::mapDeltas (txmempool.h:330). A delta may name
    * a txid that is not (yet) in the mempool — it is kept so the tx is
@@ -1349,6 +1368,8 @@ export class Mempool {
   ) {
     this.entries = new Map();
     this.outpointIndex = new Map();
+    this.wtxidIndex = new Map();
+    this.txidToWtxid = new Map();
     this.mapDeltas = new Map();
     this.maxSize = maxSize;
     this.currentSize = 0;
@@ -2388,6 +2409,7 @@ export class Mempool {
 
     // Add to mempool
     this.entries.set(txidHex, entry);
+    this.indexWtxid(txidHex, tx);
     this.currentSize += vsize;
     this.currentUsage += estimateEntryUsage(tx, vsize);
 
@@ -2500,6 +2522,7 @@ export class Mempool {
 
     // Remove from entries
     this.entries.delete(txidHex);
+    this.unindexWtxid(txidHex);
     this.currentSize -= entry.vsize;
     this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
 
@@ -2554,6 +2577,7 @@ export class Mempool {
 
         // Remove from entries
         this.entries.delete(txidHex);
+        this.unindexWtxid(txidHex);
         this.currentSize -= entry.vsize;
         this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
       }
@@ -2796,6 +2820,7 @@ export class Mempool {
       };
 
       this.entries.set(txidHex, entry);
+      this.indexWtxid(txidHex, tx);
       this.currentSize += vsize;
       this.currentUsage += estimateEntryUsage(tx, vsize);
 
@@ -2843,6 +2868,73 @@ export class Mempool {
    */
   hasTransaction(txid: Buffer): boolean {
     return this.entries.has(txid.toString("hex"));
+  }
+
+  /**
+   * Hex-keyed variant of {@link hasTransaction}. The mempool is keyed by txid
+   * hex internally, so callers on the per-announcement hot path (BlockSync's
+   * AlreadyHaveTx equivalent) can probe without allocating a 32-byte Buffer
+   * just to have it converted straight back to hex.
+   */
+  hasTxidHex(txidHex: string): boolean {
+    return this.entries.has(txidHex);
+  }
+
+  /**
+   * O(1) wtxid membership test (BIP-339 relay). See {@link wtxidIndex}.
+   */
+  hasWtxidHex(wtxidHex: string): boolean {
+    return this.wtxidIndex.has(wtxidHex);
+  }
+
+  /**
+   * Resolve a witness txid to the pool entry it names, or null. O(1).
+   */
+  getTransactionByWtxidHex(wtxidHex: string): MempoolEntry | null {
+    const txidHex = this.wtxidIndex.get(wtxidHex);
+    if (txidHex === undefined) return null;
+    return this.entries.get(txidHex) ?? null;
+  }
+
+  /**
+   * Register a pool entry in the wtxid index. Called at every `entries.set`.
+   * Computes the wtxid once, on admission, instead of once per announcement.
+   */
+  private indexWtxid(txidHex: string, tx: Transaction): void {
+    const wtxidHex = getWTxId(tx).toString("hex");
+    // Re-indexing the SAME txid with a DIFFERENT witness (witness malleation
+    // produces an identical txid but a different wtxid) must retire the old
+    // wtxid key, or `wtxidIndex[oldWtxid] -> txidHex` survives as a stale
+    // entry. That is not cosmetic: alreadyHaveInv would then report a false
+    // "already have" for the stale wtxid and we would silently skip requesting
+    // a transaction we do not hold under that wtxid, and a getdata MSG_WTX for
+    // it would be answered with the wrong-witness transaction.
+    // Reachable via the async TOCTOU in addTransaction (the duplicate check at
+    // :1490 is followed by an await before the insert), and via
+    // sendrawtransaction and mempool reload, which the cli.ts latch does not
+    // cover. Found by adversarial review of this very change.
+    const previousWtxid = this.txidToWtxid.get(txidHex);
+    if (previousWtxid !== undefined && previousWtxid !== wtxidHex) {
+      this.wtxidIndex.delete(previousWtxid);
+    }
+    this.wtxidIndex.set(wtxidHex, txidHex);
+    this.txidToWtxid.set(txidHex, wtxidHex);
+  }
+
+  /**
+   * Drop a pool entry from the wtxid index. Called at every `entries.delete`.
+   * Uses the stored inverse mapping so removal costs no hashing.
+   */
+  private unindexWtxid(txidHex: string): void {
+    const wtxidHex = this.txidToWtxid.get(txidHex);
+    if (wtxidHex !== undefined) {
+      // Guard against a same-txid replacement having re-pointed the wtxid
+      // entry at a different (or the same) txid before this removal ran.
+      if (this.wtxidIndex.get(wtxidHex) === txidHex) {
+        this.wtxidIndex.delete(wtxidHex);
+      }
+      this.txidToWtxid.delete(txidHex);
+    }
   }
 
   /**
@@ -3466,6 +3558,7 @@ export class Mempool {
 
     // Remove from entries
     this.entries.delete(txidHex);
+    this.unindexWtxid(txidHex);
     this.currentSize -= entry.vsize;
     this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
   }
@@ -3825,6 +3918,8 @@ export class Mempool {
   clear(): void {
     this.entries.clear();
     this.outpointIndex.clear();
+    this.wtxidIndex.clear();
+    this.txidToWtxid.clear();
     this.currentSize = 0;
     this.currentUsage = 0;
     this.minFeeRate = DEFAULT_MIN_FEE_RATE;

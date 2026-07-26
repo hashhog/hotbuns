@@ -33,7 +33,7 @@ import { RPCServer, type RPCServerConfig, type RPCServerDeps } from "../rpc/serv
 import { RESTServer, type RESTServerConfig, type RESTServerDeps } from "../rpc/rest.js";
 import { BlockFilterIndex, PersistentCoinStatsIndex, TxoSpenderIndex } from "../storage/indexes.js";
 import { InventoryRelay } from "../p2p/relay.js";
-import { getTxId, getTxVSize } from "../validation/tx.js";
+import { getTxId, getTxVSize, getWTxId } from "../validation/tx.js";
 import { InvType, type NetworkMessage, type InvVector } from "../p2p/messages.js";
 import { Wallet, WalletManager } from "../wallet/wallet.js";
 import { MAINNET, TESTNET, TESTNET4, REGTEST, disableAssumeValid, type ConsensusParams } from "../consensus/params.js";
@@ -2097,6 +2097,10 @@ async function startNode(config: NodeConfig): Promise<void> {
   // Closes the Pattern-A "module shipped, not wired" footnote from the
   // hotbuns DoS wave (commit 63b060c).
   const orphanPool = new OrphanPool();
+  // Let BlockSync's AlreadyHaveTx consult the orphanage, so a tx already
+  // parked awaiting its parent is neither re-requested nor re-validated.
+  // Core: TxDownloadManagerImpl::AlreadyHaveTx (txdownloadman_impl.cpp:139).
+  blockSync.setOrphanPool(orphanPool);
   // Bound on cascade-promote depth when a parent's arrival promotes
   // children that themselves promote grandchildren. Mirrors Core's
   // `MAX_ORPHAN_RESOLUTIONS_PER_TX` worklist guard — large enough to
@@ -2126,6 +2130,24 @@ async function startNode(config: NodeConfig): Promise<void> {
     );
   }
 
+  // "We already have this transaction" outcomes. In Bitcoin Core these never
+  // reach AcceptToMemoryPool — AlreadyHaveTx drops them at the p2p layer — so
+  // they never enter the recent-rejects filter. hotbuns can still produce them
+  // (a same-txid different-witness relay, or a tx confirmed between our
+  // AlreadyHaveTx probe and the mempool's own duplicate check), and treating
+  // them as rejections would blacklist a tx we are actively holding or that
+  // has just been mined.
+  // Reference: bitcoin-core/src/validation.cpp:823-830 (txn-already-in-mempool,
+  // txn-same-nonwitness-data-in-mempool) and :857-867 (txn-already-known).
+  function isAlreadyHaveError(err: string | undefined): boolean {
+    if (typeof err !== "string") return false;
+    return (
+      err.startsWith("txn-already-in-mempool") ||
+      err.startsWith("txn-same-nonwitness-data-in-mempool") ||
+      err.startsWith("txn-already-known")
+    );
+  }
+
   // Block-connected hook: drop orphans that just got mined (Core's
   // `EraseForBlock`). chainState already emits `blockConnected` whenever a
   // notification emitter is wired; we plumb a single shared emitter here so
@@ -2137,6 +2159,23 @@ async function startNode(config: NodeConfig): Promise<void> {
   chainEvents.on("blockConnected", (block: import("../validation/block.js").Block) => {
     try {
       const confirmedTxids = block.transactions.map((tx) => getTxId(tx));
+      // Core: TxDownloadManagerImpl::BlockConnected (txdownloadman_impl.cpp:
+      // 95-108) — record every mined tx (txid AND wtxid) as recently confirmed
+      // and forget any outstanding request for it. A mined tx leaves the
+      // mempool, so without this filter every re-announcement of it earns a
+      // fresh getdata plus a doomed acceptToMemoryPool. The coinbase is
+      // skipped: it is never relayed and can never be announced to us.
+      blockSync.markTxsConfirmed(
+        block.transactions.slice(1).map((tx) => ({
+          txidHex: getTxId(tx).toString("hex"),
+          wtxidHex: getWTxId(tx).toString("hex"),
+        }))
+      );
+      // Core: TxDownloadManagerImpl::ActiveTipChange (txdownloadman_impl.cpp:
+      // 88-92) wipes the recent-rejects filter on every tip move, because most
+      // rejections (min-fee, non-final locktime, ancestor limits, pool full)
+      // are height-dependent policy calls that a new tip can flip.
+      blockSync.onActiveTipChange();
       const removed = orphanPool.eraseForBlock(confirmedTxids);
       if (removed > 0) {
         console.log(`[orphan-pool] erased ${removed} orphans confirmed in block`);
@@ -2197,6 +2236,76 @@ async function startNode(config: NodeConfig): Promise<void> {
   // one-line message per 30s with a suppressed-count, instead of one full
   // source-mapped stack trace per offending tx. Never renders the Error object
   // (that is what triggers Bun's expensive source-frame reads).
+  /**
+   * Txids currently inside an `await mempool.acceptToMemoryPool(...)` call.
+   *
+   * WHY THIS EXISTS. Bitcoin Core holds `cs_main` for the whole of
+   * AcceptToMemoryPool, so two peers' copies of the same transaction can never
+   * be validated concurrently: the second one runs after the first has been
+   * inserted and is rejected by the `txn-already-in-mempool` check
+   * (validation.cpp:823-830). hotbuns' ATMP is async and yields at every UTXO
+   * read (`await this.utxo.getUTXOAsync`), which sits AFTER the equivalent
+   * duplicate check in `Mempool.addTransaction`. So when N peers deliver the
+   * same tx in the same tick, all N handlers pass the duplicate check before
+   * any of them inserts, and all N are "accepted" — each one re-running every
+   * UTXO lookup and script verification, re-announcing to every peer, and
+   * double-counting the tx in the fee estimator.
+   *
+   * Measured on the live mainnet node before this fix: 20,000 `[mempool]
+   * Accepted tx` lines covered only 16,887 distinct txids (mean 1.18, max 4),
+   * with the duplicates arriving from four different peers within a handful
+   * of consecutive log lines.
+   *
+   * This latch restores Core's serialization: the first submission for a txid
+   * runs, concurrent ones are dropped. Keyed by TXID (not wtxid) because that
+   * is what the mempool is keyed by, so it is exactly the window the mempool's
+   * own duplicate check cannot cover.
+   */
+  const txValidationInFlight = new Set<string>();
+
+  /**
+   * Single funnel for every `acceptToMemoryPool` call driven by relay (the p2p
+   * `tx` handler and the orphan cascade). Applies the concurrency latch and
+   * reports the outcome back to BlockSync's request tracker — Core's
+   * MempoolAcceptedTx / MempoolRejectedTx (txdownloadman_impl.cpp:323, :350).
+   *
+   * Returns `null` when the submission was skipped because an identical txid
+   * was already being validated; callers must treat that as "someone else is
+   * handling it" and do no relay or cascade work of their own.
+   */
+  async function submitTxToMempool(
+    tx: import("../validation/tx.js").Transaction,
+    txidHex: string,
+    wtxidHex: string
+  ): Promise<{ accepted: boolean; error?: string } | null> {
+    if (txValidationInFlight.has(txidHex)) return null;
+    txValidationInFlight.add(txidHex);
+    let result: { accepted: boolean; error?: string };
+    try {
+      result = await mempool.acceptToMemoryPool(tx);
+    } finally {
+      txValidationInFlight.delete(txidHex);
+    }
+
+    if (result.accepted) {
+      // Core: MempoolAcceptedTx → ForgetTxHash(txid), ForgetTxHash(wtxid).
+      blockSync.onMempoolAcceptedTx(txidHex, wtxidHex);
+    } else if (isAlreadyHaveError(result.error)) {
+      // "We already have it" is not a rejection — in Core these never reach
+      // ATMP at all, AlreadyHaveTx catches them first. Putting them in the
+      // rejects filter would blacklist a transaction we are actively holding.
+      // Just free the request slot.
+      blockSync.clearTxRequestInFlight(txidHex, wtxidHex);
+    } else if (!isMissingInputError(result.error)) {
+      // Core: MempoolRejectedTx adds to m_lazy_recent_rejects — but ONLY for
+      // failures other than TX_MISSING_INPUTS, which is routed to the
+      // orphanage instead so the tx stays reconsiderable once its parent
+      // shows up. Mirror that split exactly.
+      blockSync.markTxRejected(txidHex, wtxidHex);
+    }
+    return result;
+  }
+
   let txAcceptThrowCount = 0;
   let txAcceptThrowLastLog = 0;
   const logTxAcceptThrow = (err: unknown): void => {
@@ -2222,6 +2331,25 @@ async function startNode(config: NodeConfig): Promise<void> {
     // IBD skip gate — mirrors Core net_processing.cpp:4395
     if (!blockSync.isIBDComplete()) return;
     const tx = msg.payload.tx;
+
+    const txid = getTxId(tx);
+    const txidHex = txid.toString("hex");
+    const wtxidHex = getWTxId(tx).toString("hex");
+
+    // Core: TxDownloadManagerImpl::ReceivedTx (txdownloadman_impl.cpp:505-527)
+    // marks the response received — freeing the request slot — BEFORE the
+    // AlreadyHaveTx drop check, so even a duplicate delivery releases the
+    // marker. Do the same, and for both hash forms since the announcing peer
+    // may have used either.
+    blockSync.clearTxRequestInFlight(txidHex, wtxidHex);
+
+    // AlreadyHaveTx: orphanage / recent-rejects / recent-confirmed / mempool.
+    // This is the whole point of the pre-check — a duplicate now costs four
+    // hash-set probes instead of a full acceptToMemoryPool with its UTXO reads
+    // and script verification. Core drops here too, without penalising the
+    // peer (txdownloadman_impl.cpp:527 → `return {false, nullopt}`).
+    if (blockSync.alreadyHaveTx(txidHex, wtxidHex)) return;
+
     // INFRA GUARD (not a consensus change): mempool script validation can THROW
     // (e.g. a taproot key-path spend reaches verifyScript without a taproot
     // context and raises TAPROOT_CONTEXT_MISSING). This async handler had no
@@ -2234,19 +2362,20 @@ async function startNode(config: NodeConfig): Promise<void> {
     // into the SAME accept/reject outcome that already occurred (the tx was
     // dropped when it threw — no relay, no orphan-add) but without the flood.
     // The accept/reject DECISION is unchanged; only error handling + logging is.
-    let result: { accepted: boolean; error?: string };
+    let result: { accepted: boolean; error?: string } | null;
     try {
-      result = await mempool.acceptToMemoryPool(tx);
+      result = await submitTxToMempool(tx, txidHex, wtxidHex);
     } catch (err) {
       logTxAcceptThrow(err);
       return;
     }
+    // null = an identical txid was already mid-validation in another handler;
+    // that handler owns the relay/cascade work for this tx.
+    if (result === null) return;
     try {
       if (result.accepted) {
         // Successful admission. Relay to peers and cascade-promote any orphans
         // that were waiting on this tx as a parent.
-        const txid = getTxId(tx);
-        const txidHex = txid.toString("hex");
         const entry = mempool.getTransaction(txid);
         const feeRate = entry ? entry.feeRate : 0;
         txRelay.queueTxToAllFiltered(txidHex, feeRate);
@@ -2292,7 +2421,17 @@ async function startNode(config: NodeConfig): Promise<void> {
       const next = worklist.shift()!;
       const children = orphanPool.onParentAdmitted(next);
       for (const child of children) {
-        const childResult = await mempool.acceptToMemoryPool(child.tx);
+        const childTxidHexKey = child.txid.toString("hex");
+        // Same funnel as the p2p path. Matters here too: the blockConnected
+        // hook fires `Promise.all(block.transactions.map(processOrphanCascade))`,
+        // so many cascades run concurrently and a child with two missing
+        // parents can be handed to two of them in the same tick.
+        const childResult = await submitTxToMempool(
+          child.tx,
+          childTxidHexKey,
+          child.wtxid.toString("hex")
+        );
+        if (childResult === null) continue;
         if (childResult.accepted) {
           orphanPool.eraseTx(child.wtxid);
           const childTxidHex = child.txid.toString("hex");
@@ -2537,6 +2676,11 @@ async function startNode(config: NodeConfig): Promise<void> {
   chainEvents.on(
     "blockDisconnected",
     (block: import("../validation/block.js").Block) => {
+      // Core: TxDownloadManagerImpl::BlockDisconnected (txdownloadman_impl.cpp:
+      // 112-123) resets the recently-confirmed filter on any disconnect —
+      // transactions from a disconnected block become relayable again, and
+      // leaving them in the filter would make us refuse to re-download them.
+      blockSync.onBlockDisconnected();
       try {
         walletManager.disconnectBlock(block);
       } catch (err) {

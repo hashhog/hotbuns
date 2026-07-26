@@ -163,6 +163,16 @@ export class OrphanPool {
     return this.txidIndex.has(txid.toString("hex"));
   }
 
+  /**
+   * Hex-keyed variant of {@link has} / {@link hasByTxid}, for callers on the
+   * per-announcement hot path that already hold the hex form. Avoids the
+   * 32-byte Buffer allocation the Buffer-typed accessors force.
+   */
+  hasHex(wtxidHex: string, txidHex?: string): boolean {
+    if (this.byWtxid.has(wtxidHex)) return true;
+    return txidHex !== undefined && this.txidIndex.has(txidHex);
+  }
+
   /** Get an entry by wtxid, or undefined. */
   get(wtxid: Buffer): OrphanEntry | undefined {
     return this.byWtxid.get(wtxid.toString("hex"));
