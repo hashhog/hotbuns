@@ -40,6 +40,7 @@ import {
   Mempool,
   MAX_CLUSTER_COUNT,
   MAX_CLUSTER_SIZE_VBYTES,
+  MAX_CLUSTER_SIZE_WEIGHT,
   MAX_PACKAGE_COUNT,
   MAX_PACKAGE_WEIGHT,
   TRUC_VERSION,
@@ -243,12 +244,16 @@ describe("G3 — descendant set updates on removal", () => {
   });
 });
 
-describe("G4 — ancestor count limit (MAX_ANCESTORS = 25)", () => {
+describe("G4 — ancestor count is NOT a limit (cluster count is)", () => {
   /**
-   * PASS — hotbuns enforces MAX_ANCESTORS = 25 (including self).
-   * A chain of depth 25 is accepted; depth 26 is rejected.
+   * Bitcoin Core v31 replaced the ancestor/descendant limits with cluster limits.
+   * DEFAULT_ANCESTOR_LIMIT no longer gates admission and the
+   * `too-long-mempool-chain` token is gone from the Core tree entirely.
+   * A 26-deep chain is now accepted; the binding bound is the cluster gate
+   * (count > 64 or sigop-adjusted weight > 404,000), covered in
+   * src/__tests__/mempool_limits.test.ts.
    */
-  test("G4: 25-deep chain accepted, 26th rejected", async () => {
+  test("G4: 26-deep chain fully accepted (25-ancestor gate removed)", async () => {
     const fundTxid = Buffer.alloc(32, 0x30);
     await setupUTXO(fundTxid, 0, 10_000_000n);
 
@@ -272,26 +277,31 @@ describe("G4 — ancestor count limit (MAX_ANCESTORS = 25)", () => {
       value -= 10_000n;
     }
 
-    // tx[24]: ancestorCount = 25 (exactly at limit) — should be accepted
+    // tx[24]: ancestorCount = 25 — accepted (as before)
     const tx24 = makeTx([{ txid: prevTxid, vout: prevVout }], [{ value }]);
     const r24 = await mempool.addTransaction(tx24);
     expect(r24.accepted, "tx at depth 24 (ancestorCount=25) should be accepted").toBe(true);
     prevTxid = getTxId(tx24);
     value -= 10_000n;
 
-    // tx[25]: ancestorCount = 26 (over limit) — should be rejected
+    // tx[25]: ancestorCount = 26 — now ACCEPTED. Was rejected with
+    // `too-long-mempool-chain` before Core v31 deleted that gate.
     const tx25 = makeTx([{ txid: prevTxid, vout: prevVout }], [{ value }]);
     const r25 = await mempool.addTransaction(tx25);
-    expect(r25.accepted).toBe(false);
-    expect(r25.error).toMatch(/too-long-mempool-chain/i);
+    expect(r25.accepted).toBe(true);
+    expect(mempool.getSize()).toBe(26);
   });
 });
 
-describe("G5 — ancestor size limit (101,000 vB)", () => {
+describe("G5 — ancestorSize is bookkeeping only (no longer a gate)", () => {
   /**
-   * PASS — ancestor vsize sum (including self) must not exceed 101,000 vB.
+   * The ancestor-vsize gate was removed with the rest of the ancestor/descendant
+   * limits in Core v31. `ancestorSize` is still tracked on the entry for RPC
+   * reporting; it just no longer rejects. The size bound that remains is the
+   * cluster one, enforced in WEIGHT units (404,000 WU) — see
+   * src/__tests__/mempool_limits.test.ts.
    */
-  test("G5: transaction chain exceeding ancestor vsize limit is rejected", async () => {
+  test("G5: ancestorSize is tracked on the entry", async () => {
     const fundTxid = Buffer.alloc(32, 0x40);
     await setupUTXO(fundTxid, 0, 50_000_000n);
 
@@ -313,13 +323,14 @@ describe("G5 — ancestor size limit (101,000 vB)", () => {
   });
 });
 
-describe("G6 — descendant count limit (MAX_DESCENDANTS = 25)", () => {
+describe("G6 — descendant count is NOT a limit (cluster count is)", () => {
   /**
-   * PASS — hotbuns enforces MAX_DESCENDANTS = 25.
-   * A fan-out of 25 children off one parent is accepted; the 26th child is rejected.
-   * (Each child independently spends a different output of the parent.)
+   * Companion to G4. Core v31 removed DEFAULT_DESCENDANT_LIMIT enforcement, so a
+   * parent may now have more than 25 children provided the whole connected
+   * component stays within the cluster bounds (64 txs / 404,000 WU).
+   * Each child independently spends a different output of the parent.
    */
-  test("G6: 25 descendants accepted, 26th rejected", async () => {
+  test("G6: 25 children all accepted (25-descendant gate removed)", async () => {
     // Parent with 26 outputs
     const fundTxid = Buffer.alloc(32, 0x50);
     await setupUTXO(fundTxid, 0, 10_000_000n);
@@ -344,27 +355,34 @@ describe("G6 — descendant count limit (MAX_DESCENDANTS = 25)", () => {
       expect(r.accepted, `child ${i} should be accepted`).toBe(true);
     }
 
-    // 25th child (vout 24) — parent now has descendantCount = 25 (self + 24 children)
-    // Adding this would make it 26 → should be rejected
+    // 25th child (vout 24) — takes the parent to descendantCount = 26.
+    // Now ACCEPTED: the cluster is 26 txs, inside the 64 bound.
     const child25 = makeTx(
       [{ txid: parentTxid, vout: 24 }],
       [{ value: 200_000n }]
     );
     const r25 = await mempool.addTransaction(child25);
-    expect(r25.accepted).toBe(false);
-    expect(r25.error).toMatch(/too-long-mempool-chain/i);
+    expect(r25.accepted).toBe(true);
+
+    const parentEntry = mempool.getTransaction(parentTxid);
+    expect(parentEntry!.descendantCount).toBe(26);
   });
 });
 
-describe("G7 — descendant size limit (101,000 vB)", () => {
+describe("G7 — cluster size constant (101,000 vB config / 404,000 WU enforced)", () => {
   /**
-   * PASS — descendant vsize sum must stay ≤ 101,000 vB.
-   * Verified by constant inspection; behavioural check deferred (same approach as G5).
+   * The per-ancestor descendant-vsize gate is gone. The surviving size bound is
+   * the cluster one. Core keeps the CONFIG in vbytes
+   * (DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000, reported by
+   * getmempoolinfo.limitclustersize) but ENFORCES in weight, scaling by
+   * WITNESS_SCALE_FACTOR once at txmempool.cpp:181.
    */
-  test("G7: descendantSize constant correct", () => {
-    // Validate the constant exported / used in the implementation matches Core.
+  test("G7: cluster size constants match Core in both units", () => {
     // Bitcoin Core: DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 = 101 * 1000 = 101,000
     expect(MAX_CLUSTER_SIZE_VBYTES).toBe(101_000);
+    // Enforcement unit: 101,000 vB * 4 = 404,000 WU
+    expect(MAX_CLUSTER_SIZE_WEIGHT).toBe(404_000);
+    expect(MAX_CLUSTER_SIZE_WEIGHT).toBe(MAX_CLUSTER_SIZE_VBYTES * 4);
   });
 });
 

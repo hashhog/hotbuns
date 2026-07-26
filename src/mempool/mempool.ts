@@ -30,6 +30,7 @@ import {
   isCoinbase,
   serializeTx,
   checkSequenceLocks,
+  getSigOpsAdjustedWeight,
 } from "../validation/tx.js";
 import { isFinalTx } from "../mining/template.js";
 import { sha256Hash } from "../crypto/primitives.js";
@@ -74,11 +75,34 @@ import {
 export const MAX_CLUSTER_COUNT = 64;
 
 /**
- * Maximum cluster size in vbytes.
- * Bitcoin Core: kernel/mempool_limits.h cluster_size_vbytes = DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 = 101,000.
+ * Maximum cluster size in vbytes — the CONFIGURATION-facing value.
+ * Bitcoin Core: kernel/mempool_limits.h:22 cluster_size_vbytes = DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 = 101,000.
  * Reference: bitcoin-core/src/policy/policy.h:74 (DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101)
+ *
+ * This is what `getmempoolinfo.limitclustersize` reports (Core rpc/mempool.cpp:1062).
+ * It is NOT the unit the limit is enforced in — see MAX_CLUSTER_SIZE_WEIGHT.
  */
 export const MAX_CLUSTER_SIZE_VBYTES = 101_000;
+
+/**
+ * Maximum cluster size in WEIGHT units — the ENFORCEMENT value.
+ *
+ * Core converts the vbyte config into weight exactly once, when it builds the
+ * TxGraph (bitcoin-core/src/txmempool.cpp:181):
+ *
+ *     max_cluster_size = m_opts.limits.cluster_size_vbytes * WITNESS_SCALE_FACTOR
+ *
+ * and TxGraph then accumulates per-transaction *sigop-adjusted weight*
+ * (`GetSigOpsAdjustedWeight(GetTransactionWeight(tx), sigops, nBytesPerSigOp)`,
+ * txmempool.cpp:1017 → policy/policy.cpp:390) and rejects on
+ * `total_size > m_max_cluster_size` (txgraph.cpp:2059).
+ *
+ * The sum is taken in weight units with NO per-transaction division and NO
+ * per-transaction rounding. Summing per-tx ceilinged vsize instead
+ * (Σ⌈wᵢ/4⌉ ≥ (Σwᵢ)/4) is systematically STRICTER than Core and must not be
+ * reintroduced as a "simplification".
+ */
+export const MAX_CLUSTER_SIZE_WEIGHT = MAX_CLUSTER_SIZE_VBYTES * WITNESS_SCALE_FACTOR; // 404,000
 
 /**
  * @deprecated Use MAX_CLUSTER_COUNT instead.
@@ -481,30 +505,17 @@ function validateInputsStandardness(
   return { ok: true };
 }
 
-/**
- * Ancestor/descendant count limits.
- * Bitcoin Core: policy/policy.h DEFAULT_ANCESTOR_LIMIT = 25, DEFAULT_DESCENDANT_LIMIT = 25.
- * Reference: bitcoin-core/src/policy/policy.h:76-78
- *
- * In cluster-mempool Core (28+) these are enforced via MemPoolLimits and still active
- * alongside the cluster-count/size gates. Both gates apply.
- */
-const MAX_ANCESTORS = 25;
-const MAX_DESCENDANTS = 25;
-/**
- * Maximum total vsize of in-mempool ancestors (including self).
- * Bitcoin Core: kernel/mempool_limits.h — historically DEFAULT_ANCESTOR_LIMIT_SIZE_KVB * 1000.
- * Defaults to 101,000 vbytes (101 kvB).
- * Reference: bitcoin-core/src/policy/policy.h (DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 kvB shared limit)
- */
-const MAX_ANCESTOR_SIZE = 101_000; // vbytes
-/**
- * Maximum total vsize of in-mempool descendants (including self).
- * Bitcoin Core: kernel/mempool_limits.h — historically DEFAULT_DESCENDANT_LIMIT_SIZE_KVB * 1000.
- * Defaults to 101,000 vbytes (101 kvB).
- * Reference: bitcoin-core/src/policy/policy.h (DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 kvB shared limit)
- */
-const MAX_DESCENDANT_SIZE = 101_000; // vbytes
+// MAX_ANCESTORS / MAX_DESCENDANTS / MAX_ANCESTOR_SIZE / MAX_DESCENDANT_SIZE were
+// REMOVED here (Wave A, cluster limits). Core v31 no longer enforces general
+// ancestor/descendant count or size limits at all — MemPoolLimits still carries
+// ancestor_count/descendant_count fields (kernel/mempool_limits.h:24-26) but
+// nothing gates admission on them, and the `too-long-mempool-chain` token is gone
+// from the tree. The cluster count/weight gate is the sole replacement; see
+// MAX_CLUSTER_COUNT / MAX_CLUSTER_SIZE_WEIGHT above and checkClusterSizeLimit.
+//
+// DEFAULT_ANCESTOR_LIMIT (25) survives in Core only as -limitancestorcount's
+// default and as MAX_PACKAGE_COUNT below, which is a DIFFERENT limit (how many
+// txs may be submitted in one submitpackage call) and stays at 25.
 
 /**
  * TRUC (v3) policy constants per BIP 431.
@@ -1835,10 +1846,15 @@ export class Mempool {
       };
     }
 
-    // Sigop-adjusted vsize: mirrors GetVirtualTransactionSize(weight, sigOpCost, bytes_per_sigop)
-    // in bitcoin-core/src/policy/policy.cpp:395-397.
-    // If sigops are expensive (sigOpCost * 20 > weight), vsize inflates to reflect that cost.
-    const adjWeight = Math.max(weight, sigOpCost * DEFAULT_BYTES_PER_SIGOP);
+    // Sigop-adjusted weight: mirrors GetSigOpsAdjustedWeight(weight, sigop_cost, bytes_per_sigop)
+    // in bitcoin-core/src/policy/policy.cpp:390-393 = max(weight, sigop_cost * 20).
+    // This is the quantity Core feeds to TxGraph for cluster accounting
+    // (txmempool.cpp:1017) and it is what the cluster gate consumes below —
+    // in weight units, undivided. Uses the shared helper so the per-tx form here
+    // and the per-entry form in clusterWeightContribution() cannot drift apart.
+    const adjWeight = getSigOpsAdjustedWeight(weight, sigOpCost, DEFAULT_BYTES_PER_SIGOP);
+    // Sigop-adjusted vsize: GetVirtualTransactionSize (policy.cpp:395-397).
+    // Still used for fee-rate math and RPC reporting — NOT for cluster size.
     const vsize = Math.ceil(adjWeight / WITNESS_SCALE_FACTOR);
 
     // 8a. PreCheckEphemeralTx: a tx with dust outputs must have 0 fee
@@ -2116,12 +2132,22 @@ export class Mempool {
       }
     }
 
-    // 9b. Check cluster size limit (replaces ancestor/descendant limits)
+    // 9b. Cluster limits — the ONLY general mempool topology bound.
+    //
+    // Since Core v31 this REPLACES the ancestor/descendant count+size limits
+    // rather than supplementing them: `too-long-mempool-chain` is gone from the
+    // Core tree entirely. TRUC/v3's 2-ancestor/2-descendant rule is separate and
+    // still enforced above by checkTRUCPolicy.
+    //
+    // The new tx contributes its sigop-adjusted WEIGHT (`adjWeight`, computed
+    // above as max(weight, sigOpCost * 20)) — the same quantity Core hands to
+    // TxGraph at txmempool.cpp:1017. Passing `vsize` here would re-introduce the
+    // per-tx ceiling and make the gate stricter than Core.
     //
     // For RBF, evaluate against the POST-eviction state: the conflicts (and
     // their descendants gathered above into `conflictsToEvict`) will be
     // removed before the new tx is added, so they must not count toward the
-    // cluster's count/vbytes when checking the limit. Mirrors
+    // cluster's count/weight when checking the limit. Mirrors
     // `m_subpackage.m_changeset->CheckMemPoolPolicyLimits()` in
     // bitcoin-core/src/validation.cpp:1023 (ReplacementChecks).
     //
@@ -2134,16 +2160,16 @@ export class Mempool {
         evictedTxidSet.add(e.txid.toString("hex"));
       }
     }
-    const clusterResult = this.checkClusterSizeLimit(parentTxids, vsize, evictedTxidSet);
+    const clusterResult = this.checkClusterSizeLimit(parentTxids, adjWeight, evictedTxidSet);
     if (!clusterResult.valid) {
       return { accepted: false, error: clusterResult.error };
     }
 
-    // Also check legacy ancestor/descendant limits for backward compatibility
-    const ancestorResult = this.checkAncestorLimits(parentTxids, vsize);
-    if (!ancestorResult.valid) {
-      return { accepted: false, error: ancestorResult.error };
-    }
+    // (No ancestor/descendant count or size gate here by design. Core v31 deleted
+    //  MemPoolLimits::{ancestor,descendant}_count enforcement along with the
+    //  `too-long-mempool-chain` reject token; the cluster gate above subsumes it,
+    //  since a tx's ancestor set and each ancestor's descendant set are both
+    //  subsets of the connected component the cluster gate measures.)
 
     // 2e1. ValidateInputsStandardness: per-input prevScript policy checks.
     //      Mirrors Bitcoin Core's ValidateInputsStandardness() (policy/policy.cpp:214-263),
@@ -3150,80 +3176,24 @@ export class Mempool {
     return conflicts;
   }
 
-  /**
-   * Check ancestor limits for a new transaction.
-   */
-  /**
-   * Check ancestor and descendant limits for a new transaction.
-   *
-   * Enforces 4 gates from Bitcoin Core (policy/policy.h + kernel/mempool_limits.h):
-   *   Gate A — ancestor count:   new tx's ancestor set (incl. self) ≤ MAX_ANCESTORS (25).
-   *             Reference: bitcoin-core/src/policy/policy.h:76
-   *   Gate B — ancestor size:    total vsize of ancestors (incl. self) ≤ MAX_ANCESTOR_SIZE (101,000 vB).
-   *             Reference: bitcoin-core/src/policy/policy.h:74 (DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101)
-   *   Gate C — descendant count: each in-mempool ancestor's descendant count (incl. existing + new) ≤ MAX_DESCENDANTS (25).
-   *             Reference: bitcoin-core/src/policy/policy.h:78
-   *   Gate D — descendant size:  each in-mempool ancestor's descendant vsize (incl. existing + new) ≤ MAX_DESCENDANT_SIZE (101,000 vB).
-   *             Reference: bitcoin-core/src/policy/policy.h:74 (DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101)
-   *             Previously enforced via -limitdescendantsize in legacy Core.
-   */
-  private checkAncestorLimits(
-    parentTxids: Set<string>,
-    newTxVsize: number
-  ): { valid: boolean; error?: string } {
-    // Calculate ancestor stats
-    const { ancestorCount, ancestorSize } = this.calculateAncestorStats(parentTxids, newTxVsize);
-
-    // Gate A: ancestor count limit (includes self).
-    // Bitcoin Core: kernel/mempool_limits.h MemPoolLimits::ancestor_count = DEFAULT_ANCESTOR_LIMIT = 25.
-    if (ancestorCount > MAX_ANCESTORS) {
-      return {
-        valid: false,
-        error: `too-long-mempool-chain: ${ancestorCount} ancestors exceeds limit of ${MAX_ANCESTORS}`,
-      };
-    }
-
-    // Gate B: ancestor size limit in vbytes (includes self).
-    // Bitcoin Core: DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 kvB → 101,000 vB.
-    if (ancestorSize > MAX_ANCESTOR_SIZE) {
-      return {
-        valid: false,
-        error: `too-long-mempool-chain: ancestor vsize ${ancestorSize} exceeds limit of ${MAX_ANCESTOR_SIZE} vB`,
-      };
-    }
-
-    // Gates C + D: descendant limits for all in-mempool ancestors.
-    // Adding this tx would increase each ancestor's descendant count by 1 and
-    // descendant size by newTxVsize. Check both before admission.
-    const allAncestors = this.getAncestorSet(parentTxids);
-    for (const ancestorTxidHex of allAncestors) {
-      const ancestor = this.entries.get(ancestorTxidHex);
-      if (ancestor) {
-        // Gate C: descendant count.
-        // Bitcoin Core: kernel/mempool_limits.h MemPoolLimits::descendant_count = DEFAULT_DESCENDANT_LIMIT = 25.
-        const newDescendantCount = ancestor.descendantCount + 1;
-        if (newDescendantCount > MAX_DESCENDANTS) {
-          return {
-            valid: false,
-            error: `too-long-mempool-chain: ancestor ${ancestorTxidHex.slice(0, 16)}... would have ${newDescendantCount} descendants (limit ${MAX_DESCENDANTS})`,
-          };
-        }
-
-        // Gate D: descendant size in vbytes.
-        // Bitcoin Core: DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 kvB → 101,000 vB.
-        // Previously -limitdescendantsize in legacy Core before cluster mempool.
-        const newDescendantSize = ancestor.descendantSize + newTxVsize;
-        if (newDescendantSize > MAX_DESCENDANT_SIZE) {
-          return {
-            valid: false,
-            error: `too-long-mempool-chain: ancestor ${ancestorTxidHex.slice(0, 16)}... descendant vsize would be ${newDescendantSize} (limit ${MAX_DESCENDANT_SIZE} vB)`,
-          };
-        }
-      }
-    }
-
-    return { valid: true };
-  }
+  // checkAncestorLimits() was REMOVED here (Wave A, cluster limits).
+  //
+  // It enforced four gates that Bitcoin Core v31 deleted outright: ancestor
+  // count (25), ancestor vsize (101,000 vB), per-ancestor descendant count (25)
+  // and per-ancestor descendant vsize (101,000 vB), all emitting the
+  // `too-long-mempool-chain` reject token. That token no longer appears anywhere
+  // in the Core tree; the cluster count/weight gate in checkClusterSizeLimit is
+  // now the sole general topology bound, and it is strictly wider-scoped (it
+  // measures the whole connected component, of which the ancestor set and each
+  // ancestor's descendant set are subsets), so removing these gates cannot leave
+  // a cluster unbounded in either count or size.
+  //
+  // calculateAncestorStats() is retained — the ancestorCount/ancestorSize fields
+  // on MempoolEntry are still populated for RPC reporting (getmempoolentry) and
+  // mining/linearization, they are simply no longer an admission gate.
+  //
+  // TRUC/v3's 2-ancestor / 2-descendant limits are unaffected: see
+  // checkTRUCPolicy below and TRUC_ANCESTOR_LIMIT / TRUC_DESCENDANT_LIMIT.
 
   /**
    * Check TRUC (v3) policy rules for a transaction.
@@ -3974,22 +3944,63 @@ export class Mempool {
   }
 
   /**
+   * Per-transaction contribution to a cluster's size, in WEIGHT units.
+   *
+   * Core: `GetSigOpsAdjustedWeight(GetTransactionWeight(tx), sigops_cost, ::nBytesPerSigOp)`
+   * — bitcoin-core/src/policy/policy.cpp:390, fed into TxGraph at
+   * bitcoin-core/src/txmempool.cpp:1017 (ChangeSet::StageAddition).
+   *
+   *     max(weight, sigop_cost * DEFAULT_BYTES_PER_SIGOP)
+   *
+   * Deliberately NOT `entry.vsize`: that field is the ceilinged
+   * `ceil(adjWeight/4)`, and summing it over a cluster over-counts relative to
+   * Core (Σ⌈wᵢ/4⌉ ≥ (Σwᵢ)/4). Cluster accounting stays in weight end to end.
+   */
+  private clusterWeightContribution(entry: MempoolEntry): number {
+    return getSigOpsAdjustedWeight(entry.weight, entry.sigOpCost, DEFAULT_BYTES_PER_SIGOP);
+  }
+
+  /**
    * Check if adding a transaction would exceed the cluster limits.
    *
-   * Enforces two gates from Bitcoin Core (policy/policy.h + kernel/mempool_limits.h):
-   *   Gate 1 — cluster count: merged cluster tx count must not exceed MAX_CLUSTER_COUNT (64).
-   *             Core: DEFAULT_CLUSTER_LIMIT = 64; CheckMemPoolPolicyLimits() via TxGraph::IsOversized.
-   *             Reference: bitcoin-core/src/policy/policy.h:72, src/txmempool.cpp:1072-1079
-   *   Gate 2 — cluster vbytes: merged cluster total vsize must not exceed MAX_CLUSTER_SIZE_VBYTES (101,000).
-   *             Core: cluster_size_vbytes = DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 = 101,000 vB.
-   *             Reference: bitcoin-core/src/policy/policy.h:74, src/kernel/mempool_limits.h:22
+   * This is mempool POLICY, not consensus — nothing here affects block validation.
+   *
+   * Since Bitcoin Core v31 the cluster limits are the ONLY general mempool
+   * topology bound: the ancestor/descendant count and size limits were removed
+   * (`too-long-mempool-chain` no longer exists anywhere in the Core tree). The
+   * only surviving ancestor/descendant enforcement is TRUC/v3's 2-ancestor /
+   * 2-descendant rule, which is separate and untouched (see checkTRUCPolicy).
+   *
+   * Enforces two gates, both scoped to the whole CONNECTED COMPONENT (cluster)
+   * that would result from this admission — not to the ancestor set:
+   *
+   *   Gate 1 — cluster count:  reject when merged tx count  > MAX_CLUSTER_COUNT (64).
+   *             Core: DEFAULT_CLUSTER_LIMIT = 64 (policy.h:72), carried into
+   *             MemPoolLimits::cluster_count (kernel/mempool_limits.h:20).
+   *   Gate 2 — cluster weight: reject when merged sigop-adjusted weight
+   *             > MAX_CLUSTER_SIZE_WEIGHT (404,000 WU = 101,000 vB * 4).
+   *             Core: txmempool.cpp:181 scales cluster_size_vbytes by
+   *             WITNESS_SCALE_FACTOR before handing it to TxGraph.
+   *
+   * Both comparisons are strictly `>`, matching Core's single oversize test at
+   * bitcoin-core/src/txgraph.cpp:2059:
+   *
+   *     if (total_count > m_max_cluster_count || total_size > m_max_cluster_size)
+   *
+   * so 64 transactions ACCEPT and 65 REJECT; 404,000 WU ACCEPT and 404,001 REJECT.
+   *
+   * The rejection token is the bare string "too-large-cluster" with an EMPTY
+   * debug message, matching Core's four call sites
+   * (validation.cpp:1024, :1116, :1343, :1521):
+   *
+   *     state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "too-large-cluster", "");
    *
    * A new transaction may merge multiple existing clusters together when it spends
    * outputs from transactions in different clusters.
    */
   private checkClusterSizeLimit(
     parentTxids: Set<string>,
-    newTxVsize: number,
+    newTxAdjWeight: number,
     excludeTxids?: Set<string>,
   ): { valid: boolean; error?: string } {
     // `excludeTxids` is the set of txids that will be removed by this admission
@@ -3999,7 +4010,7 @@ export class Mempool {
     // which evaluates limits against the staged-changeset state, not the
     // pre-eviction state. Without this, an RBF replacement is falsely rejected
     // when the conflicts it evicts inflate the cluster past MAX_CLUSTER_COUNT
-    // or MAX_CLUSTER_SIZE_VBYTES.
+    // or MAX_CLUSTER_SIZE_WEIGHT.
     const excluded = excludeTxids ?? new Set<string>();
 
     // Find all unique cluster roots that would be merged by adding this tx.
@@ -4013,30 +4024,26 @@ export class Mempool {
       }
     }
 
-    // Gate 1: cluster count.
-    // Sum entries in each merged cluster, subtracting any entries being evicted.
+    // Accumulate the merged cluster's count and sigop-adjusted WEIGHT.
+    // The running total is never divided or rounded — see clusterWeightContribution.
     let mergedCount = 1; // +1 for the new tx
-    let mergedVsize = newTxVsize;
+    let mergedWeight = newTxAdjWeight;
     for (const [txidHex, entry] of this.entries) {
       const root = this.clusters.find(txidHex);
       if (!clusterRoots.has(root)) continue;
       if (excluded.has(txidHex)) continue;
       mergedCount += 1;
-      mergedVsize += entry.vsize;
+      mergedWeight += this.clusterWeightContribution(entry);
     }
 
+    // Gate 1: cluster count. Strict `>` — 64 accepts, 65 rejects.
     if (mergedCount > MAX_CLUSTER_COUNT) {
-      return {
-        valid: false,
-        error: `too-large-cluster: cluster would exceed maximum count ${MAX_CLUSTER_COUNT} (would be ${mergedCount})`,
-      };
+      return { valid: false, error: "too-large-cluster" };
     }
 
-    if (mergedVsize > MAX_CLUSTER_SIZE_VBYTES) {
-      return {
-        valid: false,
-        error: `too-large-cluster: cluster would exceed maximum vsize ${MAX_CLUSTER_SIZE_VBYTES} vB (would be ${mergedVsize})`,
-      };
+    // Gate 2: cluster weight. Strict `>` — 404,000 accepts, 404,001 rejects.
+    if (mergedWeight > MAX_CLUSTER_SIZE_WEIGHT) {
+      return { valid: false, error: "too-large-cluster" };
     }
 
     return { valid: true };
