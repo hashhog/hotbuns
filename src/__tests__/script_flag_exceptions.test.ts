@@ -194,3 +194,54 @@ describe("getScriptFlagsForBlock — script_flag_exceptions", () => {
     expect(flags & ScriptFlags.VERIFY_TAPROOT).toBeTruthy();
   });
 });
+
+// ─── The flag must actually be HONOURED, not just computed ────────────────────
+// Wave B fixed getScriptFlagsForBlock so the exception clears TAPROOT at block
+// 692261. That was necessary but NOT sufficient: verifyInputSignature had a
+// BIP-341 fast path keyed purely on the scriptPubKey SHAPE (OP_1 <32 bytes>)
+// that never consulted the flags, so it enforced Taproot anyway and
+// FALSE-REJECTED the block. Caught by the tools/phaseb-vectors checkblock
+// vector at 692261; guarded here so it cannot regress silently.
+//
+// Bitcoin Core, VerifyWitnessProgram (script/interpreter.cpp:1947-1950):
+//     if (!(flags & SCRIPT_VERIFY_TAPROOT)) return set_success(serror);
+//     if (stack.size() == 0) return set_error(serror, ...WITNESS_EMPTY);
+// The flag test comes FIRST and returns SUCCESS — a v1 program without the
+// TAPROOT flag is an upgradable witness program, i.e. anyone-can-spend.
+describe("P2TR spends honour SCRIPT_VERIFY_TAPROOT", () => {
+  const { verifyInputSignature } = require("../validation/tx.js") as
+    typeof import("../validation/tx.js");
+
+  // OP_1 <32 zero bytes> — a syntactically valid v1 witness program.
+  const p2trSpk = Buffer.concat([
+    Buffer.from([0x51, 0x20]),
+    Buffer.alloc(32, 0),
+  ]);
+  const mkTx = () => ({
+    version: 2,
+    inputs: [{
+      prevOut: { txid: Buffer.alloc(32, 1), vout: 0 },
+      scriptSig: Buffer.alloc(0),
+      sequence: 0xffffffff,
+      witness: [] as Buffer[],          // EMPTY witness
+    }],
+    outputs: [{ value: 1000n, scriptPubKey: Buffer.alloc(0) }],
+    lockTime: 0,
+  }) as unknown as Parameters<typeof verifyInputSignature>[0];
+  const utxo = {
+    height: 100, coinbase: false, amount: 2000n, scriptPubKey: p2trSpk,
+  } as unknown as Parameters<typeof verifyInputSignature>[2];
+
+  it("TAPROOT clear (the 692261 exception case) → anyone-can-spend, VALID", () => {
+    const flags = ScriptFlags.VERIFY_P2SH | ScriptFlags.VERIFY_WITNESS; // no TAPROOT
+    const r = verifyInputSignature(mkTx(), 0, utxo, {} as never, undefined, undefined, flags);
+    expect(r.valid).toBe(true);
+  });
+
+  it("TAPROOT set → the empty witness is still rejected", () => {
+    const flags = ScriptFlags.VERIFY_P2SH | ScriptFlags.VERIFY_WITNESS |
+                  ScriptFlags.VERIFY_TAPROOT;
+    const r = verifyInputSignature(mkTx(), 0, utxo, {} as never, undefined, undefined, flags);
+    expect(r.valid).toBe(false);
+  });
+});

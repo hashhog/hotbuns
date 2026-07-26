@@ -1752,6 +1752,28 @@ export function verifyInputSignature(
     if (input.scriptSig.length !== 0) {
       return { valid: false, inputIndex, error: "Taproot input must have empty scriptSig" };
     }
+    // TAPROOT NOT ACTIVE => the v1 witness program is an UPGRADABLE witness
+    // program, i.e. anyone-can-spend, and NONE of the BIP-341 rules below may
+    // run. Bitcoin Core, VerifyWitnessProgram (script/interpreter.cpp:1947-1950):
+    //
+    //   } else if (witversion == 1 && program.size() == WITNESS_V1_TAPROOT_SIZE && !is_p2sh) {
+    //       if (!(flags & SCRIPT_VERIFY_TAPROOT)) return set_success(serror);
+    //       if (stack.size() == 0) return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY);
+    //
+    // The flag test comes FIRST — before the empty-witness test — and returns
+    // SUCCESS, not failure.
+    //
+    // This branch previously had no flag gate at all: it enforced BIP-341 purely
+    // on the scriptPubKey SHAPE. That made hotbuns reject mainnet block 692261,
+    // whose whole reason for being in consensusparams.script_flag_exceptions is
+    // that Core validates it with P2SH|WITNESS and TAPROOT CLEARED. Fixing
+    // getScriptFlagsForBlock (Wave B) was necessary but not sufficient, because
+    // the computed flag was then ignored here. FALSE-REJECT of a real chain
+    // block — the node stalls on a block the network considers valid.
+    // Found by the tools/phaseb-vectors checkblock vector at 692261.
+    if ((scriptVerifyFlags & ScriptFlags.VERIFY_TAPROOT) === 0) {
+      return { valid: true, inputIndex };
+    }
     if (input.witness.length === 0) {
       return { valid: false, inputIndex, error: "Taproot witness empty" };
     }
