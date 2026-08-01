@@ -367,15 +367,16 @@ describe("W97 AcceptBlock — fAlreadyHave, fTooFarAhead, MinimumChainWork, Chec
     // Reference: Bitcoin Core validation.cpp::CheckBlock (line 3918+) always
     // runs; only ConnectBlock's fScriptChecks is gated on !fAssumeValid.
     const idx = BLOCKS_SRC.indexOf("async connectBlock(");
-    const slice = BLOCKS_SRC.slice(idx, idx + 8000);
+    const slice = BLOCKS_SRC.slice(idx, idx + 12000);
     // The old buggy gate must be absent.
     expect(slice).not.toMatch(/if \(!assumeValid\) {[^}]*validation = validateBlock\(/s);
-    // validateBlock must be called unconditionally (before the assumeValid variable).
+    // validateBlock must be called unconditionally, BEFORE the assumevalid
+    // (skipScripts) gate — the `const assumeValid =` local was removed in
+    // the faithful-skipScripts refactor, so anchor on the gate call itself.
     const validateCallIdx = slice.indexOf("validateBlock(block, height");
-    const assumeVarIdx = slice.indexOf("const assumeValid =");
+    const gateIdx = slice.indexOf("shouldSkipScripts(");
     expect(validateCallIdx).toBeGreaterThan(-1);
-    expect(assumeVarIdx).toBeGreaterThan(-1);
-    expect(validateCallIdx).toBeLessThan(assumeVarIdx);
+    expect(gateIdx).toBeGreaterThan(validateCallIdx);
   });
 
   // ── G21: ContextualCheckBlock invocation independent of validateBlock ──
@@ -411,22 +412,23 @@ describe("W97 AcceptBlock — fAlreadyHave, fTooFarAhead, MinimumChainWork, Chec
   });
 
   // ── G24+G25: WriteBlock + HAVE_DATA bit deep-IBD divergence ──
-  test("G24/G25 — body persistence (putBlock) and HAVE_DATA bit are gated on atTip", () => {
-    // BUG B20: db.putBlock is gated on `if (atTip) { ... }` — deep-IBD
-    // blocks have NO body persisted.
-    // BUG B21: status bit 8 (HAVE_DATA) is conditional on atTip:
-    //   status: 1 | 2 | 4 | (atTip ? 8 : 0) | haveUndo
-    expect(BLOCKS_SRC).toContain("(atTip ? 8 : 0)");
+  test("G24/G25 — body persistence (putBlock) and HAVE_DATA bit are gated on the reorg window", () => {
+    // BUG B20: db.putBlock is gated on `if (withinReorgWindow) { ... }` —
+    // deep-IBD blocks outside the 288-block reorg window have NO body
+    // persisted (documented perf optimization, flagged for parity; Core
+    // writes every accepted body to blk*.dat).
+    // BUG B21: status bit 8 (HAVE_DATA) tracks the same gate:
+    //   status: 1 | 2 | 4 | (withinReorgWindow ? 8 : 0) | haveUndo
+    expect(BLOCKS_SRC).toContain("(withinReorgWindow ? 8 : 0)");
   });
 
   // ── G26: FlushStateToDisk(NONE) unconditional ──
   test("G26 — flushDirty is gated on shouldFlush, not unconditional", () => {
     // BUG B22: Core calls FlushStateToDisk after every accepted block
     // (validation.cpp:4393).  Hotbuns gates on
-    // `shouldFlush = atTip || height % FLUSH_INTERVAL === 0` (documented
-    // perf optimization, flagged for parity).
-    expect(BLOCKS_SRC).toContain("const shouldFlush = atTip");
-    expect(BLOCKS_SRC).toContain("FLUSH_INTERVAL");
+    // `shouldFlush = atTip || withinReorgWindow || height % FLUSH_INTERVAL === 0`
+    // (documented perf optimization, flagged for parity).
+    expect(BLOCKS_SRC).toMatch(/const shouldFlush =\s+atTip \|\| withinReorgWindow \|\| height % FLUSH_INTERVAL === 0;/);
   });
 
   // ── G27: CheckBlockIndex post-condition ──
@@ -497,7 +499,7 @@ describe("W97 AcceptBlock — fAlreadyHave, fTooFarAhead, MinimumChainWork, Chec
     // a block whose header was never processed (e.g. via cmpctblock direct
     // injection), the assertion fires but no contextual re-check happens.
     const idx = BLOCKS_SRC.indexOf("async connectBlock(");
-    const slice = BLOCKS_SRC.slice(idx, idx + 8000);
+    const slice = BLOCKS_SRC.slice(idx, idx + 12000);
     expect(slice).toMatch(/headerSync\.getHeaderByHeight\(height\)/);
     expect(slice).not.toContain("acceptBlockHeader(");
   });

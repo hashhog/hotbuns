@@ -20,6 +20,7 @@ import { describe, expect, it } from "bun:test";
 import {
   addChecksum,
   descriptorChecksum,
+  DescriptorType,
   parseDescriptor,
   validateChecksum,
 } from "../wallet/descriptor.js";
@@ -163,7 +164,7 @@ describe("W131 G08 — pk(KEY) x-only requires P2TR ctx", () => {
   it("rawtr(<32-byte hex>) is accepted (TR ctx)", () => {
     // PRESENT — 32-byte raw works in TR contexts.
     const parsed = parseDescriptor(`rawtr(${SECP_G_XONLY})`);
-    expect(parsed.descriptor.getType()).toBe("rawtr");
+    expect(parsed.descriptor.getType()).toBe(DescriptorType.RAWTR);
   });
 });
 
@@ -635,7 +636,7 @@ describe("W131 round-trip — descriptor + miniscript do not regress", () => {
     const desc = `pk(${SECP_G_HEX})`;
     const withCs = addChecksum(desc);
     const p = parseDescriptor(withCs);
-    expect(p.descriptor.getType()).toBe("pk");
+    expect(p.descriptor.getType()).toBe(DescriptorType.PK);
   });
 
   it("miniscript pk_k round-trip via parser", () => {

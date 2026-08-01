@@ -149,7 +149,11 @@ function makeSenderWallet(): Wallet {
   return Wallet.create(cfg, SENDER_MNEMONIC);
 }
 
-let portCounter = 39443;
+// Randomised per-process port band (mirrors the 26682fc watchonly
+// fix): parallel test files each draw from a distinct 2000-port
+// band plus a random offset, so EADDRINUSE collisions cannot
+// happen between concurrently-running test files.
+let portCounter = 20000 + Math.floor(Math.random() * 2000);
 function getTestPort(): number { return portCounter++; }
 
 // ---------------------------------------------------------------------------

@@ -33,7 +33,11 @@ import { getTxId } from "../validation/tx.js";
 import type { Transaction } from "../validation/tx.js";
 
 // Unique per-run port base so parallel test files don't collide.
-let portCounter = 19443;
+// Randomised per-process port band (mirrors the 26682fc watchonly
+// fix): parallel test files each draw from a distinct 2000-port
+// band plus a random offset, so EADDRINUSE collisions cannot
+// happen between concurrently-running test files.
+let portCounter = 24000 + Math.floor(Math.random() * 2000);
 function getTestPort(): number {
   return portCounter++;
 }
@@ -166,14 +170,14 @@ describe("prioritisetransaction / getprioritisedtransactions", () => {
       ["fee_delta", "in_mempool", "modified_fee"].sort()
     );
 
-    // getmempoolentry reflects the modified fee too (base + delta). Note:
-    // hotbuns's getmempoolentry keys by the raw (internal-order) param it is
-    // given — a pre-existing display-order inconsistency vs getrawmempool that
-    // is out of scope here — so we look it up by the internal-order hex. This
-    // assertion targets the fees.modified wiring (getModifiedFee), not the byte
+    // getmempoolentry reflects the modified fee too (base + delta). The RPC
+    // takes the user-facing DISPLAY-order txid and reverses it internally via
+    // parseHashV (Core parity — the pre-existing display-order inconsistency
+    // noted here previously has been fixed), so we look up by displayHex.
+    // This assertion targets the fees.modified wiring (getModifiedFee), not the byte
     // order of the lookup. Core entryToJSON (mempool.cpp) emits fees as a nested
     // object only — top-level modifiedfee was removed for Core parity.
-    const me = (await rpc("getmempoolentry", [internalHex])).result;
+    const me = (await rpc("getmempoolentry", [displayHex])).result;
     // fees.modified is the canonical field (Core entryToJSON); no top-level modifiedfee.
     expect(me.fees.modified).toBeCloseTo((Number(fee) + 1000) / 1e8, 12);
 
@@ -294,11 +298,13 @@ describe("prioritisetransaction / getprioritisedtransactions", () => {
   });
 
   test("EFFECT: under mempool pressure the lowest-MODIFIED-feerate tx is evicted; a prioritised low-base-fee tx survives", async () => {
-    // Tight mempool so the two same-size txs (74 vbytes each, measured) cannot
-    // both fit: a 100-vbyte cap admits the first but forces a single TrimToSize
-    // eviction when the second arrives (74 + 74 = 148 > 100).
+    // Tight mempool so the two same-size txs cannot both fit: the cap admits
+    // the first but forces a single TrimToSize eviction when the second
+    // arrives. Since 76975fa maxSize bounds REAL HEAP USAGE (like Core's
+    // -maxmempool), not raw vsize — each fixture tx accounts ~1717 bytes of
+    // usage (74 vbytes), so a 2000-byte cap holds exactly one.
     const tinyUtxo = utxo;
-    const tightPool = new Mempool(tinyUtxo, REGTEST, 100);
+    const tightPool = new Mempool(tinyUtxo, REGTEST, 2000);
     tightPool.setTipHeight(200);
 
     // Helper bound to the tight pool (mirrors submitTx but targets tightPool and
@@ -336,7 +342,7 @@ describe("prioritisetransaction / getprioritisedtransactions", () => {
 
     const high = await submitInto(tightPool, 0x41, 100_000n, 80_000n);
 
-    // Pool is over its 400-vbyte cap with both present, so exactly one of the
+    // Pool is over its 2000-byte heap-usage cap with both present, so exactly one of the
     // two same-size txs survives. With the fix, eviction picks the LOWEST
     // MODIFIED feerate ⇒ HIGH (base 20_000) is evicted, prioritised LOW
     // (modified 35_000) survives. Without the fix (raw base feerate) LOW would

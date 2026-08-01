@@ -129,7 +129,12 @@ describe("addrman persistence: peers.dat round-trips the bucketed AddrMan", () =
     for (let i = 0; i < 20; i++) add(makeInfo(i, 1_700_000_000 + i));
 
     // Promote one address NEW->TRIED so the round-trip must carry tried state.
-    const triedInfo = makeInfo(3, 1_700_000_003);
+    // Use the FIRST-inserted address: it is guaranteed a new-bucket slot (the
+    // table was empty at insert time). A later address can lose its (bucket,
+    // position) draw to an earlier non-terrible occupant under a random nKey
+    // (Core Add_ keeps the incumbent), leaving refCount=0 so good() no-ops —
+    // that made this test flake ~1-in-5 runs on makeInfo(3).
+    const triedInfo = makeInfo(0, 1_700_000_000);
     (mgr1 as any).addrMan.good(triedInfo.host, triedInfo.port);
     expect((mgr1 as any).addrMan.isInTried(triedInfo.host, triedInfo.port)).toBe(
       true,

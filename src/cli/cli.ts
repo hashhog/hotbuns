@@ -1527,7 +1527,7 @@ async function startNode(config: NodeConfig): Promise<void> {
     daemonizeAndExit(Bun.argv);
   }
 
-  console.log("hotbuns v0.1.0 starting...");
+  console.log("hotbuns v1.0.0 starting...");
 
   // Env-var form of the assume-valid disable knob (CLI `--noassumevalid` /
   // `--assumevalid=0` sets config.noAssumeValid directly). Honored here so the
@@ -2955,7 +2955,7 @@ async function startNode(config: NodeConfig): Promise<void> {
   // 10. Log startup message
   const peerCount = peerManager.getConnectedPeers().length;
   console.log(
-    `hotbuns v0.1.0 | network=${mergedConfig.network} | height=${bestBlock.height} | peers=${peerCount} | rpc=127.0.0.1:${mergedConfig.rpcPort}`
+    `hotbuns v1.0.0 | network=${mergedConfig.network} | height=${bestBlock.height} | peers=${peerCount} | rpc=127.0.0.1:${mergedConfig.rpcPort}`
   );
 }
 
@@ -3384,7 +3384,7 @@ async function cmdWalletSend(config: NodeConfig, args: string[]): Promise<void> 
  * Print help message.
  */
 function printHelp(): void {
-  console.log(`hotbuns v0.1.0 - Bitcoin full node in TypeScript (Bun)
+  console.log(`hotbuns v1.0.0 - Bitcoin full node in TypeScript (Bun)
 
 USAGE:
   hotbuns <command> [options]

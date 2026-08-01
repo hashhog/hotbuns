@@ -154,7 +154,7 @@ describe("FeeFilterManager", () => {
 
   test("setMinFeeRate enforces minimum", () => {
     // Setting below default should use default
-    manager.setMinFeeRate(500n);
+    manager.setMinFeeRate(50n);
     const peer = createMockPeer();
     manager.sendInitialFeeFilter(peer);
 
@@ -229,10 +229,10 @@ describe("checkIncrementalRelayFee", () => {
   });
 
   test("rejects insufficient incremental fee", () => {
-    // newFee = 1100, newVsize = 200, oldFee = 1000
-    // Additional fee = 100
-    // Required (1000 sat/kvB * 200 vB / 1000) = 200
-    const result = checkIncrementalRelayFee(1100n, 200, 1000n);
+    // newFee = 1010, newVsize = 200, oldFee = 1000
+    // Additional fee = 10
+    // Required (Core v31: 100 sat/kvB * 200 vB / 1000) = 20
+    const result = checkIncrementalRelayFee(1010n, 200, 1000n);
     expect(result.isValid).toBe(false);
     expect(result.error).toBeDefined();
   });
@@ -245,32 +245,32 @@ describe("checkIncrementalRelayFee", () => {
   });
 
   test("handles edge case at exact threshold", () => {
-    // newFee = 1200, newVsize = 200, oldFee = 1000
-    // Additional fee = 200
-    // Required (1000 * 200 / 1000) = 200
-    const result = checkIncrementalRelayFee(1200n, 200, 1000n);
+    // newFee = 1020, newVsize = 200, oldFee = 1000
+    // Additional fee = 20
+    // Required (Core v31: 100 * 200 / 1000) = 20 — exact threshold
+    const result = checkIncrementalRelayFee(1020n, 200, 1000n);
     expect(result.isValid).toBe(true);
   });
 
   test("handles large transaction sizes", () => {
     // 100 kvB transaction
     const vsize = 100000;
-    // Required: 1000 * 100000 / 1000 = 100000 satoshis
-    const result = checkIncrementalRelayFee(200000n, vsize, 100000n);
+    // Required (Core v31): 100 * 100000 / 1000 = 10000 satoshis
+    const result = checkIncrementalRelayFee(110000n, vsize, 100000n);
     expect(result.isValid).toBe(true);
 
-    const result2 = checkIncrementalRelayFee(150000n, vsize, 100000n);
+    const result2 = checkIncrementalRelayFee(105000n, vsize, 100000n);
     expect(result2.isValid).toBe(false);
   });
 });
 
 describe("feefilter constants", () => {
-  test("default min relay fee is 1000 sat/kvB", () => {
-    expect(DEFAULT_MIN_RELAY_FEE_RATE).toBe(1000n);
+  test("default min relay fee is 100 sat/kvB (Core v31)", () => {
+    expect(DEFAULT_MIN_RELAY_FEE_RATE).toBe(100n);
   });
 
-  test("default incremental relay fee is 1000 sat/kvB", () => {
-    expect(DEFAULT_INCREMENTAL_RELAY_FEE).toBe(1000n);
+  test("default incremental relay fee is 100 sat/kvB (Core v31)", () => {
+    expect(DEFAULT_INCREMENTAL_RELAY_FEE).toBe(100n);
   });
 
   test("feefilter protocol version is 70013", () => {

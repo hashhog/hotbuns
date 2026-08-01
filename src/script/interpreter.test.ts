@@ -1382,6 +1382,7 @@ describe("WITNESS_MALLEATED_P2SH — P2SH-wrapped witness scriptSig byte-exact c
     verifyNullFail: false,
     verifyCheckLockTimeVerify: false,
     verifyCheckSequenceVerify: false,
+    verifyWitnessPubkeyType: false, // policy-only (BIP 141 standardness), not in block flags
     // verifyMinimalData intentionally absent → false (policy flag, not in block flags)
   };
 

@@ -827,7 +827,7 @@ describe("Coinbase maturity respected in coin selection", () => {
     expect(() => wallet.selectCoinsAdvanced(100000n, 1.0)).toThrow();
   });
 
-  test("PASS: mature coinbase (>= 100 confirmations) is selectable", () => {
+  test("PASS: mature coinbase (>= 101 confirmations) is selectable", () => {
     const wallet = Wallet.create(makeConfig("mainnet"), ABANDON_MNEMONIC);
     const addr = wallet.getNewAddress("bech32");
     wallet.addUTXO({
@@ -835,7 +835,7 @@ describe("Coinbase maturity respected in coin selection", () => {
       amount: 5000000n,
       address: addr,
       keyPath: "m/84'/0'/0'/0/0",
-      confirmations: 100,
+      confirmations: 101, // Core wallet maturity: depth >= COINBASE_MATURITY + 1
       addressType: AddressType.P2WPKH,
       isCoinbase: true,
     });

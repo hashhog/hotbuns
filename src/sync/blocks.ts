@@ -236,6 +236,17 @@ const MAX_STALL_TIMEOUT = 300000;
 /** Interval for progress logging (milliseconds). */
 const LOG_INTERVAL = 10000;
 
+/** Circuit breaker for the connect-failure retry loop. After this many
+ *  CONSECUTIVE validation failures at the SAME height, give up and hard-halt
+ *  sync (park the node, RPC stays up) instead of discarding + re-requesting
+ *  the block forever — the pre-fix behaviour burned 275k+ identical
+ *  "Missing UTXO ... discarding and re-requesting" retries at one height with
+ *  no backoff and no give-up. The first classified banner still fires at 3
+ *  attempts; this cap only bounds the loop. Connect failures are
+ *  deterministic (validation runs on a downloaded body), so a valid node
+ *  never legitimately needs more than a handful of retries at one height. */
+const MAX_CONSECUTIVE_CONNECT_FAILURES = 10;
+
 /** Minimum interval (milliseconds) between forced getheaders re-polls once the
  *  block frontier has drained every known header. See the "header-sync idle
  *  catch-all" in handleStalled(). Keeps a truly-at-tip node from spamming
@@ -2974,11 +2985,31 @@ export class BlockSync {
           // tapscript / script-rule mismatches (944,279 MAX_OPS_PER_SCRIPT).
           const cls = classifyCallbackError(failureMsg);
 
-          if (cls === "consensus") {
+          if (this.consecutiveFailures >= MAX_CONSECUTIVE_CONNECT_FAILURES) {
+            // Circuit breaker: bounded retries per block, then PARK sync.
+            // The retry loop below is correct for transient states (download
+            // races, view reconciliation after an unclean shutdown), but a
+            // deterministic connect failure at a fixed height can NEVER be
+            // fixed by re-requesting the same bytes — pre-breaker the loop
+            // emitted the same "discarding and re-requesting" line 275,299
+            // times at height 127694 with no backoff and no give-up. Halt
+            // loudly instead; RPC stays up for triage and a restart (or a
+            // code fix, for the consensus class) resumes from the last
+            // flushed height. The chainstate class already exited at 3
+            // (process.exit(78)), so in practice this bounds the consensus
+            // and unknown classes.
+            this.haltSync(
+              `block ${hashHex.slice(0, 16)} at height ${height} failed ` +
+                `validation ${this.consecutiveFailures} consecutive times ` +
+                `(class: ${cls})${coords}; refusing to retry forever. ` +
+                `Error: ${failureMsg}`
+            );
+          } else if (cls === "consensus") {
             // Consensus rule mismatch: the chainstate is recoverable; do NOT
             // exit with EX_CONFIG (which signals the operator to wipe). The
             // bounded retry will keep failing until the rule is fixed in
-            // code, but the on-disk UTXO set is fine.
+            // code (capped by MAX_CONSECUTIVE_CONNECT_FAILURES, which parks
+            // sync via haltSync), but the on-disk UTXO set is fine.
             console.error(
               `\n*** [CONSENSUS-FAILURE] Block ${height} (${hashHex.slice(0, 16)}...) ` +
                 `failed validation ${this.consecutiveFailures} consecutive times${coords}. ***\n` +
@@ -3233,15 +3264,16 @@ export class BlockSync {
    * instance — see the dual-UTXOManager note in the Pattern B fix
    * commit for details.
    *
-   * Multi-block atomicity (Pattern D, post-`9b10550`): if `pendingOps`
-   * is provided, the txindex deletes are APPENDED to it instead of
-   * being written via a standalone `db.batchWrite`.  The caller
-   * (`handleReorgUtxoAndCollect` → `connectBlock`) then funnels the
-   * accumulated ops through `UTXOManager.flushDirty(extraOps)` so the
-   * full reorg (N disconnects + M reconnects + new-tip connect) lands
-   * in a single ClassicLevel batch.  When `pendingOps` is undefined
-   * (e.g. unit tests that exercise this path in isolation), falls
-   * back to the legacy direct-write behaviour for backwards compat.
+   * Multi-block atomicity (Pattern D, post-`9b10550`): the `pendingOps`
+   * parameter is accepted for signature compatibility with the reorg
+   * dispatch, but the disconnect itself appends NOTHING to it — Core's
+   * TxIndex has no CustomRemove override (bitcoin-core/src/index/
+   * base.h:136 default no-op), so there are no disconnect-side txindex
+   * deletes to batch.  The caller (`handleReorgUtxoAndCollect` →
+   * `connectBlock`) funnels the reconnect-side ops it accumulates
+   * through `UTXOManager.flushDirty(extraOps)` so the full reorg
+   * (N disconnects + M reconnects + new-tip connect) lands in a single
+   * ClassicLevel batch.
    */
   private async disconnectBlockUtxo(
     block: Block,
@@ -3509,8 +3541,9 @@ export class BlockSync {
    * `disconnectedTxsOut` array which is populated in OLD-chain
    * disconnect order (newest first), and an optional `pendingOps`
    * buffer which accumulates every disk write the reorg would
-   * otherwise issue piecemeal (txindex deletes, intermediate undo
-   * data, intermediate txindex puts).
+   * otherwise issue piecemeal (intermediate undo data, intermediate
+   * txindex puts; no disconnect-side txindex deletes — Core's TxIndex
+   * has no CustomRemove override, base.h:136).
    *
    * Returns true when the UTXO set has been successfully
    * repositioned at the fork point AND intermediate blocks have
@@ -3711,9 +3744,9 @@ export class BlockSync {
             disconnectedTxsOut.push(tx);
           }
         }
-        // Disconnect UTXO (restore from undo data).  Pattern D:
-        // `pendingOps` collects the txindex deletes so they land in
-        // the same atomic batch as everything else in this reorg.
+        // Disconnect UTXO (restore from undo data).  No txindex
+        // deletes are collected (Core parity: TxIndex keeps entries
+        // for orphaned blocks — no CustomRemove override).
         const ok = await this.disconnectBlockUtxo(
           oldBlock,
           cursorHeight,
@@ -4087,8 +4120,8 @@ export class BlockSync {
     let reorgUtxoFixed = false;
     // Pattern D (multi-block atomicity, post-`9b10550`): collect every
     // disk write the reorg dispatch would otherwise issue piecemeal
-    // (per-block txindex deletes, per-intermediate undo data, per-
-    // intermediate txindex puts) into one buffer.  After the new-tip
+    // (per-intermediate undo data, per-intermediate txindex puts)
+    // into one buffer.  After the new-tip
     // connect succeeds, this buffer rides the same `flushDirty`
     // ClassicLevel batch as the new-tip block-index + chain-state +
     // UTXO writes — so the entire reorg lands atomically and a crash
@@ -4586,8 +4619,8 @@ export class BlockSync {
       //  + chain-state) lands in ONE ClassicLevel batch.
       const extraOps: BatchOperation[] = [];
 
-      // Reorg-side ops first (txindex deletes for disconnected blocks,
-      // intermediate undo + txindex puts).  Order doesn't matter for
+      // Reorg-side ops first (intermediate undo + txindex puts).
+      // Order doesn't matter for
       // correctness — LevelDB batches are atomic — but writing
       // disconnect-side ops first matches Bitcoin Core's ordering in
       // ActivateBestChainStep (DisconnectTip then ConnectTip).

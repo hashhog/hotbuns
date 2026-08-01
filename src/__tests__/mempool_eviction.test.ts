@@ -282,7 +282,7 @@ describe("Mempool eviction — W86 audit", () => {
       const block: Block = {
         header: {
           version: 1,
-          prevHash: Buffer.alloc(32, 0),
+          prevBlock: Buffer.alloc(32, 0),
           merkleRoot: Buffer.alloc(32, 0),
           timestamp: Math.floor(Date.now() / 1000),
           bits: 0x1d00ffff,
@@ -314,7 +314,7 @@ describe("Mempool eviction — W86 audit", () => {
       const block: Block = {
         header: {
           version: 1,
-          prevHash: Buffer.alloc(32, 0),
+          prevBlock: Buffer.alloc(32, 0),
           merkleRoot: Buffer.alloc(32, 0),
           timestamp: Math.floor(Date.now() / 1000),
           bits: 0x1d00ffff,

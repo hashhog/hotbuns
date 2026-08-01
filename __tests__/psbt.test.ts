@@ -35,6 +35,7 @@ import {
   analyzePSBT,
   convertToPSBT,
   decodePSBT,
+  BTC_AMOUNT_SENTINEL,
   PSBTRole,
 } from "../src/wallet/psbt.js";
 import {
@@ -817,7 +818,10 @@ describe("PSBT Decode", () => {
     const decoded = decodePSBT(psbt);
 
     expect(decoded.inputs[0].witness_utxo).toBeDefined();
-    expect(decoded.inputs[0].witness_utxo!.amount).toBe(0.001); // 100000 sats in BTC
+    // Amounts are sentinel-tagged BTC strings (formatBtcAmount) that the RPC
+    // serializer post-processes into raw JSON numbers (Core ValueFromAmount).
+    expect((decoded.inputs[0].witness_utxo!.amount as { toJSON(): string }).toJSON())
+      .toBe(`${BTC_AMOUNT_SENTINEL}0.00100000`); // 100000 sats in BTC
   });
 
   test("decoded PSBT includes partial signatures", () => {
@@ -860,7 +864,8 @@ describe("PSBT Decode", () => {
     expect(decoded.inputs[0].bip32_derivs).toBeDefined();
     expect(decoded.inputs[0].bip32_derivs!.length).toBe(1);
     expect(decoded.inputs[0].bip32_derivs![0].master_fingerprint).toBe("12345678");
-    expect(decoded.inputs[0].bip32_derivs![0].path).toBe("m/84'/0'/0'/0/5");
+    // Core's WriteHDKeypath defaults to the 'h' hardened suffix (no apostrophe).
+    expect(decoded.inputs[0].bip32_derivs![0].path).toBe("m/84h/0h/0h/0/5");
   });
 
   test("decoded PSBT calculates fee", () => {
@@ -868,7 +873,8 @@ describe("PSBT Decode", () => {
 
     const decoded = decodePSBT(psbt);
 
-    expect(decoded.fee).toBe(0.0005); // 50000 sats = 0.0005 BTC
+    expect((decoded.fee as { toJSON(): string }).toJSON())
+      .toBe(`${BTC_AMOUNT_SENTINEL}0.00050000`); // 50000 sats = 0.0005 BTC
   });
 });
 

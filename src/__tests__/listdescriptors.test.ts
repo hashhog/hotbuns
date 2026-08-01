@@ -138,8 +138,11 @@ describe("listdescriptors RPC contract", () => {
     server.start();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     server.stop();
+    // Drain any debounced wallet flush before the next case (same
+    // 250ms-debounce race class as wallet_psbt_rpc).
+    await manager.flushAll();
   });
 
   it("returns wallet_name + empty descriptors before any import", async () => {

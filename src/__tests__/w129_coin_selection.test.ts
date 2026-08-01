@@ -41,6 +41,7 @@ import { fileURLToPath } from "node:url";
 import {
   Wallet,
   COINBASE_MATURITY,
+  COINBASE_SPENDABLE_DEPTH,
   type WalletConfig,
   type WalletUTXO,
   type CoinSelectionResult,
@@ -617,10 +618,13 @@ describe("W129-G23: CoinEligibilityFilter — PARTIAL (narrowed)", () => {
     expect(slice).toMatch(/utxo\.confirmations\s*<\s*1/);
     expect(slice).not.toMatch(/conf_mine|confMine|conf_theirs|confTheirs/);
   });
-  test("PASS: COINBASE_MATURITY = 100 enforced", () => {
+  test("PASS: coinbase maturity enforced (wallet depth >= COINBASE_MATURITY + 1)", () => {
+    // Core parity: the wallet matures a coinbase when GetTxBlocksToMaturity()
+    // == 0, i.e. chain_depth >= COINBASE_MATURITY + 1 (wallet.cpp:3333-3343).
     expect(COINBASE_MATURITY).toBe(100);
+    expect(COINBASE_SPENDABLE_DEPTH).toBe(101);
     const slice = WALLET_SRC.slice(ADV_DEF_OFFSET, GET_INPUT_WEIGHT_OFFSET);
-    expect(slice).toMatch(/isCoinbase\s*&&\s*utxo\.confirmations\s*<\s*COINBASE_MATURITY/);
+    expect(slice).toMatch(/isCoinbase\s*&&\s*utxo\.confirmations\s*<\s*COINBASE_SPENDABLE_DEPTH/);
   });
   test("MISSING: no max_ancestors / max_cluster_count filter", () => {
     const slice = WALLET_SRC.slice(ADV_DEF_OFFSET, GET_INPUT_WEIGHT_OFFSET);
@@ -658,19 +662,20 @@ describe("W129-G25: BnB-skipped-under-SFFO — MISSING (covered by BUG-20)", () 
 // =============================================================================
 // G26 — Preset inputs in walletcreatefundedpsbt — MISSING (BUG-21, P1-API)
 // =============================================================================
-describe("W129-G26: preset inputs — MISSING (BUG-21)", () => {
+describe("W129-G26: preset inputs — FIXED (was BUG-21)", () => {
   test(
-    "BUG-21: walletcreatefundedpsbt rejects non-empty inputs with comment-as-confession",
+    "BUG-21 FIXED: walletcreatefundedpsbt accepts non-empty manual inputs verbatim",
     () => {
-      // Comment at rpc/server.ts:8779 explicitly says "Manual `inputs`
-      // aren't supported yet; pass [] to auto-select from wallet"
-      expect(RPC_SERVER_SRC).toMatch(
+      // The old "Manual `inputs` aren't supported yet" confession is gone;
+      // manual inputs are resolved from the wallet and used verbatim (Core's
+      // add_inputs semantics — no extra coin selection layered on).
+      expect(RPC_SERVER_SRC).not.toMatch(
         /Manual\s+`?inputs`?\s+aren'?t\s+supported\s+yet/i,
       );
-      // Followed by a throw INVALID_PARAMS when inputs.length > 0:
       expect(RPC_SERVER_SRC).toMatch(
-        /inputsParam\.length\s*>\s*0\s*\)\s*\{\s*throw\s+this\.rpcError/,
+        /inputsParam\.length\s*>\s*0\s*\)\s*\{\s*selectedInputs\s*=\s*\[\]/,
       );
+      expect(RPC_SERVER_SRC).toMatch(/wallet\.getUTXOByOutpoint\(inTxid, inVout\)/);
     },
   );
   test("BUG-21: no FetchSelectedInputs / preset_inputs handling", () => {
@@ -806,7 +811,7 @@ describe("W129 behavioural sanity (live coin selection)", () => {
     expect(() => w.selectCoinsAdvanced(1_000_000n, 1)).toThrow();
   });
 
-  test("PASS: mature coinbase included (confirmations >= 100)", () => {
+  test("PASS: mature coinbase included (confirmations >= 101)", () => {
     const w = mkWallet();
     const addr = w.getNewAddress();
     w.addUTXO(
@@ -815,7 +820,7 @@ describe("W129 behavioural sanity (live coin selection)", () => {
         amount: 5_000_000_000n,
         address: addr,
         keyPath: "m/84'/0'/0'/0/0",
-        confirmations: 100,
+        confirmations: 101, // Core wallet maturity: depth >= COINBASE_MATURITY + 1
         isCoinbase: true,
       }),
     );

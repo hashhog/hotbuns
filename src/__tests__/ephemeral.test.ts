@@ -249,7 +249,9 @@ describe("Ephemeral Anchor Policy", () => {
 
       const result = preCheckEphemeralTx(tx, 1000n);
       expect(result.valid).toBe(false);
-      expect(result.error).toContain("0-fee");
+      // Core parity: ephemeral_policy.cpp:27 rejects with reason "dust"
+      // (debug message "tx with dust output must be 0-fee").
+      expect(result.error).toContain("dust");
     });
   });
 
@@ -483,7 +485,8 @@ describe("Ephemeral Anchor Policy", () => {
 
       const result = await mempool.submitPackage([parent, child]);
       expect(result.result).toBe(PackageValidationResult.PCKG_POLICY);
-      expect(result.message).toContain("0-fee");
+      // Core parity: ephemeral_policy.cpp:27 rejects with reason "dust".
+      expect(result.message).toContain("dust");
     });
   });
 

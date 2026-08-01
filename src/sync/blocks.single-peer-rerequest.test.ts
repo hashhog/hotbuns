@@ -24,6 +24,7 @@ import {
   BlockHeader,
   getBlockHash,
   computeMerkleRoot,
+  encodeBip34Height,
 } from "../validation/block.js";
 import { Transaction, getTxId } from "../validation/tx.js";
 import { HeaderSync } from "./headers.js";
@@ -61,16 +62,17 @@ function createMockChainStateManager(activeTip: {
 }
 
 function createCoinbaseTx(height: number, branchTag: number): Transaction {
-  const heightScript = Buffer.alloc(4);
-  heightScript.writeUInt32LE(height);
+  // Canonical BIP-34 height encoding (Core CScript() << nHeight); the
+  // byte-exact prefix check in validateBip34Height rejects the old
+  // non-minimal 3-byte push.
+  const heightScript = encodeBip34Height(height);
   return {
     version: 1,
     inputs: [
       {
         prevOut: { txid: Buffer.alloc(32, 0), vout: 0xffffffff },
         scriptSig: Buffer.concat([
-          Buffer.from([0x03]),
-          heightScript.subarray(0, 3),
+          heightScript,
           Buffer.from([0x01, branchTag & 0xff]),
         ]),
         sequence: 0xffffffff,

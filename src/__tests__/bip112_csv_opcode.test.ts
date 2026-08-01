@@ -232,8 +232,14 @@ describe("G5: tx version < 2 → UNSATISFIED_LOCKTIME", () => {
     expectCSVError(0, CSV_FLAGS, 0, 0xffff, "UNSATISFIED_LOCKTIME");
   });
 
-  test("negative version fails", () => {
-    expectCSVError(5, CSV_FLAGS, -1, 0xffff, "UNSATISFIED_LOCKTIME");
+  test("negative version (-1) is uint32 0xffffffff in Core → version gate passes", () => {
+    // Core's CTransaction::version is uint32_t (primitives/transaction.h:293),
+    // so CheckSequence's `txTo->version < 2` is an UNSIGNED comparison
+    // (interpreter.cpp:1790): a wire version of 0xffffffff — deserialized as
+    // -1 by the signed readInt32LE — is 4294967295 >= 2 and does NOT trigger
+    // UNSATISFIED_LOCKTIME. With a satisfiable operand (5 <= 0xffff) the CSV
+    // then passes. (tx_valid.json vector 165 covers the 0xffffffff case.)
+    expect(runCSV(5, CSV_FLAGS, -1, 0xffff)).toBe(true);
   });
 });
 

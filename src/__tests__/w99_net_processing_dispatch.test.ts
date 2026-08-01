@@ -784,9 +784,9 @@ describe("G30: feefilter sent after verack", () => {
     expect(true).toBe(true);
   });
 
-  test("DEFAULT_MIN_RELAY_FEE_RATE is 1000 sat/kvB", () => {
+  test("DEFAULT_MIN_RELAY_FEE_RATE is 100 sat/kvB (Core v31)", () => {
     const { DEFAULT_MIN_RELAY_FEE_RATE } = require("../p2p/feefilter.js");
-    expect(DEFAULT_MIN_RELAY_FEE_RATE).toBe(1000n);
+    expect(DEFAULT_MIN_RELAY_FEE_RATE).toBe(100n);
   });
 });
 

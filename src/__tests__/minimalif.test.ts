@@ -322,39 +322,53 @@ describe("MINIMALIF - Legacy scripts (no MINIMALIF enforcement)", () => {
   });
 });
 
-describe("MINIMALIF - Witness v0 enforces MINIMALIF unconditionally", () => {
-  test("P2WSH automatically enforces MINIMALIF even if flag not set", () => {
-    // Even without explicitly setting verifyMinimalIf, P2WSH should enforce it
-    const flags: ScriptFlags = {
-      verifyP2SH: true,
-      verifyWitness: true,
-      verifyTaproot: false,
-      verifyStrictEncoding: false,
-      verifyDERSignatures: true,
-      verifyLowS: false,
-      verifyNullDummy: true,
-      verifyNullFail: true,
-      verifyCheckLockTimeVerify: true,
-      verifyCheckSequenceVerify: true,
-      verifyWitnessPubkeyType: true,
-      // verifyMinimalIf NOT set
-    };
+describe("MINIMALIF - Witness v0 enforces MINIMALIF only under the policy flag", () => {
+  // Core parity: for witness v0, MINIMALIF is a STANDARDNESS (policy) rule —
+  // interpreter.cpp enforces it only when SCRIPT_VERIFY_MINIMALIF is set;
+  // unconditional MINIMALIF is consensus only for TAPSCRIPT (BIP 342).
+  // Reference: bitcoin-core/src/script/interpreter.cpp OP_IF/OP_NOTIF case
+  //   (sigversion == SigVersion::TAPSCRIPT || (flags & SCRIPT_VERIFY_MINIMALIF)).
+  const witnessScript = Buffer.from([
+    Opcode.OP_IF,
+    Opcode.OP_TRUE,
+    Opcode.OP_ELSE,
+    Opcode.OP_FALSE,
+    Opcode.OP_ENDIF,
+  ]);
+  const baseFlags: ScriptFlags = {
+    verifyP2SH: true,
+    verifyWitness: true,
+    verifyTaproot: false,
+    verifyStrictEncoding: false,
+    verifyDERSignatures: true,
+    verifyLowS: false,
+    verifyNullDummy: true,
+    verifyNullFail: true,
+    verifyCheckLockTimeVerify: true,
+    verifyCheckSequenceVerify: true,
+    verifyWitnessPubkeyType: true,
+    // verifyMinimalIf NOT set
+  };
 
-    const witnessScript = Buffer.from([
-      Opcode.OP_IF,
-      Opcode.OP_TRUE,
-      Opcode.OP_ELSE,
-      Opcode.OP_FALSE,
-      Opcode.OP_ENDIF,
-    ]);
+  function p2wshWitness() {
     const scriptHash = sha256Hash(witnessScript);
-    const scriptPubKey = makeP2WSH(scriptHash);
+    return {
+      scriptPubKey: makeP2WSH(scriptHash),
+      // Invalid MINIMALIF value
+      witness: [Buffer.from([0x02]), witnessScript] as Buffer[],
+    };
+  }
 
-    // Invalid MINIMALIF value
-    const conditionValue = Buffer.from([0x02]);
-    const witness = [conditionValue, witnessScript];
+  test("P2WSH does NOT enforce MINIMALIF when the flag is not set (policy rule)", () => {
+    const { scriptPubKey, witness } = p2wshWitness();
+    expect(() => {
+      verifyScript(Buffer.alloc(0), scriptPubKey, witness, baseFlags, dummySigHasher);
+    }).not.toThrow();
+  });
 
-    // Should still throw MINIMALIF error because witness v0 enforces it internally
+  test("P2WSH enforces MINIMALIF when verifyMinimalIf is set", () => {
+    const { scriptPubKey, witness } = p2wshWitness();
+    const flags: ScriptFlags = { ...baseFlags, verifyMinimalIf: true };
     expect(() => {
       verifyScript(Buffer.alloc(0), scriptPubKey, witness, flags, dummySigHasher);
     }).toThrow(ScriptError);

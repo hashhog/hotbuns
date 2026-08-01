@@ -10,7 +10,7 @@ import { ChainDB } from "../storage/database.js";
 import { REGTEST } from "../consensus/params.js";
 import { ChainStateManager } from "./state.js";
 import type { Block, BlockHeader } from "../validation/block.js";
-import { getBlockHash } from "../validation/block.js";
+import { getBlockHash, encodeBip34Height } from "../validation/block.js";
 import {
   getTxId,
   SEQUENCE_LOCKTIME_TYPE_FLAG,
@@ -25,10 +25,12 @@ describe("ChainStateManager", () => {
 
   // Helper to create a coinbase transaction
   function createCoinbaseTx(height: number, value: bigint): Transaction {
-    const scriptSig = Buffer.concat([
-      Buffer.from([0x03]), // Push 3 bytes
-      Buffer.alloc(3, height), // Height encoding (simplified)
-    ]);
+    // Canonical BIP-34 height encoding (Core CScript() << nHeight), padded to
+    // the 2-byte coinbase scriptSig minimum.
+    const heightEnc = encodeBip34Height(height);
+    const scriptSig = heightEnc.length < 2
+      ? Buffer.concat([heightEnc, Buffer.from([0x00])])
+      : heightEnc;
 
     return {
       version: 1,
@@ -813,10 +815,10 @@ describe("ChainStateManager", () => {
         // scriptSig.  Using OP_1 avoids the need for a real secp256k1 key/sig
         // while still exercising the full connectBlock consensus path.
         function makeCoinbaseOp1(height: number, value: bigint): Transaction {
-          const scriptSig = Buffer.concat([
-            Buffer.from([0x03]),
-            Buffer.alloc(3, height),
-          ]);
+          const heightEnc = encodeBip34Height(height);
+          const scriptSig = heightEnc.length < 2
+            ? Buffer.concat([heightEnc, Buffer.from([0x00])])
+            : heightEnc;
           return {
             version: 1,
             inputs: [

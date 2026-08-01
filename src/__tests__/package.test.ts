@@ -520,16 +520,17 @@ describe("CPFP (Child-Pays-For-Parent)", () => {
     await setupUTXO(inputTxid, 0, 200000n);
 
     // Create parent with very low fee rate (almost no fee)
-    // Input: 200000, Output: 199990 -> fee = 10 sat
-    // Typical vsize ~68 bytes -> 0.15 sat/vB (below 1 sat/vB minimum)
+    // Input: 200000, Output: 199997 -> fee = 3 sat
+    // Typical vsize ~68 bytes -> 0.044 sat/vB (below the Core v31 0.1 sat/vB
+    // = 100 sat/kvB minimum relay floor)
     const parent = createTestTx(
       [{ txid: inputTxid, vout: 0 }],
-      [{ value: 199990n }]
+      [{ value: 199997n }]
     );
     const parentTxid = getTxId(parent);
 
-    // Parent alone should be rejected: its 0.15 sat/vB is below the static
-    // min-relay floor (1 sat/vB), so addTransaction rejects it with
+    // Parent alone should be rejected: its 0.044 sat/vB is below the static
+    // min-relay floor (0.1 sat/vB), so addTransaction rejects it with
     // "min relay fee not met". (It only becomes admissible inside a CPFP
     // package where the child raises the package fee rate — proven below.)
     const parentResult = await mempool.addTransaction(parent);
@@ -537,9 +538,9 @@ describe("CPFP (Child-Pays-For-Parent)", () => {
     expect(parentResult.error?.toLowerCase()).toMatch(/fee rate|min relay fee not met/);
 
     // Now create child with high fee that pays for both
-    // Child input: 199990 (from parent), output: 195000 -> fee = 4990 sat
-    // Combined: parent fee (10) + child fee (4990) = 5000 sat
-    // Combined vsize: ~136 bytes -> ~36.8 sat/vB (above minimum)
+    // Child input: 199997 (from parent) + 50000, output: 240000 -> fee = 9997 sat
+    // Combined: parent fee (3) + child fee (9997) = 10000 sat
+    // Combined vsize: ~136 bytes -> ~73 sat/vB (above minimum)
     const childInputTxid = Buffer.alloc(32, 0x02);
     await setupUTXO(childInputTxid, 0, 50000n);
 
@@ -548,7 +549,7 @@ describe("CPFP (Child-Pays-For-Parent)", () => {
         { txid: parentTxid, vout: 0 },
         { txid: childInputTxid, vout: 0 },
       ],
-      [{ value: 240000n }] // 199990 + 50000 - 240000 = 9990 fee
+      [{ value: 240000n }] // 199997 + 50000 - 240000 = 9997 fee
     );
 
     // Submit as package
