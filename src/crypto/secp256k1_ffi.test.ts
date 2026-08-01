@@ -542,7 +542,9 @@ describe("performance: FFI vs @noble speedup", () => {
 
     // Bun FFI overhead caps theoretical speedup at ~30-33x; assert >=25x to be safe.
     expect(speedup).toBeGreaterThanOrEqual(25);
-  });
+    // 30s timeout: the 2500-iteration @noble loop alone exceeds the 5s default
+    // on a loaded CI runner (timed out at 8s locally under load).
+  }, 30000);
 
   test("Schnorr verify: FFI >= 25x faster than @noble/curves", () => {
     // NOTE: Same Bun FFI overhead constraint as ECDSA above.
@@ -584,5 +586,6 @@ describe("performance: FFI vs @noble speedup", () => {
 
     // Bun FFI overhead caps theoretical speedup at ~26-30x; assert >=25x to be safe.
     expect(speedup).toBeGreaterThanOrEqual(25);
-  });
+    // 30s timeout: same loaded-runner margin as the ECDSA bench above.
+  }, 30000);
 });
