@@ -33,7 +33,7 @@ const TEST_DATADIR = "/tmp/hotbuns-watchonly-import-test";
 // the dev box: 28601-28610 are held by the phaseb python harnesses and a regtest
 // bitcoind, which made these tests fail with "Failed to start server. Is port
 // 28601 in use?" and masked the real assertion failures underneath.
-let portCounter = 41000 + Math.floor(Math.random() * 20000);
+let portCounter = 23000 + Math.floor(Math.random() * 2000);
 function getTestPort(): number {
   return portCounter++;
 }

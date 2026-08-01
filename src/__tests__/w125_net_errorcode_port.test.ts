@@ -116,10 +116,12 @@ async function rpcRequest(port: number, method: string, params: any[] = []): Pro
 }
 
 // Randomised per-process port band (mirrors the 26682fc watchonly
-// fix): parallel test files each draw from a distinct 2000-port
-// band plus a random offset, so EADDRINUSE collisions cannot
-// happen between concurrently-running test files.
-let portCounter = 28000 + Math.floor(Math.random() * 2000);
+// fix): each test file draws from a distinct band plus a random
+// offset. Every band must stay BELOW the Linux client ephemeral
+// range (ip_local_port_range 32768-60999) — a band inside it can
+// collide with a kernel-assigned fetch() client socket and fail
+// EADDRINUSE (observed on CI: ports 39450, 59180).
+let portCounter = 28000 + Math.floor(Math.random() * 800);
 function getTestPort(): number {
   return portCounter++;
 }

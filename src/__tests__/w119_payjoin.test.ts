@@ -234,7 +234,7 @@ function buildFinalizedPsbt(opts: {
   return psbt;
 }
 
-let portCounter = 40443;
+let portCounter = 29800;
 function getTestPort(): number { return portCounter++; }
 
 describe("W119 BIP-78 PayJoin audit — hotbuns", () => {
