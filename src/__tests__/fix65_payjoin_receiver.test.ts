@@ -213,7 +213,7 @@ function buildOriginalPsbt(opts: {
 
 // Each test gets its own port to avoid collisions when the runner
 // parallelizes.
-let portCounter = 38443;
+let portCounter = 27500;
 function getTestPort(): number { return portCounter++; }
 
 // ---------------------------------------------------------------------------
