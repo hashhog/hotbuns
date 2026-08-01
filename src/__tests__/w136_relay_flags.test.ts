@@ -764,8 +764,8 @@ describe("W136 live behavior: meetsFeeFilter and Poisson timing", () => {
     expect(max).toBeLessThan(1000 * 30);
   });
 
-  test("DEFAULT_MIN_RELAY_FEE_RATE is 1000 sat/kvB", () => {
-    expect(DEFAULT_MIN_RELAY_FEE_RATE).toBe(1000n);
+  test("DEFAULT_MIN_RELAY_FEE_RATE is 100 sat/kvB (Core v31)", () => {
+    expect(DEFAULT_MIN_RELAY_FEE_RATE).toBe(100n);
   });
 
   test("MAX_MONEY matches Core MAX_MONEY = 21M * 1e8", () => {
@@ -792,7 +792,7 @@ describe("W136 live behavior: FeeFilterManager state transitions", () => {
 
   test("setMinFeeRate floors at DEFAULT_MIN_RELAY_FEE_RATE", () => {
     const mgr = new FeeFilterManager(() => {});
-    mgr.setMinFeeRate(100n);  // below 1000 sat/kvB floor
+    mgr.setMinFeeRate(100n);  // at the Core v31 100 sat/kvB floor
     expect(mgr.getFeeRateToAnnounce()).toBe(DEFAULT_MIN_RELAY_FEE_RATE);
   });
 
@@ -814,7 +814,7 @@ describe("W136 live behavior: FeeFilterManager state transitions", () => {
       nextFeeFilterSend: 0,
     };
     mgr.sendInitialFeeFilter(fakePeer);
-    expect(lastRate).toBe(3000n);
+    expect(lastRate as bigint | null).toBe(3000n);
     expect(fakePeer.feeFilterSent).toBe(3000n);
     expect(fakePeer.nextFeeFilterSend).toBeGreaterThan(Date.now());
   });

@@ -381,22 +381,27 @@ describe("W132-G12: ConnectBlock BIP-68 enforcement — PARTIAL (BUG-3 P0-CDIV)"
   });
 
   test(
-    "BUG-3 P0-CDIV: assume-valid fast path SHORT-CIRCUITS before BIP-68 " +
+    "BUG-3 FIXED: no assume-valid fast path short-circuits the BIP-68 " +
       "check — Core's SequenceLocks (validation.cpp:2557) runs " +
       "unconditionally (only signature/script checks gated by fScriptChecks)",
     () => {
-      // Locate the if-assumeValid block.
-      const fastIdx = CONNECT_SRC.indexOf("if (assumeValid) {");
-      expect(fastIdx).toBeGreaterThan(0);
-      const fastReturnIdx = CONNECT_SRC.indexOf("return {", fastIdx);
-      expect(fastReturnIdx).toBeGreaterThan(0);
-      const fastPath = CONNECT_SRC.slice(fastIdx, fastReturnIdx + 200);
-      // BIP-68 / sequence locks should be in this block; they are NOT.
-      expect(fastPath).not.toMatch(/checkSequenceLocks|SequenceLocks/);
-      // But IsFinalTx IS run before the assume-valid block (line 374).
+      // The old `if (assumeValid) { ... early return ... }` fast path (which
+      // skipped the BIP-68 checkSequenceLocks call) was REMOVED for Core
+      // parity — connect_block.ts now runs the full path for every block
+      // and gates ONLY signature verification behind skipScripts.
+      expect(CONNECT_SRC).not.toContain("if (assumeValid) {");
+      // The BIP-68 check must NOT be inside the skipScripts-gated signature
+      // block: it must appear BEFORE the `if (!skipScripts)` region.
+      const csvIdx = CONNECT_SRC.indexOf("checkSequenceLocks(");
+      expect(csvIdx).toBeGreaterThan(0);
+      // Anchor on the code gate (with brace) — the doc comment at the
+      // fast-path-removal note also mentions `if (!skipScripts)` in prose.
+      const skipIdx = CONNECT_SRC.indexOf("if (!skipScripts) {");
+      expect(skipIdx).toBeGreaterThan(csvIdx);
+      // And IsFinalTx still runs unconditionally ahead of both (line ~516).
       const isFinalIdx = CONNECT_SRC.indexOf("isFinalTx(tx, height, lockTimeCutoff)");
       expect(isFinalIdx).toBeGreaterThan(0);
-      expect(isFinalIdx).toBeLessThan(fastIdx);
+      expect(isFinalIdx).toBeLessThan(csvIdx);
     },
   );
 });
@@ -422,23 +427,25 @@ describe("W132-G13: mempool BIP-68 gate — PARTIAL (BUG-4 P1-WIRE)", () => {
 // ===========================================================================
 // G14 — Mempool per-coin MTP (BUG-5: uses tip-MTP for confirmed UTXOs)
 // ===========================================================================
-describe("W132-G14: mempool per-coin MTP — PARTIAL (BUG-5 P0-CDIV mempool)", () => {
+describe("W132-G14: mempool per-coin MTP — FIXED (was BUG-5 P0-CDIV mempool)", () => {
   test(
-    "BUG-5: mempool uses currentMTP (tip MTP) for every confirmed UTXO; " +
-      "Core uses MTP at (coinHeight - 1)",
+    "BUG-5 FIXED: confirmed UTXOs use per-coin MTP at (coinHeight - 1); " +
+      "only mempool parents use the synthetic currentMTP (Core parity)",
     () => {
       // Static evidence: the .map() that builds utxoConfirmations uses
-      // currentMTP for both branches.
+      // per-coin MTP for confirmed UTXOs (Core's CheckSequenceLocksAtTip
+      // indexes mediants[] by coin creation height) and currentMTP only for
+      // unconfirmed mempool parents (synthetic tipHeight+1 convention).
       const mapIdx = MEMPOOL_SRC.indexOf("inputUtxos.map(({ utxo, isMempool: isMp })");
       expect(mapIdx).toBeGreaterThan(0);
-      const region = MEMPOOL_SRC.slice(mapIdx, mapIdx + 600);
-      // Both branches return medianTimePast: currentMTP — there is no
-      // per-coin lookup like headerSync.getMedianTimePast(headerSync.getHeaderByHeight(...)).
+      const region = MEMPOOL_SRC.slice(mapIdx, mapIdx + 1400);
+      // Exactly ONE currentMTP branch — the mempool-parent synthetic entry.
       const occurrences = (region.match(/medianTimePast:\s*currentMTP/g) ?? []).length;
-      expect(occurrences).toBeGreaterThanOrEqual(2);
-      // And there's no per-coin getHeaderByHeight(confirmedUtxo.height - 1)
-      // in the mempool path.
-      expect(region).not.toMatch(/confirmedUtxo\.height\s*-\s*1/);
+      expect(occurrences).toBe(1);
+      // The confirmed-UTXO branch looks up MTP at (coinHeight - 1)...
+      expect(region).toMatch(/confirmedUtxo\.height\s*-\s*1/);
+      // ...and returns the per-coin MTP, not the tip MTP.
+      expect(region).toMatch(/medianTimePast:\s*coinMTP/);
     },
   );
 });
@@ -489,7 +496,7 @@ describe("W132-G18: 5-byte operand support — PRESENT", () => {
   test("source uses scriptNumDecode(..., 5)", () => {
     const csvIdx = INTERP_SRC.indexOf("OP_CHECKSEQUENCEVERIFY: {");
     const region = INTERP_SRC.slice(csvIdx, csvIdx + 1200);
-    expect(region).toMatch(/scriptNumDecode\(\s*stack\[stack\.length\s*-\s*1\]\s*,\s*5\s*\)/);
+    expect(region).toMatch(/scriptNumDecode\(\s*stack\[stack\.length\s*-\s*1\]\s*,\s*5\s*,/);
   });
 });
 
@@ -842,11 +849,15 @@ describe("W132-G40: getblocktemplate.mintime = MTP+1 — PRESENT", () => {
 // G41 — IsFinalTx runs before assume-valid short-circuit — PRESENT
 // ===========================================================================
 describe("W132-G41: IsFinalTx unconditional in connect_block — PRESENT", () => {
-  test("isFinalTx loop is positioned before the assume-valid fast path", () => {
+  test("isFinalTx loop is not gated by the skipScripts fast path", () => {
+    // The old `if (assumeValid) {` fast path was removed; the only remaining
+    // gate is `if (!skipScripts)` (signature verification).  IsFinalTx must
+    // run BEFORE it — Core runs ContextualCheckBlock lock-time rules even
+    // under assumevalid (validation.cpp:4146).
     const isFinalIdx = CONNECT_SRC.indexOf("isFinalTx(tx, height, lockTimeCutoff)");
-    const fastIdx = CONNECT_SRC.indexOf("if (assumeValid) {");
+    const skipIdx = CONNECT_SRC.indexOf("if (!skipScripts) {");
     expect(isFinalIdx).toBeGreaterThan(0);
-    expect(fastIdx).toBeGreaterThan(isFinalIdx);
+    expect(skipIdx).toBeGreaterThan(isFinalIdx);
   });
 });
 

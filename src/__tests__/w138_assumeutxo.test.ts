@@ -868,8 +868,12 @@ describe("W138-G28: startBackgroundValidation has no callers (BUG-17 sister)", (
     // result anywhere outside of snapshot.ts itself.
     expect(CLI_TS).not.toMatch(/SnapshotValidationResult/);
     expect(RPC_SERVER_TS).not.toMatch(/SnapshotValidationResult/);
-    expect(SnapshotValidationResult.SUCCESS).toBe("success");
-    expect(SnapshotValidationResult.HASH_MISMATCH).toBe("hash_mismatch");
+    expect(SnapshotValidationResult.SUCCESS).toBe(
+      "success" as SnapshotValidationResult,
+    );
+    expect(SnapshotValidationResult.HASH_MISMATCH).toBe(
+      "hash_mismatch" as SnapshotValidationResult,
+    );
   });
 });
 

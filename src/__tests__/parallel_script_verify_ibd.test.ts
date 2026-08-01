@@ -34,6 +34,7 @@ import { ChainDB } from "../storage/database.js";
 import { REGTEST, compactToBigInt, getBlockSubsidy, type ConsensusParams } from "../consensus/params.js";
 import {
   computeMerkleRoot,
+  encodeBip34Height,
   getBlockHash,
   type Block,
   type BlockHeader,
@@ -103,14 +104,15 @@ function coinbaseTx(height: number, value?: bigint): Transaction {
   if (value === undefined) {
     value = getBlockSubsidy(height, TEST_PARAMS);
   }
-  // BIP34 height encoding (minimal pushdata)
-  const heightBytes: number[] = [];
-  let h = height;
-  while (h > 0) { heightBytes.push(h & 0xff); h >>= 8; }
-  if (heightBytes.length > 0 && heightBytes[heightBytes.length - 1] & 0x80) {
-    heightBytes.push(0x00);
-  }
-  const scriptSig = Buffer.from([heightBytes.length, ...heightBytes]);
+  // Canonical BIP34 height encoding (Core CScript() << nHeight): heights
+  // 1..16 → OP_N, heights ≥17 → minimal length-prefixed CScriptNum.  The
+  // byte-exact prefix check in validateBip34Height rejects a raw minimal
+  // push for the small heights.
+  const heightEnc = encodeBip34Height(height);
+  // Pad to the 2-byte coinbase scriptSig minimum (consensus/tx_check.cpp:49).
+  const scriptSig = heightEnc.length < 2
+    ? Buffer.concat([heightEnc, Buffer.from([0x00])])
+    : heightEnc;
 
   return {
     version: 1,
@@ -552,10 +554,18 @@ describe("P2-OPT-ROUND-2: parallel script verify in IBD ConnectBlock", () => {
       expect(result.skip).toBe(false);
     });
 
-    test("blocks below assumeValidHeight take the fast path and skip script checks", async () => {
-      // In the regular REGTEST params (which inherits assumeValidHeight=938343 from
-      // MAINNET), all our test blocks are in the fast path and no script checking runs.
-      // This means even a tampered signature would be accepted.
+    test("blocks below assumeValidHeight are STILL script-checked when the AV hash is not in the header index (Core ancestor rule)", async () => {
+      // Core's assumevalid skip is NOT a bare height check: validation.cpp
+      // :2346-2361 requires the configured assumevalid hash to be present in
+      // the block index AND the connected block to be an ancestor of both
+      // the assumevalid block and the best header.  Here the fixture chain
+      // is regtest while REGTEST carries the DEFAULT mainnet assumevalid
+      // hash (block 938343), which is not in the fixture's header index —
+      // Core's `it == m_blockman.m_block_index.end()` branch — so
+      // fScriptChecks stays true and a tampered signature is REJECTED even
+      // though height 102 < assumeValidHeight 938343.  (Pre-fix hotbuns
+      // used a height-only approximation and would have accepted the
+      // tampered block — that was the bug this test used to pin.)
       //
       // We use a separate DB/HeaderSync with standard REGTEST (not TEST_PARAMS).
       const SPENDING_BLOCKS = 1;
@@ -592,7 +602,9 @@ describe("P2-OPT-ROUND-2: parallel script verify in IBD ConnectBlock", () => {
           }),
         };
 
-        // Use standard REGTEST (assumeValidHeight=938343) — all heights below fast-path
+        // Use standard REGTEST (assumeValidHeight=938343) — height is below
+        // the AV height, but the AV hash is not in this chain's header index,
+        // so no fast path fires.
         const bs = new BlockSync(db, REGTEST, hs);
 
         // Connect all blocks up to (not including) spending block
@@ -600,10 +612,9 @@ describe("P2-OPT-ROUND-2: parallel script verify in IBD ConnectBlock", () => {
           await bs.connectBlock(fixture.blocks[i], i + 1);
         }
 
-        // Under standard REGTEST, tampered block is accepted because height < 938343
-        // means the fast path fires — no script checking at all.
+        // Scripts are checked (Core ancestor rule) → tampered block rejected.
         const ok = await bs.connectBlock(tampered, spendHeight);
-        expect(ok).toBe(true);
+        expect(ok).toBe(false);
 
         await bs.stop();
       } finally {

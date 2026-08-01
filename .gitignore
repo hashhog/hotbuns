@@ -8,3 +8,6 @@ dist/
 # Project-meta audit artifacts live in the meta-repo (audit-archive/).
 audit/
 CORE-PARITY-AUDIT/
+
+# Built bundle (bun build src/index.ts --target bun)
+src/index.js

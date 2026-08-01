@@ -463,11 +463,6 @@ describe("P2WSH CLTV enforcement [W81 fix Bug3]", () => {
     ]);
   }
 
-  const { sha256 } = require("crypto") as typeof import("crypto");
-  function sha256Hash(data: Buffer): Buffer {
-    return Buffer.from(sha256.create ? sha256.create().update(data).digest() : (() => { const h = sha256("sha256"); h.update(data); return h.digest(); })());
-  }
-
   // Use Node.js crypto for sha256
   function computeP2WSH(redeemScript: Buffer): Buffer {
     // OP_0 <32-byte-hash>

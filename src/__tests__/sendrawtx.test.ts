@@ -341,7 +341,11 @@ async function rpcRequest(
 }
 
 // Get a unique port for each test
-let portCounter = 19443;
+// Randomised per-process port band (mirrors the 26682fc watchonly
+// fix): parallel test files each draw from a distinct 2000-port
+// band plus a random offset, so EADDRINUSE collisions cannot
+// happen between concurrently-running test files.
+let portCounter = 26000 + Math.floor(Math.random() * 2000);
 function getTestPort(): number {
   return portCounter++;
 }

@@ -63,7 +63,7 @@ import {
   type PSBT,
 } from "../src/wallet/psbt";
 
-import { privateKeyToPublicKey, hash160 } from "../src/crypto/primitives";
+import { privateKeyToPublicKey, hash160, taggedHash, tweakPublicKey } from "../src/crypto/primitives";
 import { AddressType } from "../src/address/encoding";
 
 const TEST_DATADIR = "/tmp/hotbuns-w111-audit";
@@ -845,16 +845,18 @@ describe("G29-G30: PSBT serialization + signing", () => {
   });
 
   // BUG-3: signPSBTInput does not handle P2TR
-  test("FAIL BUG-3: signPSBTInput() throws 'Unsupported script type' for P2TR scriptPubKey", () => {
+  test("PASS (BUG-3 fixed): signPSBTInput() signs P2TR scriptPubKey (BIP-86 tweak)", () => {
     const privkey = Buffer.from(
       "0000000000000000000000000000000000000000000000000000000000000001",
       "hex"
     );
     const pubkey = privateKeyToPublicKey(privkey, true);
 
-    // P2TR scriptPubKey: OP_1 <32 bytes>
+    // P2TR scriptPubKey: OP_1 <32-byte BIP-86 tweaked output key>
+    // Q = P + H_TapTweak(x(P))*G (no merkle root — key-path-only output).
     const xOnly = pubkey.subarray(1, 33);
-    const scriptPubKey = Buffer.concat([Buffer.from([0x51, 0x20]), xOnly]);
+    const tweaked = tweakPublicKey(xOnly, taggedHash("TapTweak", xOnly));
+    const scriptPubKey = Buffer.concat([Buffer.from([0x51, 0x20]), tweaked]);
 
     const tx = {
       version: 2,
@@ -873,10 +875,20 @@ describe("G29-G30: PSBT serialization + signing", () => {
     const psbt = createPSBT(tx);
     psbt.inputs[0].witnessUtxo = { value: 100000n, scriptPubKey };
 
-    // BUG-3: signPSBTInput does not handle P2TR (OP_1 <32-byte-key>)
-    // It falls through to the else branch and throws "Unsupported script type for signing"
-    expect(() => signPSBTInput(psbt, 0, privkey, pubkey)).toThrow(
-      /Unsupported script type/
+    // BUG-3 FIXED: signPSBTInput handles P2TR (OP_1 <32-byte-key>) — it
+    // applies the BIP-341 even-y negation + TapTweak tweak to the private key
+    // and emits a 64-byte SIGHASH_DEFAULT key-path signature (tapKeySig).
+    signPSBTInput(psbt, 0, privkey, pubkey);
+    expect(psbt.inputs[0].tapKeySig).toBeDefined();
+    expect(psbt.inputs[0].tapKeySig!.length).toBe(64);
+
+    // Defence-in-depth retained: an UNTWEAKED output key (the pre-fix
+    // fixture) is rejected — the wallet key does not own that output.
+    const untweakedScript = Buffer.concat([Buffer.from([0x51, 0x20]), xOnly]);
+    const psbt2 = createPSBT(tx);
+    psbt2.inputs[0].witnessUtxo = { value: 100000n, scriptPubKey: untweakedScript };
+    expect(() => signPSBTInput(psbt2, 0, privkey, pubkey)).toThrow(
+      /P2TR output key/
     );
   });
 

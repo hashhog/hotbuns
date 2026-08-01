@@ -39,7 +39,11 @@ import { BufferReader } from "../wire/serialization.js";
 
 const TEST_DATADIR = "/tmp/hotbuns-walletprocesspsbt-rpc-test";
 
-let portCounter = 29443;
+// Randomised per-process port band (mirrors the 26682fc watchonly
+// fix): parallel test files each draw from a distinct 2000-port
+// band plus a random offset, so EADDRINUSE collisions cannot
+// happen between concurrently-running test files.
+let portCounter = 36000 + Math.floor(Math.random() * 2000);
 function getTestPort(): number {
   return portCounter++;
 }
@@ -132,8 +136,11 @@ describe("walletprocesspsbt RPC", () => {
     server.start();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     server.stop();
+    // Drain any debounced wallet flush before the next case (same
+    // 250ms-debounce race class as wallet_psbt_rpc).
+    await manager.flushAll();
   });
 
   it("updates + signs + finalizes a single wallet-input PSBT, and the sig VERIFIES", async () => {

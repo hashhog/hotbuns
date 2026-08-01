@@ -17,6 +17,7 @@ import {
   serializeBlockHeader,
   getBlockHash,
   computeMerkleRoot,
+  encodeBip34Height,
 } from "../validation/block.js";
 import { Transaction, serializeTx, getTxId } from "../validation/tx.js";
 import { hash256 } from "../crypto/primitives.js";
@@ -73,9 +74,13 @@ function createMockPeerManager(peers: any[] = []): any {
  * Create a valid coinbase transaction (non-segwit, no witness).
  */
 function createCoinbaseTx(height: number, value: bigint = 5000000000n): Transaction {
-  // BIP34 height encoding
-  const heightScript = Buffer.alloc(4);
-  heightScript.writeUInt32LE(height);
+  // Encode height using canonical BIP-34 encoding (Core CScript() << nHeight).
+  // heights 1..16 → OP_N (0x51..0x60), heights ≥17 → length-prefixed CScriptNum.
+  const heightEnc = encodeBip34Height(height);
+  // Pad to minimum 2 bytes if needed (Bitcoin Core consensus/tx_check.cpp:49)
+  const heightScript = heightEnc.length < 2
+    ? Buffer.concat([heightEnc, Buffer.from([0x00])])
+    : heightEnc;
 
   return {
     version: 1,
@@ -85,10 +90,7 @@ function createCoinbaseTx(height: number, value: bigint = 5000000000n): Transact
           txid: Buffer.alloc(32, 0),
           vout: 0xffffffff,
         },
-        scriptSig: Buffer.concat([
-          Buffer.from([0x03]), // Push 3 bytes
-          heightScript.subarray(0, 3),
-        ]),
+        scriptSig: heightScript,
         sequence: 0xffffffff,
         witness: [], // No witness for non-segwit coinbase
       },
@@ -113,9 +115,10 @@ function createCoinbaseTx(height: number, value: bigint = 5000000000n): Transact
 function createValidBlock(
   prevBlock: Buffer,
   timestamp: number,
-  height: number
+  height: number,
+  coinbaseValue: bigint = 5000000000n
 ): Block {
-  const coinbaseTx = createCoinbaseTx(height);
+  const coinbaseTx = createCoinbaseTx(height, coinbaseValue);
 
   // Compute merkle root from txid
   const txid = getTxId(coinbaseTx);
@@ -586,6 +589,56 @@ describe("BlockSync", () => {
     });
   });
 
+  describe("connect-failure circuit breaker", () => {
+    // Regression test for the infinite Missing-UTXO re-request loop: pre-fix,
+    // a deterministic connect failure at a fixed height was discarded and
+    // re-requested FOREVER (275,299 repetitions observed at height 127694)
+    // with no backoff and no give-up. The breaker allows
+    // MAX_CONSECUTIVE_CONNECT_FAILURES (10) retries at one height, then parks
+    // sync via haltSync (RPC stays up) instead of looping.
+    test("halts sync after bounded retries at one height instead of looping forever", async () => {
+      const peer = createMockPeer();
+
+      // Valid PoW + structure, but the coinbase pays 1 sat above the regtest
+      // subsidy → connectBlock fails deterministically with bad-cb-amount
+      // (class: consensus) on every single attempt.
+      const genesis = headerSync.getBestHeader()!;
+      const badBlock = createValidBlock(
+        genesis.hash,
+        genesis.header.timestamp + 600,
+        1,
+        5000000001n
+      );
+      await headerSync.processHeaders([badBlock.header], peer);
+
+      const errorLines: string[] = [];
+      const origError = console.error;
+      console.error = (...args: unknown[]) => {
+        errorLines.push(args.map(String).join(" "));
+      };
+      try {
+        // Feed the same failing body 12 times: attempts 1..9 rewind + retry,
+        // attempt 10 trips the breaker; 11 and 12 must be no-ops (parked).
+        for (let i = 0; i < 12; i++) {
+          await blockSync.handleBlock(peer, badBlock);
+        }
+      } finally {
+        console.error = origError;
+      }
+
+      const retries = errorLines.filter((l) =>
+        l.includes("discarding and re-requesting")
+      );
+      expect(retries.length).toBe(10);
+      expect(
+        errorLines.some(
+          (l) => l.includes("[SYNC-HALTED]") && l.includes("class: consensus")
+        )
+      ).toBe(true);
+      expect((blockSync as any).syncHalted).not.toBeNull();
+    });
+  });
+
   describe("UTXO management", () => {
     test("creates UTXOs for block outputs", async () => {
       const peer = createMockPeer();
@@ -731,7 +784,7 @@ describe("BlockSync", () => {
       expect(entry!.blockHash.equals(getBlockHash(block1.header))).toBe(true);
     });
 
-    test("disconnectBlockUtxo reverts txindex entries for the disconnected block", async () => {
+    test("disconnectBlockUtxo KEEPS txindex entries for the disconnected block (Core parity)", async () => {
       const peer = createMockPeer();
 
       const genesis = txHeaderSync.getBestHeader()!;
@@ -761,11 +814,13 @@ describe("BlockSync", () => {
       );
       expect(result).toBe(true);
 
-      // Post-fix: the txindex entry is gone (mirroring Core's
-      // BaseIndex::BlockDisconnected → CustomRemove).  Pre-fix this
-      // would still resolve, surfacing as the audit's Pattern C
-      // stale-confirmations bug once the read path is exercised.
-      expect(await txDb.getTxIndex(coinbaseTxid)).toBeNull();
+      // Core parity: TxIndex does NOT override CustomRemove — the
+      // BaseIndex default (bitcoin-core/src/index/base.h:136) is a no-op
+      // returning true, so entries for disconnected blocks are KEPT and
+      // getrawtransaction can still resolve a tx from an orphaned block.
+      // Reference: bitcoin-core/src/index/txindex.{h,cpp} — only
+      // CustomAppend is defined; there is no CustomRemove erase.
+      expect(await txDb.getTxIndex(coinbaseTxid)).not.toBeNull();
     });
   });
 
@@ -1307,12 +1362,15 @@ describe("BlockSync mempool refill on reorg (Pattern B)", () => {
 // ── Pattern D multi-block atomicity ──
 // Reference: post-9b10550 single-block atomicity, scope-extended to N
 // disconnect + M reconnect blocks per chain reorg.  A reorg now funnels
-// EVERY disconnect-side and reconnect-side write (txindex deletes,
-// intermediate undo, intermediate txindex puts) plus the new-tip writes
+// EVERY reconnect-side write (intermediate undo, intermediate txindex
+// puts) plus the new-tip writes
 // (undo, txindex, block-index, header, chain-state) plus the UTXO flush
 // into ONE ClassicLevel batch via UTXOManager.flushDirty(extraOps).  A
 // crash mid-reorg either lands the entire batch (post state) or none of
-// it (pre state) — never a partial mix.
+// it (pre state) — never a partial mix.  (Disconnect-side txindex
+// deletes were dropped for Core parity: TxIndex has no CustomRemove
+// override — bitcoin-core/src/index/base.h:136 — so entries for
+// orphaned blocks are kept.)
 //
 // These tests exercise the buffer-accumulation contract at the helper
 // level (driving the full reorg dispatch end-to-end requires real undo
@@ -1350,7 +1408,7 @@ describe("BlockSync reorg multi-block atomicity (Pattern D)", () => {
     await rm(dbPath, { recursive: true, force: true });
   });
 
-  test("disconnectBlockUtxo with pendingOps appends txindex deletes without firing db.batch", async () => {
+  test("disconnectBlockUtxo with pendingOps appends no txindex deletes and fires no batch (Core parity)", async () => {
     // Connect a block so we have undo data on disk + a UTXO entry
     // to disconnect.
     const peer = createMockPeer();
@@ -1366,8 +1424,8 @@ describe("BlockSync reorg multi-block atomicity (Pattern D)", () => {
 
     // Spy on db.batch (the underlying ClassicLevel-backed funnel that
     // every BatchOperation list ultimately rides) and on
-    // db.batchWrite (the fallback path used by the legacy
-    // `deleteTxIndexForBlock` helper).
+    // db.batchWrite (the fallback path a legacy
+    // `deleteTxIndexForBlock` helper would have used).
     const originalBatch = db.batch.bind(db);
     const originalBatchWrite = db.batchWrite.bind(db);
     let batchCalls = 0;
@@ -1382,7 +1440,7 @@ describe("BlockSync reorg multi-block atomicity (Pattern D)", () => {
     };
 
     // Drive the disconnect via the package-private helper, passing a
-    // pendingOps buffer.  Pattern D: ops accumulate, no batch fires.
+    // pendingOps buffer.
     const blockHash = getBlockHash(block1.header);
     const pendingOps: any[] = [];
     try {
@@ -1398,24 +1456,23 @@ describe("BlockSync reorg multi-block atomicity (Pattern D)", () => {
       (db as any).batchWrite = originalBatchWrite;
     }
 
-    // Pattern D contract:
-    //   • At least one txindex-delete op accumulated per tx.
-    //   • No db.batch / db.batchWrite call fired during the helper —
-    //     the caller (handleReorgUtxoAndCollect → connectBlock) is
-    //     responsible for the eventual single atomic flush.
-    expect(pendingOps.length).toBe(block1.transactions.length);
-    expect(pendingOps.every((o) => o.type === "del")).toBe(true);
-    // 0x74 == DBPrefix.TX_INDEX
-    expect(pendingOps.every((o) => o.prefix === 0x74)).toBe(true);
+    // Core parity: TxIndex does NOT override CustomRemove
+    // (bitcoin-core/src/index/base.h:136 default no-op), so the
+    // disconnect appends NO txindex deletes — entries for orphaned
+    // blocks are kept.  And no db.batch / db.batchWrite fires during
+    // the helper — the caller (handleReorgUtxoAndCollect →
+    // connectBlock) is responsible for the eventual single atomic
+    // flush of whatever the reorg does accumulate.
+    expect(pendingOps.length).toBe(0);
     expect(batchCalls).toBe(0);
     expect(batchWriteCalls).toBe(0);
   });
 
-  test("disconnectBlockUtxo without pendingOps falls back to direct batch write (legacy path)", async () => {
-    // Backwards-compat: callers that don't pass pendingOps (the
-    // existing Pattern C0 unit test, e.g.) keep getting the legacy
-    // standalone `deleteTxIndexForBlock` write.  This pins the
-    // fallback so a future refactor doesn't accidentally leak ops.
+  test("disconnectBlockUtxo without pendingOps issues no standalone txindex delete write (Core parity)", async () => {
+    // Pins the same no-delete contract for callers that don't pass
+    // pendingOps (the Pattern C0 unit test, e.g.): Core's TxIndex
+    // keeps entries for disconnected blocks (no CustomRemove
+    // override), so there is no legacy direct-write fallback either.
     const peer = createMockPeer();
     const genesis = headerSync.getBestHeader()!;
     const block1 = createValidBlock(
@@ -1447,9 +1504,8 @@ describe("BlockSync reorg multi-block atomicity (Pattern D)", () => {
       (db as any).batchWrite = originalBatchWrite;
     }
 
-    // Legacy path: exactly one db.batchWrite for the txindex deletes.
-    // (This is the call inside `deleteTxIndexForBlock`.)
-    expect(batchWriteCalls).toBe(1);
+    // No txindex-delete write of any kind on disconnect (Core parity).
+    expect(batchWriteCalls).toBe(0);
   });
 
   test("reorg-depth bound is gated on pruning via reorgDepthCap() (Core parity, unbounded on archive)", async () => {

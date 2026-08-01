@@ -26,7 +26,11 @@ import type { Transaction } from "../validation/tx.js";
 
 const TEST_DATADIR = "/tmp/hotbuns-wallet-psbt-rpc-test";
 
-let portCounter = 28443;
+// Randomised per-process port band (mirrors the 26682fc watchonly
+// fix): parallel test files each draw from a distinct 2000-port
+// band plus a random offset, so EADDRINUSE collisions cannot
+// happen between concurrently-running test files.
+let portCounter = 32000 + Math.floor(Math.random() * 2000);
 function getTestPort(): number {
   return portCounter++;
 }
@@ -156,8 +160,13 @@ describe("wallet/PSBT RPC wiring", () => {
     chainState = out.chainState;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     server.stop();
+    // Drain any debounced wallet flush BEFORE the next test's rm -rf of
+    // TEST_DATADIR: the 250ms-debounce timer firing into the rm window raced
+    // atomicWriteFile (ENOENT on the .tmp rename) and the unhandled rejection
+    // was attributed to whatever test happened to be running (flake).
+    await manager.flushAll();
   });
 
   // ---------------------------------------------------------------------

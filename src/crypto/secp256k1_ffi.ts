@@ -16,7 +16,9 @@
  * lives for the duration of the process. All verify functions use module-level
  * pre-allocated 64-byte output buffers to avoid per-call heap allocation.
  *
- * libsecp256k1 availability: requires /usr/lib/.../libsecp256k1.so.2
+ * libsecp256k1 availability: the loader probes a list of SONAMEs
+ * (libsecp256k1.so.2 / .so.6 / .so.5 / .so.1 / .so.0 / .so) via the
+ * usual linker paths (LD_LIBRARY_PATH, ldconfig); see LIB_CANDIDATES.
  * (libsecp256k1-dev >= 0.4.0, tested with 0.5.0 on Debian 13).
  *
  * @noble/secp256k1 / @noble/curves remain available as fallback for
@@ -29,7 +31,18 @@ import { dlopen, FFIType, ptr } from "bun:ffi";
 // Library path
 // ---------------------------------------------------------------------------
 
-const LIB_PATH = "libsecp256k1.so.2";
+const LIB_CANDIDATES = [
+  // Debian 13 packaging (libsecp256k1-dev >= 0.4.0, tested with 0.5.0).
+  "libsecp256k1.so.2",
+  // SONAMEs shipped by other releases / local builds (e.g.
+  // ~/.local/lib64/libsecp256k1.so.6). Every symbol bound below is part of
+  // the long-stable public API (secp256k1.h), so any of these is safe.
+  "libsecp256k1.so.6",
+  "libsecp256k1.so.5",
+  "libsecp256k1.so.1",
+  "libsecp256k1.so.0",
+  "libsecp256k1.so",
+];
 
 // Context flags from secp256k1.h
 const SECP256K1_CONTEXT_VERIFY = 1;
@@ -120,7 +133,7 @@ let _xonlyPubkeyPtr: number = 0;
 
 function initFFI(): boolean {
   try {
-    const lib = dlopen(LIB_PATH, {
+    const symbolDefs = {
       secp256k1_context_create: {
         args: [FFIType.u32],
         returns: FFIType.u64,
@@ -161,7 +174,22 @@ function initFFI(): boolean {
         args: [FFIType.u64, FFIType.ptr],
         returns: FFIType.i32,
       },
-    });
+    } as const;
+
+    // Probe the candidate SONAMEs in order and use the first that dlopens.
+    let lib: ReturnType<typeof dlopen> | null = null;
+    let lastErr: Error | null = null;
+    for (const candidate of LIB_CANDIDATES) {
+      try {
+        lib = dlopen(candidate, symbolDefs);
+        break;
+      } catch (e) {
+        lastErr = e as Error;
+      }
+    }
+    if (lib === null) {
+      throw lastErr ?? new Error("no libsecp256k1 candidate loadable");
+    }
 
     _syms = lib.symbols as unknown as SymbolTable;
 

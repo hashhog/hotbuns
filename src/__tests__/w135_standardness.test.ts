@@ -317,6 +317,9 @@ describe("W135 — Standardness rules (IsStandardTx)", () => {
 
     test.todo(
       "BUG-2 FIX: tx with summed non-witness sigops > 2500 should reject 'bad-txns-nonstandard-inputs'",
+      () => {
+        throw new Error("not implemented");
+      },
     );
   });
 
@@ -369,6 +372,9 @@ describe("W135 — Standardness rules (IsStandardTx)", () => {
 
     test.todo(
       "BUG-3 FIX: with permitBareMultisig=false, bare multisig n=2 should reject 'bare-multisig'",
+      () => {
+        throw new Error("not implemented");
+      },
     );
   });
 
@@ -413,6 +419,9 @@ describe("W135 — Standardness rules (IsStandardTx)", () => {
 
     test.todo(
       "BUG-5 FIX: with acceptDatacarrier=false / maxDatacarrierBytes=0, all OP_RETURN outputs reject 'datacarrier'",
+      () => {
+        throw new Error("not implemented");
+      },
     );
   });
 

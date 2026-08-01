@@ -4,7 +4,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { RPCServer, RPCServerConfig, RPCServerDeps, RPCErrorCodes } from "./server.js";
-import { REGTEST } from "../consensus/params.js";
+import { REGTEST, compactToBigInt } from "../consensus/params.js";
 import { getBlockHash, serializeBlockHeader, serializeBlock, computeWitnessMerkleRoot, computeMerkleRoot, encodeBip34Height } from "../validation/block.js";
 import { getTxId, getWTxId, serializeTx } from "../validation/tx.js";
 import { OrphanPool } from "../mempool/orphan_pool.js";
@@ -69,6 +69,13 @@ class MockMempool {
 
   getTransaction(txid: Buffer) {
     return this.entries.get(txid.toString("hex")) ?? null;
+  }
+
+  // Required by the verbose getrawmempool / getmempoolancestors /
+  // getmempooldescendants paths (bip125-replaceable field). Mock has no
+  // RBF tracking — report UNKNOWN (RBFTransactionState.UNKNOWN).
+  getRBFOptInState(_txid: Buffer) {
+    return "unknown";
   }
 
   hasTransaction(txid: Buffer) {
@@ -2340,8 +2347,12 @@ describe("RPCServer", () => {
       expect(bip22Result(ConsensusErrorCode.BAD_COINBASE_HEIGHT)).toBe("bad-cb-height");
     });
 
-    it("ConsensusErrorCode.SCRIPT_VERIFY_FLAG_FAILED → 'mandatory-script-verify-flag-failed'", () => {
-      expect(bip22Result(ConsensusErrorCode.SCRIPT_VERIFY_FLAG_FAILED)).toBe("mandatory-script-verify-flag-failed");
+    it("ConsensusErrorCode.SCRIPT_VERIFY_FLAG_FAILED → 'block-script-verify-flag-failed'", () => {
+      // Core parity: the connect-block/submitblock stage canonical string is
+      // "block-script-verify-flag-failed" (validation.cpp:2122/2618), NOT the
+      // BIP-22 spec's "mandatory-script-verify-flag-failed" (which Core does
+      // not emit from this path).
+      expect(bip22Result(ConsensusErrorCode.SCRIPT_VERIFY_FLAG_FAILED)).toBe("block-script-verify-flag-failed");
     });
 
     it("ConsensusErrorCode.DUPLICATE_INPUTS → 'bad-txns-duplicate'", () => {
@@ -2432,19 +2443,27 @@ describe("RPCServer", () => {
       const txid = getTxId(coinbaseTx);
       const correctMerkle = computeMerkleRoot([txid]);
 
-      // Nonces pre-mined to produce a valid PoW hash (< REGTEST.powLimit).
-      // With prevBlock=0x00..00, timestamp=1296688602, bits=REGTEST.powLimitBits:
-      //   valid-merkle block:  nonce=1 → hash 0x4a9b3dad...
-      //   bad-merkle block:    nonce=0 → hash 0x0c345c94...
-      const nonce = opts.badMerkle ? 0 : 1;
-      const header: import("../validation/block.js").BlockHeader = {
-        version: 1,
-        prevBlock: Buffer.alloc(32, 0), // matches MockHeaderSync.getHeader returning an entry
-        merkleRoot: opts.badMerkle ? Buffer.alloc(32, 0xab) : correctMerkle,
-        timestamp: 1296688602,
-        bits: REGTEST.powLimitBits,
-        nonce,
-      };
+      // Mine a nonce producing a valid PoW hash (< REGTEST.powLimit) — the
+      // regtest target is easy, so this finds one within a few iterations.
+      // (Previously hard-coded pre-mined nonces, which silently broke
+      // whenever the header/coinbase bytes changed: version bump, cbHeight
+      // override, etc.)
+      const target = compactToBigInt(REGTEST.powLimitBits);
+      let nonce = -1;
+      let header: import("../validation/block.js").BlockHeader;
+      do {
+        nonce++;
+        header = {
+          version: 4, // BIP-65 contextual nVersion floor (validateBlock)
+          prevBlock: Buffer.alloc(32, 0), // matches MockHeaderSync.getHeader returning an entry
+          merkleRoot: opts.badMerkle ? Buffer.alloc(32, 0xab) : correctMerkle,
+          timestamp: 1296688602,
+          bits: REGTEST.powLimitBits,
+          nonce,
+        };
+        const hash = Buffer.from(getBlockHash(header)).reverse();
+        if (BigInt("0x" + hash.toString("hex")) <= target) break;
+      } while (nonce < 10_000_000);
 
       const block: import("../validation/block.js").Block = {
         header,

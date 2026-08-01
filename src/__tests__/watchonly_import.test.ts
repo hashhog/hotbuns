@@ -161,8 +161,11 @@ describe("watch-only import contract", () => {
     server.start();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     server.stop();
+    // Drain any debounced wallet flush before the next case's WalletManager
+    // starts (same 250ms-debounce race class as wallet_psbt_rpc).
+    await manager.flushAll();
   });
 
   // -----------------------------------------------------------------------

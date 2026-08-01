@@ -92,7 +92,11 @@ function makeDeps(): RPCServerDeps {
 
 // Each test gets its own port to avoid collisions when tests are
 // parallelized by the runner.
-let portCounter = 28443;
+// Randomised per-process port band (mirrors the 26682fc watchonly
+// fix): parallel test files each draw from a distinct 2000-port
+// band plus a random offset, so EADDRINUSE collisions cannot
+// happen between concurrently-running test files.
+let portCounter = 30000 + Math.floor(Math.random() * 2000);
 function getTestPort(): number { return portCounter++; }
 
 // -----------------------------------------------------------------------

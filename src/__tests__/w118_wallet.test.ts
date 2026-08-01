@@ -1161,7 +1161,7 @@ describe("G27: coinbase maturity", () => {
     expect(wallet.getSpendableUTXOs().length).toBe(0);
   });
 
-  test("PASS: mature coinbase (conf=100) IS spendable", () => {
+  test("PASS: mature coinbase (conf=101) IS spendable", () => {
     const wallet = Wallet.create(makeConfig("mainnet"), ABANDON_MNEMONIC);
     const myAddress = wallet.getNewAddress("bech32");
     wallet.addUTXO(
@@ -1171,7 +1171,9 @@ describe("G27: coinbase maturity", () => {
         amount: 50_00000000n,
         address: myAddress,
         keyPath: "m/84'/0'/0'/0/0",
-        confirmations: 100,
+        // Core wallet matures a coinbase at depth >= COINBASE_MATURITY + 1
+        // (GetTxBlocksToMaturity == 0, wallet.cpp:3333-3343).
+        confirmations: 101,
         isCoinbase: true,
       })
     );

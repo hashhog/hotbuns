@@ -530,7 +530,7 @@ export const MAINNET: ConsensusParams = {
   // NODE_P2P_V2 in g_local_services when v2 is on (init.cpp).  With v2 now
   // default-on the advertised bitset is 0xc09 (matching Core v31.99).
   services: ADVERTISED_SERVICES, // 0xc09 when v2 enabled, 0x409 when opted out
-  userAgent: "/hotbuns:0.1.0/",
+  userAgent: "/hotbuns:1.0.0/",
   dnsSeed: [
     "seed.bitcoin.sipa.be",
     "dnsseed.bluematt.me",
