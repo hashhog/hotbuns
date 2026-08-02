@@ -8630,8 +8630,59 @@ export class RPCServer {
       const requiredTarget = this.headerSync.getNextTarget(parentEntry, block.header.timestamp);
       const blockHashReversed = Buffer.from(blockHash).reverse();
       const hashValue = BigInt("0x" + blockHashReversed.toString("hex"));
+
+      // high-hash is CONTEXT-FREE in Core and runs FIRST: CheckBlock ->
+      // CheckBlockHeader -> CheckProofOfWork compares the hash against the
+      // target encoded in the block's OWN nBits (pow.cpp CheckProofOfWorkImpl),
+      // before ContextualCheckBlockHeader ever evaluates bad-diffbits.
+      //
+      // This previously compared against requiredTarget instead, as a stand-in
+      // for the missing bad-diffbits gate ("so a block with bad bits is always
+      // high-hash rather than misleadingly valid"). With the real gate added
+      // just below, that substitution now produces the WRONG reason: a block
+      // failing its own claimed target was reported bad-diffbits where Core
+      // says high-hash (corpus entry diffbits-easier-highhash). Both reject —
+      // no chain-split either way — but the order must match Core to report
+      // the same reason.
+      // Core pow.cpp CheckProofOfWorkImpl rejects on THREE conditions, all
+      // before any contextual check: the decoded target is zero/negative/
+      // overflowed, the target is EASIER than powLimit, or the hash exceeds
+      // the target. The powLimit ceiling is what fires for a block claiming
+      // difficulty below the network minimum — its hash can still satisfy its
+      // own inflated target, so a hash-only comparison misses it.
+      const claimedTarget = compactToBigInt(block.header.bits);
+      const powLimit = compactToBigInt(this.params.powLimitBits);
+      if (claimedTarget === 0n || claimedTarget > powLimit || hashValue > claimedTarget) {
+        return "high-hash";
+      }
       if (hashValue > requiredTarget) {
         return "high-hash";
+      }
+
+      // bad-diffbits (Core ContextualCheckBlockHeader, validation.cpp:4088-4089):
+      //   if (block.nBits != GetNextWorkRequired(pindexPrev, &block, params))
+      //       return state.Invalid(..., "bad-diffbits", ...)
+      //
+      // The high-hash gate above compares the HASH against the required target,
+      // which catches a block claiming easier difficulty only when its hash also
+      // fails the real target. A block whose nBits are wrong but whose hash
+      // still happens to meet the required target slips through, and injectBlock
+      // then stores it as a side-branch answering "inconclusive" — a block Core
+      // rejects outright. Core checks the nBits FIELD for equality, independent
+      // of the hash, so the claimed difficulty can never disagree with the
+      // retarget schedule.
+      //
+      // Found by the full corpus sweep, 2026-08-02 (entries bad-diffbits-direct,
+      // bad-diffbits-sidebranch, diffbits-easier-highhash): Core
+      // reject:bad-diffbits / reject:high-hash vs hotbuns "inconclusive"
+      // (receipts/corpus-sweep-2026-08-02.md). ouroboros and blockbrew had the
+      // same class of gap on their own side-branch paths.
+      //
+      // Uses the SAME requiredTarget already computed above — no second retarget
+      // engine — converted to compact form for the field comparison. Scoped to
+      // the submitblock RPC path; the P2P/connect path is untouched.
+      if (block.header.bits !== bigIntToCompact(requiredTarget)) {
+        return "bad-diffbits";
       }
 
       // BIP-113 / Core ContextualCheckBlockHeader (validation.cpp:4092):
