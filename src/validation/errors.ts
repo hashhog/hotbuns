@@ -221,6 +221,29 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
   if (s.includes("unexpected-witness")) {
     return "unexpected-witness";
   }
+  // First transaction is not a coinbase. Core CheckBlock (validation.cpp:3952)
+  // emits "bad-cb-missing" / "first tx is not coinbase". hotbuns produces
+  // "First transaction is not coinbase" (validation/block.ts:573) and no rule
+  // matched it, so it fell through to the generic "rejected".
+  //
+  // Must precede the "coinbase value" rule below: that one matches on the bare
+  // substring "coinbase", so an error mentioning both would be mislabelled
+  // bad-cb-amount.
+  //
+  // Found by the 2026-08-02 corpus sweep, entry F-coinbase-prevout-nonnull —
+  // a coinbase with a non-null prevout fails IsCoinBase(). SEVEN of ten impls
+  // answered the generic form; only beamchain and rustoshi were correct, so
+  // this is a shared gap. Equivalents: blockbrew 72a5519, ouroboros a8f40ab.
+  //
+  // Decision unchanged (rejected either way): R2 reason-code parity.
+  if (
+    s.includes("bad-cb-missing") ||
+    s.includes("first transaction is not coinbase") ||
+    s.includes("first tx is not coinbase") ||
+    s.includes("no coinbase")
+  ) {
+    return "bad-cb-missing";
+  }
   if (s.includes("coinbase value") || s.includes("bad-cb-amount") || s.includes("subsidy")) {
     return "bad-cb-amount";
   }
