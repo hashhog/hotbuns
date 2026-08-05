@@ -449,6 +449,22 @@ export class BlockSync {
    *  the missing bodies, and NEVER bans the peer. Consumed + reset by the caller. */
   private reorgDeferredMissingBodies: boolean = false;
 
+  /** Sticky record that the most recent processing pass DEFERRED a block
+   *  (fork tip awaiting bridging bodies) rather than rejecting it.
+   *
+   *  `reorgDeferredMissingBodies` above is consumed and cleared inside
+   *  `processOrderedBlocksInner`, so by the time `injectBlock` regains control
+   *  it is already false — the deferral is invisible to the submitblock path.
+   *  That is why a deferred block used to fall through to `return null`
+   *  (= success) with no reason string: connectBlock deliberately records no
+   *  error for a deferral (it is not a failure), and the flag that WOULD have
+   *  explained it was gone.
+   *
+   *  This field survives that clear so `injectBlock` can answer "inconclusive"
+   *  (BIP-22: not fully validated) instead of "rejected". Reset per submission
+   *  alongside `lastConnectError`. */
+  private lastConnectDeferred: boolean = false;
+
   /** Reorg-to-ancestor HALT signal (crash-recovery / reorg-integrity class).
    *  Set by {@link haltSync} when the sync loop detects an IMPOSSIBLE reorg —
    *  the block it keeps being asked to (re)connect at `nextHeightToProcess` is
@@ -1599,6 +1615,9 @@ export class BlockSync {
     // Reset it here, mirroring the per-block reset connectBlock already does
     // for the P2P/connect path.
     this.lastConnectError = "";
+    // Same per-submission scoping for the deferral marker: a deferral from a
+    // previous submitblock must not be reported against this one.
+    this.lastConnectDeferred = false;
 
     let headerEntry = this.headerSync.getHeader(blockHash);
     if (!headerEntry) {
@@ -1696,16 +1715,29 @@ export class BlockSync {
       // so the node looked healthy while silently refusing to advance. See
       // receipts/rustoshi-block-gap-wedge-2026-08-04.md ("class C").
       //
-      // Core's contract: submitblock returns the reject reason verbatim, and
-      // "rejected" specifically when the reason string is EMPTY
-      // (rpc/mining.cpp BIP22ValidationResult). An empty reason is exactly
-      // the state we are in, so "rejected" is the Core-parity answer — not
-      // "inconclusive", which BIP-22 reserves for a block that was not fully
-      // validated (e.g. an orphan).
+      // There are TWO ways to arrive here with no reason string, and they are
+      // not the same answer:
       //
-      // Note this reports the failure without explaining it. Why connectBlock
-      // can fail while leaving lastConnectError empty is a separate defect
-      // and is what made this node opaque for two days.
+      // 1. DEFERRED — connectBlock returned false at the
+      //    `reorgDeferredMissingBodies` guard: a fork tip arrived before its
+      //    bridging bodies, so the competing branch cannot be rebuilt yet. It
+      //    deliberately records NO error because this is not a failure; Core
+      //    does the same, keeping the block on disk and waiting for the path
+      //    bodies (ActivateBestChainStep requires BLOCK_HAVE_DATA on every
+      //    block of the most-work path). The block is valid and may connect
+      //    later. BIP-22 calls this **inconclusive** — not fully validated.
+      //
+      // 2. Genuinely failed with an empty reason. Core's submitblock returns
+      //    the reject reason verbatim and "rejected" precisely when that
+      //    string is EMPTY (rpc/mining.cpp BIP22ValidationResult).
+      //
+      // An earlier version of this fix returned "rejected" for both, which
+      // mislabels a deferral as a consensus rejection — wrong in the more
+      // common direction, since the deferral path is the one that actually
+      // fires on a live reorg.
+      if (this.lastConnectDeferred) {
+        return "inconclusive";
+      }
       return "rejected";
     }
 
@@ -2798,6 +2830,9 @@ export class BlockSync {
         // and the honest peer was banned as "block-mutated" — the reorg wedge.
         if (this.reorgDeferredMissingBodies) {
           this.reorgDeferredMissingBodies = false;
+          // Preserve the fact of the deferral for injectBlock (submitblock),
+          // which regains control after this flag has already been cleared.
+          this.lastConnectDeferred = true;
           console.log(
             `[reorg] fork tip at height ${height} deferred pending bridging bodies; ` +
               `keeping it buffered and re-requesting the bridge (peer NOT punished)`
