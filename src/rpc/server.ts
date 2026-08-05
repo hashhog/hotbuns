@@ -2147,162 +2147,22 @@ export class RPCServer {
       }
     }
 
-    // Last resort: query the local bitcoin-core node for complete fee data.
-    // Bitcoin Core always has undo data (writes rev*.dat for every block).
-    // We only fire this if there are still unresolved inputs — which only
-    // happens for historical blocks where hotbuns' undo data was not stored
-    // during IBD (pre-May-2026 sync).  The call is gated on the well-known
-    // mainnet cookie path so it is a no-op on testnet4 / regtest.
-    const stillUnresolved = unresolvedInputs.some(({ txidHex, vout }) =>
-      !prevoutValues.has(`${txidHex}:${vout}`)
-    );
-    if (stillUnresolved) {
-      await this.tryFillFeesFromCoreOracle(blockhash, block, prevoutValues);
-    }
-
+    // Inputs that remain unresolved here belong to historical blocks whose
+    // undo data hotbuns did not store during IBD (pre-May-2026 sync).
+    //
+    // R3 (CHARTER.md "Oracle independence · proves it is a node, not a
+    // front-end"): this previously queried the local bitcoin-core node to
+    // complete the fee data. Core always has undo data, so the answer looked
+    // right — but it was Core's answer, not hotbuns'. A node that fills its
+    // own gaps from another node is a front-end, which is exactly what R3
+    // forbids.
+    //
+    // Now the gap simply stays a gap: callers see incomplete fee fields for
+    // affected historical blocks rather than borrowed ones. The real fix is
+    // to backfill the missing undo data.
     return prevoutValues;
   }
 
-  /**
-   * Best-effort fee oracle: query the local Bitcoin Core node for fee data
-   * on blocks where hotbuns' own undo data is missing.
-   *
-   * Bitcoin Core always has undo data (rev*.dat written for every block).
-   * For historical blocks processed before hotbuns stored undo data, Core
-   * is the only reliable source.  We call Core's getblock(hash, 2) and
-   * extract per-tx fee values, then synthesise a "txid:vout → amount"
-   * map from (fee + outputs) per tx.
-   *
-   * Implementation: reads the standard cookie from the well-known mainnet
-   * path.  If the cookie is absent or the call fails, silently no-ops so
-   * fees remain missing (correct per Core spec: "omitted if undo data
-   * not available").
-   */
-  private async tryFillFeesFromCoreOracle(
-    blockhash: Buffer,
-    block: Block,
-    prevoutValues: Map<string, bigint>
-  ): Promise<void> {
-    // Standard mainnet bitcoin-core cookie path on maxbox.
-    const CORE_COOKIE_PATH = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie";
-    const CORE_RPC_URL = "http://127.0.0.1:8332";
-
-    let cookieContent: string;
-    try {
-      const cookieFile = Bun.file(CORE_COOKIE_PATH);
-      if (!(await cookieFile.exists())) return;
-      cookieContent = await cookieFile.text();
-    } catch {
-      return;
-    }
-
-    const displayHash = Buffer.from(blockhash).reverse().toString("hex");
-    let coreResp: Record<string, unknown>;
-    try {
-      const resp = await fetch(CORE_RPC_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Basic ${Buffer.from(cookieContent.trim()).toString("base64")}`,
-        },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getblock", params: [displayHash, 2] }),
-        signal: AbortSignal.timeout(30_000),
-      });
-      coreResp = await resp.json() as Record<string, unknown>;
-    } catch {
-      return; // Core unavailable — fees remain missing
-    }
-
-    const result = coreResp["result"] as Record<string, unknown> | null;
-    if (!result || !Array.isArray(result["tx"])) return;
-
-    // For each non-coinbase tx in Core's response, compute prevout values
-    // by working backwards from fee + total outputs.
-    for (const coreTx of result["tx"] as Array<Record<string, unknown>>) {
-      const fee = coreTx["fee"];
-      if (typeof fee !== "number") continue; // coinbase or missing
-
-      const vout = coreTx["vout"] as Array<Record<string, unknown>> | undefined;
-      if (!Array.isArray(vout)) continue;
-
-      // Total output value (satoshis).
-      let totalOut = 0n;
-      for (const output of vout) {
-        const val = output["value"];
-        if (typeof val === "number") {
-          totalOut += BigInt(Math.round(val * 100_000_000));
-        }
-      }
-
-      // fee is totalIn - totalOut (Core's ValueFromAmount in satoshis)
-      const feeSats = BigInt(Math.round(fee * 100_000_000));
-      const totalIn = totalOut + feeSats;
-
-      // Match Core's vin list to hotbuns' block tx by txid.
-      const coreTxid = coreTx["txid"] as string;
-      if (typeof coreTxid !== "string") continue;
-
-      // Find the matching hotbuns tx.
-      const matchingTx = block.transactions.find((tx) => {
-        return Buffer.from(getTxId(tx)).reverse().toString("hex") === coreTxid;
-      });
-      if (!matchingTx || isCoinbase(matchingTx)) continue;
-
-      // Distribute totalIn across inputs proportionally is incorrect —
-      // instead, use Core's vin data which includes the actual prevout
-      // txids/vouts we're looking for.
-      const coreVin = coreTx["vin"] as Array<Record<string, unknown>> | undefined;
-      if (!Array.isArray(coreVin)) continue;
-
-      // For a tx with N inputs: sum of prevout values = totalIn.
-      // We don't know individual prevout values from Core's v2 output
-      // (Core doesn't include prevout values in v2, only in v3).
-      // However, we CAN compute per-tx fee from totalIn - totalOut.
-      // Store totalIn keyed by the tx's first unresolved input's txid:vout
-      // so the fee computation in formatTxForGetBlock can sum correctly.
-      //
-      // Actually: the fee per tx is exactly `fee` from Core.  What
-      // formatTxForGetBlock does is: amtIn (summed from prevoutValues) -
-      // amtOut (summed from tx outputs).  We need amtIn = amtOut + fee.
-      //
-      // Since we have amtOut (from hotbuns tx outputs), we can derive amtIn
-      // = amtOut + feeSats.  But we need to split amtIn across individual
-      // inputs for the prevoutValues map.
-      //
-      // Simplest correct approach: synthesise a SINGLE "virtual prevout"
-      // for the first unresolved input that carries the entire remaining
-      // amount, and zero out all other unresolved inputs.  Since
-      // formatTxForGetBlock only uses prevoutValues to compute amtIn and
-      // then amtIn - amtOut = fee, this produces the correct fee value.
-      let remainingAmtIn = totalOut + feeSats;
-
-      // First, subtract amounts already resolved (intra-block or txindex).
-      for (const input of matchingTx.inputs) {
-        const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
-        const existing = prevoutValues.get(key);
-        if (existing !== undefined) {
-          remainingAmtIn -= existing;
-        }
-      }
-
-      // Now assign remainingAmtIn to the first unresolved input.
-      // All subsequent unresolved inputs get 0 (they are already absent
-      // from the map, which is fine — we'll mark them as 0 via a sentinel).
-      let firstUnresolved = true;
-      for (const input of matchingTx.inputs) {
-        if (isCoinbase(matchingTx)) break;
-        const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
-        if (!prevoutValues.has(key)) {
-          if (firstUnresolved) {
-            prevoutValues.set(key, remainingAmtIn < 0n ? 0n : remainingAmtIn);
-            firstUnresolved = false;
-          } else {
-            prevoutValues.set(key, 0n);
-          }
-        }
-      }
-    }
-  }
 
   /**
    * getblockhash: Returns block hash at height.
@@ -4535,27 +4395,21 @@ export class RPCServer {
           // Build rich prevout map (height + coinbase + amount + scriptPubKey per input).
           let richPrevouts = await this.buildRichPrevoutMap(blockhash, block);
 
-          // If any non-coinbase inputs are still unresolved (no undo data + txindex miss
-          // + UTXO gone), fall back to querying Bitcoin Core directly.
-          // Core always has undo data (rev*.dat) and can supply the prevout info.
-          if (!isCoinbase(tx)) {
-            const hasUnresolved = tx.inputs.some((inp) => {
-              const key = `${inp.prevOut.txid.toString("hex")}:${inp.prevOut.vout}`;
-              return !richPrevouts.has(key);
-            });
-            if (hasUnresolved) {
-              const oraclePrevouts = await this.tryGetRichPrevoutsFromCoreOracle(
-                Buffer.from(txid).reverse().toString("hex"),
-                Buffer.from(blockhash).reverse().toString("hex")
-              );
-              // Merge oracle data into richPrevouts (don't overwrite already-resolved entries).
-              for (const [key, entry] of oraclePrevouts) {
-                if (!richPrevouts.has(key)) {
-                  richPrevouts.set(key, entry);
-                }
-              }
-            }
-          }
+          // Inputs may remain unresolved (no undo data + txindex miss + UTXO
+          // gone) for historical blocks hotbuns synced without storing undo
+          // data.
+          //
+          // R3 (CHARTER.md "Oracle independence · proves it is a node, not a
+          // front-end"): this previously queried Bitcoin Core directly and
+          // merged its prevout data in. Core always has rev*.dat, so the
+          // enrichment looked complete — but the completeness was Core's, not
+          // hotbuns'. Serving another node's data as your own is the exact
+          // front-end behaviour R3 forbids, and it hides the data gap instead
+          // of surfacing it.
+          //
+          // Unresolved inputs now stay unresolved: verbosity=2 returns the
+          // prevout enrichment hotbuns can actually supply. The real fix is
+          // to backfill the missing undo data.
 
           const txObj = this.formatTxForGetRawTxV2(tx, richPrevouts.size > 0 ? richPrevouts : null);
           // Field order mirrors Core rawtransaction.cpp: in_active_chain
@@ -4876,97 +4730,6 @@ export class RPCServer {
     return result;
   }
 
-  /**
-   * Oracle fallback for getrawtransaction verbosity=2 prevout enrichment.
-   *
-   * When hotbuns lacks undo data for a block (IBD before atTipForUndo gate),
-   * query the local Bitcoin Core node for getrawtransaction(txid, 2, blockhash).
-   * Core's v2 response includes per-vin prevout with height, generated, value,
-   * and scriptPubKey — exactly what we need for prevout enrichment.
-   *
-   * Converts Core's response into a UTXOEntry map keyed by "txid_hex:vout".
-   * Returns an empty map (not null) on any failure so callers degrade gracefully.
-   */
-  private async tryGetRichPrevoutsFromCoreOracle(
-    txidDisplay: string,
-    blockhashDisplay: string
-  ): Promise<Map<string, import("../storage/database.js").UTXOEntry>> {
-    type UTXOEntry = import("../storage/database.js").UTXOEntry;
-
-    const CORE_COOKIE_PATH = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie";
-    const CORE_RPC_URL = "http://127.0.0.1:8332";
-    const result = new Map<string, UTXOEntry>();
-
-    let cookieContent: string;
-    try {
-      const cookieFile = Bun.file(CORE_COOKIE_PATH);
-      if (!(await cookieFile.exists())) return result;
-      cookieContent = await cookieFile.text();
-    } catch {
-      return result;
-    }
-
-    let coreResp: Record<string, unknown>;
-    try {
-      const resp = await fetch(CORE_RPC_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Basic ${Buffer.from(cookieContent.trim()).toString("base64")}`,
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "getrawtransaction",
-          params: [txidDisplay, 2, blockhashDisplay],
-        }),
-        signal: AbortSignal.timeout(30_000),
-      });
-      coreResp = await resp.json() as Record<string, unknown>;
-    } catch {
-      return result; // Core unavailable
-    }
-
-    const tx = coreResp["result"] as Record<string, unknown> | null;
-    if (!tx || !Array.isArray(tx["vin"])) return result;
-
-    // Extract per-vin prevout data from Core's response.
-    for (const vin of tx["vin"] as Array<Record<string, unknown>>) {
-      const prevout = vin["prevout"] as Record<string, unknown> | undefined;
-      if (!prevout) continue; // coinbase or missing
-
-      const txid = vin["txid"] as string | undefined;
-      const vout = vin["vout"] as number | undefined;
-      if (typeof txid !== "string" || typeof vout !== "number") continue;
-
-      const height = prevout["height"] as number | undefined;
-      const generated = prevout["generated"] as boolean | undefined;
-      const value = prevout["value"] as number | undefined;
-      const spk = prevout["scriptPubKey"] as Record<string, unknown> | undefined;
-      if (
-        typeof height !== "number" ||
-        typeof generated !== "boolean" ||
-        typeof value !== "number" ||
-        !spk
-      ) continue;
-
-      // Convert display-order txid to wire-order for the key.
-      const txidWire = Buffer.from(txid, "hex").reverse().toString("hex");
-      const key = `${txidWire}:${vout}`;
-
-      // Reconstruct scriptPubKey bytes from hex.
-      const spkHex = spk["hex"] as string | undefined;
-      if (typeof spkHex !== "string") continue;
-      const scriptPubKey = Buffer.from(spkHex, "hex");
-
-      // Convert value (BTC float) to satoshis (bigint).
-      const amount = BigInt(Math.round(value * 100_000_000));
-
-      result.set(key, { height, coinbase: generated, amount, scriptPubKey });
-    }
-
-    return result;
-  }
 
   /**
    * Format a transaction for verbose RPC output with full details.
@@ -15512,13 +15275,18 @@ export class RPCServer {
     const blockData = await this.db.getBlock(blockHashInternal);
     if (!blockData) {
       // Local block storage doesn't have this block (historical IBD gap).
-      // Fall back to Bitcoin Core oracle: it always has undo data + raw
-      // block storage for every block.  We forward the same params to
-      // Core's gettxoutproof and return its CMerkleBlock hex verbatim.
-      const coreResult = await this.forwardGettxoutproofToCore(txidHexList, blockHashHexParam);
-      if (coreResult !== null) return coreResult;
-      // Core gettxoutproof: an unknown block -> -5 RPC_INVALID_ADDRESS_OR_KEY
-      // "Block not found" (was -1 RPC_MISC_ERROR).
+      //
+      // R3 (CHARTER.md "Oracle independence · proves it is a node, not a
+      // front-end"): no production code path may call Bitcoin Core. This
+      // previously forwarded to Core's gettxoutproof and returned its
+      // CMerkleBlock verbatim, which made hotbuns answer questions it cannot
+      // actually answer from its own data. That is precisely the front-end
+      // behaviour R3 forbids.
+      //
+      // Admitting the gap is the correct answer, and it is also Core's own
+      // answer for a block it does not have. The real fix is to backfill the
+      // missing block/undo data so the gap does not exist — not to borrow
+      // someone else's copy.
       throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found");
     }
 
@@ -15549,56 +15317,6 @@ export class RPCServer {
     return Buffer.concat(parts).toString("hex");
   }
 
-  /**
-   * Core oracle fallback for gettxoutproof: used when the local block store
-   * does not have the raw block (historical IBD gap, pre-undo-write sync).
-   *
-   * Calls the local Bitcoin Core node's gettxoutproof with the same params
-   * and returns its CMerkleBlock hex verbatim — byte-identical to Core by
-   * construction.  Returns null if Core is unavailable or the call fails
-   * (caller will surface "Block not found" in that case).
-   */
-  private async forwardGettxoutproofToCore(
-    txidHexList: string[],
-    blockHashHex: string | null
-  ): Promise<string | null> {
-    const CORE_COOKIE_PATH = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie";
-    const CORE_RPC_URL = "http://127.0.0.1:8332";
-
-    let cookieContent: string;
-    try {
-      const cookieFile = Bun.file(CORE_COOKIE_PATH);
-      if (!(await cookieFile.exists())) return null;
-      cookieContent = await cookieFile.text();
-    } catch {
-      return null;
-    }
-
-    // Build params: [txids] or [txids, blockhash].
-    const coreParams: unknown[] = [txidHexList];
-    if (blockHashHex !== null) coreParams.push(blockHashHex);
-
-    let coreResp: Record<string, unknown>;
-    try {
-      const resp = await fetch(CORE_RPC_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Basic ${Buffer.from(cookieContent.trim()).toString("base64")}`,
-        },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "gettxoutproof", params: coreParams }),
-        signal: AbortSignal.timeout(30_000),
-      });
-      coreResp = await resp.json() as Record<string, unknown>;
-    } catch {
-      return null; // Core unavailable
-    }
-
-    if (coreResp["error"]) return null;
-    const result = coreResp["result"];
-    if (typeof result !== "string" || result.length === 0) return null;
-    return result;
-  }
 
   /**
    * verifytxoutproof: Verifies a CMerkleBlock proof and returns matched txids.
