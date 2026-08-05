@@ -1685,6 +1685,28 @@ export class BlockSync {
         // Map other connectBlock failures to BIP-22 strings.
         return bip22FromConnectError(err);
       }
+      // The block was next in line and the tip did NOT advance, but
+      // connectBlock recorded no reason. Falling through to `return null`
+      // here reported SUCCESS for a block that was never connected — the
+      // exact outcome the comment above says must not happen.
+      //
+      // Measured 2026-08-05: hotbuns at 960958, fleet tip 961165,
+      // `submitblock <961059>` returned {"result":null} and the tip stayed at
+      // 960958. Nothing in the response distinguished it from a real accept,
+      // so the node looked healthy while silently refusing to advance. See
+      // receipts/rustoshi-block-gap-wedge-2026-08-04.md ("class C").
+      //
+      // Core's contract: submitblock returns the reject reason verbatim, and
+      // "rejected" specifically when the reason string is EMPTY
+      // (rpc/mining.cpp BIP22ValidationResult). An empty reason is exactly
+      // the state we are in, so "rejected" is the Core-parity answer — not
+      // "inconclusive", which BIP-22 reserves for a block that was not fully
+      // validated (e.g. an orphan).
+      //
+      // Note this reports the failure without explaining it. Why connectBlock
+      // can fail while leaving lastConnectError empty is a separate defect
+      // and is what made this node opaque for two days.
+      return "rejected";
     }
 
     return null; // success
