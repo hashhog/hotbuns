@@ -1950,6 +1950,14 @@ export class RPCServer {
     let amtIn = 0n;
     let amtOut = 0n;
     const haveUndo = !isCb && spentByOutpoint !== null;
+    // haveUndo only says the prevout map EXISTS, not that it is COMPLETE.
+    // The resolver returns a partial map for historical blocks whose undo
+    // data we never stored, and a miss below contributes 0 to amtIn — so
+    // without this flag a single unresolved input yields a silently
+    // UNDERSTATED fee. Core reports `fee` only when it genuinely has undo
+    // data; omitting it is the honest answer. See
+    // receipts/hotbuns-deploy-gate-audit-2026-08-07.md.
+    let allPrevoutsResolved = true;
     const network = this.getNetworkType();
 
     const result: Record<string, unknown> = {
@@ -1980,6 +1988,11 @@ export class RPCServer {
             const prevVal = spentByOutpoint.get(key);
             if (prevVal !== undefined) {
               amtIn += prevVal;
+            } else {
+              // Unknown input value — amtIn is now short by an unknown
+              // amount, so any fee derived from it would be wrong rather
+              // than merely imprecise.
+              allPrevoutsResolved = false;
             }
           }
         }
@@ -2010,7 +2023,9 @@ export class RPCServer {
     };
 
     // fee: only for non-coinbase when undo data available (Core: TxToUniv:521)
-    if (haveUndo) {
+    // and only when EVERY input value was resolved — a partial map makes
+    // amtIn short, which understates the fee instead of omitting it.
+    if (haveUndo && allPrevoutsResolved) {
       const fee = amtIn - amtOut;
       if (fee >= 0n) {
         result.fee = formatBtcAmount(fee);
@@ -4525,6 +4540,10 @@ export class RPCServer {
     let amtIn = 0n;
     let amtOut = 0n;
     const haveUndo = !isCb && richPrevouts !== null;
+    // Same rule as formatTxForGetBlock: the map existing is not the map
+    // being complete. A miss below adds 0 to amtIn, which understates the
+    // fee rather than omitting it.
+    let allPrevoutsResolved = true;
 
     const result: Record<string, unknown> = {
       txid: Buffer.from(txid).reverse().toString("hex"),
@@ -4561,6 +4580,10 @@ export class RPCServer {
                 value: formatBtcAmount(entry.amount),
                 scriptPubKey: buildScriptPubKeyObj(entry.scriptPubKey),
               };
+            } else {
+              // No prevout entry: the per-vin `prevout` object is already
+              // omitted above, and amtIn is short by an unknown amount.
+              allPrevoutsResolved = false;
             }
           }
         }
@@ -4583,8 +4606,9 @@ export class RPCServer {
       }),
     };
 
-    // fee: non-coinbase, undo data available (Core: TxToUniv:521)
-    if (haveUndo) {
+    // fee: non-coinbase, undo data available (Core: TxToUniv:521), and only
+    // when every input value resolved — see the note at allPrevoutsResolved.
+    if (haveUndo && allPrevoutsResolved) {
       const fee = amtIn - amtOut;
       if (fee >= 0n) {
         result.fee = formatBtcAmount(fee);
