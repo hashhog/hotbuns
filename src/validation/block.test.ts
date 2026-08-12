@@ -667,7 +667,9 @@ describe("validateBlock", () => {
 
     const result = validateBlock(block, 1, REGTEST);
     expect(result.valid).toBe(false);
-    expect(result.error).toContain("no transactions");
+    // Core CheckBlock (validation.cpp:3947-3948): empty vtx is a SIZE-LIMITS
+    // failure, token "bad-blk-length".
+    expect(result.error).toBe("bad-blk-length");
   });
 
   test("fails if first tx is not coinbase", () => {
@@ -676,7 +678,8 @@ describe("validateBlock", () => {
 
     const result = validateBlock(block, 1, REGTEST);
     expect(result.valid).toBe(false);
-    expect(result.error).toContain("not coinbase");
+    // Core CheckBlock (validation.cpp:3951-3952): "bad-cb-missing".
+    expect(result.error).toBe("bad-cb-missing");
   });
 
   test("fails if non-first tx is coinbase", () => {
@@ -690,7 +693,8 @@ describe("validateBlock", () => {
 
     const result = validateBlock(block, 1, REGTEST);
     expect(result.valid).toBe(false);
-    expect(result.error).toContain("coinbase but should not");
+    // Core CheckBlock (validation.cpp:3953-3955): "bad-cb-multiple".
+    expect(result.error).toBe("bad-cb-multiple");
   });
 
   test("fails if merkle root mismatch", () => {

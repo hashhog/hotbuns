@@ -218,6 +218,16 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
   if (s.includes("merkle root mismatch") || s.includes("bad-txnmrklroot")) {
     return "bad-txnmrklroot";
   }
+  // Witness reserved value (coinbase input witness stack) is not exactly one
+  // 32-byte item: Core CheckWitnessMalleation (validation.cpp:3883) rejects
+  // with "bad-witness-nonce-size" BEFORE the commitment-hash compare.
+  // checkWitnessMalleation (validation/block.ts) emits the bare token; no rule
+  // matched it, so it collapsed to the generic "rejected" (bwmc corpus entry
+  // C7-reserved-nonce-31-bytes). Placed before the commitment-match rule to
+  // mirror Core's check order.
+  if (s.includes("bad-witness-nonce-size")) {
+    return "bad-witness-nonce-size";
+  }
   if (s.includes("witness commitment") || s.includes("bad-witness-merkle-match")) {
     return "bad-witness-merkle-match";
   }
@@ -251,6 +261,22 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
     s.includes("no coinbase")
   ) {
     return "bad-cb-missing";
+  }
+  // More than one coinbase / coinbase at index > 0. Core CheckBlock
+  // (validation.cpp:3953-3955) rejects with "bad-cb-multiple" ("more than one
+  // coinbase"). validateBlock now emits the bare token; the legacy phrase
+  // "Transaction N is coinbase but should not be" is kept for any older
+  // callers. Previously fell through to the generic "rejected" (bwmc corpus
+  // entries A5-two-coinbases / A6-coinbase-at-index2).
+  //
+  // Must precede the "coinbase value" rule below for the legacy phrase, which
+  // contains the bare word "coinbase".
+  if (
+    s.includes("bad-cb-multiple") ||
+    s.includes("more than one coinbase") ||
+    s.includes("is coinbase but should not be")
+  ) {
+    return "bad-cb-multiple";
   }
   if (s.includes("coinbase value") || s.includes("bad-cb-amount") || s.includes("subsidy")) {
     return "bad-cb-amount";
@@ -316,7 +342,19 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
   if (s.includes("bad-version")) {
     return s.split(":")[0].trim(); // preserve "bad-version(0x00000001)" form
   }
-  if (s.includes("weight") || s.includes("oversize")) {
+  // Size-limits failure. Core CheckBlock (validation.cpp:3947-3948) folds
+  // vtx.empty() into the size-limits check, so an EMPTY block is
+  // "bad-blk-length" ("size limits failed"), not a coinbase reason.
+  // validateBlock now emits the bare token for the empty-block case; the
+  // legacy phrase "Block has no transactions" is kept for any older callers.
+  // Previously the empty-block error fell through to the generic "rejected"
+  // (bwmc corpus entry A2-empty-block).
+  if (
+    s.includes("bad-blk-length") ||
+    s.includes("block has no transactions") ||
+    s.includes("weight") ||
+    s.includes("oversize")
+  ) {
     return "bad-blk-length";
   }
 

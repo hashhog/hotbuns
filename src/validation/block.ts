@@ -562,30 +562,45 @@ export function validateBlock(
   height: number,
   params: ConsensusParams
 ): { valid: boolean; error?: string } {
-  // Block must have at least one transaction
+  // Block must have at least one transaction.
+  // Core CheckBlock (validation.cpp:3947-3948) folds vtx.empty() into the
+  // SIZE-LIMITS check, so an empty block rejects with "bad-blk-length"
+  // ("size limits failed"), NOT a coinbase reason. Emit Core's exact token
+  // (bwmc corpus entry A2-empty-block: hotbuns said generic "rejected").
   if (block.transactions.length === 0) {
-    return { valid: false, error: "Block has no transactions" };
+    return { valid: false, error: "bad-blk-length" };
   }
 
-  // First transaction must be coinbase
+  // First transaction must be coinbase.
+  // Core CheckBlock (validation.cpp:3951-3952): "bad-cb-missing"
+  // ("first tx is not coinbase").
   const coinbaseTx = block.transactions[0];
   if (!isCoinbase(coinbaseTx)) {
-    return { valid: false, error: "First transaction is not coinbase" };
+    return { valid: false, error: "bad-cb-missing" };
+  }
+
+  // No other transaction can be coinbase.
+  // Core CheckBlock (validation.cpp:3953-3955): "bad-cb-multiple"
+  // ("more than one coinbase"). This runs BEFORE the per-tx CheckTransaction
+  // loop (which is where bad-cb-length surfaces), so a two-coinbase block
+  // always answers bad-cb-multiple even if the first coinbase's scriptSig is
+  // also out of range — the cb-length check below must stay AFTER this loop
+  // (bwmc corpus entries A5-two-coinbases / A6-coinbase-at-index2: hotbuns
+  // said generic "rejected").
+  for (let i = 1; i < block.transactions.length; i++) {
+    if (isCoinbase(block.transactions[i])) {
+      return { valid: false, error: "bad-cb-multiple" };
+    }
   }
 
   // Coinbase scriptSig must be 2..100 bytes.
   // Bitcoin Core: consensus/tx_check.cpp CheckTransaction "bad-cb-length"
-  // (COINBASE_SCRIPT_SIZE_MIN=2, COINBASE_SCRIPT_SIZE_MAX=100)
+  // (COINBASE_SCRIPT_SIZE_MIN=2, COINBASE_SCRIPT_SIZE_MAX=100), surfaced
+  // through CheckBlock's CheckTransaction loop (validation.cpp:3959-3967),
+  // which Core runs after the bad-cb-missing / bad-cb-multiple checks above.
   const cbScriptLen = coinbaseTx.inputs[0].scriptSig.length;
   if (cbScriptLen < 2 || cbScriptLen > 100) {
     return { valid: false, error: "bad-cb-length" };
-  }
-
-  // No other transaction can be coinbase
-  for (let i = 1; i < block.transactions.length; i++) {
-    if (isCoinbase(block.transactions[i])) {
-      return { valid: false, error: `Transaction ${i} is coinbase but should not be` };
-    }
   }
 
   // Verify merkle root + CVE-2012-2459 mutation detection.
