@@ -652,7 +652,7 @@ export function validateBlock(
   // "bad-version(0x%08x)".
   const badVersion = (): { valid: false; error: string } => ({
     valid: false,
-    error: `bad-version(0x${block.header.version.toString(16).padStart(8, "0")}): rejected nVersion=0x${block.header.version.toString(16).padStart(8, "0")} block`,
+    error: `bad-version(0x${(block.header.version >>> 0).toString(16).padStart(8, "0")}): rejected nVersion=0x${(block.header.version >>> 0).toString(16).padStart(8, "0")} block`,
   });
   if (height >= params.bip34Height && block.header.version < 2) {
     return badVersion();

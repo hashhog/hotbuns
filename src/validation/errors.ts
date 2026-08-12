@@ -179,8 +179,16 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
 
   if (s === "bad-cb-height") return "bad-cb-height"; // already canonical
   if (s === "bad-cb-length") return "bad-cb-length"; // already canonical
-  if (s === "bad-txns-vin-empty") return "bad-txns-vin-empty";
-  if (s === "bad-txns-vout-empty") return "bad-txns-vout-empty";
+  // validateBlock wraps a tx-level CheckTransaction failure as
+  // "Transaction N: <token>" (validation/block.ts:680), so the canonical token
+  // arrives as a substring, not an exact match. Match as substring so the
+  // empty-vout / empty-vin / dup-inputs blocks emit Core's exact BIP-22 token
+  // instead of collapsing to "rejected" (empty) or the generic "duplicate"
+  // catch-all below (dup-inputs → bad-txns-duplicate, a near-miss). The bare
+  // "bad-txns-duplicate" CVE-2012-2459 merkle-mutation token (block.ts:604)
+  // does NOT contain "bad-txns-inputs-duplicate" so it still routes correctly.
+  if (s.includes("bad-txns-vin-empty")) return "bad-txns-vin-empty";
+  if (s.includes("bad-txns-vout-empty")) return "bad-txns-vout-empty";
   // validateBlock wraps a tx-level CheckTransaction failure as
   // "Transaction N: <token>" (validation/block.ts), so the canonical token
   // arrives as a substring, not an exact match. Match it as a substring so the
@@ -188,9 +196,9 @@ export function bip22Result(code: ConsensusErrorCode | string | null | undefined
   // instead of collapsing to the generic "rejected" fallback.
   if (s.includes("bad-txns-vout-negative")) return "bad-txns-vout-negative";
   if (s.includes("bad-txns-vout-toolarge")) return "bad-txns-vout-toolarge";
-  if (s === "bad-txns-txouttotal-toolarge") return "bad-txns-txouttotal-toolarge";
-  if (s === "bad-txns-inputs-duplicate") return "bad-txns-inputs-duplicate";
-  if (s === "bad-txns-prevout-null") return "bad-txns-prevout-null";
+  if (s.includes("bad-txns-txouttotal-toolarge")) return "bad-txns-txouttotal-toolarge";
+  if (s.includes("bad-txns-inputs-duplicate")) return "bad-txns-inputs-duplicate";
+  if (s.includes("bad-txns-prevout-null")) return "bad-txns-prevout-null";
   if (s === "bad-txns-inputvalues-outofrange") return "bad-txns-inputvalues-outofrange";
   if (s.startsWith("bad-txns-inputvalues-outofrange")) return "bad-txns-inputvalues-outofrange";
   if (s === "bad-txns-accumulated-fee-outofrange") return "bad-txns-accumulated-fee-outofrange";

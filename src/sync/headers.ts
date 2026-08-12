@@ -656,19 +656,19 @@ export class HeaderSync {
     if (height >= this.params.bip34Height && header.version < 2) {
       return {
         valid: false,
-        error: `bad-version(0x${header.version.toString(16).padStart(8, "0")}): rejected nVersion=0x${header.version.toString(16).padStart(8, "0")} block`,
+        error: `bad-version(0x${(header.version >>> 0).toString(16).padStart(8, "0")}): rejected nVersion=0x${(header.version >>> 0).toString(16).padStart(8, "0")} block`,
       };
     }
     if (height >= this.params.bip66Height && header.version < 3) {
       return {
         valid: false,
-        error: `bad-version(0x${header.version.toString(16).padStart(8, "0")}): rejected nVersion=0x${header.version.toString(16).padStart(8, "0")} block`,
+        error: `bad-version(0x${(header.version >>> 0).toString(16).padStart(8, "0")}): rejected nVersion=0x${(header.version >>> 0).toString(16).padStart(8, "0")} block`,
       };
     }
     if (height >= this.params.bip65Height && header.version < 4) {
       return {
         valid: false,
-        error: `bad-version(0x${header.version.toString(16).padStart(8, "0")}): rejected nVersion=0x${header.version.toString(16).padStart(8, "0")} block`,
+        error: `bad-version(0x${(header.version >>> 0).toString(16).padStart(8, "0")}): rejected nVersion=0x${(header.version >>> 0).toString(16).padStart(8, "0")} block`,
       };
     }
 

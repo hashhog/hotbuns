@@ -3809,7 +3809,8 @@ class ChainDB {
       valueEncoding: "buffer",
       cacheSize: COINS_DB_BLOCK_CACHE_BYTES,
       writeBufferSize: 16 * 1024 * 1024,
-      maxOpenFiles: 256
+      maxFileSize: COINS_DB_MAX_FILE_SIZE_BYTES,
+      maxOpenFiles: COINS_DB_MAX_OPEN_FILES
     });
     this.closing = false;
   }
@@ -4186,11 +4187,12 @@ function encodeFileNum(fileNum) {
   buf.writeUInt32LE(fileNum, 0);
   return buf;
 }
-var DEFAULT_MAX_BATCH_SIZE = 1e4, IBD_BATCH_SIZE = 50000, COINS_DB_BLOCK_CACHE_BYTES;
+var DEFAULT_MAX_BATCH_SIZE = 1e4, IBD_BATCH_SIZE = 50000, COINS_DB_BLOCK_CACHE_BYTES, COINS_DB_MAX_FILE_SIZE_BYTES, COINS_DB_MAX_OPEN_FILES = 16384;
 var init_database = __esm(() => {
   init_classic_level();
   init_serialization();
   COINS_DB_BLOCK_CACHE_BYTES = 256 * 1024 * 1024;
+  COINS_DB_MAX_FILE_SIZE_BYTES = 32 * 1024 * 1024;
 });
 
 // node_modules/@noble/hashes/utils.js
@@ -11535,6 +11537,9 @@ function verifyInputSignature(tx, inputIndex, utxo, cache, utxos, taprootCache, 
     if (input.scriptSig.length !== 0) {
       return { valid: false, inputIndex, error: "Taproot input must have empty scriptSig" };
     }
+    if ((scriptVerifyFlags & 512 /* VERIFY_TAPROOT */) === 0) {
+      return { valid: true, inputIndex };
+    }
     if (input.witness.length === 0) {
       return { valid: false, inputIndex, error: "Taproot witness empty" };
     }
@@ -11977,7 +11982,7 @@ function validateBlock(block, height, params) {
   }
   const badVersion = () => ({
     valid: false,
-    error: `bad-version(0x${block.header.version.toString(16).padStart(8, "0")}): rejected nVersion=0x${block.header.version.toString(16).padStart(8, "0")} block`
+    error: `bad-version(0x${(block.header.version >>> 0).toString(16).padStart(8, "0")}): rejected nVersion=0x${(block.header.version >>> 0).toString(16).padStart(8, "0")} block`
   });
   if (height >= params.bip34Height && block.header.version < 2) {
     return badVersion();
@@ -17107,19 +17112,19 @@ function bip22Result(code) {
     return "bad-cb-height";
   if (s === "bad-cb-length")
     return "bad-cb-length";
-  if (s === "bad-txns-vin-empty")
+  if (s.includes("bad-txns-vin-empty"))
     return "bad-txns-vin-empty";
-  if (s === "bad-txns-vout-empty")
+  if (s.includes("bad-txns-vout-empty"))
     return "bad-txns-vout-empty";
   if (s.includes("bad-txns-vout-negative"))
     return "bad-txns-vout-negative";
   if (s.includes("bad-txns-vout-toolarge"))
     return "bad-txns-vout-toolarge";
-  if (s === "bad-txns-txouttotal-toolarge")
+  if (s.includes("bad-txns-txouttotal-toolarge"))
     return "bad-txns-txouttotal-toolarge";
-  if (s === "bad-txns-inputs-duplicate")
+  if (s.includes("bad-txns-inputs-duplicate"))
     return "bad-txns-inputs-duplicate";
-  if (s === "bad-txns-prevout-null")
+  if (s.includes("bad-txns-prevout-null"))
     return "bad-txns-prevout-null";
   if (s === "bad-txns-inputvalues-outofrange")
     return "bad-txns-inputvalues-outofrange";
@@ -17147,6 +17152,9 @@ function bip22Result(code) {
   }
   if (s.includes("unexpected-witness")) {
     return "unexpected-witness";
+  }
+  if (s.includes("bad-cb-missing") || s.includes("first transaction is not coinbase") || s.includes("first tx is not coinbase") || s.includes("no coinbase")) {
+    return "bad-cb-missing";
   }
   if (s.includes("coinbase value") || s.includes("bad-cb-amount") || s.includes("subsidy")) {
     return "bad-cb-amount";
@@ -17740,12 +17748,21 @@ class BlockTemplateBuilder {
 }
 
 // src/consensus/connect_block.ts
-function getScriptFlagsForBlock(params, blockHashHex, verifyP2SH, verifyWitness, verifyTaproot2, verifyDERSig, verifyCLTV, verifyCSV, verifyNullDummy) {
+function getScriptFlagsForBlock(params, blockHashHex, verifyDERSig, verifyCLTV, verifyCSV, verifyNullDummy) {
+  let flags = 1 /* VERIFY_P2SH */ | 2 /* VERIFY_WITNESS */ | 512 /* VERIFY_TAPROOT */;
   const exception = params.scriptFlagExceptions.find((ex) => ex.blockHashHex === blockHashHex);
   if (exception !== undefined) {
-    return exception.flags;
+    flags = exception.flags;
   }
-  return (verifyP2SH ? 1 /* VERIFY_P2SH */ : 0 /* VERIFY_NONE */) | (verifyWitness ? 2 /* VERIFY_WITNESS */ : 0 /* VERIFY_NONE */) | (verifyTaproot2 ? 512 /* VERIFY_TAPROOT */ : 0 /* VERIFY_NONE */) | (verifyDERSig ? 8 /* VERIFY_DERSIG */ : 0 /* VERIFY_NONE */) | (verifyCLTV ? 32 /* VERIFY_CHECKLOCKTIMEVERIFY */ : 0 /* VERIFY_NONE */) | (verifyCSV ? 64 /* VERIFY_CHECKSEQUENCEVERIFY */ : 0 /* VERIFY_NONE */) | (verifyNullDummy ? 16 /* VERIFY_NULLDUMMY */ : 0 /* VERIFY_NONE */);
+  if (verifyDERSig)
+    flags |= 8 /* VERIFY_DERSIG */;
+  if (verifyCLTV)
+    flags |= 32 /* VERIFY_CHECKLOCKTIMEVERIFY */;
+  if (verifyCSV)
+    flags |= 64 /* VERIFY_CHECKSEQUENCEVERIFY */;
+  if (verifyNullDummy)
+    flags |= 16 /* VERIFY_NULLDUMMY */;
+  return flags;
 }
 async function coreConnectBlockChecks(block, height, utxoManager, params, opts = {}) {
   const {
@@ -17753,9 +17770,6 @@ async function coreConnectBlockChecks(block, height, utxoManager, params, opts =
     prevMTP = 0,
     enforceBIP68 = false,
     scriptThreads = 4,
-    verifyP2SH = height >= params.bip16Height,
-    verifyWitness = height >= params.segwitHeight,
-    verifyTaproot: verifyTaproot2 = height >= params.taprootHeight,
     verifyDERSig = height >= params.bip66Height,
     verifyCLTV = height >= params.bip65Height,
     verifyCSV = height >= params.csvHeight,
@@ -17775,6 +17789,9 @@ async function coreConnectBlockChecks(block, height, utxoManager, params, opts =
       coinbaseOutputValue: 0n
     };
   }
+  const blockScriptFlags = getScriptFlagsForBlock(params, blockHashHexForGate, verifyDERSig, verifyCLTV, verifyCSV, verifyNullDummy);
+  const sigopsP2SH = (blockScriptFlags & 1 /* VERIFY_P2SH */) !== 0;
+  const sigopsWitness = (blockScriptFlags & 2 /* VERIFY_WITNESS */) !== 0;
   if (utxoBestBlockHashHex !== undefined) {
     const prevBlockHexLE = Buffer.from(block.header.prevBlock).reverse().toString("hex");
     const viewBest = utxoBestBlockHashHex.toLowerCase();
@@ -17889,7 +17906,7 @@ async function coreConnectBlockChecks(block, height, utxoManager, params, opts =
         }
       }
       if (!skipScripts) {
-        const scriptFlags = getScriptFlagsForBlock(params, blockHashHexForGate, verifyP2SH, verifyWitness, verifyTaproot2, verifyDERSig, verifyCLTV, verifyCSV, verifyNullDummy);
+        const scriptFlags = blockScriptFlags;
         let scriptResult;
         if (scriptThreads === 1) {
           scriptResult = verifyAllInputsSequential(tx, inputUTXOs, scriptFlags);
@@ -17927,7 +17944,7 @@ async function coreConnectBlockChecks(block, height, utxoManager, params, opts =
         });
       }
     }
-    const txSigOpsCost = getTransactionSigOpCost(tx, prevOutputs, verifyP2SH, verifyWitness);
+    const txSigOpsCost = getTransactionSigOpCost(tx, prevOutputs, sigopsP2SH, sigopsWitness);
     totalSigOpsCost += txSigOpsCost;
     utxoManager.addTransaction(txid, tx, height, isCoinbaseTx);
     let txOutputValue = 0n;
@@ -18146,8 +18163,6 @@ class ChainStateManager {
       prevMTP: computedPrevMTP,
       enforceBIP68: csvActive,
       scriptThreads: 1,
-      verifyP2SH: height >= this.params.bip16Height,
-      verifyWitness: height >= this.params.segwitHeight,
       verifyDERSig: height >= this.params.bip66Height,
       verifyCLTV: height >= this.params.bip65Height,
       verifyCSV: height >= this.params.csvHeight,
@@ -20045,6 +20060,7 @@ function entriesAndTxidsDisjoint(replacementAncestorTxids, directConflictTxids, 
 // src/mempool/mempool.ts
 var MAX_CLUSTER_COUNT = 64;
 var MAX_CLUSTER_SIZE_VBYTES = 101000;
+var MAX_CLUSTER_SIZE_WEIGHT = MAX_CLUSTER_SIZE_VBYTES * WITNESS_SCALE_FACTOR;
 var DUST_RELAY_FEE = 3000;
 var MAX_DUST_OUTPUTS_PER_TX = 1;
 var TX_MIN_STANDARD_VERSION = 1;
@@ -20216,10 +20232,6 @@ function validateInputsStandardness(tx, inputUtxos) {
   }
   return { ok: true };
 }
-var MAX_ANCESTORS = 25;
-var MAX_DESCENDANTS = 25;
-var MAX_ANCESTOR_SIZE = 101000;
-var MAX_DESCENDANT_SIZE = 101000;
 var TRUC_VERSION = 3;
 var TRUC_ANCESTOR_LIMIT = 2;
 var TRUC_MAX_VSIZE = 1e4;
@@ -20461,6 +20473,8 @@ class UnionFind {
 class Mempool {
   entries;
   outpointIndex;
+  wtxidIndex;
+  txidToWtxid;
   mapDeltas;
   maxSize;
   currentSize;
@@ -20483,6 +20497,8 @@ class Mempool {
   constructor(utxo, params, maxSize = DEFAULT_MAX_SIZE, notificationEmitter = null) {
     this.entries = new Map;
     this.outpointIndex = new Map;
+    this.wtxidIndex = new Map;
+    this.txidToWtxid = new Map;
     this.mapDeltas = new Map;
     this.maxSize = maxSize;
     this.currentSize = 0;
@@ -20755,7 +20771,7 @@ class Mempool {
         error: `bad-txns-too-many-sigops: sigop cost ${sigOpCost} exceeds maximum ${MAX_STANDARD_TX_SIGOPS_COST}`
       };
     }
-    const adjWeight = Math.max(weight, sigOpCost * DEFAULT_BYTES_PER_SIGOP);
+    const adjWeight = getSigOpsAdjustedWeight(weight, sigOpCost, DEFAULT_BYTES_PER_SIGOP);
     const vsize = Math.ceil(adjWeight / WITNESS_SCALE_FACTOR);
     {
       const ephemeralPreCheck = preCheckEphemeralTx(tx, fee);
@@ -20897,13 +20913,9 @@ class Mempool {
         evictedTxidSet.add(e.txid.toString("hex"));
       }
     }
-    const clusterResult = this.checkClusterSizeLimit(parentTxids, vsize, evictedTxidSet);
+    const clusterResult = this.checkClusterSizeLimit(parentTxids, adjWeight, evictedTxidSet);
     if (!clusterResult.valid) {
       return { accepted: false, error: clusterResult.error };
-    }
-    const ancestorResult = this.checkAncestorLimits(parentTxids, vsize);
-    if (!ancestorResult.valid) {
-      return { accepted: false, error: ancestorResult.error };
     }
     {
       const inputsStdResult = validateInputsStandardness(tx, inputUtxos);
@@ -21039,6 +21051,7 @@ class Mempool {
       return { accepted: true };
     }
     this.entries.set(txidHex, entry);
+    this.indexWtxid(txidHex, tx);
     this.currentSize += vsize;
     this.currentUsage += estimateEntryUsage(tx, vsize);
     for (const parentTxidHex of parentTxids) {
@@ -21113,6 +21126,7 @@ class Mempool {
       this.outpointIndex.delete(outpointKey2);
     }
     this.entries.delete(txidHex);
+    this.unindexWtxid(txidHex);
     this.currentSize -= entry.vsize;
     this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
     this.clusterCacheDirty = true;
@@ -21142,6 +21156,7 @@ class Mempool {
           this.outpointIndex.delete(outpointKey2);
         }
         this.entries.delete(txidHex);
+        this.unindexWtxid(txidHex);
         this.currentSize -= entry.vsize;
         this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
       }
@@ -21270,6 +21285,7 @@ class Mempool {
         sigOpCost: 0
       };
       this.entries.set(txidHex, entry);
+      this.indexWtxid(txidHex, tx);
       this.currentSize += vsize;
       this.currentUsage += estimateEntryUsage(tx, vsize);
       for (const input of tx.inputs) {
@@ -21290,6 +21306,36 @@ class Mempool {
   }
   hasTransaction(txid) {
     return this.entries.has(txid.toString("hex"));
+  }
+  hasTxidHex(txidHex) {
+    return this.entries.has(txidHex);
+  }
+  hasWtxidHex(wtxidHex) {
+    return this.wtxidIndex.has(wtxidHex);
+  }
+  getTransactionByWtxidHex(wtxidHex) {
+    const txidHex = this.wtxidIndex.get(wtxidHex);
+    if (txidHex === undefined)
+      return null;
+    return this.entries.get(txidHex) ?? null;
+  }
+  indexWtxid(txidHex, tx) {
+    const wtxidHex = getWTxId(tx).toString("hex");
+    const previousWtxid = this.txidToWtxid.get(txidHex);
+    if (previousWtxid !== undefined && previousWtxid !== wtxidHex) {
+      this.wtxidIndex.delete(previousWtxid);
+    }
+    this.wtxidIndex.set(wtxidHex, txidHex);
+    this.txidToWtxid.set(txidHex, wtxidHex);
+  }
+  unindexWtxid(txidHex) {
+    const wtxidHex = this.txidToWtxid.get(txidHex);
+    if (wtxidHex !== undefined) {
+      if (this.wtxidIndex.get(wtxidHex) === txidHex) {
+        this.wtxidIndex.delete(wtxidHex);
+      }
+      this.txidToWtxid.delete(txidHex);
+    }
   }
   getAllTxids() {
     return Array.from(this.entries.keys()).map((hex) => Buffer.from(hex, "hex"));
@@ -21382,42 +21428,6 @@ class Mempool {
       }
     }
     return conflicts;
-  }
-  checkAncestorLimits(parentTxids, newTxVsize) {
-    const { ancestorCount, ancestorSize } = this.calculateAncestorStats(parentTxids, newTxVsize);
-    if (ancestorCount > MAX_ANCESTORS) {
-      return {
-        valid: false,
-        error: `too-long-mempool-chain: ${ancestorCount} ancestors exceeds limit of ${MAX_ANCESTORS}`
-      };
-    }
-    if (ancestorSize > MAX_ANCESTOR_SIZE) {
-      return {
-        valid: false,
-        error: `too-long-mempool-chain: ancestor vsize ${ancestorSize} exceeds limit of ${MAX_ANCESTOR_SIZE} vB`
-      };
-    }
-    const allAncestors = this.getAncestorSet(parentTxids);
-    for (const ancestorTxidHex of allAncestors) {
-      const ancestor = this.entries.get(ancestorTxidHex);
-      if (ancestor) {
-        const newDescendantCount = ancestor.descendantCount + 1;
-        if (newDescendantCount > MAX_DESCENDANTS) {
-          return {
-            valid: false,
-            error: `too-long-mempool-chain: ancestor ${ancestorTxidHex.slice(0, 16)}... would have ${newDescendantCount} descendants (limit ${MAX_DESCENDANTS})`
-          };
-        }
-        const newDescendantSize = ancestor.descendantSize + newTxVsize;
-        if (newDescendantSize > MAX_DESCENDANT_SIZE) {
-          return {
-            valid: false,
-            error: `too-long-mempool-chain: ancestor ${ancestorTxidHex.slice(0, 16)}... descendant vsize would be ${newDescendantSize} (limit ${MAX_DESCENDANT_SIZE} vB)`
-          };
-        }
-      }
-    }
-    return { valid: true };
   }
   checkTRUCPolicy(tx, vsize, parentTxids, conflicts, isReplacement) {
     const isV3 = tx.version === TRUC_VERSION;
@@ -21622,6 +21632,7 @@ class Mempool {
       this.outpointIndex.delete(outpointKey2);
     }
     this.entries.delete(txidHex);
+    this.unindexWtxid(txidHex);
     this.currentSize -= entry.vsize;
     this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
   }
@@ -21785,6 +21796,8 @@ class Mempool {
   clear() {
     this.entries.clear();
     this.outpointIndex.clear();
+    this.wtxidIndex.clear();
+    this.txidToWtxid.clear();
     this.currentSize = 0;
     this.currentUsage = 0;
     this.minFeeRate = DEFAULT_MIN_FEE_RATE;
@@ -21809,7 +21822,10 @@ class Mempool {
   getClusterSize(txidHex) {
     return this.clusters.getSize(txidHex);
   }
-  checkClusterSizeLimit(parentTxids, newTxVsize, excludeTxids) {
+  clusterWeightContribution(entry) {
+    return getSigOpsAdjustedWeight(entry.weight, entry.sigOpCost, DEFAULT_BYTES_PER_SIGOP);
+  }
+  checkClusterSizeLimit(parentTxids, newTxAdjWeight, excludeTxids) {
     const excluded = excludeTxids ?? new Set;
     const clusterRoots = new Set;
     for (const parentTxidHex of parentTxids) {
@@ -21820,7 +21836,7 @@ class Mempool {
       }
     }
     let mergedCount = 1;
-    let mergedVsize = newTxVsize;
+    let mergedWeight = newTxAdjWeight;
     for (const [txidHex, entry] of this.entries) {
       const root = this.clusters.find(txidHex);
       if (!clusterRoots.has(root))
@@ -21828,19 +21844,13 @@ class Mempool {
       if (excluded.has(txidHex))
         continue;
       mergedCount += 1;
-      mergedVsize += entry.vsize;
+      mergedWeight += this.clusterWeightContribution(entry);
     }
     if (mergedCount > MAX_CLUSTER_COUNT) {
-      return {
-        valid: false,
-        error: `too-large-cluster: cluster would exceed maximum count ${MAX_CLUSTER_COUNT} (would be ${mergedCount})`
-      };
+      return { valid: false, error: "too-large-cluster" };
     }
-    if (mergedVsize > MAX_CLUSTER_SIZE_VBYTES) {
-      return {
-        valid: false,
-        error: `too-large-cluster: cluster would exceed maximum vsize ${MAX_CLUSTER_SIZE_VBYTES} vB (would be ${mergedVsize})`
-      };
+    if (mergedWeight > MAX_CLUSTER_SIZE_WEIGHT) {
+      return { valid: false, error: "too-large-cluster" };
     }
     return { valid: true };
   }
@@ -22637,6 +22647,11 @@ class OrphanPool {
   }
   hasByTxid(txid) {
     return this.txidIndex.has(txid.toString("hex"));
+  }
+  hasHex(wtxidHex, txidHex) {
+    if (this.byWtxid.has(wtxidHex))
+      return true;
+    return txidHex !== undefined && this.txidIndex.has(txidHex);
   }
   get(wtxid) {
     return this.byWtxid.get(wtxid.toString("hex"));
@@ -29612,19 +29627,19 @@ class HeaderSync {
     if (height >= this.params.bip34Height && header.version < 2) {
       return {
         valid: false,
-        error: `bad-version(0x${header.version.toString(16).padStart(8, "0")}): rejected nVersion=0x${header.version.toString(16).padStart(8, "0")} block`
+        error: `bad-version(0x${(header.version >>> 0).toString(16).padStart(8, "0")}): rejected nVersion=0x${(header.version >>> 0).toString(16).padStart(8, "0")} block`
       };
     }
     if (height >= this.params.bip66Height && header.version < 3) {
       return {
         valid: false,
-        error: `bad-version(0x${header.version.toString(16).padStart(8, "0")}): rejected nVersion=0x${header.version.toString(16).padStart(8, "0")} block`
+        error: `bad-version(0x${(header.version >>> 0).toString(16).padStart(8, "0")}): rejected nVersion=0x${(header.version >>> 0).toString(16).padStart(8, "0")} block`
       };
     }
     if (height >= this.params.bip65Height && header.version < 4) {
       return {
         valid: false,
-        error: `bad-version(0x${header.version.toString(16).padStart(8, "0")}): rejected nVersion=0x${header.version.toString(16).padStart(8, "0")} block`
+        error: `bad-version(0x${(header.version >>> 0).toString(16).padStart(8, "0")}): rejected nVersion=0x${(header.version >>> 0).toString(16).padStart(8, "0")} block`
       };
     }
     const mtp = this.getMedianTimePast(parent);
@@ -30500,6 +30515,9 @@ var HEADER_DRAIN_POLL_MS = 5000;
 var MAX_GETDATA_ITEMS = 1000;
 var TX_REQUEST_EXPIRY_MS = 60000;
 var MAX_RECENT_REJECTED_TXS = 1e4;
+var MAX_RECENT_CONFIRMED_TXS = 48000;
+var TX_INFLIGHT_SWEEP_INTERVAL_MS = 5000;
+var MAX_TX_INFLIGHT = 50000;
 var MAX_DOWNLOADED_BUFFER = 32;
 var MIN_BLOCKS_TO_KEEP2 = 288;
 var MAX_FORK_DOWNLOAD_DEPTH = 288;
@@ -30529,6 +30547,7 @@ class BlockSync {
   lastConnectError;
   reorgAbortRestoredTip;
   reorgDeferredMissingBodies = false;
+  lastConnectDeferred = false;
   syncHalted = null;
   forkBodiesOnDisk = new Set;
   downloadedBlockPeers;
@@ -30536,6 +30555,9 @@ class BlockSync {
   mempool = null;
   requestedTxInFlight = new Map;
   recentlyRejectedTxs = new Set;
+  recentlyConfirmedTxs = new Set;
+  lastTxInFlightSweep = 0;
+  orphanPool = null;
   pruneManager = null;
   blocksSincePruneCheck = 0;
   filterIndex = null;
@@ -30574,6 +30596,9 @@ class BlockSync {
   }
   setMempool(mempool) {
     this.mempool = mempool;
+  }
+  setOrphanPool(orphanPool) {
+    this.orphanPool = orphanPool;
   }
   setPruneManager(pruneManager) {
     this.pruneManager = pruneManager;
@@ -30682,6 +30707,7 @@ class BlockSync {
       this.registerWithPeerManager(this.peerManager);
     }
     this.stallCheckInterval = setInterval(() => {
+      this.sweepTxRequestsInFlight();
       this.handleStalled();
     }, 1000);
     this.logInterval = setInterval(() => {
@@ -30748,6 +30774,10 @@ class BlockSync {
       if (msg.type === "notfound" && msg.payload?.inventory) {
         const peerKey = `${peer.host}:${peer.port}`;
         for (const inv of msg.payload.inventory) {
+          if (inv.type === 1 /* MSG_TX */ || inv.type === 5 /* MSG_WTX */ || inv.type === 1073741825 /* MSG_WITNESS_TX */) {
+            this.requestedTxInFlight.delete(inv.hash.toString("hex"));
+            continue;
+          }
           if (inv.type === 2 || inv.type === 1073741826) {
             const hashHex = inv.hash.toString("hex");
             const pending = this.state.pendingBlocks.get(hashHex);
@@ -30956,6 +30986,7 @@ class BlockSync {
     const blockHash = getBlockHash(block.header);
     const hashHex = blockHash.toString("hex");
     this.lastConnectError = "";
+    this.lastConnectDeferred = false;
     let headerEntry = this.headerSync.getHeader(blockHash);
     if (!headerEntry) {
       const accepted = await this.headerSync.processHeaders([block.header], null, false);
@@ -30999,6 +31030,10 @@ class BlockSync {
       if (err) {
         return bip22FromConnectError(err);
       }
+      if (this.lastConnectDeferred) {
+        return "inconclusive";
+      }
+      return "rejected";
     }
     return null;
   }
@@ -31033,9 +31068,7 @@ class BlockSync {
         if (!peer.wtxidRelay && inv.type === 5 /* MSG_WTX */)
           continue;
         const hashHex = inv.hash.toString("hex");
-        if (this.mempoolHasInv(inv))
-          continue;
-        if (this.recentlyRejectedTxs.has(hashHex))
+        if (this.alreadyHaveInv(inv, hashHex))
           continue;
         if (this.isTxRequestInFlight(hashHex))
           continue;
@@ -31094,15 +31127,20 @@ class BlockSync {
       return entry ? entry.tx : null;
     }
     if (inv.type === 5 /* MSG_WTX */) {
-      const wtxidHex = inv.hash.toString("hex");
-      for (const txid of this.mempool.getAllTxids()) {
-        const entry = this.mempool.getTransaction(txid);
-        if (entry && getWTxId(entry.tx).toString("hex") === wtxidHex) {
-          return entry.tx;
-        }
-      }
+      const entry = this.mempool.getTransactionByWtxidHex(inv.hash.toString("hex"));
+      return entry ? entry.tx : null;
     }
     return null;
+  }
+  alreadyHaveInv(inv, hashHex) {
+    if (this.orphanPool !== null && this.orphanPool.hasHex(hashHex, hashHex)) {
+      return true;
+    }
+    if (this.recentlyRejectedTxs.has(hashHex))
+      return true;
+    if (this.recentlyConfirmedTxs.has(hashHex))
+      return true;
+    return this.mempoolHasInv(inv);
   }
   isTxRequestInFlight(hashHex) {
     const at = this.requestedTxInFlight.get(hashHex);
@@ -31114,20 +31152,92 @@ class BlockSync {
     }
     return true;
   }
-  markTxRejected(hashHex) {
-    this.requestedTxInFlight.delete(hashHex);
-    if (this.recentlyRejectedTxs.has(hashHex))
+  sweepTxRequestsInFlight(now = Date.now()) {
+    if (now - this.lastTxInFlightSweep < TX_INFLIGHT_SWEEP_INTERVAL_MS)
+      return 0;
+    this.lastTxInFlightSweep = now;
+    let dropped = 0;
+    for (const [hashHex, at] of this.requestedTxInFlight) {
+      if (now - at > TX_REQUEST_EXPIRY_MS) {
+        this.requestedTxInFlight.delete(hashHex);
+        dropped++;
+      }
+    }
+    if (this.requestedTxInFlight.size > MAX_TX_INFLIGHT) {
+      const excess = this.requestedTxInFlight.size - MAX_TX_INFLIGHT;
+      let n = 0;
+      for (const hashHex of this.requestedTxInFlight.keys()) {
+        if (n++ >= excess)
+          break;
+        this.requestedTxInFlight.delete(hashHex);
+        dropped++;
+      }
+    }
+    return dropped;
+  }
+  alreadyHaveTx(txidHex, wtxidHex) {
+    if (this.orphanPool !== null && this.orphanPool.hasHex(wtxidHex, txidHex)) {
+      return true;
+    }
+    if (this.recentlyRejectedTxs.has(wtxidHex) || this.recentlyRejectedTxs.has(txidHex)) {
+      return true;
+    }
+    if (this.recentlyConfirmedTxs.has(wtxidHex) || this.recentlyConfirmedTxs.has(txidHex)) {
+      return true;
+    }
+    return this.mempool !== null && this.mempool.hasTxidHex(txidHex);
+  }
+  onMempoolAcceptedTx(txidHex, wtxidHex) {
+    this.requestedTxInFlight.delete(txidHex);
+    this.requestedTxInFlight.delete(wtxidHex);
+  }
+  markTxsConfirmed(hashes) {
+    for (const { txidHex, wtxidHex } of hashes) {
+      this.requestedTxInFlight.delete(txidHex);
+      this.requestedTxInFlight.delete(wtxidHex);
+      this.addRecentlyConfirmed(txidHex);
+      if (wtxidHex !== txidHex)
+        this.addRecentlyConfirmed(wtxidHex);
+    }
+  }
+  addRecentlyConfirmed(hashHex) {
+    if (this.recentlyConfirmedTxs.has(hashHex))
       return;
-    this.recentlyRejectedTxs.add(hashHex);
-    if (this.recentlyRejectedTxs.size > MAX_RECENT_REJECTED_TXS) {
-      const oldest = this.recentlyRejectedTxs.values().next().value;
-      if (oldest !== undefined)
+    this.recentlyConfirmedTxs.add(hashHex);
+    while (this.recentlyConfirmedTxs.size > MAX_RECENT_CONFIRMED_TXS) {
+      const oldest = this.recentlyConfirmedTxs.values().next().value;
+      if (oldest === undefined)
+        break;
+      this.recentlyConfirmedTxs.delete(oldest);
+    }
+  }
+  onBlockDisconnected() {
+    this.recentlyConfirmedTxs.clear();
+    this.onActiveTipChange();
+  }
+  onActiveTipChange() {
+    this.recentlyRejectedTxs.clear();
+  }
+  markTxRejected(...hashHexes) {
+    for (const hashHex of hashHexes) {
+      this.requestedTxInFlight.delete(hashHex);
+      if (this.recentlyRejectedTxs.has(hashHex))
+        continue;
+      this.recentlyRejectedTxs.add(hashHex);
+      while (this.recentlyRejectedTxs.size > MAX_RECENT_REJECTED_TXS) {
+        const oldest = this.recentlyRejectedTxs.values().next().value;
+        if (oldest === undefined)
+          break;
         this.recentlyRejectedTxs.delete(oldest);
+      }
     }
   }
   clearTxRequestInFlight(...hashHexes) {
     for (const h of hashHexes)
       this.requestedTxInFlight.delete(h);
+  }
+  getTxRequestInFlightCount() {
+    return this.requestedTxInFlight.size;
   }
   sendTxGetData(peer, items) {
     for (let i = 0;i < items.length; i += MAX_GETDATA_ITEMS) {
@@ -31460,6 +31570,7 @@ class BlockSync {
       if (!success) {
         if (this.reorgDeferredMissingBodies) {
           this.reorgDeferredMissingBodies = false;
+          this.lastConnectDeferred = true;
           console.log(`[reorg] fork tip at height ${height} deferred pending bridging bodies; ` + `keeping it buffered and re-requesting the bridge (peer NOT punished)`);
           this.requestBlocks();
           break;
@@ -31871,8 +31982,6 @@ class BlockSync {
         prevMTP: intermPrevMTP,
         enforceBIP68: intermediate.height >= this.params.csvHeight,
         scriptThreads: this.scriptThreads,
-        verifyP2SH: intermediate.height >= this.params.bip16Height,
-        verifyWitness: intermediate.height >= this.params.segwitHeight,
         verifyDERSig: intermediate.height >= this.params.bip66Height,
         verifyCLTV: intermediate.height >= this.params.bip65Height,
         verifyCSV: intermediate.height >= this.params.csvHeight,
@@ -32062,8 +32171,6 @@ class BlockSync {
       prevMTP: blockPrevMTP,
       enforceBIP68,
       scriptThreads: this.scriptThreads,
-      verifyP2SH: height >= this.params.bip16Height,
-      verifyWitness: height >= this.params.segwitHeight,
       verifyDERSig: height >= this.params.bip66Height,
       verifyCLTV: height >= this.params.bip65Height,
       verifyCSV: height >= this.params.csvHeight,
@@ -44248,6 +44355,7 @@ class RPCServer {
     let amtIn = 0n;
     let amtOut = 0n;
     const haveUndo = !isCb && spentByOutpoint !== null;
+    let allPrevoutsResolved = true;
     const network = this.getNetworkType();
     const result = {
       txid: Buffer.from(txid).reverse().toString("hex"),
@@ -44273,6 +44381,8 @@ class RPCServer {
             const prevVal = spentByOutpoint.get(key);
             if (prevVal !== undefined) {
               amtIn += prevVal;
+            } else {
+              allPrevoutsResolved = false;
             }
           }
         }
@@ -44293,7 +44403,7 @@ class RPCServer {
         };
       })
     };
-    if (haveUndo) {
+    if (haveUndo && allPrevoutsResolved) {
       const fee = amtIn - amtOut;
       if (fee >= 0n) {
         result.fee = formatBtcAmount(fee);
@@ -44391,93 +44501,7 @@ class RPCServer {
         prevoutValues.set(key, utxo.amount);
       }
     }
-    const stillUnresolved = unresolvedInputs.some(({ txidHex, vout }) => !prevoutValues.has(`${txidHex}:${vout}`));
-    if (stillUnresolved) {
-      await this.tryFillFeesFromCoreOracle(blockhash, block, prevoutValues);
-    }
     return prevoutValues;
-  }
-  async tryFillFeesFromCoreOracle(blockhash, block, prevoutValues) {
-    const CORE_COOKIE_PATH = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie";
-    const CORE_RPC_URL = "http://127.0.0.1:8332";
-    let cookieContent;
-    try {
-      const cookieFile = Bun.file(CORE_COOKIE_PATH);
-      if (!await cookieFile.exists())
-        return;
-      cookieContent = await cookieFile.text();
-    } catch {
-      return;
-    }
-    const displayHash = Buffer.from(blockhash).reverse().toString("hex");
-    let coreResp;
-    try {
-      const resp = await fetch(CORE_RPC_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Basic ${Buffer.from(cookieContent.trim()).toString("base64")}`
-        },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getblock", params: [displayHash, 2] }),
-        signal: AbortSignal.timeout(30000)
-      });
-      coreResp = await resp.json();
-    } catch {
-      return;
-    }
-    const result = coreResp["result"];
-    if (!result || !Array.isArray(result["tx"]))
-      return;
-    for (const coreTx of result["tx"]) {
-      const fee = coreTx["fee"];
-      if (typeof fee !== "number")
-        continue;
-      const vout = coreTx["vout"];
-      if (!Array.isArray(vout))
-        continue;
-      let totalOut = 0n;
-      for (const output of vout) {
-        const val = output["value"];
-        if (typeof val === "number") {
-          totalOut += BigInt(Math.round(val * 1e8));
-        }
-      }
-      const feeSats = BigInt(Math.round(fee * 1e8));
-      const totalIn = totalOut + feeSats;
-      const coreTxid = coreTx["txid"];
-      if (typeof coreTxid !== "string")
-        continue;
-      const matchingTx = block.transactions.find((tx) => {
-        return Buffer.from(getTxId(tx)).reverse().toString("hex") === coreTxid;
-      });
-      if (!matchingTx || isCoinbase(matchingTx))
-        continue;
-      const coreVin = coreTx["vin"];
-      if (!Array.isArray(coreVin))
-        continue;
-      let remainingAmtIn = totalOut + feeSats;
-      for (const input of matchingTx.inputs) {
-        const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
-        const existing = prevoutValues.get(key);
-        if (existing !== undefined) {
-          remainingAmtIn -= existing;
-        }
-      }
-      let firstUnresolved = true;
-      for (const input of matchingTx.inputs) {
-        if (isCoinbase(matchingTx))
-          break;
-        const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
-        if (!prevoutValues.has(key)) {
-          if (firstUnresolved) {
-            prevoutValues.set(key, remainingAmtIn < 0n ? 0n : remainingAmtIn);
-            firstUnresolved = false;
-          } else {
-            prevoutValues.set(key, 0n);
-          }
-        }
-      }
-    }
   }
   async getBlockHash(params) {
     const [heightParam] = params;
@@ -45110,8 +45134,6 @@ class RPCServer {
       prevMTP,
       enforceBIP68: csvActive,
       scriptThreads: 1,
-      verifyP2SH: height >= this.params.bip16Height,
-      verifyWitness: height >= this.params.segwitHeight,
       verifyDERSig: height >= this.params.bip66Height,
       verifyCLTV: height >= this.params.bip65Height,
       verifyCSV: height >= this.params.csvHeight,
@@ -45600,20 +45622,6 @@ class RPCServer {
         }
         if (verbosityLevel === 2) {
           let richPrevouts = await this.buildRichPrevoutMap(blockhash, block);
-          if (!isCoinbase(tx)) {
-            const hasUnresolved = tx.inputs.some((inp) => {
-              const key = `${inp.prevOut.txid.toString("hex")}:${inp.prevOut.vout}`;
-              return !richPrevouts.has(key);
-            });
-            if (hasUnresolved) {
-              const oraclePrevouts = await this.tryGetRichPrevoutsFromCoreOracle(Buffer.from(txid).reverse().toString("hex"), Buffer.from(blockhash).reverse().toString("hex"));
-              for (const [key, entry] of oraclePrevouts) {
-                if (!richPrevouts.has(key)) {
-                  richPrevouts.set(key, entry);
-                }
-              }
-            }
-          }
           const txObj = this.formatTxForGetRawTxV2(tx, richPrevouts.size > 0 ? richPrevouts : null);
           return {
             ...haveBlockhashArg ? { in_active_chain: inActiveChain } : {},
@@ -45681,6 +45689,7 @@ class RPCServer {
     let amtIn = 0n;
     let amtOut = 0n;
     const haveUndo = !isCb && richPrevouts !== null;
+    let allPrevoutsResolved = true;
     const result = {
       txid: Buffer.from(txid).reverse().toString("hex"),
       hash: Buffer.from(wtxid).reverse().toString("hex"),
@@ -45713,6 +45722,8 @@ class RPCServer {
                 value: formatBtcAmount(entry.amount),
                 scriptPubKey: buildScriptPubKeyObj(entry.scriptPubKey)
               };
+            } else {
+              allPrevoutsResolved = false;
             }
           }
         }
@@ -45732,7 +45743,7 @@ class RPCServer {
         };
       })
     };
-    if (haveUndo) {
+    if (haveUndo && allPrevoutsResolved) {
       const fee = amtIn - amtOut;
       if (fee >= 0n) {
         result.fee = formatBtcAmount(fee);
@@ -45835,67 +45846,6 @@ class RPCServer {
           }
         }
       }
-    }
-    return result;
-  }
-  async tryGetRichPrevoutsFromCoreOracle(txidDisplay, blockhashDisplay) {
-    const CORE_COOKIE_PATH = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie";
-    const CORE_RPC_URL = "http://127.0.0.1:8332";
-    const result = new Map;
-    let cookieContent;
-    try {
-      const cookieFile = Bun.file(CORE_COOKIE_PATH);
-      if (!await cookieFile.exists())
-        return result;
-      cookieContent = await cookieFile.text();
-    } catch {
-      return result;
-    }
-    let coreResp;
-    try {
-      const resp = await fetch(CORE_RPC_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Basic ${Buffer.from(cookieContent.trim()).toString("base64")}`
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "getrawtransaction",
-          params: [txidDisplay, 2, blockhashDisplay]
-        }),
-        signal: AbortSignal.timeout(30000)
-      });
-      coreResp = await resp.json();
-    } catch {
-      return result;
-    }
-    const tx = coreResp["result"];
-    if (!tx || !Array.isArray(tx["vin"]))
-      return result;
-    for (const vin of tx["vin"]) {
-      const prevout = vin["prevout"];
-      if (!prevout)
-        continue;
-      const txid = vin["txid"];
-      const vout = vin["vout"];
-      if (typeof txid !== "string" || typeof vout !== "number")
-        continue;
-      const height = prevout["height"];
-      const generated = prevout["generated"];
-      const value = prevout["value"];
-      const spk = prevout["scriptPubKey"];
-      if (typeof height !== "number" || typeof generated !== "boolean" || typeof value !== "number" || !spk)
-        continue;
-      const txidWire = Buffer.from(txid, "hex").reverse().toString("hex");
-      const key = `${txidWire}:${vout}`;
-      const spkHex = spk["hex"];
-      if (typeof spkHex !== "string")
-        continue;
-      const scriptPubKey = Buffer.from(spkHex, "hex");
-      const amount = BigInt(Math.round(value * 1e8));
-      result.set(key, { height, coinbase: generated, amount, scriptPubKey });
     }
     return result;
   }
@@ -47842,8 +47792,16 @@ class RPCServer {
       const requiredTarget = this.headerSync.getNextTarget(parentEntry, block.header.timestamp);
       const blockHashReversed = Buffer.from(blockHash).reverse();
       const hashValue = BigInt("0x" + blockHashReversed.toString("hex"));
+      const claimedTarget = compactToBigInt(block.header.bits);
+      const powLimit = compactToBigInt(this.params.powLimitBits);
+      if (claimedTarget === 0n || claimedTarget > powLimit || hashValue > claimedTarget) {
+        return "high-hash";
+      }
       if (hashValue > requiredTarget) {
         return "high-hash";
+      }
+      if (block.header.bits !== bigIntToCompact(requiredTarget)) {
+        return "bad-diffbits";
       }
       const mtp = this.headerSync.getMedianTimePast(parentEntry);
       if (block.header.timestamp <= mtp) {
@@ -51777,9 +51735,6 @@ class RPCServer {
     }
     const blockData = await this.db.getBlock(blockHashInternal);
     if (!blockData) {
-      const coreResult = await this.forwardGettxoutproofToCore(txidHexList, blockHashHexParam);
-      if (coreResult !== null)
-        return coreResult;
       throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found");
     }
     const reader = new BufferReader(blockData);
@@ -51800,43 +51755,6 @@ class RPCServer {
     parts.push(w47bEncodeVarInt(flagBytes.length));
     parts.push(flagBytes);
     return Buffer.concat(parts).toString("hex");
-  }
-  async forwardGettxoutproofToCore(txidHexList, blockHashHex) {
-    const CORE_COOKIE_PATH = "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie";
-    const CORE_RPC_URL = "http://127.0.0.1:8332";
-    let cookieContent;
-    try {
-      const cookieFile = Bun.file(CORE_COOKIE_PATH);
-      if (!await cookieFile.exists())
-        return null;
-      cookieContent = await cookieFile.text();
-    } catch {
-      return null;
-    }
-    const coreParams = [txidHexList];
-    if (blockHashHex !== null)
-      coreParams.push(blockHashHex);
-    let coreResp;
-    try {
-      const resp = await fetch(CORE_RPC_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Basic ${Buffer.from(cookieContent.trim()).toString("base64")}`
-        },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "gettxoutproof", params: coreParams }),
-        signal: AbortSignal.timeout(30000)
-      });
-      coreResp = await resp.json();
-    } catch {
-      return null;
-    }
-    if (coreResp["error"])
-      return null;
-    const result = coreResp["result"];
-    if (typeof result !== "string" || result.length === 0)
-      return null;
-    return result;
   }
   async verifyTxOutProof(params) {
     if (typeof params[0] !== "string") {
@@ -53826,6 +53744,7 @@ async function startNode(config) {
     peer.send({ type: "inv", payload: { inventory } });
   });
   const orphanPool = new OrphanPool;
+  blockSync.setOrphanPool(orphanPool);
   const ORPHAN_PROMOTE_MAX_ITER = 64;
   function peerKey(peer) {
     return `${peer.host}:${peer.port}`;
@@ -53835,12 +53754,22 @@ async function startNode(config) {
       return false;
     return err.startsWith("bad-txns-inputs-missingorspent") || err.startsWith("Missing input:");
   }
+  function isAlreadyHaveError(err) {
+    if (typeof err !== "string")
+      return false;
+    return err.startsWith("txn-already-in-mempool") || err.startsWith("txn-same-nonwitness-data-in-mempool") || err.startsWith("txn-already-known");
+  }
   const chainEvents = new EventEmitter;
   chainState.setNotificationEmitter(chainEvents);
   mempool.setNotificationEmitter(chainEvents);
   chainEvents.on("blockConnected", (block) => {
     try {
       const confirmedTxids = block.transactions.map((tx) => getTxId(tx));
+      blockSync.markTxsConfirmed(block.transactions.slice(1).map((tx) => ({
+        txidHex: getTxId(tx).toString("hex"),
+        wtxidHex: getWTxId(tx).toString("hex")
+      })));
+      blockSync.onActiveTipChange();
       const removed = orphanPool.eraseForBlock(confirmedTxids);
       if (removed > 0) {
         console.log(`[orphan-pool] erased ${removed} orphans confirmed in block`);
@@ -53866,6 +53795,26 @@ async function startNode(config) {
       console.log(`[orphan-pool] erased ${dropped} orphans on disconnect of ${peerKey(peer)}`);
     }
   });
+  const txValidationInFlight = new Set;
+  async function submitTxToMempool(tx, txidHex, wtxidHex) {
+    if (txValidationInFlight.has(txidHex))
+      return null;
+    txValidationInFlight.add(txidHex);
+    let result;
+    try {
+      result = await mempool.acceptToMemoryPool(tx);
+    } finally {
+      txValidationInFlight.delete(txidHex);
+    }
+    if (result.accepted) {
+      blockSync.onMempoolAcceptedTx(txidHex, wtxidHex);
+    } else if (isAlreadyHaveError(result.error)) {
+      blockSync.clearTxRequestInFlight(txidHex, wtxidHex);
+    } else if (!isMissingInputError(result.error)) {
+      blockSync.markTxRejected(txidHex, wtxidHex);
+    }
+    return result;
+  }
   let txAcceptThrowCount = 0;
   let txAcceptThrowLastLog = 0;
   const logTxAcceptThrow = (err) => {
@@ -53884,17 +53833,23 @@ async function startNode(config) {
     if (!blockSync.isIBDComplete())
       return;
     const tx = msg.payload.tx;
+    const txid = getTxId(tx);
+    const txidHex = txid.toString("hex");
+    const wtxidHex = getWTxId(tx).toString("hex");
+    blockSync.clearTxRequestInFlight(txidHex, wtxidHex);
+    if (blockSync.alreadyHaveTx(txidHex, wtxidHex))
+      return;
     let result;
     try {
-      result = await mempool.acceptToMemoryPool(tx);
+      result = await submitTxToMempool(tx, txidHex, wtxidHex);
     } catch (err) {
       logTxAcceptThrow(err);
       return;
     }
+    if (result === null)
+      return;
     try {
       if (result.accepted) {
-        const txid = getTxId(tx);
-        const txidHex = txid.toString("hex");
         const entry = mempool.getTransaction(txid);
         const feeRate = entry ? entry.feeRate : 0;
         txRelay.queueTxToAllFiltered(txidHex, feeRate);
@@ -53919,7 +53874,10 @@ async function startNode(config) {
       const next = worklist.shift();
       const children = orphanPool.onParentAdmitted(next);
       for (const child of children) {
-        const childResult = await mempool.acceptToMemoryPool(child.tx);
+        const childTxidHexKey = child.txid.toString("hex");
+        const childResult = await submitTxToMempool(child.tx, childTxidHexKey, child.wtxid.toString("hex"));
+        if (childResult === null)
+          continue;
         if (childResult.accepted) {
           orphanPool.eraseTx(child.wtxid);
           const childTxidHex = child.txid.toString("hex");
@@ -54032,6 +53990,7 @@ async function startNode(config) {
     }
   });
   chainEvents.on("blockDisconnected", (block) => {
+    blockSync.onBlockDisconnected();
     try {
       walletManager.disconnectBlock(block);
     } catch (err) {
