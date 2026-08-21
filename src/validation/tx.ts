@@ -1694,10 +1694,21 @@ export function verifyInputSignature(
   taprootCache?: TaprootSigHashCache,
   /** Per-block script verification flags (from coreConnectBlockChecks). When
    *  omitted the function defaults to all consensus rules active, matching the
-   *  pre-fix behaviour for standalone / wallet call sites. */
+   *  pre-fix behaviour for standalone / wallet call sites.
+   *
+   *  The height-gated bits (DERSIG/NULLDUMMY/CLTV/CSV) are EXPLICIT here:
+   *  scriptFlagsFromBitmask no longer infers them from WITNESS (that
+   *  inference enforced BIP-66 from genesis and false-rejected mainnet
+   *  block 124276 on the AV=0 rig), so a caller wanting modern rules must
+   *  name them. Block validation never uses this default -- it passes the
+   *  per-height mask from getScriptFlagsForBlock. */
   scriptVerifyFlags: ScriptFlags = ScriptFlags.VERIFY_P2SH |
     ScriptFlags.VERIFY_WITNESS |
-    ScriptFlags.VERIFY_TAPROOT
+    ScriptFlags.VERIFY_TAPROOT |
+    ScriptFlags.VERIFY_DERSIG |
+    ScriptFlags.VERIFY_NULLDUMMY |
+    ScriptFlags.VERIFY_CHECKLOCKTIMEVERIFY |
+    ScriptFlags.VERIFY_CHECKSEQUENCEVERIFY
 ): InputVerifyResult {
   const input = tx.inputs[inputIndex];
   const scriptPubKey = utxo.scriptPubKey;

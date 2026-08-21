@@ -3361,12 +3361,33 @@ export function scriptFlagsFromBitmask(bitmask: number): ScriptFlags {
     verifyP2SH,
     verifyWitness,
     verifyTaproot,
-    // Honour each rule's own bit; OR with verifyWitness since SegWit-active
-    // implies BIP66/65/112/147 active (segwit activates after all of them).
-    verifyDERSignatures:       verifyDERSig    || verifyWitness, // BIP-66
-    verifyCheckLockTimeVerify: verifyCLTV      || verifyWitness, // BIP-65
-    verifyCheckSequenceVerify: verifyCSV       || verifyWitness, // BIP-112
-    verifyNullDummy:           verifyNullDummy || verifyWitness, // BIP-147
+    // Honour each rule's OWN bit — and ONLY its own bit.
+    //
+    // These previously OR'd with verifyWitness, reasoning "SegWit active
+    // implies BIP66/65/112/147 active" (true of the real activation ORDER).
+    // But that conflated "the WITNESS *flag* is set" with "SegWit is *active
+    // at this height*": since getScriptFlagsForBlock adopted Core's v24+
+    // shape (validation.cpp:2262), P2SH|WITNESS|TAPROOT are set for EVERY
+    // block from genesis (script_flag_exceptions carry the two historic
+    // violations), so WITNESS stopped encoding any height information -- and
+    // the OR silently enforced all four rules from block 0, overriding the
+    // per-height gates every consensus call site carefully computes.
+    //
+    // Found live 2026-08-20: the hotbuns AV=0 genesis rig rejected mainnet
+    // block 124276 (tx 4d8666fa..., input 0) with SCRIPT_ERR_SIG_DER --
+    // strict DER is BIP-66, height 363,725, not active for another 239,449
+    // blocks. The node then marked the real block's header invalid,
+    // propagated invalidity to all 818k descendant headers, and wedged.
+    // The mainnet node never saw this because assumevalid skips those
+    // scripts; the rig is the first time they were ever verified.
+    //
+    // Callers that want "all rules on" (wallet / standalone) must say so in
+    // their bitmask -- see the verifyInputScript default, updated in the
+    // same commit.
+    verifyDERSignatures:       verifyDERSig,    // BIP-66
+    verifyCheckLockTimeVerify: verifyCLTV,      // BIP-65
+    verifyCheckSequenceVerify: verifyCSV,       // BIP-112
+    verifyNullDummy:           verifyNullDummy, // BIP-147
     // Policy flags are never set during block validation.
     verifyNullFail:            false,
     verifyWitnessPubkeyType:   false,

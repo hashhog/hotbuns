@@ -307,13 +307,26 @@ describe("tapscript OP_CHECKSEQUENCEVERIFY txContext threading", () => {
 // regression that drops the txContext argument from the P2TR branch is caught.
 // ---------------------------------------------------------------------------
 describe("verifyInputSignature P2TR branch threads txContext (block 950149 regression)", () => {
-  // Per-block consensus flag bitmask: P2SH + WITNESS + TAPROOT. WITNESS
-  // implies CLTV/CSV/DERSIG/NULLDUMMY in scriptFlagsFromBitmask — i.e. the
-  // exact post-Taproot-activation mainnet flag set that block 950149 runs under.
+  // Per-block consensus flag bitmask for height 950,149: every deployment is
+  // active, so the mask carries each rule's OWN bit — exactly what
+  // getScriptFlagsForBlock computes there (base P2SH|WITNESS|TAPROOT plus the
+  // four height-gated ORs, Core validation.cpp:2262-2286).
+  //
+  // This previously passed only P2SH|WITNESS|TAPROOT and leaned on
+  // scriptFlagsFromBitmask's "WITNESS implies CLTV/CSV/DERSIG/NULLDUMMY"
+  // inference. That inference enforced BIP-66 from genesis and false-rejected
+  // mainnet block 124276 on the AV=0 rig (SCRIPT_ERR_SIG_DER at height
+  // 124,276; BIP-66 activates at 363,725), so it was removed — each rule is
+  // honoured from its own bit only, and this fixture now names the bits the
+  // real block-950149 mask carries.
   const CONSENSUS_FLAGS =
     TxScriptFlags.VERIFY_P2SH |
     TxScriptFlags.VERIFY_WITNESS |
-    TxScriptFlags.VERIFY_TAPROOT;
+    TxScriptFlags.VERIFY_TAPROOT |
+    TxScriptFlags.VERIFY_DERSIG |
+    TxScriptFlags.VERIFY_NULLDUMMY |
+    TxScriptFlags.VERIFY_CHECKLOCKTIMEVERIFY |
+    TxScriptFlags.VERIFY_CHECKSEQUENCEVERIFY;
 
   // tapscript leaf: <950148> OP_CHECKLOCKTIMEVERIFY OP_DROP OP_1
   const cltvLeafScript = (): Buffer => {
