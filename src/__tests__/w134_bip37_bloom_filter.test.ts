@@ -543,30 +543,22 @@ describe("W134-G20: TraverseAndBuild recursion — PARTIAL (P3-COS)", () => {
 // ============================================================================
 // G21 — TraverseAndExtract overflow guards — BUG-21 PARTIAL (P0-CDIV)
 // ============================================================================
-describe("W134-G21: TraverseAndExtract overflow guards — BUG-21 P0-CDIV", () => {
-  test("rpc/server.ts w47bTraverseAndExtract uses `?? false` overflow shadow", () => {
-    // Core sets fBad = true on bits-overflow; hotbuns silently maps
-    // overflow to `false`.
-    expect(RPC_SRC).toMatch(/bits\[bitPos\+\+\]\s*\?\?\s*false/);
+describe("W134-G21 FIXED: ExtractMatches overflow guards (was BUG-21)", () => {
+  test("w47bExtractMatches has explicit bounds instead of `?? false`", () => {
+    expect(RPC_SRC).not.toMatch(/bits\[bitPos\+\+\]\s*\?\?\s*false/);
+    expect(RPC_SRC).toMatch(/bitPos\s*>=\s*bits\.length/);
   });
 
-  test("rpc/server.ts w47bTraverseAndExtract has no fBad / failure flag", () => {
-    // Look at the function body only — fBad / fail / bad MUST NOT
-    // appear, since Core's reference uses `fBad = true` on every
-    // failure condition.
-    const fnStart = RPC_SRC.indexOf("function w47bTraverseAndExtract");
+  test("w47bExtractMatches latches failures into an isBad flag (Core fBad)", () => {
+    const fnStart = RPC_SRC.indexOf("function w47bExtractMatches");
     expect(fnStart).toBeGreaterThan(-1);
-    // grab ~1200 chars of function body
-    const fnSlice = RPC_SRC.slice(fnStart, fnStart + 1200);
-    expect(fnSlice).not.toMatch(/\bfBad\b/);
-    expect(fnSlice).not.toMatch(/\bisBad\b/);
+    const fnSlice = RPC_SRC.slice(fnStart, fnStart + 2400);
+    expect(fnSlice).toMatch(/\bisBad\b/);
   });
 
-  test("rpc/server.ts w47bTraverseAndExtract uses `!` non-null-assert on overflow", () => {
-    // The non-null assert `hashes[hashPos++]!` is the static-analysis
-    // smoking gun: it silently produces undefined-via-cast at runtime,
-    // and the caller has no way to detect bounds violation.
-    expect(RPC_SRC).toMatch(/hashes\[hashPos\+\+\]!/);
+  test("no `!` non-null-assert on hash access", () => {
+    expect(RPC_SRC).not.toMatch(/hashes\[hashPos\+\+\]!/);
+    expect(RPC_SRC).toMatch(/hashPos\s*>=\s*hashes\.length/);
   });
 });
 
@@ -574,30 +566,23 @@ describe("W134-G21: TraverseAndExtract overflow guards — BUG-21 P0-CDIV", () =
 // G22 — ExtractMatches outer guards — BUG-22 MISSING (P0-CDIV)
 // ============================================================================
 describe("W134-G22: ExtractMatches outer guards — BUG-22 P0-CDIV", () => {
-  test("verifyTxOutProof never checks nTransactions vs MAX_BLOCK_WEIGHT/MIN_TX_WEIGHT", () => {
+  test("verifyTxOutProof enforces the nTransactions weight bound (FIXED)", () => {
     // Core: nTransactions > MAX_BLOCK_WEIGHT / MIN_TRANSACTION_WEIGHT
     // is the FIRST guard in ExtractMatches.
-    expect(RPC_SRC).not.toMatch(
-      /MAX_BLOCK_WEIGHT\s*\/\s*MIN_TRANSACTION_WEIGHT/,
-    );
-    // The verifyTxOutProof handler is around line 9031.
-    const handlerStart = RPC_SRC.indexOf("verifyTxOutProof");
-    expect(handlerStart).toBeGreaterThan(-1);
-    const handlerSlice = RPC_SRC.slice(handlerStart, handlerStart + 2500);
-    expect(handlerSlice).not.toMatch(/nTransactions\s*>/);
+    expect(RPC_SRC).toMatch(/MAX_MERKLEBLOCK_TXS/);
+    expect(RPC_SRC).toMatch(/4_000_000\s*\/\s*60/);
   });
 
-  test("verifyTxOutProof never checks vHash.size() <= nTransactions", () => {
-    const handlerStart = RPC_SRC.indexOf("verifyTxOutProof");
-    const handlerSlice = RPC_SRC.slice(handlerStart, handlerStart + 2500);
-    expect(handlerSlice).not.toMatch(/hashCount\s*>\s*nTx/);
-    expect(handlerSlice).not.toMatch(/vHash\.size\(\)\s*>\s*nTransactions/);
+  test("verifyTxOutProof enforces hashCount <= nTx (FIXED)", () => {
+    const handlerStart = RPC_SRC.indexOf("private async verifyTxOutProof");
+    const handlerSlice = RPC_SRC.slice(handlerStart, handlerStart + 4000);
+    expect(handlerSlice).toMatch(/hashCount\s*>\s*nTx/);
   });
 
-  test("verifyTxOutProof never checks vBits.size() >= vHash.size()", () => {
-    const handlerStart = RPC_SRC.indexOf("verifyTxOutProof");
-    const handlerSlice = RPC_SRC.slice(handlerStart, handlerStart + 2500);
-    expect(handlerSlice).not.toMatch(/flagCount\s*[<*]\s*hashCount/);
+  test("verifyTxOutProof enforces flag bits >= hashCount (FIXED)", () => {
+    const handlerStart = RPC_SRC.indexOf("private async verifyTxOutProof");
+    const handlerSlice = RPC_SRC.slice(handlerStart, handlerStart + 4000);
+    expect(handlerSlice).toMatch(/flagCount\s*\*\s*8\s*<\s*hashCount/);
   });
 });
 
@@ -605,16 +590,10 @@ describe("W134-G22: ExtractMatches outer guards — BUG-22 P0-CDIV", () => {
 // G23 — Identical left/right child rejection (CVE-2017-12842) — BUG-23 P0-CDIV
 // ============================================================================
 describe("W134-G23: identical-child rejection (CVE-2017-12842) — BUG-23 P0-CDIV", () => {
-  test("rpc/server.ts w47bTraverseAndExtract does NOT check right == left", () => {
-    // Core merkleblock.cpp:124-127 sets fBad = true when right == left
-    // (forged-duplicate-txid SPV attack vector).
-    const fnStart = RPC_SRC.indexOf("function w47bTraverseAndExtract");
-    const fnSlice = RPC_SRC.slice(fnStart, fnStart + 1200);
-    // Specifically: there is no comparison of `right` and `left`
-    // buffers (Buffer.compare / equals / === ) inside the function.
-    expect(fnSlice).not.toMatch(/right\.equals\(\s*left\s*\)/);
-    expect(fnSlice).not.toMatch(/Buffer\.compare\(\s*right\s*,\s*left\s*\)/);
-    expect(fnSlice).not.toMatch(/right\s*===\s*left/);
+  test("w47bExtractMatches rejects identical children (FIXED, CVE-2017-12842)", () => {
+    const fnStart = RPC_SRC.indexOf("function w47bExtractMatches");
+    const fnSlice = RPC_SRC.slice(fnStart, fnStart + 2400);
+    expect(fnSlice).toMatch(/right\.equals\(\s*left\s*\)/);
   });
 
   test("Core reference: identical-child triggers fBad", () => {
@@ -675,27 +654,24 @@ describe("W134-G26: verifyTxOutProof skips merkle-root check — BUG-26 P0-CDIV"
     expect(handlerStart).toBeGreaterThan(-1);
     // The function body ends before the next "private async" or class-
     // ending brace. Grab a generous window.
-    const handlerSlice = RPC_SRC.slice(handlerStart, handlerStart + 1500);
+    const handlerSlice = RPC_SRC.slice(handlerStart, handlerStart + 4000);
 
-    // The handler must NOT reference merkleRoot, hashMerkleRoot, or
-    // any "extracted-root" comparison. (If a future fix wires the
-    // check, this assertion FLIPS and the test correctly fails — at
-    // which point the test should be updated to assert the new
-    // positive behavior.)
-    expect(handlerSlice).not.toMatch(/merkleRoot/i);
-    expect(handlerSlice).not.toMatch(/hashMerkleRoot/);
+    // FIXED: the handler now compares the extracted root against the
+    // proof header's merkle root and rejects mismatches (Core
+    // rpc/txoutproof.cpp parity).  This test group FLIPPED per its own
+    // instruction when the fix landed.
+    expect(handlerSlice).toMatch(/headerMerkleRoot/);
+    expect(handlerSlice).toMatch(/root\.equals\(headerMerkleRoot\)/);
   });
 
-  test("verifyTxOutProof returns matched txids unconditionally", () => {
-    // Smoke: the function ends with `return w47bTraverseAndExtract(...)`
-    // with no `if (root !== header.merkleRoot) throw …` upstream.
+  test("verifyTxOutProof gates on chain membership, never returns unconditionally", () => {
     const handlerStart = RPC_SRC.indexOf(
       "private async verifyTxOutProof",
     );
-    const handlerSlice = RPC_SRC.slice(handlerStart, handlerStart + 1500);
-    expect(handlerSlice).toMatch(
-      /return\s+w47bTraverseAndExtract\s*\(/,
-    );
+    const handlerSlice = RPC_SRC.slice(handlerStart, handlerStart + 4000);
+    expect(handlerSlice).not.toMatch(/return\s+w47bTraverseAndExtract\s*\(/);
+    expect(handlerSlice).toMatch(/isOnBestHeaderChain/);
+    expect(handlerSlice).toMatch(/Block not found in chain/);
   });
 });
 
@@ -821,5 +797,47 @@ describe("W134 audit summary", () => {
     // (1 PRESENT [G24], 2 PARTIAL non-bug [G20, G25], 25 MISSING,
     // 2 PARTIAL-with-deviation [G21, G29].)
     expect(27).toBe(27);
+  });
+});
+
+// ============================================================================
+// BEHAVIORAL pins on the exported ExtractMatches (beyond the source greps):
+// a genuine 2-leaf proof yields the correct root + match; forged variants
+// latch bad.  FAIL AT PARENT (the old helper had no root/bad reporting —
+// these tests would not even compile against it).
+// ============================================================================
+import { w47bExtractMatches } from "../rpc/server.js";
+import { hash256 as w134hash256 } from "../crypto/primitives.js";
+
+describe("W134 behavioral: w47bExtractMatches", () => {
+  // Two leaves; prove leaf B (index 1).  Tree: root = H(A||B).
+  const leafA = w134hash256(Buffer.from("tx-a"));
+  const leafB = w134hash256(Buffer.from("tx-b"));
+  const root = w134hash256(Buffer.concat([leafA, leafB]));
+  // Traversal (nTx=2, height 1): root flag=1 (descend), left flag=0 (hash A
+  // as-is), right flag=1 at height 0 (matched leaf B).
+  // bits LSB-first: [1,0,1] -> byte 0b00000101 = 0x05.
+  const flags = Buffer.from([0x05]);
+
+  test("genuine proof: correct root + matched txid", () => {
+    const r = w47bExtractMatches(2, [leafA, leafB], flags);
+    expect(r.bad).toBe(false);
+    expect(r.root.equals(root)).toBe(true);
+    expect(r.matched).toEqual([Buffer.from(leafB).reverse().toString("hex")]);
+  });
+
+  test("identical-children forge latches bad (CVE-2017-12842)", () => {
+    const r = w47bExtractMatches(2, [leafA, leafA], flags);
+    expect(r.bad).toBe(true);
+  });
+
+  test("truncated bit vector latches bad", () => {
+    const r = w47bExtractMatches(2, [leafA, leafB], Buffer.alloc(0));
+    expect(r.bad).toBe(true);
+  });
+
+  test("leftover hashes latch bad", () => {
+    const r = w47bExtractMatches(2, [leafA, leafB, leafB], flags);
+    expect(r.bad).toBe(true);
   });
 });

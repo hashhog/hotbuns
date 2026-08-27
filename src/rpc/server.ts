@@ -522,37 +522,67 @@ function w47bReadVarInt(buf: Buffer, pos: number): [number, number] {
 }
 
 /** TraverseAndExtract: parse CMerkleBlock proof, return matched txids. */
-function w47bTraverseAndExtract(
+const W47B_ZERO32 = Buffer.alloc(32);
+
+/**
+ * Core CPartialMerkleTree::ExtractMatches parity (merkleblock.cpp:97-135):
+ * traverses the partial tree, collecting matched txids AND the computed root,
+ * with every failure condition latched into `bad` (Core's fBad):
+ *   - bits overflow / hashes overflow (bounds instead of `?? false` / `!`)
+ *   - identical left/right children (CVE-2017-12842 forged-duplicate attack)
+ *   - unconsumed hashes, or bits beyond the final pad byte
+ * The CALLER must reject when bad, and must compare root against the proof
+ * header's merkle root — returning matches without that comparison blesses
+ * any forged proof (w134 BUG-26).
+ */
+export function w47bExtractMatches(
   nTx: number,
   hashes: Buffer[],
   flagBytes: Buffer
-): string[] {
-  if (nTx === 0) return [];
+): { root: Buffer; matched: string[]; bad: boolean } {
+  if (nTx === 0) return { root: W47B_ZERO32, matched: [], bad: true };
   let nHeight = 0;
   while (w47bTreeWidth(nTx, nHeight) > 1) nHeight++;
 
   const bits = w47bBytesToBits(flagBytes);
   let bitPos = 0;
   let hashPos = 0;
+  let isBad = false;
   const matched: string[] = [];
 
   function extract(height: number, pos: number): Buffer {
-    const flag = bits[bitPos++] ?? false;
+    if (bitPos >= bits.length) {
+      isBad = true; // overran the bit vector (Core merkleblock.cpp:100)
+      return W47B_ZERO32;
+    }
+    const flag = bits[bitPos++];
     if (height === 0 || !flag) {
-      const h = hashes[hashPos++]!;
+      if (hashPos >= hashes.length) {
+        isBad = true; // overran the hash list (Core merkleblock.cpp:108)
+        return W47B_ZERO32;
+      }
+      const h = hashes[hashPos++] as Buffer;
       if (height === 0 && flag) {
         matched.push(Buffer.from(h).reverse().toString("hex"));
       }
       return h;
     }
     const left = extract(height - 1, pos * 2);
-    const right = pos * 2 + 1 < w47bTreeWidth(nTx, height - 1)
-      ? extract(height - 1, pos * 2 + 1)
-      : left;
+    let right = left;
+    if (pos * 2 + 1 < w47bTreeWidth(nTx, height - 1)) {
+      right = extract(height - 1, pos * 2 + 1);
+      if (right.equals(left)) {
+        isBad = true; // identical children (Core merkleblock.cpp:124, CVE-2017-12842)
+      }
+    }
     return hash256(Buffer.concat([left, right]));
   }
-  extract(nHeight, 0);
-  return matched;
+  const root = extract(nHeight, 0);
+  // Tail checks (Core ExtractMatches: every hash consumed; bits used except
+  // for the final pad byte's slack).
+  if (hashPos !== hashes.length) isBad = true;
+  if (Math.floor((bitPos + 7) / 8) !== flagBytes.length && flagBytes.length > 0) isBad = true;
+  return { root, matched, bad: isBad };
 }
 
 /**
@@ -15355,7 +15385,9 @@ export class RPCServer {
     }
 
     const nTx = proofBuf.readUInt32LE(80);
-    if (nTx === 0) return [];
+    if (nTx === 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Something wrong with merkleblock");
+    }
 
     let pos = 84;
     const [hashCount, pos2] = w47bReadVarInt(proofBuf, pos);
@@ -15376,7 +15408,34 @@ export class RPCServer {
     }
     const flagBytes = proofBuf.subarray(pos, pos + flagCount);
 
-    return w47bTraverseAndExtract(nTx, hashes, flagBytes);
+    // Outer guards (Core ExtractMatches merkleblock.cpp:97-105).
+    const MAX_MERKLEBLOCK_TXS = Math.floor(4_000_000 / 60); // MAX_BLOCK_WEIGHT / MIN_TRANSACTION_WEIGHT
+    if (nTx > MAX_MERKLEBLOCK_TXS) {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Something wrong with merkleblock");
+    }
+    if (hashCount > nTx) {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Something wrong with merkleblock");
+    }
+    if (flagCount * 8 < hashCount) {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Something wrong with merkleblock");
+    }
+
+    const { root, matched, bad } = w47bExtractMatches(nTx, hashes, flagBytes);
+    // The computed root MUST equal the proof header's merkle root — the old
+    // code returned matches unconditionally, blessing any forged proof
+    // (w134 BUG-26; Core rpc/txoutproof.cpp compares against
+    // header.hashMerkleRoot and throws).
+    const headerMerkleRoot = proofBuf.subarray(36, 68);
+    if (bad || !root.equals(headerMerkleRoot)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Something wrong with merkleblock");
+    }
+    // The proven block must be on the ACTIVE chain (Core: LookupBlockIndex +
+    // chain contains -> 'Block not found in chain', RPC -5).
+    const provenBlockHash = hash256(proofBuf.subarray(0, 80));
+    if (!this.headerSync.isOnBestHeaderChain(provenBlockHash)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found in chain");
+    }
+    return matched;
   }
 
   /**

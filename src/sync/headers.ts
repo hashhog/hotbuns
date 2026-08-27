@@ -1368,6 +1368,23 @@ export class HeaderSync {
   getHeaderCount(): number {
     return this.headerChain.size;
   }
+
+  /** Look up a header entry by block hash (null if unknown). */
+  getHeaderEntryByHash(hash: Buffer): HeaderChainEntry | null {
+    return this.headerChain.get(hash.toString("hex")) ?? null;
+  }
+
+  /**
+   * True when `hash` is the block on the BEST header chain at its height —
+   * i.e. active-chain membership (Core chainActive.Contains analogue).
+   * Used by verifytxoutproof's "Block not found in chain" gate.
+   */
+  isOnBestHeaderChain(hash: Buffer): boolean {
+    const entry = this.headerChain.get(hash.toString("hex"));
+    if (!entry || entry.status === "invalid") return false;
+    const atHeight = this.headersByHeight.get(entry.height);
+    return atHeight !== undefined && atHeight.hash.equals(hash);
+  }
 }
 
 // Re-export anti-DoS types for convenience
