@@ -34,7 +34,7 @@ function createMockPeer(host = "127.0.0.1", port = 8333): any {
     port,
     state: "connected",
     versionPayload: { startHeight: 1000, services: 0x409n },
-    send: mock(() => {}),
+    send: mock(() => true),
     // sendGetData (blocks.ts) calls these on every requested block to
     // mirror Bitcoin Core's per-peer block-in-flight tracking that
     // prevents stale-tip eviction (see comment at sync/blocks.ts:1323
@@ -254,6 +254,35 @@ describe("BlockSync", () => {
       const state = bs.getState();
       // Should have requested the block at height 1
       expect(state.pendingBlocks.size).toBe(1);
+
+      await bs.stop();
+    });
+
+    // #74: a getdata whose send() is DROPPED (socket gone / queue refused)
+    // must not strand pendingBlocks + blocksInFlight against a request
+    // that never went on the wire — the blockbrew-wedge shape. Fails at
+    // the parent (send() returned void; the drop was silent and the
+    // request stayed pending until the 120s stall timeout).
+    test("dropped getdata send reverts pending block state", async () => {
+      const peer = createMockPeer();
+      peer.send = mock(() => false); // every send is dropped
+      const peerManager = createMockPeerManager([peer]);
+
+      const genesis = headerSync.getBestHeader()!;
+      const block1 = createValidBlock(
+        genesis.hash,
+        genesis.header.timestamp + 600,
+        1
+      );
+      await headerSync.processHeaders([block1.header], peer);
+
+      const bs = new BlockSync(db, REGTEST, headerSync, peerManager);
+      await bs.start();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      const state = bs.getState();
+      expect(state.pendingBlocks.size).toBe(0);
+      expect(peer.removeBlockInFlight).toHaveBeenCalled();
 
       await bs.stop();
     });

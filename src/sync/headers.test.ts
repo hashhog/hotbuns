@@ -22,7 +22,7 @@ function createMockPeer(host = "127.0.0.1", port = 8333): any {
     port,
     state: "connected",
     versionPayload: { startHeight: 1000 },
-    send: () => {},
+    send: () => true,
   };
 }
 

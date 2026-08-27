@@ -3694,6 +3694,11 @@ export class PeerManager {
               peer.feedData(Buffer.from(data));
             }
           },
+          drain(socket) {
+            // #74: flush bytes parked by Peer.writeRaw on backpressure —
+            // without this, a short Bun Socket.write desyncs the stream.
+            socket.data?.peer?.onDrain();
+          },
           close(socket) {
             // Peer.disconnect will be triggered by the socket close handler
             // that was set up in acceptSocket — but Bun.listen uses its own

@@ -2658,7 +2658,24 @@ export class BlockSync {
         payload: { inventory },
       };
 
-      peer.send(msg);
+      if (!peer.send(msg)) {
+        // #74: the getdata never reached the wire — revert this batch's
+        // in-flight state immediately instead of stranding it against a
+        // request that was never sent (the blockbrew-wedge shape; old
+        // recovery was the 120s stall timeout).
+        const revertKey = `${peer.host}:${peer.port}`;
+        for (const hash of batch) {
+          const hex = hash.toString("hex");
+          peer.removeBlockInFlight(hex);
+          const pending = this.state.pendingBlocks.get(hex);
+          if (pending && pending.peer === revertKey) {
+            this.state.pendingBlocks.delete(hex);
+          }
+        }
+        console.warn(
+          `blocks: getdata batch of ${batch.length} reverted — send to ${peer.host} dropped`
+        );
+      }
     }
   }
 

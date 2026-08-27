@@ -296,6 +296,16 @@ export class Peer {
   receivedSendTxRcncl: boolean;
 
   private socket: Socket | null;
+  /**
+   * Bytes accepted by send() but not yet accepted by the kernel.
+   * Bun's Socket.write() returns the byte count actually written and does
+   * NOT buffer the remainder — ignoring a short write does not merely drop
+   * a message, it desyncs the v1 framing / v2 AEAD stream for the rest of
+   * the connection (meta #74). writeRaw() parks the tail here and
+   * onDrain() (wired from the socket's drain callback) flushes it in
+   * order.
+   */
+  private outbox: Buffer[] = [];
   private recvBuffer: Buffer;
   private config: PeerConfig;
   private events: PeerEvents;
@@ -527,6 +537,7 @@ export class Peer {
       port: this.port,
       socket: {
         data: (_socket, data) => this.onData(Buffer.from(data)),
+        drain: () => this.onDrain(),
         open: (socket) => {
           // Store socket immediately - open callback fires before await returns
           this.socket = socket;
@@ -799,38 +810,75 @@ export class Peer {
    * serializes the message in the plaintext v1 framing (4-byte magic +
    * 12-byte command + length + checksum + payload).
    */
-  send(msg: NetworkMessage): void {
+  send(msg: NetworkMessage): boolean {
     if (!this.socket || this.state === "disconnected") {
-      return;
+      // #74: this used to be a SILENT no-op while callers had already
+      // committed in-flight state (pendingBlocks / syncingPeers) — the
+      // blockbrew-wedge shape. Callers must check the return.
+      console.warn(`peer ${this.host}: send(${msg.type}) dropped — socket ${this.socket ? "disconnected" : "absent"}`);
+      return false;
     }
     if (this.transportMode === "v2" && this.v2Transport) {
-      this.sendV2(msg);
-      return;
+      return this.sendV2(msg);
     }
     const data = serializeMessage(this.config.magic, msg);
-    this.socket.write(data);
+    this.writeRaw(data);
     this.bytesSent += data.length;
     this.lastSend = Date.now();
+    return true;
+  }
+
+  /**
+   * Write bytes preserving stream order across backpressure: if the kernel
+   * accepts fewer bytes than offered, the tail is parked in the outbox and
+   * flushed by onDrain(). Never interleaves — anything queued goes first.
+   */
+  private writeRaw(data: Buffer): void {
+    if (!this.socket) return;
+    if (this.outbox.length > 0) {
+      this.outbox.push(data);
+      return;
+    }
+    const written = this.socket.write(data);
+    if (written < data.length) {
+      this.outbox.push(data.subarray(written));
+      console.warn(`peer ${this.host}: backpressure — parked ${data.length - written} bytes for drain`);
+    }
+  }
+
+  /** Socket drain callback: flush parked bytes in order. */
+  onDrain(): void {
+    while (this.outbox.length > 0 && this.socket) {
+      const head = this.outbox[0];
+      const written = this.socket.write(head);
+      if (written < head.length) {
+        this.outbox[0] = head.subarray(written);
+        return; // still backpressured; next drain continues
+      }
+      this.outbox.shift();
+    }
   }
 
   /**
    * Encrypt and send a message via the BIP-324 v2 transport.
    * Internal — callers use {@link send}.
    */
-  private sendV2(msg: NetworkMessage): void {
-    if (!this.socket || !this.v2Transport) return;
+  private sendV2(msg: NetworkMessage): boolean {
+    if (!this.socket || !this.v2Transport) return false;
     if (!this.v2Transport.isHandshakeReady()) {
       // The cipher handshake hasn't finished queueing our version
       // packet yet.  This shouldn't happen because we only flip
       // transportMode to "v2" after the handshake is ready, but
       // guard defensively.
-      return;
+      console.warn(`peer ${this.host}: sendV2(${msg.type}) dropped — handshake not ready`);
+      return false;
     }
     const { command, payload } = extractCommandAndPayload(this.config.magic, msg);
     const encrypted = this.v2Transport.encryptMessage(command, payload, false);
-    this.socket.write(encrypted);
+    this.writeRaw(encrypted);
     this.bytesSent += encrypted.length;
     this.lastSend = Date.now();
+    return true;
   }
 
   /**
@@ -843,7 +891,7 @@ export class Peer {
     if (this.v2Transport.pendingSendBytes() === 0) return;
     const out = this.v2Transport.consumeSendBuffer();
     if (out.length === 0) return;
-    this.socket.write(out);
+    this.writeRaw(out);
     this.bytesSent += out.length;
     this.lastSend = Date.now();
   }

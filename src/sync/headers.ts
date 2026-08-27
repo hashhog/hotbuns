@@ -1005,7 +1005,15 @@ export class HeaderSync {
       },
     };
 
-    peer.send(msg);
+    if (!peer.send(msg)) {
+      // #74: the getheaders never reached the wire. Release the
+      // syncingPeers latch — leaving it set makes requestHeaders
+      // early-return for this peer forever (the comment above already
+      // documented "the prior request may have silently died"; now it
+      // cannot die silently).
+      this.syncingPeers.delete(peerKey);
+      console.warn(`headers: getheaders to ${peer.host} dropped — sync latch released`);
+    }
   }
 
   /**
