@@ -603,3 +603,43 @@ describe("anti-DoS integration scenarios", () => {
     expect(headerSync.getBestHeader()!.height).toBe(10);
   });
 });
+
+// #72 row (3) — the 2-hash HSS locator anti-pattern (nimrod 4deead0 /
+// camlcoin PRESYNC / clearbit 7b97bce / blockbrew 7009b2b). Core's
+// NextHeadersRequestLocator appends LocatorEntries(&m_chain_start)
+// (headerssync.cpp:296-317 + chain.cpp:26-43): chain_start's hash plus
+// exponentially spaced ancestors down to and INCLUDING genesis — never just
+// the bare chain_start hash. If the peer recognizes neither of two hashes it
+// serves from genesis and the sync tears down.
+describe("chain-start locator entries (Core LocatorEntries parity)", () => {
+  test("locator walks from chain_start to genesis, exponentially", () => {
+    const chainStartHash = Buffer.alloc(32, 0xc5);
+    const syncState = new HeadersSyncState(
+      REGTEST,
+      { commitmentPeriod: 10, redownloadBufferSize: 5 },
+      chainStartHash,
+      1000, // chain_start height
+      REGTEST.powLimitBits,
+      0n,
+      10n ** 20n
+    );
+
+    const genesisHash = Buffer.alloc(32, 0xee);
+    const hashAtHeight = (height: number): Buffer | null => {
+      if (height === 0) return genesisHash;
+      const b = Buffer.alloc(32, 0xe0);
+      b.writeUInt16LE(height, 1);
+      return b;
+    };
+
+    const locator = syncState.getNextHeadersRequestLocator(hashAtHeight);
+
+    // Pre-fix behavior: exactly [lastHeader, chainStart] — 2 entries, no
+    // walk, no genesis.
+    expect(locator.length).toBeGreaterThan(3);
+    expect(locator[1].equals(chainStartHash)).toBe(true);
+    expect(locator[locator.length - 1].equals(genesisHash)).toBe(true);
+    // ~1000 heights under a doubling step must compress far below 1000.
+    expect(locator.length).toBeLessThan(64);
+  });
+});

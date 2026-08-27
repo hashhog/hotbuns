@@ -983,10 +983,14 @@ export class HeaderSync {
         startTime: Date.now(),
       });
 
-      locator = syncState.getNextHeadersRequestLocator();
+      locator = syncState.getNextHeadersRequestLocator(
+        (height) => this.headersByHeight.get(height)?.hash ?? null
+      );
     } else if (existingState && existingState.syncState.getState() !== HeadersSyncStateEnum.FINAL) {
       // Continue with existing anti-DoS state
-      locator = existingState.syncState.getNextHeadersRequestLocator();
+      locator = existingState.syncState.getNextHeadersRequestLocator(
+        (height) => this.headersByHeight.get(height)?.hash ?? null
+      );
     } else {
       // No anti-DoS needed, use normal locator
       locator = this.getBlockLocator();

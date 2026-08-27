@@ -403,7 +403,7 @@ export class HeadersSyncState {
    *
    * @returns Array of block hashes for the locator
    */
-  getNextHeadersRequestLocator(): Buffer[] {
+  getNextHeadersRequestLocator(hashAtHeight?: (height: number) => Buffer | null): Buffer[] {
     if (this.state === HeadersSyncStateEnum.FINAL) {
       return [];
     }
@@ -420,8 +420,31 @@ export class HeadersSyncState {
       locator.push(Buffer.from(this.redownloadBufferLastHash));
     }
 
-    // Always include chain start
+    // Chain-start locator entries — Core's LocatorEntries(&m_chain_start)
+    // (chain.cpp:26-43): chain_start's own hash, then exponentially spaced
+    // ancestors down to and including genesis. A bare chain_start hash is
+    // the 2-hash anti-pattern this fleet has now fixed four times (nimrod
+    // 4deead0, camlcoin PRESYNC unwedge, clearbit 7b97bce, blockbrew
+    // 7009b2b): if the peer recognizes neither hash it serves from genesis
+    // and the sync tears down. Callers pass a height->hash resolver over
+    // the header chain; without one only chain_start itself is included.
     locator.push(Buffer.from(this.chainStartHash));
+    if (hashAtHeight) {
+      let step = 1;
+      let height = this.chainStartHeight;
+      let entries = 1; // counts chain-start-walk entries, incl. chainStartHash
+      while (height > 0) {
+        height = Math.max(height - step, 0);
+        if (entries > 10) {
+          step *= 2;
+        }
+        const h = hashAtHeight(height);
+        if (h) {
+          locator.push(Buffer.from(h));
+          entries++;
+        }
+      }
+    }
 
     return locator;
   }
