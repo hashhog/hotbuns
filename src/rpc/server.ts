@@ -339,6 +339,22 @@ export const RPCErrorCodes = {
 } as const;
 
 /**
+ * Destination widths for `RPCServer.uvGetInt` — the JS stand-ins for the
+ * integer types Bitcoin Core hands to `UniValue::getInt<Int>()`.
+ *
+ * `int` (32-bit) is exact. `int64_t` is NOT representable in a JS number, and
+ * `JSON.parse` has already collapsed any token past 2^53-1 into a lossy double
+ * by the time an RPC handler sees it — so Number.MAX_SAFE_INTEGER is the widest
+ * bound at which "is this an exact integer?" is still an honest question. Both
+ * bounds reject with univalue's own message, so the difference is only visible
+ * for values between 2^53 and 2^63, which JSON cannot carry losslessly anyway.
+ */
+const INT32_MIN = -2147483648;
+const INT32_MAX = 2147483647;
+const INT64_MIN = Number.MIN_SAFE_INTEGER;
+const INT64_MAX = Number.MAX_SAFE_INTEGER;
+
+/**
  * Maximum number of requests allowed in a batch.
  * Prevents DoS via large batch requests.
  */
@@ -9600,6 +9616,55 @@ export class RPCServer {
   }
 
   /**
+   * UniValue::getInt<Int>() — bitcoin-core/src/univalue/include/univalue.h:139.
+   *
+   * Core never reads a JSON number straight into a field. It converts with
+   * `std::from_chars` into the DESTINATION width and throws
+   * `std::runtime_error("JSON integer out of range")` when the token does not
+   * fit or is not an exact integer. The two failure modes land on DIFFERENT
+   * codes (rpc/server.cpp:512-515):
+   *   - `UniValue::type_error` from checkType(VNUM) -> RPC_TYPE_ERROR (-3)
+   *   - `std::runtime_error`  from from_chars      -> RPC_MISC_ERROR (-1)
+   *
+   * The ordering consequence matters more than the codes: because the width
+   * check lives INSIDE the conversion, it fires before any semantic test the
+   * handler then performs on the converted value — which is why
+   * `createrawtransaction` answers -1 for an out-of-int32 vout and only -8 for
+   * an in-range negative one.
+   */
+  private uvGetInt(
+    value: unknown,
+    _name: string, // call-site label only; Core's checkType message omits it
+    min: number,
+    max: number
+  ): number {
+    if (typeof value !== "number") {
+      throw this.rpcError(
+        RPCErrorCodes.TYPE_ERROR,
+        `JSON value of type ${this.uvTypeName(value)} is not of expected type number`
+      );
+    }
+    if (!Number.isInteger(value) || value < min || value > max) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "JSON integer out of range");
+    }
+    return value;
+  }
+
+  /**
+   * univalue's `uvTypeName` (univalue.cpp:217) for a decoded-JSON JS value.
+   * Only used to build type-error messages byte-identical to Core's.
+   */
+  private uvTypeName(value: unknown): string {
+    if (value === null || value === undefined) return "null";
+    if (typeof value === "boolean") return "bool";
+    if (Array.isArray(value)) return "array";
+    if (typeof value === "object") return "object";
+    if (typeof value === "string") return "string";
+    if (typeof value === "number") return "number";
+    return "null";
+  }
+
+  /**
    * Calculate difficulty from a block hash.
    */
   private async calculateDifficulty(blockhash: Buffer): Promise<number> {
@@ -11835,13 +11900,16 @@ export class RPCServer {
     }
 
     // locktime (default 0). Parsed BEFORE the default sequence because Core's
-    // AddInputs picks the non-RBF default sequence based on nLockTime.
+    // AddInputs picks the non-RBF default sequence based on nLockTime — and
+    // before the inputs, because ConstructTransaction validates it first
+    // (rawtransaction_util.cpp:151-156).
     let lockTime = 0;
     if (locktimeParam !== undefined && locktimeParam !== null) {
-      const lt = Number(locktimeParam);
-      if (!Number.isInteger(lt) || lt < 0 || lt > 0xffffffff) {
+      // Core: locktime.getInt<int64_t>(), then [0, LOCKTIME_MAX] (script.h:53).
+      const lt = this.uvGetInt(locktimeParam, "locktime", INT64_MIN, INT64_MAX);
+      if (lt < 0 || lt > 0xffffffff) {
         throw this.rpcError(
-          RPCErrorCodes.INVALID_PARAMS,
+          RPCErrorCodes.INVALID_PARAMETER,
           "Invalid parameter, locktime out of range"
         );
       }
@@ -11875,24 +11943,53 @@ export class RPCServer {
         throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, input must be an object");
       }
       const inObj = rawIn as Record<string, unknown>;
-      const txidHex = inObj.txid;
-      const vout = inObj.vout;
-      if (typeof txidHex !== "string" || txidHex.length !== 64) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, missing or invalid txid");
+      // Core's AddInputs runs ParseHashO FIRST (rawtransaction_util.cpp:38),
+      // so a malformed txid is reported as a txid problem — with ParseHashV's
+      // exact wording — before anything is said about vout.  It also returns
+      // the internal little-endian buffer, replacing the bare
+      // `Buffer.from(hex, "hex").reverse()` that used to run unguarded.
+      const txidLE = this.parseHashV(inObj.txid, "txid");
+
+      // vout.  Core: `if (!vout_v.isNum()) throw -8 "missing vout key"`, then
+      // `vout_v.getInt<int>()` — a THIRTY-TWO-BIT int — and only then the sign
+      // test (rawtransaction_util.cpp:40-45).  The width check lives inside
+      // univalue's conversion, so RANGE BEATS SIGN: 2147483648 and -2147483649
+      // are both -1 "JSON integer out of range", while -1 (which does fit in an
+      // int32) gets the vout-specific -8 message.  That ordering is Core's, not
+      // the obvious one.
+      //
+      // Before this bound existed the serializer decided the outcome instead:
+      // vout 2147483648 was ACCEPTED and written as outpoint index 0x80000000
+      // (a spend Core refuses to build), and vout 4294967296 escaped as Node's
+      // own `ERR_OUT_OF_RANGE` from writeUInt32LE — a *string* in the JSON-RPC
+      // `code` field, which must be an integer, so the reply was not even a
+      // well-formed JSON-RPC error.
+      const voutValue = inObj.vout;
+      if (typeof voutValue !== "number") {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          "Invalid parameter, missing vout key"
+        );
       }
-      if (typeof vout !== "number" || !Number.isInteger(vout) || vout < 0) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, missing or invalid vout");
+      const vout = this.uvGetInt(voutValue, "vout", INT32_MIN, INT32_MAX);
+      if (vout < 0) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          "Invalid parameter, vout cannot be negative"
+        );
       }
-      // Display (big-endian) hex → internal little-endian buffer.
-      const txidLE = Buffer.from(txidHex, "hex").reverse();
-      if (txidLE.length !== 32) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, txid must be 32 bytes");
-      }
+
+      // Core guards the sequence read with `if (sequenceObj.isNum())`
+      // (rawtransaction_util.cpp:58), so a present but NON-numeric sequence is
+      // IGNORED and the default still applies — it is not an error.
       let sequence = defaultSequence;
-      if (inObj.sequence !== undefined && inObj.sequence !== null) {
-        const seq = Number(inObj.sequence);
-        if (!Number.isInteger(seq) || seq < 0 || seq > SEQUENCE_FINAL) {
-          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, sequence number is out of range");
+      if (typeof inObj.sequence === "number") {
+        const seq = this.uvGetInt(inObj.sequence, "sequence", INT64_MIN, INT64_MAX);
+        if (seq < 0 || seq > SEQUENCE_FINAL) {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_PARAMETER,
+            "Invalid parameter, sequence number is out of range"
+          );
         }
         sequence = seq;
       }
