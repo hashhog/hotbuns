@@ -288,4 +288,121 @@ describe("createrawtransaction vout/sequence/locktime range — REGRESSION", () 
     expect(typeof r.result).toBe("string");
     expect(firstInputVout(r.result)).toBe(7);
   });
+  // ---- THE SECOND REGRESSION: `replaceable=true` vs. the sequences --------
+  //
+  // Core's ConstructTransaction ends with (rawtransaction_util.cpp:166-168):
+  //
+  //   if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+  //       !SignalsOptInRBF(CTransaction(rawTx)))
+  //       throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter
+  //           combination: Sequence number(s) contradict replaceable option");
+  //
+  // with SignalsOptInRBF (util/rbf.cpp) true as soon as ANY input carries
+  // nSequence <= MAX_BIP125_RBF_SEQUENCE (0xfffffffd).
+  //
+  // hotbuns HAD this check but answered -32602 where Core answers -8. The code
+  // is the whole point of the row: -32602 ("Invalid params") says the request
+  // envelope was malformed, while -8 says two well-formed arguments disagree.
+  // A client switching on the numeric code to decide whether to retry, or to
+  // decide whether to surface the message to a human, gets the wrong answer.
+  //
+  // THE SUBTLE PART is that rbf keeps its OPTIONAL-NESS: `absent` and
+  // `explicitly true` pick the SAME default sequence but behave DIFFERENTLY
+  // here (has_value() vs. value_or(true)). The ABSENT and NULL controls below
+  // are what stop the check from breaking ordinary calls.
+
+  const MAX_BIP125_RBF_SEQUENCE = 0xfffffffd;
+  const MAX_SEQUENCE_NONFINAL = 0xfffffffe;
+  const SEQUENCE_FINAL = 0xffffffff;
+  const CONTRADICTION_MSG =
+    "Invalid parameter combination: Sequence number(s) contradict replaceable option";
+
+  /** Decode the returned hex and report every input's nSequence, in order. */
+  function sequencesOf(hex: string): number[] {
+    const tx = deserializeTx(new BufferReader(Buffer.from(hex, "hex")));
+    return tx.inputs.map((i) => i.sequence);
+  }
+
+  for (const [label, seq] of [
+    ["0xffffffff (SEQUENCE_FINAL)", SEQUENCE_FINAL],
+    ["0xfffffffe (MAX_SEQUENCE_NONFINAL)", MAX_SEQUENCE_NONFINAL],
+  ] as Array<[string, number]>) {
+    it(`replaceable=true + sequence ${label} -> -8 contradiction`, async () => {
+      const r = await createRaw([{ txid: TXID, vout: 0, sequence: seq }], 0, true);
+      expectError(r, -8, CONTRADICTION_MSG);
+    });
+  }
+
+  it("CONTROL: replaceable ABSENT + SEQUENCE_FINAL is ACCEPTED", async () => {
+    // rbf.has_value() is false when the argument is omitted, so the check
+    // cannot fire — and the explicit sequence still reaches the bytes. This is
+    // the row a plain-bool implementation gets wrong.
+    const r = await createRaw([{ txid: TXID, vout: 0, sequence: SEQUENCE_FINAL }]);
+    expect(r.error).toBeUndefined();
+    expect(sequencesOf(r.result)).toEqual([SEQUENCE_FINAL]);
+  });
+
+  it("CONTROL: replaceable NULL + SEQUENCE_FINAL is ACCEPTED", async () => {
+    // Core's isNull() is true for an explicit JSON null exactly as for an
+    // omitted argument, so null must behave like ABSENT, not like `false`.
+    const r = await createRaw([{ txid: TXID, vout: 0, sequence: SEQUENCE_FINAL }], 0, null);
+    expect(r.error).toBeUndefined();
+    expect(sequencesOf(r.result)).toEqual([SEQUENCE_FINAL]);
+  });
+
+  it("CONTROL: replaceable=true + sequence 0xfffffffd is ACCEPTED", async () => {
+    // 0xfffffffd IS the BIP-125 signal, so there is no contradiction.
+    const r = await createRaw(
+      [{ txid: TXID, vout: 0, sequence: MAX_BIP125_RBF_SEQUENCE }], 0, true);
+    expect(r.error).toBeUndefined();
+    expect(sequencesOf(r.result)).toEqual([MAX_BIP125_RBF_SEQUENCE]);
+  });
+
+  it("CONTROL: replaceable=false + SEQUENCE_FINAL is ACCEPTED", async () => {
+    // rbf.value() is false, so the check is inert however final the sequence.
+    const r = await createRaw([{ txid: TXID, vout: 0, sequence: SEQUENCE_FINAL }], 0, false);
+    expect(r.error).toBeUndefined();
+    expect(sequencesOf(r.result)).toEqual([SEQUENCE_FINAL]);
+  });
+
+  it("CONTROL: replaceable=true + NO inputs is ACCEPTED", async () => {
+    // Core guards on rawTx.vin.size() > 0: an input-less transaction cannot
+    // contradict anything.
+    //
+    // Asserted on the RAW BYTES rather than through deserializeTx on purpose.
+    // A zero-input transaction serializes as version || 0x00 || <vout count>,
+    // and 0x00 is also the BIP-144 witness MARKER, so a witness-aware
+    // deserializer re-reads the following output count as the witness FLAG and
+    // walks off into nonsense. That ambiguity is inherent to the encoding (Core
+    // resolves it in core_read.cpp by trying both and keeping the one that
+    // round-trips), and it is NOT what this row is about — so read the input
+    // count straight out of the hex: byte 4, immediately after the 4-byte
+    // version, is the CompactSize input count and must be 0.
+    const r = await createRaw([], 0, true);
+    expect(r.error).toBeUndefined();
+    expect(typeof r.result).toBe("string");
+    expect(r.result.slice(8, 10)).toBe("00");
+  });
+
+  it("CONTROL: replaceable=true + one of TWO inputs signals is ACCEPTED", async () => {
+    // SignalsOptInRBF is ANY, not ALL: one signalling input is enough, which
+    // is BIP-125's multi-party rule — no single co-signer may opt the whole
+    // transaction out of replacement. A check written with `every` rejects
+    // this row.
+    const r = await createRaw([
+      { txid: TXID, vout: 0, sequence: SEQUENCE_FINAL },
+      { txid: TXID, vout: 1, sequence: 0 },
+    ], 0, true);
+    expect(r.error).toBeUndefined();
+    expect(sequencesOf(r.result)).toEqual([SEQUENCE_FINAL, 0]);
+  });
+
+  it("CONTROL: replaceable=true + no explicit sequence emits 0xfffffffd", async () => {
+    // The default sequence under replaceable=true IS the RBF one, so the
+    // ordinary RBF call must keep working — and must EMIT 0xfffffffd, not
+    // merely succeed.
+    const r = await createRaw([{ txid: TXID, vout: 0 }], 0, true);
+    expect(r.error).toBeUndefined();
+    expect(sequencesOf(r.result)).toEqual([MAX_BIP125_RBF_SEQUENCE]);
+  });
 });

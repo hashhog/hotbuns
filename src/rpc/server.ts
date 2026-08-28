@@ -12053,14 +12053,34 @@ export class RPCServer {
     };
 
     // Match Core's guard: if replaceable was explicitly requested but no input
-    // actually signals opt-in RBF, the parameters contradict each other.
+    // actually signals opt-in RBF, the parameters contradict each other. This
+    // is the LAST thing ConstructTransaction does, after both AddInputs and
+    // AddOutputs (rawtransaction_util.cpp:166-168):
+    //
+    //   if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+    //       !SignalsOptInRBF(CTransaction(rawTx)))
+    //       throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter
+    //           combination: Sequence number(s) contradict replaceable option");
+    //
+    // `replaceableParam === true` is has_value() && value() in one expression:
+    // undefined and null both fall through, which is deliberate. An ABSENT
+    // argument still picks the RBF default sequence above (value_or(true)) but
+    // can never CONTRADICT anything, because the caller never stated the
+    // intent a sequence could contradict. Only an explicitly-supplied `true`
+    // arms this check.
+    //
+    // The CODE is Core's RPC_INVALID_PARAMETER (-8), not JSON-RPC's -32602.
+    // Core throws JSONRPCError(RPC_INVALID_PARAMETER, ...) here, and -32602
+    // ("Invalid params") tells a client the request envelope was malformed
+    // rather than that two well-formed arguments disagree — clients that
+    // switch on the code to decide whether to retry get the wrong answer.
     if (
       replaceableParam === true &&
       inputs.length > 0 &&
       !inputs.some((i) => i.sequence <= MAX_BIP125_RBF_SEQUENCE)
     ) {
       throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
+        RPCErrorCodes.INVALID_PARAMETER,
         "Invalid parameter combination: Sequence number(s) contradict replaceable option"
       );
     }
