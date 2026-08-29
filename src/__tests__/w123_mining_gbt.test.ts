@@ -604,7 +604,11 @@ describe("W123-G29: BIP-152 compact blocks — PRESENT", () => {
 // =============================================================================
 describe("W123-G30: getnetworkhashps window — PRESENT", () => {
   it("getNetworkHashPS computes workDiff / timeDiff over sliding window", () => {
-    const fn = rpcSlice("private async getNetworkHashPS(params:", 30);
+    // 2026-08-29: the slice was 30 lines, which stopped reaching the
+    // arithmetic once the handler gained Core's argument validation
+    // (getInt<int> widths, nblocks/height domain checks, height honoured).
+    // A fixed line count is a brittle way to look at a function; widen it.
+    const fn = rpcSlice("private async getNetworkHashPS(params:", 80);
     expect(fn).toContain("hiEntry.chainWork - loEntry.chainWork");
     expect(fn).toContain("hiEntry.header.timestamp - loEntry.header.timestamp");
     expect(fn).toContain("Number(hashps)");

@@ -317,11 +317,18 @@ describe("W139-G11: MaxUsableEstimate clamp (BUG-8, P1-API)", () => {
     expect(ESTIMATOR_SRC).not.toMatch(/historicalBest/);
   });
 
-  it("BUG-8: confTarget clamps only to [1, 1008] in RPC, not to data-span", () => {
-    // server.ts:4041 — `Math.max(1, Math.min(1008, confTargetParam))`
-    expect(RPC_SERVER_SRC).toMatch(
+  // FIXED 2026-08-29 (BUG-19 half): the RPC no longer CLAMPS -- it rejects
+  // out-of-[1,1008] like Core's ParseConfirmTarget. The remaining BUG-8 gap is
+  // the DATA-SPAN half: Core additionally clamps to MaxUsableEstimate, which
+  // the estimator above still does not model (asserted in the sibling test).
+  it("BUG-8: the RPC bound is the static [1, 1008], not the estimator's data-span", () => {
+    expect(RPC_SERVER_SRC).not.toMatch(
       /Math\.max\(\s*1,\s*Math\.min\(\s*1008,\s*confTargetParam\s*\)\s*\)/
     );
+    // The bound that IS enforced is the hardcoded 1008, passed in by the caller
+    // rather than read from the estimator's tracked span.
+    expect(RPC_SERVER_SRC).toMatch(/parseConfirmTarget\(confTargetParam,\s*1008\)/);
+    expect(RPC_SERVER_SRC).not.toMatch(/MaxUsableEstimate|HighestTargetTracked/);
   });
 });
 
@@ -599,29 +606,27 @@ describe("W139-G22: estimaterawfee inmempool semantics (BUG-18, P1-WIRE)", () =>
 // G23 — ParseConfirmTarget throws on out-of-range (BUG-19, P0-CDIV)
 // =============================================================================
 
-describe("W139-G23: out-of-range conf_target silently clamps (BUG-19, P0-CDIV)", () => {
-  it("BUG-19: estimatesmartfee Math.max/Math.min clamps instead of throwing", () => {
-    // Core: throws RPC_INVALID_PARAMETER "Invalid conf_target, must be
-    // between 1 and N". Hotbuns silently clamps.
-    expect(RPC_SERVER_SRC).toMatch(
-      /const\s+confTarget\s*=\s*Math\.max\(\s*1,\s*Math\.min\(\s*1008,\s*confTargetParam\s*\)\s*\)/
+// BUG-19 was FIXED on 2026-08-29. These three witnesses used to assert the
+// defect was PRESENT -- they matched the `Math.max(1, Math.min(1008, ...))`
+// clamp and asserted no "Invalid conf_target" path existed. They are inverted
+// here rather than deleted so the file still records that the gap audit found
+// this and the fix closed it; behavioural coverage lives in
+// src/__tests__/rpc_int_arg_bounds.test.ts, which drives the real server.
+describe("W139-G23: out-of-range conf_target REJECTED, not clamped (BUG-19 FIXED)", () => {
+  it("estimatesmartfee/estimaterawfee no longer clamp conf_target", () => {
+    expect(RPC_SERVER_SRC).not.toMatch(
+      /Math\.max\(\s*1,\s*Math\.min\(\s*1008,\s*confTargetParam\s*\)\s*\)/
     );
   });
 
-  it("BUG-19: estimaterawfee same silent-clamp pattern", () => {
-    // server.ts:4081 — second occurrence in estimateRawFee body.
-    const matches = RPC_SERVER_SRC.match(
-      /Math\.max\(\s*1,\s*Math\.min\(\s*1008,\s*confTargetParam\s*\)\s*\)/g
-    );
+  it("both call the shared Core-shaped parser", () => {
+    const matches = RPC_SERVER_SRC.match(/this\.parseConfirmTarget\(confTargetParam,\s*1008\)/g);
     expect(matches).not.toBeNull();
-    if (matches) {
-      expect(matches.length).toBeGreaterThanOrEqual(2);
-    }
+    if (matches) expect(matches.length).toBeGreaterThanOrEqual(2);
   });
 
-  it("BUG-19: no Invalid-conf_target error path", () => {
-    expect(RPC_SERVER_SRC).not.toMatch(/Invalid conf_target/);
-    expect(RPC_SERVER_SRC).not.toMatch(/ParseConfirmTarget/);
+  it("the Invalid-conf_target error path exists with Core's message", () => {
+    expect(RPC_SERVER_SRC).toMatch(/Invalid conf_target, must be between 1 and \$\{maxTarget\}/);
   });
 });
 

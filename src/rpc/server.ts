@@ -2878,6 +2878,10 @@ export class RPCServer {
         `JSON value of type ${this.coreUvType(timeout)} is not of expected type number`
       );
     }
+    // The width check lives INSIDE Core's conversion, so it fires before the
+    // negative-timeout test: an out-of-int32 timeout is -1, not -1 "Negative
+    // timeout" and not a silently narrowed wait.
+    this.uvGetInt(timeout, "timeout", INT32_MIN, INT32_MAX);
     if (timeout < 0) {
       throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Negative timeout");
     }
@@ -2895,7 +2899,9 @@ export class RPCServer {
         `JSON value of type ${this.coreUvType(height)} is not of expected type number`
       );
     }
-    return height;
+    // getInt<int>: out of int32 is a CONVERSION failure (-1), not a height
+    // that quietly wraps into the wait predicate.
+    return this.uvGetInt(height, "height", INT32_MIN, INT32_MAX);
   }
 
   /**
@@ -6368,7 +6374,8 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "conf_target must be an integer");
     }
 
-    const confTarget = Math.max(1, Math.min(1008, confTargetParam));
+    const confTarget = this.parseConfirmTarget(confTargetParam, 1008);
+    this.checkEstimateMode(params[1]);
 
     const estimate = this.feeEstimator.estimateSmartFee(confTarget);
 
@@ -6408,7 +6415,7 @@ export class RPCServer {
         "conf_target must be an integer"
       );
     }
-    const confTarget = Math.max(1, Math.min(1008, confTargetParam));
+    const confTarget = this.parseConfirmTarget(confTargetParam, 1008);
 
     let threshold = 0.95;
     if (thresholdParam !== undefined && thresholdParam !== null) {
@@ -7103,7 +7110,9 @@ export class RPCServer {
     if (countParam === undefined || countParam === null) {
       count = 1;
     } else if (typeof countParam === "number" && Number.isInteger(countParam)) {
-      count = countParam;
+      // Core: getInt<int> BEFORE the handler's own -8 range test, so an
+      // out-of-int32 count fails the conversion rather than being truncated.
+      count = this.uvGetInt(countParam, "count", INT32_MIN, INT32_MAX);
     } else {
       throw this.rpcError(
         RPCErrorCodes.INVALID_PARAMS,
@@ -9675,6 +9684,70 @@ export class RPCServer {
   }
 
   /**
+   * Core: `ConstructTransaction` (rpc/rawtransaction_util.cpp:151-156) reads
+   * locktime with getInt<int64_t>() and then bounds it to [0, LOCKTIME_MAX]
+   * (script.h) -- and createrawtransaction, createpsbt and
+   * walletcreatefundedpsbt ALL route through that one routine, so all three
+   * must answer identically.
+   *
+   * They did not: only createrawtransaction had the check. createpsbt took
+   * `typeof x === "number" ? x : 0` and walletcreatefundedpsbt wrapped with
+   * `>>> 0`, so 4294967296 became locktime 0 and the caller got a SUCCESS
+   * reply describing a transaction it had not asked for.
+   */
+  private parseLocktimeArg(value: unknown): number {
+    if (value === undefined || value === null) return 0;
+    const lt = this.uvGetInt(value, "locktime", INT64_MIN, INT64_MAX);
+    if (lt < 0 || lt > 0xffffffff) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Invalid parameter, locktime out of range"
+      );
+    }
+    return lt;
+  }
+
+  /**
+   * Core: rpc/util.cpp `ParseConfirmTarget`.  getInt<int> first (width and
+   * fractional -> -1), THEN the domain test against the estimator's highest
+   * tracked target.  CLAMPING instead of rejecting fabricates an estimate for
+   * a horizon the caller never asked about and reports it as success.
+   */
+  private parseConfirmTarget(value: number, maxTarget: number): number {
+    this.uvGetInt(value, "conf_target", INT32_MIN, INT32_MAX);
+    if (value < 1 || value > maxTarget) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        `Invalid conf_target, must be between 1 and ${maxTarget}`
+      );
+    }
+    return value;
+  }
+
+  /**
+   * Core validates estimate_mode with `FeeModeFromString`
+   * (common/messages.cpp), case-insensitively, and rejects anything outside
+   * the map.  Ignoring the argument accepted "" -- and any other garbage --
+   * and answered as though the default mode had been requested.
+   */
+  private checkEstimateMode(mode: unknown): void {
+    if (mode === undefined || mode === null) return;
+    if (typeof mode !== "string") {
+      throw this.rpcError(
+        RPCErrorCodes.TYPE_ERROR,
+        `JSON value of type ${this.uvTypeName(mode)} is not of expected type string`
+      );
+    }
+    const up = mode.toUpperCase();
+    if (up !== "UNSET" && up !== "ECONOMICAL" && up !== "CONSERVATIVE") {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        'Invalid estimate_mode parameter, must be one of: "unset", "economical", "conservative"'
+      );
+    }
+  }
+
+  /**
    * univalue's `uvTypeName` (univalue.cpp:217) for a decoded-JSON JS value.
    * Only used to build type-error messages byte-identical to Core's.
    */
@@ -11955,18 +12028,8 @@ export class RPCServer {
     // AddInputs picks the non-RBF default sequence based on nLockTime — and
     // before the inputs, because ConstructTransaction validates it first
     // (rawtransaction_util.cpp:151-156).
-    let lockTime = 0;
-    if (locktimeParam !== undefined && locktimeParam !== null) {
-      // Core: locktime.getInt<int64_t>(), then [0, LOCKTIME_MAX] (script.h:53).
-      const lt = this.uvGetInt(locktimeParam, "locktime", INT64_MIN, INT64_MAX);
-      if (lt < 0 || lt > 0xffffffff) {
-        throw this.rpcError(
-          RPCErrorCodes.INVALID_PARAMETER,
-          "Invalid parameter, locktime out of range"
-        );
-      }
-      lockTime = lt;
-    }
+    // Core: locktime.getInt<int64_t>(), then [0, LOCKTIME_MAX] (script.h:53).
+    const lockTime = this.parseLocktimeArg(locktimeParam);
 
     // Default per-input sequence, mirroring Core AddInputs
     // (rawtransaction_util.cpp:49-55) exactly:
@@ -13837,7 +13900,7 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "inputs must be an array");
     }
     const replaceable = replaceableParam === true;
-    const lockTime = typeof locktimeParam === "number" ? locktimeParam : 0;
+    const lockTime = this.parseLocktimeArg(locktimeParam);
     const sequenceDefault = replaceable ? 0xfffffffd : 0xfffffffe;
 
     const txInputs: TxIn[] = [];
@@ -14245,7 +14308,7 @@ export class RPCServer {
     }
 
     const wallet = this.getCurrentWallet();
-    const lockTime = (typeof locktimeParam === "number" ? locktimeParam : 0) >>> 0;
+    const lockTime = this.parseLocktimeArg(locktimeParam);
     const options = (typeof optionsParam === "object" && optionsParam) ? optionsParam as Record<string, unknown> : {};
     const replaceable = options.replaceable === true;
     const sequenceDefault = replaceable ? 0xfffffffd : 0xfffffffe;
@@ -15473,14 +15536,46 @@ export class RPCServer {
    * Mirrors Bitcoin Core: workDiff / timeDiff over a sliding window.
    */
   private async getNetworkHashPS(params: unknown[]): Promise<number> {
-    const nblocks = typeof params[0] === "number" ? params[0] : 120;
+    // Core: rpc/mining.cpp GetNetworkHashPS.  Both arguments are Arg<int>, and
+    // both degenerate values are REJECTED, not clamped -- and `height` selects
+    // the block to measure at.  Ignoring it answered every call with the
+    // hashrate at the tip, whatever height was asked for.
+    const nblocks =
+      params[0] === undefined || params[0] === null
+        ? 120
+        : this.uvGetInt(params[0], "nblocks", INT32_MIN, INT32_MAX);
+    const heightArg =
+      params[1] === undefined || params[1] === null
+        ? -1
+        : this.uvGetInt(params[1], "height", INT32_MIN, INT32_MAX);
+
+    if (nblocks < -1 || nblocks === 0) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Invalid nblocks. Must be a positive number or -1."
+      );
+    }
+
     const bestBlock = this.chainState.getBestBlock();
     const tipHeight = bestBlock.height;
-    if (tipHeight < 2) return 0;
+    if (heightArg < -1 || heightArg > tipHeight) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Block does not exist at specified height"
+      );
+    }
 
-    const window = nblocks <= 0 ? 120 : Math.min(nblocks, tipHeight);
-    const hiHeight = tipHeight;
-    const loHeight = hiHeight - window;
+    const hiHeight = heightArg >= 0 ? heightArg : tipHeight;
+    // Core: `if (pb == nullptr || !pb->nHeight) return 0`.
+    if (hiHeight < 1) return 0;
+
+    // nblocks == -1 means "since the last difficulty change"; a window longer
+    // than the chain is truncated to the chain.
+    let lookup = nblocks === -1
+      ? (hiHeight % this.params.difficultyAdjustmentInterval) + 1
+      : nblocks;
+    if (lookup > hiHeight) lookup = hiHeight;
+    const loHeight = hiHeight - lookup;
 
     const hiEntry = this.headerSync.getHeaderByHeight(hiHeight);
     const loEntry = this.headerSync.getHeaderByHeight(loHeight);
