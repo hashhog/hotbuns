@@ -8445,9 +8445,28 @@ export class RPCServer {
       block = deserializeBlock(reader);
       buf = null; // Release raw buffer (~1-4MB)
     } catch (err) {
+      // Core-exact decode-failure surface (rpc/mining.cpp:1079-1081):
+      //   if (!DecodeHexBlk(block, ...)) throw JSONRPCError(
+      //       RPC_DESERIALIZATION_ERROR, "Block decode failed");
+      // Two divergences lived on this line:
+      //   1. code MISC_ERROR (-1) where Core uses
+      //      RPC_DESERIALIZATION_ERROR (-22);
+      //   2. the underlying decoder text was appended to the message.
+      //      Core never leaks it — DecodeHexBlk swallows the
+      //      std::ios_base::failure ("non-canonical ReadCompactSize()",
+      //      serialize.h:344/:350/:356) and returns a bare bool.
+      // (2) is what the diff-test normalizer saw as reject:non-canonical
+      // against Core's reject:block-decode-failed on all 4 rows of corpus
+      // _tierc-guards-2026-07-06/C1-noncanonical-compactsize.  Both nodes
+      // REJECTED and the tip never moved, so this is R2 reason-token
+      // parity, not a consensus split.  Keep the detail in the log.
+      getLogger().debug(
+        "rpc",
+        `submitblock: block decode failed: ${err instanceof Error ? err.message : String(err)}`
+      );
       throw this.rpcError(
-        RPCErrorCodes.MISC_ERROR,
-        `Block decode failed: ${err instanceof Error ? err.message : String(err)}`
+        RPCErrorCodes.DESERIALIZATION_ERROR,
+        "Block decode failed"
       );
     }
 
