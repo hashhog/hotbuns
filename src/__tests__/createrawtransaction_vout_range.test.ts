@@ -406,3 +406,109 @@ describe("createrawtransaction vout/sequence/locktime range — REGRESSION", () 
     expect(sequencesOf(r.result)).toEqual([MAX_BIP125_RBF_SEQUENCE]);
   });
 });
+
+/**
+ * createrawtransaction must HONOUR the `version` argument, not ignore it.
+ *
+ * THE DEFECT.  Core's createrawtransaction takes a 5th argument, `version`
+ * (bitcoin-core/src/rpc/rawtransaction.cpp:122).  It reads it as
+ * `self.Arg<uint32_t>("version")`, bounds it to
+ * [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]
+ * (src/policy/policy.h:152-153) and EMITS it
+ * (src/rpc/rawtransaction_util.cpp:158-161).
+ *
+ * hotbuns hardcoded `version: 2` and ignored the argument.  Asked for version
+ * 1, 2 or 3 it returned 02000000 every time, and version 4 — which Core
+ * rejects — was accepted.  A success reply for a request that was not
+ * honoured, and not cosmetic: version 3 is TRUC (BIP 431), so a caller who
+ * asked for v3 and received v2 holds a transaction with different relay
+ * behaviour from the one they requested, with nothing in the reply saying so.
+ *
+ * Measured 2026-08-29 by tools/rpc-arg-differential.py against a real regtest
+ * Core: seven of the ten implementations behaved identically here.
+ *
+ * THE UNSIGNED WIDTH DECIDES WHICH ERROR YOU GET.  `version` is read as uint32,
+ * unlike the int32 used for `vout`, so 2147483648 SURVIVES the conversion and
+ * reaches the DOMAIN error (-8), while -1 and 4294967296 fail the CONVERSION
+ * first (-1).  Those two are asserted separately; collapsing them would look
+ * close enough and be wrong in both directions.
+ *
+ * THE ASSERTIONS DECODE THE VERSION BYTES off the returned transaction with the
+ * node's own deserializer.  Checking only that the call was accepted is exactly
+ * the pre-fix behaviour.
+ */
+describe("createrawtransaction version — REGRESSION (was hardcoded 2)", () => {
+  let server: RPCServer;
+  let port: number;
+
+  beforeEach(() => {
+    const out = makeServer();
+    server = out.server;
+    port = out.port;
+  });
+
+  afterEach(() => {
+    server.stop();
+  });
+
+  async function callVersion(version?: unknown): Promise<any> {
+    const params: any[] = [[{ txid: TXID, vout: 0 }], OUTPUTS, 0, false];
+    if (version !== undefined) params.push(version);
+    const r = await fetch(`http://127.0.0.1:${port}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "createrawtransaction", params }),
+    });
+    return r.json();
+  }
+
+  /** The transaction version, decoded with the node's own deserializer. */
+  function versionOf(resp: any): number {
+    expect(resp.error ?? null).toBeNull();
+    expect(typeof resp.result).toBe("string");
+    const tx = deserializeTx(new BufferReader(Buffer.from(resp.result, "hex")));
+    return tx.version;
+  }
+
+  function expectVersionError(resp: any, code: number, message: string): void {
+    expect(resp.result ?? null).toBeNull();
+    expect(resp.error).toBeDefined();
+    expect(typeof resp.error.code).toBe("number");
+    expect(resp.error.code).toBe(code);
+    expect(resp.error.message).toBe(message);
+  }
+
+  it("versions 1, 2 and 3 are emitted, not forced to 2", async () => {
+    for (const want of [1, 2, 3]) {
+      expect(versionOf(await callVersion(want))).toBe(want);
+    }
+  });
+
+  it("version 0 and 4 are rejected with Core's domain error", async () => {
+    for (const bad of [0, 4]) {
+      expectVersionError(await callVersion(bad), -8,
+        "Invalid parameter, version out of range(1~3)");
+    }
+  });
+
+  it("2147483648 fits uint32 so it reaches the DOMAIN error (-8), not -1", async () => {
+    expectVersionError(await callVersion(2147483648), -8,
+      "Invalid parameter, version out of range(1~3)");
+  });
+
+  it("4294967296 and -1 are outside uint32 so CONVERSION fails first (-1)", async () => {
+    for (const bad of [4294967296, -1, -2147483649]) {
+      expectVersionError(await callVersion(bad), -1, "JSON integer out of range");
+    }
+  });
+
+  // CONTROLS. Without these a handler that rejected every version would
+  // satisfy every rejection assertion above.
+  it("CONTROL absent version defaults to 2 (Core DEFAULT_RAWTX_VERSION)", async () => {
+    expect(versionOf(await callVersion(undefined))).toBe(2);
+  });
+
+  it("CONTROL explicit null version defaults to 2", async () => {
+    expect(versionOf(await callVersion(null))).toBe(2);
+  });
+});

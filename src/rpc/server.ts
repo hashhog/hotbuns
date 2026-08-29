@@ -353,6 +353,11 @@ const INT32_MIN = -2147483648;
 const INT32_MAX = 2147483647;
 const INT64_MIN = Number.MIN_SAFE_INTEGER;
 const INT64_MAX = Number.MAX_SAFE_INTEGER;
+// Core reads createrawtransaction's `version` with Arg<uint32_t>, so its
+// conversion bound is UNSIGNED 32-bit -- not the INT32 range used for `vout`.
+// That asymmetry is what makes 2147483648 a DOMAIN error (-8) and -1 a
+// CONVERSION error (-1).
+const UINT32_MAX = 4294967295;
 
 /**
  * Maximum number of requests allowed in a batch.
@@ -11882,7 +11887,35 @@ export class RPCServer {
    * Returns the serialized (non-witness; the tx is unsigned) transaction hex.
    */
   private async createRawTransaction(params: unknown[]): Promise<string> {
-    const [inputsParam, outputsParam, locktimeParam, replaceableParam] = params;
+    const [inputsParam, outputsParam, locktimeParam, replaceableParam, versionParam] =
+      params;
+
+    // version (Core's 5th argument, rpc/rawtransaction.cpp:122).
+    //
+    // This handler hardcoded `version: 2` and IGNORED the argument, so a caller
+    // asking for version 3 got a version 2 transaction and a success reply, and
+    // version 4 -- which Core rejects -- was accepted. Version 3 is TRUC
+    // (BIP 431) and carries different policy rules, so the transaction returned
+    // had different relay behaviour from the one requested.
+    //
+    // Core reads it as self.Arg<uint32_t>("version") -- UNSIGNED 32-bit, unlike
+    // the int32 used for vout -- then bounds it to
+    // [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]
+    // (policy/policy.h:152-153) inside ConstructTransaction
+    // (rawtransaction_util.cpp:158-161). The unsigned width decides the error:
+    // 2147483648 fits a uint32, survives the conversion and reaches the DOMAIN
+    // error (-8), while -1 and 4294967296 fail the CONVERSION first (-1).
+    let txVersion = 2; // Core's DEFAULT_RAWTX_VERSION (CURRENT_VERSION)
+    if (versionParam !== undefined && versionParam !== null) {
+      const v = this.uvGetInt(versionParam, "version", 0, UINT32_MAX);
+      if (v < 1 || v > 3) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          "Invalid parameter, version out of range(1~3)"
+        );
+      }
+      txVersion = v;
+    }
 
     if (!Array.isArray(inputsParam)) {
       throw this.rpcError(
@@ -12065,7 +12098,8 @@ export class RPCServer {
     }
 
     const tx: Transaction = {
-      version: 2,
+      // Was hardcoded 2, discarding the caller's `version`.
+      version: txVersion,
       inputs,
       outputs,
       lockTime,
@@ -13769,7 +13803,35 @@ export class RPCServer {
    * @param params [inputs, outputs, locktime?, replaceable?]
    */
   private async createPSBTRpc(params: unknown[]): Promise<string> {
-    const [inputsParam, outputsParam, locktimeParam, replaceableParam] = params;
+    const [inputsParam, outputsParam, locktimeParam, replaceableParam, versionParam] =
+      params;
+
+    // version (Core's 5th argument, rpc/rawtransaction.cpp:122).
+    //
+    // This handler hardcoded `version: 2` and IGNORED the argument, so a caller
+    // asking for version 3 got a version 2 transaction and a success reply, and
+    // version 4 -- which Core rejects -- was accepted. Version 3 is TRUC
+    // (BIP 431) and carries different policy rules, so the transaction returned
+    // had different relay behaviour from the one requested.
+    //
+    // Core reads it as self.Arg<uint32_t>("version") -- UNSIGNED 32-bit, unlike
+    // the int32 used for vout -- then bounds it to
+    // [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]
+    // (policy/policy.h:152-153) inside ConstructTransaction
+    // (rawtransaction_util.cpp:158-161). The unsigned width decides the error:
+    // 2147483648 fits a uint32, survives the conversion and reaches the DOMAIN
+    // error (-8), while -1 and 4294967296 fail the CONVERSION first (-1).
+    let txVersion = 2; // Core's DEFAULT_RAWTX_VERSION (CURRENT_VERSION)
+    if (versionParam !== undefined && versionParam !== null) {
+      const v = this.uvGetInt(versionParam, "version", 0, UINT32_MAX);
+      if (v < 1 || v > 3) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          "Invalid parameter, version out of range(1~3)"
+        );
+      }
+      txVersion = v;
+    }
 
     if (!Array.isArray(inputsParam)) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "inputs must be an array");
@@ -13851,7 +13913,8 @@ export class RPCServer {
     }
 
     const tx: Transaction = {
-      version: 2,
+      // Was hardcoded 2, discarding the caller's `version`.
+      version: txVersion,
       inputs: txInputs,
       outputs: txOutputs,
       lockTime: lockTime >>> 0,
