@@ -1859,6 +1859,11 @@ export class RPCServer {
     // the parse boundary, BEFORE the LookupBlockIndex "Block not found" (-5).
     const blockhash = this.parseHashV(blockhashParam, "blockhash");
 
+    if (typeof verbosityParam === "number") {
+      // getInt<int> before the block lookup: this answered -5 "Block not
+      // found" for an out-of-int32 verbosity where Core answers -1.
+      this.uvGetInt(verbosityParam, "verbosity", INT32_MIN, INT32_MAX);
+    }
     const verbosity = typeof verbosityParam === "number" ? verbosityParam : 1;
 
     // Get block index record first to check if pruned
@@ -2241,6 +2246,9 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "height must be an integer");
     }
 
+    // Core's getInt<int> fails in the CONVERSION, so an out-of-int32 value
+    // never reaches the lookup or the domain test below.
+    this.uvGetInt(heightParam, "height", INT32_MIN, INT32_MAX);
     const height = heightParam;
     // Core parity (bitcoin-core/src/rpc/blockchain.cpp::getblockhash):
     //   if (nHeight < 0 || nHeight > active_chain.Height())
@@ -3696,6 +3704,9 @@ export class RPCServer {
    */
   private async getChainTxStats(params: unknown[]): Promise<Record<string, unknown>> {
     const [nblocksParam, blockhashParam] = params ?? [];
+    if (typeof nblocksParam === "number") {
+      this.uvGetInt(nblocksParam, "nblocks", INT32_MIN, INT32_MAX);
+    }
 
     // Default window: one month of blocks at the network's target spacing.
     // Mirrors Core: 30*24*60*60 / nPowTargetSpacing (4320 on mainnet@600s).
@@ -4283,6 +4294,12 @@ export class RPCServer {
         RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
         "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved"
       );
+    }
+
+    // getInt<int> runs in the CONVERSION, so an out-of-int32 verbosity is -1
+    // before the tx is ever looked up; this answered -5 "No such transaction".
+    if (typeof verboseParam === "number") {
+      this.uvGetInt(verboseParam, "verbosity", INT32_MIN, INT32_MAX);
     }
 
     // Parse verbose param: boolean or number (0/1/2 like Bitcoin Core).
@@ -7846,15 +7863,51 @@ export class RPCServer {
    */
   private async disconnectNode(params: unknown[]): Promise<null> {
     let address: string | undefined;
+    let nodeidParam: unknown = params[1];
 
     if (typeof params[0] === "string") {
       address = params[0];
     } else if (typeof params[0] === "object" && params[0] !== null) {
-      address = (params[0] as Record<string, unknown>).address as string | undefined;
+      const o = params[0] as Record<string, unknown>;
+      address = o.address as string | undefined;
+      if (o.nodeid !== undefined) nodeidParam = o.nodeid;
+    }
+
+    // Core (rpc/net.cpp::disconnectnode) accepts EITHER address or nodeid and
+    // requires strictly one. hotbuns read only address, so every by-nodeid call
+    // -- the form getpeerinfo's "id" field exists to feed -- was refused with
+    // -32602 where Core disconnects, or answers -29 when the id is not connected.
+    const haveAddress = address !== undefined && address !== "";
+    const haveNodeid = nodeidParam !== undefined && nodeidParam !== null;
+
+    if (haveNodeid && !haveAddress) {
+      const nodeid = this.uvGetInt(nodeidParam, "nodeid", INT64_MIN, INT64_MAX);
+      // getpeerinfo reports id as the index into getConnectedPeers(); by-id
+      // disconnect must use the SAME mapping or the two disagree.
+      const connected = this.peerManager.getConnectedPeers();
+      const target = connected[nodeid];
+      if (nodeid < 0 || nodeid >= connected.length || target === undefined) {
+        throw this.rpcError(
+          RPCErrorCodes.CLIENT_NODE_NOT_CONNECTED,
+          "Node not found in connected nodes"
+        );
+      }
+      this.peerManager.disconnectPeer(`${target.host}:${target.port}`);
+      return null;
+    }
+
+    if (haveAddress && haveNodeid) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "Only one of address and nodeid should be provided."
+      );
     }
 
     if (!address || typeof address !== "string") {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Node address required");
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMS,
+        "Only one of address and nodeid should be provided."
+      );
     }
 
     // Parse host:port
@@ -8036,20 +8089,46 @@ export class RPCServer {
     }
 
     if (command === "add") {
+      // Core checks IsBanned FIRST, before bantime is read (rpc/net.cpp).
+      if (this.peerManager.isBanned(ip)) {
+        throw this.rpcError(
+          RPCErrorCodes.CLIENT_NODE_ALREADY_ADDED,
+          "Error: IP/Subnet already banned"
+        );
+      }
       const bantime = typeof bantimeParam === "number" ? bantimeParam : 24 * 60 * 60;
       const absolute = absoluteParam === true;
-
-      if (bantime <= 0) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Ban time must be positive");
+      // Core (rpc/net.cpp): an ABSOLUTE bantime already in the past is
+      // rejected, not silently accepted. Found by the differential's CONTROL,
+      // not by a hostile integer.
+      if (absolute && bantime < Math.floor(Date.now() / 1000)) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          "Error: Absolute timestamp is in the past"
+        );
       }
 
-      this.peerManager.banAddress(ip, bantime, "manually banned via setban RPC");
-      console.log(`Banned ${ip} for ${bantime} seconds`);
+      // Core has NO positivity check: bantime 0 means "use the default", and a
+      // negative relative bantime is accepted (it simply records an already-
+      // expired ban). Rejecting these with -32602 was a spurious refusal of
+      // calls Core answers.
+      // banAddress takes a DURATION. Core's BanMan::Ban takes the absolute flag
+      // and converts; hotbuns passed the raw value either way, so `setban ip add
+      // <now+3600> true` -- a one-hour ban -- was recorded as a 56-YEAR one.
+      // Caught by this fix's own CONTROL, not by a hostile integer.
+      const defaulted = bantime === 0 ? 24 * 60 * 60 : bantime;
+      const duration = absolute ? defaulted - Math.floor(Date.now() / 1000) : defaulted;
+      this.peerManager.banAddress(ip, duration, "manually banned via setban RPC");
+      console.log(`Banned ${ip} for ${duration} seconds`);
       return null;
     } else if (command === "remove") {
       const removed = this.peerManager.unbanAddress(ip);
       if (!removed) {
-        throw this.rpcError(RPCErrorCodes.MISC_ERROR, `Error: IP/Subnet ${ip} is not banned`);
+        // Core: RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) with this exact wording.
+        throw this.rpcError(
+          RPCErrorCodes.CLIENT_INVALID_IP_OR_SUBNET,
+          "Error: Unban failed. Requested address/subnet was not previously manually banned."
+        );
       }
       console.log(`Unbanned ${ip}`);
       return null;
@@ -10955,6 +11034,9 @@ export class RPCServer {
     if (typeof nrequiredParam !== "number" || !Number.isInteger(nrequiredParam)) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "nrequired must be an integer");
     }
+    // Core answers -1 for an out-of-int32 nrequired even when pubkeys is ALSO
+    // empty: the conversion runs before the array is examined.
+    this.uvGetInt(nrequiredParam, "nrequired", INT32_MIN, INT32_MAX);
     const nRequired = nrequiredParam;
 
     // Validate pubkeys array
@@ -12285,7 +12367,13 @@ export class RPCServer {
     if (params[1] === undefined || params[1] === null) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "vout index required");
     }
-    const vout = Number(params[1]);
+    // Core reads n as getInt<uint32_t>. Without this bound the value reached
+    // Buffer.writeUInt32LE, whose RangeError escaped as
+    // `"code": "ERR_OUT_OF_RANGE"` -- a STRING where JSON-RPC requires an
+    // integer code, so a client switching on error.code got a type it cannot
+    // handle. Same defect the createrawtransaction pin called out; it was
+    // still live here.
+    const vout = this.uvGetInt(params[1], "n", 0, UINT32_MAX);
     const includeMempool = params[2] !== false;
     const bestBlock = this.chainState.getBestBlock();
     const bestBlockHash = Buffer.from(bestBlock.hash).reverse().toString("hex");
