@@ -551,6 +551,48 @@ describe("RPCServer", () => {
       expect(result.error.code).toBe(RPCErrorCodes.METHOD_NOT_FOUND);
     });
 
+    // ---------------------------------------------------------------------
+    // #103 -- Core's central argument-count gate, over the real HTTP path.
+    // ---------------------------------------------------------------------
+    // Core checks arity in one place, after the method lookup and before any
+    // handler runs (rpc/util.cpp:644 -> IsValidNumArgs, :733):
+    // required <= n <= declared, else -1 with the help text. hotbuns went
+    // straight from this.methods.get(...) into handler(params), so surplus
+    // positional arguments were silently dropped -- even though handlers here
+    // already documented the behaviour ("Params: NONE. Any argument is a
+    // dispatcher arity error." -- ping, server.ts:7962).
+    //
+    // Verified read-only against the live Core oracle 2026-08-31:
+    //   getblockhash []           -> -1 "getblockhash height"
+    //   getblockcount ["surplus"] -> -1 "getblockcount"
+    //
+    // These go through fetch() against a running RPCServer, so they bind the
+    // gate to the dispatcher rather than to the lookup table.
+    it("#103: rejects a surplus positional argument with -1", async () => {
+      const result = await rpcRequest(testPort, "getblockcount", ["surplus"]);
+      expect(result.error.code).toBe(-1);
+      expect(result.result).toBeUndefined();
+    });
+
+    it("#103: rejects a missing required argument with -1", async () => {
+      const result = await rpcRequest(testPort, "getblockhash", []);
+      expect(result.error.code).toBe(-1);
+    });
+
+    it("#103 CONTROL: a correct call still reaches the handler", async () => {
+      // Without this, a gate that refused everything would satisfy both tests
+      // above. Assert the ANSWER, not just the absence of an error.
+      const result = await rpcRequest(testPort, "getblockcount", []);
+      expect(result.error).toBeUndefined();
+      expect(typeof result.result).toBe("number");
+    });
+
+    it("#103 CONTROL: an unlisted method is still METHOD_NOT_FOUND, not -1", async () => {
+      // Ordering is Core's: the method lookup happens first.
+      const result = await rpcRequest(testPort, "unknownmethod", ["a", "b"]);
+      expect(result.error.code).toBe(RPCErrorCodes.METHOD_NOT_FOUND);
+    });
+
     it("should handle batched requests", async () => {
       const response = await fetch(`http://127.0.0.1:${testPort}`, {
         method: "POST",

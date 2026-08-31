@@ -154,11 +154,42 @@ import {
   type PendingPayJoinRequestsMap,
 } from "../payjoin/receiver.js";
 import {
+
   sendPayJoinRequestWithFallback,
   buildOriginalPsbtFromSignedTx,
   PayJoinSenderError,
   type PayJoinSenderOptions,
 } from "../payjoin/sender.js";
+
+// ---------------------------------------------------------------------------
+// Core's central argument-count gate (#103)
+// ---------------------------------------------------------------------------
+// Maps method -> (required, declared), derived from Core's own `help` signature
+// line by tools/core-arity.py. Coverage is 87 of 103 methods; a method absent
+// from the table FAILS OPEN, because treating an unlisted method as zero-arg
+// would reject calls Core accepts.
+import CORE_ARITY_TABLE from "./core-arity.json";
+
+export interface CoreArity {
+  required: number;
+  declared: number;
+}
+
+export function coreArityFor(method: string): CoreArity | undefined {
+  // Entries also carry a "sig" field (Core's raw help signature line). Return
+  // only the two counts so the result is exactly what the type claims.
+  const e = (
+    CORE_ARITY_TABLE as Record<
+      string,
+      { required?: unknown; declared?: unknown } | undefined
+    >
+  )[method];
+  if (!e || typeof e.required !== "number" || typeof e.declared !== "number") {
+    return undefined;
+  }
+  return { required: e.required, declared: e.declared };
+}
+
 
 /**
  * JSON-RPC request format.
@@ -1179,6 +1210,33 @@ export class RPCServer {
           message: `Method '${request.method}' not found`,
         },
       };
+    }
+
+    // Core validates argument COUNT centrally, after the method lookup and
+    // before any handler runs (rpc/util.cpp:644 -> IsValidNumArgs, :733):
+    // required <= n <= declared, else it throws the help text as error -1.
+    // Several handlers in this file already document "any argument is a
+    // dispatcher arity error" (e.g. ping, :7962) -- this is the dispatcher
+    // that was supposed to enforce it.
+    //
+    // Verified read-only against the live Core oracle 2026-08-31:
+    //   getblockhash []           -> -1 "getblockhash height"
+    //   getblockcount ["surplus"] -> -1 "getblockcount"
+    // Ordering is Core's: an unknown method is METHOD_NOT_FOUND above.
+    // Named params (an object) are exempt -- Core resolves those by name.
+    if (Array.isArray(request.params)) {
+      const arity = coreArityFor(request.method);
+      if (
+        arity &&
+        (request.params.length < arity.required ||
+          request.params.length > arity.declared)
+      ) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: { code: -1, message: "Wrong number of arguments" },
+        };
+      }
     }
 
     // Execute method
