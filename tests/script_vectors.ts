@@ -13,6 +13,7 @@
  */
 
 import { readFileSync } from "fs";
+import { findVectorFile } from "./vector-path";
 import {
   Opcode,
   verifyScript,
@@ -34,8 +35,7 @@ import {
 import { taggedHash } from "../src/crypto/primitives.js";
 import { schnorr } from "@noble/curves/secp256k1.js";
 
-const VECTOR_PATH =
-  "/home/max/hashhog/bitcoin/src/test/data/script_tests.json";
+const VECTOR_PATH = findVectorFile("script_tests.json");
 
 // ---------------------------------------------------------------------------
 // Opcode name lookup

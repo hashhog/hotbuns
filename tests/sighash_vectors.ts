@@ -8,10 +8,11 @@
  */
 
 import { readFileSync } from "fs";
+import { findVectorFile } from "./vector-path";
 import { BufferReader } from "../src/wire/serialization";
 import { deserializeTx, sigHashLegacy } from "../src/validation/tx";
 
-const VECTOR_PATH = "/home/max/hashhog/ouroboros/bitcoin/src/test/data/sighash.json";
+const VECTOR_PATH = findVectorFile("sighash.json");
 
 const raw = readFileSync(VECTOR_PATH, "utf-8");
 const vectors: any[] = JSON.parse(raw);
