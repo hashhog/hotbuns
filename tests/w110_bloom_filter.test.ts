@@ -777,7 +777,9 @@ describe("Structural summary: CBloomFilter subsystem entirely absent", () => {
       "utf8"
     );
     expect(serverSrc).toContain("w47bTraverseAndBuild");
-    expect(serverSrc).toContain("w47bTraverseAndExtract");
+    // Renamed w47bTraverseAndExtract -> w47bExtractMatches in a14f84d
+    // (full Core merkleblock.cpp CPartialMerkleTree::ExtractMatches parity).
+    expect(serverSrc).toContain("w47bExtractMatches");
     // Wired only to gettxoutproof/verifytxoutproof, not to a P2P merkleblock path:
     expect(serverSrc).toContain("gettxoutproof");
     expect(serverSrc).toContain("verifytxoutproof");

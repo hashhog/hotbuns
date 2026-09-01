@@ -90,6 +90,12 @@ class MockPeerManager {
   }
 
   // ── setban surface ──
+  // Core rpc/net.cpp setban: "add" first checks BanMan::IsBanned and throws
+  // RPC_CLIENT_NODE_ALREADY_ADDED (-23) if already banned; server.ts mirrors
+  // that via peerManager.isBanned() before banAddress().
+  isBanned(address: string): boolean {
+    return this.banned.has(address);
+  }
   banAddress(address: string, _banTime?: number, _reason?: string) {
     this.banned.add(address);
   }

@@ -396,7 +396,10 @@ describe("sendrawtransaction", () => {
       const result = await rpcRequest(testPort, "sendrawtransaction", []);
 
       expect(result.error).toBeDefined();
-      expect(result.error!.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+      // Core rpc/util.cpp:644 IsValidNumArgs fails -> std::runtime_error(help)
+      // -> rpc/server.cpp:515 RPC_MISC_ERROR (-1), not -32602 (hotbuns d30ea9d).
+      expect(result.error!.code).toBe(RPCErrorCodes.MISC_ERROR);
+      expect(result.error!.code).toBe(-1);
       expect(result.error!.message).toContain("hexstring");
     });
 
