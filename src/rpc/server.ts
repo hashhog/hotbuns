@@ -190,6 +190,21 @@ export function coreArityFor(method: string): CoreArity | undefined {
   return { required: e.required, declared: e.declared };
 }
 
+/**
+ * Core's help signature line for a method (the first line of RPCHelpMan::
+ * ToString()), or undefined when the table has no entry. This is the message
+ * Core attaches to the -1 arity error: rpc/util.cpp:644 throws the help text
+ * and rpc/server.cpp:515 wraps it as RPC_MISC_ERROR, so a caller of
+ * `sendrawtransaction []` sees `sendrawtransaction "hexstring" ( ... )`, not
+ * a generic phrase.
+ */
+export function coreSignatureFor(method: string): string | undefined {
+  const e = (CORE_ARITY_TABLE as Record<string, { sig?: unknown } | undefined>)[
+    method
+  ];
+  return e && typeof e.sig === "string" ? e.sig : undefined;
+}
+
 
 /**
  * JSON-RPC request format.
@@ -1234,7 +1249,11 @@ export class RPCServer {
         return {
           jsonrpc: "2.0",
           id,
-          error: { code: -1, message: "Wrong number of arguments" },
+          error: {
+            code: -1,
+            // Core's message IS the help text (first line = signature).
+            message: coreSignatureFor(request.method) ?? "Wrong number of arguments",
+          },
         };
       }
     }
