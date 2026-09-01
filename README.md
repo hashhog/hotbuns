@@ -13,6 +13,8 @@ docker run -v hotbuns-data:/data -p 48349:48349 -p 48339:48339 hotbuns
 
 ### From Source
 
+Requires Bun 1.2+ (Dockerfile pins `oven/bun:1.2`; fleet builds run Bun 1.3.11 — Node.js is NOT supported) and the system `libsecp256k1` >= 0.4.0 (`apt install libsecp256k1-dev`, see Cryptography below).
+
 ```bash
 bun install
 bun run src/index.ts start --network=testnet4
