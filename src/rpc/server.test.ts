@@ -11,6 +11,8 @@ import { OrphanPool } from "../mempool/orphan_pool.js";
 import { BufferReader } from "../wire/serialization.js";
 import { hash256 } from "../crypto/primitives.js";
 import { bip22Result, ConsensusErrorCode } from "../validation/errors.js";
+import { checkProofOfWork } from "../consensus/pow.js";
+import { RBFTransactionState } from "../mempool/rbf.js";
 import { PeerManager, ServiceFlags, isRoutable } from "../p2p/manager.js";
 import { BIP155Network } from "../p2p/addrv2.js";
 import { ChainDB, COINS_DB_BLOCK_CACHE_BYTES } from "../storage/database.js";
@@ -51,6 +53,14 @@ class MockMempool {
 
   getAllTxids(): Buffer[] {
     return Array.from(this.entries.values()).map(e => e.txid);
+  }
+
+  // Required by the verbose getrawmempool / getmempoolancestors /
+  // getmempooldescendants paths, which populate Core's entryToJSON
+  // "bip125-replaceable" field (Core rpc/mempool.cpp entryToJSON,
+  // policy/rbf.cpp IsRBFOptIn). Mock entries carry no real tx, so report FINAL.
+  getRBFOptInState(_txid: Buffer): RBFTransactionState {
+    return RBFTransactionState.FINAL;
   }
 
   // Required by BlockTemplateBuilder.selectTransactions, which is now reached
@@ -919,6 +929,8 @@ describe("RPCServer", () => {
       expect(result.result[txidHex]).toBeDefined();
       expect(result.result[txidHex].vsize).toBe(200);
       expect(result.result[txidHex].weight).toBe(800);
+      // Core rpc/mempool.cpp entryToJSON: verbose entries carry bip125-replaceable.
+      expect(result.result[txidHex]["bip125-replaceable"]).toBe(false);
     });
   });
 
@@ -1065,6 +1077,7 @@ describe("RPCServer", () => {
       expect(child.weight).toBe(1000);
       expect(child.depends).toEqual([a.toString("hex")]);
       expect(child.spentby).toEqual([]);
+      expect(child["bip125-replaceable"]).toBe(false);
     });
 
     it("returns empty list when leaf has no descendants", async () => {
@@ -2382,8 +2395,11 @@ describe("RPCServer", () => {
       expect(bip22Result(ConsensusErrorCode.BAD_COINBASE_HEIGHT)).toBe("bad-cb-height");
     });
 
-    it("ConsensusErrorCode.SCRIPT_VERIFY_FLAG_FAILED → 'mandatory-script-verify-flag-failed'", () => {
-      expect(bip22Result(ConsensusErrorCode.SCRIPT_VERIFY_FLAG_FAILED)).toBe("mandatory-script-verify-flag-failed");
+    // Core validation.cpp:2122 (CheckInputScripts, block path): the connect-block
+    // token is "block-script-verify-flag-failed (%s)"; "mandatory-…" no longer
+    // exists anywhere in Core (mempool path is "mempool-script-verify-flag-failed").
+    it("ConsensusErrorCode.SCRIPT_VERIFY_FLAG_FAILED → 'block-script-verify-flag-failed'", () => {
+      expect(bip22Result(ConsensusErrorCode.SCRIPT_VERIFY_FLAG_FAILED)).toBe("block-script-verify-flag-failed");
     });
 
     it("ConsensusErrorCode.DUPLICATE_INPUTS → 'bad-txns-duplicate'", () => {
@@ -2474,19 +2490,26 @@ describe("RPCServer", () => {
       const txid = getTxId(coinbaseTx);
       const correctMerkle = computeMerkleRoot([txid]);
 
-      // Nonces pre-mined to produce a valid PoW hash (< REGTEST.powLimit).
-      // With prevBlock=0x00..00, timestamp=1296688602, bits=REGTEST.powLimitBits:
-      //   valid-merkle block:  nonce=1 → hash 0x4a9b3dad...
-      //   bad-merkle block:    nonce=0 → hash 0x0c345c94...
-      const nonce = opts.badMerkle ? 0 : 1;
+      // Header nVersion must be >= 4: REGTEST has bip34/bip66/bip65Height = 1
+      // (Core kernel/chainparams.cpp:536-539), so ContextualCheckBlockHeader
+      // (Core validation.cpp:4113-4117) rejects nVersion < 4 at any height >= 1
+      // with "bad-version(0x%08x)". validateBlock mirrors that gate on the
+      // submitblock path (src/validation/block.ts), so a version-1 header never
+      // reaches injectBlock.
       const header: import("../validation/block.js").BlockHeader = {
-        version: 1,
+        version: 4,
         prevBlock: Buffer.alloc(32, 0), // matches MockHeaderSync.getHeader returning an entry
         merkleRoot: opts.badMerkle ? Buffer.alloc(32, 0xab) : correctMerkle,
         timestamp: 1296688602,
         bits: REGTEST.powLimitBits,
-        nonce,
+        nonce: 0,
       };
+      // Mine the nonce deterministically (lowest nonce whose hash <= REGTEST.powLimit)
+      // instead of hard-coding one: any header-field change would otherwise
+      // silently turn every test here into a "high-hash" rejection.
+      while (!checkProofOfWork(getBlockHash(header), header.bits, REGTEST)) {
+        header.nonce++;
+      }
 
       const block: import("../validation/block.js").Block = {
         header,
