@@ -34,13 +34,19 @@ its 16 GiB memory ceiling after about 1 day 16 hours of mainnet uptime and stopp
 answering RPC entirely for 35 minutes. The process stayed alive and kept accepting
 mempool transactions the whole time, so nothing restarted it automatically and a
 process-liveness check would have called it healthy. It reaches roughly 7.5 GiB
-within an hour of a cold start and about 12 GiB by two hours, then oscillates in
-that band rather than climbing steadily — six samples over six minutes at the
-two-hour mark ran 11.90–12.23 GiB and trended *down*. So a high reading is not by
-itself a sign of imminent failure, and the shape of the curve between two hours
-and the ceiling has not been characterised: the only evidence for the far end is
-the single observed wedge. Recovery needed a manual stop, and it did not respond
-to SIGTERM — it took SIGKILL after a 30-second grace.
+within an hour of a cold start. Beyond that the rate is **not predictable**, and
+two attempts to describe it as a curve were both wrong. Measured on one run:
+~7.5 GiB at 1 h, 11.90–12.23 GiB across six samples at 2 h (trending *down* over
+six minutes), then 14.95 GiB half an hour later, flat across three samples. That
+is a plateau followed by a fast climb — but the run that actually wedged took
+about 1 d 16 h to reach the same ceiling. So the growth rate varies by a large
+factor between runs, and neither a single reading nor a short window predicts
+when the ceiling arrives.
+
+What follows practically: watch the trend rather than any one sample, and restart
+on a sustained rise rather than waiting for the wedge. A restart taken *before*
+the ceiling shuts down cleanly in about 5 seconds; the wedged process ignored
+SIGTERM and needed SIGKILL after a 30-second grace.
 
 Expect this roughly every other day until the leak is fixed. Run it under a
 memory cap with automatic restart, and alert on RPC latency rather than on
