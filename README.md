@@ -2,6 +2,65 @@
 
 A Bitcoin full node implementation in TypeScript, running on [Bun](https://bun.sh).
 
+## Status — v1.0.0
+
+**Label: "Replay-verified — pending the stateless-replay run now in flight"**
+(`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That label is
+deliberately weaker than "Validated", and the scorecard spells out why: it means
+hotbuns agreed with Core on every block the nightly instruments showed it — 169
+distilled real mainnet blocks, 10 block-context corpus entries, and its row in the
+nightly corpus sweep — and that a 26,067-height stateless replay was still running
+when the release was written. **Until that run produces a `summary.json`, this node
+has no from-genesis evidence at all.** The git tag `v0.1.0-beta1`
+(`receipts/RELEASE-v1.0-FREEZE.md`) says the same thing from the other side: `rc`
+is reserved for an independent from-genesis `--assumevalid=0` reproduction of
+Core's UTXO-set commitment, and `beta` means that receipt does not exist
+(`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither label certifies wallet
+or fund-custody readiness — see `SECURITY.md`.
+
+**hotbuns has no from-genesis UTXO-set reproduction.** There is no hotbuns row in
+the reproduction ledger (`receipts/TRUST-ANCHOR.md:140-145`). What does exist is
+weaker than it looks, in two directions:
+
+- An offline replay ledger records genesis → 250000 byte-identical to Core under
+  `assumevalid=0` on 2026-07-02
+  (`CORE-PARITY-AUDIT/replay-ledgers/hotbuns-av0-danger-ledger.txt`,
+  `overall=ALL-PASS`). But a later `assumevalid=0` rig rejected *real mainnet
+  block 124276* with `SCRIPT_ERR_SIG_DER`, because `scriptFlagsFromBitmask`
+  inferred DERSIG/CLTV/CSV/NULLDUMMY from the WITNESS flag and so enforced BIP-66
+  from genesis. Fixed in `66f3926` on 2026-08-20
+  (`receipts/beta1-tag-drafts-2026-08-20.md:60-70`). A ledger that passed a
+  height range is not a proof that the interpreter was right there.
+- `receipts/TRUST-ANCHOR.md:187-198` (correction, 2026-09-01) retracts every
+  pre-2026-09-01 M2 boundary-campaign PASS row for hotbuns as script evidence:
+  those runs used hotbuns' *default* assumevalid, so the window blocks were
+  connected with scripts **skipped**. Those rows are chain-selection evidence
+  only.
+
+The release scorecard adds a third caveat about that 2026-07-02 ledger: the
+`assumevalid=0 full-script` line in its header is the harness's own assertion, and
+no launch-flag acknowledgement from the node was recorded
+(`receipts/RELEASE-v1.0-SCORECARD.md`, hotbuns row). A reader of this repository
+alone should not conclude that hotbuns has validated the chain from genesis.
+
+**Operator RPC parity: 56 of Bitcoin Core's 85.** From the 103-method R5
+operator probe run 2026-09-01
+(`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`): hotbuns 56 PASS /
+29 FAIL, Bitcoin Core 85 PASS on the same probe, 18 methods unmeasured
+(`SKIP-REGTEST`) for every node including Core.
+
+**Known gaps in this repo** (`receipts/UNIT-BASELINE-v1.0.md`, 2026-09-01): the
+unit suite went 8 failing → 0, with **3 gaps carried as explicit skips whose IDs
+were not recorded** in the day-1 data — the baseline marks them NOT VERIFIED, so
+this README cannot name them. `bun install` crashes on the ZeroMQ NIF; run via
+`bun run`. Node.js is not supported.
+
+**Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the
+[hashhog meta-repo](https://github.com/hashhog/hashhog).
+
+> Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
+> the hashhog meta-repo, not to this repository.
+
 ## Quick Start
 
 ### Docker
@@ -93,7 +152,7 @@ prune=550
 
 ## RPC API
 
-Bitcoin Core-compatible JSON-RPC 2.0 with batch request support.
+JSON-RPC 2.0 modelled on Bitcoin Core's, with batch request support. Not behaviourally compatible: on the 2026-09-01 operator probe hotbuns answers 56 of the 103 probed methods correctly against Core's 85, with 29 failures (`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`).
 
 | Category | Methods |
 |----------|---------|
@@ -134,9 +193,11 @@ The wallet subsystem supports BIP-32/44/49/84/86 HD key derivation across all ad
 
 hotbuns uses a Bun FFI binding to the system `libsecp256k1` C library for all
 consensus-path ECDSA and BIP-340 Schnorr signature verification. This replaces
-the pure-JavaScript `@noble/curves` implementation on the verification hot path,
-achieving ~30x throughput improvement during IBD (~30,000 ECDSA ops/sec vs
-~1,000 ops/sec with `@noble/curves`).
+the pure-JavaScript `@noble/curves` implementation on the verification hot path.
+The FFI path is expected to be substantially faster there, but **no
+benchmark artifact in this project measures it** — earlier revisions of this file
+quoted "~30x" and "~30,000 vs ~1,000 ECDSA ops/sec"; those figures are not traceable
+to any committed run and have been removed rather than repeated.
 
 **Install the system library before running hotbuns:**
 
@@ -155,9 +216,11 @@ Functions:
 - `ecdsaVerifyLaxFFI` — lax DER ECDSA, historical Bitcoin compat (used by `ecdsaVerifyLax`)
 - `schnorrVerifyFFI` — BIP-340 Schnorr (used by `schnorrVerify`)
 
-**Graceful fallback:** If `libsecp256k1.so.2` is not found at startup, hotbuns
-falls back to `@noble/curves` automatically with a warning log. The node
-remains fully functional; IBD will be slower without the C library.
+**Graceful fallback (untested):** If `libsecp256k1.so.2` is not found at startup,
+hotbuns is intended to fall back to `@noble/curves` automatically with a warning log,
+remaining functional but slower during IBD. No committed test artifact in this project
+exercises that fallback path, so treat it as unverified — install the system library
+rather than relying on it.
 
 **@noble fallback:** `@noble/secp256k1` and `@noble/curves` are intentionally
 kept in `package.json`. They remain the implementation for:
