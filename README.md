@@ -27,34 +27,46 @@ Core's UTXO-set commitment, and `beta` means that receipt does not exist
 (`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither label certifies wallet
 or fund-custody readiness — see `SECURITY.md`.
 
-## Known limitation — memory
+## Known limitation — memory ceiling
 
-**hotbuns leaks memory and will wedge if left running.** On 2026-09-02 it reached
-its 16 GiB memory ceiling after about 1 day 16 hours of mainnet uptime and stopped
-answering RPC entirely for 35 minutes. The process stayed alive and kept accepting
-mempool transactions the whole time, so nothing restarted it automatically and a
-process-liveness check would have called it healthy. It reaches roughly 7.5 GiB
-within an hour of a cold start. Beyond that the rate is **not predictable**, and
-two attempts to describe it as a curve were both wrong. Measured on one run:
-~7.5 GiB at 1 h, 11.90–12.23 GiB across six samples at 2 h (trending *down* over
-six minutes), then 14.95 GiB half an hour later, flat across three samples. That
-is a plateau followed by a fast climb — but the run that actually wedged took
-about 1 d 16 h to reach the same ceiling. So the growth rate varies by a large
-factor between runs, and neither a single reading nor a short window predicts
-when the ceiling arrives.
+**hotbuns hit its 16 GiB cgroup ceiling on 2026-09-02 and stopped answering RPC
+for 35 minutes** while the process stayed alive and kept accepting mempool
+transactions — so nothing restarted it, and a process-liveness check would have
+called it healthy. Recovery needed a manual stop; the wedged process ignored
+SIGTERM and took SIGKILL after a 30-second grace.
 
-What follows practically: watch the trend rather than any one sample, and restart
-on a sustained rise rather than waiting for the wedge. A restart taken *before*
-the ceiling shuts down cleanly in about 5 seconds; the wedged process ignored
-SIGTERM and needed SIGKILL after a 30-second grace.
+**What earlier revisions of this section got wrong.** They called this a memory
+leak in hotbuns. The measurements do not support that. Splitting the cgroup
+counter with `memory.stat`:
 
-Expect this roughly every other day until the leak is fixed. Run it under a
-memory cap with automatic restart, and alert on RPC latency rather than on
-process liveness, because the failure mode is a live process that has stopped
-answering.
+| | |
+|---|---|
+| `anon` (the node's own memory) | 3.08 GiB, flat across samples over four minutes |
+| `file` (page cache, reclaimable) | ~9.5–10 GiB, and observed *falling*, i.e. reclaim works |
+| process RSS | 4.52 GiB |
+| `memory.current` (what a naive check reads) | 13.41 GiB |
+
+So about three quarters of the alarming number is reclaimable page cache from
+reading block and database files, and the node's own footprint is stable. The
+unit also runs with `memory.high=max`, meaning there is no soft throttle: the
+cgroup goes straight to the hard `memory.max`, where reclaim happens in the
+allocation path. That is a well-known way to get exactly the observed symptom —
+a live process that stops making progress.
+
+**The honest status:** the outage is real and reproducible enough to plan around;
+the *cause* is not established, and "hotbuns leaks memory" is not a claim this
+evidence supports. The most likely mechanism is page cache accumulating against a
+hard limit with no soft throttle, which is a deployment-configuration problem
+rather than a defect in the node.
+
+**If you run it:** watch `anon` from `memory.stat`, not `memory.current` — the
+latter counts cache you do not care about. Alert on RPC latency rather than
+process liveness, because liveness is precisely what lies here. Consider setting
+`memory.high` below `memory.max` so reclaim is gradual. A restart taken before
+the ceiling exits cleanly in about 5 seconds.
 
 A separate fault on 2026-08-31 killed it with `SIGILL` (illegal instruction).
-That cause has not been established, and it is not the same problem.
+That cause has not been established either, and it is not the same problem.
 
 **hotbuns has no from-genesis UTXO-set reproduction.** There is no hotbuns row in
 the reproduction ledger (`receipts/TRUST-ANCHOR.md:140-145`). What does exist is
