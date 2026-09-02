@@ -53,11 +53,21 @@ cgroup goes straight to the hard `memory.max`, where reclaim happens in the
 allocation path. That is a well-known way to get exactly the observed symptom —
 a live process that stops making progress.
 
-**The honest status:** the outage is real and reproducible enough to plan around;
-the *cause* is not established, and "hotbuns leaks memory" is not a claim this
-evidence supports. The most likely mechanism is page cache accumulating against a
-hard limit with no soft throttle, which is a deployment-configuration problem
-rather than a defect in the node.
+**The cause is now established, and it is deployment configuration, not this
+node.** `memory.events` recorded `max=405` — the cgroup had hit its hard limit
+405 times, each one a synchronous reclaim in the allocation path, which is how a
+live process stops making progress. Setting `memory.high` to 12 GiB under the
+16 GiB `memory.max` fixed it immediately and measurably: `memory.current`
+14.47 → 11.54 GiB, page cache 11.5 → 7.9 GiB, `anon` unchanged, hard-limit hits
+frozen at 405 with no further increments, and RPC latency 511 ms → 13–87 ms. The
+fix ships in the fleet launcher.
+
+This failure class was already documented twice in this project before hotbuns
+hit it — clearbit in June 2026 and rustoshi in August — including the exact
+diagnostic: *the cap is being hit by reclaimable page cache, not process memory;
+a leak looks the opposite, with RSS climbing to meet the cap.* It was still
+misread as a leak here. If you cap a node's memory, give it a soft threshold
+too, and read `anon` before naming a cause.
 
 **If you run it:** watch `anon` from `memory.stat`, not `memory.current` — the
 latter counts cache you do not care about. Alert on RPC latency rather than
