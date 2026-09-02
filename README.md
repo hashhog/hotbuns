@@ -4,22 +4,47 @@ A Bitcoin full node implementation in TypeScript, running on [Bun](https://bun.s
 
 ## Status — v1.0.0
 
-**Label: "Replay-pending — awaiting the stateless-replay run now in flight"**
+**Label: "Replay-verified"**
 (`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That label is
 deliberately weaker than "Validated", and the scorecard spells out why: it means
 hotbuns agreed with Core on every block the nightly instruments showed it — 169
 distilled real mainnet blocks, 10 block-context corpus entries, and its row in the
-nightly corpus sweep — and that a 26,067-height stateless replay was still running
-when the release was written. **Until that run produces a `summary.json`, hotbuns'
-only from-genesis evidence is the partial genesis→250,000 ledger below — and that
-ledger has a committed disconfirmation inside its own range, described there.** The
-other three nodes carrying this label have no from-genesis artifact at all;
-hotbuns' is partial and contested, which is not the same thing as absent. The git tag `v0.1.0-beta1`
+nightly corpus sweep — and that the 26,067-height stateless replay has since
+COMPLETED: 26,067 distinct heights, `accept` on every one, 0 disagreements, 0
+harness-limit rows, against 51,512 rejected control twins (scorecard footnote
+[1], which also records that the first run silently compared only 65% of its
+input and had to be re-run).
+> **What that does and does not mean.** It is a *stateless* re-check of each block
+> against Core's rules with scripts on. It is **not** a from-genesis reproduction of
+> Core's UTXO set. hotbuns' only from-genesis evidence remains the partial
+> genesis→250,000 ledger below, and that ledger has a committed disconfirmation
+> inside its own range, described there. The other three nodes that carried this
+> label have no from-genesis artifact at all; hotbuns' is partial and contested,
+> which is not the same thing as absent. The git tag `v0.1.0-beta1`
 (`receipts/RELEASE-v1.0-FREEZE.md`) says the same thing from the other side: `rc`
 is reserved for an independent from-genesis `--assumevalid=0` reproduction of
 Core's UTXO-set commitment, and `beta` means that receipt does not exist
 (`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither label certifies wallet
 or fund-custody readiness — see `SECURITY.md`.
+
+## Known limitation — memory
+
+**hotbuns leaks memory and will wedge if left running.** On 2026-09-02 it reached
+its 16 GiB memory ceiling after about 1 day 16 hours of mainnet uptime and stopped
+answering RPC entirely for 35 minutes. The process stayed alive and kept accepting
+mempool transactions the whole time, so nothing restarted it automatically and a
+process-liveness check would have called it healthy. It reaches roughly 7.5 GiB
+within an hour of a cold start and creeps to the ceiling from there. Recovery
+needed a manual stop, and it did not respond to SIGTERM — it took SIGKILL after a
+30-second grace.
+
+Expect this roughly every other day until the leak is fixed. Run it under a
+memory cap with automatic restart, and alert on RPC latency rather than on
+process liveness, because the failure mode is a live process that has stopped
+answering.
+
+A separate fault on 2026-08-31 killed it with `SIGILL` (illegal instruction).
+That cause has not been established, and it is not the same problem.
 
 **hotbuns has no from-genesis UTXO-set reproduction.** There is no hotbuns row in
 the reproduction ledger (`receipts/TRUST-ANCHOR.md:140-145`). What does exist is
