@@ -4,14 +4,17 @@ A Bitcoin full node implementation in TypeScript, running on [Bun](https://bun.s
 
 ## Status — v1.0.0
 
-**Label: "Replay-verified — pending the stateless-replay run now in flight"**
+**Label: "Replay-pending — awaiting the stateless-replay run now in flight"**
 (`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That label is
 deliberately weaker than "Validated", and the scorecard spells out why: it means
 hotbuns agreed with Core on every block the nightly instruments showed it — 169
 distilled real mainnet blocks, 10 block-context corpus entries, and its row in the
 nightly corpus sweep — and that a 26,067-height stateless replay was still running
-when the release was written. **Until that run produces a `summary.json`, this node
-has no from-genesis evidence at all.** The git tag `v0.1.0-beta1`
+when the release was written. **Until that run produces a `summary.json`, hotbuns'
+only from-genesis evidence is the partial genesis→250,000 ledger below — and that
+ledger has a committed disconfirmation inside its own range, described there.** The
+other three nodes carrying this label have no from-genesis artifact at all;
+hotbuns' is partial and contested, which is not the same thing as absent. The git tag `v0.1.0-beta1`
 (`receipts/RELEASE-v1.0-FREEZE.md`) says the same thing from the other side: `rc`
 is reserved for an independent from-genesis `--assumevalid=0` reproduction of
 Core's UTXO-set commitment, and `beta` means that receipt does not exist
@@ -60,6 +63,12 @@ this README cannot name them. `bun install` crashes on the ZeroMQ NIF; run via
 
 > Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
 > the hashhog meta-repo, not to this repository.
+> **Two notes on the citations above.** The R5 probe JSON is **gitignored** in the
+> meta-repo (`.gitignore:60  tools/diff-test-artifacts/`), so a stranger cloning
+> either repository cannot read it; regenerate it with `python3 tools/r5_probe.py`
+> against a running fleet. The nightly `diffguard-*.log` files are likewise
+> gitignored (`.gitignore:43  *.log`). Paths under `receipts/`, `docs/` and
+> `CORE-PARITY-AUDIT/` are tracked, but in the **meta-repo**, not here.
 
 ## Quick Start
 
