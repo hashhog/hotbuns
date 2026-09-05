@@ -109,13 +109,13 @@ export interface LoadSnapshotResult {
 export interface DumpSnapshotResult {
   /** Number of coins written. */
   coinsWritten: bigint;
-  /** Base block hash. */
+  /** Base block hash, hex in DISPLAY order (Core: tip->GetBlockHash().ToString()). */
   baseHash: string;
   /** Base block height. */
   baseHeight: number;
   /** Path to the snapshot file. */
   path: string;
-  /** UTXO set hash (for verification). */
+  /** UTXO set hash, hex in DISPLAY order (Core: hashSerialized.ToString()). */
   txoutsetHash: string;
   /** Cumulative transaction count. */
   nChainTx: bigint;
@@ -1484,12 +1484,26 @@ export class ChainstateManager {
       await fsp.rename(tempPath, filePath);
       renamed = true;
 
+      // Both reported hashes are rendered in DISPLAY order, matching Core's
+      // rpc/blockchain.cpp WriteUTXOSnapshot:
+      //   result.pushKV("base_hash", tip->GetBlockHash().ToString());
+      //   result.pushKV("txoutset_hash", maybe_stats->hashSerialized.ToString());
+      // uint256::ToString() is GetHex(), i.e. the byte-REVERSED hex. Both
+      // values are held here in INTERNAL (wire, little-endian) order — the
+      // chain-state record stores the tip hash as wire bytes, and
+      // computeUTXOSetHash documents its digest as internal order — so each is
+      // reversed exactly once, at this reporting boundary. The tell for the
+      // pre-fix rendering: a real block hash carries its leading zeros at the
+      // START, and the internal-order string carries them at the end.
+      //
+      // The snapshot FILE is unaffected: serializeSnapshotMetadata writes the
+      // raw internal-order bytes, which is what Core serializes too.
       return {
         coinsWritten,
-        baseHash: chainstate.bestBlockHash.toString("hex"),
+        baseHash: Buffer.from(chainstate.bestBlockHash).reverse().toString("hex"),
         baseHeight: chainstate.bestHeight,
         path: filePath,
-        txoutsetHash: hash.toString("hex"),
+        txoutsetHash: Buffer.from(hash).reverse().toString("hex"),
         nChainTx: 0n, // Would need to be computed from block index
       };
     } finally {

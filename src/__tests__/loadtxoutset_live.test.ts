@@ -235,7 +235,11 @@ describe("loadtxoutset LIVE dual-chainstate wiring", () => {
     const snapPath = join(dumpDir, "accept.dat");
     const dump = (await callRPC(server, "dumptxoutset", [snapPath, "latest"])) as Record<string, unknown>;
     const committedHashHex = dump.txoutset_hash as string;
-    const committedHash = Buffer.from(committedHashHex, "hex");
+    // dumptxoutset reports txoutset_hash in DISPLAY order (Core:
+    // hashSerialized.ToString()); AssumeutxoData.hashSerialized is compared
+    // against the internally-computed digest, which is INTERNAL (wire) order.
+    // Reverse once on the way back in — do NOT relax the comparison itself.
+    const committedHash = Buffer.from(committedHashHex, "hex").reverse();
 
     // Register the regtest AssumeUTXO entry committing to the snapshot's hash
     // (Core regtest m_assumeutxo_data). blockHash is the snapshot base in
@@ -306,7 +310,9 @@ describe("loadtxoutset LIVE dual-chainstate wiring", () => {
     // Dump the (now-doctored) UTXO set. committedHash includes the spurious coin.
     const snapPath = join(dumpDir, "reject.dat");
     const dump = (await callRPC(server, "dumptxoutset", [snapPath, "latest"])) as Record<string, unknown>;
-    const committedHash = Buffer.from(dump.txoutset_hash as string, "hex");
+    // DISPLAY order out of the RPC -> INTERNAL order for the load-time gate
+    // (see the note in the ACCEPT case above).
+    const committedHash = Buffer.from(dump.txoutset_hash as string, "hex").reverse();
 
     // Sanity: the doctored hash must DIFFER from the honest genesis->base set's
     // hash (otherwise the falsification is vacuous). Recompute the honest hash

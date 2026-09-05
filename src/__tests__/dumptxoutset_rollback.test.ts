@@ -17,7 +17,9 @@
  *   1. After a successful rollback dump, the chain tip is restored to
  *      its original (pre-dump) height and hash.
  *   2. The dump's `base_height` and `base_hash` reflect the rolled-back
- *      target, NOT the original tip.
+ *      target, NOT the original tip. `base_hash` is reported in DISPLAY
+ *      order (Core: `tip->GetBlockHash().ToString()`), so the expectations
+ *      reverse the internal-order hashes the chain state holds.
  *   3. The `rollback` option resolves both numeric heights and hex hashes.
  *   4. Bare `type="rollback"` resolves the latest assumeutxo height ≤ tip
  *      (uses a custom params variant since regtest has empty assumeutxo).
@@ -151,7 +153,7 @@ describe("dumptxoutset rollback", () => {
 
     const result = (await callRPC(server, "dumptxoutset", [dumpPath, "latest"])) as Record<string, unknown>;
     expect(result.base_height).toBe(tipBefore.height);
-    expect(result.base_hash).toBe(tipBefore.hash.toString("hex"));
+    expect(result.base_hash).toBe(Buffer.from(tipBefore.hash).reverse().toString("hex"));
 
     const tipAfter = chainState.getBestBlock();
     expect(tipAfter.height).toBe(tipBefore.height);
@@ -174,7 +176,7 @@ describe("dumptxoutset rollback", () => {
 
     // Dump base reflects the rolled-back target.
     expect(result.base_height).toBe(targetHeight);
-    expect(result.base_hash).toBe(targetHash.toString("hex"));
+    expect(result.base_hash).toBe(Buffer.from(targetHash).reverse().toString("hex"));
 
     // Chain is restored to the original tip.
     const tipAfter = chainState.getBestBlock();
@@ -198,7 +200,7 @@ describe("dumptxoutset rollback", () => {
     ])) as Record<string, unknown>;
 
     expect(result.base_height).toBe(targetHeight);
-    expect(result.base_hash).toBe(targetHash.toString("hex"));
+    expect(result.base_hash).toBe(Buffer.from(targetHash).reverse().toString("hex"));
 
     // Chain is restored.
     const tipAfter = chainState.getBestBlock();
@@ -271,7 +273,7 @@ describe("dumptxoutset rollback", () => {
       "rollback",
     ])) as Record<string, unknown>;
     expect(result.base_height).toBe(4);
-    expect(result.base_hash).toBe(hashes[3].toString("hex"));
+    expect(result.base_hash).toBe(Buffer.from(hashes[3]).reverse().toString("hex"));
 
     // Original tip restored.
     const tipAfter = chainState.getBestBlock();

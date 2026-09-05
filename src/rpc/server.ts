@@ -11558,6 +11558,23 @@ export class RPCServer {
       this.chainstateManager = chainstateManager;
     }
 
+    // Core's PrepareUTXOSnapshot does ForceFlushStateToDisk before it takes
+    // the stats + the coins cursor (rpc/blockchain.cpp:3256), and reads the
+    // dump's base back out of the flushed view
+    // (`tip = LookupBlockIndex(maybe_stats->hashBlock)`). `dumpSnapshot`
+    // likewise reads the persisted chain-state record and iterates the coins
+    // DB, so without this flush a "latest" dump silently captures the last
+    // FLUSHED height (the assumeutxo base, in the boundary-campaign case) and
+    // its coin set instead of the tip's.
+    //
+    // Flushing BEFORE the rollback dance also gives the rewind a complete
+    // starting point: ChainStateManager.disconnectBlock walks the coins DB
+    // through its own view, which cannot see coins still cached in BlockSync's
+    // separate CoinsViewCache (sync/blocks.ts:905-918). Each disconnect then
+    // rewrites the chain-state record down to the target, so the dump's base
+    // follows the rollback exactly as Core's does.
+    await this.forceFlushChainstateToDisk();
+
     // NetworkDisable RAII (TS try/finally). Mirrors Bitcoin Core's
     // NetworkDisable wrapper around TemporaryRollback in
     // rpc/blockchain.cpp::dumptxoutset. Pause inbound block acceptance
@@ -15091,6 +15108,46 @@ export class RPCServer {
   }
 
   /**
+   * Force the live chainstate (dirty coins + the chain-state tip record) to
+   * disk, so a UTXO-set scan that reads the coins DB sees the state AT THE
+   * CURRENT TIP.
+   *
+   * Mirrors Bitcoin Core's `ForceFlushStateToDisk(wipe_cache=false)`,
+   * which BOTH UTXO-set surfaces call before touching `CoinsDB()`:
+   *   - `gettxoutsetinfo`  — rpc/blockchain.cpp:1075, immediately before
+   *     `GetUTXOStats(&active_chainstate.CoinsDB(), ...)`;
+   *   - `dumptxoutset`     — rpc/blockchain.cpp:3256 inside
+   *     `PrepareUTXOSnapshot`, before the stats pass and the coins cursor.
+   *
+   * Without it both surfaces measure whatever last reached LevelDB. hotbuns'
+   * IBD connect path (sync/blocks.ts) only flushes when `shouldFlush` holds
+   * (at tip / within the reorg window / every FLUSH_INTERVAL blocks), so up to
+   * FLUSH_INTERVAL blocks' worth of coins can sit in the in-memory
+   * CoinsViewCache. Measured 2026-09-05 on the M2 boundary-6316 window: after
+   * 33 accepted blocks (6299 -> 6332) the coins DB still held the 6299 base
+   * set exactly, so `dumptxoutset` reported the base height and BOTH surfaces
+   * hashed the base's UTXO set — `gettxoutsetinfo` while labelling the result
+   * with the tip's height/bestblock, which is the more dangerous of the two
+   * (a stale set reported under a fresh tip reads as a consensus divergence).
+   *
+   * The chain-state record rides the SAME LevelDB batch as the coins (the
+   * durability invariant in chain/state.ts: CHAIN_STATE is only ever written
+   * atomically with the UTXO set it describes), so this can never advance the
+   * durable tip past the durable coins. `flushDirty` keeps the cache
+   * populated, matching Core's `wipe_cache=false`.
+   */
+  private async forceFlushChainstateToDisk(): Promise<void> {
+    const tip = this.chainState.getBestBlock();
+    await this.liveUTXOManager().flushDirty([
+      this.db.buildChainStateOp({
+        bestBlockHash: tip.hash,
+        bestHeight: tip.height,
+        totalWork: tip.chainWork,
+      }),
+    ]);
+  }
+
+  /**
    * Estimated on-disk size of the coins database, mirroring Core's
    * CCoinsViewDB::EstimateSize() reported as gettxoutsetinfo.disk_size. The
    * CoinsViewDB reports 0 until coins are flushed to its backing store, so an
@@ -15246,6 +15303,12 @@ export class RPCServer {
       }
       return result;
     }
+
+    // Core: gettxoutsetinfo calls ForceFlushStateToDisk(/*wipe_cache=*/false)
+    // before it reads CoinsDB (rpc/blockchain.cpp:1074-1081). Without it the
+    // scan below reports the tip's height/bestblock over the LAST FLUSHED coin
+    // set — the tip label makes the stale numbers look authoritative.
+    await this.forceFlushChainstateToDisk();
 
     const chainState = await this.db.getChainState();
     if (!chainState) {
