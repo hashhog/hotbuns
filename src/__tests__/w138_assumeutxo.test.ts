@@ -489,7 +489,9 @@ describe("W138-G16: best-block persistence after coin load (BUG-8, P0-CDIV)", ()
 describe("W138-G17: work-vs-active-tip recheck (height-approx)", () => {
   it("PRESENT: snapshot.ts rejects with 'Work does not exceed active chainstate'", () => {
     expect(SNAPSHOT_TS).toContain("Work does not exceed active chainstate");
-    expect(SNAPSHOT_TS).toContain("auData.height <= activeTipHeight");
+    // Spelled `baseHeight` since the HASHHOG_UNSAFE_SNAPSHOT_HEIGHT dev bypass
+    // made the chainparams entry (`auData`) optional; the gate is unchanged.
+    expect(SNAPSHOT_TS).toContain("baseHeight <= activeTipHeight");
   });
 
   it("PARITY GAP: hotbuns uses height comparison; Core uses CBlockIndexWorkComparator", () => {

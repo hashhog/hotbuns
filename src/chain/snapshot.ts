@@ -1052,7 +1052,10 @@ export class ChainstateManager {
     const fh = await fsp.open(filePath, "r");
     let coinsLoaded = 0n;
     let metadata: SnapshotMetadata;
-    let auData: AssumeutxoData;
+    // null only on the HASHHOG_UNSAFE_SNAPSHOT_HEIGHT development bypass below,
+    // where there is no chainparams entry (and so no hardcoded commitment).
+    let auData: AssumeutxoData | null;
+    let baseHeight: number;
     let snapshotChainstate: Chainstate;
     try {
       const stream = new StreamingBufferReader(fh, stat.size);
@@ -1066,18 +1069,56 @@ export class ChainstateManager {
       );
 
       // Validate against assumeutxo parameters.
+      //
+      // HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: development-only escape from the
+      // chainparams assumeutxo whitelist. Core (and this node by default)
+      // only accepts snapshots whose base blockhash is a hardcoded trust
+      // anchor, because loadtxoutset is a trust shortcut for end users.
+      // Setting this variable to the snapshot's base height accepts ANY
+      // snapshot and takes that height on faith -- it exists so the fleet can
+      // validate arbitrary block ranges in parallel from a locally generated
+      // snapshot ladder, where correctness is established by checking the
+      // range's OUTPUT utxo hash against an independent commitment, not by
+      // trusting the input. ONLY whitelist membership and the associated
+      // hardcoded hash_serialized comparison are bypassed; every other check
+      // (magic, version, network, coin count, per-coin parse, MoneyRange,
+      // vout/height bounds, trailing bytes) still runs.
+      // Unset (the default, and what ships) = unchanged Core-equivalent
+      // behaviour. Read through `process.env` at call time so it works under
+      // both `bun run src/index.ts` and the bundled `node src/index.js`.
+      const unsafeHeightEnv = process.env.HASHHOG_UNSAFE_SNAPSHOT_HEIGHT;
       const lookup = getAssumeutxoData(this.params, metadata.baseBlockHash);
-      if (!lookup) {
+      if (!lookup && !unsafeHeightEnv) {
         throw new Error(
           `No assumeutxo data for block ${metadata.baseBlockHash.toString("hex")}`,
         );
       }
-      auData = lookup;
+      if (lookup) {
+        auData = lookup;
+        baseHeight = lookup.height;
+      } else {
+        const parsedHeight = Number(unsafeHeightEnv);
+        if (!Number.isInteger(parsedHeight) || parsedHeight < 0) {
+          throw new Error(
+            `HASHHOG_UNSAFE_SNAPSHOT_HEIGHT=${unsafeHeightEnv} is not a valid block height`,
+          );
+        }
+        auData = null;
+        baseHeight = parsedHeight;
+        console.warn(
+          `WARNING: HASHHOG_UNSAFE_SNAPSHOT_HEIGHT=${parsedHeight} -- accepting an ` +
+            `UNVERIFIED snapshot whose base blockhash ` +
+            `${Buffer.from(metadata.baseBlockHash).reverse().toString("hex")} is NOT a ` +
+            `chainparams trust anchor. The hardcoded hash_serialized comparison is ` +
+            `SKIPPED and the base height is taken from the environment on faith. ` +
+            `Development use only; never enable this in production.`,
+        );
+      }
 
       // BUG-6: work-vs-active-tip height guard (continued from precondition
       // above). Reject if the snapshot base height does not strictly exceed
       // the current active tip; a stale snapshot would regress the chain.
-      if (auData.height <= activeTipHeight) {
+      if (baseHeight <= activeTipHeight) {
         throw new Error("Work does not exceed active chainstate");
       }
 
@@ -1088,7 +1129,7 @@ export class ChainstateManager {
         maxCacheBytes: this.maxCacheBytes,
       });
       snapshotChainstate.tipHash = metadata.baseBlockHash;
-      snapshotChainstate.tipHeight = auData.height;
+      snapshotChainstate.tipHeight = baseHeight;
 
       const batchOps: BatchOperation[] = [];
 
@@ -1169,9 +1210,9 @@ export class ChainstateManager {
           }
 
           // Validate coin height (must be ≤ snapshot height).
-          if (height > auData.height) {
+          if (height > baseHeight) {
             throw new Error(
-              `Invalid coin height ${height} > snapshot height ${auData.height}`,
+              `Invalid coin height ${height} > snapshot height ${baseHeight}`,
             );
           }
 
@@ -1242,7 +1283,12 @@ export class ChainstateManager {
     // poison the chainstate.
     const { hash: computedHash, coinsCount } = await computeUTXOSetHash(this.db, interruptCheck);
 
-    if (!computedHash.equals(auData.hashSerialized)) {
+    // `auData === null` ONLY under the HASHHOG_UNSAFE_SNAPSHOT_HEIGHT bypass
+    // above, where no chainparams entry exists and therefore no hardcoded
+    // hash_serialized to compare against. That is the one and only check the
+    // bypass drops (the loud warning above already said so); with the variable
+    // unset this is byte-for-byte the previous strict gate.
+    if (auData && !computedHash.equals(auData.hashSerialized)) {
       throw new Error(
         `Bad snapshot content hash: expected ${auData.hashSerialized.toString("hex")}, got ${computedHash.toString("hex")}`
       );
@@ -1261,7 +1307,7 @@ export class ChainstateManager {
     return {
       coinsLoaded,
       baseBlockHash: metadata.baseBlockHash,
-      baseHeight: auData.height,
+      baseHeight,
       path: filePath,
     };
   }
@@ -1502,6 +1548,12 @@ export class ChainstateManager {
     }
     const auData = getAssumeutxoData(this.params, baseHash);
     if (!auData) {
+      // Also the terminal state for a snapshot accepted through the
+      // HASHHOG_UNSAFE_SNAPSHOT_HEIGHT bypass: with no chainparams trust
+      // anchor there is no commitment for the background pass to re-derive
+      // and compare against, so it does not run and the snapshot stays
+      // UNVALIDATED (getchainstates validated=false). Unchanged for every
+      // whitelisted snapshot.
       this.backgroundVerdict = SnapshotValidationResult.MISSING_CHAINPARAMS;
       return null;
     }
