@@ -2,7 +2,7 @@
 
 A Bitcoin full node implementation in TypeScript, running on [Bun](https://bun.sh).
 
-## Status — v1.0.0
+## Status — v1.0.1
 
 > **Every `receipts/…`, `tools/…`, `docs/…` and `CORE-PARITY-AUDIT/…` path cited in
 > this section is in the hashhog meta-repo, which is permanently private.** Those
