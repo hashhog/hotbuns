@@ -2359,9 +2359,26 @@ export class BlockSync {
       return;
     }
 
-    const bestHeader = this.headerSync.getBestHeader();
+    let bestHeader = this.headerSync.getBestHeader();
     if (!bestHeader) {
       return;
+    }
+
+    // Pointer vs scheduler (Core net_processing.cpp FindNextBlocksToDownload).
+    // Core's scheduler walks the header INDEX toward the most-work chain
+    // (pindexBestKnownBlock / m_best_header); m_best_header is updated in
+    // AddToBlockIndex whenever a TREE-valid header out-works it, so the two
+    // cannot diverge. hotbuns' requestBlocks uses getBestHeader().height as a
+    // hard ceiling on a height walk of headersByHeight. If that pointer lags
+    // the index, the walk bails at `nextHeightToRequest > bestHeader.height`
+    // and the node sits at 100% with dl=0 — the 2026-09-07 stall (pointer
+    // 965848, headerChain 967863, 15h). Re-seat the pointer onto the
+    // most-work valid header before deciding there is nothing to download.
+    if (this.headerSync.promoteMostWorkHeader()) {
+      bestHeader = this.headerSync.getBestHeader()!;
+      if (this.ibdComplete) {
+        this.ibdComplete = false;
+      }
     }
 
     // GAP2 fix (reorg-drop part 1/2): before walking the by-height download
@@ -5197,7 +5214,19 @@ export class BlockSync {
     // read + at most one requestBlocks call per second), and guaranteed to
     // be a no-op in the steady-state happy path because requestBlocks
     // returns immediately when there's nothing to do.
-    const bestHeader = this.headerSync.getBestHeader();
+    let bestHeader = this.headerSync.getBestHeader();
+    // 1 Hz heal for the 09-07 shape: IBD already complete, pointer frozen
+    // at the validated tip, so the idle-with-headroom predicate below
+    // (`nextHeightToProcess <= bestHeader.height`) is false and would never
+    // call requestBlocks. promoteMostWorkHeader is O(1) when the pointer
+    // already matches the index.
+    if (bestHeader && this.headerSync.promoteMostWorkHeader()) {
+      bestHeader = this.headerSync.getBestHeader();
+      if (this.ibdComplete) {
+        this.ibdComplete = false;
+      }
+      this.requestBlocks();
+    }
     if (
       bestHeader &&
       this.state.nextHeightToProcess <= bestHeader.height &&

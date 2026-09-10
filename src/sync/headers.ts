@@ -101,6 +101,18 @@ export class HeaderSync {
   private db: ChainDB;
   private params: ConsensusParams;
   private bestHeader: HeaderChainEntry | null;
+  /**
+   * Most-work *valid* header in `headerChain`, independent of `bestHeader`.
+   * Bitcoin Core's `m_best_header` is updated in `AddToBlockIndex`
+   * (blockstorage.cpp:249) whenever a new TREE-valid header out-works it, so
+   * the pointer and the index cannot diverge. hotbuns can reseat `bestHeader`
+   * onto the validated tip (`invalidateHeader`) while heavier valid headers
+   * stay in the map; `requestBlocks` then treats `getBestHeader().height` as
+   * the download ceiling and idles (receipt 2026-09-07: pointer 965848,
+   * `headerChain.size` 967863, dl=0 for 15h). This field is the index side of
+   * that split: always the max-work valid entry, used to re-seat the pointer.
+   */
+  private mostWorkValid: HeaderChainEntry | null;
   private headerChain: Map<string, HeaderChainEntry>; // hash hex -> entry
   private headersByHeight: Map<number, HeaderChainEntry>; // height -> entry on best chain
   private peerManager: PeerManager | null;
@@ -130,6 +142,7 @@ export class HeaderSync {
     this.db = db;
     this.params = params;
     this.bestHeader = null;
+    this.mostWorkValid = null;
     this.headerChain = new Map();
     this.headersByHeight = new Map();
     this.peerManager = null;
@@ -198,6 +211,7 @@ export class HeaderSync {
     this.headerChain.set(hashHex, genesisEntry);
     this.headersByHeight.set(0, genesisEntry);
     this.bestHeader = genesisEntry;
+    this.mostWorkValid = genesisEntry;
   }
 
   /**
@@ -373,13 +387,21 @@ export class HeaderSync {
    */
   async processHeaders(headers: BlockHeader[], fromPeer?: Peer | null, minPowChecked: boolean = true): Promise<number> {
     let validCount = 0;
+    let pointerMoved = false;
 
     for (const header of headers) {
       const hash = getBlockHash(header);
       const hashHex = hash.toString("hex");
 
-      // Skip if we already have this header
-      if (this.headerChain.has(hashHex)) {
+      // Already known. Core's AddToBlockIndex still compares nChainWork against
+      // m_best_header on every insert (and the already-in-index path is a no-op
+      // only because the pointer was updated on the first insert). If our
+      // pointer has been reseated *below* this header, a re-delivered batch
+      // (the drain-poll getheaders) must be allowed to promote it again —
+      // otherwise the scheduler keeps seeing a frozen ceiling.
+      const existing = this.headerChain.get(hashHex);
+      if (existing) {
+        if (this.noteCandidateWork(existing)) pointerMoved = true;
         continue;
       }
 
@@ -488,13 +510,7 @@ export class HeaderSync {
 
       // Update best header if this chain has more work.  Never promote an
       // invalid header (Core FindMostWorkChain skips BLOCK_FAILED_MASK).
-      if (
-        status !== "invalid" &&
-        (!this.bestHeader || chainWork > this.bestHeader.chainWork)
-      ) {
-        this.bestHeader = entry;
-        this.updateBestChain(entry);
-      }
+      if (this.noteCandidateWork(entry)) pointerMoved = true;
 
       // Persist to database
       await this.saveHeaderEntry(entry);
@@ -502,8 +518,9 @@ export class HeaderSync {
       validCount++;
     }
 
-    // Update header tip in database
-    if (validCount > 0 && this.bestHeader) {
+    // Update header tip in database. Also persist + notify when a re-delivered
+    // already-known batch healed a stale pointer (validCount == 0).
+    if ((validCount > 0 || pointerMoved) && this.bestHeader) {
       await this.saveHeaderTip(this.bestHeader);
 
       // Notify listeners that new headers were processed
@@ -540,6 +557,81 @@ export class HeaderSync {
       const parentHashHex = entry.header.prevBlock.toString("hex");
       entry = this.headerChain.get(parentHashHex);
     }
+  }
+
+  /**
+   * Record `entry` as a most-work candidate. If it out-works the current
+   * best-header pointer, re-seat the pointer and rebuild `headersByHeight`.
+   * Returns true when the pointer moved.
+   *
+   * Bitcoin Core: `AddToBlockIndex` (blockstorage.cpp:249)
+   *   if (best_header == nullptr || best_header->nChainWork < pindexNew->nChainWork)
+   *       best_header = pindexNew;
+   * FindNextBlocksToDownload then walks that chain. A pointer that lags the
+   * index makes `requestBlocks` think it has caught up.
+   */
+  private noteCandidateWork(entry: HeaderChainEntry): boolean {
+    if (entry.status === "invalid") return false;
+    if (!this.mostWorkValid || entry.chainWork > this.mostWorkValid.chainWork) {
+      this.mostWorkValid = entry;
+    }
+    if (!this.bestHeader || entry.chainWork > this.bestHeader.chainWork) {
+      this.bestHeader = entry;
+      this.updateBestChain(entry);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Scan the header index for the TREE-valid header of greatest chainwork.
+   * Core LoadBlockIndex (validation.cpp:4919) does the same pass.
+   */
+  private findMostWorkValidHeader(): HeaderChainEntry | null {
+    let best: HeaderChainEntry | null = null;
+    for (const entry of this.headerChain.values()) {
+      if (entry.status === "invalid") continue;
+      if (!best || entry.chainWork > best.chainWork) {
+        best = entry;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Re-seat `bestHeader` on the most-work valid header in the index if the
+   * pointer has lagged it. O(1) when `mostWorkValid` is live; scans only if
+   * that cache is missing or itself invalid.
+   *
+   * Called from the download scheduler before it treats `bestHeader.height`
+   * as "nothing left to request". Returns true if the pointer moved.
+   */
+  promoteMostWorkHeader(): boolean {
+    if (!this.mostWorkValid || this.mostWorkValid.status === "invalid") {
+      this.mostWorkValid = this.findMostWorkValidHeader();
+    }
+    if (!this.mostWorkValid) return false;
+    if (this.bestHeader && this.mostWorkValid.hash.equals(this.bestHeader.hash)) {
+      return false;
+    }
+    if (this.bestHeader && this.mostWorkValid.chainWork <= this.bestHeader.chainWork) {
+      return false;
+    }
+    const oldHeight = this.bestHeader ? this.bestHeader.height : this.mostWorkValid.height;
+    const oldWork = this.bestHeader ? this.bestHeader.chainWork : 0n;
+    this.bestHeader = this.mostWorkValid;
+    if (this.mostWorkValid.height < oldHeight) {
+      for (let h = this.mostWorkValid.height + 1; h <= oldHeight; h++) {
+        this.headersByHeight.delete(h);
+      }
+    }
+    this.updateBestChain(this.mostWorkValid);
+    console.log(
+      `[best-header] pointer lagged the index (height ${oldHeight} work ${oldWork}); ` +
+        `re-seated on most-work header height ${this.mostWorkValid.height} ` +
+        `work ${this.mostWorkValid.chainWork}`
+    );
+    return true;
   }
 
   /**
@@ -606,6 +698,15 @@ export class HeaderSync {
       this.headersByHeight.delete(h);
     }
     this.updateBestChain(newBest);
+
+    // The pointer just moved onto the validated tip, which may have LESS work
+    // than another still-valid header in the index. Keep `mostWorkValid` on
+    // the true max-work valid entry so the download scheduler can re-seat
+    // (Core InvalidBlockFound then scans highpow_outofchain_headers to
+    // refresh m_best_header — validation.cpp:3606-3636).
+    if (!this.mostWorkValid || this.mostWorkValid.status === "invalid") {
+      this.mostWorkValid = this.findMostWorkValidHeader() ?? newBest;
+    }
 
     console.log(
       `[invalidate-header] ${badHash
@@ -1270,6 +1371,11 @@ export class HeaderSync {
 
       this.headerChain.set(hash.toString("hex"), entry);
 
+      if (status !== "invalid") {
+        if (!this.mostWorkValid || chainWork > this.mostWorkValid.chainWork) {
+          this.mostWorkValid = entry;
+        }
+      }
       if (!this.bestHeader || chainWork > this.bestHeader.chainWork) {
         this.bestHeader = entry;
       }
