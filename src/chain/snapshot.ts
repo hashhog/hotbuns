@@ -75,6 +75,10 @@ export interface AssumeutxoData {
   nChainTx: bigint;
   /** Block hash at this height. */
   blockHash: Buffer;
+  /** 80-byte header of the snapshot base, when the fixture supplies it. */
+  baseHeader?: Buffer;
+  /** Cumulative nChainWork of the snapshot base, when known. */
+  chainWork?: bigint;
 }
 
 /**
@@ -1764,10 +1768,9 @@ export function clearRegtestAssumeutxo(params: ConsensusParams): void {
  * One entry of a campaign-assumeutxo fixture file (DISPLAY-order hex, as
  * printed by Bitcoin Core / `dumptxoutset`). See
  * `receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md` for the shared cross-impl
- * schema. `base_mtp` / `base_header` / `chainwork` are accepted (other
- * impls need them for post-snapshot connect) but hotbuns's
- * {@link AssumeutxoData} shape does not carry them yet, so they are
- * validated-if-present and otherwise ignored here.
+ * schema. `base_mtp` is accepted and ignored (MTP overlay is a follow-on);
+ * `base_header` / `chainwork` are stored on {@link AssumeutxoData} so
+ * snapshot-boot can pin the header-sync pointer on the loaded base.
  */
 interface CampaignAssumeutxoEntry {
   height: number;
@@ -1869,10 +1872,26 @@ export async function loadCampaignAssumeutxo(params: ConsensusParams): Promise<v
         `loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) has non-hex base_header`,
       );
     }
+    if (entry.chainwork !== undefined && !HASH_HEX_RE.test(entry.chainwork)) {
+      throw new Error(
+        `loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) has invalid chainwork`,
+      );
+    }
 
     const blockHash = Buffer.from(entry.blockhash, "hex").reverse();
     const hashSerialized = Buffer.from(entry.hash_serialized, "hex").reverse();
     const key = blockHash.toString("hex");
+    let baseHeader: Buffer | undefined;
+    if (entry.base_header) {
+      const hdr = Buffer.from(entry.base_header, "hex");
+      if (hdr.length !== 80) {
+        throw new Error(
+          `loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) base_header is ${hdr.length} bytes, want 80`,
+        );
+      }
+      baseHeader = hdr;
+    }
+    const chainWork = entry.chainwork ? BigInt("0x" + entry.chainwork) : undefined;
 
     if (assumeutxo.has(key)) {
       throw new Error(
@@ -1894,6 +1913,8 @@ export async function loadCampaignAssumeutxo(params: ConsensusParams): Promise<v
       hashSerialized,
       nChainTx: BigInt(entry.m_chain_tx_count),
       blockHash,
+      baseHeader,
+      chainWork,
     });
     loadedHeights.push(entry.height);
   }

@@ -181,6 +181,15 @@ export interface AssumeutxoData {
   readonly nChainTx: bigint;
   /** Block hash at this height. */
   readonly blockHash: Buffer;
+  /**
+   * 80-byte header of the snapshot base, when the campaign fixture (or a
+   * future chainparams band) supplies it. Snapshot-first boot uses this so
+   * AddToBlockIndex can leave m_best_header on the loaded base without
+   * waiting for a peer to serve the header.
+   */
+  readonly baseHeader?: Buffer;
+  /** Cumulative nChainWork of the snapshot base, when known. */
+  readonly chainWork?: bigint;
 }
 
 /**

@@ -11347,21 +11347,31 @@ export class RPCServer {
     // Stitch the active chain tip + a minimal block index to the snapshot base
     // (the same put-* calls the CLI snapshot path runs after loadSnapshot), so
     // the snapshot baseline is the active tip and getchainstates reads it.
+    const au = this.params.assumeutxo?.get(loadResult.baseBlockHash.toString("hex"));
+    const headerBuf =
+      au?.baseHeader && au.baseHeader.length >= 80
+        ? au.baseHeader
+        : Buffer.alloc(80);
+    const snapWork =
+      au?.chainWork && au.chainWork > 0n
+        ? au.chainWork
+        : this.params.nMinimumChainWork;
     await this.db.putChainState({
       bestBlockHash: loadResult.baseBlockHash,
       bestHeight: loadResult.baseHeight,
-      totalWork: this.params.nMinimumChainWork,
+      totalWork: snapWork,
     });
     if (!(await this.db.getBlockIndex(loadResult.baseBlockHash))) {
       await this.db.putBlockIndex(loadResult.baseBlockHash, {
         height: loadResult.baseHeight,
-        header: Buffer.alloc(80),
+        header: headerBuf,
         nTx: 0,
         status:
           BlockStatus.HEADER_VALID | BlockStatus.TXS_VALID | BlockStatus.HAVE_DATA,
         dataPos: 0,
       });
     }
+    await this.db.putChainWork(loadResult.baseBlockHash, snapWork);
     // Unconditionally (re-)point the active-chain height->hash index
     // (DBPrefix.HEADER, read by getblockhash / getBlockHashByHeight) at the
     // snapshot base, regardless of the branch above. If a BLOCK_INDEX record
@@ -11391,6 +11401,16 @@ export class RPCServer {
     // here, the node keeps an in-memory tip of height 0" — same root cause,
     // same fix, now applied to the RPC-triggered load path too).
     await this.chainState.load();
+
+    // Snapshot-first boot: leave m_best_header on the loaded base before
+    // any further peer headers (Core AddToBlockIndex). Then snap the
+    // download frontier past the base so requestBlocks does not walk
+    // from height 1.
+    await this.headerSync.adoptChainTipAsBestHeader(
+      loadResult.baseBlockHash,
+      loadResult.baseHeight,
+    );
+    this.blockSync?.advanceFrontierPast(loadResult.baseHeight);
 
     // (2) REAL background dual-chainstate validation (Core AddChainstate +
     //     MaybeValidateSnapshot). The background validator owns a SEPARATE

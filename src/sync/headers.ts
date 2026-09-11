@@ -220,14 +220,30 @@ export class HeaderSync {
   private parseGenesisHeader(): BlockHeader {
     const block = this.params.genesisBlock;
     // Header is the first 80 bytes
+    return this.headerFromBytes(block.subarray(0, 80));
+  }
+
+  /** Decode an 80-byte header buffer. */
+  private headerFromBytes(headerBuf: Buffer): BlockHeader {
     return {
-      version: block.readInt32LE(0),
-      prevBlock: block.subarray(4, 36),
-      merkleRoot: block.subarray(36, 68),
-      timestamp: block.readUInt32LE(68),
-      bits: block.readUInt32LE(72),
-      nonce: block.readUInt32LE(76),
+      version: headerBuf.readInt32LE(0),
+      prevBlock: Buffer.from(headerBuf.subarray(4, 36)),
+      merkleRoot: Buffer.from(headerBuf.subarray(36, 68)),
+      timestamp: headerBuf.readUInt32LE(68),
+      bits: headerBuf.readUInt32LE(72),
+      nonce: headerBuf.readUInt32LE(76),
     };
+  }
+
+  /**
+   * Snapshot-base chainwork must strictly exceed genesis work or
+   * `noteCandidateWork` will leave `bestHeader` on height 0 (regtest
+   * nMinimumChainWork is 0).
+   */
+  private heavierThanGenesis(work: bigint): bigint {
+    const genesis = this.headerChain.get(this.params.genesisBlockHash.toString("hex"));
+    const gw = genesis?.chainWork ?? 0n;
+    return work > gw ? work : gw + 1n;
   }
 
   /**
@@ -995,6 +1011,99 @@ export class HeaderSync {
   }
 
   /**
+   * Insert a header into the index without requiring its parent, and
+   * update `bestHeader` if it out-works the current pointer.
+   *
+   * Bitcoin Core: `AddToBlockIndex` (blockstorage.cpp:224-256) sets
+   * `m_best_header` on every TREE-valid insert. Snapshot activation
+   * must leave that pointer on the loaded base before any peer headers
+   * arrive — otherwise `getblockchaininfo.headers` stays 0 and
+   * `requestBlocks` treats height 0 as the download ceiling.
+   */
+  async seedHeader(opts: {
+    hash: Buffer;
+    header: BlockHeader;
+    height: number;
+    chainWork: bigint;
+  }): Promise<HeaderChainEntry> {
+    if (!this.headerChain.has(this.params.genesisBlockHash.toString("hex"))) {
+      this.initGenesis();
+    }
+    const chainWork = this.heavierThanGenesis(opts.chainWork);
+    const hashHex = opts.hash.toString("hex");
+    const existing = this.headerChain.get(hashHex);
+    const entry: HeaderChainEntry = existing ?? {
+      hash: opts.hash,
+      header: opts.header,
+      height: opts.height,
+      chainWork,
+      status: "valid-header",
+    };
+    if (existing) {
+      entry.header = opts.header;
+      entry.height = opts.height;
+      entry.chainWork = chainWork;
+      if (entry.status === "invalid") {
+        entry.status = "valid-header";
+      }
+    } else {
+      this.headerChain.set(hashHex, entry);
+    }
+    this.noteCandidateWork(entry);
+    // Equal-work (or a pointer already on this hash): still pin the
+    // by-height index so locators and requestBlocks can see the base.
+    if (!this.headersByHeight.get(opts.height)?.hash.equals(opts.hash)) {
+      this.headersByHeight.set(opts.height, entry);
+    }
+    await this.saveHeaderEntry(entry);
+    if (this.bestHeader) {
+      await this.saveHeaderTip(this.bestHeader);
+    }
+    await this.db.putChainWork(opts.hash, chainWork);
+    return entry;
+  }
+
+  /**
+   * After snapshot load, make the chain-state tip the best-header pointer.
+   *
+   * Reads the persisted block-index / assumeutxo header (campaign
+   * `base_header` overlays a dummy 80-zero record) and calls
+   * {@link seedHeader}. Idempotent when the pointer is already the tip.
+   */
+  async adoptChainTipAsBestHeader(hash: Buffer, height: number): Promise<void> {
+    const have = this.getHeader(hash);
+    if (
+      have &&
+      this.bestHeader &&
+      this.bestHeader.hash.equals(hash) &&
+      this.bestHeader.height === height &&
+      this.headersByHeight.get(height)?.hash.equals(hash)
+    ) {
+      await this.saveHeaderTip(this.bestHeader);
+      return;
+    }
+    const rec = await this.db.getBlockIndex(hash);
+    const au = this.params.assumeutxo?.get(hash.toString("hex"));
+    let headerBuf = rec?.header && rec.header.length >= 80 ? rec.header : Buffer.alloc(80);
+    if (au?.baseHeader && au.baseHeader.length >= 80) {
+      headerBuf = au.baseHeader;
+    }
+    const storedWork = await this.db.getChainWork(hash);
+    const chainState = await this.db.getChainState();
+    const work =
+      storedWork ??
+      au?.chainWork ??
+      chainState?.totalWork ??
+      this.params.nMinimumChainWork;
+    await this.seedHeader({
+      hash,
+      header: this.headerFromBytes(headerBuf),
+      height,
+      chainWork: work,
+    });
+  }
+
+  /**
    * Get a header entry by its hash.
    */
   getHeader(hash: Buffer): HeaderChainEntry | undefined {
@@ -1255,10 +1364,13 @@ export class HeaderSync {
     // Initialize genesis first
     this.initGenesis();
 
-    // Load header tip from database
+    // Load header tip from database. Snapshot-first boot writes the
+    // assumeUTXO base into BLOCK_INDEX + CHAIN_STATE without HEADER_TIP
+    // (historical persist) — still scan so AddToBlockIndex can land
+    // m_best_header on that base.
     const headerTip = await this.loadHeaderTip();
-    if (!headerTip) {
-      // No stored headers beyond genesis
+    const chainState = await this.db.getChainState();
+    if (!headerTip && (!chainState || chainState.bestHeight <= 0)) {
       return;
     }
 
@@ -1342,14 +1454,46 @@ export class HeaderSync {
       const parentHashHex = header.prevBlock.toString("hex");
       const parent = this.headerChain.get(parentHashHex);
       if (!parent) {
-        // Parent not yet loaded — this can legitimately happen for
-        // orphans/forks whose ancestor chain wasn't persisted, or for a
-        // partially-corrupt index. Don't crash the boot; skip and let the
-        // header sync re-fetch on next round-trip.
-        console.warn(
-          `Missing parent for header at height ${record.height} ` +
-            `(${hash.toString("hex").slice(0, 16)}...)`,
+        // Snapshot-base / disconnected index entry: Core LoadBlockIndex
+        // still considers every TREE-valid pindex for m_best_header
+        // (validation.cpp:4919). A dummy prevBlock (zeros) must not
+        // leave the pointer at genesis.
+        const hashHex = hash.toString("hex");
+        const au = this.params.assumeutxo?.get(hashHex);
+        const isChainTip =
+          chainState !== null && chainState.bestBlockHash.equals(hash);
+        const isHeaderTip = headerTip !== null && headerTip.equals(hash);
+        if (!isChainTip && !isHeaderTip && !au) {
+          console.warn(
+            `Missing parent for header at height ${record.height} ` +
+              `(${hash.toString("hex").slice(0, 16)}...)`,
+          );
+          continue;
+        }
+        let hdr = header;
+        if (au?.baseHeader && au.baseHeader.length >= 80) {
+          hdr = this.headerFromBytes(au.baseHeader);
+        }
+        const storedWork = await this.db.getChainWork(hash);
+        const chainWork = this.heavierThanGenesis(
+          storedWork ??
+            au?.chainWork ??
+            chainState?.totalWork ??
+            this.params.nMinimumChainWork,
         );
+        let status: HeaderStatus = "valid-header";
+        if ((record.status & 1) === 0) {
+          status = "invalid";
+        }
+        const entry: HeaderChainEntry = {
+          hash,
+          header: hdr,
+          height: record.height,
+          chainWork,
+          status,
+        };
+        this.headerChain.set(hashHex, entry);
+        this.noteCandidateWork(entry);
         continue;
       }
 

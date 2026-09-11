@@ -900,6 +900,27 @@ export class BlockSync {
     );
   }
 
+  /**
+   * Snap the IBD request/process pointers up to `height + 1`.
+   *
+   * Snapshot activation moves the validated tip from genesis to the
+   * assumeUTXO base; `start()` only reads CHAIN_STATE once. loadtxoutset
+   * on a running node must raise the frontier or it keeps requesting
+   * from height 1 against a header pointer at the base.
+   */
+  advanceFrontierPast(height: number): void {
+    const newFrontier = height + 1;
+    if (newFrontier > this.state.nextHeightToProcess) {
+      this.state.nextHeightToProcess = newFrontier;
+    }
+    if (newFrontier > this.state.nextHeightToRequest) {
+      this.state.nextHeightToRequest = newFrontier;
+    }
+    if (height > this.lastFlushedHeight) {
+      this.lastFlushedHeight = height;
+    }
+  }
+
   resyncFrontierAfterRollback(): void {
     if (!this.chainStateManager) return;
     const tip = this.chainStateManager.getBestBlock();

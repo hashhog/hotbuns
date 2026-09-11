@@ -15,7 +15,7 @@ import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { deserializeBlock } from "../validation/block.js";
 import { ChainStateManager } from "../chain/state.js";
 import { TipNotifier } from "../chain/tip_notifier.js";
-import { ChainstateManager, loadCampaignAssumeutxo } from "../chain/snapshot.js";
+import { ChainstateManager, getAssumeutxoData, loadCampaignAssumeutxo } from "../chain/snapshot.js";
 import { UTXOManager } from "../chain/utxo.js";
 import { Mempool } from "../mempool/mempool.js";
 import { OrphanPool } from "../mempool/orphan_pool.js";
@@ -1307,33 +1307,39 @@ async function runSnapshotLoad(
     `  Base block:  ${Buffer.from(result.baseBlockHash).reverse().toString("hex")}`
   );
 
-  // Stitch chain tip + minimal block index so subsequent startup uses the
-  // snapshot baseline as the active tip. The real header will arrive via
-  // the network during follow-on IBD.
-  //
-  // chainWork is seeded to nMinimumChainWork (NOT 0): the assumeUTXO base is,
-  // by construction, on a chain whose accumulated work is at least the
-  // hardcoded minimum, and a 0 here would make the snapshot tip lose every
-  // reorg comparison and keep the node permanently in initial-block-download
-  // mode.  This mirrors rustoshi's `chain_work=minimum_chain_work` snapshot
-  // activation (rustoshi/src/main.rs:1978) and Bitcoin Core's
-  // PopulateAndValidateSnapshot, which records nChainWork on the snapshot base
-  // pindex.  The exact value is refined upward as real headers/blocks connect.
+  // Stitch chain tip + block index so subsequent startup uses the
+  // snapshot baseline as the active tip. Prefer the campaign/chainparams
+  // 80-byte base header when present — a dummy all-zero header cannot
+  // parent post-snapshot `headers` (bad-diffbits). chainWork is seeded to
+  // the fixture value or nMinimumChainWork (NOT 0): a 0 here would make
+  // the snapshot tip lose every reorg comparison. HeaderSync.loadFromDB
+  // / adoptChainTipAsBestHeader then leave m_best_header on this base
+  // (Core AddToBlockIndex).
+  const au = getAssumeutxoData(params, result.baseBlockHash);
+  const headerBuf =
+    au?.baseHeader && au.baseHeader.length >= 80
+      ? au.baseHeader
+      : Buffer.alloc(80);
+  const chainWork =
+    au?.chainWork && au.chainWork > 0n
+      ? au.chainWork
+      : params.nMinimumChainWork;
+
   await db.putChainState({
     bestBlockHash: result.baseBlockHash,
     bestHeight: result.baseHeight,
-    totalWork: params.nMinimumChainWork,
+    totalWork: chainWork,
   });
 
-  const dummyHeader = Buffer.alloc(80);
   await db.putBlockIndex(result.baseBlockHash, {
     height: result.baseHeight,
-    header: dummyHeader,
+    header: headerBuf,
     nTx: 0,
     status:
       BlockStatus.HEADER_VALID | BlockStatus.TXS_VALID | BlockStatus.HAVE_DATA,
     dataPos: 0,
   });
+  await db.putChainWork(result.baseBlockHash, chainWork);
 
   console.log(
     `Snapshot load complete. Chain tip: height ${result.baseHeight}, hash ` +
@@ -1779,13 +1785,22 @@ async function startNode(config: NodeConfig): Promise<void> {
     console.log(
       `Snapshot adopted as chain tip: height ${bestBlock.height}, hash ` +
         `${Buffer.from(bestBlock.hash).reverse().toString("hex")} — ` +
-        `header-syncing from genesis, then forward-syncing block bodies ${bestBlock.height + 1}+.`
+        `header pointer at the snapshot base, then forward-syncing block bodies ${bestBlock.height + 1}+.`
     );
   }
 
   // 5. Initialize header sync
   const headerSync = new HeaderSync(db, params);
   await headerSync.loadFromDB();
+  // Snapshot-first boot: AddToBlockIndex must leave m_best_header on the
+  // loaded base before any peer headers arrive. loadFromDB reconstructs
+  // a disconnected BLOCK_INDEX entry; adopt is the in-process pin (and
+  // persists HEADER_TIP for the next restart). Only on this path — a
+  // normal headers-ahead boot must not reseat the pointer onto the
+  // validated tip.
+  if (mergedConfig.loadSnapshot && bestBlock.height > 0) {
+    await headerSync.adoptChainTipAsBestHeader(bestBlock.hash, bestBlock.height);
+  }
 
   // 6. Start peer manager (DNS seed resolution, connect to peers)
   // BIP-159: when prune mode is on, PeerManager OR's NODE_NETWORK_LIMITED
