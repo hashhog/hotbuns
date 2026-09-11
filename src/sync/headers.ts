@@ -24,6 +24,7 @@ import {
 } from "../chain/state.js";
 import {
   getNextWorkRequired,
+  MissingRetargetAncestorError,
   type BlockInfo,
   type BlockLookup,
 } from "../consensus/pow.js";
@@ -875,7 +876,18 @@ export class HeaderSync {
     //   if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
     //     return state.Invalid(..., "bad-diffbits", ...);
     // Pass the block's timestamp for testnet min-difficulty check.
-    const expectedTarget = this.getNextTarget(parent, header.timestamp);
+    let expectedTarget: bigint;
+    try {
+      expectedTarget = this.getNextTarget(parent, header.timestamp);
+    } catch (err) {
+      if (err instanceof MissingRetargetAncestorError) {
+        return {
+          valid: false,
+          error: `bad-diffbits: ${err.message}`,
+        };
+      }
+      throw err;
+    }
     const expectedBits = bigIntToCompact(expectedTarget);
     if (header.bits !== expectedBits) {
       return {
@@ -1064,13 +1076,85 @@ export class HeaderSync {
   }
 
   /**
+   * Insert an ascending band of 80-byte headers ending at `baseHeight`.
+   *
+   * Used for campaign `base_tail_headers`: the last header is the snapshot
+   * base, and earlier entries are its real ancestors so GetNextWorkRequired
+   * can resolve the next period-start (Core pow.cpp:45 `assert(pindexFirst)`).
+   */
+  async seedTailHeaders(
+    rawHeaders: Buffer[],
+    baseHeight: number,
+    baseChainWork: bigint,
+  ): Promise<void> {
+    if (rawHeaders.length === 0) return;
+    const n = rawHeaders.length;
+    if (n - 1 > baseHeight) {
+      throw new Error(
+        `seedTailHeaders: ${n} headers at base height ${baseHeight} would start below genesis`,
+      );
+    }
+    const startHeight = baseHeight - (n - 1);
+    const decoded = rawHeaders.map((buf) => {
+      const header = this.headerFromBytes(buf);
+      return { header, hash: getBlockHash(header) };
+    });
+    // Seed the base first so noteCandidateWork pins bestHeader there.
+    // Ancestors only need bits/time for GetNextWorkRequired; their
+    // chainwork is a lower bound so they cannot displace the base
+    // (seedHeader's heavierThanGenesis would otherwise collapse a tiny
+    // synthetic chainWork onto genesis+1 for every entry and leave the
+    // pointer on the oldest tail).
+    for (let i = n - 1; i >= 0; i--) {
+      await this.seedHeader({
+        hash: decoded[i].hash,
+        header: decoded[i].header,
+        height: startHeight + i,
+        chainWork: i === n - 1 ? baseChainWork : 1n + BigInt(i),
+      });
+    }
+    console.log(
+      `[assumeutxo] seeded ${n} base_tail_headers heights ${startHeight}..${baseHeight}`,
+    );
+  }
+
+  /**
    * After snapshot load, make the chain-state tip the best-header pointer.
    *
    * Reads the persisted block-index / assumeutxo header (campaign
    * `base_header` overlays a dummy 80-zero record) and calls
-   * {@link seedHeader}. Idempotent when the pointer is already the tip.
+   * {@link seedHeader}. When `base_tail_headers` is present, seeds the
+   * whole pre-base band so the first retarget above the base can resolve
+   * its period-start ancestor. Idempotent when the pointer is already the
+   * tip *and* the oldest tail is already indexed.
    */
   async adoptChainTipAsBestHeader(hash: Buffer, height: number): Promise<void> {
+    const au = this.params.assumeutxo?.get(hash.toString("hex"));
+    const storedWork = await this.db.getChainWork(hash);
+    const chainState = await this.db.getChainState();
+    const work =
+      storedWork ??
+      au?.chainWork ??
+      chainState?.totalWork ??
+      this.params.nMinimumChainWork;
+
+    const tails = au?.baseTailHeaders;
+    if (tails && tails.length > 0) {
+      const startHeight = height - (tails.length - 1);
+      const haveStart = this.headersByHeight.get(startHeight);
+      const haveTip =
+        this.bestHeader &&
+        this.bestHeader.hash.equals(hash) &&
+        this.bestHeader.height === height &&
+        this.headersByHeight.get(height)?.hash.equals(hash);
+      if (haveTip && haveStart) {
+        await this.saveHeaderTip(this.bestHeader!);
+        return;
+      }
+      await this.seedTailHeaders(tails, height, work);
+      return;
+    }
+
     const have = this.getHeader(hash);
     if (
       have &&
@@ -1083,18 +1167,10 @@ export class HeaderSync {
       return;
     }
     const rec = await this.db.getBlockIndex(hash);
-    const au = this.params.assumeutxo?.get(hash.toString("hex"));
     let headerBuf = rec?.header && rec.header.length >= 80 ? rec.header : Buffer.alloc(80);
     if (au?.baseHeader && au.baseHeader.length >= 80) {
       headerBuf = au.baseHeader;
     }
-    const storedWork = await this.db.getChainWork(hash);
-    const chainState = await this.db.getChainState();
-    const work =
-      storedWork ??
-      au?.chainWork ??
-      chainState?.totalWork ??
-      this.params.nMinimumChainWork;
     await this.seedHeader({
       hash,
       header: this.headerFromBytes(headerBuf),

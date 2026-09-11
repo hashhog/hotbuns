@@ -132,6 +132,7 @@ import {
   deserializeSnapshotMetadata,
   deserializeCoinFromSnapshot,
   getLatestSnapshotHeightForRollback,
+  persistAssumeutxoTailHeaders,
   SNAPSHOT_MAGIC,
   SNAPSHOT_VERSION,
   type SnapshotMetadata,
@@ -11372,6 +11373,9 @@ export class RPCServer {
       });
     }
     await this.db.putChainWork(loadResult.baseBlockHash, snapWork);
+    if (au) {
+      await persistAssumeutxoTailHeaders(this.db, au);
+    }
     // Unconditionally (re-)point the active-chain height->hash index
     // (DBPrefix.HEADER, read by getblockhash / getBlockHashByHeight) at the
     // snapshot base, regardless of the branch above. If a BLOCK_INDEX record

@@ -13,7 +13,7 @@
 
 import { promises as fsp } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
-import { sha256Hash } from "../crypto/primitives.js";
+import { sha256Hash, hash256 } from "../crypto/primitives.js";
 import { BufferWriter, BufferReader, varIntSize } from "../wire/serialization.js";
 import {
   serializeTxOutCompressed,
@@ -28,7 +28,7 @@ import {
 } from "../wire/compressor.js";
 import { MuHash3072 } from "../wire/muhash.js";
 import type { UTXOEntry, BatchOperation } from "../storage/database.js";
-import { ChainDB, DBPrefix } from "../storage/database.js";
+import { ChainDB, DBPrefix, BlockStatus } from "../storage/database.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import type { Coin, CoinsViewCache, CoinsViewDB } from "./utxo.js";
 import { UTXOManager } from "./utxo.js";
@@ -79,6 +79,12 @@ export interface AssumeutxoData {
   baseHeader?: Buffer;
   /** Cumulative nChainWork of the snapshot base, when known. */
   chainWork?: bigint;
+  /**
+   * Ascending 80-byte headers ending at the snapshot base. Last element
+   * is the base itself. Empty/absent = pre-tail behaviour (header index
+   * starts at the base with no ancestors).
+   */
+  baseTailHeaders?: Buffer[];
 }
 
 /**
@@ -1769,8 +1775,9 @@ export function clearRegtestAssumeutxo(params: ConsensusParams): void {
  * printed by Bitcoin Core / `dumptxoutset`). See
  * `receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md` for the shared cross-impl
  * schema. `base_mtp` is accepted and ignored (MTP overlay is a follow-on);
- * `base_header` / `chainwork` are stored on {@link AssumeutxoData} so
- * snapshot-boot can pin the header-sync pointer on the loaded base.
+ * `base_header` / `chainwork` / `base_tail_headers` are stored on
+ * {@link AssumeutxoData} so snapshot-boot can pin the header-sync
+ * pointer on the loaded base and seed the pre-base retarget band.
  */
 interface CampaignAssumeutxoEntry {
   height: number;
@@ -1780,9 +1787,101 @@ interface CampaignAssumeutxoEntry {
   base_mtp?: number;
   base_header?: string;
   chainwork?: string;
+  base_tail_headers?: string[];
 }
 
 const HASH_HEX_RE = /^[0-9a-fA-F]{64}$/;
+const HEADER_HEX_RE = /^[0-9a-fA-F]{160}$/;
+
+/**
+ * Parse and validate a campaign entry's `base_tail_headers` hex list.
+ *
+ * Each string must be 160 hex chars (80 bytes). Headers are in ascending
+ * height order, must chain (`prevBlock` of i equals hash of i-1), and the
+ * last header's hash must equal `expectedBaseHash` (internal byte order).
+ * An empty list is a no-op. The band must not start below genesis.
+ *
+ * Reference: rustoshi `campaign_assumeutxo::parse_base_tail_headers`.
+ */
+export function parseBaseTailHeaders(
+  hexes: string[],
+  expectedBaseHash: Buffer,
+  baseHeight: number,
+  entryIndex: number,
+): Buffer[] {
+  if (hexes.length === 0) return [];
+  if (hexes.length - 1 > baseHeight) {
+    throw new Error(
+      `loadCampaignAssumeutxo: entry ${entryIndex} (height ${baseHeight}) ` +
+        `base_tail_headers has ${hexes.length} entries but the base height ` +
+        `is only ${baseHeight} (the band would start below genesis)`,
+    );
+  }
+
+  const headers: Buffer[] = [];
+  let prevHash: Buffer | null = null;
+  for (let i = 0; i < hexes.length; i++) {
+    const hex = hexes[i];
+    if (typeof hex !== "string" || !HEADER_HEX_RE.test(hex)) {
+      throw new Error(
+        `loadCampaignAssumeutxo: entry ${entryIndex} base_tail_headers[${i}] ` +
+          `is not 160 hex chars / 80 bytes`,
+      );
+    }
+    const buf = Buffer.from(hex, "hex");
+    const prevBlock = buf.subarray(4, 36);
+    if (prevHash !== null && !prevBlock.equals(prevHash)) {
+      throw new Error(
+        `loadCampaignAssumeutxo: entry ${entryIndex}: base_tail_headers does ` +
+          `not chain — header ${i}'s prev-hash does not link to [${i - 1}]`,
+      );
+    }
+    prevHash = hash256(buf);
+    headers.push(buf);
+  }
+
+  if (prevHash !== null && !prevHash.equals(expectedBaseHash)) {
+    throw new Error(
+      `loadCampaignAssumeutxo: entry ${entryIndex}: base_tail_headers' last ` +
+        `header hashes to ${Buffer.from(prevHash).reverse().toString("hex")}, ` +
+        `not the entry blockhash ${Buffer.from(expectedBaseHash).reverse().toString("hex")}`,
+    );
+  }
+  return headers;
+}
+
+/**
+ * Persist the pre-base tail band into BLOCK_INDEX so loadFromDB can
+ * reconstruct it. Skips the last entry (the snapshot base), which the
+ * caller already wrote with HAVE_DATA.
+ */
+export async function persistAssumeutxoTailHeaders(
+  db: ChainDB,
+  au: AssumeutxoData,
+): Promise<number> {
+  const tails = au.baseTailHeaders;
+  if (!tails || tails.length <= 1) return 0;
+  const n = tails.length;
+  const startHeight = au.height - (n - 1);
+  let written = 0;
+  for (let i = 0; i < n - 1; i++) {
+    const buf = tails[i];
+    const hash = hash256(buf);
+    await db.putBlockIndex(
+      hash,
+      {
+        height: startHeight + i,
+        header: buf,
+        nTx: 0,
+        status: BlockStatus.HEADER_VALID,
+        dataPos: 0,
+      },
+      { writeHeightIndex: false },
+    );
+    written++;
+  }
+  return written;
+}
 
 /**
  * Load `HASHHOG_CAMPAIGN_ASSUMEUTXO=<abs-path.json>` (read ONCE, here) and
@@ -1877,6 +1976,11 @@ export async function loadCampaignAssumeutxo(params: ConsensusParams): Promise<v
         `loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) has invalid chainwork`,
       );
     }
+    if (entry.base_tail_headers !== undefined && !Array.isArray(entry.base_tail_headers)) {
+      throw new Error(
+        `loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) base_tail_headers is not an array`,
+      );
+    }
 
     const blockHash = Buffer.from(entry.blockhash, "hex").reverse();
     const hashSerialized = Buffer.from(entry.hash_serialized, "hex").reverse();
@@ -1892,6 +1996,21 @@ export async function loadCampaignAssumeutxo(params: ConsensusParams): Promise<v
       baseHeader = hdr;
     }
     const chainWork = entry.chainwork ? BigInt("0x" + entry.chainwork) : undefined;
+    const baseTailHeaders = entry.base_tail_headers
+      ? parseBaseTailHeaders(entry.base_tail_headers, blockHash, entry.height, i)
+      : [];
+    if (baseHeader && baseTailHeaders.length > 0) {
+      const last = baseTailHeaders[baseTailHeaders.length - 1];
+      if (!last.equals(baseHeader)) {
+        throw new Error(
+          `loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) base_header ` +
+            `does not match the last base_tail_headers entry`,
+        );
+      }
+    }
+    if (!baseHeader && baseTailHeaders.length > 0) {
+      baseHeader = baseTailHeaders[baseTailHeaders.length - 1];
+    }
 
     if (assumeutxo.has(key)) {
       throw new Error(
@@ -1915,6 +2034,7 @@ export async function loadCampaignAssumeutxo(params: ConsensusParams): Promise<v
       blockHash,
       baseHeader,
       chainWork,
+      baseTailHeaders: baseTailHeaders.length > 0 ? baseTailHeaders : undefined,
     });
     loadedHeights.push(entry.height);
   }

@@ -15,7 +15,7 @@ import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { deserializeBlock } from "../validation/block.js";
 import { ChainStateManager } from "../chain/state.js";
 import { TipNotifier } from "../chain/tip_notifier.js";
-import { ChainstateManager, getAssumeutxoData, loadCampaignAssumeutxo } from "../chain/snapshot.js";
+import { ChainstateManager, getAssumeutxoData, loadCampaignAssumeutxo, persistAssumeutxoTailHeaders } from "../chain/snapshot.js";
 import { UTXOManager } from "../chain/utxo.js";
 import { Mempool } from "../mempool/mempool.js";
 import { OrphanPool } from "../mempool/orphan_pool.js";
@@ -1340,6 +1340,14 @@ async function runSnapshotLoad(
     dataPos: 0,
   });
   await db.putChainWork(result.baseBlockHash, chainWork);
+  if (au) {
+    const nTails = await persistAssumeutxoTailHeaders(db, au);
+    if (nTails > 0) {
+      console.log(
+        `[assumeutxo] persisted ${nTails} base_tail_headers below height ${result.baseHeight}`,
+      );
+    }
+  }
 
   console.log(
     `Snapshot load complete. Chain tip: height ${result.baseHeight}, hash ` +

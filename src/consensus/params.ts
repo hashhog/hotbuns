@@ -190,6 +190,13 @@ export interface AssumeutxoData {
   readonly baseHeader?: Buffer;
   /** Cumulative nChainWork of the snapshot base, when known. */
   readonly chainWork?: bigint;
+  /**
+   * Ascending band of 80-byte headers ending at the snapshot base
+   * (`base_tail_headers` in the campaign fixture). Last element IS the
+   * base header. Seeded into the header index so the next retarget can
+   * resolve its period-start ancestor (Core asserts `pindexFirst`).
+   */
+  readonly baseTailHeaders?: Buffer[];
 }
 
 /**

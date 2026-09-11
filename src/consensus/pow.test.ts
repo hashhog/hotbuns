@@ -354,6 +354,16 @@ describe("getNextWorkRequired", () => {
     // Core test #2: result capped at powLimit
     expect(bigIntToCompact(result)).toBe(0x1d00ffff);
   });
+
+  // Receipt 2026-09-11: missing period-start must fail closed (Core asserts
+  // pindexFirst). Pre-fix returned parent.bits, so retargets whose bits did
+  // not change "passed" and 60,480 (real change) was computed wrong.
+  test("missing period-start ancestor throws (fail-closed, Core pindexFirst)", () => {
+    const parent = makeBlock(60479, 0x1c0f675c, 1281893874);
+    expect(() => getNextWorkRequired(parent, 1281894000, MAINNET, () => undefined)).toThrow(
+      /retarget ancestor at height 58464/,
+    );
+  });
 });
 
 // ─── permittedDifficultyTransition ───────────────────────────────────────────

@@ -38,6 +38,32 @@ export interface BlockInfo {
 export type BlockLookup = (height: number) => BlockInfo | undefined;
 
 /**
+ * The ancestor needed to compute a difficulty retarget is not in the
+ * header index.
+ *
+ * Bitcoin Core's `GetNextWorkRequired` asserts `pindexFirst` (pow.cpp:45).
+ * A snapshot-booted chain can violate that invariant when `base_tail_headers`
+ * does not reach the next period-start. Returning the parent's bits here
+ * (the previous behaviour) is fail-open: retargets whose bits did not
+ * change (mainnet below 32,256) silently "passed", and the first real
+ * change (60,480) was computed wrong and rejected.
+ */
+export class MissingRetargetAncestorError extends Error {
+  readonly height: number;
+  readonly ancestorHeight: number;
+
+  constructor(height: number, ancestorHeight: number) {
+    super(
+      `retarget ancestor at height ${ancestorHeight} unreachable computing ` +
+        `work required for block at height ${height}`,
+    );
+    this.name = "MissingRetargetAncestorError";
+    this.height = height;
+    this.ancestorHeight = ancestorHeight;
+  }
+}
+
+/**
  * Calculate the next required work target for a block.
  *
  * This is the main entry point for difficulty adjustment, implementing
@@ -110,13 +136,14 @@ export function getNextWorkRequired(
     return compactToBigInt(parent.header.bits);
   }
 
-  // Adjustment block: find first block of this difficulty period
+  // Adjustment block: find first block of this difficulty period.
+  // Core pow.cpp:42-45: nHeightFirst = pindexLast->nHeight - (interval-1);
+  // assert(pindexFirst). Same ancestor as height - interval.
   const firstHeight = height - interval;
   const firstBlock = getBlockByHeight(firstHeight);
 
   if (!firstBlock) {
-    // Shouldn't happen if chain is consistent
-    return compactToBigInt(parent.header.bits);
+    throw new MissingRetargetAncestorError(height, firstHeight);
   }
 
   return calculateNextWorkRequired(
@@ -178,12 +205,10 @@ export function calculateNextWorkRequired(
     const firstHeight = parent.height - (interval - 1);
     const firstBlock = getBlockByHeight(firstHeight);
 
-    if (firstBlock) {
-      baseBits = firstBlock.header.bits;
-    } else {
-      // Fallback to parent's bits if lookup fails
-      baseBits = parent.header.bits;
+    if (!firstBlock) {
+      throw new MissingRetargetAncestorError(parent.height + 1, firstHeight);
     }
+    baseBits = firstBlock.header.bits;
   } else {
     // Standard behavior: use the last block of the period
     baseBits = parent.header.bits;
