@@ -27,7 +27,6 @@ import {
   MAX_SCRIPT_SIZE,
 } from "../wire/compressor.js";
 import { MuHash3072 } from "../wire/muhash.js";
-import type { UTXOEntry, BatchOperation } from "../storage/database.js";
 import { ChainDB, DBPrefix, BlockStatus } from "../storage/database.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import type { Coin, CoinsViewCache, CoinsViewDB } from "./utxo.js";
@@ -550,6 +549,92 @@ function getBogoSize(scriptPubKeyLen: number): bigint {
   return 32n + 4n + 4n + 8n + 2n + BigInt(scriptPubKeyLen);
 }
 
+/** Expand a 20-byte keyID to the 25-byte P2PKH scriptPubKey. */
+function expandP2PKH(hash160: Buffer): Buffer {
+  const out = Buffer.allocUnsafe(25);
+  out[0] = 0x76;
+  out[1] = 0xa9;
+  out[2] = 0x14;
+  hash160.copy(out, 3, 0, 20);
+  out[23] = 0x88;
+  out[24] = 0xac;
+  return out;
+}
+
+/** Expand a 20-byte scriptID to the 23-byte P2SH scriptPubKey. */
+function expandP2SH(hash160: Buffer): Buffer {
+  const out = Buffer.allocUnsafe(23);
+  out[0] = 0xa9;
+  out[1] = 0x14;
+  hash160.copy(out, 2, 0, 20);
+  out[22] = 0x87;
+  return out;
+}
+
+/**
+ * Encode one UTXO value (uncompressed local layout) into `dest`.
+ * Returns the number of bytes written. `dest` must be large enough
+ * (13 + compactsize + script; 16 KiB covers MAX_SCRIPT_SIZE).
+ */
+function encodeUtxoValue(
+  dest: Buffer,
+  height: number,
+  coinbase: boolean,
+  amount: bigint,
+  scriptPubKey: Buffer,
+): number {
+  dest.writeUInt32LE(height >>> 0, 0);
+  dest[4] = coinbase ? 1 : 0;
+  dest.writeBigUInt64LE(amount, 5);
+  const spkLen = scriptPubKey.length;
+  let pos = 13;
+  if (spkLen <= 0xfc) {
+    dest[pos++] = spkLen;
+  } else if (spkLen <= 0xffff) {
+    dest[pos++] = 0xfd;
+    dest.writeUInt16LE(spkLen, pos);
+    pos += 2;
+  } else {
+    dest[pos++] = 0xfe;
+    dest.writeUInt32LE(spkLen, pos);
+    pos += 4;
+  }
+  scriptPubKey.copy(dest, pos);
+  return pos + spkLen;
+}
+
+type SnapshotHashCoin = {
+  vout: number;
+  height: number;
+  coinbase: boolean;
+  amount: bigint;
+  scriptPubKey: Buffer;
+};
+
+/**
+ * Fold one txid-group into the load-time HASH_SERIALIZED hasher.
+ * Vouts are sorted numerically to match kernel/coinstats.cpp's std::map.
+ */
+function flushSnapshotHashGroup(
+  hasher: { update(data: Uint8Array): unknown } | null,
+  txid: Buffer | null,
+  group: SnapshotHashCoin[],
+): void {
+  if (!hasher || !txid || group.length === 0) {
+    group.length = 0;
+    return;
+  }
+  if (group.length > 1) {
+    group.sort((a, b) => a.vout - b.vout);
+  }
+  for (const c of group) {
+    hasher.update(
+      txOutSerBytes(txid, c.vout, c.height, c.coinbase, c.amount, c.scriptPubKey),
+    );
+  }
+  group.length = 0;
+}
+
 /**
  * Full `gettxoutsetinfo` statistics over the chainstate UTXO set in ONE pass.
  *
@@ -780,13 +865,12 @@ export class Chainstate {
  * (165M coins post-h=940k), so loading the whole file at once is no
  * longer viable on this runtime.
  *
- * This class holds a sliding 8 MiB window backed by a `node:fs` FileHandle
- * and exposes the subset of `BufferReader`'s API that loadSnapshot uses
- * (`readBytes`, `readUInt8/16/32LE`, `readUInt64LE`, `readVarInt`,
- * `readVarIntBig`, `readVarBytes`, `readHash`). Reads are advanced by
- * sliding the window forward; refill happens lazily when the next read
- * would underrun. `readBytes` always returns an owned copy so callers
- * cannot retain views into a buffer that the next refill will overwrite.
+ * This class holds a sliding 32 MiB window backed by a `node:fs` FileHandle
+ * and exposes a synchronous parse API (`readBytes`, `readUInt8/16/32LE`,
+ * `readUInt64LE`, `readVarInt`, `readVarIntBig`, `readHash`, `readVarIntCore`).
+ * The only async method is `fillWindow`; the per-coin loop stays on the
+ * fast path without a Promise per field. `readBytes` returns an owned copy;
+ * `readBytesView` is a window slice valid until the next fill.
  *
  * Not exported: only loadSnapshot needs this codepath. Other consumers of
  * snapshot.ts call deserializeSnapshotMetadata with a small in-memory
@@ -800,7 +884,7 @@ class StreamingBufferReader {
   private windowEnd: number;     // valid bytes [0, windowEnd) inside window
   private windowOff: number;     // next read offset within window
   private bytesConsumed: number; // total bytes returned to caller (== file pos of windowOff)
-  private static readonly WINDOW_BYTES = 8 * 1024 * 1024;
+  private static readonly WINDOW_BYTES = 32 * 1024 * 1024;
 
   constructor(fh: FileHandle, fileSize: number) {
     this.fh = fh;
@@ -816,6 +900,10 @@ class StreamingBufferReader {
     return this.bytesConsumed;
   }
 
+  remaining(): number {
+    return this.windowEnd - this.windowOff;
+  }
+
   /**
    * Returns true when the entire file has been consumed (no trailing bytes).
    */
@@ -827,27 +915,20 @@ class StreamingBufferReader {
   }
 
   /**
-   * Ensure at least `n` bytes are available starting at windowOff. Compacts
-   * the unread tail to position 0 then refills from disk.
+   * Compact the unread tail and fill the window from disk. Does not throw
+   * on a short read — callers check {@link remaining} and the sync readers
+   * throw on a real underrun. This is the ONLY async method; the per-coin
+   * parse is synchronous so a 168M-coin import does not allocate a billion
+   * promises.
    */
-  async ensure(n: number): Promise<void> {
-    if (n > this.window.length) {
-      // A single coin entry is bounded (script ≤ ~10kB, etc.); 8 MiB is
-      // plenty. If n grows beyond the window, that's a malformed snapshot.
-      throw new Error(
-        `StreamingBufferReader: requested ${n} bytes exceeds window ${this.window.length}`
-      );
-    }
-    if (this.windowEnd - this.windowOff >= n) return;
-    // Compact remaining tail to start of window.
+  async fillWindow(): Promise<void> {
     const tailLen = this.windowEnd - this.windowOff;
     if (tailLen > 0 && this.windowOff > 0) {
       this.window.copy(this.window, 0, this.windowOff, this.windowEnd);
     }
     this.windowEnd = tailLen;
     this.windowOff = 0;
-    // Fill from file.
-    while (this.windowEnd < n && this.filePos < this.fileSize) {
+    while (this.windowEnd < this.window.length && this.filePos < this.fileSize) {
       const want = Math.min(
         this.window.length - this.windowEnd,
         this.fileSize - this.filePos,
@@ -862,90 +943,104 @@ class StreamingBufferReader {
       this.windowEnd += bytesRead;
       this.filePos += bytesRead;
     }
+  }
+
+  private require(n: number): void {
+    if (n > this.window.length) {
+      throw new Error(
+        `StreamingBufferReader: requested ${n} bytes exceeds window ${this.window.length}`
+      );
+    }
     if (this.windowEnd - this.windowOff < n) {
       throw new Error(
         `StreamingBufferReader: underrun — wanted ${n} bytes but only ` +
           `${this.windowEnd - this.windowOff} available (file pos ` +
-          `${this.bytesConsumed + this.windowOff}, file size ${this.fileSize})`
+          `${this.bytesConsumed}, file size ${this.fileSize})`
       );
     }
   }
 
-  async readUInt8(): Promise<number> {
-    await this.ensure(1);
+  readUInt8(): number {
+    this.require(1);
     const v = this.window.readUInt8(this.windowOff);
     this.windowOff += 1;
     this.bytesConsumed += 1;
     return v;
   }
 
-  async readUInt16LE(): Promise<number> {
-    await this.ensure(2);
+  readUInt16LE(): number {
+    this.require(2);
     const v = this.window.readUInt16LE(this.windowOff);
     this.windowOff += 2;
     this.bytesConsumed += 2;
     return v;
   }
 
-  async readUInt32LE(): Promise<number> {
-    await this.ensure(4);
+  readUInt32LE(): number {
+    this.require(4);
     const v = this.window.readUInt32LE(this.windowOff);
     this.windowOff += 4;
     this.bytesConsumed += 4;
     return v;
   }
 
-  async readUInt64LE(): Promise<bigint> {
-    await this.ensure(8);
+  readUInt64LE(): bigint {
+    this.require(8);
     const v = this.window.readBigUInt64LE(this.windowOff);
     this.windowOff += 8;
     this.bytesConsumed += 8;
     return v;
   }
 
-  async readBytes(n: number): Promise<Buffer> {
-    await this.ensure(n);
-    // Copy: caller may retain references across subsequent reads which slide
-    // the window and overwrite the underlying memory.
-    const out = Buffer.from(this.window.subarray(this.windowOff, this.windowOff + n));
+  /**
+   * View into the window. Caller must copy before the next fillWindow.
+   */
+  readBytesView(n: number): Buffer {
+    this.require(n);
+    const view = this.window.subarray(this.windowOff, this.windowOff + n);
     this.windowOff += n;
     this.bytesConsumed += n;
-    return out;
+    return view;
   }
 
-  async readHash(): Promise<Buffer> {
+  readBytes(n: number): Buffer {
+    return Buffer.from(this.readBytesView(n));
+  }
+
+  readHash(): Buffer {
     return this.readBytes(32);
   }
 
-  async readVarIntBig(): Promise<bigint> {
-    const first = await this.readUInt8();
-    if (first <= 0xfc) return BigInt(first);
-    if (first === 0xfd) return BigInt(await this.readUInt16LE());
-    if (first === 0xfe) return BigInt(await this.readUInt32LE());
-    return await this.readUInt64LE();
+  skip(n: number): void {
+    this.require(n);
+    this.windowOff += n;
+    this.bytesConsumed += n;
   }
 
-  async readVarInt(): Promise<number> {
-    const v = await this.readVarIntBig();
+  readVarIntBig(): bigint {
+    const first = this.readUInt8();
+    if (first <= 0xfc) return BigInt(first);
+    if (first === 0xfd) return BigInt(this.readUInt16LE());
+    if (first === 0xfe) return BigInt(this.readUInt32LE());
+    return this.readUInt64LE();
+  }
+
+  readVarInt(): number {
+    const v = this.readVarIntBig();
     if (v > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new Error("readVarInt: value exceeds Number.MAX_SAFE_INTEGER");
     }
     return Number(v);
   }
 
-  async readVarBytes(): Promise<Buffer> {
-    const len = await this.readVarInt();
-    return this.readBytes(len);
-  }
-
   /**
    * Read Bitcoin Core's per-byte VARINT (NOT CompactSize). Mirrors
    * wire/compressor.ts:readVarIntCore but driven by this stream.
    */
-  async readVarIntCore(): Promise<bigint> {
+  readVarIntCore(): bigint {
     let n = 0n;
     while (true) {
-      const ch = await this.readUInt8();
+      const ch = this.readUInt8();
       n = (n << 7n) | BigInt(ch & 0x7f);
       if ((ch & 0x80) === 0) return n;
       n += 1n;
@@ -1067,12 +1162,14 @@ export class ChainstateManager {
     let auData: AssumeutxoData | null;
     let baseHeight: number;
     let snapshotChainstate: Chainstate;
+    let streamedHash: Buffer | null = null;
     try {
       const stream = new StreamingBufferReader(fh, stat.size);
+      await stream.fillWindow();
 
       // Parse metadata (51 bytes).
       const headerLen = SNAPSHOT_MAGIC.length + 2 + 4 + 32 + 8;
-      const headerBuf = await stream.readBytes(headerLen);
+      const headerBuf = stream.readBytes(headerLen);
       metadata = deserializeSnapshotMetadata(
         new BufferReader(headerBuf),
         this.params.networkMagic,
@@ -1141,18 +1238,24 @@ export class ChainstateManager {
       snapshotChainstate.tipHash = metadata.baseBlockHash;
       snapshotChainstate.tipHeight = baseHeight;
 
-      const batchOps: BatchOperation[] = [];
+      let batch = this.db.newChainedBatch();
+      const valueScratch = Buffer.allocUnsafe(16 * 1024);
+      const hasher = auData ? new Bun.CryptoHasher("sha256") : null;
+      const hashGroup: SnapshotHashCoin[] = [];
+      let hashTxid: Buffer | null = null;
 
       while (coinsLoaded < metadata.coinsCount) {
         if (interruptCheck?.()) {
           throw new Error("Interrupted");
         }
 
+        if (stream.remaining() < 64) await stream.fillWindow();
+
         // Read transaction ID.
-        const txid = await stream.readHash();
+        const txid = stream.readHash();
 
         // Read number of outputs for this transaction (CompactSize).
-        const numOutputs = await stream.readVarInt();
+        const numOutputs = stream.readVarInt();
 
         // BUG-1: per-txid overflow guard.
         // Mirrors validation.cpp:5804-5806 — coins_per_txid > coins_left
@@ -1164,9 +1267,16 @@ export class ChainstateManager {
           );
         }
 
+        if (hasher) {
+          flushSnapshotHashGroup(hasher, hashTxid, hashGroup);
+          hashTxid = txid;
+        }
+
         for (let i = 0; i < numOutputs; i++) {
+          if (stream.remaining() < 64) await stream.fillWindow();
+
           // vout index — CompactSize.
-          const vout = await stream.readVarInt();
+          const vout = stream.readVarInt();
 
           // BUG-4: vout upper-bound check.
           // Mirrors validation.cpp:5815-5818 — outpoint.n >= UINT32_MAX is
@@ -1184,11 +1294,11 @@ export class ChainstateManager {
           // deserializeCoinFromSnapshot/deserializeTxOutCompressed but
           // driven by the streaming reader so we never allocate the full
           // 9 GiB file in memory.
-          const codeBig = await stream.readVarIntCore();
+          const codeBig = stream.readVarIntCore();
           const height = Number(codeBig >> 1n);
           const isCoinbase = (codeBig & 1n) === 1n;
 
-          const compAmount = await stream.readVarIntCore();
+          const compAmount = stream.readVarIntCore();
           const value = decompressAmount(compAmount);
 
           // BUG-3: per-coin MoneyRange check.
@@ -1200,22 +1310,31 @@ export class ChainstateManager {
             );
           }
 
-          const nSizeBig = await stream.readVarIntCore();
+          const nSizeBig = stream.readVarIntCore();
           const nSize = Number(nSizeBig);
           let scriptPubKey: Buffer;
           if (nSize < NUM_SPECIAL_SCRIPTS) {
             const payloadLen = getSpecialScriptSize(nSize);
-            const payload = await stream.readBytes(payloadLen);
-            scriptPubKey = decompressScript(nSize, payload);
+            if (stream.remaining() < payloadLen) await stream.fillWindow();
+            const payload = stream.readBytesView(payloadLen);
+            if (nSize === 0) {
+              scriptPubKey = expandP2PKH(payload);
+            } else if (nSize === 1) {
+              scriptPubKey = expandP2SH(payload);
+            } else {
+              scriptPubKey = decompressScript(nSize, Buffer.from(payload));
+            }
           } else {
             const rawSize = nSize - NUM_SPECIAL_SCRIPTS;
             if (rawSize > MAX_SCRIPT_SIZE) {
               // Overly long script: replace with OP_RETURN and consume the bytes,
               // mirroring compressor.h:ScriptCompression::Unser (lines 87-90).
-              await stream.readBytes(rawSize);
+              if (stream.remaining() < rawSize) await stream.fillWindow();
+              stream.skip(rawSize);
               scriptPubKey = Buffer.from([0x6a]);
             } else {
-              scriptPubKey = await stream.readBytes(rawSize);
+              if (stream.remaining() < rawSize) await stream.fillWindow();
+              scriptPubKey = stream.readBytes(rawSize);
             }
           }
 
@@ -1226,35 +1345,40 @@ export class ChainstateManager {
             );
           }
 
-          // Add to batch.
-          const key = Buffer.alloc(36);
-          txid.copy(key, 0);
-          key.writeUInt32LE(vout, 32);
+          const encodedLen = encodeUtxoValue(
+            valueScratch,
+            height,
+            isCoinbase,
+            value,
+            scriptPubKey,
+          );
+          batch.putUTXO(txid, vout, Buffer.from(valueScratch.subarray(0, encodedLen)));
 
-          const writer = new BufferWriter();
-          writer.writeUInt32LE(height);
-          writer.writeUInt8(isCoinbase ? 1 : 0);
-          writer.writeUInt64LE(value);
-          writer.writeVarBytes(scriptPubKey);
-
-          batchOps.push({
-            type: "put",
-            prefix: DBPrefix.UTXO,
-            key,
-            value: writer.toBuffer(),
-          });
+          if (hasher) {
+            hashGroup.push({
+              vout,
+              height,
+              coinbase: isCoinbase,
+              amount: value,
+              scriptPubKey,
+            });
+          }
 
           coinsLoaded++;
 
-          if (batchOps.length >= COINS_LOAD_BATCH_SIZE) {
-            await this.db.batch(batchOps);
-            batchOps.length = 0;
+          if (batch.length >= COINS_LOAD_BATCH_SIZE) {
+            await batch.write();
+            batch = this.db.newChainedBatch();
           }
         }
       }
 
-      if (batchOps.length > 0) {
-        await this.db.batch(batchOps);
+      if (batch.length > 0) {
+        await batch.write();
+      }
+      if (hasher) {
+        flushSnapshotHashGroup(hasher, hashTxid, hashGroup);
+        streamedHash = sha256Hash(Buffer.from(hasher.digest()));
       }
 
       // BUG-2: trailing-bytes EOF check.
@@ -1291,7 +1415,16 @@ export class ChainstateManager {
     // SHA256d-via-HashWriter outputs. Refusing on mismatch is what makes
     // `loadtxoutset` strict — a malformed or out-of-band snapshot cannot
     // poison the chainstate.
-    const { hash: computedHash, coinsCount } = await computeUTXOSetHash(this.db, interruptCheck);
+    // Prefer the HASH_SERIALIZED folded during the load (same per-txid
+    // numeric-vout order as computeUTXOSetHash) so a 168M-coin import does
+    // not walk the coins DB a second time. Fall back to the DB walk if the
+    // streaming hasher was not used. HASHHOG_UNSAFE_SNAPSHOT_HEIGHT leaves
+    // auData null and skips the comparison entirely.
+    const { hash: computedHash } = streamedHash
+      ? { hash: streamedHash }
+      : auData
+        ? await computeUTXOSetHash(this.db, interruptCheck)
+        : { hash: Buffer.alloc(0) };
 
     // `auData === null` ONLY under the HASHHOG_UNSAFE_SNAPSHOT_HEIGHT bypass
     // above, where no chainparams entry exists and therefore no hardcoded

@@ -7,6 +7,9 @@ import {
   DBPrefix,
   COINS_DB_MAX_FILE_SIZE_BYTES,
   COINS_DB_MAX_OPEN_FILES,
+  COINS_DB_BLOCK_CACHE_BYTES,
+  COINS_DB_WRITE_BUFFER_BYTES,
+  COINS_DB_COMPRESSION,
   type BlockIndexRecord,
   type UTXOEntry,
   type ChainState,
@@ -46,6 +49,14 @@ describe('LevelDB tuning parity with Bitcoin Core', () => {
     // Handles are real fds beyond LevelDB's mmap limit. The process limit on
     // maxbox is 524,288 and steady-state usage is <50.
     expect(COINS_DB_MAX_OPEN_FILES).toBeLessThan(100_000);
+  });
+
+  test('writeBufferSize is Core GetOptions nCacheSize/4', () => {
+    expect(COINS_DB_WRITE_BUFFER_BYTES).toBe(COINS_DB_BLOCK_CACHE_BYTES / 4);
+  });
+
+  test('compression is off (Core kNoCompression)', () => {
+    expect(COINS_DB_COMPRESSION).toBe(false);
   });
 });
 

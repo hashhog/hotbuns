@@ -28,6 +28,22 @@ const IBD_BATCH_SIZE = 50000;
 export const COINS_DB_BLOCK_CACHE_BYTES = 256 * 1024 * 1024;
 
 /**
+ * LevelDB write-buffer size, mirroring Bitcoin Core dbwrapper.cpp GetOptions:
+ * `options.write_buffer_size = nCacheSize / 4`. Two buffers may be live, so
+ * this is the per-buffer cap. 64 MiB (with a 256 MiB block cache) is the
+ * value that makes bulk snapshot import a memtable-fill rather than a
+ * 16 MiB stutter of flushes.
+ */
+export const COINS_DB_WRITE_BUFFER_BYTES = COINS_DB_BLOCK_CACHE_BYTES / 4;
+
+/**
+ * Bitcoin Core sets `options.compression = leveldb::kNoCompression`
+ * (dbwrapper.cpp GetOptions). Snappy on already-compact UTXO values burns
+ * CPU on every 120k-coin flush and is the opposite of Core's chainstate.
+ */
+export const COINS_DB_COMPRESSION = false;
+
+/**
  * Maximum size of a single on-disk SST table, mirroring Bitcoin Core's
  * `DBWRAPPER_MAX_FILE_SIZE` (dbwrapper.h:24) — which exists precisely to
  * override LevelDB's 2 MB default:
@@ -147,6 +163,13 @@ export interface BatchOperation {
   prefix: DBPrefix;
   key: Buffer;
   value?: Buffer;
+}
+
+/** Chained native WriteBatch used by snapshot import. */
+export interface SnapshotWriteBatch {
+  putUTXO(txid: Buffer, vout: number, value: Buffer): void;
+  readonly length: number;
+  write(): Promise<void>;
 }
 
 /**
@@ -345,8 +368,8 @@ export class ChainDB {
       valueEncoding: 'buffer',
       // 256 MB LevelDB block cache (increased for 2GB UTXO cache budget)
       cacheSize: COINS_DB_BLOCK_CACHE_BYTES,
-      // 16 MB write buffer
-      writeBufferSize: 16 * 1024 * 1024,
+      writeBufferSize: COINS_DB_WRITE_BUFFER_BYTES,
+      compression: COINS_DB_COMPRESSION,
       // 32 MiB tables, matching Core's DBWRAPPER_MAX_FILE_SIZE, so the store
       // stays at a table count the cache below can actually hold.
       maxFileSize: COINS_DB_MAX_FILE_SIZE_BYTES,
@@ -724,6 +747,37 @@ export class ChainDB {
       }
     }
     await batch.write();
+  }
+
+  /**
+   * Chained LevelDB batch for bulk UTXO import.
+   *
+   * `putUTXO` encodes the prefixed key and hands the pair to the native
+   * WriteBatch, which copies immediately, so the caller's value buffer may
+   * be reused after putUTXO returns. The caller flushes at its own cadence.
+   */
+  newChainedBatch(): SnapshotWriteBatch {
+    const batch = this.db.batch();
+    const keyBuf = Buffer.allocUnsafe(37);
+    keyBuf[0] = DBPrefix.UTXO;
+    let n = 0;
+    return {
+      putUTXO: (txid: Buffer, vout: number, value: Buffer): void => {
+        txid.copy(keyBuf, 1, 0, 32);
+        keyBuf.writeUInt32LE(vout >>> 0, 33);
+        // Copy the 37-byte key: abstract-level's buffer encoder is identity,
+        // and we reuse keyBuf on the next put.
+        batch.put(Buffer.from(keyBuf), value);
+        n++;
+      },
+      get length() {
+        return n;
+      },
+      write: async (): Promise<void> => {
+        if (n === 0) return;
+        await batch.write();
+      },
+    };
   }
 
   /**
