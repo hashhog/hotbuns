@@ -231,6 +231,18 @@ export class Peer {
   /** Best known height from this peer (from version message or updates). */
   bestKnownHeight: number;
   /**
+   * Last header we have in common with this peer (Core nSyncHeight /
+   * pindexBestKnownBlock). -1 until this peer announces a header we know.
+   * Surfaced as getpeerinfo.synced_headers (rpc/net.cpp:271).
+   */
+  syncedHeaders: number;
+  /**
+   * Last block we have in common with this peer (Core nCommonHeight /
+   * pindexLastCommonBlock). -1 until we receive a block body from this peer.
+   * Surfaced as getpeerinfo.synced_blocks (rpc/net.cpp:272).
+   */
+  syncedBlocks: number;
+  /**
    * Whether peer has signaled support for receiving ADDRv2 (BIP155) messages.
    * Set when we receive sendaddrv2 message during handshake.
    * When true, we should send addrv2 instead of addr to this peer.
@@ -412,6 +424,8 @@ export class Peer {
     this.versionReceivedAt = 0;
     this.blocksInFlight = new Map();
     this.bestKnownHeight = 0;
+    this.syncedHeaders = -1;
+    this.syncedBlocks = -1;
     this.wantsAddrV2 = false;
     this.wtxidRelay = false;
     // BIP133 feefilter state
@@ -1651,6 +1665,31 @@ export class Peer {
     if (height > this.bestKnownHeight) {
       this.bestKnownHeight = height;
     }
+  }
+
+  /**
+   * Record a header we have in common with this peer (Core
+   * UpdateBlockAvailability → pindexBestKnownBlock). Also refreshes
+   * bestKnownHeight so stale-peer eviction sees the announced tip, not
+   * the VERSION startHeight captured once at handshake.
+   */
+  updateSyncedHeaders(height: number): void {
+    if (height > this.syncedHeaders) {
+      this.syncedHeaders = height;
+    }
+    this.updateBestKnownHeight(height);
+  }
+
+  /**
+   * Record a block body we received from this peer (Core
+   * pindexLastCommonBlock / nCommonHeight). A received body implies the
+   * header is also in common.
+   */
+  updateSyncedBlocks(height: number): void {
+    if (height > this.syncedBlocks) {
+      this.syncedBlocks = height;
+    }
+    this.updateSyncedHeaders(height);
   }
 
   /**

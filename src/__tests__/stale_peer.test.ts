@@ -264,6 +264,8 @@ describe("Peer stale tracking fields", () => {
     expect(peer.connectedTime).toBeGreaterThan(0);
     expect(peer.blocksInFlight.size).toBe(0);
     expect(peer.bestKnownHeight).toBe(0);
+    expect(peer.syncedHeaders).toBe(-1);
+    expect(peer.syncedBlocks).toBe(-1);
   });
 
   test("bestKnownHeight is set from version message", async () => {
@@ -787,6 +789,48 @@ describe("Best known height tracking", () => {
 
     peer.updateBestKnownHeight(100);
     expect(peer.bestKnownHeight).toBe(200); // Should not decrease
+
+    peer.disconnect();
+  }, TEST_TIMEOUT);
+
+  test("updateSyncedHeaders/updateSyncedBlocks start at -1 and only advance", async () => {
+    const config = createTestConfig(mockServer.port);
+    const events: PeerEvents = {
+      onConnect: () => {},
+      onDisconnect: () => {},
+      onMessage: () => {},
+      onHandshakeComplete: () => {},
+    };
+
+    mockServer.autoHandshake({ startHeight: 100 });
+
+    const peer = new Peer(config, events);
+    await peer.connect();
+    await waitFor(() => peer.handshakeComplete);
+
+    expect(peer.syncedHeaders).toBe(-1);
+    expect(peer.syncedBlocks).toBe(-1);
+    // VERSION startHeight must not leak into nSyncHeight.
+    expect(peer.bestKnownHeight).toBe(100);
+
+    peer.updateSyncedHeaders(50);
+    expect(peer.syncedHeaders).toBe(50);
+    expect(peer.bestKnownHeight).toBe(100);
+
+    peer.updateSyncedHeaders(200);
+    expect(peer.syncedHeaders).toBe(200);
+    expect(peer.bestKnownHeight).toBe(200);
+
+    peer.updateSyncedHeaders(150);
+    expect(peer.syncedHeaders).toBe(200);
+
+    peer.updateSyncedBlocks(180);
+    expect(peer.syncedBlocks).toBe(180);
+    expect(peer.syncedHeaders).toBe(200);
+
+    peer.updateSyncedBlocks(210);
+    expect(peer.syncedBlocks).toBe(210);
+    expect(peer.syncedHeaders).toBe(210);
 
     peer.disconnect();
   }, TEST_TIMEOUT);

@@ -419,6 +419,9 @@ export class HeaderSync {
       const existing = this.headerChain.get(hashHex);
       if (existing) {
         if (this.noteCandidateWork(existing)) pointerMoved = true;
+        // Already-known header this peer announced: Core UpdateBlockAvailability
+        // still sets pindexBestKnownBlock (nSyncHeight / synced_headers).
+        fromPeer?.updateSyncedHeaders?.(existing.height);
         continue;
       }
 
@@ -531,6 +534,10 @@ export class HeaderSync {
 
       // Persist to database
       await this.saveHeaderEntry(entry);
+
+      // Header we accepted from this peer is now in common (Core
+      // pindexBestKnownBlock / getpeerinfo.synced_headers).
+      fromPeer?.updateSyncedHeaders?.(entry.height);
 
       validCount++;
     }
@@ -1418,6 +1425,22 @@ export class HeaderSync {
   getPeerSyncState(peer: Peer): PeerSyncState | undefined {
     const peerKey = `${peer.host}:${peer.port}`;
     return this.peerSyncStates.get(peerKey);
+  }
+
+  /**
+   * Current PRESYNC/REDOWNLOAD height for this peer, or -1 if no low-work
+   * header sync is in progress. Core rpc/net.cpp:270
+   * `presynced_headers` ← `statestats.presync_height`, which is
+   * `m_headers_sync->GetPresyncHeight()` while that object exists and
+   * defaults to -1.
+   */
+  getPresyncHeightForPeer(peer: Peer): number {
+    const peerState = this.getPeerSyncState(peer);
+    if (!peerState) return -1;
+    if (peerState.syncState.getState() === HeadersSyncStateEnum.FINAL) {
+      return -1;
+    }
+    return peerState.syncState.getPresyncHeight();
   }
 
   /**

@@ -223,6 +223,36 @@ describe("HeaderSync", () => {
       const newTip = headerSync.getBestHeader()!;
       expect(newTip.chainWork).toBeGreaterThan(genesisWork);
     });
+
+    test("per-peer sync: processHeaders advances peer.syncedHeaders", async () => {
+      // Control for QUEUES.md hotbuns item 2. Core UpdateBlockAvailability
+      // (net_processing.cpp) sets pindexBestKnownBlock from headers this
+      // peer announced that we also have. getpeerinfo.synced_headers is
+      // that height — not the VERSION startHeight stub, and not -1.
+      const peer = createMockPeer();
+      peer.syncedHeaders = -1;
+      peer.updateSyncedHeaders = (height: number) => {
+        if (height > peer.syncedHeaders) peer.syncedHeaders = height;
+      };
+      peer.updateBestKnownHeight = (_height: number) => {};
+
+      expect(peer.syncedHeaders).toBe(-1);
+
+      const genesis = headerSync.getBestHeader()!;
+      const headers: BlockHeader[] = [];
+      let prevBlock = genesis.hash;
+      let timestamp = genesis.header.timestamp + 600;
+      for (let i = 0; i < 3; i++) {
+        const header = createValidHeader(prevBlock, timestamp);
+        headers.push(header);
+        prevBlock = getBlockHash(header);
+        timestamp += 600;
+      }
+
+      const accepted = await headerSync.processHeaders(headers, peer);
+      expect(accepted).toBe(3);
+      expect(peer.syncedHeaders).toBe(3);
+    });
   });
 
   describe("header validation", () => {

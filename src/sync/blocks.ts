@@ -1383,6 +1383,11 @@ export class BlockSync {
       // Unrequested block - could be from inv response post-IBD
       // Check if it's the next block we need
       const headerEntry = this.headerSync.getHeader(blockHash);
+      if (headerEntry) {
+        // Body from this peer for a header we know: last common block
+        // (getpeerinfo.synced_blocks) plus last common header.
+        peer.updateSyncedBlocks?.(headerEntry.height);
+      }
       if (!headerEntry) {
         // Unknown block — peer sent a block whose header we have never seen.
         // Core: ProcessNewBlockHeaders returns nBlocksWithValidHeaders==0 and
@@ -1427,6 +1432,7 @@ export class BlockSync {
     // Remove from pending
     this.state.pendingBlocks.delete(hashHex);
     peer.removeBlockInFlight(hashHex);
+    peer.updateSyncedBlocks?.(pending.height);
 
     // Update peer tracking
     const peerInfo = this.peerInFlight.get(peerKey);
@@ -1788,12 +1794,20 @@ export class BlockSync {
         // Check if we already have this block
         const existing = await this.db.getBlockIndex(inv.hash);
         if (existing && (existing.status & 4) !== 0) {
-          // Already have and validated
+          // Already have and validated — still a header in common
+          // (Core UpdateBlockAvailability).
+          const known = this.headerSync.getHeader(inv.hash);
+          if (known) peer.updateSyncedHeaders?.(known.height);
           continue;
         }
 
         // Check if we have the header
         const headerEntry = this.headerSync.getHeader(inv.hash);
+        if (headerEntry) {
+          // Core UpdateBlockAvailability: an announced header we already
+          // know is last-in-common with this peer (nSyncHeight).
+          peer.updateSyncedHeaders?.(headerEntry.height);
+        }
         if (!headerEntry) {
           // Unknown header — request headers from this peer so we learn
           // about the new chain, then the onHeadersProcessed callback will

@@ -7066,10 +7066,17 @@ export class RPCServer {
         // Core v31.99 removed `startingheight` from getpeerinfo (rpc/net.cpp now
         // pushes presynced_headers directly after bip152_hb_from). Dropped here
         // for wire parity (matching rustoshi 528045a).
-        presynced_headers: -1,
-        synced_headers: -1,
-        synced_blocks: -1,
-        inflight: [],
+        //
+        // Per-peer sync heights are live measurements, not stubs:
+        //   presynced_headers = HeadersSyncState.GetPresyncHeight, or -1
+        //     when no low-work anti-DoS sync is in progress (rpc/net.cpp:270)
+        //   synced_headers    = pindexBestKnownBlock->nHeight (nSyncHeight)
+        //   synced_blocks     = pindexLastCommonBlock->nHeight (nCommonHeight)
+        //   inflight          = heights of vBlocksInFlight (rpc/net.cpp:273-277)
+        presynced_headers: this.peerPresyncHeight(peer),
+        synced_headers: typeof peer.syncedHeaders === "number" ? peer.syncedHeaders : -1,
+        synced_blocks: typeof peer.syncedBlocks === "number" ? peer.syncedBlocks : -1,
+        inflight: this.peerInFlightHeights(peer),
         addr_relay_enabled: true,
         addr_processed: 0,
         addr_rate_limited: 0,
@@ -7089,6 +7096,45 @@ export class RPCServer {
 
       return entry;
     });
+  }
+
+  /**
+   * Core rpc/net.cpp:270 `presynced_headers`. -1 unless this peer is in
+   * the PRESYNC/REDOWNLOAD anti-DoS header-sync state machine.
+   */
+  private peerPresyncHeight(peer: { host: string; port: number }): number {
+    const hs = this.headerSync as HeaderSync & {
+      getPresyncHeightForPeer?: (p: { host: string; port: number }) => number;
+    };
+    if (typeof hs.getPresyncHeightForPeer !== "function") return -1;
+    return hs.getPresyncHeightForPeer(peer);
+  }
+
+  /**
+   * Core rpc/net.cpp:273-277 `inflight`: heights of blocks currently
+   * requested from this peer, looked up in the header index. Hashes we
+   * do not have a header for are omitted (Core skips a QueuedBlock with
+   * a null pindex).
+   */
+  private peerInFlightHeights(peer: { blocksInFlight?: Map<string, number> }): number[] {
+    const inFlight = peer.blocksInFlight;
+    if (!inFlight || typeof inFlight.keys !== "function") return [];
+    const heights: number[] = [];
+    for (const hashHex of inFlight.keys()) {
+      let hash: Buffer;
+      try {
+        hash = Buffer.from(hashHex, "hex");
+      } catch {
+        continue;
+      }
+      if (hash.length !== 32) continue;
+      const entry = this.headerSync.getHeader(hash);
+      if (entry && typeof entry.height === "number") {
+        heights.push(entry.height);
+      }
+    }
+    heights.sort((a, b) => a - b);
+    return heights;
   }
 
   /**

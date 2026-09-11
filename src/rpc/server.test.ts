@@ -1266,6 +1266,37 @@ describe("RPCServer", () => {
       const iPresync = keys.indexOf("presynced_headers");
       expect(iPresync).toBe(iHbFrom + 1);
     });
+
+    it("per-peer sync fields are live measurements, not -1 stubs", async () => {
+      // Control for QUEUES.md hotbuns item 2. Core rpc/net.cpp:270-277
+      // emits nSyncHeight / nCommonHeight / vHeightInFlight from CNodeState,
+      // not placeholders. A peer that has announced headers, delivered a
+      // block, and has a getdata in flight must surface those heights.
+      const inflightHash = Buffer.alloc(32, 0x11);
+      mockPeerManager.addMockPeer({
+        host: "192.168.1.3",
+        port: 8333,
+        versionPayload: {
+          version: 70016,
+          services: 1n,
+          userAgent: "/Satoshi:31.99.0/",
+          startHeight: 800000,
+          relay: true,
+        },
+        syncedHeaders: 850010,
+        syncedBlocks: 849900,
+        blocksInFlight: new Map([[inflightHash.toString("hex"), Date.now()]]),
+      });
+
+      const result = await rpcRequest(testPort, "getpeerinfo");
+      const peer = result.result[0];
+
+      expect(peer.synced_headers).toBe(850010);
+      expect(peer.synced_blocks).toBe(849900);
+      // MockHeaderSync.getHeader returns height 100 for any known hash.
+      expect(peer.inflight).toEqual([100]);
+      expect(peer.presynced_headers).toBe(-1);
+    });
   });
 
   describe("getnetworkinfo", () => {
