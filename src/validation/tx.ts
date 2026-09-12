@@ -12,7 +12,7 @@
 import { BufferReader, BufferWriter, varIntSize } from "../wire/serialization.js";
 import { hash256, sha256Hash, ecdsaVerify, schnorrVerify, taggedHash } from "../crypto/primitives.js";
 import type { UTXOEntry } from "../storage/database.js";
-import { globalSigCache } from "./sig_cache.js";
+import { globalSigCache, type CacheKey } from "./sig_cache.js";
 // Type-only import — erased at compile time, so it does NOT create the
 // runtime interpreter.ts ↔ tx.ts cycle that the lazy require()s below avoid.
 import type { TaprootContext } from "../script/interpreter.js";
@@ -1673,6 +1673,34 @@ export function buildTaprootContext(
 }
 
 /**
+ * Sigcache key for one input, bound to the spending tx + prevout + flags.
+ * Used by verifyInputSignature and by the block-level script-check queue
+ * (main thread filters hits before dispatching cache misses to workers).
+ */
+export function computeInputSigCacheKey(
+  tx: Transaction,
+  inputIndex: number,
+  utxo: UTXOEntry,
+  scriptVerifyFlags: number,
+): CacheKey {
+  const input = tx.inputs[inputIndex]!;
+  const sighashCommitWriter = new BufferWriter();
+  sighashCommitWriter.writeHash(getTxId(tx));
+  sighashCommitWriter.writeUInt32LE(inputIndex);
+  sighashCommitWriter.writeHash(input.prevOut.txid);
+  sighashCommitWriter.writeUInt32LE(input.prevOut.vout);
+  sighashCommitWriter.writeUInt64LE(utxo.amount);
+  sighashCommitWriter.writeVarBytes(utxo.scriptPubKey);
+  const sighashCommit = sha256Hash(sighashCommitWriter.toBuffer());
+  return globalSigCache.computeKey(
+    sighashCommit,
+    input.scriptSig,
+    input.witness,
+    scriptVerifyFlags,
+  );
+}
+
+/**
  * Verify a single input script (P2PKH / P2WPKH / P2TR — others fall through).
  *
  * For P2WPKH: witness[0] = signature (DER + sighash), witness[1] = pubkey
@@ -1725,21 +1753,7 @@ export function verifyInputSignature(
   // lookup would skip the interpreter entirely.  Mirrors Core's
   // CachingTransactionSignatureChecker (sigcache.cpp:39-50) which keys on
   // the (sighash, pubkey, sig) triple.
-  const sighashCommitWriter = new BufferWriter();
-  sighashCommitWriter.writeHash(getTxId(tx));
-  sighashCommitWriter.writeUInt32LE(inputIndex);
-  sighashCommitWriter.writeHash(input.prevOut.txid);
-  sighashCommitWriter.writeUInt32LE(input.prevOut.vout);
-  sighashCommitWriter.writeUInt64LE(utxo.amount);
-  sighashCommitWriter.writeVarBytes(utxo.scriptPubKey);
-  const sighashCommit = sha256Hash(sighashCommitWriter.toBuffer());
-
-  const cacheKey = globalSigCache.computeKey(
-    sighashCommit,
-    input.scriptSig,
-    input.witness,
-    scriptVerifyFlags,
-  );
+  const cacheKey = computeInputSigCacheKey(tx, inputIndex, utxo, scriptVerifyFlags);
   if (globalSigCache.lookup(cacheKey)) {
     return { valid: true, inputIndex };
   }

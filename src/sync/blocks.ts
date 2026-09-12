@@ -34,6 +34,7 @@ import {
   type AssumeValidContext,
 } from "../consensus/assumevalid.js";
 import { coreConnectBlockChecks } from "../consensus/connect_block.js";
+import { clampScriptThreads } from "../validation/script_check_queue.js";
 import {
   MAX_CMPCTBLOCK_DEPTH,
   MAX_BLOCKTXN_DEPTH,
@@ -611,12 +612,9 @@ export class BlockSync {
   private txoSpenderIndex: import("../storage/indexes.js").TxoSpenderIndex | null = null;
 
   /**
-   * Number of parallel script-verification workers.
-   * 1  = sequential (verifyAllInputsSequential) — benchmark baseline.
-   * >1 = parallel   (verifyAllInputsParallel)   — production default.
-   *
-   * Controlled via --script-threads=N CLI flag (P2-OPT-ROUND-2).
-   * Default: os.cpus().length (Bun: navigator.hardwareConcurrency).
+   * Number of parallel script-verification workers (Core -par).
+   * 1 = sequential; 0/undefined = auto; clamped to MAX_SCRIPTCHECK_THREADS=15.
+   * Controlled via --script-threads=N CLI flag.
    */
   private scriptThreads: number;
 
@@ -634,12 +632,7 @@ export class BlockSync {
     this.headerSync = headerSync;
     this.peerManager = peerManager ?? null;
     this.chainStateManager = chainStateManager ?? null;
-    // Default script thread count: hardware concurrency (>= 1).
-    this.scriptThreads =
-      scriptThreads ??
-      (typeof navigator !== "undefined" && navigator.hardwareConcurrency > 0
-        ? navigator.hardwareConcurrency
-        : 4);
+    this.scriptThreads = clampScriptThreads(scriptThreads);
     this.windowSize = DEFAULT_WINDOW_SIZE;
     this.peerInFlight = new Map();
     this.utxoManager = new UTXOManager(db, maxCacheBytes);

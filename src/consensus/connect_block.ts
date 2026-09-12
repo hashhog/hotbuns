@@ -72,10 +72,13 @@ import {
   isCoinbase,
   checkSequenceLocks,
   bip68VersionActive,
-  verifyAllInputsParallel,
-  verifyAllInputsSequential,
   ScriptFlags,
 } from "../validation/tx.js";
+import {
+  clampScriptThreads,
+  verifyScriptChecks,
+  type ScriptCheckJob,
+} from "../validation/script_check_queue.js";
 import type { UTXOEntry } from "../storage/database.js";
 import { UTXOManager, type SpentUTXO } from "../chain/utxo.js";
 import { isFinalTx } from "../mining/template.js";
@@ -218,10 +221,10 @@ export interface ConnectBlockOpts {
   enforceBIP68?: boolean;
 
   /**
-   * Number of parallel script-verification workers.
-   * 1  = sequential (verifyAllInputsSequential — benchmark baseline).
-   * >1 = parallel   (verifyAllInputsParallel  — production default).
-   * Defaults to 4 if not supplied.
+   * Number of parallel script-verification workers (Core -par).
+   * 1 / omitted = sequential on the main thread (tests, reorg, RPC).
+   * 0 = auto (hardware concurrency, clamped to 15).
+   * >1 = Bun Worker pool for the block's collected script checks.
    */
   scriptThreads?: number;
 
@@ -353,7 +356,7 @@ export async function coreConnectBlockChecks(
     skipScripts = false,
     prevMTP = 0,
     enforceBIP68 = false,
-    scriptThreads = 4,
+    scriptThreads,
     // MANDATORY height-gated consensus flags (Core GetBlockScriptFlags).
     // Default each from its own activation height in chainparams, exactly as
     // Core's GetBlockScriptFlags gates on the per-deployment activation.
@@ -561,6 +564,12 @@ export async function coreConnectBlockChecks(
   // matches Core's gate ordering.
   let nFees = 0n;
   const MAX_MONEY_FEE = 2_100_000_000_000_000n;
+  const scriptJobs: ScriptCheckJob[] = [];
+  // Tests / reorg / RPC omit this and stay serial. BlockSync always passes
+  // a clamped value (0 = auto → hardware, max 15).
+  const effectiveScriptThreads = clampScriptThreads(
+    scriptThreads === undefined ? 1 : scriptThreads,
+  );
 
   for (let txIndex = 0; txIndex < block.transactions.length; txIndex++) {
     const tx = block.transactions[txIndex];
@@ -652,29 +661,19 @@ export async function coreConnectBlockChecks(
       }
 
       // ── Script verification (skipped when skipScripts=true).
+      // Collect checks for the whole block and Wait() after the UTXO loop,
+      // matching Core CCheckQueue (validation.cpp ConnectBlock). Per-tx
+      // Promise.all cannot parallelise the common 1-input transaction.
       if (!skipScripts) {
-        // Per-block bitmask, resolved once above (see blockScriptFlags).
-        const scriptFlags = blockScriptFlags;
-
-        let scriptResult;
-        if (scriptThreads === 1) {
-          // Sequential path: benchmark baseline.
-          scriptResult = verifyAllInputsSequential(tx, inputUTXOs, scriptFlags);
-        } else {
-          // Parallel path: production default.
-          scriptResult = await verifyAllInputsParallel(tx, inputUTXOs, scriptFlags);
-        }
-
-        if (!scriptResult.valid) {
-          const errSuffix =
-            (scriptResult.failedInput !== undefined
-              ? ` (input ${scriptResult.failedInput})`
-              : "") +
-            (scriptResult.error ? `: ${scriptResult.error}` : "");
-          return {
-            ok: false,
-            error: `Script verification failed in tx ${txidHex.slice(0, 16)} at height ${height}${errSuffix}`,
-          };
+        const copied = inputUTXOs.slice();
+        for (let i = 0; i < tx.inputs.length; i++) {
+          scriptJobs.push({
+            tx,
+            inputIndex: i,
+            utxos: copied,
+            flags: blockScriptFlags,
+            txidHex,
+          });
         }
       }
 
@@ -809,6 +808,28 @@ export async function coreConnectBlockChecks(
       ok: false,
       error: `bad-cb-amount: coinbase pays too much (actual=${coinbaseOutputValue} vs limit=${blockReward}) at height ${height}`,
     };
+  }
+
+  // CCheckQueue::Wait() — after UTXO apply / sigops / coinbase value, Core
+  // joins the script-check threads (validation.cpp:2618-2626). A failure
+  // here leaves the in-memory view dirty; the caller must not flush.
+  if (scriptJobs.length > 0) {
+    const scriptResult = await verifyScriptChecks(
+      scriptJobs,
+      effectiveScriptThreads,
+    );
+    if (!scriptResult.valid) {
+      const who = scriptResult.failedTxidHex?.slice(0, 16) ?? "unknown";
+      const errSuffix =
+        (scriptResult.failedInput !== undefined
+          ? ` (input ${scriptResult.failedInput})`
+          : "") +
+        (scriptResult.error ? `: ${scriptResult.error}` : "");
+      return {
+        ok: false,
+        error: `Script verification failed in tx ${who} at height ${height}${errSuffix}`,
+      };
+    }
   }
 
   return {

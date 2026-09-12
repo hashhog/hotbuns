@@ -138,8 +138,8 @@ export interface NodeConfig {
   /**
    * Number of parallel script-verification workers for IBD ConnectBlock.
    * 1  = sequential (benchmark baseline).
-   * >1 = parallel Promise.all path (default: hardware concurrency).
-   * 0 / undefined = use hardware default.
+   * >1 = Bun Worker pool (clamped to 15, matching Core MAX_SCRIPTCHECK_THREADS).
+   * 0 / undefined = auto (hardware concurrency).
    */
   scriptThreads?: number;
   /**
@@ -487,6 +487,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
         case "script-threads":
           if (value) {
             const n = parseInt(value, 10);
+            // 0 = auto (Core -par=0). Upper bound is applied in
+            // clampScriptThreads (MAX_SCRIPTCHECK_THREADS = 15).
             if (!isNaN(n) && n >= 0) config.scriptThreads = n;
           }
           break;
