@@ -2457,7 +2457,7 @@ export class BlockSync {
         this.state.downloadedBlocks.size === 0 &&
         this.state.nextHeightToProcess > bestHeader.height
       ) {
-        this.completeIBD();
+        void this.completeIBD();
       }
       return;
     }
@@ -2765,12 +2765,21 @@ export class BlockSync {
   }
 
   private async processOrderedBlocksInner(): Promise<void> {
-    const bestHeader = this.headerSync.getBestHeader();
-    if (!bestHeader) {
-      return;
-    }
-
-    while (this.state.nextHeightToProcess <= bestHeader.height) {
+    // Re-read the live header tip every iteration. `await connectBlock` yields
+    // (script-check workers, LevelDB, the 0-ms yield every 64 blocks), so a
+    // snapshot taken at entry can be thousands of headers stale by the time
+    // the loop exits. Completing IBD against that stale snapshot was the
+    // 227914/265000 range-runner halt: "IBD complete" at 98.5% with headers
+    // still ahead, then a fire-and-forget cache-clearing flush racing the
+    // next connect → bad-txns-inputs-missingorspent on a valid block.
+    while (true) {
+      if (this.syncHalted !== null || !this.running) {
+        return;
+      }
+      const bestHeader = this.headerSync.getBestHeader();
+      if (!bestHeader || this.state.nextHeightToProcess > bestHeader.height) {
+        break;
+      }
       const height = this.state.nextHeightToProcess;
       const headerEntry = this.headerSync.getHeaderByHeight(height);
 
@@ -3258,12 +3267,17 @@ export class BlockSync {
       }
     }
 
-    // Check if IBD is complete
+    // Check if IBD is complete against the LIVE header tip, and only when
+    // nothing is buffered. A stale captured tip plus pending=0 (downloaded
+    // blocks sitting in the Map) used to fire completeIBD mid-range.
+    const liveTip = this.headerSync.getBestHeader();
     if (
-      this.state.nextHeightToProcess > bestHeader.height &&
-      this.state.pendingBlocks.size === 0
+      liveTip &&
+      this.state.nextHeightToProcess > liveTip.height &&
+      this.state.pendingBlocks.size === 0 &&
+      this.state.downloadedBlocks.size === 0
     ) {
-      this.completeIBD();
+      await this.completeIBD();
     }
   }
 
@@ -5337,9 +5351,24 @@ export class BlockSync {
 
   /**
    * Mark IBD as complete.
+   *
+   * MUST be awaited from `processOrderedBlocksInner` while `processing` is
+   * still held. A fire-and-forget `flush()` here used to drop the lock, then
+   * CLEAR the UTXO cache while the next connect was already in preload —
+   * FRESH coins vanished and a valid block failed `bad-txns-inputs-missingorspent`.
+   * Persist with `flushDirty` (sync, keep unspent cache entries) and wait.
    */
-  private completeIBD(): void {
+  private async completeIBD(): Promise<void> {
     if (this.ibdComplete) {
+      return;
+    }
+    // Last-chance live-tip gate: a caller that raced with onHeadersProcessed
+    // must not latch IBD-complete while there is still header work.
+    const liveTip = this.headerSync.getBestHeader();
+    if (liveTip && this.state.nextHeightToProcess <= liveTip.height) {
+      return;
+    }
+    if (this.state.pendingBlocks.size > 0 || this.state.downloadedBlocks.size > 0) {
       return;
     }
 
@@ -5348,10 +5377,15 @@ export class BlockSync {
     this.logProgress();
     console.log("IBD complete! Switching to normal operation.");
 
-    // Flush any remaining UTXO updates
-    this.utxoManager.flush().catch((err) => {
+    try {
+      await this.utxoManager.flushDirty();
+      const flushedAt = this.state.nextHeightToProcess - 1;
+      if (flushedAt > this.lastFlushedHeight) {
+        this.lastFlushedHeight = flushedAt;
+      }
+    } catch (err) {
       console.error("Error flushing UTXO cache:", err);
-    });
+    }
   }
 
   /**

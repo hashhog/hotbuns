@@ -47,6 +47,26 @@ export const DEFAULT_SCRIPTCHECK_THREADS = 0;
  */
 export const MIN_JOBS_FOR_POOL = 8;
 
+/**
+ * Per-chunk bound on a worker result. A lost postMessage / silent worker
+ * death used to hang `Promise.all` forever and stall IBD. On timeout the
+ * pool throws and `verifyScriptChecks` falls back to sequential.
+ */
+export const SCRIPT_CHECK_RESULT_TIMEOUT_MS = 30_000;
+
+let resultTimeoutMs = SCRIPT_CHECK_RESULT_TIMEOUT_MS;
+let workerUrlForTests: URL | null = null;
+
+/** Test-only: shorten the worker result timeout. */
+export function setScriptCheckResultTimeoutForTests(ms: number): void {
+	resultTimeoutMs = ms;
+}
+
+/** Test-only: point the pool at a hang/crash worker. */
+export function setScriptCheckWorkerUrlForTests(url: URL | null): void {
+	workerUrlForTests = url;
+}
+
 export interface ScriptCheckJob {
 	tx: Transaction;
 	inputIndex: number;
@@ -112,7 +132,8 @@ class VerifyPool {
 			};
 		});
 
-		const url = new URL("./script_check_worker.ts", import.meta.url);
+		const url =
+			workerUrlForTests ?? new URL("./script_check_worker.ts", import.meta.url);
 		for (let i = 0; i < size; i++) {
 			const worker = new Worker(url);
 			// Bun Worker: unref so the pool does not keep the process alive.
@@ -213,8 +234,31 @@ class VerifyPool {
 		}
 		const batch: WireBatch = { kind: "batch", id, txs, jobs: wireJobs };
 		return new Promise<WorkerOut>((resolve, reject) => {
-			this.inflight.set(id, { resolve, reject });
-			worker.postMessage(batch);
+			const timer = setTimeout(() => {
+				this.inflight.delete(id);
+				reject(
+					new Error(
+						`script-check worker result timeout (id=${id}, jobs=${chunk.length})`,
+					),
+				);
+			}, resultTimeoutMs);
+			this.inflight.set(id, {
+				resolve: (msg) => {
+					clearTimeout(timer);
+					resolve(msg);
+				},
+				reject: (err) => {
+					clearTimeout(timer);
+					reject(err);
+				},
+			});
+			try {
+				worker.postMessage(batch);
+			} catch (e) {
+				clearTimeout(timer);
+				this.inflight.delete(id);
+				reject(e instanceof Error ? e : new Error(String(e)));
+			}
 		});
 	}
 

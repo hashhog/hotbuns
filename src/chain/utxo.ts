@@ -637,7 +637,26 @@ export class CoinsViewCache extends CoinsView {
       throw new Error("flush() requires CoinsViewDB as base");
     }
 
+    // Snapshot identity of the cache we are about to persist. `batchWrite`
+    // awaits LevelDB, and a concurrent ConnectBlock (the old completeIBD
+    // fire-and-forget path) mutates this same Map during that await.
+    const sizeAtStart = this.cache.size;
+    const dirtyAtStart = this.dirtyCount;
+    const hashAtStart = this.hashBlock;
+
     await this.base.batchWrite(this.cache, this.hashBlock, extraOps);
+
+    if (
+      this.cache.size !== sizeAtStart ||
+      this.dirtyCount !== dirtyAtStart ||
+      this.hashBlock !== hashAtStart
+    ) {
+      // ConnectBlock added/spent coins (or advanced the view pointer) while
+      // we were in db.batch. Clearing would drop FRESH coins that were never
+      // in the written ops → bad-txns-inputs-missingorspent on the next block.
+      this.flushCount++;
+      return;
+    }
 
     // Clear the cache
     this.cache.clear();
@@ -657,7 +676,22 @@ export class CoinsViewCache extends CoinsView {
       throw new Error("sync() requires CoinsViewDB as base");
     }
 
+    const sizeAtStart = this.cache.size;
+    const dirtyAtStart = this.dirtyCount;
+    const hashAtStart = this.hashBlock;
+
     await this.base.batchWrite(this.cache, this.hashBlock, extraOps);
+
+    if (
+      this.cache.size !== sizeAtStart ||
+      this.dirtyCount !== dirtyAtStart ||
+      this.hashBlock !== hashAtStart
+    ) {
+      // Concurrent ConnectBlock mutated the cache during db.batch. Do not
+      // clear dirty flags / drop spent entries that arrived after the write.
+      this.flushCount++;
+      return;
+    }
 
     // Update cache: remove spent entries, clear dirty flags
     for (const [key, entry] of this.cache) {
