@@ -2740,6 +2740,7 @@ export class BlockSync {
     }
     this.processing = true;
 
+    const heightBefore = this.state.nextHeightToProcess;
     try {
       await this.processOrderedBlocksInner();
     } finally {
@@ -2754,6 +2755,15 @@ export class BlockSync {
     // Blocks may have arrived while we held the processing lock.  Check if
     // the next block we need is already downloaded and, if so, process it
     // immediately rather than waiting for the next handleBlock call.
+    //
+    // Re-enter ONLY if Inner advanced the frontier. Without that guard, a
+    // call that leaves the next-needed body in `downloadedBlocks` but does
+    // not connect it (submitblock/handleBlock before `start()`, or after
+    // haltSync sets running=false) re-enters forever: 22 GB RSS in <1 min
+    // and the v1.0.2 `bun test` gate never finishes.
+    if (this.state.nextHeightToProcess === heightBefore) {
+      return;
+    }
     const bestHeader = this.headerSync.getBestHeader();
     if (bestHeader && this.state.nextHeightToProcess <= bestHeader.height) {
       const nextEntry = this.headerSync.getHeaderByHeight(this.state.nextHeightToProcess);
@@ -2773,7 +2783,7 @@ export class BlockSync {
     // still ahead, then a fire-and-forget cache-clearing flush racing the
     // next connect → bad-txns-inputs-missingorspent on a valid block.
     while (true) {
-      if (this.syncHalted !== null || !this.running) {
+      if (this.syncHalted !== null) {
         return;
       }
       const bestHeader = this.headerSync.getBestHeader();
@@ -2792,6 +2802,13 @@ export class BlockSync {
       let block = this.state.downloadedBlocks.get(hashHex);
 
       if (!block) {
+        // P2P fetch path — only while the download loop is running.
+        // submitblock/handleBlock still connect bodies already in the
+        // buffer when `running` is false (tests never call start();
+        // haltSync leaves RPC up for injectBlock).
+        if (!this.running) {
+          return;
+        }
         // Block not yet downloaded.  If it's sitting in the pending map and
         // enough other blocks have arrived in the meantime, the assigned peer
         // is likely slow or dead.  Cancel the pending request and let the
