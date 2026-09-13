@@ -20,7 +20,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from "bun:test";
 import { rmSync, mkdirSync } from "fs";
-import { RPCServer, RPCServerConfig, RPCServerDeps, RPCErrorCodes } from "../rpc/server.js";
+import { RPCServer, RPCServerDeps, RPCErrorCodes } from "../rpc/server.js";
 import { REGTEST } from "../consensus/params.js";
 import { Wallet, WalletManager, type WalletConfig } from "../wallet/wallet.js";
 import { deriveAddresses, addChecksum } from "../wallet/descriptor.js";
@@ -29,13 +29,35 @@ import type { Block } from "../validation/block.js";
 
 const TEST_DATADIR = "/tmp/hotbuns-watchonly-import-test";
 
-// Randomised per-run base. A FIXED base collides with long-running processes on
-// the dev box: 28601-28610 are held by the phaseb python harnesses and a regtest
-// bitcoind, which made these tests fail with "Failed to start server. Is port
-// 28601 in use?" and masked the real assertion failures underneath.
-let portCounter = 41000 + Math.floor(Math.random() * 20000);
-function getTestPort(): number {
-  return portCounter++;
+// File-unique base (not 41000–61000: that band collides with Tailscale /
+// ephemeral listeners on the shared box). Retry on EADDRINUSE so a busy
+// port cannot turn the v1.0.2 `bun test` gate red.
+let portCounter = 38443;
+
+function isAddrInUse(err: unknown): boolean {
+  const e = err as { code?: string; message?: string };
+  return e.code === "EADDRINUSE" || /in use/i.test(String(e.message ?? err));
+}
+
+function startListening(deps: RPCServerDeps): { server: RPCServer; port: number } {
+  let last: unknown;
+  for (let i = 0; i < 32; i++) {
+    const port = portCounter++;
+    const server = new RPCServer({ port, host: "127.0.0.1", noAuth: true }, deps);
+    try {
+      server.start();
+      return { server, port };
+    } catch (err) {
+      try {
+        server.stop();
+      } catch {
+        /* already not listening */
+      }
+      if (!isAddrInUse(err)) throw err;
+      last = err;
+    }
+  }
+  throw last ?? new Error("no free RPC test port");
 }
 
 // A fixed, valid secp256k1 keypair (same scalar family the watch-only
@@ -145,8 +167,6 @@ describe("watch-only import contract", () => {
     await manager.createWallet("default", {});
     await manager.createWallet("wo", { disablePrivateKeys: true, blank: true });
 
-    port = getTestPort();
-    const config: RPCServerConfig = { port, host: "127.0.0.1", noAuth: true };
     const deps: RPCServerDeps = {
       chainState: new MockChainStateManager() as any,
       mempool: new MockMempool() as any,
@@ -157,8 +177,9 @@ describe("watch-only import contract", () => {
       params: REGTEST,
       walletManager: manager,
     };
-    server = new RPCServer(config, deps);
-    server.start();
+    const started = startListening(deps);
+    server = started.server;
+    port = started.port;
   });
 
   afterEach(() => {

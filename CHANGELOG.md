@@ -5,7 +5,7 @@
 Changes since `v1.0.0`:
 
 - fix: processOrderedBlocks no longer livelocks when the next body is buffered but the P2P loop is not running (submitblock/handleBlock before start / after haltSync); was 22G+ and hung the unit suite
-- test: `bun test` runs files in isolated processes and skips known-red audit files so the v1.0.2 unit gate finishes under 8G / 5 min
+- test: `bun test` runs files in isolated processes and skips known-red audit files so the v1.0.2 unit gate finishes under 8G / 5 min; parent preloads wait for isolation (do not run files in-process) and watch-only RPC tests retry EADDRINUSE
 - perf: block-connect script checks run on a Bun Worker pool (CCheckQueue-style, sigcache hits skipped on the main thread) so IBD is no longer single-core ECDSA
 - perf: snapshot import parses coins synchronously, writes a chained LevelDB batch, and folds HASH_SERIALIZED during the load so 168M coins finish inside the 30-minute campaign window
 - feat: getpeerinfo reports per-peer synced_headers/synced_blocks/inflight instead of -1 stubs

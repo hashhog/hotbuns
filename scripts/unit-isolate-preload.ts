@@ -5,7 +5,11 @@
  * argv = [bun, <that file>]. The first invocation in a process discovers
  * the suite, runs each file in a child (`HOTBUNS_UNIT_CHILD=1`), prints a
  * bun-style summary, and exits so leaks / port clashes / AddrMan state
- * cannot accumulate. Children return immediately from this preload.
+ * cannot accumulate.
+ *
+ * Later preloads in the SAME parent MUST await that in-flight isolate
+ * rather than return: a bare `return` lets bun run the file in-process
+ * while children also run it (port clashes + the original RSS climb).
  *
  * In-process single file: HOTBUNS_UNIT_CHILD=1 bun test ./src/foo.test.ts
  */
@@ -14,7 +18,7 @@ import { join } from "node:path";
 
 const CHILD = "HOTBUNS_UNIT_CHILD";
 const FILE_TIMEOUT_MS = 60_000;
-const g = globalThis as unknown as { __hotbunsUnitIsolate?: boolean };
+const g = globalThis as unknown as { __hotbunsUnitIsolate?: Promise<void> };
 
 function ignored(rel: string, patterns: string[]): boolean {
   const norm = rel.replaceAll("\\", "/");
@@ -56,10 +60,6 @@ function parseSummary(text: string): { pass: number; fail: number; skip: number;
 }
 
 async function isolate(): Promise<void> {
-  if (process.env[CHILD] === "1") return;
-  if (g.__hotbunsUnitIsolate) return;
-  g.__hotbunsUnitIsolate = true;
-
   const root = join(import.meta.dir, "..");
   const bunfigText = await Bun.file(join(root, "bunfig.toml")).text();
   const patterns = [...bunfigText.matchAll(/"(\*\*\/[^"]+\.test\.ts)"/g)].map(
@@ -122,4 +122,8 @@ async function isolate(): Promise<void> {
   process.exit(fail > 0 || filesFailed > 0 ? 1 : 0);
 }
 
-await isolate();
+if (process.env[CHILD] !== "1") {
+  g.__hotbunsUnitIsolate ??= isolate();
+  await g.__hotbunsUnitIsolate;
+  process.exit(1);
+}
