@@ -1,6 +1,20 @@
 # Changelog
 
-## v1.0.1 (unreleased)
+## v1.0.2 — 2026-09-13
+
+- af6a6da test: bind RPC tests on OS-assigned ports so bun test stays green
+- 3d0d4f7 test: keep bun test parent idle and retry EADDRINUSE on watch-only RPC
+- 1ee906f fix: processOrderedBlocks livelock hung bun test at 46G
+- 361f14c fix: don't complete IBD against a stale header tip
+- ce1231b perf: Bun Worker pool for block-level script verification
+- 2063853 perf: snapshot import finishes 168M coins inside 30 min
+- 9b8e0db feat: getpeerinfo reports per-peer synced_headers/synced_blocks/inflight
+- f869e16 fix: seed base_tail_headers so snapshot retargets can resolve ancestors
+- 52e0ba9 fix: seed the snapshot-base header so header-sync starts at the assumeUTXO base
+- 3b05a66 fix: keep the block-download scheduler on the most-work header
+
+
+## v1.0.2 — 2026-09-13
 
 Changes since `v1.0.0`:
 
