@@ -34,7 +34,8 @@ import { mkdtempSync, rmSync } from "fs";
 import * as os from "os";
 import * as path from "path";
 
-import { RPCServer, type RPCServerConfig, type RPCServerDeps } from "../rpc/server.js";
+import { type RPCServerDeps } from "../rpc/server.js";
+import { startTestRpc } from "../test/rpc-listen.js";
 import { REGTEST } from "../consensus/params.js";
 import { Wallet, type WalletConfig } from "../wallet/wallet.js";
 import { AddressType, decodeAddress } from "../address/encoding.js";
@@ -148,9 +149,6 @@ function makeSenderWallet(): Wallet {
   const cfg: WalletConfig = { datadir: tmpDir, network: "regtest" };
   return Wallet.create(cfg, SENDER_MNEMONIC);
 }
-
-let portCounter = 39443;
-function getTestPort(): number { return portCounter++; }
 
 // ---------------------------------------------------------------------------
 // Sender-side PSBT fixtures.
@@ -863,12 +861,7 @@ describe("BIP-78 PayJoin sender (FIX-66)", () => {
     });
 
     it("G2 + G24: sender POSTs Original to FIX-65 receiver, gets validated payjoin", async () => {
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(receiver)
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         // Build a hand-crafted Original PSBT that pays recvAddress.
         const decoded = decodeAddress(recvAddress);
@@ -900,12 +893,7 @@ describe("BIP-78 PayJoin sender (FIX-66)", () => {
     });
 
     it("G17: receiver returns version-unsupported → kind=receiver-error", async () => {
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(receiver)
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         const decoded = decodeAddress(recvAddress);
         const recvSpk = p2wpkhSpk(decoded.hash);
@@ -947,12 +935,7 @@ describe("BIP-78 PayJoin sender (FIX-66)", () => {
     });
 
     it("G17: empty body → receiver returns original-psbt-rejected", async () => {
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(receiver)
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         const r = await fetch(`http://127.0.0.1:${port}/payjoin?v=1`, {
           method: "POST",
@@ -985,12 +968,7 @@ describe("BIP-78 PayJoin sender (FIX-66)", () => {
         addressType: AddressType.P2WPKH,
         isCoinbase: false,
       });
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(receiver)
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         const decoded = decodeAddress(recvAddress);
         const recvSpk = p2wpkhSpk(decoded.hash);
@@ -1040,12 +1018,7 @@ describe("BIP-78 PayJoin sender (FIX-66)", () => {
 
     it("receiver returns 'unavailable' → kind=fallback", async () => {
       // The receiver returns "unavailable" iff no wallet is wired in.
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(undefined) // no wallet
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(undefined));
       try {
         const recvSpk = p2wpkhSpk(Buffer.alloc(20, 0xaa));
         const orig = buildFinalizedOneInputPsbt({
@@ -1095,12 +1068,7 @@ describe("BIP-78 PayJoin sender (FIX-66)", () => {
 
     it("version-unsupported is NOT retryable (sender bug)", async () => {
       const receiver = makeReceiverWallet();
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(receiver)
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         const recvSpk = p2wpkhSpk(Buffer.alloc(20, 0xaa));
         const orig = buildFinalizedOneInputPsbt({
@@ -1238,12 +1206,7 @@ describe("BIP-78 PayJoin sender (FIX-66)", () => {
   describe("RPC: getpayjoinrequest (G26)", () => {
     it("returns empty when no pending entries", async () => {
       const receiver = makeReceiverWallet();
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(receiver)
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         const r = await fetch(`http://127.0.0.1:${port}/`, {
           method: "POST",
@@ -1277,12 +1240,7 @@ describe("BIP-78 PayJoin sender (FIX-66)", () => {
         addressType: AddressType.P2WPKH,
         isCoinbase: false,
       });
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(receiver)
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         // POST a real Original PSBT through the receiver endpoint.
         const decoded = decodeAddress(recvAddr);
@@ -1338,12 +1296,7 @@ describe("BIP-78 PayJoin sender (FIX-66)", () => {
   describe("RPC: sendpayjoinrequest (G27)", () => {
     it("is registered when a wallet is wired", async () => {
       const wallet = makeSenderWallet();
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(wallet)
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(wallet));
       try {
         // Send a bogus request to verify the method is registered (we
         // expect a wallet-error / params-error rather than method-not-found).
@@ -1370,12 +1323,7 @@ describe("BIP-78 PayJoin sender (FIX-66)", () => {
 
     it("rejects non-string endpoint", async () => {
       const wallet = makeSenderWallet();
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(wallet)
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(wallet));
       try {
         const r = await fetch(`http://127.0.0.1:${port}/`, {
           method: "POST",
@@ -1397,12 +1345,7 @@ describe("BIP-78 PayJoin sender (FIX-66)", () => {
 
     it("rejects empty outputs", async () => {
       const wallet = makeSenderWallet();
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(wallet)
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(wallet));
       try {
         const r = await fetch(`http://127.0.0.1:${port}/`, {
           method: "POST",

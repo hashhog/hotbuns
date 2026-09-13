@@ -11,9 +11,12 @@
  * walletcreatefundedpsbt, sendtoaddress) are covered with a real wallet.
  */
 
-import { describe, it, expect, beforeEach, afterEach, beforeAll } from "bun:test";
-import { rmSync, mkdirSync } from "fs";
-import { RPCServer, RPCServerConfig, RPCServerDeps, RPCErrorCodes } from "../rpc/server.js";
+import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { rmSync, mkdirSync, mkdtempSync } from "fs";
+import * as os from "os";
+import * as path from "path";
+import { RPCServer, RPCServerDeps, RPCErrorCodes } from "../rpc/server.js";
+import { startTestRpc } from "../test/rpc-listen.js";
 import { REGTEST } from "../consensus/params.js";
 import { WalletManager, type WalletUTXO } from "../wallet/wallet.js";
 import { AddressType } from "../address/encoding.js";
@@ -24,12 +27,7 @@ import {
 } from "../wallet/psbt.js";
 import type { Transaction } from "../validation/tx.js";
 
-const TEST_DATADIR = "/tmp/hotbuns-wallet-psbt-rpc-test";
 
-let portCounter = 28443;
-function getTestPort(): number {
-  return portCounter++;
-}
 
 class FakeUTXOManager {
   private utxos = new Map<string, { scriptPubKey: Buffer; amount: bigint; height: number; coinbase: boolean }>();
@@ -116,9 +114,7 @@ async function rpcWallet(
 }
 
 function makeServer(opts?: { walletManager?: any }): { server: RPCServer; port: number; chainState: MockChainStateManager } {
-  const port = getTestPort();
   const chainState = new MockChainStateManager();
-  const config: RPCServerConfig = { port, host: "127.0.0.1", noAuth: true };
   const deps: RPCServerDeps = {
     chainState: chainState as any,
     mempool: new MockMempool() as any,
@@ -129,26 +125,21 @@ function makeServer(opts?: { walletManager?: any }): { server: RPCServer; port: 
     params: REGTEST,
     walletManager: opts?.walletManager,
   };
-  const server = new RPCServer(config, deps);
-  server.start();
+  const { server, port } = startTestRpc(deps);
   return { server, port, chainState };
 }
 
 describe("wallet/PSBT RPC wiring", () => {
-  beforeAll(() => {
-    mkdirSync(TEST_DATADIR, { recursive: true });
-    mkdirSync(`${TEST_DATADIR}/wallets`, { recursive: true });
-  });
-
   let server: RPCServer;
   let port: number;
   let chainState: MockChainStateManager;
   let manager: WalletManager;
+  let caseDir: string;
 
   beforeEach(async () => {
-    rmSync(TEST_DATADIR, { recursive: true, force: true });
-    mkdirSync(`${TEST_DATADIR}/wallets`, { recursive: true });
-    manager = new WalletManager(TEST_DATADIR, "regtest");
+    caseDir = mkdtempSync(path.join(os.tmpdir(), "hotbuns-wallet-psbt-rpc-"));
+    mkdirSync(`${caseDir}/wallets`, { recursive: true });
+    manager = new WalletManager(caseDir, "regtest");
     await manager.createWallet("default", {});
     const out = makeServer({ walletManager: manager });
     server = out.server;
@@ -158,6 +149,11 @@ describe("wallet/PSBT RPC wiring", () => {
 
   afterEach(() => {
     server.stop();
+    try {
+      rmSync(caseDir, { recursive: true, force: true });
+    } catch {
+      /* persist may still be flushing */
+    }
   });
 
   // ---------------------------------------------------------------------

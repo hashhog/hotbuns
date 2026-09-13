@@ -73,7 +73,8 @@ import { mkdtempSync, rmSync } from "fs";
 import * as os from "os";
 import * as path from "path";
 
-import { RPCServer, type RPCServerDeps } from "../rpc/server.js";
+import { type RPCServerDeps } from "../rpc/server.js";
+import { startTestRpc } from "../test/rpc-listen.js";
 import { REGTEST } from "../consensus/params.js";
 import { Wallet, type WalletConfig } from "../wallet/wallet.js";
 import { AddressType, decodeAddress, parseBip21Uri } from "../address/encoding.js";
@@ -234,9 +235,6 @@ function buildFinalizedPsbt(opts: {
   return psbt;
 }
 
-let portCounter = 40443;
-function getTestPort(): number { return portCounter++; }
-
 describe("W119 BIP-78 PayJoin audit — hotbuns", () => {
   describe("Receiver-side HTTP + PSBT", () => {
     // G1: Receiver HTTP endpoint exists. Implemented in FIX-65 via the
@@ -245,12 +243,7 @@ describe("W119 BIP-78 PayJoin audit — hotbuns", () => {
       const receiver = makeReceiverWallet();
       const recvAddr = receiver.getNewAddress();
       const recvSpk = p2wpkhSpk(decodeAddress(recvAddr).hash);
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(receiver)
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         const psbt = buildFinalizedPsbt({
           inputTxid: Buffer.alloc(32, 0xa1),
@@ -563,14 +556,9 @@ describe("W119 BIP-78 PayJoin audit — hotbuns", () => {
         addCalls++;
         return origAdd(tx);
       };
-      const port = getTestPort();
       const deps = makeDeps(receiver);
       (deps as any).mempool = trackingMempool;
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        deps
-      );
-      server.start();
+      const { server, port } = startTestRpc(deps);
       try {
         const r = await fetch(`http://127.0.0.1:${port}/payjoin?v=1`, {
           method: "POST",
@@ -631,12 +619,7 @@ describe("W119 BIP-78 PayJoin audit — hotbuns", () => {
         inputSpk: p2wpkhSpk(Buffer.alloc(20, 0x88)),
         outputs: [{ value: 199_000n, scriptPubKey: recvSpk }],
       });
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(receiver)
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         const r = await fetch(`http://127.0.0.1:${port}/payjoin?v=1`, {
           method: "POST",
@@ -654,12 +637,7 @@ describe("W119 BIP-78 PayJoin audit — hotbuns", () => {
     // G26: RPC method getpayjoinrequest.
     test("G26: RPC getpayjoinrequest returns pending request info", async () => {
       const receiver = makeReceiverWallet();
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(receiver)
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         const r = await fetch(`http://127.0.0.1:${port}/`, {
           method: "POST",
@@ -727,12 +705,7 @@ describe("W119 BIP-78 PayJoin audit — hotbuns", () => {
       const receiver = makeReceiverWallet();
       const recvAddr = receiver.getNewAddress();
       const recvSpk = p2wpkhSpk(decodeAddress(recvAddr).hash);
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(receiver)
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         const orig = buildFinalizedPsbt({
           inputTxid: Buffer.alloc(32, 0xc1),
@@ -957,12 +930,7 @@ describe("W119 BIP-78 PayJoin audit — hotbuns", () => {
       const receiver = makeReceiverWallet();
       const recvAddr = receiver.getNewAddress();
       const recvSpk = p2wpkhSpk(decodeAddress(recvAddr).hash);
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(receiver)
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         const orig = buildFinalizedPsbt({
           inputTxid: Buffer.alloc(32, 0xcb),
@@ -1018,12 +986,7 @@ describe("W119 BIP-78 PayJoin audit — hotbuns", () => {
     // G27: RPC method sendpayjoinrequest.
     test("G27: RPC sendpayjoinrequest is registered when wallet is wired", async () => {
       const receiver = makeReceiverWallet();
-      const port = getTestPort();
-      const server = new RPCServer(
-        { port, host: "127.0.0.1", noAuth: true },
-        makeDeps(receiver)
-      );
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         const r = await fetch(`http://127.0.0.1:${port}/`, {
           method: "POST",

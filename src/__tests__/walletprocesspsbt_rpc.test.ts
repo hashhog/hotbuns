@@ -21,8 +21,11 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { rmSync, mkdirSync } from "fs";
-import { RPCServer, RPCServerConfig, RPCServerDeps, RPCErrorCodes } from "../rpc/server.js";
+import { rmSync, mkdirSync, mkdtempSync } from "fs";
+import * as os from "os";
+import * as path from "path";
+import { RPCServer, RPCServerDeps, RPCErrorCodes } from "../rpc/server.js";
+import { startTestRpc } from "../test/rpc-listen.js";
 import { REGTEST } from "../consensus/params.js";
 import { WalletManager } from "../wallet/wallet.js";
 import {
@@ -37,12 +40,7 @@ import type { UTXOEntry } from "../storage/database.js";
 import { hash160 } from "../crypto/primitives.js";
 import { BufferReader } from "../wire/serialization.js";
 
-const TEST_DATADIR = "/tmp/hotbuns-walletprocesspsbt-rpc-test";
 
-let portCounter = 29443;
-function getTestPort(): number {
-  return portCounter++;
-}
 
 /** Minimal chainstate UTXO store the handler's UPDATER reads from. */
 class FakeUTXOManager {
@@ -108,16 +106,15 @@ describe("walletprocesspsbt RPC", () => {
   let port: number;
   let chainState: MockChainStateManager;
   let manager: WalletManager;
+  let caseDir: string;
 
   beforeEach(async () => {
-    rmSync(TEST_DATADIR, { recursive: true, force: true });
-    mkdirSync(`${TEST_DATADIR}/wallets`, { recursive: true });
-    manager = new WalletManager(TEST_DATADIR, "regtest");
+    caseDir = mkdtempSync(path.join(os.tmpdir(), "hotbuns-walletprocesspsbt-rpc-"));
+    mkdirSync(`${caseDir}/wallets`, { recursive: true });
+    manager = new WalletManager(caseDir, "regtest");
     await manager.createWallet("default", {});
 
-    port = getTestPort();
     chainState = new MockChainStateManager();
-    const config: RPCServerConfig = { port, host: "127.0.0.1", noAuth: true };
     const deps: RPCServerDeps = {
       chainState: chainState as any,
       mempool: new MockMempool() as any,
@@ -128,12 +125,18 @@ describe("walletprocesspsbt RPC", () => {
       params: REGTEST,
       walletManager: manager,
     };
-    server = new RPCServer(config, deps);
-    server.start();
+    const started = startTestRpc(deps);
+    server = started.server;
+    port = started.port;
   });
 
   afterEach(() => {
     server.stop();
+    try {
+      rmSync(caseDir, { recursive: true, force: true });
+    } catch {
+      /* persist may still be flushing */
+    }
   });
 
   it("updates + signs + finalizes a single wallet-input PSBT, and the sig VERIFIES", async () => {

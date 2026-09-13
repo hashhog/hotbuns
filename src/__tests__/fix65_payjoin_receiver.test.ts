@@ -32,7 +32,8 @@ import { mkdtempSync, rmSync } from "fs";
 import * as os from "os";
 import * as path from "path";
 
-import { RPCServer, type RPCServerConfig, type RPCServerDeps } from "../rpc/server.js";
+import { type RPCServerDeps } from "../rpc/server.js";
+import { startTestRpc } from "../test/rpc-listen.js";
 import { REGTEST } from "../consensus/params.js";
 import { Wallet, type WalletConfig } from "../wallet/wallet.js";
 import { AddressType, decodeAddress, encodeAddress } from "../address/encoding.js";
@@ -210,11 +211,6 @@ function buildOriginalPsbt(opts: {
     tx,
   };
 }
-
-// Each test gets its own port to avoid collisions when the runner
-// parallelizes.
-let portCounter = 38443;
-function getTestPort(): number { return portCounter++; }
 
 // ---------------------------------------------------------------------------
 // Test suites.
@@ -611,12 +607,7 @@ describe("BIP-78 PayJoin receiver (FIX-65)", () => {
     });
 
     it("G1 + G23: POST /payjoin?v=1 round-trips with text/plain body", async () => {
-      const port = getTestPort();
-      const config: RPCServerConfig = {
-        port, host: "127.0.0.1", noAuth: true,
-      };
-      const server = new RPCServer(config, makeDeps(receiver));
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         const { psbtBase64 } = buildOriginalPsbt({
           senderUtxoTxid: Buffer.alloc(32, 0x22),
@@ -644,12 +635,7 @@ describe("BIP-78 PayJoin receiver (FIX-65)", () => {
     });
 
     it("G21: POST /payjoin?v=2 → 400 with version-unsupported", async () => {
-      const port = getTestPort();
-      const config: RPCServerConfig = {
-        port, host: "127.0.0.1", noAuth: true,
-      };
-      const server = new RPCServer(config, makeDeps(receiver));
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         const { psbtBase64 } = buildOriginalPsbt({
           senderUtxoTxid: Buffer.alloc(32, 0x23),
@@ -673,12 +659,7 @@ describe("BIP-78 PayJoin receiver (FIX-65)", () => {
     });
 
     it("BIP-78 §G: empty body → original-psbt-rejected JSON", async () => {
-      const port = getTestPort();
-      const config: RPCServerConfig = {
-        port, host: "127.0.0.1", noAuth: true,
-      };
-      const server = new RPCServer(config, makeDeps(receiver));
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         const response = await fetch(`http://127.0.0.1:${port}/payjoin?v=1`, {
           method: "POST",
@@ -694,13 +675,8 @@ describe("BIP-78 PayJoin receiver (FIX-65)", () => {
     });
 
     it("BIP-78 §G: no wallet wired → unavailable", async () => {
-      const port = getTestPort();
-      const config: RPCServerConfig = {
-        port, host: "127.0.0.1", noAuth: true,
-      };
       // makeDeps() without the wallet arg.
-      const server = new RPCServer(config, makeDeps(undefined));
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(undefined));
       try {
         const response = await fetch(`http://127.0.0.1:${port}/payjoin?v=1`, {
           method: "POST",
@@ -716,12 +692,7 @@ describe("BIP-78 PayJoin receiver (FIX-65)", () => {
     });
 
     it("non-POST to /payjoin → 405 method-not-allowed", async () => {
-      const port = getTestPort();
-      const config: RPCServerConfig = {
-        port, host: "127.0.0.1", noAuth: true,
-      };
-      const server = new RPCServer(config, makeDeps(receiver));
-      server.start();
+      const { server, port } = startTestRpc(makeDeps(receiver));
       try {
         const response = await fetch(`http://127.0.0.1:${port}/payjoin?v=1`, {
           method: "GET",

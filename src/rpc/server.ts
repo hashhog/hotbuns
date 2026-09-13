@@ -943,8 +943,13 @@ export class RPCServer {
 
     const scheme = tlsEnabled ? "https" : "http";
     console.log(
-      `RPC server listening on ${scheme}://${this.config.host}:${this.config.port}`
+      `RPC server listening on ${scheme}://${this.config.host}:${this.server.port}`
     );
+  }
+
+  /** Bound TCP port after start(). Equals config.port unless that was 0. */
+  listeningPort(): number {
+    return this.server?.port ?? this.config.port;
   }
 
   /**
