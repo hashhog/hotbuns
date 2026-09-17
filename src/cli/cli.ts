@@ -1297,7 +1297,7 @@ async function runSnapshotLoad(
   db: ChainDB,
   chainState: ChainStateManager,
   params: ConsensusParams,
-): Promise<void> {
+): Promise<import("../chain/snapshot.js").LoadSnapshotResult> {
   console.log(`Loading Core-format UTXO snapshot: ${snapshotPath}`);
 
   const manager = new ChainstateManager(db, params);
@@ -1355,6 +1355,7 @@ async function runSnapshotLoad(
     `Snapshot load complete. Chain tip: height ${result.baseHeight}, hash ` +
       Buffer.from(result.baseBlockHash).reverse().toString("hex")
   );
+  return result;
 }
 
 /**
@@ -1760,8 +1761,9 @@ async function startNode(config: NodeConfig): Promise<void> {
   // stuck at the snapshot height — the Phase B re-validation FAIL.  Fall through
   // to header sync (section 5) + peer manager (section 6) so the node validates
   // forward to the chain tip instead of closing the DB and exiting.
+  let snapshotLoadResult: import("../chain/snapshot.js").LoadSnapshotResult | null = null;
   if (mergedConfig.loadSnapshot) {
-    await runSnapshotLoad(mergedConfig.loadSnapshot, db, chainState, params);
+    snapshotLoadResult = await runSnapshotLoad(mergedConfig.loadSnapshot, db, chainState, params);
 
     // ── Adopt the snapshot base as the active chain tip ──
     //
@@ -1791,6 +1793,23 @@ async function startNode(config: NodeConfig): Promise<void> {
     await chainState.load();
     bestBlock = chainState.getBestBlock();
     mempool.setTipHeight(bestBlock.height);
+    if (
+      snapshotLoadResult?.hashSerialized &&
+      snapshotLoadResult.txouts !== undefined &&
+      snapshotLoadResult.transactions !== undefined &&
+      snapshotLoadResult.bogosize !== undefined &&
+      snapshotLoadResult.totalAmount !== undefined
+    ) {
+      chainState.setCachedTxOutSet({
+        height: snapshotLoadResult.baseHeight,
+        bestBlock: snapshotLoadResult.baseBlockHash,
+        hashSerialized: snapshotLoadResult.hashSerialized,
+        txouts: snapshotLoadResult.txouts,
+        transactions: snapshotLoadResult.transactions,
+        bogosize: snapshotLoadResult.bogosize,
+        totalAmount: snapshotLoadResult.totalAmount,
+      });
+    }
 
     console.log(
       `Snapshot adopted as chain tip: height ${bestBlock.height}, hash ` +

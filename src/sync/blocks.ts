@@ -408,6 +408,13 @@ export class BlockSync {
   /** Lock to prevent concurrent block processing. */
   private processing: boolean;
 
+  /**
+   * Count of in-flight gettxoutsetinfo / whole-set scans. While > 0 the
+   * connect loop yields (Core holds cs_main in GetUTXOStats). Nested so a
+   * scan that starts during another still resumes only on the last resume.
+   */
+  private utxoScanPause = 0;
+
   /** Last height at which UTXO cache was flushed to disk. */
   private lastFlushedHeight: number;
 
@@ -2727,10 +2734,32 @@ export class BlockSync {
   /**
    * Process downloaded blocks in height order.
    */
+  /**
+   * Pause block-connect for a whole-set UTXO scan. Pair with
+   * {@link resumeAfterUTXOScan}.
+   */
+  pauseForUTXOScan(): void {
+    this.utxoScanPause++;
+  }
+
+  /**
+   * Resume block-connect after {@link pauseForUTXOScan}. Kicks the connect
+   * loop once the last nested pause drops so buffered bodies are not stuck.
+   */
+  resumeAfterUTXOScan(): void {
+    if (this.utxoScanPause > 0) this.utxoScanPause--;
+    if (this.utxoScanPause === 0 && this.running && this.syncHalted === null) {
+      void this.processOrderedBlocks();
+    }
+  }
+
   private async processOrderedBlocks(): Promise<void> {
     // Reorg-to-ancestor HALT (crash-recovery / reorg-integrity class): once the
     // sync loop has hard-failed on an impossible reorg it must NOT keep spinning.
     if (this.syncHalted !== null) {
+      return;
+    }
+    if (this.utxoScanPause > 0) {
       return;
     }
     // Prevent concurrent block processing - multiple handleBlock calls can
@@ -2784,6 +2813,9 @@ export class BlockSync {
     // next connect → bad-txns-inputs-missingorspent on a valid block.
     while (true) {
       if (this.syncHalted !== null) {
+        return;
+      }
+      if (this.utxoScanPause > 0) {
         return;
       }
       const bestHeader = this.headerSync.getBestHeader();

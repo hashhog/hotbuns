@@ -110,6 +110,20 @@ export interface LoadSnapshotResult {
   baseHeight: number;
   /** Path to the snapshot file. */
   path: string;
+  /**
+   * HASH_SERIALIZED (internal byte order) folded during the load, when the
+   * streaming hasher ran. Same digest gettxoutsetinfo must report at this
+   * base before any later block connects.
+   */
+  hashSerialized?: Buffer;
+  /** Distinct-txid count over the loaded coins (`gettxoutsetinfo.transactions`). */
+  transactions?: bigint;
+  /** Output count (`gettxoutsetinfo.txouts`). */
+  txouts?: bigint;
+  /** Core bogosize over the loaded coins. */
+  bogosize?: bigint;
+  /** Sum of loaded coin values, satoshis. */
+  totalAmount?: bigint;
 }
 
 /**
@@ -615,22 +629,38 @@ type SnapshotHashCoin = {
  * Fold one txid-group into the load-time HASH_SERIALIZED hasher.
  * Vouts are sorted numerically to match kernel/coinstats.cpp's std::map.
  */
+type SnapshotLoadStats = {
+  txouts: bigint;
+  transactions: bigint;
+  bogosize: bigint;
+  totalAmount: bigint;
+};
+
 function flushSnapshotHashGroup(
   hasher: { update(data: Uint8Array): unknown } | null,
   txid: Buffer | null,
   group: SnapshotHashCoin[],
+  stats?: SnapshotLoadStats,
 ): void {
-  if (!hasher || !txid || group.length === 0) {
+  if (!txid || group.length === 0) {
     group.length = 0;
     return;
   }
   if (group.length > 1) {
     group.sort((a, b) => a.vout - b.vout);
   }
+  if (stats) stats.transactions++;
   for (const c of group) {
-    hasher.update(
-      txOutSerBytes(txid, c.vout, c.height, c.coinbase, c.amount, c.scriptPubKey),
-    );
+    if (stats) {
+      stats.txouts++;
+      stats.totalAmount += c.amount;
+      stats.bogosize += getBogoSize(c.scriptPubKey.length);
+    }
+    if (hasher) {
+      hasher.update(
+        txOutSerBytes(txid, c.vout, c.height, c.coinbase, c.amount, c.scriptPubKey),
+      );
+    }
   }
   group.length = 0;
 }
@@ -1163,6 +1193,12 @@ export class ChainstateManager {
     let baseHeight: number;
     let snapshotChainstate: Chainstate;
     let streamedHash: Buffer | null = null;
+    const loadStats: SnapshotLoadStats = {
+      txouts: 0n,
+      transactions: 0n,
+      bogosize: 0n,
+      totalAmount: 0n,
+    };
     try {
       const stream = new StreamingBufferReader(fh, stat.size);
       await stream.fillWindow();
@@ -1267,10 +1303,8 @@ export class ChainstateManager {
           );
         }
 
-        if (hasher) {
-          flushSnapshotHashGroup(hasher, hashTxid, hashGroup);
-          hashTxid = txid;
-        }
+        flushSnapshotHashGroup(hasher, hashTxid, hashGroup, loadStats);
+        hashTxid = txid;
 
         for (let i = 0; i < numOutputs; i++) {
           if (stream.remaining() < 64) await stream.fillWindow();
@@ -1354,15 +1388,13 @@ export class ChainstateManager {
           );
           batch.putUTXO(txid, vout, Buffer.from(valueScratch.subarray(0, encodedLen)));
 
-          if (hasher) {
-            hashGroup.push({
-              vout,
-              height,
-              coinbase: isCoinbase,
-              amount: value,
-              scriptPubKey,
-            });
-          }
+          hashGroup.push({
+            vout,
+            height,
+            coinbase: isCoinbase,
+            amount: value,
+            scriptPubKey,
+          });
 
           coinsLoaded++;
 
@@ -1376,8 +1408,8 @@ export class ChainstateManager {
       if (batch.length > 0) {
         await batch.write();
       }
+      flushSnapshotHashGroup(hasher, hashTxid, hashGroup, loadStats);
       if (hasher) {
-        flushSnapshotHashGroup(hasher, hashTxid, hashGroup);
         streamedHash = sha256Hash(Buffer.from(hasher.digest()));
       }
 
@@ -1452,6 +1484,11 @@ export class ChainstateManager {
       baseBlockHash: metadata.baseBlockHash,
       baseHeight,
       path: filePath,
+      hashSerialized: streamedHash ?? (computedHash.length === 32 ? computedHash : undefined),
+      transactions: loadStats.transactions,
+      txouts: loadStats.txouts,
+      bogosize: loadStats.bogosize,
+      totalAmount: loadStats.totalAmount,
     };
   }
 

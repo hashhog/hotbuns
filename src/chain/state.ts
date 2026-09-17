@@ -69,6 +69,19 @@ export interface ChainManagementResult {
 }
 
 /**
+ * Snapshot-base `gettxoutsetinfo` surface. HASH_SERIALIZED is internal-order.
+ */
+export interface CachedTxOutSetInfo {
+  height: number;
+  bestBlock: Buffer;
+  hashSerialized: Buffer;
+  txouts: bigint;
+  transactions: bigint;
+  bogosize: bigint;
+  totalAmount: bigint;
+}
+
+/**
  * Get the highest checkpoint height from consensus params.
  *
  * @param params - Network consensus parameters
@@ -237,6 +250,13 @@ export class ChainStateManager {
    *  only the MIN_BLOCKS_TO_KEEP (288) undo window. Wired from cli.ts via
    *  `setPruningEnabled()`. Defaults to archive (unbounded). */
   private pruningEnabled: boolean = false;
+  /**
+   * UTXO-set stats captured at assumeUTXO snapshot load. Valid only while
+   * the active tip is still the snapshot base — the first connect/disconnect
+   * drops it. Lets `gettxoutsetinfo` at a snapshot base answer without a
+   * full coins-DB walk (campaign base control at 290000).
+   */
+  private cachedTxOutSet: CachedTxOutSetInfo | null = null;
 
   constructor(db: ChainDB, params: ConsensusParams, maxCacheBytes?: number) {
     this.db = db;
@@ -673,6 +693,7 @@ export class ChainStateManager {
       height,
       chainWork,
     };
+    this.clearCachedTxOutSet();
 
     // Tip advanced (extension or reorg reconnect) — wake any wait-family RPC.
     // Core: ConnectTip fires KernelNotifications::blockTip for every connect.
@@ -978,6 +999,7 @@ export class ChainStateManager {
       height: prevHeight,
       chainWork: prevChainWork,
     };
+    this.clearCachedTxOutSet();
 
     // Tip moved (reorg rewind / invalidateblock) — this is the DISCONNECT half
     // of a reorg, a tip change too.  Core's KernelNotifications::blockTip fires
@@ -1190,11 +1212,29 @@ export class ChainStateManager {
   }
 
   /**
+   * Seed the snapshot-base gettxoutsetinfo cache. Call after `--load-snapshot`
+   * / `loadtxoutset` once the in-memory tip is the loaded base.
+   */
+  setCachedTxOutSet(stats: CachedTxOutSetInfo): void {
+    this.cachedTxOutSet = stats;
+  }
+
+  /** Snapshot-base UTXO stats, or null once the tip has moved. */
+  getCachedTxOutSet(): CachedTxOutSetInfo | null {
+    return this.cachedTxOutSet;
+  }
+
+  private clearCachedTxOutSet(): void {
+    this.cachedTxOutSet = null;
+  }
+
+  /**
    * Update the in-memory chain tip without going through full connectBlock.
    * Used by BlockSync to keep RPC state in sync during IBD.
    */
   updateTip(hash: Buffer, height: number, chainWork: bigint): void {
     this.bestBlock = { hash, height, chainWork };
+    this.clearCachedTxOutSet();
     // This is the tip-advance funnel for the BlockSync connect path: IBD and
     // post-IBD P2P block-connect, submitblock, and generatetoaddress/
     // generateblock (which all route injectBlock → BlockSync.connectBlock →

@@ -11456,6 +11456,23 @@ export class RPCServer {
     // here, the node keeps an in-memory tip of height 0" — same root cause,
     // same fix, now applied to the RPC-triggered load path too).
     await this.chainState.load();
+    if (
+      loadResult.hashSerialized &&
+      loadResult.txouts !== undefined &&
+      loadResult.transactions !== undefined &&
+      loadResult.bogosize !== undefined &&
+      loadResult.totalAmount !== undefined
+    ) {
+      this.chainState.setCachedTxOutSet({
+        height: loadResult.baseHeight,
+        bestBlock: loadResult.baseBlockHash,
+        hashSerialized: loadResult.hashSerialized,
+        txouts: loadResult.txouts,
+        transactions: loadResult.transactions,
+        bogosize: loadResult.bogosize,
+        totalAmount: loadResult.totalAmount,
+      });
+    }
 
     // Snapshot-first boot: leave m_best_header on the loaded base before
     // any further peer headers (Core AddToBlockIndex). Then snap the
@@ -15379,52 +15396,89 @@ export class RPCServer {
       return result;
     }
 
+    // Snapshot-base cache: after --load-snapshot / loadtxoutset the load
+    // already folded HASH_SERIALIZED + totals. Serving that here means the
+    // campaign base control does not have to walk 9.5M coins on the same
+    // event loop as IBD (290000→315000: NO-ORACLE-SURFACE, utxo_hash="-1",
+    // curl's 900s scan deadline). Dropped on the first tip change.
+    const tip = this.chainState.getBestBlock();
+    const cached = this.chainState.getCachedTxOutSet();
+    if (
+      cached &&
+      (hashType === "hash_serialized_3" || hashType === "none") &&
+      cached.height === tip.height &&
+      cached.bestBlock.equals(tip.hash)
+    ) {
+      const result: Record<string, unknown> = {
+        height: cached.height,
+        bestblock: Buffer.from(cached.bestBlock).reverse().toString("hex"),
+        txouts: Number(cached.txouts),
+        bogosize: Number(cached.bogosize),
+      };
+      if (hashType === "hash_serialized_3") {
+        result.hash_serialized_3 = Buffer.from(cached.hashSerialized)
+          .reverse()
+          .toString("hex");
+      }
+      result.total_amount = formatBtcAmount(cached.totalAmount);
+      result.transactions = Number(cached.transactions);
+      result.disk_size = this.utxoDiskSize();
+      return result;
+    }
+
     // Core: gettxoutsetinfo calls ForceFlushStateToDisk(/*wipe_cache=*/false)
     // before it reads CoinsDB (rpc/blockchain.cpp:1074-1081). Without it the
     // scan below reports the tip's height/bestblock over the LAST FLUSHED coin
     // set — the tip label makes the stale numbers look authoritative.
-    await this.forceFlushChainstateToDisk();
+    // Pause block-connect for the walk (Core holds cs_main in GetUTXOStats)
+    // so IBD does not starve the scan on the single event loop.
+    this.blockSync?.pauseForUTXOScan();
+    try {
+      await this.forceFlushChainstateToDisk();
 
-    const chainState = await this.db.getChainState();
-    if (!chainState) {
-      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "No chain state available");
+      const chainState = await this.db.getChainState();
+      if (!chainState) {
+        throw this.rpcError(RPCErrorCodes.MISC_ERROR, "No chain state available");
+      }
+      const bestBlock = this.chainState.getBestBlock();
+      const bestBlockHashHex = Buffer.from(bestBlock.hash).reverse().toString("hex");
+
+      // ── Single coin-cursor pass: stats + (optional) set hash. ────────────
+      const stats = await computeUTXOSetStats(this.db, hashType);
+
+      const result: Record<string, unknown> = {
+        height: bestBlock.height,
+        bestblock: bestBlockHashHex,
+        txouts: Number(stats.txouts),
+        bogosize: Number(stats.bogosize),
+        // hash_serialized_3 / muhash inserted below, between bogosize and
+        // total_amount, matching Core's field order.
+        total_amount: formatBtcAmount(stats.totalAmount),
+        // Not available when coinstatsindex is used; always present here.
+        transactions: Number(stats.transactions),
+        // disk_size mirrors Core's CCoinsViewDB::EstimateSize() (kernel/coinstats):
+        // the LevelDB on-disk size of the coins database. hotbuns keeps the coin
+        // set in the in-memory CoinsViewCache and writes a separate on-disk coins
+        // database only at flush boundaries, so its EstimateSize() equivalent is 0
+        // for an UNFLUSHED chainstate (e.g. a freshly-mirrored regtest chain) —
+        // matching Core, which also reports 0 there. The earlier bogosize proxy
+        // over-reported relative to Core.
+        disk_size: this.utxoDiskSize(),
+      };
+
+      if (hashType === "hash_serialized_3" && stats.hash) {
+        result.hash_serialized_3 = Buffer.from(stats.hash).reverse().toString("hex");
+      } else if (hashType === "muhash" && stats.hash) {
+        // MuHash3072.finalize() already yields the display-order digest
+        // (SHA256(LE_384(num/den))); Core prints it verbatim via uint256.GetHex
+        // over the same bytes, so reverse for the standard hex display.
+        result.muhash = Buffer.from(stats.hash).reverse().toString("hex");
+      }
+
+      return result;
+    } finally {
+      this.blockSync?.resumeAfterUTXOScan();
     }
-    const bestBlock = this.chainState.getBestBlock();
-    const bestBlockHashHex = Buffer.from(bestBlock.hash).reverse().toString("hex");
-
-    // ── Single coin-cursor pass: stats + (optional) set hash. ────────────
-    const stats = await computeUTXOSetStats(this.db, hashType);
-
-    const result: Record<string, unknown> = {
-      height: bestBlock.height,
-      bestblock: bestBlockHashHex,
-      txouts: Number(stats.txouts),
-      bogosize: Number(stats.bogosize),
-      // hash_serialized_3 / muhash inserted below, between bogosize and
-      // total_amount, matching Core's field order.
-      total_amount: formatBtcAmount(stats.totalAmount),
-      // Not available when coinstatsindex is used; always present here.
-      transactions: Number(stats.transactions),
-      // disk_size mirrors Core's CCoinsViewDB::EstimateSize() (kernel/coinstats):
-      // the LevelDB on-disk size of the coins database. hotbuns keeps the coin
-      // set in the in-memory CoinsViewCache and writes a separate on-disk coins
-      // database only at flush boundaries, so its EstimateSize() equivalent is 0
-      // for an UNFLUSHED chainstate (e.g. a freshly-mirrored regtest chain) —
-      // matching Core, which also reports 0 there. The earlier bogosize proxy
-      // over-reported relative to Core.
-      disk_size: this.utxoDiskSize(),
-    };
-
-    if (hashType === "hash_serialized_3" && stats.hash) {
-      result.hash_serialized_3 = Buffer.from(stats.hash).reverse().toString("hex");
-    } else if (hashType === "muhash" && stats.hash) {
-      // MuHash3072.finalize() already yields the display-order digest
-      // (SHA256(LE_384(num/den))); Core prints it verbatim via uint256.GetHex
-      // over the same bytes, so reverse for the standard hex display.
-      result.muhash = Buffer.from(stats.hash).reverse().toString("hex");
-    }
-
-    return result;
   }
 
   /**

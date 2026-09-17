@@ -2,6 +2,7 @@
 
 ## v1.0.2 — 2026-09-13
 
+- fix: snapshot-base gettxoutsetinfo reports height/hash without a second coins-DB walk
 - af6a6da test: bind RPC tests on OS-assigned ports so bun test stays green
 - 3d0d4f7 test: keep bun test parent idle and retry EADDRINUSE on watch-only RPC
 - 1ee906f fix: processOrderedBlocks livelock hung bun test at 46G
