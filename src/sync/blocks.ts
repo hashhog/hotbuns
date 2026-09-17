@@ -3286,14 +3286,12 @@ export class BlockSync {
         await this.utxoManager.flushDirty(extraOps);
         this.lastFlushedHeight = height;
 
-        // Use FULL GC (true) on memory-triggered flushes to release the
-        // large batch of evicted Map entries and Buffers back to the OS.
-        // With the reduced 256MB cache, memory flushes happen less often
-        // (~every 1-3 blocks at 380K+), so the stop-the-world cost is
-        // amortized. Incremental GC was insufficient — it left dead objects
-        // in the old generation, keeping RSS at 4GB+.
+        // Incremental GC only. Full GC (true) while 15 bun:ffi script-check
+        // workers are live is the 340890 SIGSEGV class: compacting the
+        // isolate next to native secp256k1 pointers. The 10s full-GC ticker
+        // was already removed for the same reason (see logProgress).
         if (typeof Bun !== "undefined" && Bun.gc) {
-          Bun.gc(true);
+          Bun.gc(false);
         }
       }
 

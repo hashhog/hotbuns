@@ -215,17 +215,35 @@ if (FFI_AVAILABLE) {
 // ---------------------------------------------------------------------------
 
 /**
+ * bun:ffi ptr() on an empty (or detached) ArrayBufferView does not throw:
+ * it RETURNS a TypeError object. Passing that object as FFIType.ptr either
+ * throws "Unable to convert TypeError to a pointer" or, under GC pressure
+ * with worker FFI, is interpreted as a tagged JSValue and SIGSEGVs at a
+ * wild address (0x401FFFFFFBE at height 340890). Never hand ptr()'s result
+ * to libsecp256k1 unless it is a finite number.
+ */
+function nativePtr(buf: Uint8Array): number | null {
+  if (buf.byteLength === 0) return null;
+  try {
+    const p = ptr(buf);
+    if (typeof p !== "number" || !Number.isFinite(p)) return null;
+    return p;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Parse a secp256k1 public key (33-byte compressed or 65-byte uncompressed)
  * into the internal 64-byte opaque format in _pubkeyBuf.
  * Returns true on success.
  */
 function _parsePubkey(pubkeyBytes: Uint8Array): boolean {
-  // An empty pubkey (e.g. OP_0 on the stack feeding OP_CHECKSIG without
-  // STRICTENC) is never a valid encoding — return false rather than letting
-  // Bun's ptr() throw on a zero-length buffer. Mirrors Core, where a bad
+  // Empty / detached pubkey is never a valid encoding — return false rather
+  // than feeding bun:ffi ptr() a TypeError object. Mirrors Core, where a bad
   // pubkey simply yields a failed signature check (false), not an error.
-  if (pubkeyBytes.length === 0) return false;
-  const inputPtr = ptr(pubkeyBytes);
+  const inputPtr = nativePtr(pubkeyBytes);
+  if (inputPtr === null) return false;
   return _syms!.secp256k1_ec_pubkey_parse(
     _ctx,
     _pubkeyPtr,
@@ -239,7 +257,8 @@ function _parsePubkey(pubkeyBytes: Uint8Array): boolean {
  * Returns true on success.
  */
 function _parseSigDER(derBytes: Uint8Array): boolean {
-  const inputPtr = ptr(derBytes);
+  const inputPtr = nativePtr(derBytes);
+  if (inputPtr === null) return false;
   return _syms!.secp256k1_ecdsa_signature_parse_der(
     _ctx,
     _sigPtr,
@@ -375,7 +394,8 @@ export function ecdsaVerifyFFI(
   // Normalize to low-S (required by secp256k1_ecdsa_verify which rejects high-S)
   _syms!.secp256k1_ecdsa_signature_normalize(_ctx, _sigPtr, _sigPtr);
 
-  const msgPtr = ptr(msgHash as Uint8Array);
+  const msgPtr = nativePtr(msgHash as Uint8Array);
+  if (msgPtr === null) return false;
   return _syms!.secp256k1_ecdsa_verify(_ctx, _sigPtr, msgPtr, _pubkeyPtr) === 1;
 }
 
@@ -418,7 +438,8 @@ export function ecdsaVerifyLaxFFI(
   if (!compact) return false;
 
   // Parse via compact format (bypasses strict DER requirements)
-  const compactPtr = ptr(compact);
+  const compactPtr = nativePtr(compact);
+  if (compactPtr === null) return false;
   if (_syms!.secp256k1_ecdsa_signature_parse_compact(_ctx, _sigPtr, compactPtr) !== 1) {
     return false;
   }
@@ -434,7 +455,8 @@ export function ecdsaVerifyLaxFFI(
   //   secp256k1_ecdsa_signature_normalize(secp256k1_context_static, &sig, &sig);
   _syms!.secp256k1_ecdsa_signature_normalize(_ctx, _sigPtr, _sigPtr);
 
-  const msgPtr = ptr(msgHash as Uint8Array);
+  const msgPtr = nativePtr(msgHash as Uint8Array);
+  if (msgPtr === null) return false;
   return _syms!.secp256k1_ecdsa_verify(_ctx, _sigPtr, msgPtr, _pubkeyPtr) === 1;
 }
 
@@ -466,22 +488,25 @@ export function schnorrVerifyFFI(
   }
 
   // Parse x-only pubkey into opaque struct
-  const xpkPtr = ptr(xonlyPubkey as Uint8Array);
+  const xpkPtr = nativePtr(xonlyPubkey as Uint8Array);
+  if (xpkPtr === null) return false;
   if (_syms!.secp256k1_xonly_pubkey_parse(_ctx, _xonlyPubkeyPtr, xpkPtr) !== 1) {
     return false;
   }
 
-  const sigPtr = ptr(signature as Uint8Array);
-  // For zero-length messages, Bun's ptr() will throw on an empty Uint8Array;
-  // libsecp256k1's API allows msg=NULL when msglen=0 so we synthesize a
-  // dummy 1-byte buffer pointer and pass msglen=0.
-  let msgPtr: number;
+  const sigPtr = nativePtr(signature as Uint8Array);
+  if (sigPtr === null) return false;
+  // For zero-length messages, Bun's ptr() returns a TypeError object rather
+  // than a pointer. libsecp256k1 allows msg=NULL when msglen=0, so we
+  // synthesize a dummy 1-byte buffer and pass msglen=0.
+  let msgPtr: number | null;
   if (msg.length === 0) {
     const dummy = new Uint8Array(1);
-    msgPtr = ptr(dummy);
+    msgPtr = nativePtr(dummy);
   } else {
-    msgPtr = ptr(msg as Uint8Array);
+    msgPtr = nativePtr(msg as Uint8Array);
   }
+  if (msgPtr === null) return false;
   return _syms!.secp256k1_schnorrsig_verify(_ctx, sigPtr, msgPtr, msg.length, _xonlyPubkeyPtr) === 1;
 }
 

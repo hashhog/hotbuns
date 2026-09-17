@@ -544,8 +544,13 @@ export class CoinsViewCache extends CoinsView {
     this.cachedCoinsUsage -= coinMemoryUsage(entry.coin);
 
     // If FRESH, we can just delete the entry entirely
-    // (it was created and spent within this cache session)
+    // (it was created and spent within this cache session).
+    // CACHE_ENTRY_OVERHEAD was charged at insert; drop it here or the
+    // running counter leaks 3KB per same-window spend and shouldFlush()
+    // fires forever on an empty cache (Bun SIGSEGV 340890 class).
     if (entry.fresh) {
+      this.cachedCoinsUsage -= CACHE_ENTRY_OVERHEAD;
+      if (this.cachedCoinsUsage < 0) this.cachedCoinsUsage = 0;
       this.cache.delete(key);
     } else {
       // Mark as spent and dirty
@@ -583,6 +588,8 @@ export class CoinsViewCache extends CoinsView {
     this.cachedCoinsUsage -= coinMemoryUsage(entry.coin);
 
     if (entry.fresh) {
+      this.cachedCoinsUsage -= CACHE_ENTRY_OVERHEAD;
+      if (this.cachedCoinsUsage < 0) this.cachedCoinsUsage = 0;
       this.cache.delete(key);
     } else {
       entry.coin = null;
@@ -739,6 +746,11 @@ export class CoinsViewCache extends CoinsView {
    * Check if the cache should be flushed based on memory usage.
    */
   shouldFlush(): boolean {
+    // Empty cache cannot be over budget; a leftover counter is a leak.
+    if (this.cache.size === 0) {
+      this.cachedCoinsUsage = 0;
+      return false;
+    }
     return this.cachedCoinsUsage >= this.maxCacheBytes;
   }
 

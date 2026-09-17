@@ -72,9 +72,13 @@ export function toU8(b: Buffer): Uint8Array {
 }
 
 export function fromU8(u: Uint8Array): Buffer {
-	return Buffer.isBuffer(u)
-		? u
-		: Buffer.from(u.buffer, u.byteOffset, u.byteLength);
+	// Copy. Buffer.from(u.buffer, offset, len) is a VIEW of the structured-
+	// clone ArrayBuffer the worker just received. FFI ptr() of that view is
+	// dangling if the message backing store is recycled — the 340890 SIGSEGV
+	// class. A tight copy severs the alias the same way toU8 does on send.
+	const out = Buffer.allocUnsafe(u.byteLength);
+	if (u.byteLength > 0) out.set(u);
+	return out;
 }
 
 export function toWireTx(tx: Transaction): WireTx {
