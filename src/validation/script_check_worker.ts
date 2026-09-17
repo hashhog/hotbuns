@@ -34,6 +34,7 @@ self.onmessage = (ev: MessageEvent<WorkerIn>) => {
 	}
 	try {
 		const txs = msg.txs.map(fromWireTx);
+		const txUtxos = (msg.txUtxos ?? []).map((arr) => arr.map(fromWireUtxo));
 		const caches = new Map<
 			number,
 			{ sig: SigHashCache; tap: TaprootSigHashCache }
@@ -47,7 +48,7 @@ self.onmessage = (ev: MessageEvent<WorkerIn>) => {
 				caches.set(job.txi, cache);
 			}
 			const tx = txs[job.txi]!;
-			const utxos = job.utxos.map(fromWireUtxo);
+			const utxos = txUtxos[job.txi] ?? [];
 			const utxo = utxos[job.inputIndex]!;
 			const result = verifyInputSignature(
 				tx,

@@ -21,9 +21,9 @@
 
 import type { UTXOEntry } from "../storage/database.js";
 import {
-	toWireTx,
-	toWireUtxo,
-	type WireBatch,
+	buildWireBatch,
+	scriptCheckWireBudget,
+	splitJobsByWireBudget,
 	type WorkerOut,
 } from "./script_check_wire.js";
 import { globalSigCache } from "./sig_cache.js";
@@ -83,7 +83,17 @@ export interface ScriptCheckResult {
 	failedTxidHex?: string;
 }
 
-export function clampScriptThreads(n: number | undefined): number {
+/**
+ * RSS we budget per script-check isolate (tx.ts + interpreter + bun:ffi).
+ * Used to cap worker count from --dbcache so 15 isolates cannot dominate a
+ * small cache. 2560 MiB / 64 MiB = 40 → still 15; 32 MiB → 1.
+ */
+export const SCRIPT_WORKER_RSS_BUDGET = 64 * 1024 * 1024;
+
+export function clampScriptThreads(
+	n: number | undefined,
+	cacheBytes?: number,
+): number {
 	let threads = n;
 	if (threads === undefined || threads <= 0) {
 		const hw =
@@ -92,7 +102,15 @@ export function clampScriptThreads(n: number | undefined): number {
 				: 4;
 		threads = hw;
 	}
-	return Math.max(1, Math.min(Math.floor(threads), MAX_SCRIPTCHECK_THREADS));
+	threads = Math.max(1, Math.min(Math.floor(threads), MAX_SCRIPTCHECK_THREADS));
+	if (typeof cacheBytes === "number" && Number.isFinite(cacheBytes) && cacheBytes > 0) {
+		const maxByCache = Math.max(
+			1,
+			Math.floor(cacheBytes / SCRIPT_WORKER_RSS_BUDGET),
+		);
+		threads = Math.min(threads, maxByCache);
+	}
+	return threads;
 }
 
 function hardwareThreads(): number {
@@ -169,11 +187,24 @@ class VerifyPool {
 		if (this.failed) throw this.failed;
 	}
 
-	async verify(jobs: ScriptCheckJob[]): Promise<ScriptCheckResult> {
+	async verify(
+		jobs: ScriptCheckJob[],
+		wireBudgetBytes?: number,
+	): Promise<ScriptCheckResult> {
 		await this.waitReady();
 		if (this.failed) throw this.failed;
 		if (jobs.length === 0) return { valid: true };
 
+		const budget = wireBudgetBytes ?? scriptCheckWireBudget();
+		const groups = splitJobsByWireBudget(jobs, budget);
+		for (const group of groups) {
+			const result = await this.verifyGroup(group);
+			if (!result.valid) return result;
+		}
+		return { valid: true };
+	}
+
+	private async verifyGroup(jobs: ScriptCheckJob[]): Promise<ScriptCheckResult> {
 		const n = Math.min(this.size, jobs.length);
 		const chunkSize = Math.ceil(jobs.length / n);
 		const waves: Promise<{ start: number; out: WorkerOut }>[] = [];
@@ -215,24 +246,7 @@ class VerifyPool {
 		chunk: ScriptCheckJob[],
 	): Promise<WorkerOut> {
 		const id = this.nextId++;
-		const txMap = new Map<Transaction, number>();
-		const txs = [];
-		const wireJobs = [];
-		for (const job of chunk) {
-			let txi = txMap.get(job.tx);
-			if (txi === undefined) {
-				txi = txs.length;
-				txMap.set(job.tx, txi);
-				txs.push(toWireTx(job.tx));
-			}
-			wireJobs.push({
-				txi,
-				inputIndex: job.inputIndex,
-				utxos: job.utxos.map(toWireUtxo),
-				flags: job.flags,
-			});
-		}
-		const batch: WireBatch = { kind: "batch", id, txs, jobs: wireJobs };
+		const batch = buildWireBatch(id, chunk);
 		return new Promise<WorkerOut>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.inflight.delete(id);
@@ -358,10 +372,11 @@ function verifySequential(jobs: ScriptCheckJob[]): ScriptCheckResult {
 export async function verifyScriptChecks(
 	jobs: ScriptCheckJob[],
 	threads?: number,
+	cacheBytes?: number,
 ): Promise<ScriptCheckResult> {
 	if (jobs.length === 0) return { valid: true };
 
-	const n = clampScriptThreads(threads ?? hardwareThreads());
+	const n = clampScriptThreads(threads ?? hardwareThreads(), cacheBytes);
 	const usePool = n > 1 && jobs.length >= MIN_JOBS_FOR_POOL;
 
 	if (!usePool) {
@@ -393,7 +408,7 @@ export async function verifyScriptChecks(
 
 	try {
 		const pool = await getPool(n);
-		const result = await pool.verify(pending);
+		const result = await pool.verify(pending, scriptCheckWireBudget(cacheBytes));
 		if (result.valid) {
 			for (const job of pending) {
 				const utxo = job.utxos[job.inputIndex]!;

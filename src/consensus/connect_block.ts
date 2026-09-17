@@ -569,6 +569,7 @@ export async function coreConnectBlockChecks(
   // a clamped value (0 = auto → hardware, max 15).
   const effectiveScriptThreads = clampScriptThreads(
     scriptThreads === undefined ? 1 : scriptThreads,
+    utxoManager.getMaxCacheBytes(),
   );
 
   for (let txIndex = 0; txIndex < block.transactions.length; txIndex++) {
@@ -817,6 +818,7 @@ export async function coreConnectBlockChecks(
     const scriptResult = await verifyScriptChecks(
       scriptJobs,
       effectiveScriptThreads,
+      utxoManager.getMaxCacheBytes(),
     );
     if (!scriptResult.valid) {
       const who = scriptResult.failedTxidHex?.slice(0, 16) ?? "unknown";

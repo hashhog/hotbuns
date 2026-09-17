@@ -35,7 +35,6 @@ export interface WireUtxo {
 export interface WireJob {
 	txi: number;
 	inputIndex: number;
-	utxos: WireUtxo[];
 	flags: number;
 }
 
@@ -43,8 +42,21 @@ export interface WireBatch {
 	kind: "batch";
 	id: number;
 	txs: WireTx[];
+	/** UTXO vectors once per tx, not once per input (O(inputs) not O(inputs²)). */
+	txUtxos: WireUtxo[][];
 	jobs: WireJob[];
 }
+
+/** Jobs the main thread hands to {@link buildWireBatch}. */
+export interface WireableJob {
+	tx: Transaction;
+	inputIndex: number;
+	utxos: UTXOEntry[];
+	flags: number;
+}
+
+/** Hard cap on one structured-clone payload. Also the default when no dbcache. */
+export const MAX_SCRIPTCHECK_WIRE_BYTES = 8 * 1024 * 1024;
 
 export interface WireStop {
 	kind: "stop";
@@ -131,4 +143,84 @@ export function fromWireUtxo(w: WireUtxo): UTXOEntry {
 		amount: w.amount,
 		scriptPubKey: fromU8(w.scriptPubKey),
 	};
+}
+
+/**
+ * Build a worker batch that stores each tx's UTXO vector once.
+ * The previous per-job `utxos: job.utxos.map(toWireUtxo)` copied the full
+ * prevout vector once per input — a 128-input tx became 16 384 UTXO clones
+ * before structured-clone duplicated them into every worker isolate.
+ */
+export function buildWireBatch(id: number, chunk: WireableJob[]): WireBatch {
+	const txMap = new Map<Transaction, number>();
+	const txs: WireTx[] = [];
+	const txUtxos: WireUtxo[][] = [];
+	const jobs: WireJob[] = [];
+	for (const job of chunk) {
+		let txi = txMap.get(job.tx);
+		if (txi === undefined) {
+			txi = txs.length;
+			txMap.set(job.tx, txi);
+			txs.push(toWireTx(job.tx));
+			txUtxos.push(job.utxos.map(toWireUtxo));
+		}
+		jobs.push({
+			txi,
+			inputIndex: job.inputIndex,
+			flags: job.flags,
+		});
+	}
+	return { kind: "batch", id, txs, txUtxos, jobs };
+}
+
+export function countWireUtxos(batch: WireBatch): number {
+	let n = 0;
+	for (const arr of batch.txUtxos) n += arr.length;
+	return n;
+}
+
+export function estimateWireBatchBytes(batch: WireBatch): number {
+	let n = 64;
+	for (const tx of batch.txs) {
+		n += 24;
+		for (const inp of tx.inputs) {
+			n += 40 + inp.scriptSig.byteLength;
+			for (const w of inp.witness) n += w.byteLength;
+		}
+		for (const o of tx.outputs) n += 16 + o.scriptPubKey.byteLength;
+	}
+	for (const arr of batch.txUtxos) {
+		for (const u of arr) n += 24 + u.scriptPubKey.byteLength;
+	}
+	n += batch.jobs.length * 16;
+	return n;
+}
+
+/**
+ * Split jobs so each structured-clone payload stays ≤ budget. Whole
+ * transactions stay together when a single tx already fits.
+ */
+export function splitJobsByWireBudget(
+	jobs: WireableJob[],
+	budget: number,
+): WireableJob[][] {
+	if (jobs.length === 0) return [];
+	const est = estimateWireBatchBytes(buildWireBatch(0, jobs));
+	if (est <= budget || jobs.length === 1) return [jobs];
+	const mid = Math.ceil(jobs.length / 2);
+	return [
+		...splitJobsByWireBudget(jobs.slice(0, mid), budget),
+		...splitJobsByWireBudget(jobs.slice(mid), budget),
+	];
+}
+
+/** In-flight wire budget: 1–8 MiB, and never more than a quarter of dbcache. */
+export function scriptCheckWireBudget(cacheBytes?: number): number {
+	if (typeof cacheBytes === "number" && cacheBytes > 0) {
+		return Math.max(
+			1024 * 1024,
+			Math.min(MAX_SCRIPTCHECK_WIRE_BYTES, Math.floor(cacheBytes / 4)),
+		);
+	}
+	return MAX_SCRIPTCHECK_WIRE_BYTES;
 }

@@ -67,7 +67,7 @@ const DEFAULT_DBCACHE_BYTES = 512 * 1024 * 1024;
  * the key string (67-char hex), CoinEntry/Coin/txOut nested objects,
  * Buffer with ArrayBuffer backing, bigint, and Map internal bookkeeping.
  */
-const CACHE_ENTRY_OVERHEAD = 3000;
+export const CACHE_ENTRY_OVERHEAD = 3000;
 
 /**
  * A single coin in the UTXO set.
@@ -203,7 +203,7 @@ function deserializeCoin(data: Buffer): Coin {
 /**
  * Estimate memory usage of a Coin.
  */
-function coinMemoryUsage(coin: Coin | null): number {
+export function coinMemoryUsage(coin: Coin | null): number {
   if (!coin) return 0;
   // Base size: object overhead + bigint + number + boolean + scriptPubKey
   return 48 + coin.txOut.scriptPubKey.length;
@@ -759,6 +759,20 @@ export class CoinsViewCache extends CoinsView {
    */
   getMemoryUsage(): number {
     return this.cachedCoinsUsage;
+  }
+
+  /**
+   * Configured dbcache budget in bytes.
+   */
+  getMaxCacheBytes(): number {
+    return this.maxCacheBytes;
+  }
+
+  /**
+   * Update the flush threshold. Must be forwarded from UTXOManager.setMaxCacheBytes.
+   */
+  setMaxCacheBytes(maxBytes: number): void {
+    this.maxCacheBytes = maxBytes;
   }
 
   /**
@@ -1420,6 +1434,18 @@ export class UTXOManager implements UTXOSet {
     return this.cache.getMemoryUsage();
   }
 
+  /** Alias of {@link getEstimatedMemoryUsage} for MemorySnapshot. */
+  getMemoryUsage(): number {
+    return this.cache.getMemoryUsage();
+  }
+
+  /**
+   * Configured dbcache budget in bytes (the flush threshold).
+   */
+  getMaxCacheBytes(): number {
+    return this.maxCacheBytes;
+  }
+
   /**
    * Get the maximum cache size in entries.
    */
@@ -1433,6 +1459,7 @@ export class UTXOManager implements UTXOSet {
   setMaxCacheBytes(maxBytes: number): void {
     this.maxCacheBytes = maxBytes;
     this.maxCacheSize = Math.floor(maxBytes / CACHE_ENTRY_OVERHEAD);
+    this.cache.setMaxCacheBytes(maxBytes);
   }
 
   /**

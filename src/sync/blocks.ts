@@ -34,7 +34,15 @@ import {
   type AssumeValidContext,
 } from "../consensus/assumevalid.js";
 import { coreConnectBlockChecks } from "../consensus/connect_block.js";
-import { clampScriptThreads } from "../validation/script_check_queue.js";
+import {
+  clampScriptThreads,
+  scriptCheckPoolSize,
+} from "../validation/script_check_queue.js";
+import {
+  exceedsRssBudget,
+  formatMemoryBreakdown,
+  snapshotMemory,
+} from "../chain/memory_snapshot.js";
 import {
   MAX_CMPCTBLOCK_DEPTH,
   MAX_BLOCKTXN_DEPTH,
@@ -639,7 +647,7 @@ export class BlockSync {
     this.headerSync = headerSync;
     this.peerManager = peerManager ?? null;
     this.chainStateManager = chainStateManager ?? null;
-    this.scriptThreads = clampScriptThreads(scriptThreads);
+    this.scriptThreads = clampScriptThreads(scriptThreads, maxCacheBytes);
     this.windowSize = DEFAULT_WINDOW_SIZE;
     this.peerInFlight = new Map();
     this.utxoManager = new UTXOManager(db, maxCacheBytes);
@@ -3262,9 +3270,15 @@ export class BlockSync {
       // leaves the DB in an unrecoverable state: spent coins deleted but
       // bestHeight pointing before the spend, causing "Missing UTXO" on
       // restart. This was the root cause of the height 380001 corruption.
-      const memoryFlush = this.utxoManager.shouldFlush();
+      const memSnap = snapshotMemory(this.utxoManager, scriptCheckPoolSize());
+      const memoryFlush =
+        this.utxoManager.shouldFlush() ||
+        exceedsRssBudget(memSnap, this.utxoManager.getMaxCacheBytes());
       if (memoryFlush && this.utxoManager.getDirtyCount() > 0) {
-        console.log(`UTXO memory flush at height ${height}: ${this.utxoManager.getCacheSize()} entries`);
+        const why = this.utxoManager.shouldFlush() ? "cache" : "rss";
+        console.log(
+          `UTXO memory flush (${why}) at height ${height}: ${this.utxoManager.getCacheSize()} entries | ${formatMemoryBreakdown(memSnap)}`,
+        );
 
         // Build extraOps with chain state so the flush is crash-safe.
         // Use headerEntry which is already resolved for this height.
@@ -5502,10 +5516,7 @@ export class BlockSync {
 
     const peerCount = this.peerManager?.getConnectedPeers().length ?? 0;
 
-    const mem = process.memoryUsage();
-    const rssMB = (mem.rss / 1024 / 1024).toFixed(0);
-    const heapMB = (mem.heapUsed / 1024 / 1024).toFixed(0);
-    const utxoCacheSize = this.utxoManager.getCacheSize();
+    const mem = snapshotMemory(this.utxoManager, scriptCheckPoolSize());
     const pendingCount = this.state.pendingBlocks.size;
     const downloadedCount = this.state.downloadedBlocks.size;
     const headerCount = this.headerSync.getHeaderCount();
@@ -5514,7 +5525,7 @@ export class BlockSync {
     // Let the runtime manage GC naturally.
 
     console.log(
-      `IBD: height=${processed}/${total} (${percent.toFixed(1)}%) | ${blocksPerSec.toFixed(0)} blk/s | ${peerCount} peers | RSS=${rssMB}MB heap=${heapMB}MB | utxo=${utxoCacheSize} pend=${pendingCount} dl=${downloadedCount} hdrs=${headerCount}`
+      `IBD: height=${processed}/${total} (${percent.toFixed(1)}%) | ${blocksPerSec.toFixed(0)} blk/s | ${peerCount} peers | ${formatMemoryBreakdown(mem)} | pend=${pendingCount} dl=${downloadedCount} hdrs=${headerCount}`
     );
   }
 
