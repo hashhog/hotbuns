@@ -5,6 +5,7 @@
  * tracks peer quality via ban scores, and routes messages to handlers.
  */
 
+import type { TCPSocketListener } from "bun";
 import {
   Peer,
   type PeerConfig,
@@ -130,6 +131,20 @@ export interface PeerManagerConfig {
   listen?: boolean;
   /** P2P port to listen on (default: network default port) */
   port?: number;
+  /**
+   * Bind addresses for the inbound listener (Core `-bind=<addr>[:port]`).
+   * Repeatable. Each entry is a host, `[ipv6]`, `host:port`, or `[ipv6]:port`.
+   * When omitted or empty, bind `0.0.0.0` and `::` on {@link port} (all
+   * interfaces, not loopback). Pass `["127.0.0.1"]` to restrict to IPv4
+   * loopback.
+   */
+  bind?: string[];
+  /**
+   * Handshake timeout in ms, plumbed into every Peer. Defaults to
+   * 60_000. Tests pass a short value so a half-open inbound is reaped
+   * without waiting a minute.
+   */
+  handshakeTimeoutMs?: number;
   /**
    * Whether prune mode is enabled (--prune > 0).  Note: this does NOT gate
    * NODE_NETWORK_LIMITED advertisement.  Core advertises NODE_NETWORK_LIMITED
@@ -311,6 +326,79 @@ export const FIXED_SEEDS: Record<number, Array<{ host: string; port: number }>> 
 
 /** Database prefix for peer addresses. */
 export const DB_PREFIX_PEERS = 0x70; // 'p'
+
+/**
+ * Default `-bind` hosts when the operator does not pass `--bind`.
+ * All interfaces, matching Bitcoin Core's `inaddr_any` + `in6addr_any`
+ * (net.cpp InitBinds when vBinds is empty) — not loopback.
+ */
+export const DEFAULT_BIND_HOSTS = ["0.0.0.0", "::"] as const;
+
+/**
+ * Core `DEFAULT_MAX_PEER_CONNECTIONS` (net.h). Inbound slots =
+ * max(0, maxconnections - maxoutbound). With the CLI default of 8
+ * outbound that yields 117 inbound, matching the historical
+ * {@link PeerManagerConfig.maxInbound} default.
+ */
+export const DEFAULT_MAX_CONNECTIONS = 125;
+
+/** A resolved P2P bind address. */
+export interface BindAddress {
+  host: string;
+  port: number;
+}
+
+/**
+ * Parse a Core-style `-bind` spec.
+ *
+ *   `0.0.0.0`          → host 0.0.0.0, defaultPort
+ *   `127.0.0.1:8334`   → host 127.0.0.1, port 8334
+ *   `[::]` / `::`      → host ::, defaultPort
+ *   `[::1]:18444`      → host ::1, port 18444
+ *
+ * IPv6 with an explicit port MUST be bracketed (`[::1]:8333`); a bare
+ * multi-colon string is treated as IPv6 without a port.
+ */
+export function parseBindSpec(spec: string, defaultPort: number): BindAddress {
+  const trimmed = spec.trim();
+  if (trimmed.length === 0) {
+    throw new Error("invalid -bind address: empty");
+  }
+  if (trimmed.startsWith("[")) {
+    const close = trimmed.indexOf("]");
+    if (close <= 1) {
+      throw new Error(`invalid -bind address: ${spec}`);
+    }
+    const host = trimmed.slice(1, close);
+    const rest = trimmed.slice(close + 1);
+    if (rest === "") {
+      return { host, port: defaultPort };
+    }
+    if (!rest.startsWith(":")) {
+      throw new Error(`invalid -bind address: ${spec}`);
+    }
+    const port = parseInt(rest.slice(1), 10);
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      throw new Error(`invalid -bind port: ${spec}`);
+    }
+    return { host, port };
+  }
+  const colonCount = (trimmed.match(/:/g) ?? []).length;
+  if (colonCount === 0) {
+    return { host: trimmed, port: defaultPort };
+  }
+  if (colonCount === 1) {
+    const idx = trimmed.indexOf(":");
+    const host = trimmed.slice(0, idx);
+    const port = parseInt(trimmed.slice(idx + 1), 10);
+    if (!host || !Number.isInteger(port) || port < 0 || port > 65535) {
+      throw new Error(`invalid -bind address: ${spec}`);
+    }
+    return { host, port };
+  }
+  // Two or more colons: IPv6 without a port.
+  return { host: trimmed, port: defaultPort };
+}
 
 /** Maximum outbound full-relay connections. */
 export const MAX_OUTBOUND_FULL_RELAY = 8;
@@ -657,9 +745,8 @@ export class PeerManager {
   private feeFilterInterval: ReturnType<typeof setInterval> | null;
   /** Interval for periodic ASMap health-check log (every 3600 s). */
   private asmapHealthCheckInterval: ReturnType<typeof setInterval> | null;
-  /** TCP listener for inbound P2P connections (Bun.listen). */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private tcpListener: any;
+  /** TCP listeners for inbound P2P connections (Bun.listen). */
+  private tcpListeners: TCPSocketListener<{ peer: Peer | null }>[];
 
   /**
    * Per-address v1-only cache.  After a failed BIP-324 v2 outbound
@@ -742,6 +829,8 @@ export class PeerManager {
       connect: config.connect,
       listen: config.listen ?? true,
       port: config.port ?? config.params.defaultPort,
+      bind: config.bind,
+      handshakeTimeoutMs: config.handshakeTimeoutMs,
       // Retained for prune-mode behavior generally; it no longer gates the
       // NODE_NETWORK_LIMITED service bit (advertised unconditionally for this
       // full node via params.services = 0x409, per Core init.cpp:863/1950).
@@ -779,7 +868,7 @@ export class PeerManager {
     });
     this.feeFilterInterval = null;
     this.asmapHealthCheckInterval = null;
-    this.tcpListener = null;
+    this.tcpListeners = [];
     this.v1OnlyCache = new Map();
 
     // Load asmap if --asmap path was supplied.
@@ -1129,9 +1218,10 @@ export class PeerManager {
     // period (Core net.cpp ThreadOpenConnections `start`).
     this.loopStartTs = Date.now();
 
-    // Start TCP listener for inbound connections
-    if (this.config.listen && this.config.port) {
-      this.startListener(this.config.port);
+    // Start TCP listener(s) for inbound connections. Port 0 is valid
+    // (OS-assigned) — do not treat it as "do not listen".
+    if (this.config.listen) {
+      this.startListeners();
     }
 
     // Load ban list and persisted addresses
@@ -1281,11 +1371,11 @@ export class PeerManager {
     this.shuttingDown = true;
     this.running = false;
 
-    // Stop TCP listener
-    if (this.tcpListener) {
-      this.tcpListener.stop(true);
-      this.tcpListener = null;
+    // Stop TCP listeners
+    for (const listener of this.tcpListeners) {
+      listener.stop(true);
     }
+    this.tcpListeners = [];
 
     // Stop maintenance loop
     if (this.maintainInterval) {
@@ -1443,6 +1533,7 @@ export class PeerManager {
       // direct-IPv6 from the node's perspective (no proxy hop).
       proxyManager: this.proxyManager ?? undefined,
       networkType,
+      handshakeTimeoutMs: this.config.handshakeTimeoutMs,
     };
 
     const events: PeerEvents = {
@@ -3617,109 +3708,176 @@ export class PeerManager {
   }
 
   /**
-   * Start the TCP listener for inbound P2P connections using Bun.listen.
+   * Resolved bind list: operator `--bind` specs, or the all-interfaces
+   * default (`0.0.0.0` and `::`) on {@link PeerManagerConfig.port}.
    */
-  private startListener(port: number): void {
-    try {
-      const manager = this;
-      this.tcpListener = Bun.listen<{ peer: Peer | null }>({
-        hostname: "0.0.0.0",
-        port,
-        socket: {
-          open(socket) {
-            const host = socket.remoteAddress;
-            // Check if banned
-            if (manager.banManager.isBanned(host)) {
-              socket.end();
-              return;
-            }
-            // Network-active gate (Core net.cpp:1786): while networking is
-            // disabled (`setnetworkactive false`) refuse NEW inbound
-            // connections. Existing peers are untouched — only new
-            // establishment is suppressed.
-            if (!manager.networkActive) {
-              socket.end();
-              return;
-            }
-            // Check inbound capacity
-            if (manager.inboundPeers.size >= manager.config.maxInbound) {
-              const evicted = manager.selectPeerToEvict();
-              if (!evicted) {
-                socket.end();
-                return;
-              }
-              manager.disconnectPeer(evicted);
-            }
+  getBindAddresses(): BindAddress[] {
+    const port = this.config.port ?? this.config.params.defaultPort;
+    const specs =
+      this.config.bind && this.config.bind.length > 0
+        ? this.config.bind
+        : [...DEFAULT_BIND_HOSTS];
+    return specs.map((spec) => parseBindSpec(spec, port));
+  }
 
-            // NODE_NETWORK_LIMITED is advertised UNCONDITIONALLY for this full
-            // node — already part of `params.services` (0x409), same as the
-            // outbound site.  No prune gate (Core init.cpp:863/1950).
-            const inAdvertisedServices = manager.config.params.services;
+  /**
+   * Bind addresses that actually accepted (after start()). Port 0 is
+   * replaced with the OS-assigned port. IPv6 binds that failed are omitted.
+   */
+  getListeningBinds(): BindAddress[] {
+    return this.tcpListeners.map((l) => ({ host: l.hostname, port: l.port }));
+  }
 
-            // Create a Peer for this inbound connection
-            const peerConfig: PeerConfig = {
-              host,
-              port: 0, // remote ephemeral port; not meaningful for inbound
-              magic: manager.config.params.networkMagic,
-              protocolVersion: manager.config.params.protocolVersion,
-              services: inAdvertisedServices,
-              userAgent: manager.config.params.userAgent,
-              bestHeight: manager.config.bestHeight,
-              relay: true,
-            };
-            const events: PeerEvents = {
-              onConnect: (peer) => manager.handlePeerConnect(peer),
-              onDisconnect: (peer, error) => manager.handlePeerDisconnect(peer, error),
-              onMessage: (peer, msg) => manager.handlePeerMessage(peer, msg),
-              onHandshakeComplete: (peer) => manager.handleHandshakeComplete(peer),
-            };
-            const onBan: OnBanCallback = (peer, reason) => {
-              manager.banManager.ban(peer.host, DEFAULT_BAN_TIME, reason);
-            };
-
-            const peer = new Peer(peerConfig, events, onBan);
-            socket.data = { peer };
-            const key = `${host}:${0}`;
-            manager.peers.set(key, peer);
-            manager.lastActivity.set(key, Date.now());
-            manager.peerConnectionType.set(key, "inbound");
-            manager.inboundPeers.add(key);
-
-            // Accept the already-connected socket
-            peer.acceptSocket(socket);
-          },
-          data(socket, data) {
-            const peer = socket.data?.peer;
-            if (peer) {
-              peer.feedData(Buffer.from(data));
-            }
-          },
-          drain(socket) {
-            // #74: flush bytes parked by Peer.writeRaw on backpressure —
-            // without this, a short Bun Socket.write desyncs the stream.
-            socket.data?.peer?.onDrain();
-          },
-          close(socket) {
-            // Peer.disconnect will be triggered by the socket close handler
-            // that was set up in acceptSocket — but Bun.listen uses its own
-            // close callback, so we need to notify the peer here.
-            const peer = socket.data?.peer;
-            if (peer && peer.state !== "disconnected") {
-              peer.disconnect("remote closed");
-            }
-          },
-          error(socket, err) {
-            const peer = socket.data?.peer;
-            if (peer && peer.state !== "disconnected") {
-              peer.disconnect("socket error");
-            }
-          },
-        },
-      });
-      console.log(`P2P listening on port ${port}`);
-    } catch (err) {
-      console.error(`Failed to start P2P listener on port ${port}:`, err);
+  /**
+   * Start TCP listeners for inbound P2P connections using Bun.listen.
+   *
+   * Default is dual-stack all-interfaces (`0.0.0.0` + `::`). `--bind`
+   * replaces that list. If the first spec uses port 0, subsequent specs
+   * reuse the OS-assigned port so IPv4 and IPv6 share one number.
+   */
+  private startListeners(): void {
+    // Prefer IPv6 first. Bun's [::] sockets are typically dual-stack
+    // (IPV6_V6ONLY=0), so binding :: before 0.0.0.0 covers both families;
+    // the IPv4 wildcard then no-ops with EADDRINUSE. Binding IPv4 first
+    // would leave IPv6 inbound dead.
+    const binds = [...this.getBindAddresses()].sort((a, b) => {
+      const a6 = a.host.includes(":");
+      const b6 = b.host.includes(":");
+      if (a6 === b6) return 0;
+      return a6 ? -1 : 1;
+    });
+    let sharedPort: number | undefined;
+    for (const addr of binds) {
+      const port = addr.port === 0 && sharedPort !== undefined ? sharedPort : addr.port;
+      try {
+        const listener = this.bindOne(addr.host, port);
+        this.tcpListeners.push(listener);
+        if (sharedPort === undefined) sharedPort = listener.port;
+        const shown = addr.host.includes(":") ? `[${addr.host}]` : addr.host;
+        console.log(`P2P listening on ${shown}:${listener.port}`);
+      } catch (err) {
+        const shown = addr.host.includes(":") ? `[${addr.host}]` : addr.host;
+        const msg = err instanceof Error ? err.message : String(err);
+        if (this.tcpListeners.length === 0) {
+          console.error(`Failed to start P2P listener on ${shown}:${port}:`, err);
+        } else {
+          // Typical on Linux when the other family already bound dual-stack
+          // (Bun IPv6 sockets often have IPV6_V6ONLY=0). One all-interfaces
+          // listener is enough.
+          console.log(`P2P: bind ${shown}:${port} skipped (${msg})`);
+        }
+      }
     }
+  }
+
+  /**
+   * Bind a single inbound listener and wire accept → Peer.
+   */
+  private bindOne(
+    hostname: string,
+    port: number,
+  ): TCPSocketListener<{ peer: Peer | null }> {
+    const manager = this;
+    return Bun.listen<{ peer: Peer | null }>({
+      hostname,
+      port,
+      socket: {
+        open(socket) {
+          const host = socket.remoteAddress;
+          const remotePort = socket.remotePort || 0;
+          // Check if banned
+          if (manager.banManager.isBanned(host)) {
+            socket.end();
+            return;
+          }
+          // Network-active gate (Core net.cpp:1786): while networking is
+          // disabled (`setnetworkactive false`) refuse NEW inbound
+          // connections. Existing peers are untouched — only new
+          // establishment is suppressed.
+          if (!manager.networkActive) {
+            socket.end();
+            return;
+          }
+          // Check inbound capacity. Eviction only considers inbound peers
+          // (Core AttemptToEvictConnection), so a flood cannot steal an
+          // outbound sync slot.
+          if (manager.inboundPeers.size >= manager.config.maxInbound) {
+            const evicted = manager.selectPeerToEvict();
+            if (!evicted) {
+              socket.end();
+              return;
+            }
+            manager.disconnectPeer(evicted);
+          }
+
+          // NODE_NETWORK_LIMITED is advertised UNCONDITIONALLY for this full
+          // node — already part of `params.services` (0x409), same as the
+          // outbound site.  No prune gate (Core init.cpp:863/1950).
+          const inAdvertisedServices = manager.config.params.services;
+
+          // Create a Peer for this inbound connection. Key by the remote
+          // ephemeral port so two inbound sockets from the same host do
+          // not collide (the old `${host}:0` key did).
+          const peerConfig: PeerConfig = {
+            host,
+            port: remotePort,
+            magic: manager.config.params.networkMagic,
+            protocolVersion: manager.config.params.protocolVersion,
+            services: inAdvertisedServices,
+            userAgent: manager.config.params.userAgent,
+            bestHeight: manager.config.bestHeight,
+            relay: true,
+            handshakeTimeoutMs: manager.config.handshakeTimeoutMs,
+          };
+          const events: PeerEvents = {
+            onConnect: (peer) => manager.handlePeerConnect(peer),
+            onDisconnect: (peer, error) => manager.handlePeerDisconnect(peer, error),
+            onMessage: (peer, msg) => manager.handlePeerMessage(peer, msg),
+            onHandshakeComplete: (peer) => manager.handleHandshakeComplete(peer),
+          };
+          const onBan: OnBanCallback = (peer, reason) => {
+            manager.banManager.ban(peer.host, DEFAULT_BAN_TIME, reason);
+          };
+
+          const peer = new Peer(peerConfig, events, onBan, { connType: "inbound" });
+          socket.data = { peer };
+          const key = `${host}:${remotePort}`;
+          manager.peers.set(key, peer);
+          manager.lastActivity.set(key, Date.now());
+          manager.peerConnectionType.set(key, "inbound");
+          manager.inboundPeers.add(key);
+
+          // Accept the already-connected socket
+          peer.acceptSocket(socket);
+        },
+        data(socket, data) {
+          const peer = socket.data?.peer;
+          if (peer) {
+            peer.feedData(Buffer.from(data));
+          }
+        },
+        drain(socket) {
+          // #74: flush bytes parked by Peer.writeRaw on backpressure —
+          // without this, a short Bun Socket.write desyncs the stream.
+          socket.data?.peer?.onDrain();
+        },
+        close(socket) {
+          // Peer.disconnect will be triggered by the socket close handler
+          // that was set up in acceptSocket — but Bun.listen uses its own
+          // close callback, so we need to notify the peer here.
+          const peer = socket.data?.peer;
+          if (peer && peer.state !== "disconnected") {
+            peer.disconnect("remote closed");
+          }
+        },
+        error(_socket, _err) {
+          const peer = _socket.data?.peer;
+          if (peer && peer.state !== "disconnected") {
+            peer.disconnect("socket error");
+          }
+        },
+      },
+    });
   }
 
   /**

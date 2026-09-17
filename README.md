@@ -201,7 +201,9 @@ bun run src/index.ts --help
 | `--rpc-user=USER` | `user` | RPC username |
 | `--rpc-password=PASS` | `pass` | RPC password |
 | `--port=PORT` | per-network | P2P listen port |
+| `--bind=ADDR` | `0.0.0.0` and `[::]` | P2P bind address (repeatable). Default is all interfaces, not loopback. `--bind=127.0.0.1` restricts to IPv4 loopback. |
 | `--max-outbound=N` | `8` | Maximum outbound peers |
+| `--maxconnections=N` | `125` | Total P2P connection cap (inbound = maxconnections − outbound) |
 | `--listen=BOOL` | `true` | Accept inbound P2P connections |
 | `--connect=ADDR` | none | Connect to specific peer (repeatable) |
 | `--addnode=ADDR` | none | Add peer to address manager (repeatable) |
@@ -221,6 +223,8 @@ rpcport=48349
 rpcuser=myuser
 rpcpassword=mypass
 maxoutbound=10
+maxconnections=125
+bind=0.0.0.0
 listen=1
 port=48339
 loglevel=info

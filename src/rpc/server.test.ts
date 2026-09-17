@@ -220,6 +220,11 @@ class MockPeerManager {
     this.peers.push(peer);
   }
 
+  getConnectionType(key: string): string | undefined {
+    const peer = this.peers.find((p) => `${p.host}:${p.port}` === key);
+    return peer?.connectionType;
+  }
+
   // ASMap stubs — always return no-asmap state in tests
   usingASMap(): boolean { return false; }
   getMappedAS(_addr: string): number { return 0; }
@@ -1225,6 +1230,27 @@ describe("RPCServer", () => {
       expect(Array.isArray(result.result)).toBe(true);
       expect(result.result.length).toBe(1);
       expect(result.result[0].addr).toBe("192.168.1.1:8333");
+      expect(result.result[0].inbound).toBe(false);
+      expect(result.result[0].connection_type).toBe("outbound-full-relay");
+    });
+
+    it("reports inbound: true and connection_type inbound for accepted sockets", async () => {
+      mockPeerManager.addMockPeer({
+        host: "203.0.113.9",
+        port: 54321,
+        connectionType: "inbound",
+        versionPayload: {
+          version: 70016,
+          services: 1n,
+          userAgent: "/inbound-peer:0.0.1/",
+          startHeight: 0,
+          relay: true,
+        },
+      });
+
+      const result = await rpcRequest(testPort, "getpeerinfo");
+      expect(result.result[0].inbound).toBe(true);
+      expect(result.result[0].connection_type).toBe("inbound");
     });
 
     it("emits Core v31.99 fields: last_inv_sequence + inv_to_send, no startingheight", async () => {

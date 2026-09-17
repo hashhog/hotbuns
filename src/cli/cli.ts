@@ -21,7 +21,7 @@ import { Mempool } from "../mempool/mempool.js";
 import { OrphanPool } from "../mempool/orphan_pool.js";
 import { dumpMempool, loadMempool } from "../mempool/persist.js";
 import { FeeEstimator } from "../fees/estimator.js";
-import { PeerManager } from "../p2p/manager.js";
+import { PeerManager, DEFAULT_MAX_CONNECTIONS } from "../p2p/manager.js";
 import {
   ProxyManager,
   type MultiProxyConfig,
@@ -51,6 +51,18 @@ export interface NodeConfig {
   maxOutbound: number;
   listen: boolean;
   port: number;
+  /**
+   * Repeatable Core-style `-bind=<addr>[:port]`. When omitted the P2P
+   * listener binds all interfaces (`0.0.0.0` and `[::]`). Pass
+   * `--bind=127.0.0.1` to restrict to loopback.
+   */
+  bind?: string[];
+  /**
+   * Cap on total P2P connections (Core `-maxconnections`, default 125).
+   * Inbound slots = max(0, maxconnections - maxoutbound) so an inbound
+   * flood cannot starve outbound sync.
+   */
+  maxConnections?: number;
   /** Prometheus metrics port (0 = disabled). */
   metricsPort: number;
   logLevel: "debug" | "info" | "warn" | "error";
@@ -402,6 +414,16 @@ export function parseArgs(argv: string[]): ParsedArgs {
           break;
         case "max-outbound":
           if (value) config.maxOutbound = parseInt(value, 10);
+          break;
+        case "maxconnections":
+        case "max-connections":
+          if (value) config.maxConnections = parseInt(value, 10);
+          break;
+        case "bind":
+          if (value) {
+            config.bind = config.bind || [];
+            config.bind.push(value);
+          }
           break;
         case "listen":
           config.listen = value !== "0" && value !== "false";
@@ -786,6 +808,15 @@ export async function loadConfig(
         case "maxoutbound":
           config.maxOutbound = parseInt(value, 10);
           break;
+        case "maxconnections":
+          config.maxConnections = parseInt(value, 10);
+          break;
+        case "bind":
+          if (value) {
+            config.bind = config.bind || [];
+            config.bind.push(value);
+          }
+          break;
         case "listen":
           config.listen = value === "1" || value === "true";
           break;
@@ -893,6 +924,10 @@ export async function saveConfig(
   if (config.rpcUser) lines.push(`rpcuser=${config.rpcUser}`);
   if (config.rpcPassword) lines.push(`rpcpassword=${config.rpcPassword}`);
   if (config.maxOutbound) lines.push(`maxoutbound=${config.maxOutbound}`);
+  if (config.maxConnections) lines.push(`maxconnections=${config.maxConnections}`);
+  if (config.bind) {
+    for (const b of config.bind) lines.push(`bind=${b}`);
+  }
   if (config.listen !== undefined) lines.push(`listen=${config.listen ? "1" : "0"}`);
   if (config.port) lines.push(`port=${config.port}`);
   if (config.logLevel) lines.push(`loglevel=${config.logLevel}`);
@@ -1903,9 +1938,11 @@ async function startNode(config: NodeConfig): Promise<void> {
     }
   }
 
+  const maxConnections = mergedConfig.maxConnections ?? DEFAULT_MAX_CONNECTIONS;
+  const maxInbound = Math.max(0, maxConnections - mergedConfig.maxOutbound);
   const peerManager = new PeerManager({
     maxOutbound: mergedConfig.maxOutbound,
-    maxInbound: 117,
+    maxInbound,
     params,
     bestHeight: bestBlock.height,
     datadir: mergedConfig.datadir,
@@ -1916,6 +1953,7 @@ async function startNode(config: NodeConfig): Promise<void> {
     dnsSeed: mergedConfig.dnsSeed,
     listen: mergedConfig.listen,
     port: mergedConfig.port,
+    bind: mergedConfig.bind,
     pruneMode: pruneManager !== undefined,
     asmapPath: resolvedAsmapPath,
     proxyManager,

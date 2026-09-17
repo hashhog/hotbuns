@@ -7065,7 +7065,7 @@ export class RPCServer {
           : {}),
         version: peer.versionPayload?.version ?? 0,
         subver: peer.versionPayload?.userAgent ?? "",
-        inbound: false,
+        inbound: this.peerIsInbound(peer),
         bip152_hb_to: false,
         bip152_hb_from: false,
         // Core v31.99 removed `startingheight` from getpeerinfo (rpc/net.cpp now
@@ -7089,7 +7089,7 @@ export class RPCServer {
         minfeefilter: 0,
         bytessent_per_msg: {},
         bytesrecv_per_msg: {},
-        connection_type: "outbound-full-relay",
+        connection_type: this.peerConnectionTypeRpc(peer),
         transport_protocol_type: "v1",
         session_id: "",
       };
@@ -7101,6 +7101,41 @@ export class RPCServer {
 
       return entry;
     });
+  }
+
+  /**
+   * Look up the manager's connection-type for this peer. Mocks used by
+   * RPC unit tests may omit getConnectionType — treat that as outbound.
+   */
+  private peerConnType(
+    peer: { host: string; port: number },
+  ): string | undefined {
+    const pm = this.peerManager as PeerManager & {
+      getConnectionType?: (key: string) => string | undefined;
+    };
+    if (typeof pm.getConnectionType !== "function") return undefined;
+    return pm.getConnectionType(`${peer.host}:${peer.port}`);
+  }
+
+  /** Core getpeerinfo `inbound` — true only for accepted sockets. */
+  private peerIsInbound(peer: { host: string; port: number }): boolean {
+    return this.peerConnType(peer) === "inbound";
+  }
+
+  /**
+   * Core getpeerinfo `connection_type` (rpc/net.cpp ConnectionTypeAsString).
+   */
+  private peerConnectionTypeRpc(peer: { host: string; port: number }): string {
+    switch (this.peerConnType(peer)) {
+      case "inbound":
+        return "inbound";
+      case "block_relay":
+        return "block-relay-only";
+      case "feeler":
+        return "feeler";
+      default:
+        return "outbound-full-relay";
+    }
   }
 
   /**

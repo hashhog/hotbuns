@@ -61,6 +61,12 @@ export interface PeerConfig {
    * Defaults to "ipv4" when not supplied (preserves existing callers).
    */
   networkType?: NetworkType;
+  /**
+   * Handshake timeout in ms. Defaults to {@link HANDSHAKE_TIMEOUT_MS}.
+   * Inbound half-open connections that never complete version/verack are
+   * disconnected when this fires so they cannot hold a slot forever.
+   */
+  handshakeTimeoutMs?: number;
 }
 
 /** Event handlers for peer lifecycle events. */
@@ -579,11 +585,7 @@ export class Peer {
             // v1: send our VERSION immediately and arm the normal
             // handshake timeout.
             this.sendVersionMessage();
-            this.handshakeTimer = setTimeout(() => {
-              if (!this.handshakeComplete && this.state !== "disconnected") {
-                this.disconnect("handshake timeout");
-              }
-            }, HANDSHAKE_TIMEOUT_MS);
+            this.armHandshakeTimer();
           }
         },
         close: (_socket) => {
@@ -741,11 +743,7 @@ export class Peer {
       }, V2_HANDSHAKE_DEADLINE_MS);
     } else {
       this.sendVersionMessage();
-      this.handshakeTimer = setTimeout(() => {
-        if (!this.handshakeComplete && this.state !== "disconnected") {
-          this.disconnect("handshake timeout");
-        }
-      }, HANDSHAKE_TIMEOUT_MS);
+      this.armHandshakeTimer();
     }
   }
 
@@ -803,11 +801,7 @@ export class Peer {
     this.events.onConnect(this);
 
     // Start handshake timeout — covers both v1 and v2 paths.
-    this.handshakeTimer = setTimeout(() => {
-      if (!this.handshakeComplete && this.state !== "disconnected") {
-        this.disconnect("handshake timeout");
-      }
-    }, HANDSHAKE_TIMEOUT_MS);
+    this.armHandshakeTimer();
   }
 
   /**
@@ -958,6 +952,20 @@ export class Peer {
       clearTimeout(this.handshakeTimer);
       this.handshakeTimer = null;
     }
+  }
+
+  /**
+   * Arm the version/verack handshake deadline. A peer that never completes
+   * the handshake is disconnected so it cannot occupy an inbound slot.
+   */
+  private armHandshakeTimer(): void {
+    this.cleanupHandshakeTimer();
+    const ms = this.config.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS;
+    this.handshakeTimer = setTimeout(() => {
+      if (!this.handshakeComplete && this.state !== "disconnected") {
+        this.disconnect("handshake timeout");
+      }
+    }, ms);
   }
 
   /**
