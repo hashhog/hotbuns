@@ -1,0 +1,42 @@
+hotbuns Bun SIGSEGV at height 340890 — UNEXPLAINED, not closed
+
+Crash (one shot, 2026-09-17):
+  commit     280c6f02ebe5  (snapshot-boot IBD-latch; == the later CLOSED run)
+  range      340000 -> 363708
+  last line  IBD: height=340890/364782 (93.5%) | RSS=2921MB heap=406MB | utxo=43175
+  dump       panic: Segmentation fault at address 0x401FFFFFFBE
+             Bun v1.3.11 (af24e281), workers_spawned(15), bun:ffi, Peak: 6.85GB
+  receipt    meta-repo receipts/hotbuns-bun-segfault-340890-2026-09-17.md
+
+What closed on the same bits:
+  The same range CLOSED 2026-09-17T18:57:41Z on the SAME commit 280c6f02ebe5:
+  23,708 blocks, scripts_ack yes, utxo_hash
+  a742c2a04c54f5e5c9313589321310d8bcf72d94c44338c6c62d31a37d27b37d,
+  ZERO crashes. So 0f1a48b (FRESH-spend cache leak + bun:ffi empty ptr()
+  guard) cannot be "the SIGSEGV fix": the crash and the clean close both
+  ran on its parent.
+
+What 0f1a48b did fix (real, independent of the SIGSEGV):
+  Spending a FRESH coin left CACHE_ENTRY_OVERHEAD in cachedCoinsUsage, so
+  shouldFlush fired with a near-empty cache. The crash log's flush-every-
+  block spiral from ~340555 to 340871 is that leak. Empty ArrayBufferView
+  bun:ffi ptr() RETURNS a TypeError object instead of throwing; passing
+  that to a dlopen() symbol throws
+    "Unable to convert TypeError [ERR_INVALID_ARG_TYPE]: ArrayBufferView
+     must have a length > 0 … to a pointer"
+  rather than returning false. nativePtr() stops that throw.
+
+What does NOT explain the SIGSEGV (measured 2026-09-17 on bun 1.3.11):
+  - ptr(empty) / empty view / detached view: returns TypeError, does not throw.
+  - Passing that TypeError into libsecp256k1 via dlopen(): throws the convert
+    TypeError. 15 workers × 5,000 calls = 75,000 throws, 0 returns, 0 SIGSEGV,
+    including under Bun.gc(true).
+  - Cached ptr() of a live Uint8Array survives Bun.gc(true) (address unchanged,
+    typical heap 0x7f70…). The crash address 0x401FFFFFFBE is not that class.
+  - bun#37989 (non-numeric FFI args become garbage pointers, SIGSEGV at
+    0xFFFFFFFFFFFFFFFF) is cc()-only. hotbuns uses dlopen(), which since
+    bun#35246 converts in-engine and throws TypeError.
+
+Status: UNEXPLAINED. A non-deterministic native fault that appeared once
+and did not recur on the same binary across 23,708 blocks. A fault that
+did not recur is not a closed fault. Do not strike it as fixed by 0f1a48b.

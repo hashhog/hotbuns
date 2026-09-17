@@ -1,27 +1,32 @@
 /**
- * Native-memory lifetime class that SIGSEGV'd Bun mid-IBD at height 340890.
+ * Native-memory lifetime class around the 340890 IBD crash window.
  *
  * Receipt: receipts/hotbuns-bun-segfault-340890-2026-09-17.md
+ * Proof:   proof/r4/segfault-340890.txt (UNEXPLAINED — do not claim this
+ *          file closed the SIGSEGV).
  *
- * The crash was non-deterministic at that height (a re-run passed 340890 and
- * climbed to 343362). The crash dump had workers_spawned(15), bun:ffi, and
- * Peak 6.85 GB against --dbcache=2560. Two cooperating bugs:
+ * The crash was non-deterministic at that height. The same commit
+ * `280c6f02ebe5` later CLOSED 340000→363708 with zero crashes, so the
+ * FRESH-spend / empty-ptr work here is a real footgun class, not a
+ * demonstrated SIGSEGV root cause. Two cooperating bugs this file
+ * actually controls:
  *
  *   1. Spending a FRESH coin deletes the cache entry but leaves
  *      CACHE_ENTRY_OVERHEAD (3000) in cachedCoinsUsage. After ~850k such
  *      spends the counter is permanently >= dbcache, so every subsequent
  *      block does a full UTXO flush + Bun.gc(true) with 15 FFI workers live.
- *      That is the 2.7× RSS overshoot and the GC storm around the crash.
+ *      That is the 2.7× RSS overshoot and the crash-log flush spiral.
  *   2. bun:ffi ptr() on an empty ArrayBufferView does not throw — it RETURNS
- *      a TypeError object. Passing that to libsecp256k1 is "Unable to convert
- *      TypeError to a pointer" on a good day and a tagged-pointer SIGSEGV
- *      (the crash address 0x401FFFFFFBE) on a bad one. Worker fromU8 also
- *      aliases the structured-clone ArrayBuffer, so a detach/recycle of the
- *      message backing store feeds FFI a dangling view.
+ *      a TypeError object. Passing that to a dlopen() libsecp256k1 symbol
+ *      throws "Unable to convert TypeError to a pointer". Worker fromU8
+ *      also aliased the structured-clone ArrayBuffer. Neither path has
+ *      been observed to SIGSEGV (15×5000 worker trials: 75,000 throws,
+ *      0 SIGSEGV). nativePtr() still must not hand the TypeError to C.
  *
  * Control: HOTBUNS_UNIT_CHILD=1 bun test ./src/validation/bun-native-lifetime.test.ts
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { dlopen, FFIType, ptr as ffiPtr } from "bun:ffi";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -118,6 +123,36 @@ describe("FRESH-spend cache usage (dbcache overshoot / GC storm)", () => {
 describe("FFI ptr() lifetime (empty / detached must not reach libsecp)", () => {
 	test("libsecp256k1 FFI is available", () => {
 		expect(FFI_AVAILABLE).toBe(true);
+	});
+
+	test("bun:ffi ptr(empty) returns TypeError; dlopen FFI throws, does not SIGSEGV", () => {
+		// Evidence that the 340890 SIGSEGV is not "TypeError used as a pointer"
+		// on the dlopen() path hotbuns actually uses. See proof/r4/segfault-340890.txt.
+		const empty = new Uint8Array(0);
+		const emptyView = new Uint8Array(64).subarray(10, 10);
+		let emptyPtr: unknown;
+		expect(() => {
+			emptyPtr = ffiPtr(empty);
+		}).not.toThrow();
+		expect(emptyPtr instanceof Error).toBe(true);
+		expect(String(emptyPtr)).toMatch(/length > 0/);
+		expect(() => {
+			ffiPtr(emptyView);
+		}).not.toThrow();
+		const lib = dlopen("libsecp256k1.so.2", {
+			secp256k1_context_create: { args: [FFIType.u32], returns: FFIType.u64 },
+			secp256k1_ecdsa_signature_parse_der: {
+				args: [FFIType.u64, FFIType.ptr, FFIType.ptr, FFIType.u64],
+				returns: FFIType.i32,
+			},
+		});
+		const ctx = lib.symbols.secp256k1_context_create(1);
+		const out = new Uint8Array(64);
+		const outPtr = ffiPtr(out) as number;
+		expect(typeof outPtr).toBe("number");
+		expect(() =>
+			lib.symbols.secp256k1_ecdsa_signature_parse_der(ctx, outPtr, emptyPtr as number, 0),
+		).toThrow(/Unable to convert TypeError/);
 	});
 
 	test("empty signature returns false and does not throw", () => {

@@ -216,11 +216,12 @@ if (FFI_AVAILABLE) {
 
 /**
  * bun:ffi ptr() on an empty (or detached) ArrayBufferView does not throw:
- * it RETURNS a TypeError object. Passing that object as FFIType.ptr either
- * throws "Unable to convert TypeError to a pointer" or, under GC pressure
- * with worker FFI, is interpreted as a tagged JSValue and SIGSEGVs at a
- * wild address (0x401FFFFFFBE at height 340890). Never hand ptr()'s result
- * to libsecp256k1 unless it is a finite number.
+ * it RETURNS a TypeError object. Passing that object as FFIType.ptr on the
+ * dlopen() path throws "Unable to convert TypeError to a pointer". Never
+ * hand ptr()'s result to libsecp256k1 unless it is a finite number.
+ * (The 340890 SIGSEGV at 0x401FFFFFFBE remains UNEXPLAINED; see
+ * proof/r4/segfault-340890.txt. This guard stops the TypeError throw,
+ * not a demonstrated tagged-pointer crash.)
  */
 function nativePtr(buf: Uint8Array): number | null {
   if (buf.byteLength === 0) return null;

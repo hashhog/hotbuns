@@ -61,7 +61,8 @@ This node has no such capture. `r4/status.json` says `UNPROVEN`.
 | `r4/command.txt` | What a real R4 receipt would take. | That anyone has done it. |
 | `r4/av0-250000-ledger.txt` and `r4/av0-250000-ledger.jsonl` | A **contested** AV=0 genesis→250,000 replay: 11 checkpoints, terminal UTXO hash `dd8e8cfd6fe67f59f1dce40e43cd5b36ad3661f574a9d5c8c4a089048bbd649c`, 6,802,755 txouts, `overall=ALL-PASS`. | R4. See `r4/disconfirmation.txt`. |
 | `r4/disconfirmation.txt` | On 2026-08-20 an AV=0 rig **rejected real mainnet block 124276** (`SCRIPT_ERR_SIG_DER`) inside that ALL-PASS range. Strict DER is BIP-66 (height 363,725). Fixed in `1e516d5b80f4`. | That the rest of the 250k ledger is now trustworthy. The run was taken with the bug in place. |
-| `r4/range-coverage.txt` and `r4/range-rows.json` | Snapshot-booted ladder coverage: 19 CLOSED / 333,701 blocks (34.53%), plus STALLED 340000→363708, NO-ORACLE-SURFACE 363708→388364, STALLED 900000→910000. Both files say `counts_as_r4=false`. | From-genesis UTXO-hash identity with Core. These boots start from a Core-format snapshot. |
+| `r4/range-coverage.txt` and `r4/range-rows.json` | Snapshot-booted ladder coverage: 20 CLOSED / 357,409 blocks (36.99%), including 340000→363708 CLOSED on `280c6f02ebe5` (`utxo_hash a742c2a04c54f5e5…`, `scripts_ack yes`). Remaining holes: NO-ORACLE-SURFACE 363708→388364, STALLED 900000→910000. Both files say `counts_as_r4=false`. | From-genesis UTXO-hash identity with Core. These boots start from a Core-format snapshot. |
+| `r4/segfault-340890.txt` | The one-shot Bun SIGSEGV at height 340890 (`0x401FFFFFFBE` on `280c6f02ebe5`) is **UNEXPLAINED**. The same range CLOSED on that same commit with zero crashes, so `0f1a48b` cannot be the SIGSEGV fix. | That the fault is gone. A fault that did not recur is not a closed fault. |
 
 ### R1 interpreter — `r1/`
 

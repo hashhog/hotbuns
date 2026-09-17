@@ -1,12 +1,19 @@
 impl          closed       blocks  % of chain  other verdicts
-hotbuns           19      333,701      34.53%  NO-ORACLE-SURFACE:1, STALLED:2
+hotbuns           20      357,409      36.99%  NO-ORACLE-SURFACE:1, STALLED:1
 
 TRUST-ANCHOR: these rows are snapshot-booted (range-runner.sh loads a
 Core-format UTXO snapshot at the range base). They are NOT a from-genesis
 AV=0 lineage and MUST NOT be counted as R4. Listed so the holes are visible:
-  STALLED 340000->363708 (max tip 340852; bun SIGSEGV at 340890 on a later attempt)
-  NO-ORACLE-SURFACE 363708->388364 (gettxoutsetinfo no usable height at base)
-  STALLED 900000->910000 (tip stuck at 900514)
+  340000->363708 CLOSED 2026-09-17T18:57:41Z on 280c6f02ebe5 (23,708 blocks,
+    utxo_hash a742c2a04c54f5e5…, scripts_ack yes). An earlier attempt on the
+    SAME commit SIGSEGV'd at height 340890; that fault did not recur across
+    the closed run. It is UNEXPLAINED, not fixed — see r4/segfault-340890.txt.
+  NO-ORACLE-SURFACE 363708->388364 (gettxoutsetinfo no usable height at base,
+    captured 2026-09-12 on ce1231bc; 4534e61 later cached the snapshot hash
+    but this range has not been re-run)
+  STALLED 900000->910000 (last written verdict 2026-09-11 tip stuck at 900514
+    on 52e0ba95; a re-run launched 2026-09-17T18:59Z on 0f1a48b is operator
+    work and is not claimed CLOSED here)
 
-19 CLOSED / 333,701 blocks is 34.53% of the ladder tip. Six nodes already
+20 CLOSED / 357,409 blocks is 36.99% of the ladder tip. Six nodes already
 carry C(958794) from genesis; this node does not.

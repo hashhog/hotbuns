@@ -2,11 +2,11 @@
   "note": "Snapshot-booted ladder ranges. TRUST-ANCHOR: these do NOT count as R4 from-genesis evidence. Included so a reader can see coverage and the holes, not as a C(H) reproduction.",
   "snapshot_booted": true,
   "counts_as_r4": false,
-  "closed": 19,
-  "closed_blocks": 333701,
+  "closed": 20,
+  "closed_blocks": 357409,
   "other": {
     "NO-ORACLE-SURFACE": 1,
-    "STALLED": 2
+    "STALLED": 1
   },
   "rows": [
     {
@@ -260,14 +260,14 @@
       "from_height": 340000,
       "to_height": 363708,
       "blocks": 23708,
-      "verdict": "STALLED",
+      "verdict": "CLOSED",
       "scripts_ack": "yes",
       "impl_commit": "280c6f02ebe5",
       "oracle_attested_by": "boundary-snapshot.sh",
-      "utxo_hash": null,
-      "tip_hash": null,
-      "detail": "no net progress: max tip 340852 < 363708 for 600s (last poll ?)",
-      "ran": "2026-09-17T15:27:50+00:00"
+      "utxo_hash": "a742c2a04c54f5e5c9313589321310d8bcf72d94c44338c6c62d31a37d27b37d",
+      "tip_hash": "00000000000000000648500f41d559d22afdb1937d2b9bac1529d37d69aedeb0",
+      "detail": "23708 blocks connected, UTXO set == rung 363708 commitment",
+      "ran": "2026-09-17T18:57:41+00:00"
     },
     {
       "from_height": 363708,

@@ -65,10 +65,36 @@ if blocks != c["range_closed_blocks"]:
     errs.append(f"range closed blocks {blocks} != claims {c['range_closed_blocks']}")
 if st["range_closed"] != c["range_closed"] or st["range_closed_blocks"] != c["range_closed_blocks"]:
     errs.append("status.json range counts do not match claims")
-if "333,701" not in cov and "333701" not in cov:
-    errs.append("range-coverage.txt missing 333,701")
+want_blocks = str(c["range_closed_blocks"])
+if want_blocks not in cov and f"{c['range_closed_blocks']:,}" not in cov:
+    errs.append(f"range-coverage.txt missing {c['range_closed_blocks']}")
 if "TRUST-ANCHOR" not in cov:
     errs.append("range-coverage.txt missing TRUST-ANCHOR")
+row340 = next((r for r in rows["rows"] if r["from_height"] == 340000 and r["to_height"] == 363708), None)
+if row340 is None:
+    errs.append("range-rows.json missing 340000→363708")
+else:
+    if row340["verdict"] != "CLOSED" or c.get("range_340000_363708_verdict") != "CLOSED":
+        errs.append("340000→363708 must be CLOSED (operator 2026-09-17T18:57:41Z); a STALLED row is the crash-misreported run")
+    if (row340.get("utxo_hash") or "") != c.get("range_340000_363708_utxo_hash"):
+        errs.append("340000→363708 utxo_hash does not match claims")
+    if not (row340.get("utxo_hash") or "").startswith("a742c2a04c54f5e5"):
+        errs.append("340000→363708 utxo_hash is not the rung 363708 commitment")
+    if row340.get("scripts_ack") != "yes":
+        errs.append("340000→363708 scripts_ack is not yes")
+    if row340.get("impl_commit") != "280c6f02ebe5":
+        errs.append("340000→363708 impl_commit is not 280c6f02ebe5")
+seg = (proof / "r4/segfault-340890.txt").read_text()
+if c.get("segfault_340890_status") != "UNEXPLAINED":
+    errs.append("claims must keep segfault_340890_status=UNEXPLAINED")
+if "UNEXPLAINED" not in seg:
+    errs.append("segfault-340890.txt must say UNEXPLAINED")
+if "0f1a48b" in seg.lower() and "cannot be" not in seg:
+    errs.append("segfault-340890.txt must not claim 0f1a48b closed the SIGSEGV")
+if "280c6f02ebe5" not in seg:
+    errs.append("segfault-340890.txt must name the crash+CLOSED commit 280c6f02ebe5")
+if "0x401FFFFFFBE" not in seg:
+    errs.append("segfault-340890.txt missing crash address")
 if c["ledger_250000_disconfirmed"] is not True or st["ledger_250000_disconfirmed"] is not True:
     errs.append("the 250k ledger is disconfirmed; claims must say so")
 if "overall=ALL-PASS" not in ledger_txt:
