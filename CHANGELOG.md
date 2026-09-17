@@ -2,6 +2,7 @@
 
 ## v1.0.2 — 2026-09-13
 
+- fix: do not latch IBD-complete at a snapshot base whose chainwork is still below nMinimumChainWork
 - feat: inbound P2P binds a configurable address (default 0.0.0.0 and [::]), reports inbound:true in getpeerinfo, reaps half-open handshakes, and serves getheaders/getdata to inbound peers
 - fix: snapshot-base gettxoutsetinfo reports height/hash without a second coins-DB walk
 - af6a6da test: bind RPC tests on OS-assigned ports so bun test stays green

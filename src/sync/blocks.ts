@@ -5421,6 +5421,19 @@ export class BlockSync {
       return;
     }
 
+    // Core CChainState::IsInitialBlockDownload (validation.cpp): chainwork
+    // below nMinimumChainWork means we are still in IBD. Snapshot-boot
+    // start() sets nextHeight = base+1 with bestHeader still at the loaded
+    // assumeutxo base, so the caught-up-to-headers checks above are true
+    // before the replay peer has sent any headers. Latched
+    // hasCompletedInitialSync then enabled post-IBD fork-body handling and
+    // a cache-clearing flush; the next valid block failed
+    // bad-txns-inputs-missingorspent and the range SYNC-HALTED
+    // (315000@315251, 340000@355644, 900000@900514).
+    if (liveTip && liveTip.chainWork < this.params.nMinimumChainWork) {
+      return;
+    }
+
     this.ibdComplete = true;
     this.hasCompletedInitialSync = true;
     this.logProgress();

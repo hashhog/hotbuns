@@ -17,6 +17,13 @@
  * missing-inputs, then the halt — not a worker deadlock).
  *
  * Control: this file + `RANGE_FORCE=1 bash tools/range-runner.sh run hotbuns 227914 230909`
+ *
+ * A second hole on the same class: snapshot-boot start() has
+ * nextHeight = base+1 and bestHeader at the loaded base, so the
+ * caught-up-to-headers check is true before any peer headers arrive.
+ * completeIBD must also refuse while liveTip.chainWork < nMinimumChainWork
+ * (Core IsInitialBlockDownload). That is the 315000@315251 / 340000@355644 /
+ * 900000@900514 range-runner stall on commits that already re-read the live tip.
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtemp, rm } from "fs/promises";
@@ -288,6 +295,52 @@ describe("IBD-complete race (stale bestHeader + unawaited cache-clearing flush)"
     expect(settled).toBe(true);
     expect(flushReleased).toBe(true);
     expect((bs as any).ibdComplete).toBe(true);
+
+    await bs.stop();
+  });
+
+  test("snapshot-boot caught-up-to-headers does not latch IBD while chainwork < nMinimumChainWork", async () => {
+    // Campaign snapshot-boot (soak-315000 / soak-340000 / soak-900000):
+    // start() sets nextHeight = base+1 with bestHeader still at the loaded
+    // base, pending=downloaded=0. completeIBD treated that as "caught up"
+    // and latched hasCompletedInitialSync BEFORE the replay peer sent any
+    // headers. That is Core IsInitialBlockDownload's chainwork gate
+    // (validation.cpp): nChainWork < nMinimumChainWork ⇒ still IBD.
+    // Mainnet nMinimumChainWork is ~8.5e28; 315251/900514 are below it.
+    // REGTEST's floor is 0, so clone a floor the 5-block chain cannot meet.
+    const genesis = headerSync.getBestHeader()!;
+    const chain = buildChain(genesis.header, 0, 5, genesis.header.timestamp + 600);
+    const peer = createMockPeer("127.0.0.1", 9404);
+    await headerSync.processHeaders(
+      chain.map((b) => b.header),
+      peer,
+    );
+    expect(headerSync.getBestHeader()!.height).toBe(5);
+
+    const tip5 = headerSync.getHeaderByHeight(5)!;
+    const params = { ...REGTEST, nMinimumChainWork: 1n << 128n };
+    const bs = new BlockSync(
+      db,
+      params,
+      headerSync,
+      createMockPeerManager([peer]),
+      createMockChainStateManager({
+        hash: tip5.hash,
+        height: 5,
+        chainWork: tip5.chainWork,
+      }),
+    );
+    (bs as any).running = true;
+    bs.getState().nextHeightToProcess = 6;
+    bs.getState().nextHeightToRequest = 6;
+
+    await (bs as any).processOrderedBlocks();
+    (bs as any).requestBlocks();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(tip5.chainWork < params.nMinimumChainWork).toBe(true);
+    expect((bs as any).ibdComplete).toBe(false);
+    expect((bs as any).hasCompletedInitialSync).toBe(false);
 
     await bs.stop();
   });
