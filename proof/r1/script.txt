@@ -1,0 +1,8 @@
+# Captured 2026-09-17 by: bun tests/script_vectors.ts
+# (hotbuns in-repo harness over Core script_tests.json)
+[secp256k1_ffi] libsecp256k1 0.5.0 FFI ready — ECDSA/Schnorr via C library
+script_tests.json results: 1222 passed, 0 failed, 51 skipped, 0 parse errors
+
+# 51 skipped are comment rows (entry.length <= 1), not scored.
+# 1222 passed / 0 failed / 0 parse errors = every data row in Core's
+# script_tests.json. CHARTER R1 script arm is 1,222 vectors.

@@ -1,0 +1,74 @@
+  jobs recorded: 440   corpora x impls
+  IMPL           PASS   FAIL   ERR   AGREEMENT
+  ----------------------------------------------
+  ouroboros       347     23     0       93.8%
+  haskoin         352     18     0       95.1%
+  lunarblock      360     10     0       97.3%
+  camlcoin        362      8     0       97.8%
+  clearbit        365      5     0       98.6%
+  nimrod          365      5     0       98.6%
+  rustoshi        365      5     0       98.6%
+  beamchain       367      3     0       99.2%
+  hotbuns         368      2     0       99.5%
+  blockbrew       369      1     0       99.7%
+  
+  DIVERGENCES (44 corpus/impl pairs):
+    ouroboros    regression                       14 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/regression__ouroboros.log
+    haskoin      regression                       8 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/regression__haskoin.log
+    ouroboros    ts-mtp                           4 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/ts-mtp__ouroboros.log
+    lunarblock   _advsweep-2026-07-07/nulldummy-multisig 3 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_advsweep-2026-07-07__nulldummy-multisig__lunarblock.log
+    rustoshi     submitblock-sidebranch           3 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/submitblock-sidebranch__rustoshi.log
+    haskoin      tws                              3 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/tws__haskoin.log
+    camlcoin     regression                       2 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/regression__camlcoin.log
+    lunarblock   regression                       2 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/regression__lunarblock.log
+    clearbit     submitblock-sidebranch           2 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/submitblock-sidebranch__clearbit.log
+    lunarblock   submitblock-sidebranch           2 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/submitblock-sidebranch__lunarblock.log
+    camlcoin     _tierb-guards-2026-07-06/B2-bad-diffbits 2 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_tierb-guards-2026-07-06__B2-bad-diffbits__camlcoin.log
+    beamchain    _tierc-guards-2026-07-06/C9-sidebranch-invalid-reorg 2 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_tierc-guards-2026-07-06__C9-sidebranch-invalid-reorg__beamchain.log
+    haskoin      version-dup                      2 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/version-dup__haskoin.log
+    haskoin      _advsweep-2026-07-07/weight-sigops-limit 1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_advsweep-2026-07-07__weight-sigops-limit__haskoin.log
+    blockbrew    _cve-histbug-2026-07-07/cve-2010-value-overflow 1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_cve-histbug-2026-07-07__cve-2010-value-overflow__blockbrew.log
+    clearbit     _cve-histbug-2026-07-07/cve-2010-value-overflow 1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_cve-histbug-2026-07-07__cve-2010-value-overflow__clearbit.log
+    camlcoin     _cve-histbug-2026-07-07/cve-2010-value-overflow 1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_cve-histbug-2026-07-07__cve-2010-value-overflow__camlcoin.log
+    beamchain    _cve-histbug-2026-07-07/cve-2010-value-overflow 1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_cve-histbug-2026-07-07__cve-2010-value-overflow__beamchain.log
+    haskoin      _cve-histbug-2026-07-07/sigop-cost-witness 1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_cve-histbug-2026-07-07__sigop-cost-witness__haskoin.log
+    ouroboros    mtp-nonmonotonic-parent          1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/mtp-nonmonotonic-parent__ouroboros.log
+    rustoshi     regression                       1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/regression__rustoshi.log
+    nimrod       regression                       1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/regression__nimrod.log
+    clearbit     regression                       1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/regression__clearbit.log
+    haskoin      submitblock-sidebranch           1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/submitblock-sidebranch__haskoin.log
+    nimrod       _tierb-guards-2026-07-06/B1-scripttests/scripttests 1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_tierb-guards-2026-07-06__B1-scripttests__scripttests__nimrod.log
+    camlcoin     _tierb-guards-2026-07-06/B1-scripttests/scripttests 1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_tierb-guards-2026-07-06__B1-scripttests__scripttests__camlcoin.log
+    ouroboros    _tierb-guards-2026-07-06/B1-scripttests/scripttests 1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_tierb-guards-2026-07-06__B1-scripttests__scripttests__ouroboros.log
+    rustoshi     _tierb-guards-2026-07-06/B2-bad-diffbits 1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_tierb-guards-2026-07-06__B2-bad-diffbits__rustoshi.log
+    haskoin      _tierb-guards-2026-07-06/B1-scripttests/scripttests 1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_tierb-guards-2026-07-06__B1-scripttests__scripttests__haskoin.log
+    clearbit     _tierb-guards-2026-07-06/B2-bad-diffbits 1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_tierb-guards-2026-07-06__B2-bad-diffbits__clearbit.log
+    nimrod       _tierb-guards-2026-07-06/B2-bad-diffbits 1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_tierb-guards-2026-07-06__B2-bad-diffbits__nimrod.log
+    ouroboros    _tierb-guards-2026-07-06/B2-bad-diffbits 1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_tierb-guards-2026-07-06__B2-bad-diffbits__ouroboros.log
+    lunarblock   _tierb-guards-2026-07-06/B2-bad-diffbits 1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_tierb-guards-2026-07-06__B2-bad-diffbits__lunarblock.log
+    nimrod       tws                              1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/tws__nimrod.log
+    camlcoin     tws                              1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/tws__camlcoin.log
+    hotbuns      tws                              1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/tws__hotbuns.log
+    ouroboros    tws                              1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/tws__ouroboros.log
+    lunarblock   tws                              1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/tws__lunarblock.log
+    nimrod       tws-tail                         1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/tws-tail__nimrod.log
+    camlcoin     tws-tail                         1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/tws-tail__camlcoin.log
+    hotbuns      tws-tail                         1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/tws-tail__hotbuns.log
+    ouroboros    tws-tail                         1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/tws-tail__ouroboros.log
+    lunarblock   tws-tail                         1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/tws-tail__lunarblock.log
+    haskoin      tws-tail                         1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/tws-tail__haskoin.log
+  
+  ==============================================================
+  CONSENSUS SPLITS (accept vs reject -- chain-split risk): 0
+  ERROR-CODE ONLY (same accept/reject, different reason): 0
+  MEMPOOL DIVERGENCE (policy, not block consensus): 14
+     ouroboros   10
+     camlcoin    1
+     clearbit    1
+     haskoin     1
+     rustoshi    1
+  TXINDEX DIVERGENCE (index, not block consensus): 1
+     ouroboros   1
+  
+     !! ACCOUNTING GAP: runner counted 80 failed entries, classifier saw 92 (77 unparsed). Do not trust the split count until this is zero.
+{"ts":"2026-09-17T07:30:02Z","phase":"partial","recorded":396}

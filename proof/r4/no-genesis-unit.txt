@@ -1,0 +1,11 @@
+# There is no genesis-IBD systemd unit and no /home/work/genesis-ibd/hotbuns
+# datadir on this host. nimrod's bundle can cite genesis-unit.service with
+# --assumevalid=0 and a lineage.log.gz starting at height=0 on Bitcoin's
+# genesis hash. hotbuns cannot.
+#
+# A from-genesis AV=0 run that reproduces Core's hash_serialized_3 at some
+# height H is the missing receipt. Until that exists, R4 stays UNPROVEN.
+# Snapshot-booted range-runner rows (r4/range-rows.json) are not that receipt.
+#
+# matches=0 of loadtxoutset/assumeutxo/snapshot in a lineage log cannot be
+# checked here because there is no lineage log.

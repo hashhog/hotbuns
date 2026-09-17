@@ -1,0 +1,12 @@
+# Re-run R2 (validator decision parity) for hotbuns. Needs the hashhog
+# meta-repo (tools/diff-test-corpus, tools/corpus-sweep.sh, a live bitcoind
+# as oracle). Hours, not minutes. Do not run against production ports.
+#
+#   SWEEP_IMPLS=hotbuns bash tools/corpus-sweep.sh
+#   bash tools/corpus-sweep.sh --report
+#
+# The numbers in results.json are from the nightly 440-job table
+# (hotbuns 368 PASS / 2 FAIL / 0 ERR, 99.5%) around the
+# 2026-09-15T07:30:03Z partial marker, confirmed in
+# results.20260916T045125Z.jsonl. Both FAILs are reject-vs-reject
+# (Core bad-blk-weight vs hotbuns bad-blk-length) on weight-one-over-limit.

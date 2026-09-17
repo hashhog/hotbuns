@@ -1,0 +1,33 @@
+# The genesis→250,000 ledger does NOT count as R4.
+#
+# Artifact: r4/av0-250000-ledger.txt / .jsonl
+# Header claims: assumevalid=0 full-script, 11 checkpoints, each hash == Core,
+# terminal UTXO hash dd8e8cfd…649c, txouts=6802755, overall=ALL-PASS.
+# Run: 2026-07-02.
+#
+# Direct disconfirmation, 2026-08-20: an AV=0 hotbuns rig rejected real
+# mainnet block 124276 (inside that ALL-PASS range) with SCRIPT_ERR_SIG_DER
+# on tx 4d8666fa40125172 / fb0a1d8d...864d input 0, then marked the header
+# invalid and wedged. Strict DER is BIP-66, activation height 363,725 —
+# not active for another 239,449 blocks. Bitcoin Core accepts the block.
+#
+# Root cause: scriptFlagsFromBitmask mapped
+#     verifyDERSignatures: verifyDERSig || verifyWitness
+# (and the same for CLTV / CSV / NULLDUMMY). getScriptFlagsForBlock sets
+# WITNESS from genesis (Core v24+ shape), so all four rules fired from
+# block 0. Height gates were dead code. Hidden behind assumevalid on the
+# live node; the AV=0 rig was the first time those scripts ran.
+#
+# Fix: hotbuns 1e516d5b80f4
+#   "fix(consensus): stop inferring DERSIG/CLTV/CSV/NULLDUMMY from the WITNESS flag"
+# In-repo control: bun test ./src/__tests__/bip66_height_gate.test.ts
+# (re-run live by proof/verify.sh).
+#
+# Three committed caveats on the ledger itself (scorecard 2026-09-02):
+# (i) the AV=0 setting in its header is the harness's own assertion; no
+#     launch-flag ack was recorded.
+# (ii) a later campaign ran hotbuns with default assumevalid, scripts skipped.
+# (iii) this SIG_DER rejection inside the ALL-PASS range.
+#
+# TRUST-ANCHOR: a disconfirmed ALL-PASS ledger is not C(H). There is no
+# from-genesis hash_serialized_3 capture at any height for this node.

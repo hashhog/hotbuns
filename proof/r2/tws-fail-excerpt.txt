@@ -1,0 +1,15 @@
+# Direct read of the two FAIL logs (reject-vs-reject, not a consensus split).
+# tools/diff-test-artifacts/corpus-sweep/logs/tws__hotbuns.log
+# tools/diff-test-artifacts/corpus-sweep/logs/tws-tail__hotbuns.log
+
+tws / weight-one-over-limit (expected=reject,bad-blk-weight):
+  bitcoin-core: reject:bad-blk-weight
+  hotbuns:      reject:bad-blk-length
+  same_accept_reject: true
+
+tws-tail / weight-one-over-limit (expected=reject,bad-blk-weight):
+  bitcoin-core: reject:bad-blk-weight
+  hotbuns:      reject:bad-blk-length
+  same_accept_reject: true
+
+CONSENSUS SPLITS (accept vs reject): 0

@@ -1,0 +1,25 @@
+{
+  "source": "tools/diff-test-artifacts/corpus-sweep/nightly-history.jsonl table at jobs recorded: 440, preceding 2026-09-15T07:30:03Z partial marker (and confirmed in results.20260916T045125Z.jsonl)",
+  "impl": "hotbuns",
+  "pass": 368,
+  "fail": 2,
+  "err": 0,
+  "agreement_pct": 99.5,
+  "consensus_splits_accept_vs_reject": 0,
+  "fails": [
+    {
+      "corpus": "tws",
+      "entry": "weight-one-over-limit",
+      "core": "reject:bad-blk-weight",
+      "hotbuns": "reject:bad-blk-length",
+      "same_accept_reject": true
+    },
+    {
+      "corpus": "tws-tail",
+      "entry": "weight-one-over-limit",
+      "core": "reject:bad-blk-weight",
+      "hotbuns": "reject:bad-blk-length",
+      "same_accept_reject": true
+    }
+  ]
+}

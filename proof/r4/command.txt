@@ -1,0 +1,18 @@
+# What a real R4 receipt would take (NOT claimed here).
+#
+# 1. Launch this node's own validation from height 0 on Bitcoin genesis
+#    000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f
+#    with --assumevalid=0 (scripts on), no loadtxoutset / assumeutxo /
+#    snapshot boot, fed by a capped blk-replay peer.
+# 2. Freeze at some height H and capture gettxoutsetinfo hash_serialized_3
+#    against Core's C(H).
+# 3. Keep the lineage log and prove it starts at height=0, contains no
+#    snapshot-boot lines, and the capture hash matches Core.
+#
+# That run is not on this hardware today (R4 not reachable at IBD speed;
+# same class as lunarblock). Do not treat r4/range-rows.json as a substitute.
+#
+# Supporting / contested artifacts in this directory:
+#   av0-250000-ledger.txt     — 2026-07-02 genesis→250000, overall=ALL-PASS,
+#                               DISCONFIRMED (see disconfirmation.txt)
+#   range-rows.json           — snapshot-booted coverage, counts_as_r4=false

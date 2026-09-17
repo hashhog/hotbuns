@@ -1,0 +1,40 @@
+# Captured 2026-09-17 by:
+#   cd tools/phaseb-vectors
+#   python3 phaseb_vectors.py --driver='bun run ./hotbuns-shim/verifyscript_shim.ts' --txvectors
+# Needs the hashhog meta-repo (shim + Core vectors). Not re-run by verify.sh.
+
+##### tx_valid.json : 121 data rows (expect ACCEPT) #####
+
+=== Phase B tx_valid/tx_invalid (checktx AND verifytx) run ===
+cases scored                 : 121
+  PASS (decision matches Core) : 121
+  FAIL (decision diverges)     : 0
+  shim error / skipped         : 0
+  rows w/ unmapped flag token  : 0
+  assemble errors (pre-run)    : 0
+  --- BADTX rows (now SCORED via checktx, expect REJECT) ---
+    BADTX rows seen            : 0
+    rejected by checktx (good) : 0/0
+  --- tx_valid checktx invariant (must ALL pass) ---
+    tx_valid rows scored       : 121
+    checktx PASS (good)        : 121/121
+  decision coverage            : 121/121 (100.0% produced a verdict)
+  decision accuracy            : 121/121 (100.0%)
+
+##### tx_invalid.json : 93 data rows (expect REJECT) #####
+
+=== Phase B tx_valid/tx_invalid (checktx AND verifytx) run ===
+cases scored                 : 93
+  PASS (decision matches Core) : 93
+  FAIL (decision diverges)     : 0
+  shim error / skipped         : 0
+  rows w/ unmapped flag token  : 0
+  assemble errors (pre-run)    : 0
+  --- BADTX rows (now SCORED via checktx, expect REJECT) ---
+    BADTX rows seen            : 9
+    rejected by checktx (good) : 9/9
+  --- tx_valid checktx invariant (must ALL pass) ---
+    tx_valid rows scored       : 0
+    checktx PASS (good)        : 0/0
+  decision coverage            : 93/93 (100.0% produced a verdict)
+  decision accuracy            : 93/93 (100.0%)

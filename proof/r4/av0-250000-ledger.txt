@@ -1,0 +1,16 @@
+=== hotbuns AV=0 genesis->250k danger-zone replay  start 2026-07-02T06:12:57.706239+00:00 ===
+    method: fixed server cap=250000 (single-peer safe), assumevalid=0 full-script
+  HEIGHT  VERDICT   hotbuns blockhash(H)                                                note
+    1000  PASS      00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09    
+   74638  PASS      000000000069e1affe7161ab4bcbeacebb4ddf155b50e807f42de971b688a09b    
+   91722  PASS      00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e    BIP30
+   91812  PASS      00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f    BIP30
+   91842  PASS      00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec    BIP30
+   91880  PASS      00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721    BIP30
+  170060  PASS      00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22    BIP16-violator
+  173805  PASS      00000000000000ce80a7e057163a4db1d5ad7b20fb6f598c9597b9665c8fb0d4    
+  200000  PASS      000000000000034a7dedef4a161fa058a2d67a173a90155f3a2fe6fc132e0ebf    
+  227931  PASS      000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8    BIP34-activation
+          [terminal] tip_ok=True utxo_hash=dd8e8cfd6fe67f59f1dce40e43cd5b36ad3661f574a9d5c8c4a089048bbd649c txouts=6802755 total=11499864.80131183
+  250000  PASS      000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214    
+=== done 2026-07-02T09:24:32.088575+00:00  overall=ALL-PASS ===

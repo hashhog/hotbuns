@@ -1,0 +1,12 @@
+impl          closed       blocks  % of chain  other verdicts
+hotbuns           19      333,701      34.53%  NO-ORACLE-SURFACE:1, STALLED:2
+
+TRUST-ANCHOR: these rows are snapshot-booted (range-runner.sh loads a
+Core-format UTXO snapshot at the range base). They are NOT a from-genesis
+AV=0 lineage and MUST NOT be counted as R4. Listed so the holes are visible:
+  STALLED 340000->363708 (max tip 340852; bun SIGSEGV at 340890 on a later attempt)
+  NO-ORACLE-SURFACE 363708->388364 (gettxoutsetinfo no usable height at base)
+  STALLED 900000->910000 (tip stuck at 900514)
+
+19 CLOSED / 333,701 blocks is 34.53% of the ladder tip. Six nodes already
+carry C(958794) from genesis; this node does not.

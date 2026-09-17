@@ -1,0 +1,16 @@
+# Re-run R1 (interpreter) for hotbuns.
+#
+# In-repo (no meta-repo required) — this is what proof/verify.sh re-runs:
+#   HOTBUNS_UNIT_CHILD=1 bun test ./src/__tests__/bip66_height_gate.test.ts ./src/script/interpreter.test.ts
+#
+# Core script_tests.json / sighash.json via the in-repo harnesses
+# (needs sibling bitcoin-core/src/test/data or resources/):
+#   bun tests/script_vectors.ts
+#   bun tests/sighash_vectors.ts
+#
+# tx_valid / tx_invalid (needs the hashhog meta-repo shim):
+#   cd tools/phaseb-vectors
+#   python3 phaseb_vectors.py --driver='bun run ./hotbuns-shim/verifyscript_shim.ts' --txvectors
+#
+# Full CHARTER reject-bar (script + tx + sighash) from the meta-repo:
+#   bash tools/phaseb-vectors/run-regression.sh   # includes shim:hotbuns:{script,tx,sighash}

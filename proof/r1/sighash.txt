@@ -1,0 +1,6 @@
+# Captured 2026-09-17 by: bun tests/sighash_vectors.ts
+# (hotbuns in-repo harness over Core sighash.json)
+[secp256k1_ffi] libsecp256k1 0.5.0 FFI ready — ECDSA/Schnorr via C library
+
+Sighash test vectors: 500 passed, 0 failed, 1 skipped (header)
+Total vectors processed: 500

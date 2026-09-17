@@ -1,0 +1,66 @@
+{
+  "live": {
+    "artifact": "r5/live-20260901T182642Z.json",
+    "command": "python3 tools/r5_probe.py --impl hotbuns -v",
+    "T1": {
+      "pass": 41,
+      "total": 46
+    },
+    "T2": {
+      "pass": 15,
+      "total": 41
+    },
+    "T3": {
+      "pass": 0,
+      "total": 16,
+      "note": "SKIP-REGTEST on the live lane"
+    },
+    "fails_t1": [
+      "addnode",
+      "getblocktemplate",
+      "sendrawtransaction",
+      "testmempoolaccept"
+    ],
+    "fails_t2": [
+      "decoderawtransaction",
+      "validateaddress",
+      "getchaintxstats",
+      "getdeploymentinfo",
+      "gettxoutproof",
+      "verifytxoutproof",
+      "importmempool",
+      "prioritisetransaction",
+      "scantxoutset",
+      "pruneblockchain",
+      "decodescript",
+      "combinerawtransaction",
+      "createpsbt",
+      "decodepsbt",
+      "analyzepsbt",
+      "combinepsbt",
+      "finalizepsbt",
+      "joinpsbts",
+      "utxoupdatepsbt",
+      "descriptorprocesspsbt",
+      "submitpackage",
+      "createmultisig",
+      "deriveaddresses",
+      "getindexinfo",
+      "verifymessage"
+    ],
+    "note": "Captured 2026-09-01T18:26Z against the then-running mainnet unit. The unit is now maintenance-paused; this commit does not restart it. T3 is unmeasured on this lane."
+  },
+  "regtest": {
+    "artifact": null,
+    "T3": {
+      "pass": null,
+      "total": 16,
+      "status": "UNPROVEN"
+    },
+    "note": "No hotbuns regtest-lane r5_probe artifact is in this bundle. Do not read T3 0/16 as a measured 0; it is SKIP-REGTEST on the live lane."
+  },
+  "in_repo_live_rerun": {
+    "command": "HOTBUNS_UNIT_CHILD=1 bun test ./src/__tests__/bip66_height_gate.test.ts ./src/script/interpreter.test.ts",
+    "why": "bip66_height_gate.test.ts is the in-repo control for the 124276 SIG_DER consensus bug (the R4 ledger disconfirmation). interpreter.test.ts is the interpreter unit suite. Both are fully in-repo (no Core vectors, no live node)."
+  }
+}

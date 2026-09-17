@@ -1,0 +1,78 @@
+{
+  "r4": {
+    "files": [
+      "r4/status.json",
+      "r4/command.txt",
+      "r4/av0-250000-ledger.txt",
+      "r4/av0-250000-ledger.jsonl",
+      "r4/disconfirmation.txt",
+      "r4/range-coverage.txt",
+      "r4/range-rows.json",
+      "r4/no-genesis-unit.txt"
+    ],
+    "status": "UNPROVEN",
+    "snapshot_booted_does_not_count": true,
+    "range_counts_as_r4": false,
+    "range_closed": 19,
+    "range_closed_blocks": 333701,
+    "ledger_250000_overall": "ALL-PASS",
+    "ledger_250000_disconfirmed": true,
+    "ledger_250000_utxo_hash": "dd8e8cfd6fe67f59f1dce40e43cd5b36ad3661f574a9d5c8c4a089048bbd649c",
+    "ledger_250000_txouts": 6802755,
+    "disconfirmation_height": 124276,
+    "disconfirmation_token": "SCRIPT_ERR_SIG_DER",
+    "fix_commit": "1e516d5b80f4",
+    "genesis_block_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+    "assumevalid_required_for_r4": "0"
+  },
+  "r1": {
+    "files": ["r1/results.json", "r1/script.txt", "r1/tx.txt", "r1/sighash.txt", "r1/command.txt"],
+    "script_pass": 1222,
+    "script_fail": 0,
+    "tx_valid_pass": 121,
+    "tx_invalid_pass": 93,
+    "sighash_pass": 500,
+    "divergences": 0,
+    "decided": 1936,
+    "charter_vector_count": 1936
+  },
+  "r2": {
+    "files": [
+      "r2/results.json",
+      "r2/nightly-report-excerpt.txt",
+      "r2/tws-fail-excerpt.txt",
+      "r2/command.txt"
+    ],
+    "pass": 368,
+    "fail": 2,
+    "err": 0,
+    "consensus_splits_accept_vs_reject": 0
+  },
+  "r5": {
+    "files": [
+      "r5/scorecard.json",
+      "r5/live-20260901T182642Z.json",
+      "r5/command.txt"
+    ],
+    "live_t1_pass": 41,
+    "live_t1_total": 46,
+    "live_t2_pass": 15,
+    "live_t2_total": 41,
+    "live_t1_fail_methods": [
+      "addnode",
+      "getblocktemplate",
+      "sendrawtransaction",
+      "testmempoolaccept"
+    ],
+    "regtest_t3_status": "UNPROVEN"
+  },
+  "provenance": {
+    "files": ["provenance.txt", "runnable-tree.sha256"],
+    "runtime": "bun 1.3.11",
+    "runtime_sha256": "6d5bb405b1d037a2a466b92757de7e47e4369930fa94bd42f8ff44ba49de6c57",
+    "parent_commit": "0f1a48bacdd19984474ee41ccdde309c696267d2",
+    "interpreted": true,
+    "promote_does_not_apply": true,
+    "launch": "bun run src/index.ts"
+  }
+}
