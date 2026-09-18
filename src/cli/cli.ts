@@ -38,6 +38,7 @@ import { InvType, type NetworkMessage, type InvVector } from "../p2p/messages.js
 import { Wallet, WalletManager } from "../wallet/wallet.js";
 import { MAINNET, TESTNET, TESTNET4, REGTEST, disableAssumeValid, type ConsensusParams } from "../consensus/params.js";
 import { Logger, setLogger } from "../logger/logger.js";
+import { runSupervisorFromArgv } from "./supervisor.js";
 
 /**
  * Node configuration options.
@@ -113,6 +114,21 @@ export interface NodeConfig {
    * "you are the detached worker, do not fork again".
    */
   internalDaemonChild: boolean;
+  /**
+   * Parent-process supervisor. When set, `main()` spawns the node as a
+   * child, treats SIGSEGV/SIGILL (and Bun's "panic: Segmentation fault"
+   * banner) as CRASHED rather than a stall/"behind", and restarts the
+   * child so it resumes from the datadir. Opt-in: `--supervise` or
+   * HOTBUNS_SUPERVISE=1. The 401723 / 340890 Bun 1.3.11 JSC GC crashes
+   * are this class — not a poison block.
+   */
+  supervise?: boolean;
+  /** Restarts after a hard crash. Default 3 when `--supervise` is on. */
+  superviseRestarts?: number;
+  /**
+   * Child of a `--supervise` re-exec. Internal: do not wrap again.
+   */
+  internalSupervisedChild?: boolean;
   /**
    * Optional path to an alternate config file.  When set, overrides the
    * default `<datadir>/hotbuns.conf` lookup.  Mirrors Bitcoin Core's
@@ -333,6 +349,8 @@ const DEFAULT_CONFIG: NodeConfig = {
   dbcacheMB: 512,
   daemon: false,
   internalDaemonChild: false,
+  supervise: false,
+  internalSupervisedChild: false,
   rest: false,
   blockfilterindex: false,
   coinstatsindex: false,
@@ -548,6 +566,24 @@ export function parseArgs(argv: string[]): ParsedArgs {
           // Internal handoff flag set by the parent of a `--daemon`
           // re-exec.  Never set by the user.
           config.internalDaemonChild = true;
+          break;
+        case "supervise":
+          // Parent watches the node child. A Bun SIGSEGV is CRASHED
+          // (process dead), not "behind". Bare / =1 / =true enables.
+          if (value === undefined || value === "1" || value === "true") {
+            config.supervise = true;
+          } else if (value === "0" || value === "false") {
+            config.supervise = false;
+          }
+          break;
+        case "supervise-restarts":
+          if (value !== undefined) {
+            const n = parseInt(value, 10);
+            if (!isNaN(n) && n >= 0) config.superviseRestarts = n;
+          }
+          break;
+        case "internal-supervised-child":
+          config.internalSupervisedChild = true;
           break;
         case "conf":
           // Bitcoin Core flag `-conf=<file>`.  Promotes the config-file
@@ -3510,6 +3546,8 @@ OPTIONS:
   --dbcache=<n>         UTXO cache size in MiB (default: 512)
   --load-snapshot=<path> Load Bitcoin Core-format UTXO snapshot (assumeutxo)
   --daemon              Fork to background and detach (re-execs self under Bun)
+  --supervise           Parent watches the node; SIGSEGV/SIGILL is CRASHED (not 'behind') and the child restarts to resume
+  --supervise-restarts=<N>  Restarts after a hard crash (default 3; 0 = report CRASHED and exit)
   --pid=<file>          PID file path (default: <datadir>/hotbuns.pid; '' to disable)
   --ready-fd=<N>        Write 'ready\\n' to this fd once startup completes
   --password=<pass>     Wallet password (for wallet commands)
@@ -3534,6 +3572,22 @@ export async function main(): Promise<void> {
   if (command === "help" || command === "--help") {
     printHelp();
     return;
+  }
+
+  // --supervise / HOTBUNS_SUPERVISE=1: wrap `start` in a parent that
+  // classifies a Bun SIGSEGV as CRASHED (not "behind") and restarts.
+  const envSupervise = process.env.HOTBUNS_SUPERVISE;
+  const wantSupervise =
+    command === "start" &&
+    !config.internalSupervisedChild &&
+    (config.supervise === true ||
+      envSupervise === "1" ||
+      envSupervise === "true");
+  if (wantSupervise) {
+    const code = await runSupervisorFromArgv(Bun.argv, {
+      maxRestarts: config.superviseRestarts ?? 3,
+    });
+    process.exit(code);
   }
 
   // Route to appropriate command handler
