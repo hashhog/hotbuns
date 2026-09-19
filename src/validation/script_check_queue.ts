@@ -14,6 +14,8 @@
  *   - treats 0 / undefined as auto (hardware concurrency)
  *   - consults globalSigCache on the main thread before dispatch
  *   - runs remaining checks on a persistent Worker pool (or serial fallback)
+ *   - drains a bounded FIFO (SCRIPTCHECK_BATCH_SIZE=128, Core nBatchSize)
+ *     so in-flight wire is O(workers) not O(block inputs)
  *
  * Reference: bitcoin-core/src/checkqueue.h, src/validation.h MAX_SCRIPTCHECK_THREADS,
  *            src/node/chainstatemanager_args.h DEFAULT_SCRIPTCHECK_THREADS.
@@ -22,8 +24,9 @@
 import type { UTXOEntry } from "../storage/database.js";
 import {
 	buildWireBatch,
+	encodePackedBatch,
+	estimateWireBatchBytes,
 	scriptCheckWireBudget,
-	splitJobsByWireBudget,
 	type WorkerOut,
 } from "./script_check_wire.js";
 import { globalSigCache } from "./sig_cache.js";
@@ -40,6 +43,13 @@ export const MAX_SCRIPTCHECK_THREADS = 15;
 
 /** Core DEFAULT_SCRIPTCHECK_THREADS = 0 (auto-detect). */
 export const DEFAULT_SCRIPTCHECK_THREADS = 0;
+
+/**
+ * Core CCheckQueue nBatchSize (validation.cpp:6136). Workers drain at most
+ * this many checks per postMessage so in-flight wire is O(workers), not
+ * O(inputs in the block).
+ */
+export const SCRIPTCHECK_BATCH_SIZE = 128;
 
 /**
  * Below this many cache-miss jobs, dispatch overhead dominates libsecp256k1
@@ -190,55 +200,130 @@ class VerifyPool {
 	async verify(
 		jobs: ScriptCheckJob[],
 		wireBudgetBytes?: number,
+		threadLimit?: number,
 	): Promise<ScriptCheckResult> {
 		await this.waitReady();
 		if (this.failed) throw this.failed;
 		if (jobs.length === 0) return { valid: true };
 
 		const budget = wireBudgetBytes ?? scriptCheckWireBudget();
-		const groups = splitJobsByWireBudget(jobs, budget);
-		for (const group of groups) {
-			const result = await this.verifyGroup(group);
-			if (!result.valid) return result;
-		}
-		return { valid: true };
+		const n = Math.max(
+			1,
+			Math.min(threadLimit ?? this.size, this.size, jobs.length),
+		);
+		return this.drain(jobs, n, budget);
 	}
 
-	private async verifyGroup(jobs: ScriptCheckJob[]): Promise<ScriptCheckResult> {
-		const n = Math.min(this.size, jobs.length);
-		const chunkSize = Math.ceil(jobs.length / n);
-		const waves: Promise<{ start: number; out: WorkerOut }>[] = [];
+	/**
+	 * CCheckQueue-style drain: a bounded FIFO of per-input jobs, at most
+	 * `nWorkers` in-flight batches of SCRIPTCHECK_BATCH_SIZE (and never more
+	 * than `budget` bytes each). On the first failure we stop dispatching
+	 * later-index jobs but wait for in-flight work, then return the
+	 * earliest-index failure so the reject reason does not depend on the
+	 * split. Core's queue is LIFO; we FIFO so serial and N-worker paths
+	 * report the same first failure without racing a later-index job.
+	 */
+	private async drain(
+		jobs: ScriptCheckJob[],
+		nWorkers: number,
+		budget: number,
+	): Promise<ScriptCheckResult> {
+		peakInFlightJobs = 0;
+		peakInFlightBytes = 0;
+		lastDispatchWorkers = 0;
 
-		for (let w = 0; w < n; w++) {
-			const start = w * chunkSize;
-			const chunk = jobs.slice(start, start + chunkSize);
-			if (chunk.length === 0) break;
-			waves.push(
-				this.sendChunk(this.workers[w]!, chunk).then((out) => ({ start, out })),
-			);
-		}
+		let qHead = 0;
+		let earliestFailIndex = Number.POSITIVE_INFINITY;
+		let failResult: ScriptCheckResult | null = null;
+		let inFlightJobs = 0;
+		let inFlightBytes = 0;
+		const used = new Set<number>();
 
-		const parts = await Promise.all(waves);
-		for (const { start, out } of parts) {
-			if (out.kind === "crash") {
-				throw new Error(out.error);
+		const takeBatch = (): {
+			items: ScriptCheckJob[];
+			origIndices: number[];
+			bytes: number;
+		} | null => {
+			const items: ScriptCheckJob[] = [];
+			const origIndices: number[] = [];
+			const remaining = jobs.length - qHead;
+			if (remaining <= 0) return null;
+			// Core: nNow = max(1, min(nBatchSize, queue / (nTotal+nIdle+1))).
+			// Split leftover work across the pool so a 256-input block still
+			// uses all requested workers instead of two 128-job chunks.
+			const adaptive = Math.max(1, Math.ceil(remaining / nWorkers));
+			const cap = Math.min(SCRIPTCHECK_BATCH_SIZE, adaptive);
+			while (qHead < jobs.length && items.length < cap) {
+				const origIndex = qHead;
+				if (origIndex >= earliestFailIndex) {
+					qHead = jobs.length;
+					break;
+				}
+				const job = jobs[origIndex]!;
+				if (items.length > 0) {
+					const bytes = estimateWireBatchBytes(
+						buildWireBatch(0, [...items, job]),
+					);
+					if (bytes > budget) break;
+				}
+				items.push(job);
+				origIndices.push(origIndex);
+				qHead++;
 			}
-			if (out.kind !== "result") {
-				throw new Error(`unexpected worker message ${out.kind}`);
-			}
-			for (const item of out.results) {
-				if (!item.valid) {
-					const job = jobs[start + item.jobIndex]!;
-					return {
-						valid: false,
-						error: item.error ?? "Input verification failed",
-						failedInput: job.inputIndex,
-						failedTxidHex: job.txidHex,
-					};
+			if (items.length === 0) return null;
+			return {
+				items,
+				origIndices,
+				bytes: estimateWireBatchBytes(buildWireBatch(0, items)),
+			};
+		};
+
+		const workerLoop = async (w: number): Promise<void> => {
+			while (true) {
+				const batch = takeBatch();
+				if (!batch) return;
+				used.add(w);
+				inFlightJobs += batch.items.length;
+				inFlightBytes += batch.bytes;
+				if (inFlightJobs > peakInFlightJobs) peakInFlightJobs = inFlightJobs;
+				if (inFlightBytes > peakInFlightBytes) peakInFlightBytes = inFlightBytes;
+				try {
+					const out = await this.sendChunk(this.workers[w]!, batch.items);
+					if (out.kind === "crash") {
+						throw new Error(out.error);
+					}
+					if (out.kind !== "result") {
+						throw new Error(`unexpected worker message ${out.kind}`);
+					}
+					for (const item of out.results) {
+						if (item.valid) continue;
+						const origIndex = batch.origIndices[item.jobIndex]!;
+						if (origIndex >= earliestFailIndex) continue;
+						const job = batch.items[item.jobIndex]!;
+						earliestFailIndex = origIndex;
+						failResult = {
+							valid: false,
+							error: item.error ?? "Input verification failed",
+							failedInput: job.inputIndex,
+							failedTxidHex: job.txidHex,
+						};
+					}
+				} finally {
+					inFlightJobs -= batch.items.length;
+					inFlightBytes -= batch.bytes;
 				}
 			}
+		};
+
+		const settled = await Promise.allSettled(
+			Array.from({ length: nWorkers }, (_, w) => workerLoop(w)),
+		);
+		lastDispatchWorkers = used.size;
+		const rejected = settled.find((s) => s.status === "rejected");
+		if (rejected && rejected.status === "rejected") {
+			throw rejected.reason;
 		}
-		return { valid: true };
+		return failResult ?? { valid: true };
 	}
 
 	private sendChunk(
@@ -247,6 +332,7 @@ class VerifyPool {
 	): Promise<WorkerOut> {
 		const id = this.nextId++;
 		const batch = buildWireBatch(id, chunk);
+		const packed = encodePackedBatch(batch);
 		return new Promise<WorkerOut>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.inflight.delete(id);
@@ -267,7 +353,7 @@ class VerifyPool {
 				},
 			});
 			try {
-				worker.postMessage(batch);
+				worker.postMessage(packed, [packed]);
 			} catch (e) {
 				clearTimeout(timer);
 				this.inflight.delete(id);
@@ -298,6 +384,28 @@ let creating: Promise<VerifyPool> | null = null;
 
 export function scriptCheckPoolSize(): number {
 	return globalPool?.size ?? 0;
+}
+
+let peakInFlightJobs = 0;
+let peakInFlightBytes = 0;
+let lastDispatchWorkers = 0;
+
+export function scriptCheckPeakInFlightJobs(): number {
+	return peakInFlightJobs;
+}
+
+export function scriptCheckPeakInFlightBytes(): number {
+	return peakInFlightBytes;
+}
+
+export function scriptCheckLastDispatchWorkers(): number {
+	return lastDispatchWorkers;
+}
+
+export function scriptCheckResetStats(): void {
+	peakInFlightJobs = 0;
+	peakInFlightBytes = 0;
+	lastDispatchWorkers = 0;
 }
 
 export async function shutdownScriptCheckPool(): Promise<void> {
@@ -408,7 +516,11 @@ export async function verifyScriptChecks(
 
 	try {
 		const pool = await getPool(n);
-		const result = await pool.verify(pending, scriptCheckWireBudget(cacheBytes));
+		const result = await pool.verify(
+			pending,
+			scriptCheckWireBudget(cacheBytes),
+			n,
+		);
 		if (result.valid) {
 			for (const job of pending) {
 				const utxo = job.utxos[job.inputIndex]!;

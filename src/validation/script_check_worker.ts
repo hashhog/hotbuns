@@ -11,8 +11,10 @@
  */
 
 import {
+	decodePackedBatch,
 	fromWireTx,
 	fromWireUtxo,
+	type WireBatch,
 	type WireResultItem,
 	type WorkerIn,
 	type WorkerOut,
@@ -24,14 +26,7 @@ import {
 } from "./tx.js";
 import "../crypto/secp256k1_ffi.js";
 
-self.onmessage = (ev: MessageEvent<WorkerIn>) => {
-	const msg = ev.data;
-	if (!msg || msg.kind === "stop") {
-		return;
-	}
-	if (msg.kind !== "batch") {
-		return;
-	}
+function runBatch(msg: WireBatch): void {
 	try {
 		const txs = msg.txs.map(fromWireTx);
 		const txUtxos = (msg.txUtxos ?? []).map((arr) => arr.map(fromWireUtxo));
@@ -74,6 +69,21 @@ self.onmessage = (ev: MessageEvent<WorkerIn>) => {
 			error: e instanceof Error ? e.message : String(e),
 		} satisfies WorkerOut);
 	}
+}
+
+self.onmessage = (ev: MessageEvent<WorkerIn | ArrayBuffer>) => {
+	const data = ev.data;
+	if (data instanceof ArrayBuffer) {
+		runBatch(decodePackedBatch(data));
+		return;
+	}
+	if (!data || data.kind === "stop") {
+		return;
+	}
+	if (data.kind !== "batch") {
+		return;
+	}
+	runBatch(data);
 };
 
 postMessage({ kind: "ready" } satisfies WorkerOut);
