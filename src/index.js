@@ -3808,7 +3808,8 @@ class ChainDB {
       keyEncoding: "buffer",
       valueEncoding: "buffer",
       cacheSize: COINS_DB_BLOCK_CACHE_BYTES,
-      writeBufferSize: 16 * 1024 * 1024,
+      writeBufferSize: COINS_DB_WRITE_BUFFER_BYTES,
+      compression: COINS_DB_COMPRESSION,
       maxFileSize: COINS_DB_MAX_FILE_SIZE_BYTES,
       maxOpenFiles: COINS_DB_MAX_OPEN_FILES
     });
@@ -4017,6 +4018,28 @@ class ChainDB {
     }
     await batch.write();
   }
+  newChainedBatch() {
+    const batch = this.db.batch();
+    const keyBuf = Buffer.allocUnsafe(37);
+    keyBuf[0] = 117 /* UTXO */;
+    let n = 0;
+    return {
+      putUTXO: (txid, vout, value) => {
+        txid.copy(keyBuf, 1, 0, 32);
+        keyBuf.writeUInt32LE(vout >>> 0, 33);
+        batch.put(Buffer.from(keyBuf), value);
+        n++;
+      },
+      get length() {
+        return n;
+      },
+      write: async () => {
+        if (n === 0)
+          return;
+        await batch.write();
+      }
+    };
+  }
   async batchWrite(ops, maxBatchSize = DEFAULT_MAX_BATCH_SIZE) {
     if (ops.length === 0) {
       return;
@@ -4187,11 +4210,12 @@ function encodeFileNum(fileNum) {
   buf.writeUInt32LE(fileNum, 0);
   return buf;
 }
-var DEFAULT_MAX_BATCH_SIZE = 1e4, IBD_BATCH_SIZE = 50000, COINS_DB_BLOCK_CACHE_BYTES, COINS_DB_MAX_FILE_SIZE_BYTES, COINS_DB_MAX_OPEN_FILES = 16384;
+var DEFAULT_MAX_BATCH_SIZE = 1e4, IBD_BATCH_SIZE = 50000, COINS_DB_BLOCK_CACHE_BYTES, COINS_DB_WRITE_BUFFER_BYTES, COINS_DB_COMPRESSION = false, COINS_DB_MAX_FILE_SIZE_BYTES, COINS_DB_MAX_OPEN_FILES = 16384;
 var init_database = __esm(() => {
   init_classic_level();
   init_serialization();
   COINS_DB_BLOCK_CACHE_BYTES = 256 * 1024 * 1024;
+  COINS_DB_WRITE_BUFFER_BYTES = COINS_DB_BLOCK_CACHE_BYTES / 4;
   COINS_DB_MAX_FILE_SIZE_BYTES = 32 * 1024 * 1024;
 });
 
@@ -7138,14 +7162,28 @@ function initFFI() {
     return false;
   }
 }
+function nativePtr(buf) {
+  if (buf.byteLength === 0)
+    return null;
+  try {
+    const p = ptr(buf);
+    if (typeof p !== "number" || !Number.isFinite(p))
+      return null;
+    return p;
+  } catch {
+    return null;
+  }
+}
 function _parsePubkey(pubkeyBytes) {
-  if (pubkeyBytes.length === 0)
+  const inputPtr = nativePtr(pubkeyBytes);
+  if (inputPtr === null)
     return false;
-  const inputPtr = ptr(pubkeyBytes);
   return _syms.secp256k1_ec_pubkey_parse(_ctx, _pubkeyPtr, inputPtr, pubkeyBytes.length) === 1;
 }
 function _parseSigDER(derBytes) {
-  const inputPtr = ptr(derBytes);
+  const inputPtr = nativePtr(derBytes);
+  if (inputPtr === null)
+    return false;
   return _syms.secp256k1_ecdsa_signature_parse_der(_ctx, _sigPtr, inputPtr, derBytes.length) === 1;
 }
 function _laxDerToCompact(sig) {
@@ -7224,7 +7262,9 @@ function ecdsaVerifyFFI(signature, msgHash, publicKey) {
   if (!_parseSigDER(signature))
     return false;
   _syms.secp256k1_ecdsa_signature_normalize(_ctx, _sigPtr, _sigPtr);
-  const msgPtr = ptr(msgHash);
+  const msgPtr = nativePtr(msgHash);
+  if (msgPtr === null)
+    return false;
   return _syms.secp256k1_ecdsa_verify(_ctx, _sigPtr, msgPtr, _pubkeyPtr) === 1;
 }
 function ecdsaVerifyLaxFFI(signature, msgHash, publicKey) {
@@ -7237,12 +7277,16 @@ function ecdsaVerifyLaxFFI(signature, msgHash, publicKey) {
   const compact = _laxDerToCompact(signature);
   if (!compact)
     return false;
-  const compactPtr = ptr(compact);
+  const compactPtr = nativePtr(compact);
+  if (compactPtr === null)
+    return false;
   if (_syms.secp256k1_ecdsa_signature_parse_compact(_ctx, _sigPtr, compactPtr) !== 1) {
     return false;
   }
   _syms.secp256k1_ecdsa_signature_normalize(_ctx, _sigPtr, _sigPtr);
-  const msgPtr = ptr(msgHash);
+  const msgPtr = nativePtr(msgHash);
+  if (msgPtr === null)
+    return false;
   return _syms.secp256k1_ecdsa_verify(_ctx, _sigPtr, msgPtr, _pubkeyPtr) === 1;
 }
 function schnorrVerifyFFI(signature, msg, xonlyPubkey) {
@@ -7251,18 +7295,24 @@ function schnorrVerifyFFI(signature, msg, xonlyPubkey) {
   if (signature.length !== 64 || xonlyPubkey.length !== 32) {
     return false;
   }
-  const xpkPtr = ptr(xonlyPubkey);
+  const xpkPtr = nativePtr(xonlyPubkey);
+  if (xpkPtr === null)
+    return false;
   if (_syms.secp256k1_xonly_pubkey_parse(_ctx, _xonlyPubkeyPtr, xpkPtr) !== 1) {
     return false;
   }
-  const sigPtr = ptr(signature);
+  const sigPtr = nativePtr(signature);
+  if (sigPtr === null)
+    return false;
   let msgPtr;
   if (msg.length === 0) {
     const dummy = new Uint8Array(1);
-    msgPtr = ptr(dummy);
+    msgPtr = nativePtr(dummy);
   } else {
-    msgPtr = ptr(msg);
+    msgPtr = nativePtr(msg);
   }
+  if (msgPtr === null)
+    return false;
   return _syms.secp256k1_schnorrsig_verify(_ctx, sigPtr, msgPtr, msg.length, _xonlyPubkeyPtr) === 1;
 }
 function ecdsaVerifyFFICounted(signature, msgHash, publicKey) {
@@ -10439,10 +10489,10 @@ function scriptFlagsFromBitmask(bitmask) {
     verifyP2SH,
     verifyWitness,
     verifyTaproot: verifyTaproot2,
-    verifyDERSignatures: verifyDERSig || verifyWitness,
-    verifyCheckLockTimeVerify: verifyCLTV || verifyWitness,
-    verifyCheckSequenceVerify: verifyCSV || verifyWitness,
-    verifyNullDummy: verifyNullDummy || verifyWitness,
+    verifyDERSignatures: verifyDERSig,
+    verifyCheckLockTimeVerify: verifyCLTV,
+    verifyCheckSequenceVerify: verifyCSV,
+    verifyNullDummy,
     verifyNullFail: false,
     verifyWitnessPubkeyType: false,
     verifyStrictEncoding: false,
@@ -10648,6 +10698,7 @@ __export(exports_tx, {
   evaluateSequenceLocks: () => evaluateSequenceLocks,
   deserializeTx: () => deserializeTx,
   decodeTxWitnessAware: () => decodeTxWitnessAware,
+  computeInputSigCacheKey: () => computeInputSigCacheKey,
   checkSequenceLocks: () => checkSequenceLocks,
   calculateSequenceLocks: () => calculateSequenceLocks,
   buildTaprootContext: () => buildTaprootContext,
@@ -11518,9 +11569,8 @@ function buildTaprootContext(tx, inputIndex, prevOuts, cache) {
     scriptPathSigHasher: (hashType, leafHash, codeSepPos) => sigHashTaproot(tx, inputIndex, prevOuts, hashType, 1, annexHash, leafHash, 0, codeSepPos, cache)
   };
 }
-function verifyInputSignature(tx, inputIndex, utxo, cache, utxos, taprootCache, scriptVerifyFlags = 1 /* VERIFY_P2SH */ | 2 /* VERIFY_WITNESS */ | 512 /* VERIFY_TAPROOT */) {
+function computeInputSigCacheKey(tx, inputIndex, utxo, scriptVerifyFlags) {
   const input = tx.inputs[inputIndex];
-  const scriptPubKey = utxo.scriptPubKey;
   const sighashCommitWriter = new BufferWriter;
   sighashCommitWriter.writeHash(getTxId(tx));
   sighashCommitWriter.writeUInt32LE(inputIndex);
@@ -11529,7 +11579,12 @@ function verifyInputSignature(tx, inputIndex, utxo, cache, utxos, taprootCache, 
   sighashCommitWriter.writeUInt64LE(utxo.amount);
   sighashCommitWriter.writeVarBytes(utxo.scriptPubKey);
   const sighashCommit = sha256Hash(sighashCommitWriter.toBuffer());
-  const cacheKey = globalSigCache.computeKey(sighashCommit, input.scriptSig, input.witness, scriptVerifyFlags);
+  return globalSigCache.computeKey(sighashCommit, input.scriptSig, input.witness, scriptVerifyFlags);
+}
+function verifyInputSignature(tx, inputIndex, utxo, cache, utxos, taprootCache, scriptVerifyFlags = 1 /* VERIFY_P2SH */ | 2 /* VERIFY_WITNESS */ | 512 /* VERIFY_TAPROOT */ | 8 /* VERIFY_DERSIG */ | 16 /* VERIFY_NULLDUMMY */ | 32 /* VERIFY_CHECKLOCKTIMEVERIFY */ | 64 /* VERIFY_CHECKSEQUENCEVERIFY */) {
+  const input = tx.inputs[inputIndex];
+  const scriptPubKey = utxo.scriptPubKey;
+  const cacheKey = computeInputSigCacheKey(tx, inputIndex, utxo, scriptVerifyFlags);
   if (globalSigCache.lookup(cacheKey)) {
     return { valid: true, inputIndex };
   }
@@ -11947,20 +12002,20 @@ function validateBip34Height(coinbaseTx, height) {
 }
 function validateBlock(block, height, params) {
   if (block.transactions.length === 0) {
-    return { valid: false, error: "Block has no transactions" };
+    return { valid: false, error: "bad-blk-length" };
   }
   const coinbaseTx = block.transactions[0];
   if (!isCoinbase(coinbaseTx)) {
-    return { valid: false, error: "First transaction is not coinbase" };
+    return { valid: false, error: "bad-cb-missing" };
+  }
+  for (let i = 1;i < block.transactions.length; i++) {
+    if (isCoinbase(block.transactions[i])) {
+      return { valid: false, error: "bad-cb-multiple" };
+    }
   }
   const cbScriptLen = coinbaseTx.inputs[0].scriptSig.length;
   if (cbScriptLen < 2 || cbScriptLen > 100) {
     return { valid: false, error: "bad-cb-length" };
-  }
-  for (let i = 1;i < block.transactions.length; i++) {
-    if (isCoinbase(block.transactions[i])) {
-      return { valid: false, error: `Transaction ${i} is coinbase but should not be` };
-    }
   }
   const txids = block.transactions.map((tx) => getTxId(tx));
   const merkleFlag = { mutated: false };
@@ -12251,12 +12306,14 @@ var exports_utxo = {};
 __export(exports_utxo, {
   serializeUndoData: () => serializeUndoData,
   deserializeUndoData: () => deserializeUndoData,
+  coinMemoryUsage: () => coinMemoryUsage,
   applyTxInUndo: () => applyTxInUndo,
   UTXOManager: () => UTXOManager,
   DisconnectResult: () => DisconnectResult,
   CoinsViewDB: () => CoinsViewDB,
   CoinsViewCache: () => CoinsViewCache,
-  CoinsView: () => CoinsView
+  CoinsView: () => CoinsView,
+  CACHE_ENTRY_OVERHEAD: () => CACHE_ENTRY_OVERHEAD
 });
 function isUnspendableScript(scriptPubKey) {
   return scriptPubKey.length > 0 && scriptPubKey[0] === 106 || scriptPubKey.length > MAX_SCRIPT_SIZE3;
@@ -12562,12 +12619,19 @@ class UTXOManager {
   getEstimatedMemoryUsage() {
     return this.cache.getMemoryUsage();
   }
+  getMemoryUsage() {
+    return this.cache.getMemoryUsage();
+  }
+  getMaxCacheBytes() {
+    return this.maxCacheBytes;
+  }
   getMaxCacheSize() {
     return this.maxCacheSize;
   }
   setMaxCacheBytes(maxBytes) {
     this.maxCacheBytes = maxBytes;
     this.maxCacheSize = Math.floor(maxBytes / CACHE_ENTRY_OVERHEAD);
+    this.cache.setMaxCacheBytes(maxBytes);
   }
   getCacheSize() {
     return this.cache.getCacheSize();
@@ -12770,6 +12834,9 @@ var init_utxo = __esm(() => {
         this.dirtyCount--;
       this.cachedCoinsUsage -= coinMemoryUsage(entry.coin);
       if (entry.fresh) {
+        this.cachedCoinsUsage -= CACHE_ENTRY_OVERHEAD;
+        if (this.cachedCoinsUsage < 0)
+          this.cachedCoinsUsage = 0;
         this.cache.delete(key);
       } else {
         entry.coin = null;
@@ -12794,6 +12861,9 @@ var init_utxo = __esm(() => {
         this.dirtyCount--;
       this.cachedCoinsUsage -= coinMemoryUsage(entry.coin);
       if (entry.fresh) {
+        this.cachedCoinsUsage -= CACHE_ENTRY_OVERHEAD;
+        if (this.cachedCoinsUsage < 0)
+          this.cachedCoinsUsage = 0;
         this.cache.delete(key);
       } else {
         entry.coin = null;
@@ -12823,7 +12893,14 @@ var init_utxo = __esm(() => {
       if (!(this.base instanceof CoinsViewDB)) {
         throw new Error("flush() requires CoinsViewDB as base");
       }
+      const sizeAtStart = this.cache.size;
+      const dirtyAtStart = this.dirtyCount;
+      const hashAtStart = this.hashBlock;
       await this.base.batchWrite(this.cache, this.hashBlock, extraOps);
+      if (this.cache.size !== sizeAtStart || this.dirtyCount !== dirtyAtStart || this.hashBlock !== hashAtStart) {
+        this.flushCount++;
+        return;
+      }
       this.cache.clear();
       this.cachedCoinsUsage = 0;
       this.dirtyCount = 0;
@@ -12833,7 +12910,14 @@ var init_utxo = __esm(() => {
       if (!(this.base instanceof CoinsViewDB)) {
         throw new Error("sync() requires CoinsViewDB as base");
       }
+      const sizeAtStart = this.cache.size;
+      const dirtyAtStart = this.dirtyCount;
+      const hashAtStart = this.hashBlock;
       await this.base.batchWrite(this.cache, this.hashBlock, extraOps);
+      if (this.cache.size !== sizeAtStart || this.dirtyCount !== dirtyAtStart || this.hashBlock !== hashAtStart) {
+        this.flushCount++;
+        return;
+      }
       for (const [key, entry] of this.cache) {
         if (entry.coin === null) {
           this.cachedCoinsUsage -= CACHE_ENTRY_OVERHEAD;
@@ -12862,10 +12946,20 @@ var init_utxo = __esm(() => {
       }
     }
     shouldFlush() {
+      if (this.cache.size === 0) {
+        this.cachedCoinsUsage = 0;
+        return false;
+      }
       return this.cachedCoinsUsage >= this.maxCacheBytes;
     }
     getMemoryUsage() {
       return this.cachedCoinsUsage;
+    }
+    getMaxCacheBytes() {
+      return this.maxCacheBytes;
+    }
+    setMaxCacheBytes(maxBytes) {
+      this.maxCacheBytes = maxBytes;
     }
     getCacheSize() {
       return this.cache.size;
@@ -14961,6 +15055,10 @@ function serializeMessage(magic, msg) {
       break;
     case "getdata":
       command = "getdata";
+      payload = serializeInvPayload(msg.payload.inventory);
+      break;
+    case "notfound":
+      command = "notfound";
       payload = serializeInvPayload(msg.payload.inventory);
       break;
     case "getblocks":
@@ -17147,6 +17245,9 @@ function bip22Result(code) {
   if (s.includes("merkle root mismatch") || s.includes("bad-txnmrklroot")) {
     return "bad-txnmrklroot";
   }
+  if (s.includes("bad-witness-nonce-size")) {
+    return "bad-witness-nonce-size";
+  }
   if (s.includes("witness commitment") || s.includes("bad-witness-merkle-match")) {
     return "bad-witness-merkle-match";
   }
@@ -17155,6 +17256,9 @@ function bip22Result(code) {
   }
   if (s.includes("bad-cb-missing") || s.includes("first transaction is not coinbase") || s.includes("first tx is not coinbase") || s.includes("no coinbase")) {
     return "bad-cb-missing";
+  }
+  if (s.includes("bad-cb-multiple") || s.includes("more than one coinbase") || s.includes("is coinbase but should not be")) {
+    return "bad-cb-multiple";
   }
   if (s.includes("coinbase value") || s.includes("bad-cb-amount") || s.includes("subsidy")) {
     return "bad-cb-amount";
@@ -17198,7 +17302,7 @@ function bip22Result(code) {
   if (s.includes("bad-version")) {
     return s.split(":")[0].trim();
   }
-  if (s.includes("weight") || s.includes("oversize")) {
+  if (s.includes("bad-blk-length") || s.includes("block has no transactions") || s.includes("weight") || s.includes("oversize")) {
     return "bad-blk-length";
   }
   return "rejected";
@@ -17212,6 +17316,483 @@ init_sig_cache();
 init_params();
 init_block();
 init_tx();
+
+// src/validation/script_check_wire.ts
+var MAX_SCRIPTCHECK_WIRE_BYTES = 8 * 1024 * 1024;
+function toU8(b) {
+  const out = new Uint8Array(b.byteLength);
+  out.set(b);
+  return out;
+}
+function toWireTx(tx) {
+  return {
+    version: tx.version,
+    inputs: tx.inputs.map((inp) => ({
+      prevOut: { txid: toU8(inp.prevOut.txid), vout: inp.prevOut.vout },
+      scriptSig: toU8(inp.scriptSig),
+      sequence: inp.sequence,
+      witness: inp.witness.map(toU8)
+    })),
+    outputs: tx.outputs.map((out) => ({
+      value: out.value,
+      scriptPubKey: toU8(out.scriptPubKey)
+    })),
+    lockTime: tx.lockTime
+  };
+}
+function toWireUtxo(u) {
+  return {
+    height: u.height,
+    coinbase: u.coinbase,
+    amount: u.amount,
+    scriptPubKey: toU8(u.scriptPubKey)
+  };
+}
+function buildWireBatch(id, chunk) {
+  const txMap = new Map;
+  const txs = [];
+  const txUtxos = [];
+  const jobs = [];
+  for (const job of chunk) {
+    let txi = txMap.get(job.tx);
+    if (txi === undefined) {
+      txi = txs.length;
+      txMap.set(job.tx, txi);
+      txs.push(toWireTx(job.tx));
+      txUtxos.push(job.utxos.map(toWireUtxo));
+    }
+    jobs.push({
+      txi,
+      inputIndex: job.inputIndex,
+      flags: job.flags
+    });
+  }
+  return { kind: "batch", id, txs, txUtxos, jobs };
+}
+function estimateWireBatchBytes(batch) {
+  let n = 64;
+  for (const tx of batch.txs) {
+    n += 24;
+    for (const inp of tx.inputs) {
+      n += 40 + inp.scriptSig.byteLength;
+      for (const w of inp.witness)
+        n += w.byteLength;
+    }
+    for (const o of tx.outputs)
+      n += 16 + o.scriptPubKey.byteLength;
+  }
+  for (const arr of batch.txUtxos) {
+    for (const u of arr)
+      n += 24 + u.scriptPubKey.byteLength;
+  }
+  n += batch.jobs.length * 16;
+  return n;
+}
+var PACKED_MAGIC = 1212306243;
+function packedSize(batch) {
+  return estimateWireBatchBytes(batch) + 256;
+}
+function encodePackedBatch(batch) {
+  const buf = new ArrayBuffer(packedSize(batch));
+  const v = new DataView(buf);
+  const u8 = new Uint8Array(buf);
+  let o = 0;
+  const wU32 = (x) => {
+    v.setUint32(o, x >>> 0, true);
+    o += 4;
+  };
+  const wI32 = (x) => {
+    v.setInt32(o, x, true);
+    o += 4;
+  };
+  const wU8 = (x) => {
+    v.setUint8(o, x);
+    o += 1;
+  };
+  const wU64 = (x) => {
+    v.setBigUint64(o, x, true);
+    o += 8;
+  };
+  const wBytes = (b) => {
+    wU32(b.byteLength);
+    if (b.byteLength > 0) {
+      u8.set(b, o);
+      o += b.byteLength;
+    }
+  };
+  wU32(PACKED_MAGIC);
+  wU32(batch.id);
+  wU32(batch.txs.length);
+  for (const tx of batch.txs) {
+    wI32(tx.version);
+    wU32(tx.inputs.length);
+    wU32(tx.outputs.length);
+    wU32(tx.lockTime);
+    for (const inp of tx.inputs) {
+      if (inp.prevOut.txid.byteLength !== 32) {
+        throw new Error("packed wire: txid must be 32 bytes");
+      }
+      u8.set(inp.prevOut.txid, o);
+      o += 32;
+      wU32(inp.prevOut.vout);
+      wBytes(inp.scriptSig);
+      wU32(inp.sequence);
+      wU32(inp.witness.length);
+      for (const w of inp.witness)
+        wBytes(w);
+    }
+    for (const out of tx.outputs) {
+      wU64(out.value);
+      wBytes(out.scriptPubKey);
+    }
+  }
+  wU32(batch.txUtxos.length);
+  for (const arr of batch.txUtxos) {
+    wU32(arr.length);
+    for (const u of arr) {
+      wU32(u.height);
+      wU8(u.coinbase ? 1 : 0);
+      wU64(u.amount);
+      wBytes(u.scriptPubKey);
+    }
+  }
+  wU32(batch.jobs.length);
+  for (const job of batch.jobs) {
+    wU32(job.txi);
+    wU32(job.inputIndex);
+    wU32(job.flags);
+  }
+  if (o !== buf.byteLength) {
+    return buf.slice(0, o);
+  }
+  return buf;
+}
+function scriptCheckWireBudget(cacheBytes) {
+  if (typeof cacheBytes === "number" && cacheBytes > 0) {
+    return Math.max(1024 * 1024, Math.min(MAX_SCRIPTCHECK_WIRE_BYTES, Math.floor(cacheBytes / 4)));
+  }
+  return MAX_SCRIPTCHECK_WIRE_BYTES;
+}
+
+// src/validation/script_check_queue.ts
+init_sig_cache();
+init_tx();
+var MAX_SCRIPTCHECK_THREADS = 15;
+var SCRIPTCHECK_BATCH_SIZE = 128;
+var MIN_JOBS_FOR_POOL = 8;
+var SCRIPT_CHECK_RESULT_TIMEOUT_MS = 30000;
+var resultTimeoutMs = SCRIPT_CHECK_RESULT_TIMEOUT_MS;
+var workerUrlForTests = null;
+var SCRIPT_WORKER_RSS_BUDGET = 64 * 1024 * 1024;
+function clampScriptThreads(n, cacheBytes) {
+  let threads = n;
+  if (threads === undefined || threads <= 0) {
+    const hw = typeof navigator !== "undefined" && navigator.hardwareConcurrency > 0 ? navigator.hardwareConcurrency : 4;
+    threads = hw;
+  }
+  threads = Math.max(1, Math.min(Math.floor(threads), MAX_SCRIPTCHECK_THREADS));
+  if (typeof cacheBytes === "number" && Number.isFinite(cacheBytes) && cacheBytes > 0) {
+    const maxByCache = Math.max(1, Math.floor(cacheBytes / SCRIPT_WORKER_RSS_BUDGET));
+    threads = Math.min(threads, maxByCache);
+  }
+  return threads;
+}
+function hardwareThreads() {
+  return clampScriptThreads(0);
+}
+
+class VerifyPool {
+  size;
+  workers = [];
+  ready;
+  nextId = 1;
+  inflight = new Map;
+  readyCount = 0;
+  readyResolve = null;
+  failed = null;
+  constructor(size) {
+    this.size = size;
+    this.ready = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.readyCount < this.size) {
+          reject(new Error(`script-check workers ready timeout (${this.readyCount}/${this.size})`));
+        }
+      }, 20000);
+      this.readyResolve = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+    const url = workerUrlForTests ?? new URL("./script_check_worker.ts", import.meta.url);
+    for (let i = 0;i < size; i++) {
+      const worker = new Worker(url);
+      worker.unref?.();
+      worker.onmessage = (ev) => this.onMessage(ev.data);
+      worker.onerror = (ev) => {
+        this.failed = new Error(ev.message || "script-check worker error");
+        for (const p of this.inflight.values())
+          p.reject(this.failed);
+        this.inflight.clear();
+      };
+      this.workers.push(worker);
+    }
+  }
+  onMessage(msg) {
+    if (msg.kind === "ready") {
+      this.readyCount++;
+      if (this.readyCount >= this.size) {
+        this.readyResolve?.();
+        this.readyResolve = null;
+      }
+      return;
+    }
+    const pending = this.inflight.get(msg.id);
+    if (!pending)
+      return;
+    this.inflight.delete(msg.id);
+    pending.resolve(msg);
+  }
+  async waitReady() {
+    await this.ready;
+    if (this.failed)
+      throw this.failed;
+  }
+  async verify(jobs, wireBudgetBytes, threadLimit) {
+    await this.waitReady();
+    if (this.failed)
+      throw this.failed;
+    if (jobs.length === 0)
+      return { valid: true };
+    const budget = wireBudgetBytes ?? scriptCheckWireBudget();
+    const n = Math.max(1, Math.min(threadLimit ?? this.size, this.size, jobs.length));
+    return this.drain(jobs, n, budget);
+  }
+  async drain(jobs, nWorkers, budget) {
+    peakInFlightJobs = 0;
+    peakInFlightBytes = 0;
+    lastDispatchWorkers = 0;
+    let qHead = 0;
+    let earliestFailIndex = Number.POSITIVE_INFINITY;
+    let failResult = null;
+    let inFlightJobs = 0;
+    let inFlightBytes = 0;
+    const used = new Set;
+    const takeBatch = () => {
+      const items = [];
+      const origIndices = [];
+      const remaining = jobs.length - qHead;
+      if (remaining <= 0)
+        return null;
+      const adaptive = Math.max(1, Math.ceil(remaining / nWorkers));
+      const cap = Math.min(SCRIPTCHECK_BATCH_SIZE, adaptive);
+      while (qHead < jobs.length && items.length < cap) {
+        const origIndex = qHead;
+        if (origIndex >= earliestFailIndex) {
+          qHead = jobs.length;
+          break;
+        }
+        const job = jobs[origIndex];
+        if (items.length > 0) {
+          const bytes = estimateWireBatchBytes(buildWireBatch(0, [...items, job]));
+          if (bytes > budget)
+            break;
+        }
+        items.push(job);
+        origIndices.push(origIndex);
+        qHead++;
+      }
+      if (items.length === 0)
+        return null;
+      return {
+        items,
+        origIndices,
+        bytes: estimateWireBatchBytes(buildWireBatch(0, items))
+      };
+    };
+    const workerLoop = async (w) => {
+      while (true) {
+        const batch = takeBatch();
+        if (!batch)
+          return;
+        used.add(w);
+        inFlightJobs += batch.items.length;
+        inFlightBytes += batch.bytes;
+        if (inFlightJobs > peakInFlightJobs)
+          peakInFlightJobs = inFlightJobs;
+        if (inFlightBytes > peakInFlightBytes)
+          peakInFlightBytes = inFlightBytes;
+        try {
+          const out = await this.sendChunk(this.workers[w], batch.items);
+          if (out.kind === "crash") {
+            throw new Error(out.error);
+          }
+          if (out.kind !== "result") {
+            throw new Error(`unexpected worker message ${out.kind}`);
+          }
+          for (const item of out.results) {
+            if (item.valid)
+              continue;
+            const origIndex = batch.origIndices[item.jobIndex];
+            if (origIndex >= earliestFailIndex)
+              continue;
+            const job = batch.items[item.jobIndex];
+            earliestFailIndex = origIndex;
+            failResult = {
+              valid: false,
+              error: item.error ?? "Input verification failed",
+              failedInput: job.inputIndex,
+              failedTxidHex: job.txidHex
+            };
+          }
+        } finally {
+          inFlightJobs -= batch.items.length;
+          inFlightBytes -= batch.bytes;
+        }
+      }
+    };
+    const settled = await Promise.allSettled(Array.from({ length: nWorkers }, (_, w) => workerLoop(w)));
+    lastDispatchWorkers = used.size;
+    const rejected = settled.find((s) => s.status === "rejected");
+    if (rejected && rejected.status === "rejected") {
+      throw rejected.reason;
+    }
+    return failResult ?? { valid: true };
+  }
+  sendChunk(worker, chunk) {
+    const id = this.nextId++;
+    const batch = buildWireBatch(id, chunk);
+    const packed = encodePackedBatch(batch);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.inflight.delete(id);
+        reject(new Error(`script-check worker result timeout (id=${id}, jobs=${chunk.length})`));
+      }, resultTimeoutMs);
+      this.inflight.set(id, {
+        resolve: (msg) => {
+          clearTimeout(timer);
+          resolve(msg);
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        }
+      });
+      try {
+        worker.postMessage(packed, [packed]);
+      } catch (e) {
+        clearTimeout(timer);
+        this.inflight.delete(id);
+        reject(e instanceof Error ? e : new Error(String(e)));
+      }
+    });
+  }
+  shutdown() {
+    for (const w of this.workers) {
+      try {
+        w.postMessage({ kind: "stop" });
+        w.terminate();
+      } catch {}
+    }
+    this.workers = [];
+    for (const p of this.inflight.values()) {
+      p.reject(new Error("script-check pool shutdown"));
+    }
+    this.inflight.clear();
+  }
+}
+var globalPool = null;
+var creating = null;
+function scriptCheckPoolSize() {
+  return globalPool?.size ?? 0;
+}
+var peakInFlightJobs = 0;
+var peakInFlightBytes = 0;
+var lastDispatchWorkers = 0;
+async function getPool(size) {
+  if (globalPool && globalPool.size >= size) {
+    await globalPool.waitReady();
+    return globalPool;
+  }
+  if (creating) {
+    const pending = await creating;
+    if (pending.size >= size)
+      return pending;
+  }
+  creating = (async () => {
+    globalPool?.shutdown();
+    const pool = new VerifyPool(size);
+    await pool.waitReady();
+    globalPool = pool;
+    return pool;
+  })();
+  try {
+    return await creating;
+  } finally {
+    creating = null;
+  }
+}
+function verifySequential(jobs) {
+  const caches = new Map;
+  for (const job of jobs) {
+    let cache = caches.get(job.tx);
+    if (!cache) {
+      cache = { sig: {}, tap: {} };
+      caches.set(job.tx, cache);
+    }
+    const utxo = job.utxos[job.inputIndex];
+    const result = verifyInputSignature(job.tx, job.inputIndex, utxo, cache.sig, job.utxos, cache.tap, job.flags);
+    if (!result.valid) {
+      return {
+        valid: false,
+        error: result.error ?? "Input verification failed",
+        failedInput: job.inputIndex,
+        failedTxidHex: job.txidHex
+      };
+    }
+  }
+  return { valid: true };
+}
+async function verifyScriptChecks(jobs, threads, cacheBytes) {
+  if (jobs.length === 0)
+    return { valid: true };
+  const n = clampScriptThreads(threads ?? hardwareThreads(), cacheBytes);
+  const usePool = n > 1 && jobs.length >= MIN_JOBS_FOR_POOL;
+  if (!usePool) {
+    return verifySequential(jobs);
+  }
+  const pending = [];
+  for (const job of jobs) {
+    const utxo = job.utxos[job.inputIndex];
+    if (!utxo) {
+      return {
+        valid: false,
+        error: "UTXO count mismatch",
+        failedInput: job.inputIndex,
+        failedTxidHex: job.txidHex
+      };
+    }
+    const key = computeInputSigCacheKey(job.tx, job.inputIndex, utxo, job.flags);
+    if (!globalSigCache.lookup(key)) {
+      pending.push(job);
+    }
+  }
+  if (pending.length === 0)
+    return { valid: true };
+  try {
+    const pool = await getPool(n);
+    const result = await pool.verify(pending, scriptCheckWireBudget(cacheBytes), n);
+    if (result.valid) {
+      for (const job of pending) {
+        const utxo = job.utxos[job.inputIndex];
+        globalSigCache.insert(computeInputSigCacheKey(job.tx, job.inputIndex, utxo, job.flags));
+      }
+    }
+    return result;
+  } catch (e) {
+    console.warn(`[script-check] worker pool failed (${e instanceof Error ? e.message : String(e)}); falling back to sequential`);
+    return verifySequential(pending);
+  }
+}
 
 // src/mining/template.ts
 init_params();
@@ -17769,7 +18350,7 @@ async function coreConnectBlockChecks(block, height, utxoManager, params, opts =
     skipScripts = false,
     prevMTP = 0,
     enforceBIP68 = false,
-    scriptThreads = 4,
+    scriptThreads,
     verifyDERSig = height >= params.bip66Height,
     verifyCLTV = height >= params.bip65Height,
     verifyCSV = height >= params.csvHeight,
@@ -17857,6 +18438,8 @@ async function coreConnectBlockChecks(block, height, utxoManager, params, opts =
   let totalOutputValue = 0n;
   let nFees = 0n;
   const MAX_MONEY_FEE = 2100000000000000n;
+  const scriptJobs = [];
+  const effectiveScriptThreads = clampScriptThreads(scriptThreads === undefined ? 1 : scriptThreads, utxoManager.getMaxCacheBytes());
   for (let txIndex = 0;txIndex < block.transactions.length; txIndex++) {
     const tx = block.transactions[txIndex];
     const txid = getTxId(tx);
@@ -17906,19 +18489,15 @@ async function coreConnectBlockChecks(block, height, utxoManager, params, opts =
         }
       }
       if (!skipScripts) {
-        const scriptFlags = blockScriptFlags;
-        let scriptResult;
-        if (scriptThreads === 1) {
-          scriptResult = verifyAllInputsSequential(tx, inputUTXOs, scriptFlags);
-        } else {
-          scriptResult = await verifyAllInputsParallel(tx, inputUTXOs, scriptFlags);
-        }
-        if (!scriptResult.valid) {
-          const errSuffix = (scriptResult.failedInput !== undefined ? ` (input ${scriptResult.failedInput})` : "") + (scriptResult.error ? `: ${scriptResult.error}` : "");
-          return {
-            ok: false,
-            error: `Script verification failed in tx ${txidHex.slice(0, 16)} at height ${height}${errSuffix}`
-          };
+        const copied = inputUTXOs.slice();
+        for (let i = 0;i < tx.inputs.length; i++) {
+          scriptJobs.push({
+            tx,
+            inputIndex: i,
+            utxos: copied,
+            flags: blockScriptFlags,
+            txidHex
+          });
         }
       }
       const MAX_MONEY_INPUT = 2100000000000000n;
@@ -17999,6 +18578,17 @@ async function coreConnectBlockChecks(block, height, utxoManager, params, opts =
       error: `bad-cb-amount: coinbase pays too much (actual=${coinbaseOutputValue} vs limit=${blockReward}) at height ${height}`
     };
   }
+  if (scriptJobs.length > 0) {
+    const scriptResult = await verifyScriptChecks(scriptJobs, effectiveScriptThreads, utxoManager.getMaxCacheBytes());
+    if (!scriptResult.valid) {
+      const who = scriptResult.failedTxidHex?.slice(0, 16) ?? "unknown";
+      const errSuffix = (scriptResult.failedInput !== undefined ? ` (input ${scriptResult.failedInput})` : "") + (scriptResult.error ? `: ${scriptResult.error}` : "");
+      return {
+        ok: false,
+        error: `Script verification failed in tx ${who} at height ${height}${errSuffix}`
+      };
+    }
+  }
   return {
     ok: true,
     spentOutputs,
@@ -18073,6 +18663,7 @@ class ChainStateManager {
   blockSequenceId = 0;
   lastPreciousChainwork = 0n;
   pruningEnabled = false;
+  cachedTxOutSet = null;
   constructor(db, params, maxCacheBytes) {
     this.db = db;
     this.utxo = new UTXOManager(db, maxCacheBytes);
@@ -18238,6 +18829,7 @@ class ChainStateManager {
       height,
       chainWork
     };
+    this.clearCachedTxOutSet();
     this.notifyTipChanged();
     await this.db.putChainState({
       bestBlockHash: blockHash,
@@ -18351,6 +18943,7 @@ class ChainStateManager {
       height: prevHeight,
       chainWork: prevChainWork
     };
+    this.clearCachedTxOutSet();
     this.notifyTipChanged();
     if (this.filterIndex && this.filterIndex.isEnabled()) {
       try {
@@ -18442,8 +19035,18 @@ class ChainStateManager {
   getBestBlock() {
     return { ...this.bestBlock };
   }
+  setCachedTxOutSet(stats) {
+    this.cachedTxOutSet = stats;
+  }
+  getCachedTxOutSet() {
+    return this.cachedTxOutSet;
+  }
+  clearCachedTxOutSet() {
+    this.cachedTxOutSet = null;
+  }
   updateTip(hash, height, chainWork) {
     this.bestBlock = { hash, height, chainWork };
+    this.clearCachedTxOutSet();
     this.notifyTipChanged();
   }
   validateTxInputs(tx, height) {
@@ -19149,6 +19752,66 @@ async function computeUTXOSetHash(db, interruptCheck) {
 function getBogoSize(scriptPubKeyLen) {
   return 32n + 4n + 4n + 8n + 2n + BigInt(scriptPubKeyLen);
 }
+function expandP2PKH(hash1602) {
+  const out = Buffer.allocUnsafe(25);
+  out[0] = 118;
+  out[1] = 169;
+  out[2] = 20;
+  hash1602.copy(out, 3, 0, 20);
+  out[23] = 136;
+  out[24] = 172;
+  return out;
+}
+function expandP2SH(hash1602) {
+  const out = Buffer.allocUnsafe(23);
+  out[0] = 169;
+  out[1] = 20;
+  hash1602.copy(out, 2, 0, 20);
+  out[22] = 135;
+  return out;
+}
+function encodeUtxoValue(dest, height, coinbase, amount, scriptPubKey) {
+  dest.writeUInt32LE(height >>> 0, 0);
+  dest[4] = coinbase ? 1 : 0;
+  dest.writeBigUInt64LE(amount, 5);
+  const spkLen = scriptPubKey.length;
+  let pos = 13;
+  if (spkLen <= 252) {
+    dest[pos++] = spkLen;
+  } else if (spkLen <= 65535) {
+    dest[pos++] = 253;
+    dest.writeUInt16LE(spkLen, pos);
+    pos += 2;
+  } else {
+    dest[pos++] = 254;
+    dest.writeUInt32LE(spkLen, pos);
+    pos += 4;
+  }
+  scriptPubKey.copy(dest, pos);
+  return pos + spkLen;
+}
+function flushSnapshotHashGroup(hasher, txid, group, stats) {
+  if (!txid || group.length === 0) {
+    group.length = 0;
+    return;
+  }
+  if (group.length > 1) {
+    group.sort((a, b) => a.vout - b.vout);
+  }
+  if (stats)
+    stats.transactions++;
+  for (const c of group) {
+    if (stats) {
+      stats.txouts++;
+      stats.totalAmount += c.amount;
+      stats.bogosize += getBogoSize(c.scriptPubKey.length);
+    }
+    if (hasher) {
+      hasher.update(txOutSerBytes(txid, c.vout, c.height, c.coinbase, c.amount, c.scriptPubKey));
+    }
+  }
+  group.length = 0;
+}
 async function computeUTXOSetStats(db, hashType, interruptCheck) {
   const hasher = hashType === "hash_serialized_3" ? new Bun.CryptoHasher("sha256") : null;
   const muhash = hashType === "muhash" ? new MuHash3072 : null;
@@ -19260,7 +19923,7 @@ class StreamingBufferReader {
   windowEnd;
   windowOff;
   bytesConsumed;
-  static WINDOW_BYTES = 8 * 1024 * 1024;
+  static WINDOW_BYTES = 32 * 1024 * 1024;
   constructor(fh, fileSize) {
     this.fh = fh;
     this.fileSize = fileSize;
@@ -19273,22 +19936,20 @@ class StreamingBufferReader {
   get position() {
     return this.bytesConsumed;
   }
+  remaining() {
+    return this.windowEnd - this.windowOff;
+  }
   isEOF() {
     return this.filePos >= this.fileSize && this.windowOff >= this.windowEnd;
   }
-  async ensure(n) {
-    if (n > this.window.length) {
-      throw new Error(`StreamingBufferReader: requested ${n} bytes exceeds window ${this.window.length}`);
-    }
-    if (this.windowEnd - this.windowOff >= n)
-      return;
+  async fillWindow() {
     const tailLen = this.windowEnd - this.windowOff;
     if (tailLen > 0 && this.windowOff > 0) {
       this.window.copy(this.window, 0, this.windowOff, this.windowEnd);
     }
     this.windowEnd = tailLen;
     this.windowOff = 0;
-    while (this.windowEnd < n && this.filePos < this.fileSize) {
+    while (this.windowEnd < this.window.length && this.filePos < this.fileSize) {
       const want = Math.min(this.window.length - this.windowEnd, this.fileSize - this.filePos);
       const { bytesRead } = await this.fh.read(this.window, this.windowEnd, want, this.filePos);
       if (bytesRead === 0)
@@ -19296,73 +19957,82 @@ class StreamingBufferReader {
       this.windowEnd += bytesRead;
       this.filePos += bytesRead;
     }
+  }
+  require(n) {
+    if (n > this.window.length) {
+      throw new Error(`StreamingBufferReader: requested ${n} bytes exceeds window ${this.window.length}`);
+    }
     if (this.windowEnd - this.windowOff < n) {
-      throw new Error(`StreamingBufferReader: underrun — wanted ${n} bytes but only ` + `${this.windowEnd - this.windowOff} available (file pos ` + `${this.bytesConsumed + this.windowOff}, file size ${this.fileSize})`);
+      throw new Error(`StreamingBufferReader: underrun — wanted ${n} bytes but only ` + `${this.windowEnd - this.windowOff} available (file pos ` + `${this.bytesConsumed}, file size ${this.fileSize})`);
     }
   }
-  async readUInt8() {
-    await this.ensure(1);
+  readUInt8() {
+    this.require(1);
     const v = this.window.readUInt8(this.windowOff);
     this.windowOff += 1;
     this.bytesConsumed += 1;
     return v;
   }
-  async readUInt16LE() {
-    await this.ensure(2);
+  readUInt16LE() {
+    this.require(2);
     const v = this.window.readUInt16LE(this.windowOff);
     this.windowOff += 2;
     this.bytesConsumed += 2;
     return v;
   }
-  async readUInt32LE() {
-    await this.ensure(4);
+  readUInt32LE() {
+    this.require(4);
     const v = this.window.readUInt32LE(this.windowOff);
     this.windowOff += 4;
     this.bytesConsumed += 4;
     return v;
   }
-  async readUInt64LE() {
-    await this.ensure(8);
+  readUInt64LE() {
+    this.require(8);
     const v = this.window.readBigUInt64LE(this.windowOff);
     this.windowOff += 8;
     this.bytesConsumed += 8;
     return v;
   }
-  async readBytes(n) {
-    await this.ensure(n);
-    const out = Buffer.from(this.window.subarray(this.windowOff, this.windowOff + n));
+  readBytesView(n) {
+    this.require(n);
+    const view = this.window.subarray(this.windowOff, this.windowOff + n);
     this.windowOff += n;
     this.bytesConsumed += n;
-    return out;
+    return view;
   }
-  async readHash() {
+  readBytes(n) {
+    return Buffer.from(this.readBytesView(n));
+  }
+  readHash() {
     return this.readBytes(32);
   }
-  async readVarIntBig() {
-    const first = await this.readUInt8();
+  skip(n) {
+    this.require(n);
+    this.windowOff += n;
+    this.bytesConsumed += n;
+  }
+  readVarIntBig() {
+    const first = this.readUInt8();
     if (first <= 252)
       return BigInt(first);
     if (first === 253)
-      return BigInt(await this.readUInt16LE());
+      return BigInt(this.readUInt16LE());
     if (first === 254)
-      return BigInt(await this.readUInt32LE());
-    return await this.readUInt64LE();
+      return BigInt(this.readUInt32LE());
+    return this.readUInt64LE();
   }
-  async readVarInt() {
-    const v = await this.readVarIntBig();
+  readVarInt() {
+    const v = this.readVarIntBig();
     if (v > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new Error("readVarInt: value exceeds Number.MAX_SAFE_INTEGER");
     }
     return Number(v);
   }
-  async readVarBytes() {
-    const len = await this.readVarInt();
-    return this.readBytes(len);
-  }
-  async readVarIntCore() {
+  readVarIntCore() {
     let n = 0n;
     while (true) {
-      const ch = await this.readUInt8();
+      const ch = this.readUInt8();
       n = n << 7n | BigInt(ch & 127);
       if ((ch & 128) === 0)
         return n;
@@ -19413,18 +20083,39 @@ class ChainstateManager {
     let coinsLoaded = 0n;
     let metadata;
     let auData;
+    let baseHeight;
     let snapshotChainstate;
+    let streamedHash = null;
+    const loadStats = {
+      txouts: 0n,
+      transactions: 0n,
+      bogosize: 0n,
+      totalAmount: 0n
+    };
     try {
       const stream = new StreamingBufferReader(fh, stat.size);
+      await stream.fillWindow();
       const headerLen = SNAPSHOT_MAGIC.length + 2 + 4 + 32 + 8;
-      const headerBuf = await stream.readBytes(headerLen);
+      const headerBuf = stream.readBytes(headerLen);
       metadata = deserializeSnapshotMetadata(new BufferReader(headerBuf), this.params.networkMagic);
+      const unsafeHeightEnv = process.env.HASHHOG_UNSAFE_SNAPSHOT_HEIGHT;
       const lookup = getAssumeutxoData(this.params, metadata.baseBlockHash);
-      if (!lookup) {
+      if (!lookup && !unsafeHeightEnv) {
         throw new Error(`No assumeutxo data for block ${metadata.baseBlockHash.toString("hex")}`);
       }
-      auData = lookup;
-      if (auData.height <= activeTipHeight) {
+      if (lookup) {
+        auData = lookup;
+        baseHeight = lookup.height;
+      } else {
+        const parsedHeight = Number(unsafeHeightEnv);
+        if (!Number.isInteger(parsedHeight) || parsedHeight < 0) {
+          throw new Error(`HASHHOG_UNSAFE_SNAPSHOT_HEIGHT=${unsafeHeightEnv} is not a valid block height`);
+        }
+        auData = null;
+        baseHeight = parsedHeight;
+        console.warn(`WARNING: HASHHOG_UNSAFE_SNAPSHOT_HEIGHT=${parsedHeight} -- accepting an ` + `UNVERIFIED snapshot whose base blockhash ` + `${Buffer.from(metadata.baseBlockHash).reverse().toString("hex")} is NOT a ` + `chainparams trust anchor. The hardcoded hash_serialized comparison is ` + `SKIPPED and the base height is taken from the environment on faith. ` + `Development use only; never enable this in production.`);
+      }
+      if (baseHeight <= activeTipHeight) {
         throw new Error("Work does not exceed active chainstate");
       }
       snapshotChainstate = new Chainstate(this.db, this.params, {
@@ -19433,72 +20124,93 @@ class ChainstateManager {
         maxCacheBytes: this.maxCacheBytes
       });
       snapshotChainstate.tipHash = metadata.baseBlockHash;
-      snapshotChainstate.tipHeight = auData.height;
-      const batchOps = [];
+      snapshotChainstate.tipHeight = baseHeight;
+      let batch = this.db.newChainedBatch();
+      const valueScratch = Buffer.allocUnsafe(16 * 1024);
+      const hasher = auData ? new Bun.CryptoHasher("sha256") : null;
+      const hashGroup = [];
+      let hashTxid = null;
       while (coinsLoaded < metadata.coinsCount) {
         if (interruptCheck?.()) {
           throw new Error("Interrupted");
         }
-        const txid = await stream.readHash();
-        const numOutputs = await stream.readVarInt();
+        if (stream.remaining() < 64)
+          await stream.fillWindow();
+        const txid = stream.readHash();
+        const numOutputs = stream.readVarInt();
         if (BigInt(numOutputs) > metadata.coinsCount - coinsLoaded) {
           throw new Error("Mismatch in coins count in snapshot metadata and actual snapshot data");
         }
+        flushSnapshotHashGroup(hasher, hashTxid, hashGroup, loadStats);
+        hashTxid = txid;
         for (let i = 0;i < numOutputs; i++) {
-          const vout = await stream.readVarInt();
+          if (stream.remaining() < 64)
+            await stream.fillWindow();
+          const vout = stream.readVarInt();
           if (vout >= MAX_VOUT) {
             throw new Error(`Bad snapshot data after deserializing ${coinsLoaded} coins`);
           }
-          const codeBig = await stream.readVarIntCore();
+          const codeBig = stream.readVarIntCore();
           const height = Number(codeBig >> 1n);
           const isCoinbase2 = (codeBig & 1n) === 1n;
-          const compAmount = await stream.readVarIntCore();
+          const compAmount = stream.readVarIntCore();
           const value = decompressAmount(compAmount);
           if (value < 0n || value > MAX_MONEY) {
             throw new Error(`Bad snapshot data after deserializing ${coinsLoaded} coins - bad tx out value`);
           }
-          const nSizeBig = await stream.readVarIntCore();
+          const nSizeBig = stream.readVarIntCore();
           const nSize = Number(nSizeBig);
           let scriptPubKey;
           if (nSize < NUM_SPECIAL_SCRIPTS) {
             const payloadLen = getSpecialScriptSize(nSize);
-            const payload = await stream.readBytes(payloadLen);
-            scriptPubKey = decompressScript(nSize, payload);
+            if (stream.remaining() < payloadLen)
+              await stream.fillWindow();
+            const payload = stream.readBytesView(payloadLen);
+            if (nSize === 0) {
+              scriptPubKey = expandP2PKH(payload);
+            } else if (nSize === 1) {
+              scriptPubKey = expandP2SH(payload);
+            } else {
+              scriptPubKey = decompressScript(nSize, Buffer.from(payload));
+            }
           } else {
             const rawSize = nSize - NUM_SPECIAL_SCRIPTS;
             if (rawSize > MAX_SCRIPT_SIZE4) {
-              await stream.readBytes(rawSize);
+              if (stream.remaining() < rawSize)
+                await stream.fillWindow();
+              stream.skip(rawSize);
               scriptPubKey = Buffer.from([106]);
             } else {
-              scriptPubKey = await stream.readBytes(rawSize);
+              if (stream.remaining() < rawSize)
+                await stream.fillWindow();
+              scriptPubKey = stream.readBytes(rawSize);
             }
           }
-          if (height > auData.height) {
-            throw new Error(`Invalid coin height ${height} > snapshot height ${auData.height}`);
+          if (height > baseHeight) {
+            throw new Error(`Invalid coin height ${height} > snapshot height ${baseHeight}`);
           }
-          const key = Buffer.alloc(36);
-          txid.copy(key, 0);
-          key.writeUInt32LE(vout, 32);
-          const writer = new BufferWriter;
-          writer.writeUInt32LE(height);
-          writer.writeUInt8(isCoinbase2 ? 1 : 0);
-          writer.writeUInt64LE(value);
-          writer.writeVarBytes(scriptPubKey);
-          batchOps.push({
-            type: "put",
-            prefix: 117 /* UTXO */,
-            key,
-            value: writer.toBuffer()
+          const encodedLen = encodeUtxoValue(valueScratch, height, isCoinbase2, value, scriptPubKey);
+          batch.putUTXO(txid, vout, Buffer.from(valueScratch.subarray(0, encodedLen)));
+          hashGroup.push({
+            vout,
+            height,
+            coinbase: isCoinbase2,
+            amount: value,
+            scriptPubKey
           });
           coinsLoaded++;
-          if (batchOps.length >= COINS_LOAD_BATCH_SIZE) {
-            await this.db.batch(batchOps);
-            batchOps.length = 0;
+          if (batch.length >= COINS_LOAD_BATCH_SIZE) {
+            await batch.write();
+            batch = this.db.newChainedBatch();
           }
         }
       }
-      if (batchOps.length > 0) {
-        await this.db.batch(batchOps);
+      if (batch.length > 0) {
+        await batch.write();
+      }
+      flushSnapshotHashGroup(hasher, hashTxid, hashGroup, loadStats);
+      if (hasher) {
+        streamedHash = sha256Hash(Buffer.from(hasher.digest()));
       }
       if (!stream.isEOF()) {
         throw new Error(`Bad snapshot - coins left over after deserializing ${coinsLoaded} coins`);
@@ -19506,8 +20218,8 @@ class ChainstateManager {
     } finally {
       await fh.close().catch(() => {});
     }
-    const { hash: computedHash, coinsCount } = await computeUTXOSetHash(this.db, interruptCheck);
-    if (!computedHash.equals(auData.hashSerialized)) {
+    const { hash: computedHash } = streamedHash ? { hash: streamedHash } : auData ? await computeUTXOSetHash(this.db, interruptCheck) : { hash: Buffer.alloc(0) };
+    if (auData && !computedHash.equals(auData.hashSerialized)) {
       throw new Error(`Bad snapshot content hash: expected ${auData.hashSerialized.toString("hex")}, got ${computedHash.toString("hex")}`);
     }
     this.backgroundChainstate = new Chainstate(this.db, this.params, {
@@ -19519,8 +20231,13 @@ class ChainstateManager {
     return {
       coinsLoaded,
       baseBlockHash: metadata.baseBlockHash,
-      baseHeight: auData.height,
-      path: filePath
+      baseHeight,
+      path: filePath,
+      hashSerialized: streamedHash ?? (computedHash.length === 32 ? computedHash : undefined),
+      transactions: loadStats.transactions,
+      txouts: loadStats.txouts,
+      bogosize: loadStats.bogosize,
+      totalAmount: loadStats.totalAmount
     };
   }
   async dumpSnapshot(filePath, interruptCheck) {
@@ -19618,10 +20335,10 @@ class ChainstateManager {
       renamed = true;
       return {
         coinsWritten,
-        baseHash: chainstate.bestBlockHash.toString("hex"),
+        baseHash: Buffer.from(chainstate.bestBlockHash).reverse().toString("hex"),
         baseHeight: chainstate.bestHeight,
         path: filePath,
-        txoutsetHash: hash.toString("hex"),
+        txoutsetHash: Buffer.from(hash).reverse().toString("hex"),
         nChainTx: 0n
       };
     } finally {
@@ -19730,6 +20447,54 @@ function getAssumeutxoData(params, blockHash) {
   return assumeutxo.get(key) ?? null;
 }
 var HASH_HEX_RE = /^[0-9a-fA-F]{64}$/;
+var HEADER_HEX_RE = /^[0-9a-fA-F]{160}$/;
+function parseBaseTailHeaders(hexes2, expectedBaseHash, baseHeight, entryIndex) {
+  if (hexes2.length === 0)
+    return [];
+  if (hexes2.length - 1 > baseHeight) {
+    throw new Error(`loadCampaignAssumeutxo: entry ${entryIndex} (height ${baseHeight}) ` + `base_tail_headers has ${hexes2.length} entries but the base height ` + `is only ${baseHeight} (the band would start below genesis)`);
+  }
+  const headers = [];
+  let prevHash = null;
+  for (let i = 0;i < hexes2.length; i++) {
+    const hex = hexes2[i];
+    if (typeof hex !== "string" || !HEADER_HEX_RE.test(hex)) {
+      throw new Error(`loadCampaignAssumeutxo: entry ${entryIndex} base_tail_headers[${i}] ` + `is not 160 hex chars / 80 bytes`);
+    }
+    const buf = Buffer.from(hex, "hex");
+    const prevBlock = buf.subarray(4, 36);
+    if (prevHash !== null && !prevBlock.equals(prevHash)) {
+      throw new Error(`loadCampaignAssumeutxo: entry ${entryIndex}: base_tail_headers does ` + `not chain — header ${i}'s prev-hash does not link to [${i - 1}]`);
+    }
+    prevHash = hash256(buf);
+    headers.push(buf);
+  }
+  if (prevHash !== null && !prevHash.equals(expectedBaseHash)) {
+    throw new Error(`loadCampaignAssumeutxo: entry ${entryIndex}: base_tail_headers' last ` + `header hashes to ${Buffer.from(prevHash).reverse().toString("hex")}, ` + `not the entry blockhash ${Buffer.from(expectedBaseHash).reverse().toString("hex")}`);
+  }
+  return headers;
+}
+async function persistAssumeutxoTailHeaders(db, au) {
+  const tails = au.baseTailHeaders;
+  if (!tails || tails.length <= 1)
+    return 0;
+  const n = tails.length;
+  const startHeight = au.height - (n - 1);
+  let written = 0;
+  for (let i = 0;i < n - 1; i++) {
+    const buf = tails[i];
+    const hash = hash256(buf);
+    await db.putBlockIndex(hash, {
+      height: startHeight + i,
+      header: buf,
+      nTx: 0,
+      status: 1 /* HEADER_VALID */,
+      dataPos: 0
+    }, { writeHeightIndex: false });
+    written++;
+  }
+  return written;
+}
 async function loadCampaignAssumeutxo(params) {
   const fixturePath = process.env.HASHHOG_CAMPAIGN_ASSUMEUTXO;
   if (!fixturePath)
@@ -19774,9 +20539,34 @@ async function loadCampaignAssumeutxo(params) {
     if (entry.base_header !== undefined && !/^[0-9a-fA-F]+$/.test(entry.base_header)) {
       throw new Error(`loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) has non-hex base_header`);
     }
+    if (entry.chainwork !== undefined && !HASH_HEX_RE.test(entry.chainwork)) {
+      throw new Error(`loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) has invalid chainwork`);
+    }
+    if (entry.base_tail_headers !== undefined && !Array.isArray(entry.base_tail_headers)) {
+      throw new Error(`loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) base_tail_headers is not an array`);
+    }
     const blockHash = Buffer.from(entry.blockhash, "hex").reverse();
     const hashSerialized = Buffer.from(entry.hash_serialized, "hex").reverse();
     const key = blockHash.toString("hex");
+    let baseHeader;
+    if (entry.base_header) {
+      const hdr = Buffer.from(entry.base_header, "hex");
+      if (hdr.length !== 80) {
+        throw new Error(`loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) base_header is ${hdr.length} bytes, want 80`);
+      }
+      baseHeader = hdr;
+    }
+    const chainWork = entry.chainwork ? BigInt("0x" + entry.chainwork) : undefined;
+    const baseTailHeaders = entry.base_tail_headers ? parseBaseTailHeaders(entry.base_tail_headers, blockHash, entry.height, i) : [];
+    if (baseHeader && baseTailHeaders.length > 0) {
+      const last = baseTailHeaders[baseTailHeaders.length - 1];
+      if (!last.equals(baseHeader)) {
+        throw new Error(`loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) base_header ` + `does not match the last base_tail_headers entry`);
+      }
+    }
+    if (!baseHeader && baseTailHeaders.length > 0) {
+      baseHeader = baseTailHeaders[baseTailHeaders.length - 1];
+    }
     if (assumeutxo.has(key)) {
       throw new Error(`loadCampaignAssumeutxo: entry ${i} blockhash ${entry.blockhash} collides with an ` + `existing assumeutxo entry — refusing to override a production/loaded hash`);
     }
@@ -19789,7 +20579,10 @@ async function loadCampaignAssumeutxo(params) {
       height: entry.height,
       hashSerialized,
       nChainTx: BigInt(entry.m_chain_tx_count),
-      blockHash
+      blockHash,
+      baseHeader,
+      chainWork,
+      baseTailHeaders: baseTailHeaders.length > 0 ? baseTailHeaders : undefined
     });
     loadedHeights.push(entry.height);
   }
@@ -24597,6 +25390,8 @@ class Peer {
   versionReceivedAt;
   blocksInFlight;
   bestKnownHeight;
+  syncedHeaders;
+  syncedBlocks;
   wantsAddrV2;
   wtxidRelay;
   feeFilterReceived;
@@ -24608,6 +25403,7 @@ class Peer {
   sentSendTxRcncl;
   receivedSendTxRcncl;
   socket;
+  outbox = [];
   recvBuffer;
   config;
   events;
@@ -24665,6 +25461,8 @@ class Peer {
     this.versionReceivedAt = 0;
     this.blocksInFlight = new Map;
     this.bestKnownHeight = 0;
+    this.syncedHeaders = -1;
+    this.syncedBlocks = -1;
     this.wantsAddrV2 = false;
     this.wtxidRelay = false;
     this.feeFilterReceived = 0n;
@@ -24712,6 +25510,7 @@ class Peer {
       port: this.port,
       socket: {
         data: (_socket, data) => this.onData(Buffer.from(data)),
+        drain: () => this.onDrain(),
         open: (socket) => {
           this.socket = socket;
           this.tcpEstablished = true;
@@ -24726,11 +25525,7 @@ class Peer {
             }, V2_HANDSHAKE_DEADLINE_MS);
           } else {
             this.sendVersionMessage();
-            this.handshakeTimer = setTimeout(() => {
-              if (!this.handshakeComplete && this.state !== "disconnected") {
-                this.disconnect("handshake timeout");
-              }
-            }, HANDSHAKE_TIMEOUT_MS);
+            this.armHandshakeTimer();
           }
         },
         close: (_socket) => {
@@ -24828,11 +25623,7 @@ class Peer {
       }, V2_HANDSHAKE_DEADLINE_MS);
     } else {
       this.sendVersionMessage();
-      this.handshakeTimer = setTimeout(() => {
-        if (!this.handshakeComplete && this.state !== "disconnected") {
-          this.disconnect("handshake timeout");
-        }
-      }, HANDSHAKE_TIMEOUT_MS);
+      this.armHandshakeTimer();
     }
   }
   prepareV2Outbound() {
@@ -24847,39 +25638,62 @@ class Peer {
     this.connectedTime = Date.now();
     this.transportMode = "unknown";
     this.events.onConnect(this);
-    this.handshakeTimer = setTimeout(() => {
-      if (!this.handshakeComplete && this.state !== "disconnected") {
-        this.disconnect("handshake timeout");
-      }
-    }, HANDSHAKE_TIMEOUT_MS);
+    this.armHandshakeTimer();
   }
   feedData(data) {
     this.onData(data);
   }
   send(msg) {
     if (!this.socket || this.state === "disconnected") {
-      return;
+      console.warn(`peer ${this.host}: send(${msg.type}) dropped — socket ${this.socket ? "disconnected" : "absent"}`);
+      return false;
     }
     if (this.transportMode === "v2" && this.v2Transport) {
-      this.sendV2(msg);
-      return;
+      return this.sendV2(msg);
     }
     const data = serializeMessage(this.config.magic, msg);
-    this.socket.write(data);
+    this.writeRaw(data);
     this.bytesSent += data.length;
     this.lastSend = Date.now();
+    return true;
+  }
+  writeRaw(data) {
+    if (!this.socket)
+      return;
+    if (this.outbox.length > 0) {
+      this.outbox.push(data);
+      return;
+    }
+    const written = this.socket.write(data);
+    if (written < data.length) {
+      this.outbox.push(data.subarray(written));
+      console.warn(`peer ${this.host}: backpressure — parked ${data.length - written} bytes for drain`);
+    }
+  }
+  onDrain() {
+    while (this.outbox.length > 0 && this.socket) {
+      const head = this.outbox[0];
+      const written = this.socket.write(head);
+      if (written < head.length) {
+        this.outbox[0] = head.subarray(written);
+        return;
+      }
+      this.outbox.shift();
+    }
   }
   sendV2(msg) {
     if (!this.socket || !this.v2Transport)
-      return;
+      return false;
     if (!this.v2Transport.isHandshakeReady()) {
-      return;
+      console.warn(`peer ${this.host}: sendV2(${msg.type}) dropped — handshake not ready`);
+      return false;
     }
     const { command, payload } = extractCommandAndPayload(this.config.magic, msg);
     const encrypted = this.v2Transport.encryptMessage(command, payload, false);
-    this.socket.write(encrypted);
+    this.writeRaw(encrypted);
     this.bytesSent += encrypted.length;
     this.lastSend = Date.now();
+    return true;
   }
   flushV2SendBuffer() {
     if (!this.socket || !this.v2Transport)
@@ -24889,7 +25703,7 @@ class Peer {
     const out = this.v2Transport.consumeSendBuffer();
     if (out.length === 0)
       return;
-    this.socket.write(out);
+    this.writeRaw(out);
     this.bytesSent += out.length;
     this.lastSend = Date.now();
   }
@@ -24915,6 +25729,15 @@ class Peer {
       clearTimeout(this.handshakeTimer);
       this.handshakeTimer = null;
     }
+  }
+  armHandshakeTimer() {
+    this.cleanupHandshakeTimer();
+    const ms = this.config.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS;
+    this.handshakeTimer = setTimeout(() => {
+      if (!this.handshakeComplete && this.state !== "disconnected") {
+        this.disconnect("handshake timeout");
+      }
+    }, ms);
   }
   settleV2HandshakeOk() {
     if (this.v2HandshakeSettled)
@@ -25266,6 +26089,18 @@ class Peer {
     if (height > this.bestKnownHeight) {
       this.bestKnownHeight = height;
     }
+  }
+  updateSyncedHeaders(height) {
+    if (height > this.syncedHeaders) {
+      this.syncedHeaders = height;
+    }
+    this.updateBestKnownHeight(height);
+  }
+  updateSyncedBlocks(height) {
+    if (height > this.syncedBlocks) {
+      this.syncedBlocks = height;
+    }
+    this.updateSyncedHeaders(height);
   }
   hasPingTimedOut() {
     if (!this.pingOutstanding || this.pingSentTime === 0) {
@@ -27019,6 +27854,47 @@ var FIXED_SEEDS = {
   675223068: [],
   3669344250: []
 };
+var DEFAULT_BIND_HOSTS = ["0.0.0.0", "::"];
+var DEFAULT_MAX_CONNECTIONS = 125;
+function parseBindSpec(spec, defaultPort) {
+  const trimmed = spec.trim();
+  if (trimmed.length === 0) {
+    throw new Error("invalid -bind address: empty");
+  }
+  if (trimmed.startsWith("[")) {
+    const close = trimmed.indexOf("]");
+    if (close <= 1) {
+      throw new Error(`invalid -bind address: ${spec}`);
+    }
+    const host = trimmed.slice(1, close);
+    const rest = trimmed.slice(close + 1);
+    if (rest === "") {
+      return { host, port: defaultPort };
+    }
+    if (!rest.startsWith(":")) {
+      throw new Error(`invalid -bind address: ${spec}`);
+    }
+    const port = parseInt(rest.slice(1), 10);
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      throw new Error(`invalid -bind port: ${spec}`);
+    }
+    return { host, port };
+  }
+  const colonCount = (trimmed.match(/:/g) ?? []).length;
+  if (colonCount === 0) {
+    return { host: trimmed, port: defaultPort };
+  }
+  if (colonCount === 1) {
+    const idx = trimmed.indexOf(":");
+    const host = trimmed.slice(0, idx);
+    const port = parseInt(trimmed.slice(idx + 1), 10);
+    if (!host || !Number.isInteger(port) || port < 0 || port > 65535) {
+      throw new Error(`invalid -bind address: ${spec}`);
+    }
+    return { host, port };
+  }
+  return { host: trimmed, port: defaultPort };
+}
 var MAX_OUTBOUND_FULL_RELAY = 8;
 var MAX_OUTBOUND_BLOCK_RELAY = 2;
 var MAX_BLOCK_RELAY_ONLY_ANCHORS = 2;
@@ -27131,7 +28007,7 @@ class PeerManager {
   feeFilterManager;
   feeFilterInterval;
   asmapHealthCheckInterval;
-  tcpListener;
+  tcpListeners;
   v1OnlyCache;
   asmapData;
   proxyManager;
@@ -27152,6 +28028,8 @@ class PeerManager {
       connect: config.connect,
       listen: config.listen ?? true,
       port: config.port ?? config.params.defaultPort,
+      bind: config.bind,
+      handshakeTimeoutMs: config.handshakeTimeoutMs,
       pruneMode: config.pruneMode ?? false
     };
     this.peers = new Map;
@@ -27182,7 +28060,7 @@ class PeerManager {
     });
     this.feeFilterInterval = null;
     this.asmapHealthCheckInterval = null;
-    this.tcpListener = null;
+    this.tcpListeners = [];
     this.v1OnlyCache = new Map;
     if (config.asmapPath) {
       const data = loadAsmap(config.asmapPath);
@@ -27354,8 +28232,8 @@ class PeerManager {
   async start() {
     this.running = true;
     this.loopStartTs = Date.now();
-    if (this.config.listen && this.config.port) {
-      this.startListener(this.config.port);
+    if (this.config.listen) {
+      this.startListeners();
     }
     await this.banManager.load();
     await this.loadAddresses();
@@ -27438,10 +28316,10 @@ class PeerManager {
   async stop() {
     this.shuttingDown = true;
     this.running = false;
-    if (this.tcpListener) {
-      this.tcpListener.stop(true);
-      this.tcpListener = null;
+    for (const listener of this.tcpListeners) {
+      listener.stop(true);
     }
+    this.tcpListeners = [];
     if (this.maintainInterval) {
       clearInterval(this.maintainInterval);
       this.maintainInterval = null;
@@ -27521,7 +28399,8 @@ class PeerManager {
       bestHeight: this.config.bestHeight,
       relay: connectionType !== "block_relay" && connectionType !== "feeler",
       proxyManager: this.proxyManager ?? undefined,
-      networkType
+      networkType,
+      handshakeTimeoutMs: this.config.handshakeTimeoutMs
     };
     const events = {
       onConnect: (peer2) => this.handlePeerConnect(peer2),
@@ -28687,84 +29566,121 @@ class PeerManager {
       await Bun.write(path2, writer.toBuffer());
     } catch {}
   }
-  startListener(port) {
-    try {
-      const manager = this;
-      this.tcpListener = Bun.listen({
-        hostname: "0.0.0.0",
-        port,
-        socket: {
-          open(socket) {
-            const host = socket.remoteAddress;
-            if (manager.banManager.isBanned(host)) {
+  getBindAddresses() {
+    const port = this.config.port ?? this.config.params.defaultPort;
+    const specs = this.config.bind && this.config.bind.length > 0 ? this.config.bind : [...DEFAULT_BIND_HOSTS];
+    return specs.map((spec) => parseBindSpec(spec, port));
+  }
+  getListeningBinds() {
+    return this.tcpListeners.map((l) => ({ host: l.hostname, port: l.port }));
+  }
+  startListeners() {
+    const binds = [...this.getBindAddresses()].sort((a, b) => {
+      const a6 = a.host.includes(":");
+      const b6 = b.host.includes(":");
+      if (a6 === b6)
+        return 0;
+      return a6 ? -1 : 1;
+    });
+    let sharedPort;
+    for (const addr of binds) {
+      const port = addr.port === 0 && sharedPort !== undefined ? sharedPort : addr.port;
+      try {
+        const listener = this.bindOne(addr.host, port);
+        this.tcpListeners.push(listener);
+        if (sharedPort === undefined)
+          sharedPort = listener.port;
+        const shown = addr.host.includes(":") ? `[${addr.host}]` : addr.host;
+        console.log(`P2P listening on ${shown}:${listener.port}`);
+      } catch (err) {
+        const shown = addr.host.includes(":") ? `[${addr.host}]` : addr.host;
+        const msg = err instanceof Error ? err.message : String(err);
+        if (this.tcpListeners.length === 0) {
+          console.error(`Failed to start P2P listener on ${shown}:${port}:`, err);
+        } else {
+          console.log(`P2P: bind ${shown}:${port} skipped (${msg})`);
+        }
+      }
+    }
+  }
+  bindOne(hostname, port) {
+    const manager = this;
+    return Bun.listen({
+      hostname,
+      port,
+      socket: {
+        open(socket) {
+          const host = socket.remoteAddress;
+          const remotePort = socket.remotePort || 0;
+          if (manager.banManager.isBanned(host)) {
+            socket.end();
+            return;
+          }
+          if (!manager.networkActive) {
+            socket.end();
+            return;
+          }
+          if (manager.inboundPeers.size >= manager.config.maxInbound) {
+            const evicted = manager.selectPeerToEvict();
+            if (!evicted) {
               socket.end();
               return;
             }
-            if (!manager.networkActive) {
-              socket.end();
-              return;
-            }
-            if (manager.inboundPeers.size >= manager.config.maxInbound) {
-              const evicted = manager.selectPeerToEvict();
-              if (!evicted) {
-                socket.end();
-                return;
-              }
-              manager.disconnectPeer(evicted);
-            }
-            const inAdvertisedServices = manager.config.params.services;
-            const peerConfig = {
-              host,
-              port: 0,
-              magic: manager.config.params.networkMagic,
-              protocolVersion: manager.config.params.protocolVersion,
-              services: inAdvertisedServices,
-              userAgent: manager.config.params.userAgent,
-              bestHeight: manager.config.bestHeight,
-              relay: true
-            };
-            const events = {
-              onConnect: (peer2) => manager.handlePeerConnect(peer2),
-              onDisconnect: (peer2, error) => manager.handlePeerDisconnect(peer2, error),
-              onMessage: (peer2, msg) => manager.handlePeerMessage(peer2, msg),
-              onHandshakeComplete: (peer2) => manager.handleHandshakeComplete(peer2)
-            };
-            const onBan = (peer2, reason) => {
-              manager.banManager.ban(peer2.host, DEFAULT_BAN_TIME, reason);
-            };
-            const peer = new Peer(peerConfig, events, onBan);
-            socket.data = { peer };
-            const key = `${host}:0`;
-            manager.peers.set(key, peer);
-            manager.lastActivity.set(key, Date.now());
-            manager.peerConnectionType.set(key, "inbound");
-            manager.inboundPeers.add(key);
-            peer.acceptSocket(socket);
-          },
-          data(socket, data) {
-            const peer = socket.data?.peer;
-            if (peer) {
-              peer.feedData(Buffer.from(data));
-            }
-          },
-          close(socket) {
-            const peer = socket.data?.peer;
-            if (peer && peer.state !== "disconnected") {
-              peer.disconnect("remote closed");
-            }
-          },
-          error(socket, err) {
-            const peer = socket.data?.peer;
-            if (peer && peer.state !== "disconnected") {
-              peer.disconnect("socket error");
-            }
+            manager.disconnectPeer(evicted);
+          }
+          const inAdvertisedServices = manager.config.params.services;
+          const peerConfig = {
+            host,
+            port: remotePort,
+            magic: manager.config.params.networkMagic,
+            protocolVersion: manager.config.params.protocolVersion,
+            services: inAdvertisedServices,
+            userAgent: manager.config.params.userAgent,
+            bestHeight: manager.config.bestHeight,
+            relay: true,
+            handshakeTimeoutMs: manager.config.handshakeTimeoutMs
+          };
+          const events = {
+            onConnect: (peer2) => manager.handlePeerConnect(peer2),
+            onDisconnect: (peer2, error) => manager.handlePeerDisconnect(peer2, error),
+            onMessage: (peer2, msg) => manager.handlePeerMessage(peer2, msg),
+            onHandshakeComplete: (peer2) => manager.handleHandshakeComplete(peer2)
+          };
+          const onBan = (peer2, reason) => {
+            manager.banManager.ban(peer2.host, DEFAULT_BAN_TIME, reason);
+          };
+          const peer = new Peer(peerConfig, events, onBan, { connType: "inbound" });
+          socket.data = { peer };
+          const key = `${host}:${remotePort}`;
+          manager.peers.set(key, peer);
+          manager.lastActivity.set(key, Date.now());
+          manager.peerConnectionType.set(key, "inbound");
+          manager.inboundPeers.add(key);
+          peer.acceptSocket(socket);
+        },
+        data(socket, data) {
+          const peer = socket.data?.peer;
+          if (peer) {
+            peer.feedData(Buffer.from(data));
+          }
+        },
+        drain(socket) {
+          socket.data?.peer?.onDrain();
+        },
+        close(socket) {
+          const peer = socket.data?.peer;
+          if (peer && peer.state !== "disconnected") {
+            peer.disconnect("remote closed");
+          }
+        },
+        error(_socket, _err) {
+          const peer = _socket.data?.peer;
+          if (peer && peer.state !== "disconnected") {
+            peer.disconnect("socket error");
           }
         }
-      });
-      console.log(`P2P listening on port ${port}`);
-    } catch (err) {
-      console.error(`Failed to start P2P listener on port ${port}:`, err);
-    }
+      }
+    });
   }
   async acceptInbound(host, port) {
     if (this.banManager.isBanned(host)) {
@@ -28965,6 +29881,17 @@ init_params();
 
 // src/consensus/pow.ts
 init_params();
+
+class MissingRetargetAncestorError extends Error {
+  height;
+  ancestorHeight;
+  constructor(height, ancestorHeight) {
+    super(`retarget ancestor at height ${ancestorHeight} unreachable computing ` + `work required for block at height ${height}`);
+    this.name = "MissingRetargetAncestorError";
+    this.height = height;
+    this.ancestorHeight = ancestorHeight;
+  }
+}
 function getNextWorkRequired(parent, blockTimestamp, params, getBlockByHeight) {
   const height = parent.height + 1;
   const interval = params.difficultyAdjustmentInterval;
@@ -28993,7 +29920,7 @@ function getNextWorkRequired(parent, blockTimestamp, params, getBlockByHeight) {
   const firstHeight = height - interval;
   const firstBlock = getBlockByHeight(firstHeight);
   if (!firstBlock) {
-    return compactToBigInt(parent.header.bits);
+    throw new MissingRetargetAncestorError(height, firstHeight);
   }
   return calculateNextWorkRequired(parent, firstBlock.header.timestamp, params, getBlockByHeight);
 }
@@ -29016,11 +29943,10 @@ function calculateNextWorkRequired(parent, firstBlockTime, params, getBlockByHei
     const interval = params.difficultyAdjustmentInterval;
     const firstHeight = parent.height - (interval - 1);
     const firstBlock = getBlockByHeight(firstHeight);
-    if (firstBlock) {
-      baseBits = firstBlock.header.bits;
-    } else {
-      baseBits = parent.header.bits;
+    if (!firstBlock) {
+      throw new MissingRetargetAncestorError(parent.height + 1, firstHeight);
     }
+    baseBits = firstBlock.header.bits;
   } else {
     baseBits = parent.header.bits;
   }
@@ -29218,7 +30144,7 @@ class HeadersSyncState {
     }
     return result;
   }
-  getNextHeadersRequestLocator() {
+  getNextHeadersRequestLocator(hashAtHeight) {
     if (this.state === "final" /* FINAL */) {
       return [];
     }
@@ -29231,6 +30157,22 @@ class HeadersSyncState {
       locator.push(Buffer.from(this.redownloadBufferLastHash));
     }
     locator.push(Buffer.from(this.chainStartHash));
+    if (hashAtHeight) {
+      let step = 1;
+      let height = this.chainStartHeight;
+      let entries = 1;
+      while (height > 0) {
+        height = Math.max(height - step, 0);
+        if (entries > 10) {
+          step *= 2;
+        }
+        const h = hashAtHeight(height);
+        if (h) {
+          locator.push(Buffer.from(h));
+          entries++;
+        }
+      }
+    }
     return locator;
   }
   finalize() {
@@ -29379,6 +30321,7 @@ class HeaderSync {
   db;
   params;
   bestHeader;
+  mostWorkValid;
   headerChain;
   headersByHeight;
   peerManager;
@@ -29391,6 +30334,7 @@ class HeaderSync {
     this.db = db;
     this.params = params;
     this.bestHeader = null;
+    this.mostWorkValid = null;
     this.headerChain = new Map;
     this.headersByHeight = new Map;
     this.peerManager = null;
@@ -29429,17 +30373,26 @@ class HeaderSync {
     this.headerChain.set(hashHex, genesisEntry);
     this.headersByHeight.set(0, genesisEntry);
     this.bestHeader = genesisEntry;
+    this.mostWorkValid = genesisEntry;
   }
   parseGenesisHeader() {
     const block = this.params.genesisBlock;
+    return this.headerFromBytes(block.subarray(0, 80));
+  }
+  headerFromBytes(headerBuf) {
     return {
-      version: block.readInt32LE(0),
-      prevBlock: block.subarray(4, 36),
-      merkleRoot: block.subarray(36, 68),
-      timestamp: block.readUInt32LE(68),
-      bits: block.readUInt32LE(72),
-      nonce: block.readUInt32LE(76)
+      version: headerBuf.readInt32LE(0),
+      prevBlock: Buffer.from(headerBuf.subarray(4, 36)),
+      merkleRoot: Buffer.from(headerBuf.subarray(36, 68)),
+      timestamp: headerBuf.readUInt32LE(68),
+      bits: headerBuf.readUInt32LE(72),
+      nonce: headerBuf.readUInt32LE(76)
     };
+  }
+  heavierThanGenesis(work) {
+    const genesis = this.headerChain.get(this.params.genesisBlockHash.toString("hex"));
+    const gw = genesis?.chainWork ?? 0n;
+    return work > gw ? work : gw + 1n;
   }
   registerWithPeerManager(peerManager) {
     this.peerManager = peerManager;
@@ -29525,10 +30478,15 @@ class HeaderSync {
   }
   async processHeaders(headers, fromPeer, minPowChecked = true) {
     let validCount = 0;
+    let pointerMoved = false;
     for (const header of headers) {
       const hash = getBlockHash(header);
       const hashHex = hash.toString("hex");
-      if (this.headerChain.has(hashHex)) {
+      const existing = this.headerChain.get(hashHex);
+      if (existing) {
+        if (this.noteCandidateWork(existing))
+          pointerMoved = true;
+        fromPeer?.updateSyncedHeaders?.(existing.height);
         continue;
       }
       const parentHashHex = header.prevBlock.toString("hex");
@@ -29574,14 +30532,13 @@ class HeaderSync {
         status
       };
       this.headerChain.set(hashHex, entry);
-      if (status !== "invalid" && (!this.bestHeader || chainWork > this.bestHeader.chainWork)) {
-        this.bestHeader = entry;
-        this.updateBestChain(entry);
-      }
+      if (this.noteCandidateWork(entry))
+        pointerMoved = true;
       await this.saveHeaderEntry(entry);
+      fromPeer?.updateSyncedHeaders?.(entry.height);
       validCount++;
     }
-    if (validCount > 0 && this.bestHeader) {
+    if ((validCount > 0 || pointerMoved) && this.bestHeader) {
       await this.saveHeaderTip(this.bestHeader);
       const tipHeight = this.bestHeader.height;
       for (const cb of this.headersProcessedCallbacks) {
@@ -29604,6 +30561,54 @@ class HeaderSync {
       entry = this.headerChain.get(parentHashHex);
     }
   }
+  noteCandidateWork(entry) {
+    if (entry.status === "invalid")
+      return false;
+    if (!this.mostWorkValid || entry.chainWork > this.mostWorkValid.chainWork) {
+      this.mostWorkValid = entry;
+    }
+    if (!this.bestHeader || entry.chainWork > this.bestHeader.chainWork) {
+      this.bestHeader = entry;
+      this.updateBestChain(entry);
+      return true;
+    }
+    return false;
+  }
+  findMostWorkValidHeader() {
+    let best = null;
+    for (const entry of this.headerChain.values()) {
+      if (entry.status === "invalid")
+        continue;
+      if (!best || entry.chainWork > best.chainWork) {
+        best = entry;
+      }
+    }
+    return best;
+  }
+  promoteMostWorkHeader() {
+    if (!this.mostWorkValid || this.mostWorkValid.status === "invalid") {
+      this.mostWorkValid = this.findMostWorkValidHeader();
+    }
+    if (!this.mostWorkValid)
+      return false;
+    if (this.bestHeader && this.mostWorkValid.hash.equals(this.bestHeader.hash)) {
+      return false;
+    }
+    if (this.bestHeader && this.mostWorkValid.chainWork <= this.bestHeader.chainWork) {
+      return false;
+    }
+    const oldHeight = this.bestHeader ? this.bestHeader.height : this.mostWorkValid.height;
+    const oldWork = this.bestHeader ? this.bestHeader.chainWork : 0n;
+    this.bestHeader = this.mostWorkValid;
+    if (this.mostWorkValid.height < oldHeight) {
+      for (let h = this.mostWorkValid.height + 1;h <= oldHeight; h++) {
+        this.headersByHeight.delete(h);
+      }
+    }
+    this.updateBestChain(this.mostWorkValid);
+    console.log(`[best-header] pointer lagged the index (height ${oldHeight} work ${oldWork}); ` + `re-seated on most-work header height ${this.mostWorkValid.height} ` + `work ${this.mostWorkValid.chainWork}`);
+    return true;
+  }
   invalidateHeader(badHash, newBestHash) {
     const badEntry = this.headerChain.get(badHash.toString("hex"));
     if (!badEntry)
@@ -29620,6 +30625,9 @@ class HeaderSync {
       this.headersByHeight.delete(h);
     }
     this.updateBestChain(newBest);
+    if (!this.mostWorkValid || this.mostWorkValid.status === "invalid") {
+      this.mostWorkValid = this.findMostWorkValidHeader() ?? newBest;
+    }
     console.log(`[invalidate-header] ${badHash.toString("hex").slice(0, 16)} (height ${badEntry.height}) marked invalid; ` + `best header re-seated on ${newBestHash.toString("hex").slice(0, 16)} (height ${newBest.height})`);
   }
   validateHeader(header, parent, opts) {
@@ -29679,7 +30687,18 @@ class HeaderSync {
         return { valid: false, error: "high-hash: proof of work failed" };
       }
     }
-    const expectedTarget = this.getNextTarget(parent, header.timestamp);
+    let expectedTarget;
+    try {
+      expectedTarget = this.getNextTarget(parent, header.timestamp);
+    } catch (err) {
+      if (err instanceof MissingRetargetAncestorError) {
+        return {
+          valid: false,
+          error: `bad-diffbits: ${err.message}`
+        };
+      }
+      throw err;
+    }
     const expectedBits = bigIntToCompact(expectedTarget);
     if (header.bits !== expectedBits) {
       return {
@@ -29748,6 +30767,97 @@ class HeaderSync {
   getBestHeader() {
     return this.bestHeader;
   }
+  async seedHeader(opts) {
+    if (!this.headerChain.has(this.params.genesisBlockHash.toString("hex"))) {
+      this.initGenesis();
+    }
+    const chainWork = this.heavierThanGenesis(opts.chainWork);
+    const hashHex = opts.hash.toString("hex");
+    const existing = this.headerChain.get(hashHex);
+    const entry = existing ?? {
+      hash: opts.hash,
+      header: opts.header,
+      height: opts.height,
+      chainWork,
+      status: "valid-header"
+    };
+    if (existing) {
+      entry.header = opts.header;
+      entry.height = opts.height;
+      entry.chainWork = chainWork;
+      if (entry.status === "invalid") {
+        entry.status = "valid-header";
+      }
+    } else {
+      this.headerChain.set(hashHex, entry);
+    }
+    this.noteCandidateWork(entry);
+    if (!this.headersByHeight.get(opts.height)?.hash.equals(opts.hash)) {
+      this.headersByHeight.set(opts.height, entry);
+    }
+    await this.saveHeaderEntry(entry);
+    if (this.bestHeader) {
+      await this.saveHeaderTip(this.bestHeader);
+    }
+    await this.db.putChainWork(opts.hash, chainWork);
+    return entry;
+  }
+  async seedTailHeaders(rawHeaders, baseHeight, baseChainWork) {
+    if (rawHeaders.length === 0)
+      return;
+    const n = rawHeaders.length;
+    if (n - 1 > baseHeight) {
+      throw new Error(`seedTailHeaders: ${n} headers at base height ${baseHeight} would start below genesis`);
+    }
+    const startHeight = baseHeight - (n - 1);
+    const decoded = rawHeaders.map((buf) => {
+      const header = this.headerFromBytes(buf);
+      return { header, hash: getBlockHash(header) };
+    });
+    for (let i = n - 1;i >= 0; i--) {
+      await this.seedHeader({
+        hash: decoded[i].hash,
+        header: decoded[i].header,
+        height: startHeight + i,
+        chainWork: i === n - 1 ? baseChainWork : 1n + BigInt(i)
+      });
+    }
+    console.log(`[assumeutxo] seeded ${n} base_tail_headers heights ${startHeight}..${baseHeight}`);
+  }
+  async adoptChainTipAsBestHeader(hash, height) {
+    const au = this.params.assumeutxo?.get(hash.toString("hex"));
+    const storedWork = await this.db.getChainWork(hash);
+    const chainState = await this.db.getChainState();
+    const work = storedWork ?? au?.chainWork ?? chainState?.totalWork ?? this.params.nMinimumChainWork;
+    const tails = au?.baseTailHeaders;
+    if (tails && tails.length > 0) {
+      const startHeight = height - (tails.length - 1);
+      const haveStart = this.headersByHeight.get(startHeight);
+      const haveTip = this.bestHeader && this.bestHeader.hash.equals(hash) && this.bestHeader.height === height && this.headersByHeight.get(height)?.hash.equals(hash);
+      if (haveTip && haveStart) {
+        await this.saveHeaderTip(this.bestHeader);
+        return;
+      }
+      await this.seedTailHeaders(tails, height, work);
+      return;
+    }
+    const have = this.getHeader(hash);
+    if (have && this.bestHeader && this.bestHeader.hash.equals(hash) && this.bestHeader.height === height && this.headersByHeight.get(height)?.hash.equals(hash)) {
+      await this.saveHeaderTip(this.bestHeader);
+      return;
+    }
+    const rec = await this.db.getBlockIndex(hash);
+    let headerBuf = rec?.header && rec.header.length >= 80 ? rec.header : Buffer.alloc(80);
+    if (au?.baseHeader && au.baseHeader.length >= 80) {
+      headerBuf = au.baseHeader;
+    }
+    await this.seedHeader({
+      hash,
+      header: this.headerFromBytes(headerBuf),
+      height,
+      chainWork: work
+    });
+  }
   getHeader(hash) {
     return this.headerChain.get(hash.toString("hex"));
   }
@@ -29784,9 +30894,9 @@ class HeaderSync {
         syncState,
         startTime: Date.now()
       });
-      locator = syncState.getNextHeadersRequestLocator();
+      locator = syncState.getNextHeadersRequestLocator((height) => this.headersByHeight.get(height)?.hash ?? null);
     } else if (existingState && existingState.syncState.getState() !== "final" /* FINAL */) {
-      locator = existingState.syncState.getNextHeadersRequestLocator();
+      locator = existingState.syncState.getNextHeadersRequestLocator((height) => this.headersByHeight.get(height)?.hash ?? null);
     } else {
       locator = this.getBlockLocator();
     }
@@ -29798,7 +30908,10 @@ class HeaderSync {
         hashStop: Buffer.alloc(32, 0)
       }
     };
-    peer.send(msg);
+    if (!peer.send(msg)) {
+      this.syncingPeers.delete(peerKey);
+      console.warn(`headers: getheaders to ${peer.host} dropped — sync latch released`);
+    }
   }
   needsAntiDoS() {
     if (this.params.nMinimumChainWork === 0n) {
@@ -29858,10 +30971,20 @@ class HeaderSync {
     const peerKey = `${peer.host}:${peer.port}`;
     return this.peerSyncStates.get(peerKey);
   }
+  getPresyncHeightForPeer(peer) {
+    const peerState = this.getPeerSyncState(peer);
+    if (!peerState)
+      return -1;
+    if (peerState.syncState.getState() === "final" /* FINAL */) {
+      return -1;
+    }
+    return peerState.syncState.getPresyncHeight();
+  }
   async loadFromDB() {
     this.initGenesis();
     const headerTip = await this.loadHeaderTip();
-    if (!headerTip) {
+    const chainState = await this.db.getChainState();
+    if (!headerTip && (!chainState || chainState.bestHeight <= 0)) {
       return;
     }
     const blockIndexPrefix = Buffer.from([98 /* BLOCK_INDEX */]);
@@ -29911,7 +31034,33 @@ class HeaderSync {
       const parentHashHex = header.prevBlock.toString("hex");
       const parent = this.headerChain.get(parentHashHex);
       if (!parent) {
-        console.warn(`Missing parent for header at height ${record.height} ` + `(${hash.toString("hex").slice(0, 16)}...)`);
+        const hashHex = hash.toString("hex");
+        const au = this.params.assumeutxo?.get(hashHex);
+        const isChainTip = chainState !== null && chainState.bestBlockHash.equals(hash);
+        const isHeaderTip = headerTip !== null && headerTip.equals(hash);
+        if (!isChainTip && !isHeaderTip && !au) {
+          console.warn(`Missing parent for header at height ${record.height} ` + `(${hash.toString("hex").slice(0, 16)}...)`);
+          continue;
+        }
+        let hdr = header;
+        if (au?.baseHeader && au.baseHeader.length >= 80) {
+          hdr = this.headerFromBytes(au.baseHeader);
+        }
+        const storedWork = await this.db.getChainWork(hash);
+        const chainWork2 = this.heavierThanGenesis(storedWork ?? au?.chainWork ?? chainState?.totalWork ?? this.params.nMinimumChainWork);
+        let status2 = "valid-header";
+        if ((record.status & 1) === 0) {
+          status2 = "invalid";
+        }
+        const entry2 = {
+          hash,
+          header: hdr,
+          height: record.height,
+          chainWork: chainWork2,
+          status: status2
+        };
+        this.headerChain.set(hashHex, entry2);
+        this.noteCandidateWork(entry2);
         continue;
       }
       const headerWork = this.getHeaderWork(header.bits);
@@ -29928,6 +31077,11 @@ class HeaderSync {
         status
       };
       this.headerChain.set(hash.toString("hex"), entry);
+      if (status !== "invalid") {
+        if (!this.mostWorkValid || chainWork > this.mostWorkValid.chainWork) {
+          this.mostWorkValid = entry;
+        }
+      }
       if (!this.bestHeader || chainWork > this.bestHeader.chainWork) {
         this.bestHeader = entry;
       }
@@ -29976,6 +31130,16 @@ class HeaderSync {
   getHeaderCount() {
     return this.headerChain.size;
   }
+  getHeaderEntryByHash(hash) {
+    return this.headerChain.get(hash.toString("hex")) ?? null;
+  }
+  isOnBestHeaderChain(hash) {
+    const entry = this.headerChain.get(hash.toString("hex"));
+    if (!entry || entry.status === "invalid")
+      return false;
+    const atHeight = this.headersByHeight.get(entry.height);
+    return atHeight !== undefined && atHeight.hash.equals(hash);
+  }
 }
 
 // src/sync/blocks.ts
@@ -29985,6 +31149,72 @@ init_block();
 init_tx();
 init_serialization();
 init_utxo();
+
+// src/chain/memory_snapshot.ts
+import { readFileSync as readFileSync2 } from "node:fs";
+var RSS_PRESSURE_MULTIPLE = 4;
+function readProcRss() {
+  try {
+    const text = readFileSync2("/proc/self/status", "utf8");
+    let anon = null;
+    let file = null;
+    for (const line of text.split(`
+`)) {
+      if (line.startsWith("RssAnon:")) {
+        anon = parseInt(line.split(/\s+/)[1], 10) * 1024;
+      } else if (line.startsWith("RssFile:")) {
+        file = parseInt(line.split(/\s+/)[1], 10) * 1024;
+      }
+    }
+    if (anon === null || file === null)
+      return null;
+    return { anon, file };
+  } catch {
+    return null;
+  }
+}
+function snapshotMemory(utxo, workers = 0) {
+  const mem = process.memoryUsage();
+  const proc = readProcRss();
+  const heapUsed = mem.heapUsed;
+  const rssAnon = proc?.anon ?? null;
+  let perWorkerNative = null;
+  if (rssAnon !== null && workers > 0) {
+    perWorkerNative = Math.max(0, Math.floor((rssAnon - heapUsed) / workers));
+  }
+  return {
+    rss: mem.rss,
+    heapUsed,
+    heapTotal: mem.heapTotal,
+    external: mem.external,
+    arrayBuffers: mem.arrayBuffers,
+    rssAnon,
+    rssFile: proc?.file ?? null,
+    utxoBytes: utxo?.getMemoryUsage() ?? 0,
+    utxoEntries: utxo?.getCacheSize() ?? 0,
+    utxoDirty: utxo?.getDirtyCount() ?? 0,
+    utxoMaxBytes: utxo?.getMaxCacheBytes() ?? 0,
+    workers,
+    nonHeap: Math.max(0, mem.rss - heapUsed),
+    perWorkerNative
+  };
+}
+function mb(n) {
+  return (n / (1024 * 1024)).toFixed(0);
+}
+function formatMemoryBreakdown(s) {
+  const anon = s.rssAnon !== null ? `${mb(s.rssAnon)}MB` : "?";
+  const file = s.rssFile !== null ? `${mb(s.rssFile)}MB` : "?";
+  const utxoMaxMB = s.utxoMaxBytes > 0 ? mb(s.utxoMaxBytes) : "?";
+  const per = s.perWorkerNative !== null ? ` × ~${mb(s.perWorkerNative)}MB` : "";
+  return `RSS=${mb(s.rss)}MB heap=${mb(s.heapUsed)}MB ext=${mb(s.external)}MB ab=${mb(s.arrayBuffers)}MB` + ` | anon=${anon} file=${file} nonheap=${mb(s.nonHeap)}MB` + ` | utxo=${s.utxoEntries}/${utxoMaxMB}MB used=${mb(s.utxoBytes)}MB dirty=${s.utxoDirty}` + ` | workers=${s.workers}${per}`;
+}
+function exceedsRssBudget(snap, cacheBytes) {
+  if (!(cacheBytes > 0))
+    return false;
+  const pressure = snap.rssAnon ?? snap.nonHeap;
+  return pressure > RSS_PRESSURE_MULTIPLE * cacheBytes;
+}
 
 // src/p2p/compact_blocks.ts
 init_tx();
@@ -30541,6 +31771,7 @@ class BlockSync {
   hasCompletedInitialSync = false;
   running;
   processing;
+  utxoScanPause = 0;
   lastFlushedHeight;
   consecutiveFailures;
   lastFailedHeight;
@@ -30570,7 +31801,7 @@ class BlockSync {
     this.headerSync = headerSync;
     this.peerManager = peerManager ?? null;
     this.chainStateManager = chainStateManager ?? null;
-    this.scriptThreads = scriptThreads ?? (typeof navigator !== "undefined" && navigator.hardwareConcurrency > 0 ? navigator.hardwareConcurrency : 4);
+    this.scriptThreads = clampScriptThreads(scriptThreads, maxCacheBytes);
     this.windowSize = DEFAULT_WINDOW_SIZE;
     this.peerInFlight = new Map;
     this.utxoManager = new UTXOManager(db, maxCacheBytes);
@@ -30657,6 +31888,18 @@ class BlockSync {
 ` + `livelock. RPC remains available for triage. Investigate the invalidated
 ` + `/ competing header state (getchaintips, reconsiderblock) or reindex.
 `);
+  }
+  advanceFrontierPast(height) {
+    const newFrontier = height + 1;
+    if (newFrontier > this.state.nextHeightToProcess) {
+      this.state.nextHeightToProcess = newFrontier;
+    }
+    if (newFrontier > this.state.nextHeightToRequest) {
+      this.state.nextHeightToRequest = newFrontier;
+    }
+    if (height > this.lastFlushedHeight) {
+      this.lastFlushedHeight = height;
+    }
   }
   resyncFrontierAfterRollback() {
     if (!this.chainStateManager)
@@ -30895,6 +32138,9 @@ class BlockSync {
     const pending = this.state.pendingBlocks.get(hashHex);
     if (!pending) {
       const headerEntry = this.headerSync.getHeader(blockHash);
+      if (headerEntry) {
+        peer.updateSyncedBlocks?.(headerEntry.height);
+      }
       if (!headerEntry) {
         peer.misbehaving(100, "block-invalid-header");
         return;
@@ -30917,6 +32163,7 @@ class BlockSync {
     }
     this.state.pendingBlocks.delete(hashHex);
     peer.removeBlockInFlight(hashHex);
+    peer.updateSyncedBlocks?.(pending.height);
     const peerInfo = this.peerInFlight.get(peerKey);
     if (peerInfo) {
       peerInfo.count = Math.max(0, peerInfo.count - 1);
@@ -31049,9 +32296,15 @@ class BlockSync {
         const hashHex = inv.hash.toString("hex");
         const existing = await this.db.getBlockIndex(inv.hash);
         if (existing && (existing.status & 4) !== 0) {
+          const known = this.headerSync.getHeader(inv.hash);
+          if (known)
+            peer.updateSyncedHeaders?.(known.height);
           continue;
         }
         const headerEntry = this.headerSync.getHeader(inv.hash);
+        if (headerEntry) {
+          peer.updateSyncedHeaders?.(headerEntry.height);
+        }
         if (!headerEntry) {
           needHeaders = true;
           continue;
@@ -31298,9 +32551,15 @@ class BlockSync {
     if (this.syncHalted !== null || !this.running || !this.peerManager) {
       return;
     }
-    const bestHeader = this.headerSync.getBestHeader();
+    let bestHeader = this.headerSync.getBestHeader();
     if (!bestHeader) {
       return;
+    }
+    if (this.headerSync.promoteMostWorkHeader()) {
+      bestHeader = this.headerSync.getBestHeader();
+      if (this.ibdComplete) {
+        this.ibdComplete = false;
+      }
     }
     this.lowerDownloadFloorForFork(bestHeader);
     if (this.state.downloadedBlocks.size >= MAX_DOWNLOADED_BUFFER) {
@@ -31487,23 +32746,51 @@ class BlockSync {
         type: "getdata",
         payload: { inventory }
       };
-      peer.send(msg);
+      if (!peer.send(msg)) {
+        const revertKey = `${peer.host}:${peer.port}`;
+        for (const hash of batch) {
+          const hex = hash.toString("hex");
+          peer.removeBlockInFlight(hex);
+          const pending = this.state.pendingBlocks.get(hex);
+          if (pending && pending.peer === revertKey) {
+            this.state.pendingBlocks.delete(hex);
+          }
+        }
+        console.warn(`blocks: getdata batch of ${batch.length} reverted — send to ${peer.host} dropped`);
+      }
+    }
+  }
+  pauseForUTXOScan() {
+    this.utxoScanPause++;
+  }
+  resumeAfterUTXOScan() {
+    if (this.utxoScanPause > 0)
+      this.utxoScanPause--;
+    if (this.utxoScanPause === 0 && this.running && this.syncHalted === null) {
+      this.processOrderedBlocks();
     }
   }
   async processOrderedBlocks() {
     if (this.syncHalted !== null) {
       return;
     }
+    if (this.utxoScanPause > 0) {
+      return;
+    }
     if (this.processing) {
       return;
     }
     this.processing = true;
+    const heightBefore = this.state.nextHeightToProcess;
     try {
       await this.processOrderedBlocksInner();
     } finally {
       this.processing = false;
     }
     this.requestBlocks();
+    if (this.state.nextHeightToProcess === heightBefore) {
+      return;
+    }
     const bestHeader = this.headerSync.getBestHeader();
     if (bestHeader && this.state.nextHeightToProcess <= bestHeader.height) {
       const nextEntry = this.headerSync.getHeaderByHeight(this.state.nextHeightToProcess);
@@ -31513,11 +32800,17 @@ class BlockSync {
     }
   }
   async processOrderedBlocksInner() {
-    const bestHeader = this.headerSync.getBestHeader();
-    if (!bestHeader) {
-      return;
-    }
-    while (this.state.nextHeightToProcess <= bestHeader.height) {
+    while (true) {
+      if (this.syncHalted !== null) {
+        return;
+      }
+      if (this.utxoScanPause > 0) {
+        return;
+      }
+      const bestHeader = this.headerSync.getBestHeader();
+      if (!bestHeader || this.state.nextHeightToProcess > bestHeader.height) {
+        break;
+      }
       const height = this.state.nextHeightToProcess;
       const headerEntry = this.headerSync.getHeaderByHeight(height);
       if (!headerEntry) {
@@ -31526,6 +32819,9 @@ class BlockSync {
       const hashHex = headerEntry.hash.toString("hex");
       let block = this.state.downloadedBlocks.get(hashHex);
       if (!block) {
+        if (!this.running) {
+          return;
+        }
         const pending = this.state.pendingBlocks.get(hashHex);
         const stealAge = pending ? Date.now() - pending.requestedAt : 0;
         const lastDupAt = pending?.lastDupAt ?? 0;
@@ -31690,9 +32986,11 @@ class BlockSync {
           }
         }
       }
-      const memoryFlush = this.utxoManager.shouldFlush();
+      const memSnap = snapshotMemory(this.utxoManager, scriptCheckPoolSize());
+      const memoryFlush = this.utxoManager.shouldFlush() || exceedsRssBudget(memSnap, this.utxoManager.getMaxCacheBytes());
       if (memoryFlush && this.utxoManager.getDirtyCount() > 0) {
-        console.log(`UTXO memory flush at height ${height}: ${this.utxoManager.getCacheSize()} entries`);
+        const why = this.utxoManager.shouldFlush() ? "cache" : "rss";
+        console.log(`UTXO memory flush (${why}) at height ${height}: ${this.utxoManager.getCacheSize()} entries | ${formatMemoryBreakdown(memSnap)}`);
         const extraOps = [];
         if (headerEntry) {
           const chainStateValue = this.serializeChainState(headerEntry.hash, height, headerEntry.chainWork);
@@ -31706,7 +33004,7 @@ class BlockSync {
         await this.utxoManager.flushDirty(extraOps);
         this.lastFlushedHeight = height;
         if (typeof Bun !== "undefined" && Bun.gc) {
-          Bun.gc(true);
+          Bun.gc(false);
         }
       }
       if (this.blocksProcessed % 64 === 0) {
@@ -31716,8 +33014,9 @@ class BlockSync {
         Bun.gc(false);
       }
     }
-    if (this.state.nextHeightToProcess > bestHeader.height && this.state.pendingBlocks.size === 0) {
-      this.completeIBD();
+    const liveTip = this.headerSync.getBestHeader();
+    if (liveTip && this.state.nextHeightToProcess > liveTip.height && this.state.pendingBlocks.size === 0 && this.state.downloadedBlocks.size === 0) {
+      await this.completeIBD();
     }
   }
   recordConnectError(msg) {
@@ -32333,7 +33632,7 @@ class BlockSync {
       };
       this.peerManager.broadcast(invMsg);
     }
-    if (atTip && this.chainStateManager) {
+    if (this.chainStateManager) {
       try {
         this.chainStateManager.emitBlockConnected(block);
       } catch (err) {
@@ -32492,7 +33791,14 @@ class BlockSync {
         }
       }
     }
-    const bestHeader = this.headerSync.getBestHeader();
+    let bestHeader = this.headerSync.getBestHeader();
+    if (bestHeader && this.headerSync.promoteMostWorkHeader()) {
+      bestHeader = this.headerSync.getBestHeader();
+      if (this.ibdComplete) {
+        this.ibdComplete = false;
+      }
+      this.requestBlocks();
+    }
     if (bestHeader && this.state.nextHeightToProcess <= bestHeader.height && this.state.pendingBlocks.size === 0 && this.state.downloadedBlocks.size < MAX_DOWNLOADED_BUFFER) {
       if (this.state.nextHeightToRequest > this.state.nextHeightToProcess) {
         this.state.nextHeightToRequest = this.state.nextHeightToProcess;
@@ -32509,17 +33815,33 @@ class BlockSync {
       this.requestBlocks();
     }
   }
-  completeIBD() {
+  async completeIBD() {
     if (this.ibdComplete) {
+      return;
+    }
+    const liveTip = this.headerSync.getBestHeader();
+    if (liveTip && this.state.nextHeightToProcess <= liveTip.height) {
+      return;
+    }
+    if (this.state.pendingBlocks.size > 0 || this.state.downloadedBlocks.size > 0) {
+      return;
+    }
+    if (liveTip && liveTip.chainWork < this.params.nMinimumChainWork) {
       return;
     }
     this.ibdComplete = true;
     this.hasCompletedInitialSync = true;
     this.logProgress();
     console.log("IBD complete! Switching to normal operation.");
-    this.utxoManager.flush().catch((err) => {
+    try {
+      await this.utxoManager.flushDirty();
+      const flushedAt = this.state.nextHeightToProcess - 1;
+      if (flushedAt > this.lastFlushedHeight) {
+        this.lastFlushedHeight = flushedAt;
+      }
+    } catch (err) {
       console.error("Error flushing UTXO cache:", err);
-    });
+    }
   }
   isIBDComplete() {
     return this.ibdComplete;
@@ -32546,14 +33868,11 @@ class BlockSync {
     const elapsed = (Date.now() - this.startTime) / 1000;
     const blocksPerSec = elapsed > 0 ? this.blocksProcessed / elapsed : 0;
     const peerCount = this.peerManager?.getConnectedPeers().length ?? 0;
-    const mem = process.memoryUsage();
-    const rssMB = (mem.rss / 1024 / 1024).toFixed(0);
-    const heapMB = (mem.heapUsed / 1024 / 1024).toFixed(0);
-    const utxoCacheSize = this.utxoManager.getCacheSize();
+    const mem = snapshotMemory(this.utxoManager, scriptCheckPoolSize());
     const pendingCount = this.state.pendingBlocks.size;
     const downloadedCount = this.state.downloadedBlocks.size;
     const headerCount = this.headerSync.getHeaderCount();
-    console.log(`IBD: height=${processed}/${total} (${percent.toFixed(1)}%) | ${blocksPerSec.toFixed(0)} blk/s | ${peerCount} peers | RSS=${rssMB}MB heap=${heapMB}MB | utxo=${utxoCacheSize} pend=${pendingCount} dl=${downloadedCount} hdrs=${headerCount}`);
+    console.log(`IBD: height=${processed}/${total} (${percent.toFixed(1)}%) | ${blocksPerSec.toFixed(0)} blk/s | ${peerCount} peers | ${formatMemoryBreakdown(mem)} | pend=${pendingCount} dl=${downloadedCount} hdrs=${headerCount}`);
   }
   getState() {
     return this.state;
@@ -38488,6 +39807,12 @@ class Wallet {
     });
     return tx;
   }
+  commitUnconfirmedSpend(tx) {
+    for (const input of tx.inputs) {
+      const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+      this.utxos.delete(key);
+    }
+  }
   getOutgoingTx(txid) {
     return this.outgoingTxs.get(txid);
   }
@@ -43400,8 +44725,537 @@ function buildOriginalPsbtFromSignedTx(tx, prevOuts) {
   }
   return psbt;
 }
+// src/rpc/core-arity.json
+var core_arity_default = {
+  addnode: {
+    declared: 3,
+    required: 2,
+    sig: 'addnode "node" "command" ( v2transport )'
+  },
+  analyzepsbt: {
+    declared: 1,
+    required: 1,
+    sig: 'analyzepsbt "psbt"'
+  },
+  clearbanned: {
+    declared: 0,
+    required: 0,
+    sig: "clearbanned"
+  },
+  combinepsbt: {
+    declared: 1,
+    required: 1,
+    sig: 'combinepsbt ["psbt",...]'
+  },
+  combinerawtransaction: {
+    declared: 1,
+    required: 1,
+    sig: 'combinerawtransaction ["hexstring",...]'
+  },
+  converttopsbt: {
+    declared: 3,
+    required: 1,
+    sig: 'converttopsbt "hexstring" ( permitsigdata iswitness )'
+  },
+  createmultisig: {
+    declared: 3,
+    required: 2,
+    sig: 'createmultisig nrequired ["key",...] ( "address_type" )'
+  },
+  createpsbt: {
+    declared: 5,
+    required: 2,
+    sig: 'createpsbt [{"txid":"hex","vout":n,"sequence":n},...] [{"address":amount,...},{"data":"hex"},...] ( locktime replaceable version )'
+  },
+  createrawtransaction: {
+    declared: 5,
+    required: 2,
+    sig: 'createrawtransaction [{"txid":"hex","vout":n,"sequence":n},...] [{"address":amount,...},{"data":"hex"},...] ( locktime replaceable version )'
+  },
+  decodepsbt: {
+    declared: 1,
+    required: 1,
+    sig: 'decodepsbt "psbt"'
+  },
+  decoderawtransaction: {
+    declared: 2,
+    required: 1,
+    sig: 'decoderawtransaction "hexstring" ( iswitness )'
+  },
+  decodescript: {
+    declared: 1,
+    required: 1,
+    sig: 'decodescript "hexstring"'
+  },
+  deriveaddresses: {
+    declared: 2,
+    required: 1,
+    sig: 'deriveaddresses "descriptor" ( range )'
+  },
+  descriptorprocesspsbt: {
+    declared: 7,
+    required: 4,
+    sig: 'descriptorprocesspsbt "psbt" ["",{"desc":"str","range":n or [n,n]},...] ( "sighashtype" bip32derivs finalize )'
+  },
+  disconnectnode: {
+    declared: 2,
+    required: 0,
+    sig: 'disconnectnode ( "address" nodeid )'
+  },
+  estimatesmartfee: {
+    declared: 2,
+    required: 1,
+    sig: 'estimatesmartfee conf_target ( "estimate_mode" )'
+  },
+  finalizepsbt: {
+    declared: 2,
+    required: 1,
+    sig: 'finalizepsbt "psbt" ( extract )'
+  },
+  getaddednodeinfo: {
+    declared: 1,
+    required: 0,
+    sig: 'getaddednodeinfo ( "node" )'
+  },
+  getaddrmaninfo: {
+    declared: 0,
+    required: 0,
+    sig: "getaddrmaninfo"
+  },
+  getbestblockhash: {
+    declared: 0,
+    required: 0,
+    sig: "getbestblockhash"
+  },
+  getblock: {
+    declared: 2,
+    required: 1,
+    sig: 'getblock "blockhash" ( verbosity )'
+  },
+  getblockchaininfo: {
+    declared: 0,
+    required: 0,
+    sig: "getblockchaininfo"
+  },
+  getblockcount: {
+    declared: 0,
+    required: 0,
+    sig: "getblockcount"
+  },
+  getblockfilter: {
+    declared: 2,
+    required: 1,
+    sig: 'getblockfilter "blockhash" ( "filtertype" )'
+  },
+  getblockfrompeer: {
+    declared: 2,
+    required: 2,
+    sig: 'getblockfrompeer "blockhash" peer_id'
+  },
+  getblockhash: {
+    declared: 1,
+    required: 1,
+    sig: "getblockhash height"
+  },
+  getblockheader: {
+    declared: 2,
+    required: 1,
+    sig: 'getblockheader "blockhash" ( verbose )'
+  },
+  getblockstats: {
+    declared: 2,
+    required: 1,
+    sig: "getblockstats hash_or_height ( stats )"
+  },
+  getblocktemplate: {
+    declared: 1,
+    required: 1,
+    sig: 'getblocktemplate {"mode":"str","capabilities":["str",...],"rules":["segwit","str",...],"longpollid":"str","data":"hex"}'
+  },
+  getchainstates: {
+    declared: 0,
+    required: 0,
+    sig: "getchainstates"
+  },
+  getchaintips: {
+    declared: 0,
+    required: 0,
+    sig: "getchaintips"
+  },
+  getchaintxstats: {
+    declared: 2,
+    required: 0,
+    sig: 'getchaintxstats ( nblocks "blockhash" )'
+  },
+  getconnectioncount: {
+    declared: 0,
+    required: 0,
+    sig: "getconnectioncount"
+  },
+  getdeploymentinfo: {
+    declared: 1,
+    required: 0,
+    sig: 'getdeploymentinfo ( "blockhash" )'
+  },
+  getdescriptorinfo: {
+    declared: 1,
+    required: 1,
+    sig: 'getdescriptorinfo "descriptor"'
+  },
+  getdifficulty: {
+    declared: 0,
+    required: 0,
+    sig: "getdifficulty"
+  },
+  getindexinfo: {
+    declared: 1,
+    required: 0,
+    sig: 'getindexinfo ( "index_name" )'
+  },
+  getmemoryinfo: {
+    declared: 1,
+    required: 0,
+    sig: 'getmemoryinfo ( "mode" )'
+  },
+  getmempoolancestors: {
+    declared: 2,
+    required: 1,
+    sig: 'getmempoolancestors "txid" ( verbose )'
+  },
+  getmempooldescendants: {
+    declared: 2,
+    required: 1,
+    sig: 'getmempooldescendants "txid" ( verbose )'
+  },
+  getmempoolentry: {
+    declared: 1,
+    required: 1,
+    sig: 'getmempoolentry "txid"'
+  },
+  getmempoolinfo: {
+    declared: 0,
+    required: 0,
+    sig: "getmempoolinfo"
+  },
+  getmininginfo: {
+    declared: 0,
+    required: 0,
+    sig: "getmininginfo"
+  },
+  getnettotals: {
+    declared: 0,
+    required: 0,
+    sig: "getnettotals"
+  },
+  getnetworkhashps: {
+    declared: 2,
+    required: 0,
+    sig: "getnetworkhashps ( nblocks height )"
+  },
+  getnetworkinfo: {
+    declared: 0,
+    required: 0,
+    sig: "getnetworkinfo"
+  },
+  getnodeaddresses: {
+    declared: 2,
+    required: 0,
+    sig: 'getnodeaddresses ( count "network" )'
+  },
+  getpeerinfo: {
+    declared: 0,
+    required: 0,
+    sig: "getpeerinfo"
+  },
+  getprioritisedtransactions: {
+    declared: 0,
+    required: 0,
+    sig: "getprioritisedtransactions"
+  },
+  getrawmempool: {
+    declared: 2,
+    required: 0,
+    sig: "getrawmempool ( verbose mempool_sequence )"
+  },
+  getrawtransaction: {
+    declared: 3,
+    required: 1,
+    sig: 'getrawtransaction "txid" ( verbosity "blockhash" )'
+  },
+  getrpcinfo: {
+    declared: 0,
+    required: 0,
+    sig: "getrpcinfo"
+  },
+  gettxout: {
+    declared: 3,
+    required: 2,
+    sig: 'gettxout "txid" n ( include_mempool )'
+  },
+  gettxoutproof: {
+    declared: 2,
+    required: 1,
+    sig: 'gettxoutproof ["txid",...] ( "blockhash" )'
+  },
+  gettxoutsetinfo: {
+    declared: 3,
+    required: 0,
+    sig: 'gettxoutsetinfo ( "hash_type" hash_or_height use_index )'
+  },
+  gettxspendingprevout: {
+    declared: 2,
+    required: 1,
+    sig: 'gettxspendingprevout [{"txid":"hex","vout":n},...] ( {"mempool_only":bool,"return_spending_tx":bool,...} )'
+  },
+  help: {
+    declared: 1,
+    required: 0,
+    sig: 'help ( "command" )'
+  },
+  importmempool: {
+    declared: 2,
+    required: 1,
+    sig: 'importmempool "filepath" ( options )'
+  },
+  joinpsbts: {
+    declared: 1,
+    required: 1,
+    sig: 'joinpsbts ["psbt",...]'
+  },
+  listbanned: {
+    declared: 0,
+    required: 0,
+    sig: "listbanned"
+  },
+  logging: {
+    declared: 2,
+    required: 0,
+    sig: 'logging ( ["include_category",...] ["exclude_category",...] )'
+  },
+  ping: {
+    declared: 0,
+    required: 0,
+    sig: "ping"
+  },
+  preciousblock: {
+    declared: 1,
+    required: 1,
+    sig: 'preciousblock "blockhash"'
+  },
+  prioritisetransaction: {
+    declared: 3,
+    required: 1,
+    sig: 'prioritisetransaction "txid" ( dummy ) fee_delta'
+  },
+  pruneblockchain: {
+    declared: 1,
+    required: 1,
+    sig: "pruneblockchain height"
+  },
+  savemempool: {
+    declared: 0,
+    required: 0,
+    sig: "savemempool"
+  },
+  scanblocks: {
+    declared: 6,
+    required: 1,
+    sig: 'scanblocks "action" ( [scanobjects,...] start_height stop_height "filtertype" options )'
+  },
+  scantxoutset: {
+    declared: 2,
+    required: 1,
+    sig: 'scantxoutset "action" ( [scanobjects,...] )'
+  },
+  sendrawtransaction: {
+    declared: 3,
+    required: 1,
+    sig: 'sendrawtransaction "hexstring" ( maxfeerate maxburnamount )'
+  },
+  setban: {
+    declared: 4,
+    required: 2,
+    sig: 'setban "subnet" "command" ( bantime absolute )'
+  },
+  setnetworkactive: {
+    declared: 1,
+    required: 1,
+    sig: "setnetworkactive state"
+  },
+  signmessagewithprivkey: {
+    declared: 2,
+    required: 2,
+    sig: 'signmessagewithprivkey "privkey" "message"'
+  },
+  signrawtransactionwithkey: {
+    declared: 4,
+    required: 2,
+    sig: 'signrawtransactionwithkey "hexstring" ["privatekey",...] ( [{"txid":"hex","vout":n,"scriptPubKey":"hex","redeemScript":"hex","witnessScript":"hex","amount":amount},...] "sighashtype" )'
+  },
+  stop: {
+    declared: 1,
+    required: 0,
+    sig: "stop ( wait )"
+  },
+  submitblock: {
+    declared: 2,
+    required: 1,
+    sig: 'submitblock "hexdata" ( "dummy" )'
+  },
+  submitheader: {
+    declared: 1,
+    required: 1,
+    sig: 'submitheader "hexdata"'
+  },
+  submitpackage: {
+    declared: 3,
+    required: 1,
+    sig: 'submitpackage ["rawtx",...] ( maxfeerate maxburnamount )'
+  },
+  testmempoolaccept: {
+    declared: 2,
+    required: 1,
+    sig: 'testmempoolaccept ["rawtx",...] ( maxfeerate )'
+  },
+  uptime: {
+    declared: 0,
+    required: 0,
+    sig: "uptime"
+  },
+  utxoupdatepsbt: {
+    declared: 4,
+    required: 1,
+    sig: 'utxoupdatepsbt "psbt" ( ["",{"desc":"str","range":n or [n,n]},...] )'
+  },
+  validateaddress: {
+    declared: 1,
+    required: 1,
+    sig: 'validateaddress "address"'
+  },
+  verifychain: {
+    declared: 2,
+    required: 0,
+    sig: "verifychain ( checklevel nblocks )"
+  },
+  verifymessage: {
+    declared: 3,
+    required: 3,
+    sig: 'verifymessage "address" "signature" "message"'
+  },
+  verifytxoutproof: {
+    declared: 1,
+    required: 1,
+    sig: 'verifytxoutproof "proof"'
+  },
+  waitforblock: {
+    declared: 2,
+    required: 1,
+    sig: 'waitforblock "blockhash" ( timeout )'
+  },
+  waitforblockheight: {
+    declared: 2,
+    required: 1,
+    sig: "waitforblockheight height ( timeout )"
+  },
+  waitfornewblock: {
+    declared: 2,
+    required: 0,
+    sig: 'waitfornewblock ( timeout "current_tip" )'
+  },
+  backupwallet: {
+    declared: 1,
+    required: 1,
+    sig: 'backupwallet "destination"'
+  },
+  createwallet: {
+    declared: 8,
+    required: 1,
+    sig: 'createwallet "wallet_name" ( disable_private_keys blank "passphrase" avoid_reuse descriptors load_on_startup external_signer )'
+  },
+  getaddressinfo: {
+    declared: 1,
+    required: 1,
+    sig: 'getaddressinfo "address"'
+  },
+  getbalances: {
+    declared: 0,
+    required: 0,
+    sig: "getbalances"
+  },
+  getnewaddress: {
+    declared: 2,
+    required: 0,
+    sig: 'getnewaddress ( "label" "address_type" )'
+  },
+  getwalletinfo: {
+    declared: 0,
+    required: 0,
+    sig: "getwalletinfo"
+  },
+  listtransactions: {
+    declared: 4,
+    required: 0,
+    sig: 'listtransactions ( "label" count skip include_watchonly )'
+  },
+  listunspent: {
+    declared: 5,
+    required: 0,
+    sig: 'listunspent ( minconf maxconf ["address",...] include_unsafe query_options )'
+  },
+  listwallets: {
+    declared: 0,
+    required: 0,
+    sig: "listwallets"
+  },
+  loadwallet: {
+    declared: 2,
+    required: 1,
+    sig: 'loadwallet "filename" ( load_on_startup )'
+  },
+  restorewallet: {
+    declared: 3,
+    required: 2,
+    sig: 'restorewallet "wallet_name" "backup_file" ( load_on_startup )'
+  },
+  send: {
+    declared: 6,
+    required: 1,
+    sig: 'send [{"address":amount,...},...] ( conf_target "estimate_mode" fee_rate options version )'
+  },
+  sendtoaddress: {
+    declared: 11,
+    required: 2,
+    sig: 'sendtoaddress "address" amount ( "comment" "comment_to" subtractfeefromamount replaceable conf_target "estimate_mode" avoid_reuse fee_rate verbose )'
+  },
+  unloadwallet: {
+    declared: 2,
+    required: 0,
+    sig: 'unloadwallet ( "wallet_name" load_on_startup )'
+  },
+  walletcreatefundedpsbt: {
+    declared: 6,
+    required: 0,
+    sig: 'walletcreatefundedpsbt ( [{"txid":"hex","vout":n},...] [{"address":amount},...] locktime options bip32derivs version )'
+  },
+  walletprocesspsbt: {
+    declared: 5,
+    required: 1,
+    sig: 'walletprocesspsbt "psbt" ( sign "sighashtype" bip32derivs finalize )'
+  }
+};
 
 // src/rpc/server.ts
+function coreArityFor(method) {
+  const e = core_arity_default[method];
+  if (!e || typeof e.required !== "number" || typeof e.declared !== "number") {
+    return;
+  }
+  return { required: e.required, declared: e.declared };
+}
+function coreSignatureFor(method) {
+  const e = core_arity_default[method];
+  return e && typeof e.sig === "string" ? e.sig : undefined;
+}
 var RPCErrorCodes = {
   INVALID_REQUEST: -32600,
   METHOD_NOT_FOUND: -32601,
@@ -43433,8 +45287,15 @@ var RPCErrorCodes = {
   WALLET_ENCRYPTION_FAILED: -16,
   WALLET_ALREADY_UNLOCKED: -17,
   WALLET_NOT_FOUND: -18,
-  WALLET_NOT_SPECIFIED: -19
+  WALLET_NOT_SPECIFIED: -19,
+  WALLET_ALREADY_LOADED: -35,
+  WALLET_ALREADY_EXISTS: -36
 };
+var INT32_MIN = -2147483648;
+var INT32_MAX = 2147483647;
+var INT64_MIN = Number.MIN_SAFE_INTEGER;
+var INT64_MAX = Number.MAX_SAFE_INTEGER;
+var UINT32_MAX = 4294967295;
 var MAX_BATCH_SIZE = 1000;
 function jsonTypeName(value) {
   if (value === null || value === undefined)
@@ -43550,19 +45411,29 @@ function w47bReadVarInt(buf, pos) {
     return [buf.readUInt32LE(pos + 1), pos + 5];
   return [buf.readUInt32LE(pos + 1), pos + 9];
 }
-function w47bTraverseAndExtract(nTx, hashes, flagBytes) {
+var W47B_ZERO32 = Buffer.alloc(32);
+function w47bExtractMatches(nTx, hashes, flagBytes) {
   if (nTx === 0)
-    return [];
+    return { root: W47B_ZERO32, matched: [], bad: true };
   let nHeight = 0;
   while (w47bTreeWidth(nTx, nHeight) > 1)
     nHeight++;
   const bits = w47bBytesToBits(flagBytes);
   let bitPos = 0;
   let hashPos = 0;
+  let isBad = false;
   const matched = [];
   function extract(height, pos) {
-    const flag = bits[bitPos++] ?? false;
+    if (bitPos >= bits.length) {
+      isBad = true;
+      return W47B_ZERO32;
+    }
+    const flag = bits[bitPos++];
     if (height === 0 || !flag) {
+      if (hashPos >= hashes.length) {
+        isBad = true;
+        return W47B_ZERO32;
+      }
       const h = hashes[hashPos++];
       if (height === 0 && flag) {
         matched.push(Buffer.from(h).reverse().toString("hex"));
@@ -43570,11 +45441,21 @@ function w47bTraverseAndExtract(nTx, hashes, flagBytes) {
       return h;
     }
     const left = extract(height - 1, pos * 2);
-    const right = pos * 2 + 1 < w47bTreeWidth(nTx, height - 1) ? extract(height - 1, pos * 2 + 1) : left;
+    let right = left;
+    if (pos * 2 + 1 < w47bTreeWidth(nTx, height - 1)) {
+      right = extract(height - 1, pos * 2 + 1);
+      if (right.equals(left)) {
+        isBad = true;
+      }
+    }
     return hash256(Buffer.concat([left, right]));
   }
-  extract(nHeight, 0);
-  return matched;
+  const root = extract(nHeight, 0);
+  if (hashPos !== hashes.length)
+    isBad = true;
+  if (Math.floor((bitPos + 7) / 8) !== flagBytes.length && flagBytes.length > 0)
+    isBad = true;
+  return { root, matched, bad: isBad };
 }
 
 class RPCServer {
@@ -43727,7 +45608,10 @@ class RPCServer {
       ...tlsConfig ? { tls: tlsConfig } : {}
     });
     const scheme = tlsEnabled ? "https" : "http";
-    console.log(`RPC server listening on ${scheme}://${this.config.host}:${this.config.port}`);
+    console.log(`RPC server listening on ${scheme}://${this.config.host}:${this.server.port}`);
+  }
+  listeningPort() {
+    return this.server?.port ?? this.config.port;
   }
   stop() {
     if (this.server) {
@@ -43892,6 +45776,19 @@ class RPCServer {
         }
       };
     }
+    if (Array.isArray(request.params)) {
+      const arity = coreArityFor(request.method);
+      if (arity && (request.params.length < arity.required || request.params.length > arity.declared)) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -1,
+            message: coreSignatureFor(request.method) ?? "Wrong number of arguments"
+          }
+        };
+      }
+    }
     try {
       const params = Array.isArray(request.params) ? request.params : [];
       const result = await handler(params);
@@ -44026,7 +45923,7 @@ class RPCServer {
     this.registerMethod("gettxout", (params) => this.getTxOut(params));
     this.registerMethod("getindexinfo", (params) => this.getIndexInfo(params));
     this.registerMethod("gettxspendingprevout", (params) => this.getTxSpendingPrevout(params));
-    this.registerMethod("stop", () => this.stopNode());
+    this.registerMethod("stop", (params) => this.stopNode(params));
     this.registerMethod("uptime", () => this.getUptime());
     this.registerMethod("getmemoryinfo", async (params) => this.getMemoryInfo(params));
     this.registerMethod("logging", async (params) => this.logging(params));
@@ -44036,6 +45933,7 @@ class RPCServer {
       this.registerMethod("unloadwallet", (params) => this.unloadWallet(params));
       this.registerMethod("listwallets", () => this.listWallets());
       this.registerMethod("listwalletdir", () => this.listWalletDir());
+      this.registerMethod("restorewallet", (params) => this.restoreWallet(params));
     }
     if (this.wallet || this.walletManager) {
       this.registerMethod("encryptwallet", (params) => this.encryptWallet(params));
@@ -44049,7 +45947,10 @@ class RPCServer {
       this.registerMethod("getwalletinfo", () => this.getWalletInfo());
       this.registerMethod("getnewaddress", (params) => this.getNewAddress(params));
       this.registerMethod("getbalance", (params) => this.getBalance(params));
+      this.registerMethod("getbalances", () => this.getBalances());
       this.registerMethod("sendtoaddress", (params) => this.sendToAddress(params));
+      this.registerMethod("send", (params) => this.send(params));
+      this.registerMethod("backupwallet", (params) => this.backupWallet(params));
       this.registerMethod("listunspent", (params) => this.listUnspent(params));
       this.registerMethod("signrawtransactionwithwallet", (params) => this.signRawTransactionWithWallet(params));
       this.registerMethod("importdescriptors", (params) => this.importDescriptors(params));
@@ -44270,6 +46171,9 @@ class RPCServer {
   async getBlock(params) {
     const [blockhashParam, verbosityParam] = params;
     const blockhash = this.parseHashV(blockhashParam, "blockhash");
+    if (typeof verbosityParam === "number") {
+      this.uvGetInt(verbosityParam, "verbosity", INT32_MIN, INT32_MAX);
+    }
     const verbosity = typeof verbosityParam === "number" ? verbosityParam : 1;
     const blockIndex = await this.db.getBlockIndex(blockhash);
     if (!blockIndex) {
@@ -44508,6 +46412,7 @@ class RPCServer {
     if (typeof heightParam !== "number" || !Number.isInteger(heightParam)) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "height must be an integer");
     }
+    this.uvGetInt(heightParam, "height", INT32_MIN, INT32_MAX);
     const height = heightParam;
     const bestBlock = this.chainState.getBestBlock();
     if (height < 0 || height > bestBlock.height) {
@@ -44810,6 +46715,7 @@ class RPCServer {
     if (typeof timeout === "boolean" || typeof timeout !== "number" || !Number.isInteger(timeout)) {
       throw this.rpcError(RPCErrorCodes.TYPE_ERROR, `JSON value of type ${this.coreUvType(timeout)} is not of expected type number`);
     }
+    this.uvGetInt(timeout, "timeout", INT32_MIN, INT32_MAX);
     if (timeout < 0) {
       throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Negative timeout");
     }
@@ -44819,7 +46725,7 @@ class RPCServer {
     if (typeof height === "boolean" || typeof height !== "number" || !Number.isInteger(height)) {
       throw this.rpcError(RPCErrorCodes.TYPE_ERROR, `JSON value of type ${this.coreUvType(height)} is not of expected type number`);
     }
-    return height;
+    return this.uvGetInt(height, "height", INT32_MIN, INT32_MAX);
   }
   async waitForTip(predicate, timeoutMs) {
     let tip = this.currentTip();
@@ -45170,6 +47076,9 @@ class RPCServer {
   }
   async getChainTxStats(params) {
     const [nblocksParam, blockhashParam] = params ?? [];
+    if (typeof nblocksParam === "number") {
+      this.uvGetInt(nblocksParam, "nblocks", INT32_MIN, INT32_MAX);
+    }
     let blockcount = Math.floor(2592000 / this.params.targetSpacing);
     let pindexHash;
     let pindexHeight;
@@ -45531,6 +47440,9 @@ class RPCServer {
     const txid = this.parseHashV(txidParam, "txid");
     if (txid.equals(this.getGenesisCoinbaseTxidLE())) {
       throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved");
+    }
+    if (typeof verboseParam === "number") {
+      this.uvGetInt(verboseParam, "verbosity", INT32_MIN, INT32_MAX);
     }
     let verbosityLevel = 0;
     if (verboseParam === true || verboseParam === 1) {
@@ -46787,7 +48699,8 @@ class RPCServer {
     if (typeof confTargetParam !== "number" || !Number.isInteger(confTargetParam)) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "conf_target must be an integer");
     }
-    const confTarget = Math.max(1, Math.min(1008, confTargetParam));
+    const confTarget = this.parseConfirmTarget(confTargetParam, 1008);
+    this.checkEstimateMode(params[1]);
     const estimate = this.feeEstimator.estimateSmartFee(confTarget);
     if (!estimate.feeRate || estimate.feeRate <= 0) {
       return {
@@ -46805,7 +48718,7 @@ class RPCServer {
     if (typeof confTargetParam !== "number" || !Number.isInteger(confTargetParam)) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "conf_target must be an integer");
     }
-    const confTarget = Math.max(1, Math.min(1008, confTargetParam));
+    const confTarget = this.parseConfirmTarget(confTargetParam, 1008);
     let threshold = 0.95;
     if (thresholdParam !== undefined && thresholdParam !== null) {
       if (typeof thresholdParam !== "number") {
@@ -47092,13 +49005,13 @@ class RPCServer {
         ...peer.pingOutstanding && peer.pingSentTime > 0 ? { pingwait: Math.max(0, Date.now() - peer.pingSentTime) / 1000 } : {},
         version: peer.versionPayload?.version ?? 0,
         subver: peer.versionPayload?.userAgent ?? "",
-        inbound: false,
+        inbound: this.peerIsInbound(peer),
         bip152_hb_to: false,
         bip152_hb_from: false,
-        presynced_headers: -1,
-        synced_headers: -1,
-        synced_blocks: -1,
-        inflight: [],
+        presynced_headers: this.peerPresyncHeight(peer),
+        synced_headers: typeof peer.syncedHeaders === "number" ? peer.syncedHeaders : -1,
+        synced_blocks: typeof peer.syncedBlocks === "number" ? peer.syncedBlocks : -1,
+        inflight: this.peerInFlightHeights(peer),
         addr_relay_enabled: true,
         addr_processed: 0,
         addr_rate_limited: 0,
@@ -47106,7 +49019,7 @@ class RPCServer {
         minfeefilter: 0,
         bytessent_per_msg: {},
         bytesrecv_per_msg: {},
-        connection_type: "outbound-full-relay",
+        connection_type: this.peerConnectionTypeRpc(peer),
         transport_protocol_type: "v1",
         session_id: ""
       };
@@ -47115,6 +49028,55 @@ class RPCServer {
       }
       return entry;
     });
+  }
+  peerConnType(peer) {
+    const pm = this.peerManager;
+    if (typeof pm.getConnectionType !== "function")
+      return;
+    return pm.getConnectionType(`${peer.host}:${peer.port}`);
+  }
+  peerIsInbound(peer) {
+    return this.peerConnType(peer) === "inbound";
+  }
+  peerConnectionTypeRpc(peer) {
+    switch (this.peerConnType(peer)) {
+      case "inbound":
+        return "inbound";
+      case "block_relay":
+        return "block-relay-only";
+      case "feeler":
+        return "feeler";
+      default:
+        return "outbound-full-relay";
+    }
+  }
+  peerPresyncHeight(peer) {
+    const hs = this.headerSync;
+    if (typeof hs.getPresyncHeightForPeer !== "function")
+      return -1;
+    return hs.getPresyncHeightForPeer(peer);
+  }
+  peerInFlightHeights(peer) {
+    const inFlight = peer.blocksInFlight;
+    if (!inFlight || typeof inFlight.keys !== "function")
+      return [];
+    const heights = [];
+    for (const hashHex of inFlight.keys()) {
+      let hash;
+      try {
+        hash = Buffer.from(hashHex, "hex");
+      } catch {
+        continue;
+      }
+      if (hash.length !== 32)
+        continue;
+      const entry = this.headerSync.getHeader(hash);
+      if (entry && typeof entry.height === "number") {
+        heights.push(entry.height);
+      }
+    }
+    heights.sort((a, b) => a - b);
+    return heights;
   }
   async getBlockFromPeer(params) {
     const [blockhashParam, peerIdParam] = params;
@@ -47150,7 +49112,7 @@ class RPCServer {
     if (countParam === undefined || countParam === null) {
       count = 1;
     } else if (typeof countParam === "number" && Number.isInteger(countParam)) {
-      count = countParam;
+      count = this.uvGetInt(countParam, "count", INT32_MIN, INT32_MAX);
     } else {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "JSON value of type " + typeof countParam + " is not of expected type number");
     }
@@ -47435,13 +49397,32 @@ class RPCServer {
   }
   async disconnectNode(params) {
     let address;
+    let nodeidParam = params[1];
     if (typeof params[0] === "string") {
       address = params[0];
     } else if (typeof params[0] === "object" && params[0] !== null) {
-      address = params[0].address;
+      const o = params[0];
+      address = o.address;
+      if (o.nodeid !== undefined)
+        nodeidParam = o.nodeid;
+    }
+    const haveAddress = address !== undefined && address !== "";
+    const haveNodeid = nodeidParam !== undefined && nodeidParam !== null;
+    if (haveNodeid && !haveAddress) {
+      const nodeid = this.uvGetInt(nodeidParam, "nodeid", INT64_MIN, INT64_MAX);
+      const connected = this.peerManager.getConnectedPeers();
+      const target = connected[nodeid];
+      if (nodeid < 0 || nodeid >= connected.length || target === undefined) {
+        throw this.rpcError(RPCErrorCodes.CLIENT_NODE_NOT_CONNECTED, "Node not found in connected nodes");
+      }
+      this.peerManager.disconnectPeer(`${target.host}:${target.port}`);
+      return null;
+    }
+    if (haveAddress && haveNodeid) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Only one of address and nodeid should be provided.");
     }
     if (!address || typeof address !== "string") {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Node address required");
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Only one of address and nodeid should be provided.");
     }
     const lastColon = address.lastIndexOf(":");
     let host;
@@ -47522,18 +49503,23 @@ class RPCServer {
       throw this.rpcError(RPCErrorCodes.CLIENT_INVALID_IP_OR_SUBNET, "Error: Invalid IP/Subnet");
     }
     if (command === "add") {
+      if (this.peerManager.isBanned(ip)) {
+        throw this.rpcError(RPCErrorCodes.CLIENT_NODE_ALREADY_ADDED, "Error: IP/Subnet already banned");
+      }
       const bantime = typeof bantimeParam === "number" ? bantimeParam : 86400;
       const absolute = absoluteParam === true;
-      if (bantime <= 0) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Ban time must be positive");
+      if (absolute && bantime < Math.floor(Date.now() / 1000)) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Error: Absolute timestamp is in the past");
       }
-      this.peerManager.banAddress(ip, bantime, "manually banned via setban RPC");
-      console.log(`Banned ${ip} for ${bantime} seconds`);
+      const defaulted = bantime === 0 ? 86400 : bantime;
+      const duration = absolute ? defaulted - Math.floor(Date.now() / 1000) : defaulted;
+      this.peerManager.banAddress(ip, duration, "manually banned via setban RPC");
+      console.log(`Banned ${ip} for ${duration} seconds`);
       return null;
     } else if (command === "remove") {
       const removed = this.peerManager.unbanAddress(ip);
       if (!removed) {
-        throw this.rpcError(RPCErrorCodes.MISC_ERROR, `Error: IP/Subnet ${ip} is not banned`);
+        throw this.rpcError(RPCErrorCodes.CLIENT_INVALID_IP_OR_SUBNET, "Error: Unban failed. Requested address/subnet was not previously manually banned.");
       }
       console.log(`Unbanned ${ip}`);
       return null;
@@ -47546,7 +49532,16 @@ class RPCServer {
     console.log("Cleared all bans");
     return null;
   }
-  async stopNode() {
+  async stopNode(params = []) {
+    if (params.length > 0 && params[0] !== null && params[0] !== undefined) {
+      const wait = params[0];
+      if (typeof wait !== "number" || !Number.isFinite(wait)) {
+        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "JSON value is not of expected type number");
+      }
+      if (wait > 0) {
+        await new Promise((resolve) => setTimeout(resolve, wait));
+      }
+    }
     setTimeout(() => {
       if (this.shutdownCallback) {
         this.shutdownCallback();
@@ -47622,6 +49617,8 @@ class RPCServer {
     }
     if (watch) {
       result.parent_desc = watch.parentDesc;
+    } else if (ismine && solvable && typeof result.desc === "string") {
+      result.parent_desc = result.desc;
     }
     result.iswatchonly = false;
     result.isscript = decoded.isScript;
@@ -47784,7 +49781,8 @@ class RPCServer {
       block = deserializeBlock(reader);
       buf = null;
     } catch (err) {
-      throw this.rpcError(RPCErrorCodes.MISC_ERROR, `Block decode failed: ${err instanceof Error ? err.message : String(err)}`);
+      getLogger().debug("rpc", `submitblock: block decode failed: ${err instanceof Error ? err.message : String(err)}`);
+      throw this.rpcError(RPCErrorCodes.DESERIALIZATION_ERROR, "Block decode failed");
     }
     const blockHash = getBlockHash(block.header);
     const parentEntry = this.headerSync.getHeader(block.header.prevBlock);
@@ -48321,6 +50319,57 @@ class RPCServer {
     }
     return Buffer.from(value, "hex").reverse();
   }
+  uvGetInt(value, _name, min, max) {
+    if (typeof value !== "number") {
+      throw this.rpcError(RPCErrorCodes.TYPE_ERROR, `JSON value of type ${this.uvTypeName(value)} is not of expected type number`);
+    }
+    if (!Number.isInteger(value) || value < min || value > max) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "JSON integer out of range");
+    }
+    return value;
+  }
+  parseLocktimeArg(value) {
+    if (value === undefined || value === null)
+      return 0;
+    const lt = this.uvGetInt(value, "locktime", INT64_MIN, INT64_MAX);
+    if (lt < 0 || lt > 4294967295) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Invalid parameter, locktime out of range");
+    }
+    return lt;
+  }
+  parseConfirmTarget(value, maxTarget) {
+    this.uvGetInt(value, "conf_target", INT32_MIN, INT32_MAX);
+    if (value < 1 || value > maxTarget) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, `Invalid conf_target, must be between 1 and ${maxTarget}`);
+    }
+    return value;
+  }
+  checkEstimateMode(mode) {
+    if (mode === undefined || mode === null)
+      return;
+    if (typeof mode !== "string") {
+      throw this.rpcError(RPCErrorCodes.TYPE_ERROR, `JSON value of type ${this.uvTypeName(mode)} is not of expected type string`);
+    }
+    const up = mode.toUpperCase();
+    if (up !== "UNSET" && up !== "ECONOMICAL" && up !== "CONSERVATIVE") {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, 'Invalid estimate_mode parameter, must be one of: "unset", "economical", "conservative"');
+    }
+  }
+  uvTypeName(value) {
+    if (value === null || value === undefined)
+      return "null";
+    if (typeof value === "boolean")
+      return "bool";
+    if (Array.isArray(value))
+      return "array";
+    if (typeof value === "object")
+      return "object";
+    if (typeof value === "string")
+      return "string";
+    if (typeof value === "number")
+      return "number";
+    return "null";
+  }
   async calculateDifficulty(blockhash) {
     const blockIndex = await this.db.getBlockIndex(blockhash);
     if (!blockIndex) {
@@ -48670,10 +50719,15 @@ class RPCServer {
       }
       return response;
     } catch (err) {
-      throw {
-        code: RPCErrorCodes.WALLET_ERROR,
-        message: err instanceof Error ? err.message : "Failed to load wallet"
-      };
+      const message = err instanceof Error ? err.message : "Failed to load wallet";
+      const lower = message.toLowerCase();
+      if (lower.includes("not found") || lower.includes("does not exist")) {
+        throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message };
+      }
+      if (lower.includes("already loaded")) {
+        throw { code: RPCErrorCodes.WALLET_ALREADY_LOADED, message };
+      }
+      throw { code: RPCErrorCodes.WALLET_ERROR, message };
     }
   }
   async unloadWallet(params) {
@@ -48729,10 +50783,12 @@ class RPCServer {
       }
       return response;
     } catch (err) {
-      throw {
-        code: RPCErrorCodes.WALLET_ERROR,
-        message: err instanceof Error ? err.message : "Failed to unload wallet"
-      };
+      const message = err instanceof Error ? err.message : "Failed to unload wallet";
+      const lower = message.toLowerCase();
+      if (lower.includes("not loaded") || lower.includes("not found") || lower.includes("does not exist")) {
+        throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message };
+      }
+      throw { code: RPCErrorCodes.WALLET_ERROR, message };
     }
   }
   async listWallets() {
@@ -48971,10 +51027,10 @@ class RPCServer {
     const count = typeof countParam === "number" ? Math.min(countParam, 1000) : 10;
     const skip = typeof skipParam === "number" ? skipParam : 0;
     if (count < 0) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Negative count");
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Negative count");
     }
     if (skip < 0) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Negative from");
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Negative from");
     }
     const tipHeight = this.chainState.getBestBlock().height;
     const labelLookup = (address) => wallet.getLabel(address);
@@ -49066,16 +51122,18 @@ class RPCServer {
   async getWalletInfo() {
     const wallet = this.getCurrentWallet();
     const balances = wallet.getBalances();
-    const utxos = wallet.getUTXOs();
     const privateKeysEnabled = !wallet.isPrivateKeysDisabled();
+    const best = this.chainState.getBestBlock();
+    const txcount = wallet.getTxHistory().length;
     return {
       walletname: this.getCurrentWalletName(),
-      walletversion: 1,
+      walletversion: 169900,
+      format: "sqlite",
       balance: Number(balances.trusted) / 1e8,
       unconfirmed_balance: Number(balances.untrustedPending) / 1e8,
       immature_balance: Number(balances.immature) / 1e8,
-      txcount: utxos.length,
-      keypoolsize: privateKeysEnabled ? 20 : 0,
+      txcount,
+      keypoolsize: privateKeysEnabled && !wallet.isBlank() ? 20 : 0,
       unlocked_until: wallet.isLocked() ? 0 : undefined,
       paytxfee: 0,
       hdseedid: undefined,
@@ -49083,6 +51141,13 @@ class RPCServer {
       avoid_reuse: false,
       scanning: false,
       descriptors: true,
+      external_signer: false,
+      blank: wallet.isBlank(),
+      flags: ["descriptors"],
+      lastprocessedblock: {
+        hash: Buffer.from(best.hash).reverse().toString("hex"),
+        height: best.height
+      },
       encrypted: wallet.isEncrypted(),
       locked: wallet.isLocked()
     };
@@ -49145,6 +51210,7 @@ class RPCServer {
     if (typeof nrequiredParam !== "number" || !Number.isInteger(nrequiredParam)) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "nrequired must be an integer");
     }
+    this.uvGetInt(nrequiredParam, "nrequired", INT32_MIN, INT32_MAX);
     const nRequired = nrequiredParam;
     if (!Array.isArray(pubkeysParam)) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "keys must be an array");
@@ -49274,22 +51340,42 @@ class RPCServer {
     } catch (e) {
       throw this.rpcError(RPCErrorCodes.INTERNAL_ERROR, e instanceof Error ? e.message : String(e));
     }
+    const au = this.params.assumeutxo?.get(loadResult.baseBlockHash.toString("hex"));
+    const headerBuf = au?.baseHeader && au.baseHeader.length >= 80 ? au.baseHeader : Buffer.alloc(80);
+    const snapWork = au?.chainWork && au.chainWork > 0n ? au.chainWork : this.params.nMinimumChainWork;
     await this.db.putChainState({
       bestBlockHash: loadResult.baseBlockHash,
       bestHeight: loadResult.baseHeight,
-      totalWork: this.params.nMinimumChainWork
+      totalWork: snapWork
     });
     if (!await this.db.getBlockIndex(loadResult.baseBlockHash)) {
       await this.db.putBlockIndex(loadResult.baseBlockHash, {
         height: loadResult.baseHeight,
-        header: Buffer.alloc(80),
+        header: headerBuf,
         nTx: 0,
         status: 1 /* HEADER_VALID */ | 4 /* TXS_VALID */ | 8 /* HAVE_DATA */,
         dataPos: 0
       });
     }
+    await this.db.putChainWork(loadResult.baseBlockHash, snapWork);
+    if (au) {
+      await persistAssumeutxoTailHeaders(this.db, au);
+    }
     await this.db.putBlockHashByHeight(loadResult.baseHeight, loadResult.baseBlockHash);
     await this.chainState.load();
+    if (loadResult.hashSerialized && loadResult.txouts !== undefined && loadResult.transactions !== undefined && loadResult.bogosize !== undefined && loadResult.totalAmount !== undefined) {
+      this.chainState.setCachedTxOutSet({
+        height: loadResult.baseHeight,
+        bestBlock: loadResult.baseBlockHash,
+        hashSerialized: loadResult.hashSerialized,
+        txouts: loadResult.txouts,
+        transactions: loadResult.transactions,
+        bogosize: loadResult.bogosize,
+        totalAmount: loadResult.totalAmount
+      });
+    }
+    await this.headerSync.adoptChainTipAsBestHeader(loadResult.baseBlockHash, loadResult.baseHeight);
+    this.blockSync?.advanceFrontierPast(loadResult.baseHeight);
     manager.setBackgroundDataDir(`${this.db.path()}-bgvalidate-${Date.now()}`);
     const getBlock = async (height) => {
       const hash = await this.db.getBlockHashByHeight(height);
@@ -49359,6 +51445,7 @@ class RPCServer {
       chainstateManager = new ChainstateManager(this.db, this.params);
       this.chainstateManager = chainstateManager;
     }
+    await this.forceFlushChainstateToDisk();
     const networkPauseActive = targetHeight < tip.height;
     if (networkPauseActive) {
       this.blockSubmissionPaused = true;
@@ -49647,7 +51734,15 @@ class RPCServer {
     }
   }
   async createRawTransaction(params) {
-    const [inputsParam, outputsParam, locktimeParam, replaceableParam] = params;
+    const [inputsParam, outputsParam, locktimeParam, replaceableParam, versionParam] = params;
+    let txVersion = 2;
+    if (versionParam !== undefined && versionParam !== null) {
+      const v = this.uvGetInt(versionParam, "version", 0, UINT32_MAX);
+      if (v < 1 || v > 3) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Invalid parameter, version out of range(1~3)");
+      }
+      txVersion = v;
+    }
     if (!Array.isArray(inputsParam)) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, inputs must be an array");
     }
@@ -49660,14 +51755,7 @@ class RPCServer {
     if (replaceableParam !== undefined && replaceableParam !== null && typeof replaceableParam !== "boolean") {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, replaceable must be a boolean");
     }
-    let lockTime = 0;
-    if (locktimeParam !== undefined && locktimeParam !== null) {
-      const lt = Number(locktimeParam);
-      if (!Number.isInteger(lt) || lt < 0 || lt > 4294967295) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, locktime out of range");
-      }
-      lockTime = lt;
-    }
+    const lockTime = this.parseLocktimeArg(locktimeParam);
     const rbf = replaceableParam === undefined || replaceableParam === null ? true : replaceableParam;
     let defaultSequence;
     if (rbf) {
@@ -49683,23 +51771,20 @@ class RPCServer {
         throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, input must be an object");
       }
       const inObj = rawIn;
-      const txidHex = inObj.txid;
-      const vout = inObj.vout;
-      if (typeof txidHex !== "string" || txidHex.length !== 64) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, missing or invalid txid");
+      const txidLE = this.parseHashV(inObj.txid, "txid");
+      const voutValue = inObj.vout;
+      if (typeof voutValue !== "number") {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Invalid parameter, missing vout key");
       }
-      if (typeof vout !== "number" || !Number.isInteger(vout) || vout < 0) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, missing or invalid vout");
-      }
-      const txidLE = Buffer.from(txidHex, "hex").reverse();
-      if (txidLE.length !== 32) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, txid must be 32 bytes");
+      const vout = this.uvGetInt(voutValue, "vout", INT32_MIN, INT32_MAX);
+      if (vout < 0) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Invalid parameter, vout cannot be negative");
       }
       let sequence = defaultSequence;
-      if (inObj.sequence !== undefined && inObj.sequence !== null) {
-        const seq = Number(inObj.sequence);
-        if (!Number.isInteger(seq) || seq < 0 || seq > SEQUENCE_FINAL2) {
-          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter, sequence number is out of range");
+      if (typeof inObj.sequence === "number") {
+        const seq = this.uvGetInt(inObj.sequence, "sequence", INT64_MIN, INT64_MAX);
+        if (seq < 0 || seq > SEQUENCE_FINAL2) {
+          throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Invalid parameter, sequence number is out of range");
         }
         sequence = seq;
       }
@@ -49745,13 +51830,13 @@ class RPCServer {
       }
     }
     const tx = {
-      version: 2,
+      version: txVersion,
       inputs,
       outputs,
       lockTime
     };
     if (replaceableParam === true && inputs.length > 0 && !inputs.some((i) => i.sequence <= MAX_BIP125_RBF_SEQUENCE3)) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameter combination: Sequence number(s) contradict replaceable option");
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Invalid parameter combination: Sequence number(s) contradict replaceable option");
     }
     return serializeTx(tx, false).toString("hex");
   }
@@ -49812,7 +51897,7 @@ class RPCServer {
     if (params[1] === undefined || params[1] === null) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "vout index required");
     }
-    const vout = Number(params[1]);
+    const vout = this.uvGetInt(params[1], "n", 0, UINT32_MAX);
     const includeMempool = params[2] !== false;
     const bestBlock = this.chainState.getBestBlock();
     const bestBlockHash = Buffer.from(bestBlock.hash).reverse().toString("hex");
@@ -49860,7 +51945,7 @@ class RPCServer {
         throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Address type must be a string");
       }
       if (addressTypeParam !== "legacy" && addressTypeParam !== "p2sh-segwit" && addressTypeParam !== "bech32" && addressTypeParam !== "bech32m") {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, `Unknown address type '${addressTypeParam}'`);
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Unknown address type '${addressTypeParam}'`);
       }
       addressType = addressTypeParam;
     }
@@ -49876,13 +51961,182 @@ class RPCServer {
     }
     return Number(spendable) / 1e8;
   }
+  async getBalances() {
+    const wallet = this.getCurrentWallet();
+    const balances = wallet.getBalances();
+    const best = this.chainState.getBestBlock();
+    const btc = (sats) => Number(sats) / 1e8;
+    return {
+      mine: {
+        trusted: btc(balances.trusted),
+        untrusted_pending: btc(balances.untrustedPending),
+        immature: btc(balances.immature)
+      },
+      lastprocessedblock: {
+        hash: Buffer.from(best.hash).reverse().toString("hex"),
+        height: best.height
+      }
+    };
+  }
+  parsePaymentOutputs(outputsParam) {
+    let entries = [];
+    if (Array.isArray(outputsParam)) {
+      if (outputsParam.length === 0) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Invalid parameter, output argument must be non-empty");
+      }
+      for (const item of outputsParam) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Invalid type for outputs");
+        }
+        for (const [k, v] of Object.entries(item)) {
+          entries.push([k, v]);
+        }
+      }
+    } else if (outputsParam && typeof outputsParam === "object") {
+      entries = Object.entries(outputsParam);
+    } else {
+      throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "outputs must be an array or object");
+    }
+    if (entries.length === 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Invalid parameter, output argument must be non-empty");
+    }
+    const outputs = [];
+    for (const [address, value] of entries) {
+      if (address === "data") {
+        continue;
+      }
+      if (typeof value !== "number" || !(value > 0) || !Number.isFinite(value)) {
+        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Invalid amount");
+      }
+      try {
+        decodeAddress(address);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid address: ${msg}`);
+      }
+      outputs.push({
+        address,
+        amount: BigInt(Math.round(value * 1e8))
+      });
+    }
+    if (outputs.length === 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Invalid parameter, output argument must be non-empty");
+    }
+    return outputs;
+  }
+  async send(params) {
+    const [outputsParam, , , feeRateParam] = params;
+    const outputs = this.parsePaymentOutputs(outputsParam);
+    let feeRate = 1;
+    if (typeof feeRateParam === "number" && feeRateParam > 0 && Number.isFinite(feeRateParam)) {
+      feeRate = feeRateParam;
+    }
+    const wallet = this.getCurrentWallet();
+    if (wallet.isPrivateKeysDisabled()) {
+      throw this.rpcError(RPCErrorCodes.WALLET_ERROR, "Error: Private keys are disabled for this wallet");
+    }
+    if (wallet.isLocked()) {
+      throw this.rpcError(RPCErrorCodes.WALLET_UNLOCK_NEEDED, "Error: Please enter the wallet passphrase with walletpassphrase first.");
+    }
+    let tx;
+    try {
+      tx = wallet.createTransaction(outputs, feeRate);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("Insufficient funds") || msg.includes("No confirmed UTXOs")) {
+        throw this.rpcError(RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS, msg);
+      }
+      throw this.rpcError(RPCErrorCodes.WALLET_ERROR, msg);
+    }
+    this.markWalletDirty();
+    const txHex = serializeTx(tx, true).toString("hex");
+    const txid = await this.sendRawTransaction([txHex]);
+    wallet.commitUnconfirmedSpend(tx);
+    this.markWalletDirty();
+    return { complete: true, txid };
+  }
+  async backupWallet(params) {
+    this.getCurrentWallet();
+    if (!this.walletManager) {
+      throw this.rpcError(RPCErrorCodes.WALLET_NOT_FOUND, "Wallet manager not available");
+    }
+    const dest = params[0];
+    if (typeof dest !== "string" || dest.length === 0) {
+      throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "destination must be a string");
+    }
+    const name2 = this.getCurrentWalletName();
+    await this.walletManager.flushAll();
+    const src = this.walletManager.getWalletFilePath(name2);
+    if (!fs2.existsSync(src)) {
+      throw this.rpcError(RPCErrorCodes.WALLET_ERROR, "Error: Wallet backup failed!");
+    }
+    try {
+      if (fs2.existsSync(dest) && fs2.statSync(dest).isDirectory()) {
+        fs2.copyFileSync(src, path2.join(dest, path2.basename(src)));
+      } else {
+        const parent = path2.dirname(dest);
+        if (!fs2.existsSync(parent)) {
+          throw new Error("destination directory does not exist");
+        }
+        fs2.copyFileSync(src, dest);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Error: Wallet backup failed!";
+      throw this.rpcError(RPCErrorCodes.WALLET_ERROR, msg.startsWith("Error:") ? msg : "Error: Wallet backup failed!");
+    }
+    return null;
+  }
+  async restoreWallet(params) {
+    if (!this.walletManager) {
+      throw this.rpcError(RPCErrorCodes.WALLET_NOT_FOUND, "Wallet manager not available");
+    }
+    const [nameParam, backupParam, loadOnStartup] = params;
+    if (typeof nameParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "wallet_name must be a string");
+    }
+    if (typeof backupParam !== "string" || backupParam.length === 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Backup file does not exist");
+    }
+    if (!fs2.existsSync(backupParam) || !fs2.statSync(backupParam).isFile()) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Backup file does not exist");
+    }
+    if (nameParam.length === 0 || nameParam.includes("/") || nameParam.includes("\\")) {
+      throw this.rpcError(RPCErrorCodes.WALLET_ERROR, "Wallet name cannot be empty or contain path separators");
+    }
+    const destFile = this.walletManager.getWalletFilePath(nameParam);
+    if (fs2.existsSync(destFile) || this.walletManager.hasWallet(nameParam)) {
+      throw this.rpcError(RPCErrorCodes.WALLET_ALREADY_EXISTS, `Failed to restore wallet. Database file exists in '${destFile}'.`);
+    }
+    fs2.mkdirSync(path2.dirname(destFile), { recursive: true });
+    fs2.copyFileSync(backupParam, destFile);
+    let loadOnStartupValue;
+    if (loadOnStartup !== undefined && loadOnStartup !== null) {
+      if (typeof loadOnStartup !== "boolean") {
+        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "load_on_startup must be a boolean");
+      }
+      loadOnStartupValue = loadOnStartup;
+    }
+    try {
+      const result = await this.walletManager.loadWallet(nameParam, "hotbuns", loadOnStartupValue);
+      return { name: result.name };
+    } catch (err) {
+      try {
+        fs2.unlinkSync(destFile);
+      } catch {}
+      const message = err instanceof Error ? err.message : "Failed to restore wallet";
+      if (message.toLowerCase().includes("already loaded")) {
+        throw this.rpcError(RPCErrorCodes.WALLET_ALREADY_LOADED, message);
+      }
+      throw this.rpcError(RPCErrorCodes.WALLET_ERROR, message);
+    }
+  }
   async sendToAddress(params) {
     const [addressParam, amountParam, , , , , , , , feeRateParam] = params;
     if (typeof addressParam !== "string") {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "address must be a string");
     }
     if (typeof amountParam !== "number" || !(amountParam > 0)) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "amount must be a positive number (BTC)");
+      throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Invalid amount");
     }
     try {
       decodeAddress(addressParam);
@@ -49907,14 +52161,17 @@ class RPCServer {
       tx = wallet.createTransaction([{ address: addressParam, amount: amountSats }], feeRate);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      if (msg.includes("Insufficient funds")) {
+      if (msg.includes("Insufficient funds") || msg.includes("No confirmed UTXOs")) {
         throw this.rpcError(RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS, msg);
       }
       throw this.rpcError(RPCErrorCodes.WALLET_ERROR, msg);
     }
     this.markWalletDirty();
     const txHex = serializeTx(tx, true).toString("hex");
-    return await this.sendRawTransaction([txHex]);
+    const txid = await this.sendRawTransaction([txHex]);
+    wallet.commitUnconfirmedSpend(tx);
+    this.markWalletDirty();
+    return txid;
   }
   async bumpFee(params) {
     const [txidParam, optionsParam] = params;
@@ -50214,10 +52471,19 @@ class RPCServer {
     let addressFilter = null;
     if (Array.isArray(addressesRaw)) {
       addressFilter = new Set;
+      const seen = new Set;
       for (const a of addressesRaw) {
         if (typeof a !== "string") {
-          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "addresses must be strings");
+          throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "addresses must be strings");
         }
+        const decoded = this.decodeAddress(a);
+        if (!decoded.valid) {
+          throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid Bitcoin address: ${a}`);
+        }
+        if (seen.has(a)) {
+          throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, `Invalid parameter, duplicated address: ${a}`);
+        }
+        seen.add(a);
         addressFilter.add(a);
       }
     }
@@ -50237,6 +52503,8 @@ class RPCServer {
       }
       const spendable = wallet.isUTXOSpendable(utxo);
       const solvable = key !== undefined || (wallet.getWatchAddressInfo(utxo.address)?.solvable ?? false);
+      const desc = this.solvedDescriptor(wallet, utxo.address);
+      const parentDesc = wallet.getWatchAddressInfo(utxo.address)?.parentDesc ?? desc;
       result.push({
         txid: Buffer.from(utxo.outpoint.txid).reverse().toString("hex"),
         vout: utxo.outpoint.vout,
@@ -50247,10 +52515,40 @@ class RPCServer {
         confirmations: utxo.confirmations,
         spendable,
         solvable,
+        desc: desc ?? "",
+        parent_descs: parentDesc ? [parentDesc] : [],
         safe: spendable
       });
     }
     return result;
+  }
+  solvedDescriptor(wallet, address) {
+    const key = wallet.getKey(address);
+    if (!key) {
+      const watch = wallet.getWatchAddressInfo(address);
+      if (watch?.solvable && watch.parentDesc)
+        return watch.parentDesc;
+      return;
+    }
+    const pubkeyHex = key.publicKey.toString("hex");
+    let body;
+    switch (key.addressType) {
+      case "p2wpkh" /* P2WPKH */:
+        body = `wpkh(${pubkeyHex})`;
+        break;
+      case "p2pkh" /* P2PKH */:
+        body = `pkh(${pubkeyHex})`;
+        break;
+      case "p2sh" /* P2SH */:
+        body = `sh(wpkh(${pubkeyHex}))`;
+        break;
+      case "p2tr" /* P2TR */:
+        body = `tr(${pubkeyHex})`;
+        break;
+      default:
+        return;
+    }
+    return addChecksum(body);
   }
   buildScriptPubKeyHex(type, hash) {
     switch (type) {
@@ -50774,12 +53072,20 @@ class RPCServer {
     return lo;
   }
   async createPSBTRpc(params) {
-    const [inputsParam, outputsParam, locktimeParam, replaceableParam] = params;
+    const [inputsParam, outputsParam, locktimeParam, replaceableParam, versionParam] = params;
+    let txVersion = 2;
+    if (versionParam !== undefined && versionParam !== null) {
+      const v = this.uvGetInt(versionParam, "version", 0, UINT32_MAX);
+      if (v < 1 || v > 3) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Invalid parameter, version out of range(1~3)");
+      }
+      txVersion = v;
+    }
     if (!Array.isArray(inputsParam)) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "inputs must be an array");
     }
     const replaceable = replaceableParam === true;
-    const lockTime = typeof locktimeParam === "number" ? locktimeParam : 0;
+    const lockTime = this.parseLocktimeArg(locktimeParam);
     const sequenceDefault = replaceable ? 4294967293 : 4294967294;
     const txInputs = [];
     for (const inUnknown of inputsParam) {
@@ -50835,7 +53141,7 @@ class RPCServer {
       }
     }
     const tx = {
-      version: 2,
+      version: txVersion,
       inputs: txInputs,
       outputs: txOutputs,
       lockTime: lockTime >>> 0
@@ -51010,7 +53316,7 @@ class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "outputs must be array or object");
     }
     const wallet = this.getCurrentWallet();
-    const lockTime = (typeof locktimeParam === "number" ? locktimeParam : 0) >>> 0;
+    const lockTime = this.parseLocktimeArg(locktimeParam);
     const options = typeof optionsParam === "object" && optionsParam ? optionsParam : {};
     const replaceable = options.replaceable === true;
     const sequenceDefault = replaceable ? 4294967293 : 4294967294;
@@ -51046,6 +53352,9 @@ class RPCServer {
           });
         }
       }
+    }
+    if (outputsList.length === 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Invalid parameter, output argument must be non-empty");
     }
     let feeRate = 1;
     if (typeof options.fee_rate === "number" && options.fee_rate > 0) {
@@ -51180,9 +53489,9 @@ class RPCServer {
     try {
       psbt = decodePSBTBase64(psbtParam);
     } catch (e) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, `TX decode failed ${e.message}`);
+      throw this.rpcError(RPCErrorCodes.DESERIALIZATION_ERROR, `TX decode failed ${e.message}`);
     }
-    const utxoManager = this.chainState.getUTXOManager();
+    const utxoManager = this.liveUTXOManager();
     for (let i = 0;i < psbt.tx.inputs.length; i++) {
       const txin = psbt.tx.inputs[i];
       if (isInputFinalized(psbt.inputs[i]))
@@ -51392,6 +53701,16 @@ class RPCServer {
   liveUTXOManager() {
     return this.blockSync?.getUTXOManager() ?? this.chainState.getUTXOManager();
   }
+  async forceFlushChainstateToDisk() {
+    const tip = this.chainState.getBestBlock();
+    await this.liveUTXOManager().flushDirty([
+      this.db.buildChainStateOp({
+        bestBlockHash: tip.hash,
+        bestHeight: tip.height,
+        totalWork: tip.chainWork
+      })
+    ]);
+  }
   utxoDiskSize() {
     try {
       return this.liveUTXOManager().getCoinsViewDB().estimateSize();
@@ -51449,7 +53768,7 @@ class RPCServer {
         throw this.rpcError(RPCErrorCodes.MISC_ERROR, `Unable to read UTXO set at height ${targetHeight}`);
       }
       const bestBlockAtH = Buffer.from(csStats.blockHash).reverse().toString("hex");
-      const result2 = {
+      const result = {
         height: targetHeight,
         bestblock: bestBlockAtH,
         txouts: Number(csStats.txouts),
@@ -51457,32 +53776,55 @@ class RPCServer {
         total_amount: formatBtcAmount(csStats.totalAmount)
       };
       if (hashType === "muhash") {
-        result2.muhash = Buffer.from(csStats.muhash).reverse().toString("hex");
+        result.muhash = Buffer.from(csStats.muhash).reverse().toString("hex");
       }
-      return result2;
+      return result;
     }
-    const chainState = await this.db.getChainState();
-    if (!chainState) {
-      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "No chain state available");
+    const tip = this.chainState.getBestBlock();
+    const cached = this.chainState.getCachedTxOutSet();
+    if (cached && (hashType === "hash_serialized_3" || hashType === "none") && cached.height === tip.height && cached.bestBlock.equals(tip.hash)) {
+      const result = {
+        height: cached.height,
+        bestblock: Buffer.from(cached.bestBlock).reverse().toString("hex"),
+        txouts: Number(cached.txouts),
+        bogosize: Number(cached.bogosize)
+      };
+      if (hashType === "hash_serialized_3") {
+        result.hash_serialized_3 = Buffer.from(cached.hashSerialized).reverse().toString("hex");
+      }
+      result.total_amount = formatBtcAmount(cached.totalAmount);
+      result.transactions = Number(cached.transactions);
+      result.disk_size = this.utxoDiskSize();
+      return result;
     }
-    const bestBlock = this.chainState.getBestBlock();
-    const bestBlockHashHex = Buffer.from(bestBlock.hash).reverse().toString("hex");
-    const stats = await computeUTXOSetStats(this.db, hashType);
-    const result = {
-      height: bestBlock.height,
-      bestblock: bestBlockHashHex,
-      txouts: Number(stats.txouts),
-      bogosize: Number(stats.bogosize),
-      total_amount: formatBtcAmount(stats.totalAmount),
-      transactions: Number(stats.transactions),
-      disk_size: this.utxoDiskSize()
-    };
-    if (hashType === "hash_serialized_3" && stats.hash) {
-      result.hash_serialized_3 = Buffer.from(stats.hash).reverse().toString("hex");
-    } else if (hashType === "muhash" && stats.hash) {
-      result.muhash = Buffer.from(stats.hash).reverse().toString("hex");
+    this.blockSync?.pauseForUTXOScan();
+    try {
+      await this.forceFlushChainstateToDisk();
+      const chainState = await this.db.getChainState();
+      if (!chainState) {
+        throw this.rpcError(RPCErrorCodes.MISC_ERROR, "No chain state available");
+      }
+      const bestBlock = this.chainState.getBestBlock();
+      const bestBlockHashHex = Buffer.from(bestBlock.hash).reverse().toString("hex");
+      const stats = await computeUTXOSetStats(this.db, hashType);
+      const result = {
+        height: bestBlock.height,
+        bestblock: bestBlockHashHex,
+        txouts: Number(stats.txouts),
+        bogosize: Number(stats.bogosize),
+        total_amount: formatBtcAmount(stats.totalAmount),
+        transactions: Number(stats.transactions),
+        disk_size: this.utxoDiskSize()
+      };
+      if (hashType === "hash_serialized_3" && stats.hash) {
+        result.hash_serialized_3 = Buffer.from(stats.hash).reverse().toString("hex");
+      } else if (hashType === "muhash" && stats.hash) {
+        result.muhash = Buffer.from(stats.hash).reverse().toString("hex");
+      }
+      return result;
+    } finally {
+      this.blockSync?.resumeAfterUTXOScan();
     }
-    return result;
   }
   async scanTxOutSet(params) {
     const action = typeof params[0] === "string" ? params[0] : undefined;
@@ -51695,14 +54037,23 @@ class RPCServer {
     return pubkey;
   }
   async getNetworkHashPS(params) {
-    const nblocks = typeof params[0] === "number" ? params[0] : 120;
+    const nblocks = params[0] === undefined || params[0] === null ? 120 : this.uvGetInt(params[0], "nblocks", INT32_MIN, INT32_MAX);
+    const heightArg = params[1] === undefined || params[1] === null ? -1 : this.uvGetInt(params[1], "height", INT32_MIN, INT32_MAX);
+    if (nblocks < -1 || nblocks === 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Invalid nblocks. Must be a positive number or -1.");
+    }
     const bestBlock = this.chainState.getBestBlock();
     const tipHeight = bestBlock.height;
-    if (tipHeight < 2)
+    if (heightArg < -1 || heightArg > tipHeight) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Block does not exist at specified height");
+    }
+    const hiHeight = heightArg >= 0 ? heightArg : tipHeight;
+    if (hiHeight < 1)
       return 0;
-    const window2 = nblocks <= 0 ? 120 : Math.min(nblocks, tipHeight);
-    const hiHeight = tipHeight;
-    const loHeight = hiHeight - window2;
+    let lookup = nblocks === -1 ? hiHeight % this.params.difficultyAdjustmentInterval + 1 : nblocks;
+    if (lookup > hiHeight)
+      lookup = hiHeight;
+    const loHeight = hiHeight - lookup;
     const hiEntry = this.headerSync.getHeaderByHeight(hiHeight);
     const loEntry = this.headerSync.getHeaderByHeight(loHeight);
     if (!hiEntry || !loEntry)
@@ -51765,8 +54116,9 @@ class RPCServer {
       throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Proof too short");
     }
     const nTx = proofBuf.readUInt32LE(80);
-    if (nTx === 0)
-      return [];
+    if (nTx === 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Something wrong with merkleblock");
+    }
     let pos = 84;
     const [hashCount, pos2] = w47bReadVarInt(proofBuf, pos);
     pos = pos2;
@@ -51784,7 +54136,26 @@ class RPCServer {
       throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Proof truncated (flags)");
     }
     const flagBytes = proofBuf.subarray(pos, pos + flagCount);
-    return w47bTraverseAndExtract(nTx, hashes, flagBytes);
+    const MAX_MERKLEBLOCK_TXS = Math.floor(66666.66666666667);
+    if (nTx > MAX_MERKLEBLOCK_TXS) {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Something wrong with merkleblock");
+    }
+    if (hashCount > nTx) {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Something wrong with merkleblock");
+    }
+    if (flagCount * 8 < hashCount) {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Something wrong with merkleblock");
+    }
+    const { root, matched, bad } = w47bExtractMatches(nTx, hashes, flagBytes);
+    const headerMerkleRoot = proofBuf.subarray(36, 68);
+    if (bad || !root.equals(headerMerkleRoot)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Something wrong with merkleblock");
+    }
+    const provenBlockHash = hash256(proofBuf.subarray(0, 80));
+    if (!this.headerSync.isOnBestHeaderChain(provenBlockHash)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found in chain");
+    }
+    return matched;
   }
   async getRpcInfo() {
     return {
@@ -52692,6 +55063,142 @@ class InventoryRelay {
 init_tx();
 init_messages();
 init_params();
+
+// src/cli/supervisor.ts
+var FATAL_SIGNALS = new Set([
+  "SIGSEGV",
+  "SIGILL",
+  "SIGABRT",
+  "SIGBUS",
+  "SIGFPE"
+]);
+var FATAL_EXIT_CODES = new Set([132, 134, 135, 136, 139]);
+var BUN_PANIC_RE = /Segmentation fault|Bun has crashed|panic:\s*Segmentation/i;
+function isHardCrash(opts) {
+  if (opts.signalCode && FATAL_SIGNALS.has(opts.signalCode))
+    return true;
+  if (opts.exitCode != null && FATAL_EXIT_CODES.has(opts.exitCode))
+    return true;
+  if (opts.logSnippet && BUN_PANIC_RE.test(opts.logSnippet))
+    return true;
+  return false;
+}
+function formatCrashLine(opts) {
+  const sig = opts.signalCode ?? (opts.exitCode != null ? `exit ${opts.exitCode}` : "unknown");
+  const snippet = (opts.logSnippet ?? "").replace(/\u001b\[[0-9;]*m/g, "").replace(/\s+/g, " ").trim().slice(0, 160);
+  let line = `CRASHED — child pid=${opts.pid} died signal=${sig}`;
+  if (snippet)
+    line += ` — ${snippet}`;
+  if (opts.restart) {
+    line += ` — restarting ${opts.restart.attempt}/${opts.restart.max} to resume from datadir`;
+  } else {
+    line += " — process is dead";
+  }
+  return line;
+}
+function childArgvFromSupervised(argv) {
+  const bunExe = argv[0] || process.execPath;
+  const scriptPath = argv[1] || "src/index.ts";
+  const rest = argv.slice(2).filter((arg) => {
+    if (arg === "--supervise" || arg.startsWith("--supervise="))
+      return false;
+    if (arg === "--internal-supervised-child")
+      return false;
+    if (arg.startsWith("--supervise-restarts"))
+      return false;
+    return true;
+  });
+  rest.push("--internal-supervised-child");
+  return [bunExe, "run", scriptPath, ...rest];
+}
+async function teeCapture(stream, dest) {
+  if (!stream || typeof stream === "number")
+    return "";
+  const reader = stream.getReader();
+  const dec = new TextDecoder;
+  let text = "";
+  for (;; ) {
+    const { done, value } = await reader.read();
+    if (done)
+      break;
+    if (value) {
+      dest?.write(value);
+      text += dec.decode(value, { stream: true });
+      if (text.length > 64000)
+        text = text.slice(-32000);
+    }
+  }
+  return text;
+}
+async function superviseChild(opts) {
+  const maxRestarts = opts.maxRestarts ?? 0;
+  const backoff = opts.restartBackoffMs ?? 1000;
+  const log = opts.log ?? ((line) => console.error(line));
+  let attempt = 0;
+  const env = {};
+  const src = opts.env ?? process.env;
+  for (const [k, v] of Object.entries(src)) {
+    if (typeof v === "string")
+      env[k] = v;
+  }
+  env.HOTBUNS_SUPERVISE = "0";
+  for (;; ) {
+    const child = Bun.spawn(opts.cmd, {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      cwd: opts.cwd,
+      env
+    });
+    const pid = child.pid;
+    opts.onSpawn?.(pid);
+    const [stdoutText, stderrText, code] = await Promise.all([
+      teeCapture(child.stdout, opts.forwardStdout),
+      teeCapture(child.stderr, opts.forwardStderr),
+      child.exited
+    ]);
+    const signalCode = child.signalCode;
+    const exitCode = child.exitCode;
+    const snippet = `${stderrText}
+${stdoutText}`;
+    if (signalCode === "SIGTERM" || signalCode === "SIGINT") {
+      return code;
+    }
+    if (isHardCrash({
+      signalCode,
+      exitCode,
+      logSnippet: snippet
+    })) {
+      const canRestart = attempt < maxRestarts;
+      log(formatCrashLine({
+        pid,
+        signalCode,
+        exitCode: exitCode ?? code,
+        logSnippet: snippet,
+        restart: canRestart ? { attempt: attempt + 1, max: maxRestarts } : undefined
+      }));
+      if (canRestart) {
+        attempt++;
+        await Bun.sleep(backoff);
+        continue;
+      }
+      return exitCode ?? code ?? 139;
+    }
+    if (code === 0)
+      return 0;
+    log(`EXIT — child pid=${pid} status=${code} signal=${signalCode ?? "none"} — process is dead`);
+    return code;
+  }
+}
+async function runSupervisorFromArgv(argv, opts) {
+  return superviseChild({
+    cmd: childArgvFromSupervised(argv),
+    maxRestarts: opts?.maxRestarts ?? 3,
+    restartBackoffMs: 1000
+  });
+}
+
+// src/cli/cli.ts
 var DEFAULT_CONFIG = {
   datadir: path3.join(os.homedir(), ".hotbuns"),
   network: "mainnet",
@@ -52707,6 +55214,8 @@ var DEFAULT_CONFIG = {
   dbcacheMB: 512,
   daemon: false,
   internalDaemonChild: false,
+  supervise: false,
+  internalSupervisedChild: false,
   rest: false,
   blockfilterindex: false,
   coinstatsindex: false,
@@ -52772,6 +55281,17 @@ function parseArgs(argv) {
         case "max-outbound":
           if (value)
             config.maxOutbound = parseInt(value, 10);
+          break;
+        case "maxconnections":
+        case "max-connections":
+          if (value)
+            config.maxConnections = parseInt(value, 10);
+          break;
+        case "bind":
+          if (value) {
+            config.bind = config.bind || [];
+            config.bind.push(value);
+          }
           break;
         case "listen":
           config.listen = value !== "0" && value !== "false";
@@ -52872,6 +55392,23 @@ function parseArgs(argv) {
           break;
         case "internal-daemon-child":
           config.internalDaemonChild = true;
+          break;
+        case "supervise":
+          if (value === undefined || value === "1" || value === "true") {
+            config.supervise = true;
+          } else if (value === "0" || value === "false") {
+            config.supervise = false;
+          }
+          break;
+        case "supervise-restarts":
+          if (value !== undefined) {
+            const n = parseInt(value, 10);
+            if (!isNaN(n) && n >= 0)
+              config.superviseRestarts = n;
+          }
+          break;
+        case "internal-supervised-child":
+          config.internalSupervisedChild = true;
           break;
         case "conf":
           if (value)
@@ -53049,6 +55586,15 @@ async function loadConfig(datadir, confOverride) {
           break;
         case "maxoutbound":
           config.maxOutbound = parseInt(value, 10);
+          break;
+        case "maxconnections":
+          config.maxConnections = parseInt(value, 10);
+          break;
+        case "bind":
+          if (value) {
+            config.bind = config.bind || [];
+            config.bind.push(value);
+          }
           break;
         case "listen":
           config.listen = value === "1" || value === "true";
@@ -53352,20 +55898,30 @@ async function runSnapshotLoad(snapshotPath, db, chainState, params) {
   console.log(`Loaded ${result.coinsLoaded} coins`);
   console.log(`  Base height: ${result.baseHeight}`);
   console.log(`  Base block:  ${Buffer.from(result.baseBlockHash).reverse().toString("hex")}`);
+  const au = getAssumeutxoData(params, result.baseBlockHash);
+  const headerBuf = au?.baseHeader && au.baseHeader.length >= 80 ? au.baseHeader : Buffer.alloc(80);
+  const chainWork = au?.chainWork && au.chainWork > 0n ? au.chainWork : params.nMinimumChainWork;
   await db.putChainState({
     bestBlockHash: result.baseBlockHash,
     bestHeight: result.baseHeight,
-    totalWork: params.nMinimumChainWork
+    totalWork: chainWork
   });
-  const dummyHeader = Buffer.alloc(80);
   await db.putBlockIndex(result.baseBlockHash, {
     height: result.baseHeight,
-    header: dummyHeader,
+    header: headerBuf,
     nTx: 0,
     status: 1 /* HEADER_VALID */ | 4 /* TXS_VALID */ | 8 /* HAVE_DATA */,
     dataPos: 0
   });
+  await db.putChainWork(result.baseBlockHash, chainWork);
+  if (au) {
+    const nTails = await persistAssumeutxoTailHeaders(db, au);
+    if (nTails > 0) {
+      console.log(`[assumeutxo] persisted ${nTails} base_tail_headers below height ${result.baseHeight}`);
+    }
+  }
   console.log(`Snapshot load complete. Chain tip: height ${result.baseHeight}, hash ` + Buffer.from(result.baseBlockHash).reverse().toString("hex"));
+  return result;
 }
 function daemonizeAndExit(originalArgv) {
   const childArgs = originalArgv.slice(2).filter((arg) => {
@@ -53574,15 +56130,30 @@ async function startNode(config) {
     await db.close();
     return;
   }
+  let snapshotLoadResult = null;
   if (mergedConfig.loadSnapshot) {
-    await runSnapshotLoad(mergedConfig.loadSnapshot, db, chainState, params);
+    snapshotLoadResult = await runSnapshotLoad(mergedConfig.loadSnapshot, db, chainState, params);
     await chainState.load();
     bestBlock = chainState.getBestBlock();
     mempool.setTipHeight(bestBlock.height);
-    console.log(`Snapshot adopted as chain tip: height ${bestBlock.height}, hash ${Buffer.from(bestBlock.hash).reverse().toString("hex")} — ` + `header-syncing from genesis, then forward-syncing block bodies ${bestBlock.height + 1}+.`);
+    if (snapshotLoadResult?.hashSerialized && snapshotLoadResult.txouts !== undefined && snapshotLoadResult.transactions !== undefined && snapshotLoadResult.bogosize !== undefined && snapshotLoadResult.totalAmount !== undefined) {
+      chainState.setCachedTxOutSet({
+        height: snapshotLoadResult.baseHeight,
+        bestBlock: snapshotLoadResult.baseBlockHash,
+        hashSerialized: snapshotLoadResult.hashSerialized,
+        txouts: snapshotLoadResult.txouts,
+        transactions: snapshotLoadResult.transactions,
+        bogosize: snapshotLoadResult.bogosize,
+        totalAmount: snapshotLoadResult.totalAmount
+      });
+    }
+    console.log(`Snapshot adopted as chain tip: height ${bestBlock.height}, hash ${Buffer.from(bestBlock.hash).reverse().toString("hex")} — ` + `header pointer at the snapshot base, then forward-syncing block bodies ${bestBlock.height + 1}+.`);
   }
   const headerSync = new HeaderSync(db, params);
   await headerSync.loadFromDB();
+  if (mergedConfig.loadSnapshot && bestBlock.height > 0) {
+    await headerSync.adoptChainTipAsBestHeader(bestBlock.hash, bestBlock.height);
+  }
   let resolvedAsmapPath = null;
   if (mergedConfig.asmapPath) {
     resolvedAsmapPath = path3.isAbsolute(mergedConfig.asmapPath) ? mergedConfig.asmapPath : path3.join(mergedConfig.datadir, mergedConfig.asmapPath);
@@ -53638,9 +56209,11 @@ async function startNode(config) {
       proxyManager = null;
     }
   }
+  const maxConnections = mergedConfig.maxConnections ?? DEFAULT_MAX_CONNECTIONS;
+  const maxInbound = Math.max(0, maxConnections - mergedConfig.maxOutbound);
   const peerManager = new PeerManager({
     maxOutbound: mergedConfig.maxOutbound,
-    maxInbound: 117,
+    maxInbound,
     params,
     bestHeight: bestBlock.height,
     datadir: mergedConfig.datadir,
@@ -53648,6 +56221,7 @@ async function startNode(config) {
     dnsSeed: mergedConfig.dnsSeed,
     listen: mergedConfig.listen,
     port: mergedConfig.port,
+    bind: mergedConfig.bind,
     pruneMode: pruneManager !== undefined,
     asmapPath: resolvedAsmapPath,
     proxyManager,
@@ -54467,6 +57041,8 @@ OPTIONS:
   --dbcache=<n>         UTXO cache size in MiB (default: 512)
   --load-snapshot=<path> Load Bitcoin Core-format UTXO snapshot (assumeutxo)
   --daemon              Fork to background and detach (re-execs self under Bun)
+  --supervise           Parent watches the node; SIGSEGV/SIGILL is CRASHED (not 'behind') and the child restarts to resume
+  --supervise-restarts=<N>  Restarts after a hard crash (default 3; 0 = report CRASHED and exit)
   --pid=<file>          PID file path (default: <datadir>/hotbuns.pid; '' to disable)
   --ready-fd=<N>        Write 'ready\\n' to this fd once startup completes
   --password=<pass>     Wallet password (for wallet commands)
@@ -54485,6 +57061,14 @@ async function main() {
   if (command === "help" || command === "--help") {
     printHelp();
     return;
+  }
+  const envSupervise = process.env.HOTBUNS_SUPERVISE;
+  const wantSupervise = command === "start" && !config.internalSupervisedChild && (config.supervise === true || envSupervise === "1" || envSupervise === "true");
+  if (wantSupervise) {
+    const code = await runSupervisorFromArgv(Bun.argv, {
+      maxRestarts: config.superviseRestarts ?? 3
+    });
+    process.exit(code);
   }
   switch (command) {
     case "start":

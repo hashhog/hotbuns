@@ -4946,12 +4946,17 @@ export class BlockSync {
     // BOTH connect paths converge on the same listeners — Core's ConnectTip
     // fires BlockConnected for every connected block.
     //
-    // Gated on `atTip` (matching removeForBlock + the tip inv above): deep-IBD
-    // historical blocks are intentionally not fed per-block — the wallet adopts
-    // its funds via the post-IBD rescan, unchanged by this fix. A block connects
-    // through exactly one of connectBlock / BlockSync, so there is no double
-    // credit. Best-effort: a notify failure must never roll back the connect.
-    if (atTip && this.chainStateManager) {
+    // Every connected block, not only the one that lands on the header tip.
+    // Headers-first catch-up connects the earlier blocks of a batch while
+    // bestHeader is still ahead, so an atTip gate drops them. The regtest
+    // wallet lane mines its funding transactions into the first of several
+    // confirmation blocks; only the last block is atTip, and the wallet then
+    // reports txcount 0 / no UTXOs. Core's ConnectTip fires BlockConnected
+    // for every connected block. With no wallet loaded the listener iterates
+    // an empty set, so deep IBD stays cheap. A block still connects through
+    // exactly one of connectBlock / BlockSync. Best-effort: a notify failure
+    // must never roll back the connect.
+    if (this.chainStateManager) {
       try {
         this.chainStateManager.emitBlockConnected(block);
       } catch (err) {

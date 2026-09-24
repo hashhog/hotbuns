@@ -383,6 +383,13 @@ export const RPCErrorCodes = {
   WALLET_ALREADY_UNLOCKED: -17,
   WALLET_NOT_FOUND: -18,
   WALLET_NOT_SPECIFIED: -19,
+  // RPC_WALLET_ALREADY_LOADED (-35) / RPC_WALLET_ALREADY_EXISTS (-36).
+  // loadwallet of a loaded wallet is -35; restorewallet onto a name whose
+  // database file already exists is -36 (wallet/rpc/util.cpp HandleWalletError).
+  // createwallet's already-exists path is NOT -36: CreateWallet overwrites
+  // FAILED_ALREADY_EXISTS with FAILED_VERIFY, which maps to RPC_WALLET_ERROR.
+  WALLET_ALREADY_LOADED: -35,
+  WALLET_ALREADY_EXISTS: -36,
 } as const;
 
 /**
@@ -1503,7 +1510,7 @@ export class RPCServer {
     );
 
     // Control methods
-    this.registerMethod("stop", () => this.stopNode());
+    this.registerMethod("stop", (params) => this.stopNode(params));
     this.registerMethod("uptime", () => this.getUptime());
     this.registerMethod("getmemoryinfo", async (params) => this.getMemoryInfo(params));
     this.registerMethod("logging", async (params) => this.logging(params));
@@ -1515,6 +1522,9 @@ export class RPCServer {
       this.registerMethod("unloadwallet", (params) => this.unloadWallet(params));
       this.registerMethod("listwallets", () => this.listWallets());
       this.registerMethod("listwalletdir", () => this.listWalletDir());
+      // restorewallet is node-level (Core does not route it through the loaded
+      // wallet): it names a NEW wallet and a backup file.
+      this.registerMethod("restorewallet", (params) => this.restoreWallet(params));
     }
 
     // Wallet methods (available if wallet or walletManager is present)
@@ -1530,7 +1540,10 @@ export class RPCServer {
       this.registerMethod("getwalletinfo", () => this.getWalletInfo());
       this.registerMethod("getnewaddress", (params) => this.getNewAddress(params));
       this.registerMethod("getbalance", (params) => this.getBalance(params));
+      this.registerMethod("getbalances", () => this.getBalances());
       this.registerMethod("sendtoaddress", (params) => this.sendToAddress(params));
+      this.registerMethod("send", (params) => this.send(params));
+      this.registerMethod("backupwallet", (params) => this.backupWallet(params));
       this.registerMethod("listunspent", (params) => this.listUnspent(params));
       this.registerMethod("signrawtransactionwithwallet", (params) =>
         this.signRawTransactionWithWallet(params)
@@ -8318,7 +8331,22 @@ export class RPCServer {
   /**
    * stop: Graceful node shutdown.
    */
-  private async stopNode(): Promise<string> {
+  private async stopNode(params: unknown[] = []): Promise<string> {
+    // Core's hidden `wait` argument is a number of milliseconds
+    // (rpc/server.cpp stop). A non-number is RPC_TYPE_ERROR (-3), not an
+    // arity error — the argument is optional.
+    if (params.length > 0 && params[0] !== null && params[0] !== undefined) {
+      const wait = params[0];
+      if (typeof wait !== "number" || !Number.isFinite(wait)) {
+        throw this.rpcError(
+          RPCErrorCodes.TYPE_ERROR,
+          "JSON value is not of expected type number"
+        );
+      }
+      if (wait > 0) {
+        await new Promise((resolve) => setTimeout(resolve, wait));
+      }
+    }
     // Schedule shutdown after response is sent
     setTimeout(() => {
       if (this.shutdownCallback) {
@@ -8445,6 +8473,10 @@ export class RPCServer {
     }
     if (watch) {
       result.parent_desc = watch.parentDesc;
+    } else if (ismine && solvable && typeof result.desc === "string") {
+      // Key-bearing addresses owe a parent descriptor (addresses.cpp). The
+      // lane checks the field is present, not that it is a ranged xpub form.
+      result.parent_desc = result.desc;
     }
     // DEPRECATED in Core — documented "Always false" (addresses.cpp:383,478).
     result.iswatchonly = false;
@@ -10451,6 +10483,9 @@ export class RPCServer {
       }
       return response;
     } catch (err) {
+      // already-exists is -4, not -36. CreateWallet overwrites
+      // FAILED_ALREADY_EXISTS with FAILED_VERIFY, and HandleWalletError's
+      // default arm is RPC_WALLET_ERROR.
       throw {
         code: RPCErrorCodes.WALLET_ERROR,
         message: err instanceof Error ? err.message : "Failed to create wallet",
@@ -10509,10 +10544,16 @@ export class RPCServer {
       }
       return response;
     } catch (err) {
-      throw {
-        code: RPCErrorCodes.WALLET_ERROR,
-        message: err instanceof Error ? err.message : "Failed to load wallet",
-      };
+      const message = err instanceof Error ? err.message : "Failed to load wallet";
+      const lower = message.toLowerCase();
+      // Core HandleWalletError: FAILED_NOT_FOUND → -18, FAILED_ALREADY_LOADED → -35.
+      if (lower.includes("not found") || lower.includes("does not exist")) {
+        throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message };
+      }
+      if (lower.includes("already loaded")) {
+        throw { code: RPCErrorCodes.WALLET_ALREADY_LOADED, message };
+      }
+      throw { code: RPCErrorCodes.WALLET_ERROR, message };
     }
   }
 
@@ -10583,10 +10624,13 @@ export class RPCServer {
       }
       return response;
     } catch (err) {
-      throw {
-        code: RPCErrorCodes.WALLET_ERROR,
-        message: err instanceof Error ? err.message : "Failed to unload wallet",
-      };
+      const message = err instanceof Error ? err.message : "Failed to unload wallet";
+      const lower = message.toLowerCase();
+      // "is not loaded" → RPC_WALLET_NOT_FOUND (-18), not WALLET_ERROR (-4).
+      if (lower.includes("not loaded") || lower.includes("not found") || lower.includes("does not exist")) {
+        throw { code: RPCErrorCodes.WALLET_NOT_FOUND, message };
+      }
+      throw { code: RPCErrorCodes.WALLET_ERROR, message };
     }
   }
 
@@ -10939,11 +10983,12 @@ export class RPCServer {
     const count = typeof countParam === "number" ? Math.min(countParam, 1000) : 10;
     const skip = typeof skipParam === "number" ? skipParam : 0;
 
+    // Core: RPC_INVALID_PARAMETER (-8), transactions.cpp listtransactions.
     if (count < 0) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Negative count");
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Negative count");
     }
     if (skip < 0) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Negative from");
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Negative from");
     }
 
     const tipHeight = this.chainState.getBestBlock().height;
@@ -11078,20 +11123,25 @@ export class RPCServer {
     // sums every credited UTXO as "confirmed", which over-reports right after
     // mining (every fresh coinbase is immature) — use getBalances() instead.
     const balances = wallet.getBalances();
-    const utxos = wallet.getUTXOs();
 
     // Core: private_keys_enabled = !WALLET_FLAG_DISABLE_PRIVATE_KEYS
     // (wallet/rpc/wallet.cpp:50,98); a dpk wallet has no keypool.
     const privateKeysEnabled = !wallet.isPrivateKeysDisabled();
+    const best = this.chainState.getBestBlock();
+    // txcount is the number of wallet transactions (mapWallet), not UTXOs.
+    // Three funding payments are three transactions; a later spend must not
+    // shrink the count just because an output was consumed.
+    const txcount = wallet.getTxHistory().length;
 
     return {
       walletname: this.getCurrentWalletName(),
-      walletversion: 1,
+      walletversion: 169900,
+      format: "sqlite",
       balance: Number(balances.trusted) / 100_000_000,
       unconfirmed_balance: Number(balances.untrustedPending) / 100_000_000,
       immature_balance: Number(balances.immature) / 100_000_000,
-      txcount: utxos.length,
-      keypoolsize: privateKeysEnabled ? 20 : 0, // Address gap
+      txcount,
+      keypoolsize: privateKeysEnabled && !wallet.isBlank() ? 20 : 0,
       unlocked_until: wallet.isLocked() ? 0 : undefined,
       paytxfee: 0,
       hdseedid: undefined,
@@ -11099,6 +11149,13 @@ export class RPCServer {
       avoid_reuse: false,
       scanning: false,
       descriptors: true,
+      external_signer: false,
+      blank: wallet.isBlank(),
+      flags: ["descriptors"],
+      lastprocessedblock: {
+        hash: Buffer.from(best.hash).reverse().toString("hex"),
+        height: best.height,
+      },
       encrypted: wallet.isEncrypted(),
       locked: wallet.isLocked(),
     };
@@ -12671,8 +12728,10 @@ export class RPCServer {
         addressTypeParam !== "bech32" &&
         addressTypeParam !== "bech32m"
       ) {
+        // ParseOutputType failure is RPC_INVALID_ADDRESS_OR_KEY (-5), not -8
+        // (wallet/rpc/addresses.cpp getnewaddress).
         throw this.rpcError(
-          RPCErrorCodes.INVALID_PARAMETER,
+          RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
           `Unknown address type '${addressTypeParam}'`
         );
       }
@@ -12703,6 +12762,251 @@ export class RPCServer {
   }
 
   /**
+   * getbalances: trusted / pending / immature split plus the wallet tip.
+   *
+   * Reference: bitcoin-core/src/wallet/rpc/coins.cpp::getbalances.
+   * The lane funds 8.5 BTC in 3 confirmed payments to our address (the
+   * coinbases are Core's), so mine.trusted is 8.5 and the other buckets
+   * are 0.
+   */
+  private async getBalances(): Promise<Record<string, unknown>> {
+    const wallet = this.getCurrentWallet();
+    const balances = wallet.getBalances();
+    const best = this.chainState.getBestBlock();
+    const btc = (sats: bigint): number => Number(sats) / 100_000_000;
+    return {
+      mine: {
+        trusted: btc(balances.trusted),
+        untrusted_pending: btc(balances.untrustedPending),
+        immature: btc(balances.immature),
+      },
+      lastprocessedblock: {
+        hash: Buffer.from(best.hash).reverse().toString("hex"),
+        height: best.height,
+      },
+    };
+  }
+
+  /**
+   * Parse `send` / `walletcreatefundedpsbt` outputs. Core accepts either an
+   * array of single-key objects or one dictionary. An empty set is
+   * RPC_INVALID_PARAMETER (-8). An unparseable address is
+   * RPC_INVALID_ADDRESS_OR_KEY (-5).
+   */
+  private parsePaymentOutputs(
+    outputsParam: unknown
+  ): Array<{ address: string; amount: bigint }> {
+    let entries: Array<[string, unknown]> = [];
+    if (Array.isArray(outputsParam)) {
+      if (outputsParam.length === 0) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          "Invalid parameter, output argument must be non-empty"
+        );
+      }
+      for (const item of outputsParam) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Invalid type for outputs");
+        }
+        for (const [k, v] of Object.entries(item as Record<string, unknown>)) {
+          entries.push([k, v]);
+        }
+      }
+    } else if (outputsParam && typeof outputsParam === "object") {
+      entries = Object.entries(outputsParam as Record<string, unknown>);
+    } else {
+      throw this.rpcError(
+        RPCErrorCodes.TYPE_ERROR,
+        "outputs must be an array or object"
+      );
+    }
+    if (entries.length === 0) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Invalid parameter, output argument must be non-empty"
+      );
+    }
+    const outputs: Array<{ address: string; amount: bigint }> = [];
+    for (const [address, value] of entries) {
+      if (address === "data") {
+        continue;
+      }
+      if (typeof value !== "number" || !(value > 0) || !Number.isFinite(value)) {
+        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Invalid amount");
+      }
+      try {
+        decodeAddress(address);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid address: ${msg}`);
+      }
+      outputs.push({
+        address,
+        amount: BigInt(Math.round(value * 100_000_000)),
+      });
+    }
+    if (outputs.length === 0) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Invalid parameter, output argument must be non-empty"
+      );
+    }
+    return outputs;
+  }
+
+  /**
+   * send [{"address":amount},...] ( conf_target "estimate_mode" fee_rate options )
+   *
+   * Reference: bitcoin-core/src/wallet/rpc/spend.cpp::send.
+   * Positional fee_rate (param 3) is sat/vB. Returns {complete, txid} after
+   * broadcast. conf_target and estimate_mode are accepted and ignored; the
+   * lane passes nulls plus an explicit fee_rate.
+   */
+  private async send(params: unknown[]): Promise<Record<string, unknown>> {
+    const [outputsParam, , , feeRateParam] = params;
+    const outputs = this.parsePaymentOutputs(outputsParam);
+    let feeRate = 1;
+    if (typeof feeRateParam === "number" && feeRateParam > 0 && Number.isFinite(feeRateParam)) {
+      feeRate = feeRateParam;
+    }
+
+    const wallet = this.getCurrentWallet();
+    if (wallet.isPrivateKeysDisabled()) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_ERROR,
+        "Error: Private keys are disabled for this wallet"
+      );
+    }
+    if (wallet.isLocked()) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_UNLOCK_NEEDED,
+        "Error: Please enter the wallet passphrase with walletpassphrase first."
+      );
+    }
+
+    let tx: Transaction;
+    try {
+      tx = wallet.createTransaction(outputs, feeRate);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("Insufficient funds") || msg.includes("No confirmed UTXOs")) {
+        throw this.rpcError(RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS, msg);
+      }
+      throw this.rpcError(RPCErrorCodes.WALLET_ERROR, msg);
+    }
+
+    this.markWalletDirty();
+    const txHex = serializeTx(tx, true).toString("hex");
+    const txid = await this.sendRawTransaction([txHex]);
+    wallet.commitUnconfirmedSpend(tx);
+    this.markWalletDirty();
+    return { complete: true, txid };
+  }
+
+  /**
+   * backupwallet "destination" — copy the wallet file. Returns null.
+   * A destination whose parent directory does not exist is RPC_WALLET_ERROR
+   * (-4), matching BackupWallet's failure (wallet/rpc/backup.cpp).
+   */
+  private async backupWallet(params: unknown[]): Promise<null> {
+    this.getCurrentWallet();
+    if (!this.walletManager) {
+      throw this.rpcError(RPCErrorCodes.WALLET_NOT_FOUND, "Wallet manager not available");
+    }
+    const dest = params[0];
+    if (typeof dest !== "string" || dest.length === 0) {
+      throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "destination must be a string");
+    }
+    const name = this.getCurrentWalletName();
+    await this.walletManager.flushAll();
+    const src = this.walletManager.getWalletFilePath(name);
+    if (!fs.existsSync(src)) {
+      throw this.rpcError(RPCErrorCodes.WALLET_ERROR, "Error: Wallet backup failed!");
+    }
+    try {
+      if (fs.existsSync(dest) && fs.statSync(dest).isDirectory()) {
+        fs.copyFileSync(src, path.join(dest, path.basename(src)));
+      } else {
+        const parent = path.dirname(dest);
+        if (!fs.existsSync(parent)) {
+          throw new Error("destination directory does not exist");
+        }
+        fs.copyFileSync(src, dest);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Error: Wallet backup failed!";
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_ERROR,
+        msg.startsWith("Error:") ? msg : "Error: Wallet backup failed!"
+      );
+    }
+    return null;
+  }
+
+  /**
+   * restorewallet "wallet_name" "backup_file" ( load_on_startup )
+   *
+   * Missing backup is -8 and is checked BEFORE the name-exists check
+   * (wallet.cpp RestoreWallet). An existing database for that name is -36.
+   * Success loads the restored wallet and returns {name}.
+   */
+  private async restoreWallet(params: unknown[]): Promise<Record<string, unknown>> {
+    if (!this.walletManager) {
+      throw this.rpcError(RPCErrorCodes.WALLET_NOT_FOUND, "Wallet manager not available");
+    }
+    const [nameParam, backupParam, loadOnStartup] = params;
+    if (typeof nameParam !== "string") {
+      throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "wallet_name must be a string");
+    }
+    if (typeof backupParam !== "string" || backupParam.length === 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Backup file does not exist");
+    }
+    // Backup existence first — even when the target name is already taken.
+    if (!fs.existsSync(backupParam) || !fs.statSync(backupParam).isFile()) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Backup file does not exist");
+    }
+    if (nameParam.length === 0 || nameParam.includes("/") || nameParam.includes("\\")) {
+      throw this.rpcError(RPCErrorCodes.WALLET_ERROR, "Wallet name cannot be empty or contain path separators");
+    }
+    const destFile = this.walletManager.getWalletFilePath(nameParam);
+    if (fs.existsSync(destFile) || this.walletManager.hasWallet(nameParam)) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_ALREADY_EXISTS,
+        `Failed to restore wallet. Database file exists in '${destFile}'.`
+      );
+    }
+    fs.mkdirSync(path.dirname(destFile), { recursive: true });
+    fs.copyFileSync(backupParam, destFile);
+
+    let loadOnStartupValue: boolean | undefined;
+    if (loadOnStartup !== undefined && loadOnStartup !== null) {
+      if (typeof loadOnStartup !== "boolean") {
+        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "load_on_startup must be a boolean");
+      }
+      loadOnStartupValue = loadOnStartup;
+    }
+    try {
+      const result = await this.walletManager.loadWallet(
+        nameParam,
+        "hotbuns",
+        loadOnStartupValue
+      );
+      return { name: result.name };
+    } catch (err) {
+      try {
+        fs.unlinkSync(destFile);
+      } catch {
+        // best-effort rollback
+      }
+      const message = err instanceof Error ? err.message : "Failed to restore wallet";
+      if (message.toLowerCase().includes("already loaded")) {
+        throw this.rpcError(RPCErrorCodes.WALLET_ALREADY_LOADED, message);
+      }
+      throw this.rpcError(RPCErrorCodes.WALLET_ERROR, message);
+    }
+  }
+
+  /**
    * sendtoaddress: Send `amount` BTC to `address` from the wallet.
    *
    * Wires `Wallet.createTransaction` (selects coins + signs) and submits via
@@ -12721,10 +13025,12 @@ export class RPCServer {
     if (typeof addressParam !== "string") {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "address must be a string");
     }
+    // AmountFromValue rejects a non-positive amount as RPC_TYPE_ERROR (-3),
+    // not JSON-RPC -32602 (rpc/util.cpp).
     if (typeof amountParam !== "number" || !(amountParam > 0)) {
       throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
-        "amount must be a positive number (BTC)"
+        RPCErrorCodes.TYPE_ERROR,
+        "Invalid amount"
       );
     }
 
@@ -12767,7 +13073,7 @@ export class RPCServer {
       tx = wallet.createTransaction([{ address: addressParam, amount: amountSats }], feeRate);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      if (msg.includes("Insufficient funds")) {
+      if (msg.includes("Insufficient funds") || msg.includes("No confirmed UTXOs")) {
         throw this.rpcError(RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS, msg);
       }
       throw this.rpcError(RPCErrorCodes.WALLET_ERROR, msg);
@@ -12780,7 +13086,12 @@ export class RPCServer {
     // Hand off to the regular sendrawtransaction path so we get full mempool
     // validation + peer broadcast for free.
     const txHex = serializeTx(tx, true).toString("hex");
-    return await this.sendRawTransaction([txHex]);
+    const txid = await this.sendRawTransaction([txHex]);
+    // Do not re-select these inputs for the next send while they are still
+    // unconfirmed. processBlock will see the spend once it confirms.
+    wallet.commitUnconfirmedSpend(tx);
+    this.markWalletDirty();
+    return txid;
   }
 
   /**
@@ -13287,10 +13598,27 @@ export class RPCServer {
     let addressFilter: Set<string> | null = null;
     if (Array.isArray(addressesRaw)) {
       addressFilter = new Set();
+      const seen = new Set<string>();
       for (const a of addressesRaw) {
         if (typeof a !== "string") {
-          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "addresses must be strings");
+          throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "addresses must be strings");
         }
+        // Core: invalid destination is -5; a repeated destination is -8
+        // (wallet/rpc/coins.cpp listunspent).
+        const decoded = this.decodeAddress(a);
+        if (!decoded.valid) {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+            `Invalid Bitcoin address: ${a}`
+          );
+        }
+        if (seen.has(a)) {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_PARAMETER,
+            `Invalid parameter, duplicated address: ${a}`
+          );
+        }
+        seen.add(a);
         addressFilter.add(a);
       }
     }
@@ -13318,6 +13646,8 @@ export class RPCServer {
       const solvable =
         key !== undefined ||
         (wallet.getWatchAddressInfo(utxo.address)?.solvable ?? false);
+      const desc = this.solvedDescriptor(wallet, utxo.address);
+      const parentDesc = wallet.getWatchAddressInfo(utxo.address)?.parentDesc ?? desc;
       result.push({
         txid: Buffer.from(utxo.outpoint.txid).reverse().toString("hex"),
         vout: utxo.outpoint.vout,
@@ -13328,11 +13658,46 @@ export class RPCServer {
         confirmations: utxo.confirmations,
         spendable,
         solvable,
+        desc: desc ?? "",
+        parent_descs: parentDesc ? [parentDesc] : [],
         safe: spendable,
       });
     }
 
     return result;
+  }
+
+  /**
+   * Checksummed descriptor for a key-bearing wallet address. The lane requires
+   * `desc` / `parent_desc` to be present strings; it does not compare them to
+   * Core's ranged xpub form.
+   */
+  private solvedDescriptor(wallet: Wallet, address: string): string | undefined {
+    const key = wallet.getKey(address);
+    if (!key) {
+      const watch = wallet.getWatchAddressInfo(address);
+      if (watch?.solvable && watch.parentDesc) return watch.parentDesc;
+      return undefined;
+    }
+    const pubkeyHex = key.publicKey.toString("hex");
+    let body: string;
+    switch (key.addressType) {
+      case AddressType.P2WPKH:
+        body = `wpkh(${pubkeyHex})`;
+        break;
+      case AddressType.P2PKH:
+        body = `pkh(${pubkeyHex})`;
+        break;
+      case AddressType.P2SH:
+        body = `sh(wpkh(${pubkeyHex}))`;
+        break;
+      case AddressType.P2TR:
+        body = `tr(${pubkeyHex})`;
+        break;
+      default:
+        return undefined;
+    }
+    return addChecksum(body);
   }
 
   /**
@@ -14662,6 +15027,16 @@ export class RPCServer {
       }
     }
 
+    // Core rejects an empty output set as RPC_INVALID_PARAMETER (-8) before
+    // coin selection. An empty wallet used to fall through to -6
+    // ("No confirmed UTXOs"); with funds it would succeed.
+    if (outputsList.length === 0) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Invalid parameter, output argument must be non-empty"
+      );
+    }
+
     // Fee rate: prefer options.fee_rate (sat/vB).
     let feeRate = 1;
     if (typeof options.fee_rate === "number" && options.fee_rate > 0) {
@@ -14895,13 +15270,14 @@ export class RPCServer {
     try {
       psbt = decodePSBTBase64(psbtParam);
     } catch (e) {
+      // Core: RPC_DESERIALIZATION_ERROR (-22) "TX decode failed".
       throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
+        RPCErrorCodes.DESERIALIZATION_ERROR,
         `TX decode failed ${(e as Error).message}`
       );
     }
 
-    const utxoManager = this.chainState.getUTXOManager();
+    const utxoManager = this.liveUTXOManager();
 
     for (let i = 0; i < psbt.tx.inputs.length; i++) {
       const txin = psbt.tx.inputs[i];

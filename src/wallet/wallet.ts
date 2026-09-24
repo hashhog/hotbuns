@@ -1652,6 +1652,19 @@ export class Wallet {
   }
 
   /**
+   * Drop inputs consumed by a wallet transaction that has been broadcast but
+   * not yet confirmed, so a later send cannot re-select them and conflict in
+   * the mempool. Change is not re-credited until the spending block connects
+   * (processBlock). Called by the RPC layer only after broadcast succeeds.
+   */
+  commitUnconfirmedSpend(tx: Transaction): void {
+    for (const input of tx.inputs) {
+      const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+      this.utxos.delete(key);
+    }
+  }
+
+  /**
    * Get an outgoing wallet transaction by txid. Returns undefined if not
    * tracked (either never sent by this wallet, or pruned). Exposed so
    * the RPC layer can introspect for bumpfee.

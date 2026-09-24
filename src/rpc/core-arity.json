@@ -365,9 +365,9 @@
   "sig": "signrawtransactionwithkey \"hexstring\" [\"privatekey\",...] ( [{\"txid\":\"hex\",\"vout\":n,\"scriptPubKey\":\"hex\",\"redeemScript\":\"hex\",\"witnessScript\":\"hex\",\"amount\":amount},...] \"sighashtype\" )"
  },
  "stop": {
-  "declared": 0,
+  "declared": 1,
   "required": 0,
-  "sig": "stop"
+  "sig": "stop ( wait )"
  },
  "submitblock": {
   "declared": 2,
@@ -433,5 +433,85 @@
   "declared": 2,
   "required": 0,
   "sig": "waitfornewblock ( timeout \"current_tip\" )"
+ },
+ "backupwallet": {
+  "declared": 1,
+  "required": 1,
+  "sig": "backupwallet \"destination\""
+ },
+ "createwallet": {
+  "declared": 8,
+  "required": 1,
+  "sig": "createwallet \"wallet_name\" ( disable_private_keys blank \"passphrase\" avoid_reuse descriptors load_on_startup external_signer )"
+ },
+ "getaddressinfo": {
+  "declared": 1,
+  "required": 1,
+  "sig": "getaddressinfo \"address\""
+ },
+ "getbalances": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getbalances"
+ },
+ "getnewaddress": {
+  "declared": 2,
+  "required": 0,
+  "sig": "getnewaddress ( \"label\" \"address_type\" )"
+ },
+ "getwalletinfo": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getwalletinfo"
+ },
+ "listtransactions": {
+  "declared": 4,
+  "required": 0,
+  "sig": "listtransactions ( \"label\" count skip include_watchonly )"
+ },
+ "listunspent": {
+  "declared": 5,
+  "required": 0,
+  "sig": "listunspent ( minconf maxconf [\"address\",...] include_unsafe query_options )"
+ },
+ "listwallets": {
+  "declared": 0,
+  "required": 0,
+  "sig": "listwallets"
+ },
+ "loadwallet": {
+  "declared": 2,
+  "required": 1,
+  "sig": "loadwallet \"filename\" ( load_on_startup )"
+ },
+ "restorewallet": {
+  "declared": 3,
+  "required": 2,
+  "sig": "restorewallet \"wallet_name\" \"backup_file\" ( load_on_startup )"
+ },
+ "send": {
+  "declared": 6,
+  "required": 1,
+  "sig": "send [{\"address\":amount,...},...] ( conf_target \"estimate_mode\" fee_rate options version )"
+ },
+ "sendtoaddress": {
+  "declared": 11,
+  "required": 2,
+  "sig": "sendtoaddress \"address\" amount ( \"comment\" \"comment_to\" subtractfeefromamount replaceable conf_target \"estimate_mode\" avoid_reuse fee_rate verbose )"
+ },
+ "unloadwallet": {
+  "declared": 2,
+  "required": 0,
+  "sig": "unloadwallet ( \"wallet_name\" load_on_startup )"
+ },
+ "walletcreatefundedpsbt": {
+  "declared": 6,
+  "required": 0,
+  "sig": "walletcreatefundedpsbt ( [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] locktime options bip32derivs version )"
+ },
+ "walletprocesspsbt": {
+  "declared": 5,
+  "required": 1,
+  "sig": "walletprocesspsbt \"psbt\" ( sign \"sighashtype\" bip32derivs finalize )"
  }
 }
