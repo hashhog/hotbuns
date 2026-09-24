@@ -1932,7 +1932,16 @@ export class BlockSync {
     }
 
     if (notFound.length > 0) {
-      peer.send({ type: "notfound", payload: { inventory: notFound } });
+      // Peer.send returns false when the bytes never left (no socket,
+      // already disconnected, or BIP-324 handshake not ready). A caller
+      // that ignores that cannot tell a dropped notfound from one a peer
+      // received — the getdata handler then logs nothing. Surface it.
+      const reached = peer.send({ type: "notfound", payload: { inventory: notFound } });
+      if (reached === false) {
+        throw new Error(
+          `notfound did not reach ${peer.host}:${peer.port} (${notFound.length} inv)`,
+        );
+      }
     }
   }
 
