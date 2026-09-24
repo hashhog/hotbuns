@@ -1429,6 +1429,11 @@ export function serializeMessage(magic: number, msg: NetworkMessage): Buffer {
       command = "getdata";
       payload = serializeInvPayload(msg.payload.inventory);
       break;
+    case "notfound":
+      // Same bytes as inv: compact-size count + inventory vectors (BIP-37).
+      command = "notfound";
+      payload = serializeInvPayload(msg.payload.inventory);
+      break;
     case "getblocks":
       command = "getblocks";
       payload = serializeBlockLocator(

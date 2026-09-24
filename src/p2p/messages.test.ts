@@ -21,6 +21,7 @@ import {
   MAX_LOCATOR_SZ,
   serializeMessage,
   deserializeMessage,
+  extractCommandAndPayload,
   serializeHeader,
   parseHeader,
   ipv4ToBuffer,
@@ -342,6 +343,57 @@ describe("ping/pong messages", () => {
     if (deserialized.type === "pong") {
       expect(deserialized.payload.nonce).toBe(0x123456789abcdef0n);
     }
+  });
+});
+
+describe("notfound message", () => {
+  // Control for the mainnet failure: handleGetData answers a miss with
+  // `{ type: "notfound" }`, and Peer.send → serializeMessage threw
+  // `Unknown message type: notfound` (no switch case; deserialize already
+  // accepted the command). Wire format is identical to inv (BIP-37 / protocol).
+  test("notfound: round-trips like inv", () => {
+    const txHash = Buffer.alloc(32, 0xab);
+    const wtxHash = Buffer.alloc(32, 0xcd);
+
+    const original: NetworkMessage = {
+      type: "notfound",
+      payload: {
+        inventory: [
+          { type: InvType.MSG_TX, hash: txHash },
+          { type: InvType.MSG_WTX, hash: wtxHash },
+        ],
+      },
+    };
+
+    const serialized = serializeMessage(MAGIC, original);
+    const header = parseHeader(serialized)!;
+    const payload = serialized.subarray(MESSAGE_HEADER_SIZE);
+
+    expect(header.command).toBe("notfound");
+    // 1 byte count + 2 * (4 type + 32 hash) = 73
+    expect(payload.length).toBe(73);
+
+    const deserialized = deserializeMessage(header, payload);
+    expect(deserialized.type).toBe("notfound");
+    if (deserialized.type === "notfound") {
+      expect(deserialized.payload.inventory.length).toBe(2);
+      expect(deserialized.payload.inventory[0].type).toBe(InvType.MSG_TX);
+      expect(deserialized.payload.inventory[0].hash.equals(txHash)).toBe(true);
+      expect(deserialized.payload.inventory[1].type).toBe(InvType.MSG_WTX);
+      expect(deserialized.payload.inventory[1].hash.equals(wtxHash)).toBe(true);
+    }
+
+    // Payload bytes match inv; only the 12-byte command differs.
+    const asInv = serializeMessage(MAGIC, {
+      type: "inv",
+      payload: original.payload,
+    });
+    expect(payload.equals(asInv.subarray(MESSAGE_HEADER_SIZE))).toBe(true);
+
+    // BIP-324 send path re-enters serializeMessage.
+    const parts = extractCommandAndPayload(MAGIC, original);
+    expect(parts.command).toBe("notfound");
+    expect(parts.payload.equals(payload)).toBe(true);
   });
 });
 
