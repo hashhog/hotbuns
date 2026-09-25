@@ -5,7 +5,7 @@
  * validation, and full block validation against consensus rules.
  */
 
-import { BufferReader, BufferWriter } from "../wire/serialization.js";
+import { BufferReader, BufferWriter, varIntSize } from "../wire/serialization.js";
 import { hash256 } from "../crypto/primitives.js";
 import { ConsensusParams, compactToBigInt } from "../consensus/params.js";
 import {
@@ -15,6 +15,8 @@ import {
   getTxId,
   getWTxId,
   getTxWeight,
+  getTxBaseSize,
+  getTxTotalSize,
   hasWitness,
   isCoinbase,
   validateTxBasic,
@@ -720,9 +722,13 @@ export function getBlockBaseSize(block: Block): number {
   else if (txCount <= 0xffffffff) size += 5;
   else size += 9;
 
-  // Each transaction without witness
+  // Each transaction without witness. getTxBaseSize is the length of
+  // serializeTx(tx, false) computed arithmetically: validateBlock used to
+  // serialize every tx here, again for the total size, and again in
+  // validateTxBasic — ~3 full re-serialisations of each block on the
+  // validation thread just to learn byte counts.
   for (const tx of block.transactions) {
-    size += serializeTx(tx, false).length;
+    size += getTxBaseSize(tx);
   }
 
   return size;
@@ -732,7 +738,13 @@ export function getBlockBaseSize(block: Block): number {
  * Calculate the total size of a block (with witness data).
  */
 export function getBlockTotalSize(block: Block): number {
-  return serializeBlock(block).length;
+  // == serializeBlock(block).length: 80-byte header + CompactSize(nTx) +
+  // each tx with witness (Core GetSerializeSize(TX_WITH_WITNESS(block))).
+  let size = 80 + varIntSize(block.transactions.length);
+  for (const tx of block.transactions) {
+    size += getTxTotalSize(tx);
+  }
+  return size;
 }
 
 /**

@@ -405,8 +405,11 @@ export function getWTxId(tx: Transaction): Buffer {
 
 /**
  * Calculate the base size of a transaction (without witness data).
+ *
+ * Byte-for-byte the length of `serializeTx(tx, false)` (Core
+ * GetSerializeSize(TX_NO_WITNESS(tx))), computed without serializing.
  */
-function getTxBaseSize(tx: Transaction): number {
+export function getTxBaseSize(tx: Transaction): number {
   // version(4) + inputCount(varint) + inputs + outputCount(varint) + outputs + lockTime(4)
   let size = 4; // version
 
@@ -435,8 +438,13 @@ function getTxBaseSize(tx: Transaction): number {
 
 /**
  * Calculate the total size of a transaction (with witness data if present).
+ *
+ * Byte-for-byte the length of `serializeTx(tx, true)` (Core
+ * GetSerializeSize(TX_WITH_WITNESS(tx))): marker+flag and the witness
+ * section only when some input carries witness items — the same
+ * `hasWitness` test serializeTx uses.
  */
-function getTxTotalSize(tx: Transaction): number {
+export function getTxTotalSize(tx: Transaction): number {
   if (!hasWitness(tx)) {
     return getTxBaseSize(tx);
   }
@@ -1169,7 +1177,7 @@ export function validateTxBasic(tx: Transaction): { valid: boolean; error?: stri
   //   GetSerializeSize(TX_NO_WITNESS(tx)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
   // i.e. stripped_size * 4 > 4_000_000  →  stripped_size > 1_000_000.
   // We check stripped (non-witness) size * 4, NOT total wire size.
-  const strippedSize = serializeTx(tx, false).length;
+  const strippedSize = getTxBaseSize(tx);
   if (strippedSize * 4 > 4_000_000) {
     return { valid: false, error: "bad-txns-oversize" };
   }
