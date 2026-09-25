@@ -113,7 +113,7 @@ describe("packed script-check wire sizing", () => {
 			const back = decodePackedBatch(packed);
 			expect(back.jobs.length).toBe(nIn);
 			expect(back.txs[0]!.inputs.length).toBe(nIn);
-			expect(Buffer.from(back.txs[0]!.inputs[nIn - 1]!.witness[1]!)).toEqual(PUB);
+			expect(Buffer.from(back.txs[0]!.inputs[nIn - 1]!.witness[1]!).equals(PUB)).toBe(true);
 		}
 	});
 
