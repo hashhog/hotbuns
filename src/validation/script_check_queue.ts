@@ -25,7 +25,10 @@ import type { UTXOEntry } from "../storage/database.js";
 import {
 	buildWireBatch,
 	encodePackedBatch,
-	estimateWireBatchBytes,
+	PACKED_HEADER_BYTES,
+	PACKED_JOB_BYTES,
+	packedTxBytes,
+	packedUtxosBytes,
 	scriptCheckWireBudget,
 	type WorkerOut,
 } from "./script_check_wire.js";
@@ -239,6 +242,20 @@ class VerifyPool {
 		let inFlightBytes = 0;
 		const used = new Set<number>();
 
+		// Per-tx packed size (tx + its UTXO vector), computed once per drain.
+		// takeBatch used to rebuild and re-measure the whole candidate batch
+		// for every job it appended — O(batch²) wire conversions per batch on
+		// the main thread. Sizes are now exact and accumulated incrementally.
+		const txBytes = new Map<Transaction, number>();
+		const txCost = (job: ScriptCheckJob): number => {
+			let b = txBytes.get(job.tx);
+			if (b === undefined) {
+				b = packedTxBytes(job.tx) + packedUtxosBytes(job.utxos);
+				txBytes.set(job.tx, b);
+			}
+			return b;
+		};
+
 		const takeBatch = (): {
 			items: ScriptCheckJob[];
 			origIndices: number[];
@@ -253,6 +270,8 @@ class VerifyPool {
 			// uses all requested workers instead of two 128-job chunks.
 			const adaptive = Math.max(1, Math.ceil(remaining / nWorkers));
 			const cap = Math.min(SCRIPTCHECK_BATCH_SIZE, adaptive);
+			const inBatch = new Set<Transaction>();
+			let bytes = PACKED_HEADER_BYTES;
 			while (qHead < jobs.length && items.length < cap) {
 				const origIndex = qHead;
 				if (origIndex >= earliestFailIndex) {
@@ -260,22 +279,17 @@ class VerifyPool {
 					break;
 				}
 				const job = jobs[origIndex]!;
-				if (items.length > 0) {
-					const bytes = estimateWireBatchBytes(
-						buildWireBatch(0, [...items, job]),
-					);
-					if (bytes > budget) break;
-				}
+				const add =
+					PACKED_JOB_BYTES + (inBatch.has(job.tx) ? 0 : txCost(job));
+				if (items.length > 0 && bytes + add > budget) break;
+				bytes += add;
+				inBatch.add(job.tx);
 				items.push(job);
 				origIndices.push(origIndex);
 				qHead++;
 			}
 			if (items.length === 0) return null;
-			return {
-				items,
-				origIndices,
-				bytes: estimateWireBatchBytes(buildWireBatch(0, items)),
-			};
+			return { items, origIndices, bytes };
 		};
 
 		const workerLoop = async (w: number): Promise<void> => {

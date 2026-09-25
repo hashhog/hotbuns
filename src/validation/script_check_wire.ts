@@ -179,20 +179,49 @@ export function countWireUtxos(batch: WireBatch): number {
 	return n;
 }
 
+/**
+ * Exact byte length of {@link encodePackedBatch}'s output.
+ *
+ * This used to be an estimate (40 B/input, witness items without their
+ * 4-byte length prefix) padded by a fixed 256 B. A tx with more than ~50
+ * two-item witness inputs overran the padding, so encodePackedBatch threw
+ * "Out of bounds access" / "Range consisting of offset and length are out of
+ * bounds" and the WHOLE block fell back to serial verification on the main
+ * thread — observed on 23,914 of ~34,000 blocks in the 515000 R4 slice.
+ * The size is now computed field-for-field against the encoder below.
+ */
+export const PACKED_HEADER_BYTES = 20; // magic + id + nTx + nGroups + nJobs
+export const PACKED_JOB_BYTES = 12; // txi + inputIndex + flags
+
+/** Packed bytes for one tx (Transaction or WireTx — same field shapes). */
+export function packedTxBytes(tx: {
+	inputs: ReadonlyArray<{ scriptSig: Uint8Array; witness: ReadonlyArray<Uint8Array> }>;
+	outputs: ReadonlyArray<{ scriptPubKey: Uint8Array }>;
+}): number {
+	let n = 16; // version + nIn + nOut + lockTime
+	for (const inp of tx.inputs) {
+		// txid 32 + vout 4 + scriptSig len 4 + sequence 4 + nWit 4
+		n += 48 + inp.scriptSig.byteLength;
+		for (const w of inp.witness) n += 4 + w.byteLength;
+	}
+	for (const o of tx.outputs) n += 12 + o.scriptPubKey.byteLength;
+	return n;
+}
+
+/** Packed bytes for one tx's UTXO vector (UTXOEntry or WireUtxo). */
+export function packedUtxosBytes(
+	utxos: ReadonlyArray<{ scriptPubKey: Uint8Array }>,
+): number {
+	let n = 4; // group length
+	for (const u of utxos) n += 17 + u.scriptPubKey.byteLength; // h4 cb1 amt8 len4
+	return n;
+}
+
 export function estimateWireBatchBytes(batch: WireBatch): number {
-	let n = 64;
-	for (const tx of batch.txs) {
-		n += 24;
-		for (const inp of tx.inputs) {
-			n += 40 + inp.scriptSig.byteLength;
-			for (const w of inp.witness) n += w.byteLength;
-		}
-		for (const o of tx.outputs) n += 16 + o.scriptPubKey.byteLength;
-	}
-	for (const arr of batch.txUtxos) {
-		for (const u of arr) n += 24 + u.scriptPubKey.byteLength;
-	}
-	n += batch.jobs.length * 16;
+	let n = PACKED_HEADER_BYTES;
+	for (const tx of batch.txs) n += packedTxBytes(tx);
+	for (const arr of batch.txUtxos) n += packedUtxosBytes(arr);
+	n += batch.jobs.length * PACKED_JOB_BYTES;
 	return n;
 }
 
@@ -217,8 +246,7 @@ export function splitJobsByWireBudget(
 const PACKED_MAGIC = 0x48425343; // 'HBSC'
 
 function packedSize(batch: WireBatch): number {
-	// Generous: encodePackedBatch slices to the bytes actually written.
-	return estimateWireBatchBytes(batch) + 256;
+	return estimateWireBatchBytes(batch);
 }
 
 /**
@@ -297,7 +325,10 @@ export function encodePackedBatch(batch: WireBatch): ArrayBuffer {
 		wU32(job.flags);
 	}
 	if (o !== buf.byteLength) {
-		return buf.slice(0, o);
+		// packedSize is exact; a mismatch means the encoder and the sizer
+		// drifted apart. Throw (the queue falls back to serial) rather than
+		// ship a buffer with trailing garbage.
+		throw new Error(`packed wire: wrote ${o} of ${buf.byteLength} bytes`);
 	}
 	return buf;
 }
