@@ -35,8 +35,10 @@ import { globalSigCache } from "./sig_cache.js";
 import {
 	ScriptFlags,
 	SIGHASH_ALL,
+	setInputSigCacheEnabled,
 	sigHashWitnessV0,
 	type Transaction,
+	verifyInputSignature,
 } from "./tx.js";
 
 const PRIV = Buffer.from(
@@ -176,5 +178,32 @@ describe("packed script-check wire sizing", () => {
 		expect(r.valid).toBe(false);
 		expect(r.failedInput).toBe(170);
 		expect(warns.filter((w) => w.includes("worker pool failed"))).toEqual([]);
+	});
+});
+
+describe("worker isolates skip the per-input sig cache", () => {
+	it("same verdicts with the cache off, and nothing inserted", () => {
+		const { tx, jobs } = manyInputTx(6);
+		tx.inputs[4]!.witness[0]![12] ^= 0x01;
+		const run = () =>
+			jobs.map((j) =>
+				verifyInputSignature(j.tx, j.inputIndex, j.utxos[j.inputIndex]!, {}, j.utxos, {}, j.flags).valid,
+			);
+		globalSigCache.clear();
+		setInputSigCacheEnabled(false);
+		let off: boolean[];
+		try {
+			off = run();
+			expect(globalSigCache.size).toBe(0);
+		} finally {
+			setInputSigCacheEnabled(true);
+		}
+		globalSigCache.clear();
+		const on = run();
+		expect(globalSigCache.size).toBe(5);
+		expect(off).toEqual([true, true, true, true, false, true]);
+		expect(on).toEqual(off);
+		// With the cache on, a second pass is served from it — same answers.
+		expect(run()).toEqual(off);
 	});
 });

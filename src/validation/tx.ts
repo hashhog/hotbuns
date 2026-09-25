@@ -1721,6 +1721,27 @@ export function computeInputSigCacheKey(
  * @param taprootCache - shared per-tx cache of sha_prevouts/amounts/scriptpubkeys/
  *   sequences/outputs so multiple Taproot inputs in the same tx don't recompute.
  */
+/**
+ * Whether {@link verifyInputSignature} consults / fills the process-wide
+ * signature cache. True everywhere except inside a script-check Worker
+ * isolate (script_check_worker.ts turns it off at load): each Worker has its
+ * own module instance and therefore its own private `globalSigCache` that no
+ * other thread reads, and the block drain hands every input to exactly one
+ * worker once — so the per-input key build (serialize + two SHA-256) and the
+ * lookup/insert there were pure overhead (~10% of worker time, measured).
+ * The main thread still does the lookup before dispatch and the insert after
+ * a valid block (script_check_queue.ts verifyScriptChecks).
+ *
+ * Verdict-neutral by construction: the cache only ever short-circuits to
+ * `valid` for material a previous interpreter run in the same isolate
+ * already accepted; with it off the interpreter always runs.
+ */
+let inputSigCacheEnabled = true;
+
+export function setInputSigCacheEnabled(on: boolean): void {
+  inputSigCacheEnabled = on;
+}
+
 export function verifyInputSignature(
   tx: Transaction,
   inputIndex: number,
@@ -1761,8 +1782,10 @@ export function verifyInputSignature(
   // lookup would skip the interpreter entirely.  Mirrors Core's
   // CachingTransactionSignatureChecker (sigcache.cpp:39-50) which keys on
   // the (sighash, pubkey, sig) triple.
-  const cacheKey = computeInputSigCacheKey(tx, inputIndex, utxo, scriptVerifyFlags);
-  if (globalSigCache.lookup(cacheKey)) {
+  const cacheKey = inputSigCacheEnabled
+    ? computeInputSigCacheKey(tx, inputIndex, utxo, scriptVerifyFlags)
+    : null;
+  if (cacheKey !== null && globalSigCache.lookup(cacheKey)) {
     return { valid: true, inputIndex };
   }
 
@@ -1854,7 +1877,7 @@ export function verifyInputSignature(
       if (!ok) {
         return { valid: false, inputIndex, error: "Taproot verify returned false" };
       }
-      globalSigCache.insert(cacheKey);
+      if (cacheKey !== null) globalSigCache.insert(cacheKey);
       return { valid: true, inputIndex };
     } catch (e) {
       return {
@@ -1918,7 +1941,7 @@ export function verifyInputSignature(
     if (!ok) {
       return { valid: false, inputIndex, error: "Script verify returned false" };
     }
-    globalSigCache.insert(cacheKey);
+    if (cacheKey !== null) globalSigCache.insert(cacheKey);
     return { valid: true, inputIndex };
   } catch (e) {
     return {

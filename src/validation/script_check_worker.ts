@@ -20,11 +20,16 @@ import {
 	type WorkerOut,
 } from "./script_check_wire.js";
 import {
+	setInputSigCacheEnabled,
 	type SigHashCache,
 	type TaprootSigHashCache,
 	verifyInputSignature,
 } from "./tx.js";
 import "../crypto/secp256k1_ffi.js";
+
+// This isolate's sig cache is private and never re-queried for the same
+// input (see setInputSigCacheEnabled); skip the per-input key build.
+setInputSigCacheEnabled(false);
 
 function runBatch(msg: WireBatch): void {
 	try {
