@@ -28,6 +28,7 @@ import {
 	buildWireBatch,
 	decodePackedBatch,
 	encodePackedBatch,
+	encodePackedJobs,
 	estimateWireBatchBytes,
 } from "./script_check_wire.js";
 import { globalSigCache } from "./sig_cache.js";
@@ -111,6 +112,30 @@ describe("packed script-check wire sizing", () => {
 			expect(back.jobs.length).toBe(nIn);
 			expect(back.txs[0]!.inputs.length).toBe(nIn);
 			expect(Buffer.from(back.txs[0]!.inputs[nIn - 1]!.witness[1]!)).toEqual(PUB);
+		}
+	});
+
+	it("encodePackedJobs is byte-identical to encodePackedBatch(buildWireBatch)", () => {
+		// Several txs, interleaved and partially covered, one coinbase-flagged
+		// prevout, a non-empty scriptSig, an empty witness — every field path.
+		const a = manyInputTx(5);
+		const b = manyInputTx(3);
+		b.tx.inputs[1]!.scriptSig = Buffer.from([0x51, 0x52, 0x53]);
+		b.tx.inputs[2]!.witness = [];
+		b.jobs[0]!.utxos[0] = { ...b.jobs[0]!.utxos[0]!, coinbase: true, height: 123456 };
+		b.tx.version = -2;
+		b.tx.lockTime = 0xfffffffe;
+		const chunk = [a.jobs[4]!, b.jobs[1]!, a.jobs[0]!, b.jobs[2]!, b.jobs[0]!];
+		const want = new Uint8Array(encodePackedBatch(buildWireBatch(42, chunk)));
+		const got = new Uint8Array(encodePackedJobs(42, chunk));
+		expect(Buffer.from(got).equals(Buffer.from(want))).toBe(true);
+		for (const nIn of [1, 64, 300]) {
+			const { jobs } = manyInputTx(nIn);
+			expect(
+				Buffer.from(encodePackedJobs(7, jobs)).equals(
+					Buffer.from(encodePackedBatch(buildWireBatch(7, jobs))),
+				),
+			).toBe(true);
 		}
 	});
 

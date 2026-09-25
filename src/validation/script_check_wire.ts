@@ -333,6 +333,98 @@ export function encodePackedBatch(batch: WireBatch): ArrayBuffer {
 	return buf;
 }
 
+/**
+ * Encode jobs straight to the packed format, byte-identical to
+ * `encodePackedBatch(buildWireBatch(id, chunk))`.
+ *
+ * The two-step path first copied every input's txid/scriptSig/witness item
+ * and every prevout script into fresh Uint8Arrays (toWireTx/toWireUtxo), only
+ * to copy them again into the ArrayBuffer — 11-14% of main-thread time in the
+ * 515000 R4 slice profile once the pool was reached. Buffers are Uint8Arrays,
+ * so they are written into the transfer buffer directly. The transfer buffer
+ * is a fresh ArrayBuffer either way: nothing the worker sees aliases a
+ * main-thread Buffer (the property toU8 existed to guarantee).
+ */
+export function encodePackedJobs(id: number, chunk: WireableJob[]): ArrayBuffer {
+	const txIndex = new Map<Transaction, number>();
+	const txs: Transaction[] = [];
+	const txUtxos: UTXOEntry[][] = [];
+	let size = PACKED_HEADER_BYTES + chunk.length * PACKED_JOB_BYTES;
+	for (const job of chunk) {
+		if (!txIndex.has(job.tx)) {
+			txIndex.set(job.tx, txs.length);
+			txs.push(job.tx);
+			txUtxos.push(job.utxos);
+			size += packedTxBytes(job.tx) + packedUtxosBytes(job.utxos);
+		}
+	}
+	const buf = new ArrayBuffer(size);
+	const v = new DataView(buf);
+	const u8 = new Uint8Array(buf);
+	let o = 0;
+	const wU32 = (x: number) => {
+		v.setUint32(o, x >>> 0, true);
+		o += 4;
+	};
+	const wBytes = (b: Uint8Array) => {
+		v.setUint32(o, b.byteLength, true);
+		o += 4;
+		if (b.byteLength > 0) {
+			u8.set(b, o);
+			o += b.byteLength;
+		}
+	};
+	wU32(PACKED_MAGIC);
+	wU32(id);
+	wU32(txs.length);
+	for (const tx of txs) {
+		v.setInt32(o, tx.version, true);
+		o += 4;
+		wU32(tx.inputs.length);
+		wU32(tx.outputs.length);
+		wU32(tx.lockTime);
+		for (const inp of tx.inputs) {
+			if (inp.prevOut.txid.byteLength !== 32) {
+				throw new Error("packed wire: txid must be 32 bytes");
+			}
+			u8.set(inp.prevOut.txid, o);
+			o += 32;
+			wU32(inp.prevOut.vout);
+			wBytes(inp.scriptSig);
+			wU32(inp.sequence);
+			wU32(inp.witness.length);
+			for (const w of inp.witness) wBytes(w);
+		}
+		for (const out of tx.outputs) {
+			v.setBigUint64(o, out.value, true);
+			o += 8;
+			wBytes(out.scriptPubKey);
+		}
+	}
+	wU32(txUtxos.length);
+	for (const arr of txUtxos) {
+		wU32(arr.length);
+		for (const u of arr) {
+			wU32(u.height);
+			v.setUint8(o, u.coinbase ? 1 : 0);
+			o += 1;
+			v.setBigUint64(o, u.amount, true);
+			o += 8;
+			wBytes(u.scriptPubKey);
+		}
+	}
+	wU32(chunk.length);
+	for (const job of chunk) {
+		wU32(txIndex.get(job.tx)!);
+		wU32(job.inputIndex);
+		wU32(job.flags);
+	}
+	if (o !== size) {
+		throw new Error(`packed wire: wrote ${o} of ${size} bytes`);
+	}
+	return buf;
+}
+
 export function decodePackedBatch(buf: ArrayBuffer): WireBatch {
 	const v = new DataView(buf);
 	const u8 = new Uint8Array(buf);

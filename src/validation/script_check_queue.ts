@@ -23,8 +23,7 @@
 
 import type { UTXOEntry } from "../storage/database.js";
 import {
-	buildWireBatch,
-	encodePackedBatch,
+	encodePackedJobs,
 	PACKED_HEADER_BYTES,
 	PACKED_JOB_BYTES,
 	packedTxBytes,
@@ -345,8 +344,7 @@ class VerifyPool {
 		chunk: ScriptCheckJob[],
 	): Promise<WorkerOut> {
 		const id = this.nextId++;
-		const batch = buildWireBatch(id, chunk);
-		const packed = encodePackedBatch(batch);
+		const packed = encodePackedJobs(id, chunk);
 		return new Promise<WorkerOut>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.inflight.delete(id);
@@ -506,6 +504,9 @@ export async function verifyScriptChecks(
 	}
 
 	const pending: ScriptCheckJob[] = [];
+	// Keys of the cache-miss jobs, kept so a valid block inserts them without
+	// rebuilding each one (two SHA-256 passes per input on this thread).
+	const pendingKeys: ReturnType<typeof computeInputSigCacheKey>[] = [];
 	for (const job of jobs) {
 		const utxo = job.utxos[job.inputIndex];
 		if (!utxo) {
@@ -524,6 +525,7 @@ export async function verifyScriptChecks(
 		);
 		if (!globalSigCache.lookup(key)) {
 			pending.push(job);
+			pendingKeys.push(key);
 		}
 	}
 	if (pending.length === 0) return { valid: true };
@@ -536,12 +538,7 @@ export async function verifyScriptChecks(
 			n,
 		);
 		if (result.valid) {
-			for (const job of pending) {
-				const utxo = job.utxos[job.inputIndex]!;
-				globalSigCache.insert(
-					computeInputSigCacheKey(job.tx, job.inputIndex, utxo, job.flags),
-				);
-			}
+			for (const key of pendingKeys) globalSigCache.insert(key);
 		}
 		return result;
 	} catch (e) {
