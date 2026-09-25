@@ -560,6 +560,10 @@ export class BlockSync {
    * TxDownloadManagerImpl::BlockDisconnected).
    */
   private recentlyConfirmedTxs: Set<string> = new Set();
+  /** Insertion-order ring of {@link recentlyConfirmedTxs} for FIFO eviction
+   *  (see {@link addRecentlyConfirmed}). */
+  private recentlyConfirmedRing: string[] = [];
+  private recentlyConfirmedHead = 0;
 
   /** Wall-clock ms of the last unconditional {@link sweepTxRequestsInFlight}. */
   private lastTxInFlightSweep: number = 0;
@@ -2138,15 +2142,29 @@ export class BlockSync {
     }
   }
 
-  /** Bounded-FIFO insert into {@link recentlyConfirmedTxs}. */
+  /**
+   * Bounded-FIFO insert into {@link recentlyConfirmedTxs}.
+   *
+   * Eviction used `values().next()` on the Set, which in JSC walks the
+   * tombstones earlier deletes left in the ordered hash table — O(tombstones)
+   * per eviction under steady churn. Every connected block inserts ~2 keys per
+   * tx into a set already at its 48,000 cap during IBD, so this was 4.7% of
+   * main-thread time in the 515000 R4 slice profile. The ring evicts exactly
+   * the key the iterator would have: keys are only appended (duplicates are
+   * skipped) and removed oldest-first or all at once (onBlockDisconnected).
+   */
   private addRecentlyConfirmed(hashHex: string): void {
     if (this.recentlyConfirmedTxs.has(hashHex)) return;
-    this.recentlyConfirmedTxs.add(hashHex);
-    while (this.recentlyConfirmedTxs.size > MAX_RECENT_CONFIRMED_TXS) {
-      const oldest = this.recentlyConfirmedTxs.values().next().value;
-      if (oldest === undefined) break;
+    if (this.recentlyConfirmedTxs.size >= MAX_RECENT_CONFIRMED_TXS) {
+      const oldest = this.recentlyConfirmedRing[this.recentlyConfirmedHead]!;
       this.recentlyConfirmedTxs.delete(oldest);
+      this.recentlyConfirmedRing[this.recentlyConfirmedHead] = hashHex;
+      this.recentlyConfirmedHead =
+        (this.recentlyConfirmedHead + 1) % this.recentlyConfirmedRing.length;
+    } else {
+      this.recentlyConfirmedRing.push(hashHex);
     }
+    this.recentlyConfirmedTxs.add(hashHex);
   }
 
   /**
@@ -2159,6 +2177,8 @@ export class BlockSync {
    */
   onBlockDisconnected(): void {
     this.recentlyConfirmedTxs.clear();
+    this.recentlyConfirmedRing = [];
+    this.recentlyConfirmedHead = 0;
     this.onActiveTipChange();
   }
 

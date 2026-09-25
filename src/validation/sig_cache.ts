@@ -64,6 +64,18 @@ export interface CacheKey {
 export class SigCache {
   /** Cache storing successful verification results. Value is always true. */
   private cache: Map<string, true>;
+  /**
+   * Insertion-order ring of the keys in {@link cache} (FIFO eviction).
+   * Evicting via `cache.keys().next()` walked JSC's ordered-hash-table
+   * tombstones left by earlier deletes, so under steady churn (IBD inserts
+   * thousands per block into a full cache) each eviction cost O(tombstones);
+   * it was 5.4% of main-thread time in the 515000 R4 slice profile. The ring
+   * evicts exactly the same key the Map iterator would have: entries are only
+   * ever added at the tail (insert skips present keys) and removed oldest-
+   * first or all at once (clear).
+   */
+  private ring: string[] = [];
+  private ringHead = 0;
   /** Maximum number of entries before eviction. */
   private maxEntries: number;
   /**
@@ -173,13 +185,16 @@ export class SigCache {
       return;
     }
 
-    // Evict oldest entry if at capacity
-    if (this.cache.size >= this.maxEntries) {
-      // Map.keys().next().value gives the first (oldest) key
-      const oldestKey = this.cache.keys().next().value;
-      if (oldestKey !== undefined) {
-        this.cache.delete(oldestKey);
-      }
+    // Evict oldest entry if at capacity (FIFO; see `ring`).
+    if (this.cache.size >= this.maxEntries && this.cache.size > 0) {
+      const oldestKey = this.ring[this.ringHead]!;
+      this.cache.delete(oldestKey);
+      this.ring[this.ringHead] = key.entryHex;
+      this.ringHead = (this.ringHead + 1) % this.ring.length;
+    } else {
+      // Not full: the ring is exactly [0, size) in insertion order and
+      // ringHead is 0 (it only moves once the cache is full).
+      this.ring.push(key.entryHex);
     }
 
     this.cache.set(key.entryHex, true);
@@ -193,6 +208,8 @@ export class SigCache {
    */
   clear(): void {
     this.cache.clear();
+    this.ring = [];
+    this.ringHead = 0;
   }
 
   /**
