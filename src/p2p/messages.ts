@@ -193,7 +193,12 @@ export interface InvVector {
   hash: Buffer;   // 32 bytes
 }
 
-export interface PingPayload { nonce: bigint; }
+/**
+ * `noNonce` marks a pre-BIP-31 ping (empty payload).  Core only reads/writes
+ * the nonce when the common version > BIP0031_VERSION (60000); a 31800..60000
+ * peer sends — and must be sent — a bare ping.
+ */
+export interface PingPayload { nonce: bigint; noNonce?: boolean; }
 export interface PongPayload { nonce: bigint; }
 export interface InvPayload { inventory: InvVector[]; }
 export interface GetDataPayload { inventory: InvVector[]; }
@@ -1415,7 +1420,9 @@ export function serializeMessage(magic: number, msg: NetworkMessage): Buffer {
       break;
     case "ping":
       command = "ping";
-      payload = serializePingPongPayload(msg.payload.nonce);
+      payload = msg.payload.noNonce
+        ? Buffer.alloc(0)
+        : serializePingPongPayload(msg.payload.nonce);
       break;
     case "pong":
       command = "pong";
@@ -1662,6 +1669,11 @@ export function deserializeMessage(header: MessageHeader, payload: Buffer): Netw
     case "verack":
       return { type: "verack", payload: null };
     case "ping":
+      // Pre-BIP-31 peers send an empty ping (Core only reads the nonce when
+      // the common version > 60000).
+      if (payload.length === 0) {
+        return { type: "ping", payload: { nonce: 0n, noNonce: true } };
+      }
       return { type: "ping", payload: deserializePingPongPayload(reader) };
     case "pong":
       return { type: "pong", payload: deserializePingPongPayload(reader) };

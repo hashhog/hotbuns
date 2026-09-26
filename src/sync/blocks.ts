@@ -10,6 +10,7 @@ import type { ChainDB, BlockIndexRecord, BatchOperation } from "../storage/datab
 import { DBPrefix } from "../storage/database.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import type { Peer } from "../p2p/peer.js";
+import { canServeWitnessBlocks } from "../p2p/peer.js";
 import type { PeerManager } from "../p2p/manager.js";
 import type { NetworkMessage, InvVector } from "../p2p/messages.js";
 import { InvType } from "../p2p/messages.js";
@@ -1097,6 +1098,24 @@ export class BlockSync {
       }
       await this.utxoManager.flush(extraOps);
     }
+  }
+
+  /**
+   * Connected peers we may request BLOCKS from: they must be able to serve
+   * witness blocks (Core FindNextBlocksToDownload skips !CanServeWitnesses
+   * peers; CanServeBlocks needs NODE_NETWORK or NODE_NETWORK_LIMITED).  The
+   * handshake accepts any peer >= MIN_PEER_PROTO_VERSION (31800) like Core,
+   * so an old / non-witness inbound peer stays connected but is never asked
+   * for blocks.
+   */
+  private getBlockDownloadPeers(): Peer[] {
+    if (!this.peerManager) return [];
+    return this.peerManager.getConnectedPeers().filter(
+      (peer) =>
+        !peer.versionPayload ||
+        peer.versionPayload.services === undefined ||
+        canServeWitnessBlocks(peer.versionPayload.services)
+    );
   }
 
   /**
@@ -2482,7 +2501,7 @@ export class BlockSync {
         const critAge = critPending ? Date.now() - critPending.requestedAt : 0;
         // After 30s of waiting, blast the request to all peers
         if (critPending && critAge > 30000) {
-          const allPeers = this.peerManager.getConnectedPeers();
+          const allPeers = this.getBlockDownloadPeers();
           for (const p of allPeers) {
             const pk = `${p.host}:${p.port}`;
             if (pk !== critPending.peer) {
@@ -2507,7 +2526,7 @@ export class BlockSync {
     }
 
     // Get connected peers
-    const peers = this.peerManager.getConnectedPeers();
+    const peers = this.getBlockDownloadPeers();
     if (peers.length === 0) {
       return;
     }
@@ -2910,7 +2929,7 @@ export class BlockSync {
           // Keep the original pending entry so we don't disrupt the original
           // peer's delivery if it's just slow (queued behind other blocks).
           if (this.peerManager) {
-            const connPeers = this.peerManager.getConnectedPeers();
+            const connPeers = this.getBlockDownloadPeers();
             // Send duplicate getdata to up to 3 other peers.
             //
             // Two-pass selection: prefer recently-active peers (< 120 s since

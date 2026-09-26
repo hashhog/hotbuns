@@ -67,6 +67,22 @@ export interface PeerConfig {
    * disconnected when this fires so they cannot hold a slot forever.
    */
   handshakeTimeoutMs?: number;
+  /**
+   * Core CNode::ExpectServicesFromConn(): true for connections WE chose to
+   * make for block/tx relay (outbound full-relay, block-relay-only,
+   * addr-fetch).  When set, a VERSION whose services lack the desirable
+   * flags (NODE_NETWORK|NODE_WITNESS, or NODE_NETWORK_LIMITED|NODE_WITNESS
+   * once near the tip) is disconnected before the version check
+   * (net_processing.cpp:3608-3616).  Inbound, manual and feeler
+   * connections never set this — an inbound peer lacking witness is KEPT.
+   */
+  expectServices?: boolean;
+  /**
+   * Predicate "are we near the tip?" used by {@link getDesirableServiceFlags}
+   * (Core: ApproximateBestBlockDepth() < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS).
+   * When absent, limited peers are treated as NOT desirable (IBD default).
+   */
+  isNearTip?: () => boolean;
 }
 
 /** Event handlers for peer lifecycle events. */
@@ -113,8 +129,59 @@ export interface PeerOptions {
  * Handles TCP connection, message framing over the stream,
  * version handshake, and ping/pong latency measurement.
  */
-/** Minimum protocol version for witness support. */
-export const MIN_PEER_PROTO_VERSION = 70015;
+/**
+ * Disconnect peers older than this protocol version.
+ * Core node/protocol_version.h:18 MIN_PEER_PROTO_VERSION = 31800, checked for
+ * ALL peers (net_processing.cpp:3619).  This was 70015 here, which dropped
+ * inbound peers Core keeps; witness capability is a SERVICES question
+ * (NODE_WITNESS), enforced for outbound connections and block download only.
+ */
+export const MIN_PEER_PROTO_VERSION = 31800;
+
+/** Core protocol_version.h feature thresholds (compared against the COMMON version). */
+/** "pong" and nonce-bearing "ping" (BIP-31) — peers <= this send/accept bare pings. */
+export const BIP0031_VERSION = 60000;
+/** "sendheaders" (BIP-130). */
+export const SENDHEADERS_VERSION = 70012;
+/** Compact blocks / "sendcmpct" (BIP-152). */
+export const SHORT_IDS_BLOCKS_VERSION = 70014;
+/** "wtxidrelay" (BIP-339); also the courtesy gate for "sendaddrv2" (BIP-155). */
+export const WTXID_RELAY_VERSION = 70016;
+
+/** Service bits used by the desirable-services test. */
+const SVC_NODE_NETWORK = 1n;
+const SVC_NODE_WITNESS = 8n;
+const SVC_NODE_NETWORK_LIMITED = 1024n;
+
+/**
+ * Core PeerManagerImpl::GetDesirableServiceFlags (net_processing.cpp:1758).
+ */
+export function getDesirableServiceFlags(services: bigint, nearTip: boolean): bigint {
+  if ((services & SVC_NODE_NETWORK_LIMITED) !== 0n && nearTip) {
+    return SVC_NODE_NETWORK_LIMITED | SVC_NODE_WITNESS;
+  }
+  return SVC_NODE_NETWORK | SVC_NODE_WITNESS;
+}
+
+/** Core HasAllDesirableServiceFlags (net_processing.cpp:1752). */
+export function hasAllDesirableServiceFlags(services: bigint, nearTip: boolean): boolean {
+  const want = getDesirableServiceFlags(services, nearTip);
+  return (want & ~services) === 0n;
+}
+
+/**
+ * Core CanServeBlocks && CanServeWitnesses — the peer can serve witness
+ * blocks (NODE_WITNESS and NODE_NETWORK or NODE_NETWORK_LIMITED).  This is
+ * the gate for choosing a peer to DOWNLOAD blocks from (Core
+ * FindNextBlocksToDownload skips !CanServeWitnesses peers once segwit is
+ * active).  It is NOT a connection gate.
+ */
+export function canServeWitnessBlocks(services: bigint): boolean {
+  return (
+    (services & SVC_NODE_WITNESS) !== 0n &&
+    (services & (SVC_NODE_NETWORK | SVC_NODE_NETWORK_LIMITED)) !== 0n
+  );
+}
 
 /** TCP connection timeout in milliseconds. */
 export const CONNECT_TIMEOUT_MS = 10_000;
@@ -185,6 +252,22 @@ export class Peer {
   shouldDisconnect: boolean;
   /** Whether the VERSION + VERACK handshake is complete. */
   handshakeComplete: boolean;
+
+  /**
+   * Peer sent "sendheaders" (BIP-130) — Core Peer::m_prefers_headers.
+   * Recorded whether it arrives before or after verack (Core processes
+   * SENDHEADERS pre-verack, net_processing.cpp:3896).
+   */
+  prefersHeaders: boolean;
+  /**
+   * Peer sent "sendcmpct" version 2 — Core CNodeState::m_provides_cmpctblocks.
+   * Recorded pre- or post-verack (net_processing.cpp:3901).
+   */
+  providesCmpctBlocks: boolean;
+  /** Core CNodeState::m_requested_hb_cmpctblocks (sendcmpct announce flag). */
+  requestedHbCmpctBlocks: boolean;
+  /** Count of messages ignored as "Unsupported message prior to verack". */
+  ignoredPreVerackMessages: number;
 
   /**
    * Whether the TCP connection ever established (the socket `open` callback
@@ -418,6 +501,10 @@ export class Peer {
     this.misbehaviorScore = 0;
     this.shouldDisconnect = false;
     this.handshakeComplete = false;
+    this.prefersHeaders = false;
+    this.providesCmpctBlocks = false;
+    this.requestedHbCmpctBlocks = false;
+    this.ignoredPreVerackMessages = 0;
     this.tcpEstablished = false;
     this.onBan = onBan ?? null;
     this.noban = options?.noban ?? false;
@@ -1150,10 +1237,28 @@ export class Peer {
   }
 
   /**
+   * Core CNode::GetCommonVersion(): min(peer VERSION, our PROTOCOL_VERSION).
+   * 0 before the peer's VERSION has been processed.  Every feature message we
+   * send or accept is gated on this, never on the raw peer version.
+   */
+  get commonVersion(): number {
+    if (!this.versionPayload) return 0;
+    return Math.min(this.versionPayload.version, this.config.protocolVersion);
+  }
+
+  /**
    * Send a ping message and start latency measurement.
    * The pong response will be used to calculate round-trip latency.
    */
   sendPing(): void {
+    // Core SendMessages MaybeSendPing (net_processing.cpp:5431): a peer at or
+    // below BIP0031_VERSION gets a bare ping and no pong is expected (so no
+    // ping timeout is armed — Core leaves m_ping_nonce_sent = 0).
+    if (this.commonVersion <= BIP0031_VERSION) {
+      this.lastPingTime = Date.now();
+      this.send({ type: "ping", payload: { nonce: 0n, noNonce: true } });
+      return;
+    }
     this.pingNonce = BigInt(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER));
     this.lastPingTime = Date.now();
     this.pingSentTime = this.lastPingTime;
@@ -1432,32 +1537,64 @@ export class Peer {
    * - After handshake complete: accept all messages
    */
   private handleMessage(msg: NetworkMessage): void {
-    // Check for pre-handshake message violations
+    // Feature-negotiation messages Core records whenever they arrive, before
+    // OR after verack (net_processing.cpp:3896 SENDHEADERS, :3901 SENDCMPCT).
+    // Core requires only that VERSION has been processed (nVersion != 0).
+    if (this.receivedVersion) {
+      if (msg.type === "sendheaders") {
+        this.prefersHeaders = true;
+      } else if (msg.type === "sendcmpct") {
+        // Only support compact block relay with witnesses (version 2).
+        if (msg.payload.version === 2n) {
+          this.providesCmpctBlocks = true;
+          this.requestedHbCmpctBlocks = msg.payload.enabled;
+        }
+      }
+    }
+
     if (!this.handshakeComplete) {
-      // Before we've received their version, only accept version messages
+      // Core ProcessMessage, pre-verack (net_processing.cpp:3581-4012):
+      //  - VERSION is always processed (a redundant one is logged + ignored);
+      //  - anything before VERSION: "non-version message before version
+      //    handshake" — logged and ignored, NOT a disconnect (:3810-3814);
+      //  - VERACK, SENDHEADERS, SENDCMPCT, WTXIDRELAY, SENDADDRV2,
+      //    SENDTXRCNCL are processed;
+      //  - everything else: "Unsupported message prior to verack" — logged
+      //    and ignored, no misbehaviour, no disconnect, no cap (:4010-4011).
       if (!this.receivedVersion && msg.type !== "version") {
-        // Non-version message before version handshake
-        this.misbehaving(10, `non-version message before version handshake: ${msg.type}`);
+        console.log(
+          `P2P: non-version message before version handshake "${msg.type}" from ${this.host}:${this.port} (ignored)`
+        );
+        return;
+      }
+      if (msg.type === "sendheaders" || msg.type === "sendcmpct") {
+        return; // recorded above
+      }
+      const processedPreVerack = [
+        "version",
+        "verack",
+        "wtxidrelay",
+        "sendaddrv2",
+        "sendtxrcncl",
+      ];
+      if (!processedPreVerack.includes(msg.type)) {
+        this.ignoredPreVerackMessages++;
+        console.log(
+          `P2P: unsupported message "${msg.type}" prior to verack from ${this.host}:${this.port} (ignored)`
+        );
         return;
       }
 
-      // After version but before verack, only accept certain messages
-      if (this.receivedVersion && !this.handshakeComplete) {
-        const allowedDuringHandshake = [
-          "version", // Duplicate version check handled in handleHandshake
-          "verack",
-          "wtxidrelay",
-          "sendaddrv2",
-          "sendtxrcncl",
-        ];
-        if (!allowedDuringHandshake.includes(msg.type)) {
-          this.misbehaving(10, `unsupported message prior to verack: ${msg.type}`);
-          return;
-        }
-      }
-
       this.handleHandshake(msg);
-    } else if (this.state === "connected") {
+      return;
+    }
+
+    // Post-verack VERSION: Core "redundant version message" — log + ignore.
+    if (msg.type === "version") {
+      return;
+    }
+
+    if (this.state === "connected") {
       // Handle pong for latency measurement
       if (msg.type === "pong" && this.pingNonce !== null) {
         if (msg.payload.nonce === this.pingNonce) {
@@ -1488,22 +1625,40 @@ export class Peer {
    * We transition to 'connected' once we have both sent and received verack.
    *
    * Additional checks (per Bitcoin Core net_processing.cpp):
-   * - Reject duplicate version messages (misbehavior 1)
+   * - Ignore redundant version messages (log only, like Core)
+   * - Outbound relay connections must offer the desirable services
    * - Detect self-connections via nonce
-   * - Enforce minimum protocol version (70015 for witness)
+   * - Enforce MIN_PEER_PROTO_VERSION (31800, all peers)
    */
   private handleHandshake(msg: NetworkMessage): void {
     switch (msg.type) {
       case "version": {
-        // Check for duplicate version message
+        // Redundant version: Core logs "redundant version message" and
+        // ignores it (net_processing.cpp:3582-3585) — no misbehaviour.
         if (this.receivedVersion) {
-          this.misbehaving(1, "duplicate version message");
           return;
         }
 
         const versionPayload = msg.payload;
 
-        // Check minimum protocol version (70015 for witness support)
+        // Outbound connections we chose for relay must offer the desirable
+        // services (Core ExpectServicesFromConn, net_processing.cpp:3608).
+        // Inbound / manual / feeler never reach this — Core keeps them.
+        if (
+          this.config.expectServices &&
+          !hasAllDesirableServiceFlags(
+            versionPayload.services,
+            this.config.isNearTip ? this.config.isNearTip() : false
+          )
+        ) {
+          this.disconnect(
+            `peer does not offer the expected services (${versionPayload.services.toString(16)} offered)`
+          );
+          return;
+        }
+
+        // Minimum protocol version: Core MIN_PEER_PROTO_VERSION = 31800,
+        // for ALL peers (net_processing.cpp:3619).
         if (versionPayload.version < MIN_PEER_PROTO_VERSION) {
           this.disconnect(`peer using obsolete version ${versionPayload.version}`);
           return;
@@ -1520,9 +1675,14 @@ export class Peer {
         this.versionReceivedAt = Date.now();
         this.receivedVersion = true;
 
-        // Send feature negotiation messages BEFORE verack (required by protocol)
-        this.send({ type: "wtxidrelay", payload: null });
-        this.send({ type: "sendaddrv2", payload: null });
+        // Feature negotiation BEFORE verack, gated on the common version
+        // exactly as Core (net_processing.cpp:3711-3721): WTXIDRELAY and
+        // SENDADDRV2 only to peers at >= 70016.  A 70002 peer must never be
+        // sent a message it cannot parse.
+        if (this.commonVersion >= WTXID_RELAY_VERSION) {
+          this.send({ type: "wtxidrelay", payload: null });
+          this.send({ type: "sendaddrv2", payload: null });
+        }
 
         // Send verack in response
         this.send({ type: "verack", payload: null });
@@ -1549,6 +1709,11 @@ export class Peer {
         if (this.handshakeComplete) {
           this.misbehaving(10, "wtxidrelay received after verack");
           return;
+        }
+        // Core: ignored (not an error) when the common version is too old
+        // (net_processing.cpp:3926-3934).
+        if (this.commonVersion < WTXID_RELAY_VERSION) {
+          break;
         }
         this.wtxidRelay = true;
         break;
@@ -1601,15 +1766,21 @@ export class Peer {
       this.bestKnownHeight = this.versionPayload.startHeight;
       this.events.onHandshakeComplete(this);
 
-      // Send post-handshake feature negotiation messages
-      this.send({ type: "sendheaders", payload: null });
+      // Post-handshake feature negotiation, version-gated like Core:
+      // SENDHEADERS needs >= SENDHEADERS_VERSION (net_processing.cpp:5525),
+      // SENDCMPCT needs >= SHORT_IDS_BLOCKS_VERSION (:3864).
+      if (this.commonVersion >= SENDHEADERS_VERSION) {
+        this.send({ type: "sendheaders", payload: null });
+      }
 
       // BIP 152: Signal compact block relay support (version 2 = segwit)
       // enabled=false means low-bandwidth mode (we receive inv/headers first)
-      this.send({
-        type: "sendcmpct",
-        payload: { enabled: false, version: 2n },
-      });
+      if (this.commonVersion >= SHORT_IDS_BLOCKS_VERSION) {
+        this.send({
+          type: "sendcmpct",
+          payload: { enabled: false, version: 2n },
+        });
+      }
     }
   }
 

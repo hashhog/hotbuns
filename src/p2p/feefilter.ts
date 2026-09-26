@@ -131,6 +131,11 @@ export class FeeFilterManager {
     if (isBlockRelayOnly) {
       return;
     }
+    // Core SendMessages MaybeSendFeefilter: never to peers below
+    // FEEFILTER_VERSION (net_processing.cpp:5543).
+    if (peer.commonVersion < FEEFILTER_VERSION) {
+      return;
+    }
 
     const filterToSend = this.getFeeRateToAnnounce();
 

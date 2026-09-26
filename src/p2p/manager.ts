@@ -18,6 +18,7 @@ import {
   STALE_CHECK_INTERVAL_MS,
   MINIMUM_CONNECT_TIME_MS,
   MAX_OUTBOUND_PEERS_TO_PROTECT,
+  BIP0031_VERSION,
 } from "./peer.js";
 import type { NetworkMessage, AddrPayload, NetworkAddress, AddrV2Payload, FeeFilterPayload } from "./messages.js";
 import { ipv4ToBuffer, hostToBuffer } from "./messages.js";
@@ -1610,6 +1611,14 @@ export class PeerManager {
       proxyManager: this.proxyManager ?? undefined,
       networkType,
       handshakeTimeoutMs: this.config.handshakeTimeoutMs,
+      // Core ExpectServicesFromConn: only connections WE picked for relay
+      // (outbound full-relay / block-relay) must offer NODE_NETWORK|WITNESS.
+      // Manual connections (-connect pins, addnode) and feelers are exempt,
+      // as are inbound peers (they never come through here with this type).
+      expectServices:
+        (connectionType === "full_relay" || connectionType === "block_relay") &&
+        !this.isManualConnection(key),
+      isNearTip: () => (this.isIBDFn ? !this.isIBDFn() : false),
     };
 
     const events: PeerEvents = {
@@ -1829,6 +1838,15 @@ export class PeerManager {
     return Array.from(this.peers.values()).filter(
       (peer) => peer.state === "connected"
     );
+  }
+
+  /**
+   * True when `key` (host:port) is a manual connection (a `-connect` pin or
+   * an `addnode` entry) — Core ConnectionType::MANUAL.
+   */
+  private isManualConnection(key: string): boolean {
+    if (this.addedNodes.has(key)) return true;
+    return this.connectPeers.some((p) => `${p.host}:${p.port}` === key);
   }
 
   /**
@@ -3102,7 +3120,9 @@ export class PeerManager {
     this.lastActivity.set(key, Date.now());
 
     // Respond to ping with pong (required by Bitcoin protocol)
-    if (msg.type === "ping") {
+    // Core net_processing.cpp:4883: only answer with pong when the common
+    // version > BIP0031_VERSION (older peers don't know "pong").
+    if (msg.type === "ping" && peer.commonVersion > BIP0031_VERSION) {
       peer.send({ type: "pong", payload: { nonce: msg.payload.nonce } });
     }
 

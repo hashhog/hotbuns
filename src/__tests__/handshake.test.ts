@@ -193,7 +193,10 @@ async function waitFor(
   }
 }
 
-describe("Pre-handshake message rejection", () => {
+// Core parity: messages other than VERSION before the peer's VERSION, and
+// "unsupported" messages between VERSION and VERACK, are logged and IGNORED
+// (net_processing.cpp:3810-3814, :4010-4011) — no misbehaviour, no disconnect.
+describe("Pre-handshake message handling (Core: ignore, not misbehave)", () => {
   let mockServer: MockPeerServer;
 
   beforeEach(async () => {
@@ -206,7 +209,7 @@ describe("Pre-handshake message rejection", () => {
     mockServer.stop();
   });
 
-  test("rejects non-version message before version received", async () => {
+  test("ignores non-version message before version received", async () => {
     const config = createTestConfig(mockServer.port);
 
     let disconnected = false;
@@ -228,16 +231,17 @@ describe("Pre-handshake message rejection", () => {
     const peer = new Peer(config, events);
     await peer.connect();
 
-    // Wait for misbehavior to be recorded
-    await waitFor(() => peer.misbehaviorScore > 0);
+    await new Promise((r) => setTimeout(r, 300));
 
-    expect(peer.misbehaviorScore).toBe(10);
+    expect(peer.misbehaviorScore).toBe(0);
+    expect(disconnected).toBe(false);
+    expect(peer.state).not.toBe("disconnected");
     expect(peer.handshakeComplete).toBe(false);
 
     peer.disconnect();
   }, TEST_TIMEOUT);
 
-  test("rejects inv message before handshake complete", async () => {
+  test("ignores inv message before handshake complete", async () => {
     const config = createTestConfig(mockServer.port);
 
     const events: PeerEvents = {
@@ -262,11 +266,15 @@ describe("Pre-handshake message rejection", () => {
     const peer = new Peer(config, events);
     await peer.connect();
 
-    // Wait for misbehavior to be recorded
-    await waitFor(() => peer.misbehaviorScore > 0);
+    await waitFor(() => peer.ignoredPreVerackMessages > 0);
 
-    expect(peer.misbehaviorScore).toBe(10);
+    expect(peer.misbehaviorScore).toBe(0);
+    expect(peer.state).not.toBe("disconnected");
     expect(peer.handshakeComplete).toBe(false);
+
+    // The handshake still completes once the verack arrives.
+    mockServer.sendVerack();
+    await waitFor(() => peer.handshakeComplete);
 
     peer.disconnect();
   }, TEST_TIMEOUT);
@@ -347,7 +355,9 @@ describe("Duplicate VERSION detection", () => {
     mockServer.stop();
   });
 
-  test("rejects duplicate version message with misbehavior 1", async () => {
+  // Core net_processing.cpp:3582-3585: "redundant version message" is logged
+  // and ignored — no misbehaviour.
+  test("ignores duplicate version message (no misbehaviour)", async () => {
     const config = createTestConfig(mockServer.port);
 
     const events: PeerEvents = {
@@ -374,10 +384,11 @@ describe("Duplicate VERSION detection", () => {
     const peer = new Peer(config, events);
     await peer.connect();
 
-    // Wait for both versions to be processed
-    await waitFor(() => peer.misbehaviorScore > 0);
+    await waitFor(() => peer.handshakeComplete);
+    await new Promise((r) => setTimeout(r, 100));
 
-    expect(peer.misbehaviorScore).toBe(1);
+    expect(peer.misbehaviorScore).toBe(0);
+    expect(peer.state).toBe("connected");
 
     peer.disconnect();
   }, TEST_TIMEOUT);
@@ -472,11 +483,11 @@ describe("Minimum protocol version", () => {
     mockServer.stop();
   });
 
-  test("MIN_PEER_PROTO_VERSION is 70015", () => {
-    expect(MIN_PEER_PROTO_VERSION).toBe(70015);
+  test("MIN_PEER_PROTO_VERSION is Core's 31800", () => {
+    expect(MIN_PEER_PROTO_VERSION).toBe(31800);
   });
 
-  test("disconnects peer with version below 70015", async () => {
+  test("disconnects peer with version below 31800", async () => {
     const config = createTestConfig(mockServer.port);
 
     let disconnected = false;
@@ -490,7 +501,7 @@ describe("Minimum protocol version", () => {
     // Server sends old version
     mockServer.onMessage = (msg) => {
       if (msg.type === "version") {
-        mockServer.sendVersion({ version: 70014 }); // Below minimum
+        mockServer.sendVersion({ version: 31799 }); // Below minimum
         mockServer.sendVerack();
       }
     };
