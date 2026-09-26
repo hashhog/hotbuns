@@ -497,6 +497,36 @@ export class ChainDB {
     await this.db.del(key);
   }
 
+  /**
+   * Delete every active-chain height -> hash entry ABOVE `height` in one
+   * atomic batch; returns the heights removed (ascending). Used on boot to
+   * rewind the height index to the durable UTXO tip after an unclean stop.
+   */
+  async deleteBlockHashesAbove(height: number): Promise<number[]> {
+    const it = this.db.iterator({
+      gt: makeKey(DBPrefix.HEADER, encodeHeight(height)),
+      lt: Buffer.from([DBPrefix.HEADER + 1]),
+      values: false,
+    });
+    const keys: Buffer[] = [];
+    const heights: number[] = [];
+    try {
+      for await (const [key] of it) {
+        if (key.length !== 5) continue;
+        keys.push(Buffer.from(key));
+        heights.push(key.readUInt32BE(1));
+      }
+    } finally {
+      await it.close();
+    }
+    if (keys.length > 0) {
+      const batch = this.db.batch();
+      for (const k of keys) batch.del(k);
+      await batch.write();
+    }
+    return heights;
+  }
+
   /** Set the active-chain height -> hash mapping at `height` (standalone,
    *  non-batch path). Counterpart to {@link buildHeightHashPutOp}. */
   async putBlockHashByHeight(height: number, hash: Buffer): Promise<void> {

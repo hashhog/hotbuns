@@ -12,11 +12,13 @@
  * prevout `gettxout` returned null (observed: resume at 250000, spurious reject of
  * valid block 255587 with bad-txns-inputs-missingorspent).
  *
- * Fix: `load()` detects the leading active-chain index (an entry above the
- * durable CHAIN_STATE tip) and FAILS CLOSED with a clear, actionable
- * "chainstate incomplete, reindex needed" error instead of silently running with
- * a corrupt view. On a CLEAN datadir the height index == CHAIN_STATE tip, so there
- * is no false positive.
+ * First fix: `load()` failed closed ("chainstate incomplete, reindex needed").
+ * That made every unclean stop mid-IBD a wipe-and-resync. Current behaviour
+ * (2026-09-26): the coins on disk are a complete UTXO set AT the CHAIN_STATE
+ * tip, and block sync resumes from that tip, so `load()` rolls the height index
+ * back to it (Core: the tip comes from the coins-DB best block) and the blocks
+ * above are connected again. On a CLEAN datadir the height index == CHAIN_STATE
+ * tip, so nothing is removed.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
@@ -42,7 +44,7 @@ describe("ChainStateManager.load resume-integrity guard", () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  test("HALTS when the active-chain height index leads the durable UTXO tip (unclean shutdown)", async () => {
+  test("ROLLS BACK the height index when it leads the durable UTXO tip (unclean stop), instead of refusing to boot", async () => {
     // Durable UTXO tip = height 5 (what the last atomic flush persisted).
     const tipHash = Buffer.alloc(32, 0xa5);
     await db.putChainState({
@@ -50,13 +52,28 @@ describe("ChainStateManager.load resume-integrity guard", () => {
       bestHeight: 5,
       totalWork: 100n,
     });
-    // Active-chain height index advanced to 6 by a per-block write from a prior
-    // run that was then killed before the next flush — the height-6 coins were
-    // never persisted. This is the incomplete-chainstate signal.
-    await db.putBlockHashByHeight(6, Buffer.alloc(32, 0x06));
+    await db.putBlockHashByHeight(5, tipHash);
+    // Active-chain height index advanced to 6..9 (and a stray 12) by per-block
+    // writes from a prior run that stopped before the next coins flush — the
+    // coins for those heights were never persisted.
+    for (const h of [6, 7, 8, 9, 12]) {
+      await db.putBlockHashByHeight(h, Buffer.alloc(32, h));
+    }
 
     const csm = new ChainStateManager(db, REGTEST);
-    await expect(csm.load()).rejects.toThrow(/chainstate incomplete/i);
+    // Pre-fix: rejects with "chainstate incomplete ... wipe the datadir".
+    await expect(csm.load()).resolves.toBeUndefined();
+    expect(csm.getBestBlock().height).toBe(5);
+    expect(csm.getBestBlock().hash.equals(tipHash)).toBe(true);
+    // Height index now agrees with the durable coins tip.
+    expect((await db.getBlockHashByHeight(5))!.equals(tipHash)).toBe(true);
+    for (const h of [6, 7, 8, 9, 10, 12]) {
+      expect(await db.getBlockHashByHeight(h)).toBeNull();
+    }
+    // Second boot is a no-op (idempotent).
+    const csm2 = new ChainStateManager(db, REGTEST);
+    await expect(csm2.load()).resolves.toBeUndefined();
+    expect(csm2.getBestBlock().height).toBe(5);
   });
 
   test("does NOT halt on a clean datadir (height index == durable tip)", async () => {

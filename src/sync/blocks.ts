@@ -418,6 +418,15 @@ export class BlockSync {
   private processing: boolean;
 
   /**
+   * Latched by {@link stop}. Unlike `running` (which is also false before
+   * `start()` and after `haltSync`, where submitblock may still connect
+   * buffered bodies), this means "shutdown has been requested": the connect
+   * loop must not START another block (Core's ActivateBestChain checks
+   * ShutdownRequested between blocks, never mid-block).
+   */
+  private stopRequested: boolean = false;
+
+  /**
    * Count of in-flight gettxoutsetinfo / whole-set scans. While > 0 the
    * connect loop yields (Core holds cs_main in GetUTXOStats). Nested so a
    * scan that starts during another still resumes only on the last resume.
@@ -1036,6 +1045,7 @@ export class BlockSync {
    */
   async stop(): Promise<void> {
     this.running = false;
+    this.stopRequested = true;
 
     if (this.stallCheckInterval) {
       clearInterval(this.stallCheckInterval);
@@ -1047,57 +1057,79 @@ export class BlockSync {
       this.logInterval = null;
     }
 
-    // If we are in the middle of connectBlock, the UTXO cache may contain
-    // partially-processed state (some inputs spent, some outputs added for
-    // the in-progress block).  Flushing that to disk would corrupt the UTXO
-    // set: a spent coin gets DELETEd from LevelDB even though the block was
-    // never fully connected.  On the next restart the chain-state height
-    // points *before* that block, so we'd try to spend the coin again — but
-    // it's already gone from the DB → permanent "Missing UTXO" stall.
+    // Core parity (validation.cpp ActivateBestChain + init.cpp Shutdown):
+    // shutdown interrupts block connection BETWEEN blocks — the block being
+    // connected always finishes — and then FlushStateToDisk writes the coins
+    // and the best block in one atomic batch.
     //
-    // Bug #132 (2026-05-26): the prior fix discarded the dirty cache with
-    // a bare clearCache() and let the caller's final flush() write
-    // chain-state separately. That left the disk with a chain-state
-    // pointer advanced past the actual UTXO content for blocks the cache
-    // had absorbed but not yet flushed (observed at h=950371 — 65 blocks
-    // of dirty UTXOs silently dropped, then `bad-txns-inputs-missingorspent`
-    // on the first connect after restart).
+    // History: Bug #132 waited only 5 s for the in-flight connect and then
+    // DISCARDED the whole dirty UTXO cache (clearCache) while that connect was
+    // still running. The connect loop also ignored `running=false` whenever
+    // bodies were buffered, so blocks kept connecting after "Stopping
+    // services...", the in-flight block then read the torn cache and failed
+    // bad-txns-inputs-missingorspent (its valid header marked invalid), and no
+    // CHAIN_STATE was written for the heights whose height->hash entries had
+    // already been persisted per block — the next boot refused to start
+    // ("chainstate incomplete ... wipe the datadir").
     //
-    // Fix: wait up to 5s for the in-flight processOrderedBlocksInner loop
-    // to reach an iteration boundary (which respects `running=false` and
-    // exits naturally), then ALWAYS take the flush-with-chain-state path
-    // so the disk is consistent. If the loop hasn't drained in 5s, fall
-    // back to the old clearCache() — at that point the worst case is the
-    // historical bug, not worse than the prior behavior.
-    const drainDeadline = Date.now() + 5000;
-    while (this.processing && Date.now() < drainDeadline) {
+    // Now: `stopRequested` stops the loop before it starts another block, we
+    // wait for the in-flight connect to finish (no deadline — a connect is
+    // bounded work; if the supervisor SIGKILLs us instead, boot rolls the
+    // height index back to the durable tip, see ChainStateManager.load), and
+    // then flush every dirty coin together with CHAIN_STATE for the block the
+    // in-memory view actually reflects.
+    const waitStart = Date.now();
+    let nextLog = waitStart + 10_000;
+    while (this.processing) {
       await new Promise<void>((resolve) => setTimeout(resolve, 10));
-    }
-    if (this.processing) {
-      // Drain timed out — fall back to the old destructive behavior.
-      // This is no worse than what the original code did unconditionally.
-      this.utxoManager.clearCache();
-    } else {
-      // Flush any pending UTXO updates WITH chain state so shutdown is
-      // crash-safe (no "Missing UTXO" on restart).
-      const shutdownHeight = this.state.nextHeightToProcess - 1;
-      const shutdownEntry = this.headerSync.getHeaderByHeight(shutdownHeight);
-      const extraOps: BatchOperation[] = [];
-      if (shutdownEntry && shutdownHeight > 0) {
-        const chainStateValue = this.serializeChainState(
-          shutdownEntry.hash,
-          shutdownHeight,
-          shutdownEntry.chainWork
+      if (Date.now() >= nextLog) {
+        console.log(
+          `[shutdown] waiting for the in-flight block connect to finish ` +
+            `(${Math.round((Date.now() - waitStart) / 1000)}s)`
         );
-        extraOps.push({
-          type: "put",
-          prefix: DBPrefix.CHAIN_STATE,
-          key: Buffer.alloc(0),
-          value: chainStateValue,
-        });
+        nextLog = Date.now() + 10_000;
       }
-      await this.utxoManager.flush(extraOps);
     }
+    const extraOps = await this.buildViewTipChainStateOps();
+    await this.utxoManager.flush(extraOps);
+    const tip = extraOps.length > 0 ? this.lastViewTipHeight : null;
+    if (tip !== null) this.lastFlushedHeight = tip;
+    console.log(
+      `[shutdown] block sync stopped; UTXO cache flushed with chain state` +
+        (tip !== null ? ` at height ${tip}` : ` (view at genesis/fresh sentinel)`)
+    );
+  }
+
+  /** Height resolved by the last {@link buildViewTipChainStateOps} call. */
+  private lastViewTipHeight: number | null = null;
+
+  /**
+   * CHAIN_STATE put for the block the in-memory UTXO view reflects (its best
+   * block pointer), so a coins flush and the durable tip always move together.
+   * Returns [] when the view is at the all-zero fresh sentinel or its tip
+   * header is unknown (then nothing is claimed beyond what is on disk).
+   */
+  private async buildViewTipChainStateOps(): Promise<BatchOperation[]> {
+    this.lastViewTipHeight = null;
+    const viewTip = await this.utxoManager.getCoinsViewCache().getBestBlock();
+    if (viewTip.equals(Buffer.alloc(32))) return [];
+    const entry = this.headerSync.getHeader(viewTip);
+    if (!entry) {
+      console.warn(
+        `[chainstate] UTXO view tip ${viewTip.toString("hex").slice(0, 16)} has no ` +
+          `header entry; flushing without a CHAIN_STATE update`
+      );
+      return [];
+    }
+    this.lastViewTipHeight = entry.height;
+    return [
+      {
+        type: "put",
+        prefix: DBPrefix.CHAIN_STATE,
+        key: Buffer.alloc(0),
+        value: this.serializeChainState(entry.hash, entry.height, entry.chainWork),
+      },
+    ];
   }
 
   /**
@@ -2825,6 +2857,10 @@ export class BlockSync {
   }
 
   private async processOrderedBlocks(): Promise<void> {
+    // Shutdown requested: never start another block (see stop()).
+    if (this.stopRequested) {
+      return;
+    }
     // Reorg-to-ancestor HALT (crash-recovery / reorg-integrity class): once the
     // sync loop has hard-failed on an impossible reorg it must NOT keep spinning.
     if (this.syncHalted !== null) {
@@ -2883,6 +2919,12 @@ export class BlockSync {
     // still ahead, then a fire-and-forget cache-clearing flush racing the
     // next connect → bad-txns-inputs-missingorspent on a valid block.
     while (true) {
+      // Core ActivateBestChain: ShutdownRequested() is checked BETWEEN blocks.
+      // Buffered bodies must not keep connecting after stop() — the loop used
+      // to test `running` only when the next body was missing.
+      if (this.stopRequested) {
+        return;
+      }
       if (this.syncHalted !== null) {
         return;
       }
@@ -3095,7 +3137,12 @@ export class BlockSync {
         // In both the reorg-abort and the direct-extension cases the active
         // chain tip is `chainStateManager.getBestBlock()` (the reorg dispatch
         // never advanced it, since the connect failed).
+        //
+        // Never while shutting down: a connect that fails after stop() began is
+        // not evidence the block is invalid (Core never calls InvalidBlockFound
+        // for an interrupted connect).
         if (
+          !this.stopRequested &&
           this.chainStateManager &&
           headerEntry &&
           classifyCallbackError(failureMsg) === "consensus"
@@ -3131,6 +3178,7 @@ export class BlockSync {
         // connect failure must never punish the delivering peer.
         const blockPeerKey = this.downloadedBlockPeers.get(hashHex);
         if (
+          !this.stopRequested &&
           blockPeerKey &&
           this.peerManager &&
           classifyCallbackError(failureMsg) === "consensus"
@@ -3197,10 +3245,12 @@ export class BlockSync {
           this.utxoManager.clearCache(flushedTipEntry.hash);
         } else if (this.lastFlushedHeight === 0) {
           // Pre-first-flush: the on-disk UTXO set is the genesis state.
-          // The all-zero "fresh view" sentinel is correct here, so a bare
-          // clear (which leaves the pointer untouched / re-seeds all-zero
-          // on next lazy-load) is exactly right.
-          this.utxoManager.clearCache();
+          // The all-zero "fresh view" sentinel is correct here. Set it
+          // explicitly: a bare clear leaves CoinsViewDB's pointer on the
+          // last CONNECTED block, so the fresh cache would lazy-load a tip
+          // whose coins were just discarded (and a shutdown flush would
+          // then persist CHAIN_STATE for it).
+          this.utxoManager.clearCache(Buffer.alloc(32));
         } else {
           // lastFlushedHeight > 0 but its header is missing — should not
           // happen (headers are synced before blocks).  Bare clear keeps
@@ -4926,6 +4976,10 @@ export class BlockSync {
         if (reorgPendingOps.length > 0) extraOps.push(...reorgPendingOps);
         if (newTipUndoOp) extraOps.push(newTipUndoOp);
         if (newTipTxIndexOps.length > 0) extraOps.push(...newTipTxIndexOps);
+        // Coins never reach disk without CHAIN_STATE for the same block: a
+        // crash after a coins-only flush would boot from an older tip whose
+        // spent coins are already gone.
+        extraOps.push(...(await this.buildViewTipChainStateOps()));
         await this.utxoManager.flushDirty(extraOps);
         this.lastFlushedHeight = height;
       }
@@ -5520,7 +5574,8 @@ export class BlockSync {
     console.log("IBD complete! Switching to normal operation.");
 
     try {
-      await this.utxoManager.flushDirty();
+      // Coins + CHAIN_STATE in one batch (never coins alone).
+      await this.utxoManager.flushDirty(await this.buildViewTipChainStateOps());
       const flushedAt = this.state.nextHeightToProcess - 1;
       if (flushedAt > this.lastFlushedHeight) {
         this.lastFlushedHeight = flushedAt;

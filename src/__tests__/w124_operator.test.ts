@@ -100,18 +100,17 @@ describe("W124 G4: SIGUSR1/SIGUSR2/SIGQUIT operator-dump signals (MISSING)", () 
   });
 });
 
-describe("W124 G5: re-entrant shutdown guard (MISSING — BUG-1 P0)", () => {
-  test("MISSING: gracefulShutdown has no `if (shuttingDown) return` early-exit", () => {
+describe("W124 G5: re-entrant shutdown guard (PRESENT — BUG-1 fixed 2026-09-26)", () => {
+  test("gracefulShutdown returns early when a shutdown is already in progress", () => {
     // Extract the gracefulShutdown body.
     const fnStart = CLI_SRC.indexOf("async function gracefulShutdown");
     expect(fnStart).toBeGreaterThanOrEqual(0);
     const body = CLI_SRC.slice(fnStart, fnStart + 4000);
-    // No `shuttingDown` / `shutdownInProgress` / `isShuttingDown` guard
-    expect(/shuttingDown|shutdownInProgress|isShuttingDown|shutdownStarted/.test(body)).toBe(
-      false
-    );
-    // Second SIGTERM during in-flight stop races against db.close + mempool dump
-    // + fee_estimates.json write. BUG-1 asserts this current state.
+    // A second SIGTERM / RPC stop while the first is waiting for the in-flight
+    // block connect must not run a parallel shutdown (db.close under the
+    // first one's flush). Flipped from the BUG-1 "MISSING" assertion.
+    expect(/if \(shutdownInProgress\)/.test(body)).toBe(true);
+    expect(CLI_SRC.includes("let shutdownInProgress = false;")).toBe(true);
   });
 });
 

@@ -3146,7 +3146,18 @@ async function startNode(config: NodeConfig): Promise<void> {
 /**
  * Graceful shutdown sequence.
  */
+let shutdownInProgress = false;
+
 async function gracefulShutdown(): Promise<void> {
+  // RPC `stop` and SIGTERM/SIGINT (systemd, stop_mainnet.sh, the dispatcher)
+  // all land here. A second request while the first is still waiting for the
+  // in-flight block connect must not run a parallel shutdown (which would
+  // close the DB under the first one's flush) or exit early.
+  if (shutdownInProgress) {
+    console.log("Shutdown already in progress; waiting for it to finish...");
+    return;
+  }
+  shutdownInProgress = true;
   if (!runningNode) {
     process.exit(0);
     return;

@@ -1409,52 +1409,39 @@ export class ChainStateManager {
         );
       }
 
-      // ── Incomplete-chainstate detection on resume (crash-recovery /
-      //    state-integrity class) ──
+      // ── Height-index / durable-coins reconciliation on resume ──
       //
-      // The CHAIN_STATE record is the durable UTXO tip: it is written ONLY in
-      // the atomic flush batch alongside the UTXO coins (sync/blocks.ts
-      // connectBlock's `shouldFlush` path), so the on-disk UTXO set is complete
-      // exactly up to `bestHeight`.  But during deep IBD the ACTIVE-CHAIN
-      // height->hash index (DBPrefix.HEADER) is advanced PER-BLOCK
-      // (`putBlockHashByHeight`, blocks.ts non-flush path) — ahead of the next
-      // periodic flush.  On a CLEAN shutdown `stop()` flushes CHAIN_STATE up to
-      // the last connected height, so the height index and CHAIN_STATE agree.
-      // On an UNCLEAN shutdown (SIGKILL / OOM / power loss) between the periodic
-      // flushes, the height index leads: it describes an active chain up to some
-      // height N while the durable UTXO set + CHAIN_STATE only reach
-      // `bestHeight` < N.  The dirty in-memory UTXO coins for bestHeight+1..N
-      // were never flushed and are gone.
+      // CHAIN_STATE is the durable UTXO tip: it is written ONLY in the atomic
+      // flush batch together with the coins (sync/blocks.ts), so the on-disk
+      // UTXO set is exactly the set at `bestHeight`. The active-chain
+      // height->hash index (DBPrefix.HEADER) is advanced per block on the
+      // deep-IBD non-flush path, ahead of the next coins flush. After an
+      // UNCLEAN stop (SIGKILL / OOM / power loss, or the pre-fix RPC `stop`
+      // that discarded the dirty cache) the index can therefore lead the
+      // durable tip; the coins for those heights were never written.
       //
-      // Continuing from here runs the node with an active-chain view whose UTXO
-      // set is INCOMPLETE: a later block legitimately spending an output that
-      // (pre-crash) lived only in the lost cache gets a null `gettxout` and is
-      // spuriously rejected with bad-txns-inputs-missingorspent — silent
-      // corruption surfacing thousands of blocks later (observed: resume at
-      // 250000, spurious reject of valid block 255587).  Note: because the
-      // HEADER prefix is written with `writeHeightIndex:false` for non-active
-      // headers/forks (see database.ts + headers.ts), an entry ABOVE the durable
-      // tip can only be an active-connect leftover from a prior unclean run —
-      // never a fork header — so this has no false positive on a clean datadir
-      // (where height-index max == bestHeight).
+      // Pre-fix this refused to boot ("chainstate incomplete ... wipe the
+      // datadir"). But nothing is lost that matters: the coins on disk are a
+      // complete, consistent UTXO set AT `bestHeight`, and block sync resumes
+      // from CHAIN_STATE (BlockSync.start), re-downloading and re-connecting
+      // the blocks above it. Core does the same — the chain tip is set from
+      // the coins-DB best block (LoadChainTip, validation.cpp) and blocks
+      // above it are simply connected again. What would be wrong is running
+      // with the index claiming heights the coins do not reflect, so ROLL THE
+      // INDEX BACK to the durable tip (one atomic batch) and continue.
       //
-      // Bitcoin Core reconciles the coins-DB best block against the block index
-      // on startup (LoadChainTip + ReplayBlocks, validation.cpp:4546/:4773).
-      // hotbuns cannot cheaply replay (deep-IBD block bodies are not retained on
-      // disk), so we fail CLOSED with a clear, actionable error rather than run
-      // with a hole and reject valid blocks later.
-      const aheadHash = await this.db.getBlockHashByHeight(this.bestBlock.height + 1);
-      if (aheadHash !== null) {
-        throw new Error(
-          `chainstate incomplete: durable UTXO tip is height ${this.bestBlock.height} ` +
-            `(${this.bestBlock.hash.toString("hex")}) but the active-chain height ` +
-            `index already contains height ${this.bestBlock.height + 1} ` +
-            `(${aheadHash.toString("hex")}). This datadir was shut down UNCLEANLY ` +
-            `mid-IBD: the UTXO set for blocks above ${this.bestBlock.height} was ` +
-            `never flushed and is lost, so the view has holes. Refusing to run ` +
-            `with a corrupt UTXO set (it would spuriously reject valid blocks ` +
-            `later). Reindex / re-sync from the last durable tip: stop the node, ` +
-            `wipe the datadir, and restart. (chainstate-incomplete, reindex needed)`
+      // An entry ABOVE the durable tip can only be an active-connect leftover
+      // (header reception writes with writeHeightIndex:false), so this never
+      // removes anything a clean datadir needs.
+      const removed = await this.db.deleteBlockHashesAbove(this.bestBlock.height);
+      if (removed.length > 0) {
+        console.warn(
+          `[chainstate] height index led the durable UTXO tip ` +
+            `${this.bestBlock.height} (${this.bestBlock.hash.toString("hex")}) by ` +
+            `${removed.length} entr${removed.length === 1 ? "y" : "ies"} ` +
+            `(heights ${removed[0]}..${removed[removed.length - 1]}) — unclean stop; ` +
+            `rolled the height index back to the durable tip. Blocks above it ` +
+            `will be downloaded and connected again.`
         );
       }
     } else {
