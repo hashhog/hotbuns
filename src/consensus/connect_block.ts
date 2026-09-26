@@ -73,6 +73,8 @@ import {
   checkSequenceLocks,
   bip68VersionActive,
   ScriptFlags,
+  SEQUENCE_LOCKTIME_DISABLE_FLAG,
+  SEQUENCE_LOCKTIME_TYPE_FLAG,
 } from "../validation/tx.js";
 import {
   clampScriptThreads,
@@ -364,10 +366,28 @@ export async function coreConnectBlockChecks(
     verifyCLTV = height >= params.bip65Height,
     verifyCSV = height >= params.csvHeight,
     verifyNullDummy = height >= params.segwitHeight,
-    getUTXOMTP,
+    getUTXOMTP: getUTXOMTPRaw,
     genesisHashHex,
     utxoBestBlockHashHex,
   } = opts;
+
+  // BIP-68 coin-time provider, memoised per coin height for this block.
+  // Each call walks 11 header parents + sorts; it is only needed for
+  // time-type relative locks (see needsCoinTime below), and many inputs of
+  // one block share a coin height.  The memo lives for one ConnectBlock, so
+  // it cannot outlive a header reorg.
+  let getUTXOMTP: ((utxoHeight: number) => number) | undefined;
+  if (getUTXOMTPRaw) {
+    const mtpByHeight = new Map<number, number>();
+    getUTXOMTP = (utxoHeight: number): number => {
+      let v = mtpByHeight.get(utxoHeight);
+      if (v === undefined) {
+        v = getUTXOMTPRaw(utxoHeight);
+        mtpByHeight.set(utxoHeight, v);
+      }
+      return v;
+    };
+  }
 
   // ── W93 Gate 0a: Genesis short-circuit.
   //
@@ -606,6 +626,13 @@ export async function coreConnectBlockChecks(
 
       const utxoConfirmations: UTXOConfirmation[] = [];
       const inputUTXOs: UTXOEntry[] = [];
+      // calculateSequenceLocks reads an input's coin MTP only when BIP-68 is
+      // enforced for this tx AND that input has the disable flag clear AND the
+      // time-type flag set (Core CalculateSequenceLocks, tx_verify.cpp:66-99 —
+      // the only caller of GetAncestor(...)->GetMedianTimePast()).  Compute it
+      // for exactly those inputs; everywhere else the value is never read, so
+      // 0 is recorded without the 11-header walk.
+      const seqLocksApply = enforceBIP68 && bip68VersionActive(tx.version);
 
       for (const input of tx.inputs) {
         const utxo = utxoManager.getUTXO(input.prevOut);
@@ -630,8 +657,16 @@ export async function coreConnectBlockChecks(
           // default to 0, which makes block-height-based locks work correctly
           // and time-based locks conservative (never spuriously fails, may miss
           // a time-lock violation at the exact MTP boundary).
-          const coinMTP = getUTXOMTP ? getUTXOMTP(utxo.height) : 0;
-          utxoConfirmations.push({ height: utxo.height, medianTimePast: coinMTP });
+          const needsCoinTime =
+            seqLocksApply &&
+            ((input.sequence >>> 0) & SEQUENCE_LOCKTIME_DISABLE_FLAG) === 0 &&
+            (input.sequence & SEQUENCE_LOCKTIME_TYPE_FLAG) !== 0;
+          if (needsCoinTime) {
+            const coinMTP = getUTXOMTP ? getUTXOMTP(utxo.height) : 0;
+            utxoConfirmations.push({ height: utxo.height, medianTimePast: coinMTP });
+          } else {
+            utxoConfirmations.push({ height: utxo.height, medianTimePast: 0 });
+          }
         }
       }
 

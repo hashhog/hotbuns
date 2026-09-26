@@ -55,19 +55,33 @@ function isUnspendableScript(scriptPubKey: Buffer): boolean {
 }
 
 /** Default max cache size in bytes (~512MB).
- *  JS objects have ~3KB overhead per Map entry.  With BUN_JSC_forceRAMSize=4GB,
- *  a 512MB UTXO cache leaves ~2-3GB for block processing, header index, and
- *  V8/JSC overhead.  The smaller cache means more frequent LevelDB reads but
- *  keeps RSS stable under the 4GB cap instead of growing ~1.7MB/block. */
+ *  With BUN_JSC_forceRAMSize=4GB, a 512MB UTXO cache leaves ~2-3GB for block
+ *  processing, header index, and JSC overhead. */
 const DEFAULT_DBCACHE_BYTES = 512 * 1024 * 1024;
 
 /**
- * Estimated overhead per cache entry in the JS heap.
- * Empirical measurement on testnet4: ~3KB per Map entry including
- * the key string (67-char hex), CoinEntry/Coin/txOut nested objects,
- * Buffer with ArrayBuffer backing, bigint, and Map internal bookkeeping.
+ * Accounted memory per cache entry, on top of coinMemoryUsage() (48 bytes +
+ * scriptPubKey length).
+ *
+ * Deliberately conservative.  Measured 2026-09-26 (Bun 1.3.11): the RSS
+ * slope of a CoinsViewCache under churn is ~1.52 KB/coin, and live marginal
+ * anon RSS ~0.9 KB/coin, so 3000 over-counts ~2x and --dbcache=1024 holds
+ * ~350k coins.  A 1450 figure was benchmarked on 632000-633023 and bought no
+ * CPU (fewer LevelDB reads, but GC time grew with the larger live cache by
+ * the same amount) while pushing the dbcache-rss-bound test over its bound,
+ * so the budget is kept at the old, over-counting value.  With the dirty-set
+ * sync and evict-to-target below, a memory flush now costs O(dirty +
+ * evicted) and fires every ~20 blocks here instead of almost every block.
  */
 export const CACHE_ENTRY_OVERHEAD = 3000;
+
+/**
+ * When a memory-triggered sync finds the cache over budget, clean entries
+ * are evicted down to this fraction of the budget.  The gap is hysteresis:
+ * it sets how many blocks pass before the next memory flush (~25% of the
+ * budget of growth), while keeping the youngest ~75% of the coins warm.
+ */
+export const EVICT_TARGET_FRACTION = 0.75;
 
 /**
  * A single coin in the UTXO set.
@@ -291,7 +305,7 @@ export class CoinsViewDB extends CoinsView {
    * @param extraOps - Additional operations to include atomically (e.g., chain state)
    */
   async batchWrite(
-    entries: Map<string, CoinEntry>,
+    entries: Iterable<[string, CoinEntry]>,
     hashBlock: Buffer,
     extraOps?: BatchOperation[]
   ): Promise<void> {
@@ -352,9 +366,30 @@ export class CoinsViewCache extends CoinsView {
   private cache: Map<string, CoinEntry>;
   private hashBlock: Buffer;
 
+  /**
+   * Keys of every DIRTY entry in `cache` (spent-and-dirty entries included).
+   * Invariant: `k ∈ dirtyKeys ⇔ cache.get(k)?.dirty === true`.
+   *
+   * Core keeps the same thing as a flagged linked list threaded through the
+   * cache entries (coins.h `CCoinsCacheEntry::m_flagged`, walked by
+   * `CCoinsViewCache::Sync/Flush` → `BatchWrite`), so a flush costs
+   * O(dirty), not O(cache).  Before this set, every sync walked the whole
+   * Map three times (batchWrite filter, flag-clear pass, eviction pass).
+   */
+  private dirtyKeys: Set<string>;
+
+  /**
+   * Bumped on every coin-state mutation (add/spend).  sync()/flush() compare
+   * it across their `await batchWrite` to detect a concurrent ConnectBlock
+   * mutating the cache while LevelDB was writing (the old completeIBD
+   * fire-and-forget race); when that happens they leave the dirty flags
+   * alone so the next sync rewrites them (idempotent).  Clean loads from the
+   * backing store do not bump it — they never touch dirty state.
+   */
+  private mutationSeq: number;
+
   // Memory management
   private cachedCoinsUsage: number;
-  private dirtyCount: number;
   private maxCacheBytes: number;
 
   // Statistics
@@ -369,9 +404,10 @@ export class CoinsViewCache extends CoinsView {
     super();
     this.base = base;
     this.cache = new Map();
+    this.dirtyKeys = new Set();
+    this.mutationSeq = 0;
     this.hashBlock = Buffer.alloc(32);
     this.cachedCoinsUsage = 0;
-    this.dirtyCount = 0;
     this.maxCacheBytes = maxCacheBytes;
     this.hits = 0;
     this.misses = 0;
@@ -396,6 +432,15 @@ export class CoinsViewCache extends CoinsView {
     // Fetch from backing store
     const coin = await this.base.getCoin(outpoint);
     if (coin) {
+      // A concurrent caller may have inserted this key while we awaited the
+      // backing store (parallel preloads of the same outpoint, or an addCoin
+      // / spend in between).  Never clobber that entry: it is at least as new
+      // as the DB, and overwriting a DIRTY one with a clean copy would drop a
+      // pending write (and leak its dirtyKeys membership).
+      const raced = this.cache.get(key);
+      if (raced !== undefined) {
+        return raced.coin;
+      }
       // Cache for future lookups (not dirty, not fresh)
       const entry: CoinEntry = {
         coin,
@@ -456,8 +501,6 @@ export class CoinsViewCache extends CoinsView {
    * @param possibleOverwrite - True if an unspent coin may already exist
    */
   addCoin(outpoint: OutPoint, coin: Coin, possibleOverwrite: boolean): void {
-    const key = outpointKeyFromOutpoint(outpoint);
-
     // Skip unspendable outputs.  Mirrors bitcoin-core/src/script/script.h
     // `CScript::IsUnspendable`: OP_RETURN-prefixed OR scriptPubKey larger
     // than MAX_SCRIPT_SIZE (10000 bytes).  Pre-W92 this gate checked only
@@ -467,6 +510,7 @@ export class CoinsViewCache extends CoinsView {
       return;
     }
 
+    const key = outpointKeyFromOutpoint(outpoint);
     const existing = this.cache.get(key);
     let fresh = false;
 
@@ -485,7 +529,6 @@ export class CoinsViewCache extends CoinsView {
 
     // Update memory usage
     if (existing) {
-      if (existing.dirty) this.dirtyCount--;
       this.cachedCoinsUsage -= coinMemoryUsage(existing.coin);
       // Don't add CACHE_ENTRY_OVERHEAD again - it was counted when the entry was first created
     }
@@ -497,8 +540,35 @@ export class CoinsViewCache extends CoinsView {
     };
 
     this.cache.set(key, entry);
-    this.dirtyCount++;
+    this.dirtyKeys.add(key);
+    this.mutationSeq++;
     this.cachedCoinsUsage += coinMemoryUsage(coin) + (existing ? 0 : CACHE_ENTRY_OVERHEAD);
+  }
+
+  /**
+   * Shared tail of spendCoin / spendCoinSync once `entry` (unspent, cached)
+   * is known.
+   */
+  private spendEntry(key: string, entry: CoinEntry): void {
+    this.cachedCoinsUsage -= coinMemoryUsage(entry.coin);
+    this.mutationSeq++;
+
+    // If FRESH, we can just delete the entry entirely
+    // (it was created and spent within this cache session).
+    // CACHE_ENTRY_OVERHEAD was charged at insert; drop it here or the
+    // running counter leaks the overhead per same-window spend and
+    // shouldFlush() fires forever on an empty cache (Bun SIGSEGV 340890 class).
+    if (entry.fresh) {
+      this.cachedCoinsUsage -= CACHE_ENTRY_OVERHEAD;
+      if (this.cachedCoinsUsage < 0) this.cachedCoinsUsage = 0;
+      this.cache.delete(key);
+      this.dirtyKeys.delete(key);
+    } else {
+      // Mark as spent and dirty
+      entry.coin = null;
+      entry.dirty = true;
+      this.dirtyKeys.add(key);
+    }
   }
 
   /**
@@ -517,16 +587,21 @@ export class CoinsViewCache extends CoinsView {
     if (entry === undefined) {
       // Try to fetch from backing store
       const coin = await this.base.getCoin(outpoint);
-      if (!coin) return false;
+      // Re-read after the await: another caller may have populated (or
+      // spent) this key meanwhile — its entry wins over our DB copy.
+      entry = this.cache.get(key);
+      if (entry === undefined) {
+        if (!coin) return false;
 
-      // Add to cache as clean
-      entry = {
-        coin,
-        dirty: false,
-        fresh: false,
-      };
-      this.cache.set(key, entry);
-      this.cachedCoinsUsage += coinMemoryUsage(coin) + CACHE_ENTRY_OVERHEAD;
+        // Add to cache as clean
+        entry = {
+          coin,
+          dirty: false,
+          fresh: false,
+        };
+        this.cache.set(key, entry);
+        this.cachedCoinsUsage += coinMemoryUsage(coin) + CACHE_ENTRY_OVERHEAD;
+      }
     }
 
     if (entry.coin === null) {
@@ -539,26 +614,7 @@ export class CoinsViewCache extends CoinsView {
       moveout.coin = entry.coin;
     }
 
-    // Update memory usage
-    if (entry.dirty) this.dirtyCount--;
-    this.cachedCoinsUsage -= coinMemoryUsage(entry.coin);
-
-    // If FRESH, we can just delete the entry entirely
-    // (it was created and spent within this cache session).
-    // CACHE_ENTRY_OVERHEAD was charged at insert; drop it here or the
-    // running counter leaks 3KB per same-window spend and shouldFlush()
-    // fires forever on an empty cache (Bun SIGSEGV 340890 class).
-    if (entry.fresh) {
-      this.cachedCoinsUsage -= CACHE_ENTRY_OVERHEAD;
-      if (this.cachedCoinsUsage < 0) this.cachedCoinsUsage = 0;
-      this.cache.delete(key);
-    } else {
-      // Mark as spent and dirty
-      entry.coin = null;
-      entry.dirty = true;
-      this.dirtyCount++;
-    }
-
+    this.spendEntry(key, entry);
     return true;
   }
 
@@ -584,19 +640,7 @@ export class CoinsViewCache extends CoinsView {
       moveout.coin = entry.coin;
     }
 
-    if (entry.dirty) this.dirtyCount--;
-    this.cachedCoinsUsage -= coinMemoryUsage(entry.coin);
-
-    if (entry.fresh) {
-      this.cachedCoinsUsage -= CACHE_ENTRY_OVERHEAD;
-      if (this.cachedCoinsUsage < 0) this.cachedCoinsUsage = 0;
-      this.cache.delete(key);
-    } else {
-      entry.coin = null;
-      entry.dirty = true;
-      this.dirtyCount++;
-    }
-
+    this.spendEntry(key, entry);
     return true;
   }
 
@@ -631,6 +675,27 @@ export class CoinsViewCache extends CoinsView {
   }
 
   /**
+   * The dirty entries, in dirty-set order — what batchWrite needs to see.
+   * Consumed synchronously by CoinsViewDB.batchWrite before its first await.
+   *
+   * Each unspent entry handed out is about to be PUT, so it stops being
+   * FRESH here, before the write is awaited.  Otherwise a spend racing the
+   * LevelDB write (the concurrent-ConnectBlock window that sync()/flush()
+   * guard against) would see FRESH, drop the entry without a delete, and the
+   * coin just written would come back to life on disk.  Clearing FRESH early
+   * is always safe: the worst case (the batch then fails) is one redundant
+   * delete of a key that is not on disk.
+   */
+  private *dirtyEntries(): IterableIterator<[string, CoinEntry]> {
+    for (const key of this.dirtyKeys) {
+      const entry = this.cache.get(key);
+      if (entry === undefined) continue;
+      yield [key, entry];
+      if (entry.coin !== null) entry.fresh = false;
+    }
+  }
+
+  /**
    * Flush all dirty entries to the backing store and clear the cache.
    *
    * After flush, the cache is empty and all changes are persisted.
@@ -646,18 +711,13 @@ export class CoinsViewCache extends CoinsView {
 
     // Snapshot identity of the cache we are about to persist. `batchWrite`
     // awaits LevelDB, and a concurrent ConnectBlock (the old completeIBD
-    // fire-and-forget path) mutates this same Map during that await.
-    const sizeAtStart = this.cache.size;
-    const dirtyAtStart = this.dirtyCount;
+    // fire-and-forget path) may mutate this same cache during that await.
+    const seqAtStart = this.mutationSeq;
     const hashAtStart = this.hashBlock;
 
-    await this.base.batchWrite(this.cache, this.hashBlock, extraOps);
+    await this.base.batchWrite(this.dirtyEntries(), this.hashBlock, extraOps);
 
-    if (
-      this.cache.size !== sizeAtStart ||
-      this.dirtyCount !== dirtyAtStart ||
-      this.hashBlock !== hashAtStart
-    ) {
+    if (this.mutationSeq !== seqAtStart || this.hashBlock !== hashAtStart) {
       // ConnectBlock added/spent coins (or advanced the view pointer) while
       // we were in db.batch. Clearing would drop FRESH coins that were never
       // in the written ops → bad-txns-inputs-missingorspent on the next block.
@@ -667,14 +727,19 @@ export class CoinsViewCache extends CoinsView {
 
     // Clear the cache
     this.cache.clear();
+    this.dirtyKeys.clear();
     this.cachedCoinsUsage = 0;
-    this.dirtyCount = 0;
     this.flushCount++;
   }
 
   /**
    * Sync dirty entries to backing store but keep cache contents.
-   * Spent entries are erased, unspent entries become clean.
+   * Spent entries are erased, unspent entries become clean.  Then, only if
+   * the cache is over its memory budget, the oldest clean entries are
+   * evicted (see {@link evictCleanEntries}).
+   *
+   * Cost is O(dirty + evicted), never O(cache): the write and the
+   * flag-clearing both walk only `dirtyKeys`.
    *
    * @param extraOps - Additional DB operations committed atomically with the sync
    */
@@ -683,54 +748,62 @@ export class CoinsViewCache extends CoinsView {
       throw new Error("sync() requires CoinsViewDB as base");
     }
 
-    const sizeAtStart = this.cache.size;
-    const dirtyAtStart = this.dirtyCount;
+    const seqAtStart = this.mutationSeq;
     const hashAtStart = this.hashBlock;
+    // Memory-triggered sync (the caller saw shouldFlush()): evict down to the
+    // target even if dropping the spent entries alone gets back under budget
+    // — otherwise usage sits just below the budget and the next block's
+    // outputs trigger another memory flush, i.e. a flush every block.
+    const overBudgetAtStart = this.cachedCoinsUsage >= this.maxCacheBytes;
 
-    await this.base.batchWrite(this.cache, this.hashBlock, extraOps);
+    await this.base.batchWrite(this.dirtyEntries(), this.hashBlock, extraOps);
 
-    if (
-      this.cache.size !== sizeAtStart ||
-      this.dirtyCount !== dirtyAtStart ||
-      this.hashBlock !== hashAtStart
-    ) {
+    if (this.mutationSeq !== seqAtStart || this.hashBlock !== hashAtStart) {
       // Concurrent ConnectBlock mutated the cache during db.batch. Do not
       // clear dirty flags / drop spent entries that arrived after the write.
       this.flushCount++;
       return;
     }
 
-    // Update cache: remove spent entries, clear dirty flags
-    for (const [key, entry] of this.cache) {
+    // Update cache: remove spent entries, clear dirty flags.  Every spent
+    // entry in the cache is dirty (spending a non-FRESH coin marks it dirty;
+    // spending a FRESH one deletes it), so walking the dirty set is complete.
+    for (const key of this.dirtyKeys) {
+      const entry = this.cache.get(key);
+      if (entry === undefined) continue;
       if (entry.coin === null) {
-        // Remove spent entries
         this.cachedCoinsUsage -= CACHE_ENTRY_OVERHEAD;
         this.cache.delete(key);
       } else {
-        // Clear dirty flag
         entry.dirty = false;
         entry.fresh = false;
       }
     }
-
-    this.dirtyCount = 0;
+    this.dirtyKeys.clear();
+    if (this.cachedCoinsUsage < 0) this.cachedCoinsUsage = 0;
     this.flushCount++;
 
-    // Evict clean entries if the cache exceeds the memory limit.
-    // Clean entries can always be re-fetched from the database.
-    if (this.cachedCoinsUsage > this.maxCacheBytes) {
+    // Evict clean entries if the cache was, or still is, over the memory
+    // limit.  Clean entries can always be re-fetched from the database.
+    if (overBudgetAtStart || this.cachedCoinsUsage > this.maxCacheBytes) {
       this.evictCleanEntries();
     }
   }
 
   /**
-   * Evict non-dirty entries from the cache to free memory.
-   * Removes clean entries until usage drops below 60% of max.
-   * With the reduced 256MB cache, 60% (153MB) leaves enough hot entries
-   * to avoid excessive re-fetches while keeping RSS growth in check.
+   * Evict clean entries, oldest-inserted first, until usage is at most
+   * EVICT_TARGET_FRACTION of the budget.
+   *
+   * Only reached from sync() when the cache is over budget, i.e. when memory
+   * actually requires it (Core's "cache critical" flush); periodic and tip
+   * flushes under budget never evict.  Insertion order approximates coin age: coins that
+   * were loaded-and-spent are already gone (spent entries are dropped by
+   * sync), so what remains up front is the oldest created outputs, the ones
+   * least likely to be spent soon.  The hysteresis gap keeps a
+   * memory-triggered flush from recurring every block.
    */
   private evictCleanEntries(): void {
-    const target = Math.floor(this.maxCacheBytes * 0.60);
+    const target = Math.floor(this.maxCacheBytes * EVICT_TARGET_FRACTION);
     for (const [key, entry] of this.cache) {
       if (this.cachedCoinsUsage <= target) {
         break;
@@ -740,6 +813,7 @@ export class CoinsViewCache extends CoinsView {
         this.cache.delete(key);
       }
     }
+    if (this.cachedCoinsUsage < 0) this.cachedCoinsUsage = 0;
   }
 
   /**
@@ -786,7 +860,35 @@ export class CoinsViewCache extends CoinsView {
    * Get the number of dirty entries.
    */
   getDirtyCount(): number {
-    return this.dirtyCount;
+    return this.dirtyKeys.size;
+  }
+
+  /**
+   * Full O(cache) consistency check, for tests only (the invariants of
+   * Core's CCoinsViewCache::SanityCheck, over this cache's own shape).  Throws on the first violation:
+   * dirty set ⇔ dirty flag, spent ⇒ dirty, FRESH ⇒ DIRTY-or-unspent, and
+   * the memory counter equals a from-scratch recount.
+   */
+  debugCheckInvariants(): void {
+    let recount = 0;
+    let dirty = 0;
+    for (const [key, entry] of this.cache) {
+      recount += coinMemoryUsage(entry.coin) + CACHE_ENTRY_OVERHEAD;
+      if (entry.dirty) {
+        dirty++;
+        if (!this.dirtyKeys.has(key)) throw new Error(`dirty entry missing from dirty set`);
+      } else if (this.dirtyKeys.has(key)) {
+        throw new Error(`clean entry present in dirty set`);
+      }
+      if (entry.coin === null && !entry.dirty) throw new Error(`spent entry not dirty`);
+      if (entry.coin === null && entry.fresh) throw new Error(`spent entry still FRESH`);
+    }
+    if (dirty !== this.dirtyKeys.size) {
+      throw new Error(`dirty set size ${this.dirtyKeys.size} != dirty entries ${dirty}`);
+    }
+    if (recount !== this.cachedCoinsUsage) {
+      throw new Error(`memory counter ${this.cachedCoinsUsage} != recount ${recount}`);
+    }
   }
 
   /**
@@ -803,7 +905,7 @@ export class CoinsViewCache extends CoinsView {
   } {
     return {
       size: this.cache.size,
-      dirtyCount: this.dirtyCount,
+      dirtyCount: this.dirtyKeys.size,
       memoryUsage: this.cachedCoinsUsage,
       maxMemory: this.maxCacheBytes,
       hits: this.hits,
