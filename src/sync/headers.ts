@@ -344,9 +344,14 @@ export class HeaderSync {
       }
     }
 
-    if (headers.length > 0) {
-      peer.send({ type: "headers", payload: { headers } });
-    }
+    // Always answer, with an EMPTY headers message when the peer already has
+    // our tip. Core's GETHEADERS handler (net_processing.cpp) always pushes a
+    // HEADERS reply. Staying silent is not neutral: the requester only clears
+    // m_last_getheaders_timestamp on a HEADERS reply, so MaybeSendGetHeaders
+    // then refuses to send another getheaders for HEADERS_RESPONSE_TIME
+    // (2 min), and every inv we announce in that window is ignored (regtest
+    // relay test 2026-09-26: Core B stayed at genesis through 101 blocks).
+    peer.send({ type: "headers", payload: { headers } });
   }
 
   /**

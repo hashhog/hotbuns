@@ -1922,7 +1922,22 @@ export class BlockSync {
     const notFound: InvVector[] = [];
 
     for (const inv of inventory) {
-      if (inv.type === InvType.MSG_BLOCK || inv.type === InvType.MSG_WITNESS_BLOCK) {
+      if (
+        inv.type === InvType.MSG_BLOCK ||
+        inv.type === InvType.MSG_WITNESS_BLOCK ||
+        // BIP-152: a Core peer that picked us as a high-bandwidth compact
+        // block peer fetches a freshly announced tip with
+        // getdata(MSG_CMPCT_BLOCK). This arm used to be missing, so the
+        // request was dropped with no reply and no notfound, and the peer
+        // never got the block (regtest relay test 2026-09-26). We answer
+        // with the FULL block, which is what Core itself sends for
+        // MSG_CMPCT_BLOCK outside MAX_CMPCTBLOCK_DEPTH
+        // (net_processing.cpp ProcessGetBlockData, the IsMsgCmpctBlk arm);
+        // a full block always satisfies the in-flight request. A cmpctblock
+        // reply would additionally require serving getblocktxn, which
+        // hotbuns does not do yet.
+        inv.type === InvType.MSG_CMPCT_BLOCK
+      ) {
         const rawBlock = await this.db.getBlock(inv.hash);
         if (rawBlock) {
           const block = deserializeBlock(new BufferReader(rawBlock));
