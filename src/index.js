@@ -64,7 +64,7 @@ var __export = (target, all) => {
 var __esm = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
-// node_modules/level-supports/index.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/level-supports/index.js
 var require_level_supports = __commonJS((exports) => {
   exports.supports = function supports(...manifests) {
     const manifest = manifests.reduce((acc, m) => Object.assign(acc, m), {});
@@ -89,7 +89,7 @@ var require_level_supports = __commonJS((exports) => {
   };
 });
 
-// node_modules/module-error/index.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/module-error/index.js
 var require_module_error = __commonJS((exports, module) => {
   module.exports = class ModuleError extends Error {
     constructor(message, options) {
@@ -111,7 +111,7 @@ var require_module_error = __commonJS((exports, module) => {
   };
 });
 
-// node_modules/level-transcoder/lib/text-endec.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/level-transcoder/lib/text-endec.js
 var require_text_endec = __commonJS((exports, module) => {
   var lazy = null;
   module.exports = function() {
@@ -125,7 +125,7 @@ var require_text_endec = __commonJS((exports, module) => {
   };
 });
 
-// node_modules/level-transcoder/lib/encoding.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/level-transcoder/lib/encoding.js
 var require_encoding = __commonJS((exports) => {
   var ModuleError = require_module_error();
   var formats = new Set(["buffer", "view", "utf8"]);
@@ -182,7 +182,7 @@ var require_encoding = __commonJS((exports) => {
   exports.Encoding = Encoding;
 });
 
-// node_modules/level-transcoder/lib/formats.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/level-transcoder/lib/formats.js
 var require_formats = __commonJS((exports) => {
   var { Buffer: Buffer2 } = __require("buffer") || {};
   var { Encoding } = require_encoding();
@@ -251,7 +251,7 @@ var require_formats = __commonJS((exports) => {
   exports.UTF8Format = UTF8Format;
 });
 
-// node_modules/level-transcoder/lib/encodings.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/level-transcoder/lib/encodings.js
 var require_encodings = __commonJS((exports) => {
   var { Buffer: Buffer2 } = __require("buffer") || { Buffer: { isBuffer: () => false } };
   var { textEncoder, textDecoder } = require_text_endec()();
@@ -345,7 +345,7 @@ var require_encodings = __commonJS((exports) => {
   });
 });
 
-// node_modules/level-transcoder/index.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/level-transcoder/index.js
 var require_level_transcoder = __commonJS((exports) => {
   var ModuleError = require_module_error();
   var encodings = require_encodings();
@@ -453,7 +453,7 @@ var require_level_transcoder = __commonJS((exports) => {
   var anonymousCount = 0;
 });
 
-// node_modules/maybe-combine-errors/index.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/maybe-combine-errors/index.js
 var require_maybe_combine_errors = __commonJS((exports, module) => {
   var kErrors = Symbol("kErrors");
   module.exports = function(errors) {
@@ -505,7 +505,7 @@ var require_maybe_combine_errors = __commonJS((exports, module) => {
   }
 });
 
-// node_modules/abstract-level/lib/common.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/lib/common.js
 var require_common = __commonJS((exports) => {
   var ModuleError = require_module_error();
   var deprecations = new Set;
@@ -532,7 +532,7 @@ var require_common = __commonJS((exports) => {
   };
 });
 
-// node_modules/abstract-level/lib/errors.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/lib/errors.js
 var require_errors = __commonJS((exports) => {
   var ModuleError = require_module_error();
 
@@ -550,7 +550,7 @@ var require_errors = __commonJS((exports) => {
   exports.AbortError = AbortError;
 });
 
-// node_modules/abstract-level/abstract-iterator.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/abstract-iterator.js
 var require_abstract_iterator = __commonJS((exports) => {
   var ModuleError = require_module_error();
   var combineErrors = require_maybe_combine_errors();
@@ -868,7 +868,7 @@ var require_abstract_iterator = __commonJS((exports) => {
   exports.AbstractValueIterator = AbstractValueIterator;
 });
 
-// node_modules/abstract-level/lib/default-kv-iterator.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/lib/default-kv-iterator.js
 var require_default_kv_iterator = __commonJS((exports) => {
   var { AbstractKeyIterator, AbstractValueIterator } = require_abstract_iterator();
   var kIterator = Symbol("iterator");
@@ -930,7 +930,7 @@ var require_default_kv_iterator = __commonJS((exports) => {
   exports.DefaultValueIterator = DefaultValueIterator;
 });
 
-// node_modules/abstract-level/lib/deferred-iterator.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/lib/deferred-iterator.js
 var require_deferred_iterator = __commonJS((exports) => {
   var { AbstractIterator, AbstractKeyIterator, AbstractValueIterator } = require_abstract_iterator();
   var ModuleError = require_module_error();
@@ -1027,7 +1027,7 @@ var require_deferred_iterator = __commonJS((exports) => {
   exports.DeferredValueIterator = DeferredValueIterator;
 });
 
-// node_modules/abstract-level/lib/prefixes.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/lib/prefixes.js
 var require_prefixes = __commonJS((exports) => {
   exports.prefixDescendantKey = function(key, keyFormat, descendant, ancestor) {
     while (descendant !== null && descendant !== ancestor) {
@@ -1047,7 +1047,7 @@ var require_prefixes = __commonJS((exports) => {
   };
 });
 
-// node_modules/abstract-level/lib/prewrite-batch.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/lib/prewrite-batch.js
 var require_prewrite_batch = __commonJS((exports) => {
   var { prefixDescendantKey, isDescendant } = require_prefixes();
 
@@ -1113,7 +1113,7 @@ var require_prewrite_batch = __commonJS((exports) => {
   exports.PrewriteBatch = PrewriteBatch;
 });
 
-// node_modules/abstract-level/abstract-chained-batch.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/abstract-chained-batch.js
 var require_abstract_chained_batch = __commonJS((exports) => {
   var combineErrors = require_maybe_combine_errors();
   var ModuleError = require_module_error();
@@ -1392,7 +1392,7 @@ var require_abstract_chained_batch = __commonJS((exports) => {
   exports.AbstractChainedBatch = AbstractChainedBatch;
 });
 
-// node_modules/abstract-level/lib/default-chained-batch.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/lib/default-chained-batch.js
 var require_default_chained_batch = __commonJS((exports) => {
   var { AbstractChainedBatch } = require_abstract_chained_batch();
 
@@ -1414,7 +1414,7 @@ var require_default_chained_batch = __commonJS((exports) => {
   exports.DefaultChainedBatch = DefaultChainedBatch;
 });
 
-// node_modules/abstract-level/lib/hooks.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/lib/hooks.js
 var require_hooks = __commonJS((exports) => {
   var { noop } = require_common();
 
@@ -1478,7 +1478,7 @@ var require_hooks = __commonJS((exports) => {
   exports.DatabaseHooks = DatabaseHooks;
 });
 
-// node_modules/abstract-level/lib/event-monitor.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/lib/event-monitor.js
 var require_event_monitor = __commonJS((exports) => {
   var { deprecate } = require_common();
   exports.EventMonitor = class EventMonitor {
@@ -1503,7 +1503,7 @@ var require_event_monitor = __commonJS((exports) => {
   };
 });
 
-// node_modules/abstract-level/lib/deferred-queue.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/lib/deferred-queue.js
 var require_deferred_queue = __commonJS((exports) => {
   var { getOptions, emptyOptions } = require_common();
   var { AbortError } = require_errors();
@@ -1572,7 +1572,7 @@ var require_deferred_queue = __commonJS((exports) => {
   exports.DeferredQueue = DeferredQueue;
 });
 
-// node_modules/abstract-level/lib/range-options.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/lib/range-options.js
 var require_range_options = __commonJS((exports, module) => {
   var hasOwnProperty = Object.prototype.hasOwnProperty;
   var rangeOptions = new Set(["lt", "lte", "gt", "gte"]);
@@ -1595,7 +1595,7 @@ var require_range_options = __commonJS((exports, module) => {
   };
 });
 
-// node_modules/abstract-level/lib/abstract-sublevel-iterator.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/lib/abstract-sublevel-iterator.js
 var require_abstract_sublevel_iterator = __commonJS((exports) => {
   var { AbstractIterator, AbstractKeyIterator, AbstractValueIterator } = require_abstract_iterator();
 
@@ -1711,7 +1711,7 @@ var require_abstract_sublevel_iterator = __commonJS((exports) => {
   exports.AbstractSublevelValueIterator = AbstractSublevelValueIterator;
 });
 
-// node_modules/abstract-level/lib/abstract-sublevel.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/lib/abstract-sublevel.js
 var require_abstract_sublevel = __commonJS((exports, module) => {
   var ModuleError = require_module_error();
   var { Buffer: Buffer2 } = __require("buffer") || {};
@@ -1927,7 +1927,7 @@ var require_abstract_sublevel = __commonJS((exports, module) => {
   };
 });
 
-// node_modules/abstract-level/abstract-level.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/abstract-level.js
 var require_abstract_level = __commonJS((exports) => {
   var { supports } = require_level_supports();
   var { Transcoder } = require_level_transcoder();
@@ -2758,7 +2758,7 @@ var require_abstract_level = __commonJS((exports) => {
   }
 });
 
-// node_modules/abstract-level/abstract-snapshot.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/abstract-snapshot.js
 var require_abstract_snapshot = __commonJS((exports) => {
   var ModuleError = require_module_error();
   var { noop } = require_common();
@@ -2821,7 +2821,7 @@ var require_abstract_snapshot = __commonJS((exports) => {
   exports.AbstractSnapshot = AbstractSnapshot;
 });
 
-// node_modules/abstract-level/index.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/abstract-level/index.js
 var require_abstract_level2 = __commonJS((exports) => {
   exports.AbstractLevel = require_abstract_level().AbstractLevel;
   exports.AbstractSublevel = require_abstract_level().AbstractSublevel;
@@ -2832,7 +2832,7 @@ var require_abstract_level2 = __commonJS((exports) => {
   exports.AbstractSnapshot = require_abstract_snapshot().AbstractSnapshot;
 });
 
-// node_modules/node-gyp-build/node-gyp-build.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/node-gyp-build/node-gyp-build.js
 var require_node_gyp_build = __commonJS((exports, module) => {
   var fs = __require("fs");
   var path = __require("path");
@@ -3021,7 +3021,7 @@ var require_node_gyp_build = __commonJS((exports, module) => {
   load.compareTuples = compareTuples;
 });
 
-// node_modules/node-gyp-build/index.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/node-gyp-build/index.js
 var require_node_gyp_build2 = __commonJS((exports, module) => {
   var runtimeRequire = typeof __webpack_require__ === "function" ? __non_webpack_require__ : __require;
   if (typeof runtimeRequire.addon === "function") {
@@ -3031,13 +3031,13 @@ var require_node_gyp_build2 = __commonJS((exports, module) => {
   }
 });
 
-// node_modules/classic-level/binding.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/classic-level/binding.js
 var require_binding = __commonJS((exports, module) => {
   var __dirname = "/home/work/hashhog/hotbuns/node_modules/classic-level";
   module.exports = require_node_gyp_build2()(__dirname);
 });
 
-// node_modules/classic-level/chained-batch.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/classic-level/chained-batch.js
 var require_chained_batch = __commonJS((exports) => {
   var { AbstractChainedBatch } = require_abstract_level2();
   var binding = require_binding();
@@ -3065,7 +3065,7 @@ var require_chained_batch = __commonJS((exports) => {
   exports.ChainedBatch = ChainedBatch;
 });
 
-// node_modules/classic-level/iterator.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/classic-level/iterator.js
 var require_iterator = __commonJS((exports) => {
   var { AbstractIterator } = require_abstract_level2();
   var binding = require_binding();
@@ -3153,7 +3153,7 @@ var require_iterator = __commonJS((exports) => {
   exports.Iterator = Iterator;
 });
 
-// node_modules/classic-level/index.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/classic-level/index.js
 var AbstractLevel, AbstractSnapshot, ModuleError, fsp, binding, ChainedBatch, Iterator, kContext, kLocation, ClassicLevel, Snapshot, $ClassicLevel, FLAG_FILL_CACHE = 1, FLAG_KEY_AS_BUFFER = 2, FLAG_VALUE_AS_BUFFER = 4, FLAG_SHARED_KEY = 8;
 var init_classic_level = __esm(() => {
   ({ AbstractLevel, AbstractSnapshot } = require_abstract_level2());
@@ -4219,7 +4219,7 @@ var init_database = __esm(() => {
   COINS_DB_MAX_FILE_SIZE_BYTES = 32 * 1024 * 1024;
 });
 
-// node_modules/@noble/hashes/utils.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/hashes/utils.js
 function isBytes(a) {
   return a instanceof Uint8Array || ArrayBuffer.isView(a) && a.constructor.name === "Uint8Array";
 }
@@ -4370,7 +4370,7 @@ var init_utils = __esm(() => {
   asciis = { _0: 48, _9: 57, A: 65, F: 70, a: 97, f: 102 };
 });
 
-// node_modules/@noble/hashes/_md.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/hashes/_md.js
 function Chi(a, b, c) {
   return a & b ^ ~a & c;
 }
@@ -4533,7 +4533,7 @@ var init__md = __esm(() => {
   ]);
 });
 
-// node_modules/@noble/hashes/_u64.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/hashes/_u64.js
 function fromBig(n, le = false) {
   if (le)
     return { h: Number(n & U32_MASK64), l: Number(n >> _32n & U32_MASK64) };
@@ -4559,7 +4559,7 @@ var init__u64 = __esm(() => {
   _32n = /* @__PURE__ */ BigInt(32);
 });
 
-// node_modules/@noble/hashes/sha2.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/hashes/sha2.js
 var SHA256_K, SHA256_W, SHA2_32B, _SHA256, _SHA224, K512, SHA512_Kh, SHA512_Kl, SHA512_W_H, SHA512_W_L, SHA2_64B, _SHA512, _SHA384, T224_IV, T256_IV, _SHA512_224, _SHA512_256, sha256, sha512;
 var init_sha2 = __esm(() => {
   init__md();
@@ -5022,7 +5022,7 @@ var init_sha2 = __esm(() => {
   sha512 = /* @__PURE__ */ createHasher(() => new _SHA512, /* @__PURE__ */ oidNist(3));
 });
 
-// node_modules/@noble/hashes/legacy.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/hashes/legacy.js
 function ripemd_f(group, x, y, z) {
   if (group === 0)
     return x ^ y ^ z;
@@ -5282,7 +5282,7 @@ var init_legacy = __esm(() => {
   ripemd160 = /* @__PURE__ */ createHasher(() => new _RIPEMD160);
 });
 
-// node_modules/@noble/curves/utils.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/curves/utils.js
 function abool(value, title = "") {
   if (typeof value !== "boolean") {
     const prefix = title && `"${title}" `;
@@ -5435,7 +5435,7 @@ var init_utils2 = __esm(() => {
   _1n = /* @__PURE__ */ BigInt(1);
 });
 
-// node_modules/@noble/curves/abstract/modular.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/curves/abstract/modular.js
 function mod(a, b) {
   const result = a % b;
   return result >= _0n2 ? result : b + result;
@@ -5821,7 +5821,7 @@ var init_modular = __esm(() => {
   ];
 });
 
-// node_modules/@noble/curves/abstract/curve.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/curves/abstract/curve.js
 function negateCt(condition, item) {
   const neg = item.negate();
   return condition ? neg : item;
@@ -6033,7 +6033,7 @@ var init_curve = __esm(() => {
   pointWindowSizes = new WeakMap;
 });
 
-// node_modules/@noble/hashes/hmac.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/hashes/hmac.js
 class _HMAC {
   oHash;
   iHash;
@@ -6107,7 +6107,7 @@ var init_hmac = __esm(() => {
   hmac.create = (hash, key) => new _HMAC(hash, key);
 });
 
-// node_modules/@noble/curves/abstract/weierstrass.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/curves/abstract/weierstrass.js
 function _splitEndoScalar(k, basis, n) {
   const [[a1, b1], [a2, b2]] = basis;
   const c1 = divNearest(b2 * k, n);
@@ -6934,7 +6934,7 @@ var init_weierstrass = __esm(() => {
   _4n2 = BigInt(4);
 });
 
-// node_modules/@noble/curves/secp256k1.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/curves/secp256k1.js
 function sqrtMod(y) {
   const P = secp256k1_CURVE.p;
   const _3n3 = BigInt(3), _6n = BigInt(6), _11n = BigInt(11), _22n = BigInt(22);
@@ -8321,7 +8321,7 @@ var init_params = __esm(() => {
         {
           height: 944183,
           hashSerialized: Buffer.from("a888bcbc200384747c0813c8e7f4650d9bc0847b5147791c3ca869567271af2e", "hex"),
-          nChainTx: 1334000000n,
+          nChainTx: 1335914531n,
           blockHash: Buffer.from("0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817", "hex").reverse()
         }
       ]
@@ -8523,6 +8523,8 @@ import { createHash as createHash2, randomBytes as randomBytes2 } from "crypto";
 
 class SigCache {
   cache;
+  ring = [];
+  ringHead = 0;
   maxEntries;
   nonce;
   constructor(maxEntries = 50000, nonce) {
@@ -8560,16 +8562,20 @@ class SigCache {
     if (this.cache.has(key.entryHex)) {
       return;
     }
-    if (this.cache.size >= this.maxEntries) {
-      const oldestKey = this.cache.keys().next().value;
-      if (oldestKey !== undefined) {
-        this.cache.delete(oldestKey);
-      }
+    if (this.cache.size >= this.maxEntries && this.cache.size > 0) {
+      const oldestKey = this.ring[this.ringHead];
+      this.cache.delete(oldestKey);
+      this.ring[this.ringHead] = key.entryHex;
+      this.ringHead = (this.ringHead + 1) % this.ring.length;
+    } else {
+      this.ring.push(key.entryHex);
     }
     this.cache.set(key.entryHex, true);
   }
   clear() {
     this.cache.clear();
+    this.ring = [];
+    this.ringHead = 0;
   }
   get size() {
     return this.cache.size;
@@ -10683,6 +10689,7 @@ __export(exports_tx, {
   sigHashLegacyWithSig: () => sigHashLegacyWithSig,
   sigHashLegacyRaw: () => sigHashLegacyRaw,
   sigHashLegacy: () => sigHashLegacy,
+  setInputSigCacheEnabled: () => setInputSigCacheEnabled,
   serializeTx: () => serializeTx,
   removeCodeSeparators: () => removeCodeSeparators,
   prepareSubscriptForSigning: () => prepareSubscriptForSigning,
@@ -10692,7 +10699,9 @@ __export(exports_tx, {
   getVirtualTransactionSize: () => getVirtualTransactionSize,
   getTxWeight: () => getTxWeight,
   getTxVSize: () => getTxVSize,
+  getTxTotalSize: () => getTxTotalSize,
   getTxId: () => getTxId,
+  getTxBaseSize: () => getTxBaseSize,
   getSigOpsAdjustedWeight: () => getSigOpsAdjustedWeight,
   findAndDelete: () => findAndDelete2,
   evaluateSequenceLocks: () => evaluateSequenceLocks,
@@ -11319,7 +11328,7 @@ function validateTxBasic(tx) {
   if (tx.outputs.length === 0) {
     return { valid: false, error: "bad-txns-vout-empty" };
   }
-  const strippedSize = serializeTx(tx, false).length;
+  const strippedSize = getTxBaseSize(tx);
   if (strippedSize * 4 > 4000000) {
     return { valid: false, error: "bad-txns-oversize" };
   }
@@ -11581,11 +11590,14 @@ function computeInputSigCacheKey(tx, inputIndex, utxo, scriptVerifyFlags) {
   const sighashCommit = sha256Hash(sighashCommitWriter.toBuffer());
   return globalSigCache.computeKey(sighashCommit, input.scriptSig, input.witness, scriptVerifyFlags);
 }
+function setInputSigCacheEnabled(on) {
+  inputSigCacheEnabled = on;
+}
 function verifyInputSignature(tx, inputIndex, utxo, cache, utxos, taprootCache, scriptVerifyFlags = 1 /* VERIFY_P2SH */ | 2 /* VERIFY_WITNESS */ | 512 /* VERIFY_TAPROOT */ | 8 /* VERIFY_DERSIG */ | 16 /* VERIFY_NULLDUMMY */ | 32 /* VERIFY_CHECKLOCKTIMEVERIFY */ | 64 /* VERIFY_CHECKSEQUENCEVERIFY */) {
   const input = tx.inputs[inputIndex];
   const scriptPubKey = utxo.scriptPubKey;
-  const cacheKey = computeInputSigCacheKey(tx, inputIndex, utxo, scriptVerifyFlags);
-  if (globalSigCache.lookup(cacheKey)) {
+  const cacheKey = inputSigCacheEnabled ? computeInputSigCacheKey(tx, inputIndex, utxo, scriptVerifyFlags) : null;
+  if (cacheKey !== null && globalSigCache.lookup(cacheKey)) {
     return { valid: true, inputIndex };
   }
   if (scriptPubKey.length === 34 && scriptPubKey[0] === 81 && scriptPubKey[1] === 32) {
@@ -11619,7 +11631,8 @@ function verifyInputSignature(tx, inputIndex, utxo, cache, utxos, taprootCache, 
       if (!ok) {
         return { valid: false, inputIndex, error: "Taproot verify returned false" };
       }
-      globalSigCache.insert(cacheKey);
+      if (cacheKey !== null)
+        globalSigCache.insert(cacheKey);
       return { valid: true, inputIndex };
     } catch (e) {
       return {
@@ -11652,7 +11665,8 @@ function verifyInputSignature(tx, inputIndex, utxo, cache, utxos, taprootCache, 
     if (!ok) {
       return { valid: false, inputIndex, error: "Script verify returned false" };
     }
-    globalSigCache.insert(cacheKey);
+    if (cacheKey !== null)
+      globalSigCache.insert(cacheKey);
     return { valid: true, inputIndex };
   } catch (e) {
     return {
@@ -11749,7 +11763,7 @@ function checkSequenceLocks(tx, enforceBIP68, blockHeight, blockPrevMTP, utxoCon
   const locks = calculateSequenceLocks(tx, enforceBIP68, utxoConfirmations);
   return evaluateSequenceLocks(blockHeight, blockPrevMTP, locks);
 }
-var ScriptFlags, SIGHASH_ALL = 1, SIGHASH_NONE = 2, SIGHASH_SINGLE = 3, SIGHASH_ANYONECANPAY = 128, SIGHASH_DEFAULT = 0, MAX_SCRIPT_SIZE2 = 1e4, OP_CODESEPARATOR = 171, SEQUENCE_LOCKTIME_DISABLE_FLAG, SEQUENCE_LOCKTIME_TYPE_FLAG, SEQUENCE_LOCKTIME_MASK = 65535, SEQUENCE_LOCKTIME_GRANULARITY = 9, SEQUENCE_FINAL = 4294967295;
+var ScriptFlags, SIGHASH_ALL = 1, SIGHASH_NONE = 2, SIGHASH_SINGLE = 3, SIGHASH_ANYONECANPAY = 128, SIGHASH_DEFAULT = 0, MAX_SCRIPT_SIZE2 = 1e4, OP_CODESEPARATOR = 171, inputSigCacheEnabled = true, SEQUENCE_LOCKTIME_DISABLE_FLAG, SEQUENCE_LOCKTIME_TYPE_FLAG, SEQUENCE_LOCKTIME_MASK = 65535, SEQUENCE_LOCKTIME_GRANULARITY = 9, SEQUENCE_FINAL = 4294967295;
 var init_tx = __esm(() => {
   init_serialization();
   init_primitives();
@@ -12074,12 +12088,16 @@ function getBlockBaseSize(block) {
   else
     size += 9;
   for (const tx of block.transactions) {
-    size += serializeTx(tx, false).length;
+    size += getTxBaseSize(tx);
   }
   return size;
 }
 function getBlockTotalSize(block) {
-  return serializeBlock(block).length;
+  let size = 80 + varIntSize(block.transactions.length);
+  for (const tx of block.transactions) {
+    size += getTxTotalSize(tx);
+  }
+  return size;
 }
 function getBlockWeight(block) {
   const baseSize = getBlockBaseSize(block);
@@ -12991,7 +13009,7 @@ var init_utxo = __esm(() => {
   MAX_OUTPUTS_PER_BLOCK = 4000000 / 8;
 });
 
-// node_modules/@noble/ciphers/utils.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/ciphers/utils.js
 function isBytes2(a) {
   return a instanceof Uint8Array || ArrayBuffer.isView(a) && a.constructor.name === "Uint8Array";
 }
@@ -13133,7 +13151,7 @@ var init_utils3 = __esm(() => {
   isLE = /* @__PURE__ */ (() => new Uint8Array(new Uint32Array([287454020]).buffer)[0] === 68)();
 });
 
-// node_modules/@noble/ciphers/_arx.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/ciphers/_arx.js
 function rotl2(a, b) {
   return a << b | a >>> 32 - b;
 }
@@ -13243,7 +13261,7 @@ var init__arx = __esm(() => {
   U32_EMPTY = Uint32Array.of();
 });
 
-// node_modules/@noble/ciphers/_poly1305.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/ciphers/_poly1305.js
 function u8to16(a, i) {
   return a[i++] & 255 | (a[i++] & 255) << 8;
 }
@@ -13504,7 +13522,7 @@ var init__poly1305 = __esm(() => {
   poly1305 = /* @__PURE__ */ (() => wrapConstructorWithKey((key) => new Poly1305(key)))();
 });
 
-// node_modules/@noble/ciphers/chacha.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/ciphers/chacha.js
 function chachaCore(s, k, n, out, cnt, rounds = 20) {
   let y00 = s[0], y01 = s[1], y02 = s[2], y03 = s[3], y04 = k[0], y05 = k[1], y06 = k[2], y07 = k[3], y08 = k[4], y09 = k[5], y10 = k[6], y11 = k[7], y12 = cnt, y13 = n[0], y14 = n[1], y15 = n[2];
   let x00 = y00, x01 = y01, x02 = y02, x03 = y03, x04 = y04, x05 = y05, x06 = y06, x07 = y07, x08 = y08, x09 = y09, x10 = y10, x11 = y11, x12 = y12, x13 = y13, x14 = y14, x15 = y15;
@@ -16250,7 +16268,7 @@ var init_indexes = __esm(() => {
   BIP30_BLOCK_91812 = Buffer.from("00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f", "hex").reverse();
 });
 
-// node_modules/bech32/dist/index.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/bech32/dist/index.js
 var require_dist = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", { value: true });
   exports.bech32m = exports.bech32 = undefined;
@@ -17319,81 +17337,40 @@ init_tx();
 
 // src/validation/script_check_wire.ts
 var MAX_SCRIPTCHECK_WIRE_BYTES = 8 * 1024 * 1024;
-function toU8(b) {
-  const out = new Uint8Array(b.byteLength);
-  out.set(b);
-  return out;
-}
-function toWireTx(tx) {
-  return {
-    version: tx.version,
-    inputs: tx.inputs.map((inp) => ({
-      prevOut: { txid: toU8(inp.prevOut.txid), vout: inp.prevOut.vout },
-      scriptSig: toU8(inp.scriptSig),
-      sequence: inp.sequence,
-      witness: inp.witness.map(toU8)
-    })),
-    outputs: tx.outputs.map((out) => ({
-      value: out.value,
-      scriptPubKey: toU8(out.scriptPubKey)
-    })),
-    lockTime: tx.lockTime
-  };
-}
-function toWireUtxo(u) {
-  return {
-    height: u.height,
-    coinbase: u.coinbase,
-    amount: u.amount,
-    scriptPubKey: toU8(u.scriptPubKey)
-  };
-}
-function buildWireBatch(id, chunk) {
-  const txMap = new Map;
-  const txs = [];
-  const txUtxos = [];
-  const jobs = [];
-  for (const job of chunk) {
-    let txi = txMap.get(job.tx);
-    if (txi === undefined) {
-      txi = txs.length;
-      txMap.set(job.tx, txi);
-      txs.push(toWireTx(job.tx));
-      txUtxos.push(job.utxos.map(toWireUtxo));
-    }
-    jobs.push({
-      txi,
-      inputIndex: job.inputIndex,
-      flags: job.flags
-    });
+var PACKED_HEADER_BYTES = 20;
+var PACKED_JOB_BYTES = 12;
+function packedTxBytes(tx) {
+  let n = 16;
+  for (const inp of tx.inputs) {
+    n += 48 + inp.scriptSig.byteLength;
+    for (const w of inp.witness)
+      n += 4 + w.byteLength;
   }
-  return { kind: "batch", id, txs, txUtxos, jobs };
+  for (const o of tx.outputs)
+    n += 12 + o.scriptPubKey.byteLength;
+  return n;
 }
-function estimateWireBatchBytes(batch) {
-  let n = 64;
-  for (const tx of batch.txs) {
-    n += 24;
-    for (const inp of tx.inputs) {
-      n += 40 + inp.scriptSig.byteLength;
-      for (const w of inp.witness)
-        n += w.byteLength;
-    }
-    for (const o of tx.outputs)
-      n += 16 + o.scriptPubKey.byteLength;
-  }
-  for (const arr of batch.txUtxos) {
-    for (const u of arr)
-      n += 24 + u.scriptPubKey.byteLength;
-  }
-  n += batch.jobs.length * 16;
+function packedUtxosBytes(utxos) {
+  let n = 4;
+  for (const u of utxos)
+    n += 17 + u.scriptPubKey.byteLength;
   return n;
 }
 var PACKED_MAGIC = 1212306243;
-function packedSize(batch) {
-  return estimateWireBatchBytes(batch) + 256;
-}
-function encodePackedBatch(batch) {
-  const buf = new ArrayBuffer(packedSize(batch));
+function encodePackedJobs(id, chunk) {
+  const txIndex = new Map;
+  const txs = [];
+  const txUtxos = [];
+  let size = PACKED_HEADER_BYTES + chunk.length * PACKED_JOB_BYTES;
+  for (const job of chunk) {
+    if (!txIndex.has(job.tx)) {
+      txIndex.set(job.tx, txs.length);
+      txs.push(job.tx);
+      txUtxos.push(job.utxos);
+      size += packedTxBytes(job.tx) + packedUtxosBytes(job.utxos);
+    }
+  }
+  const buf = new ArrayBuffer(size);
   const v = new DataView(buf);
   const u8 = new Uint8Array(buf);
   let o = 0;
@@ -17401,30 +17378,20 @@ function encodePackedBatch(batch) {
     v.setUint32(o, x >>> 0, true);
     o += 4;
   };
-  const wI32 = (x) => {
-    v.setInt32(o, x, true);
-    o += 4;
-  };
-  const wU8 = (x) => {
-    v.setUint8(o, x);
-    o += 1;
-  };
-  const wU64 = (x) => {
-    v.setBigUint64(o, x, true);
-    o += 8;
-  };
   const wBytes = (b) => {
-    wU32(b.byteLength);
+    v.setUint32(o, b.byteLength, true);
+    o += 4;
     if (b.byteLength > 0) {
       u8.set(b, o);
       o += b.byteLength;
     }
   };
   wU32(PACKED_MAGIC);
-  wU32(batch.id);
-  wU32(batch.txs.length);
-  for (const tx of batch.txs) {
-    wI32(tx.version);
+  wU32(id);
+  wU32(txs.length);
+  for (const tx of txs) {
+    v.setInt32(o, tx.version, true);
+    o += 4;
     wU32(tx.inputs.length);
     wU32(tx.outputs.length);
     wU32(tx.lockTime);
@@ -17442,28 +17409,31 @@ function encodePackedBatch(batch) {
         wBytes(w);
     }
     for (const out of tx.outputs) {
-      wU64(out.value);
+      v.setBigUint64(o, out.value, true);
+      o += 8;
       wBytes(out.scriptPubKey);
     }
   }
-  wU32(batch.txUtxos.length);
-  for (const arr of batch.txUtxos) {
+  wU32(txUtxos.length);
+  for (const arr of txUtxos) {
     wU32(arr.length);
     for (const u of arr) {
       wU32(u.height);
-      wU8(u.coinbase ? 1 : 0);
-      wU64(u.amount);
+      v.setUint8(o, u.coinbase ? 1 : 0);
+      o += 1;
+      v.setBigUint64(o, u.amount, true);
+      o += 8;
       wBytes(u.scriptPubKey);
     }
   }
-  wU32(batch.jobs.length);
-  for (const job of batch.jobs) {
-    wU32(job.txi);
+  wU32(chunk.length);
+  for (const job of chunk) {
+    wU32(txIndex.get(job.tx));
     wU32(job.inputIndex);
     wU32(job.flags);
   }
-  if (o !== buf.byteLength) {
-    return buf.slice(0, o);
+  if (o !== size) {
+    throw new Error(`packed wire: wrote ${o} of ${size} bytes`);
   }
   return buf;
 }
@@ -17577,6 +17547,15 @@ class VerifyPool {
     let inFlightJobs = 0;
     let inFlightBytes = 0;
     const used = new Set;
+    const txBytes = new Map;
+    const txCost = (job) => {
+      let b = txBytes.get(job.tx);
+      if (b === undefined) {
+        b = packedTxBytes(job.tx) + packedUtxosBytes(job.utxos);
+        txBytes.set(job.tx, b);
+      }
+      return b;
+    };
     const takeBatch = () => {
       const items = [];
       const origIndices = [];
@@ -17585,6 +17564,8 @@ class VerifyPool {
         return null;
       const adaptive = Math.max(1, Math.ceil(remaining / nWorkers));
       const cap = Math.min(SCRIPTCHECK_BATCH_SIZE, adaptive);
+      const inBatch = new Set;
+      let bytes = PACKED_HEADER_BYTES;
       while (qHead < jobs.length && items.length < cap) {
         const origIndex = qHead;
         if (origIndex >= earliestFailIndex) {
@@ -17592,22 +17573,18 @@ class VerifyPool {
           break;
         }
         const job = jobs[origIndex];
-        if (items.length > 0) {
-          const bytes = estimateWireBatchBytes(buildWireBatch(0, [...items, job]));
-          if (bytes > budget)
-            break;
-        }
+        const add2 = PACKED_JOB_BYTES + (inBatch.has(job.tx) ? 0 : txCost(job));
+        if (items.length > 0 && bytes + add2 > budget)
+          break;
+        bytes += add2;
+        inBatch.add(job.tx);
         items.push(job);
         origIndices.push(origIndex);
         qHead++;
       }
       if (items.length === 0)
         return null;
-      return {
-        items,
-        origIndices,
-        bytes: estimateWireBatchBytes(buildWireBatch(0, items))
-      };
+      return { items, origIndices, bytes };
     };
     const workerLoop = async (w) => {
       while (true) {
@@ -17660,8 +17637,7 @@ class VerifyPool {
   }
   sendChunk(worker, chunk) {
     const id = this.nextId++;
-    const batch = buildWireBatch(id, chunk);
-    const packed = encodePackedBatch(batch);
+    const packed = encodePackedJobs(id, chunk);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.inflight.delete(id);
@@ -17761,6 +17737,7 @@ async function verifyScriptChecks(jobs, threads, cacheBytes) {
     return verifySequential(jobs);
   }
   const pending = [];
+  const pendingKeys = [];
   for (const job of jobs) {
     const utxo = job.utxos[job.inputIndex];
     if (!utxo) {
@@ -17774,6 +17751,7 @@ async function verifyScriptChecks(jobs, threads, cacheBytes) {
     const key = computeInputSigCacheKey(job.tx, job.inputIndex, utxo, job.flags);
     if (!globalSigCache.lookup(key)) {
       pending.push(job);
+      pendingKeys.push(key);
     }
   }
   if (pending.length === 0)
@@ -17782,10 +17760,8 @@ async function verifyScriptChecks(jobs, threads, cacheBytes) {
     const pool = await getPool(n);
     const result = await pool.verify(pending, scriptCheckWireBudget(cacheBytes), n);
     if (result.valid) {
-      for (const job of pending) {
-        const utxo = job.utxos[job.inputIndex];
-        globalSigCache.insert(computeInputSigCacheKey(job.tx, job.inputIndex, utxo, job.flags));
-      }
+      for (const key of pendingKeys)
+        globalSigCache.insert(key);
     }
     return result;
   } catch (e) {
@@ -21841,7 +21817,7 @@ class Mempool {
       sigOpCost
     };
     if (options?.testAccept) {
-      return { accepted: true };
+      return { accepted: true, fee, vsize };
     }
     this.entries.set(txidHex, entry);
     this.indexWtxid(txidHex, tx);
@@ -31787,6 +31763,8 @@ class BlockSync {
   requestedTxInFlight = new Map;
   recentlyRejectedTxs = new Set;
   recentlyConfirmedTxs = new Set;
+  recentlyConfirmedRing = [];
+  recentlyConfirmedHead = 0;
   lastTxInFlightSweep = 0;
   orphanPool = null;
   pruneManager = null;
@@ -32366,7 +32344,10 @@ class BlockSync {
       }
     }
     if (notFound.length > 0) {
-      peer.send({ type: "notfound", payload: { inventory: notFound } });
+      const reached = peer.send({ type: "notfound", payload: { inventory: notFound } });
+      if (reached === false) {
+        throw new Error(`notfound did not reach ${peer.host}:${peer.port} (${notFound.length} inv)`);
+      }
     }
   }
   mempoolHasInv(inv) {
@@ -32456,16 +32437,20 @@ class BlockSync {
   addRecentlyConfirmed(hashHex) {
     if (this.recentlyConfirmedTxs.has(hashHex))
       return;
-    this.recentlyConfirmedTxs.add(hashHex);
-    while (this.recentlyConfirmedTxs.size > MAX_RECENT_CONFIRMED_TXS) {
-      const oldest = this.recentlyConfirmedTxs.values().next().value;
-      if (oldest === undefined)
-        break;
+    if (this.recentlyConfirmedTxs.size >= MAX_RECENT_CONFIRMED_TXS) {
+      const oldest = this.recentlyConfirmedRing[this.recentlyConfirmedHead];
       this.recentlyConfirmedTxs.delete(oldest);
+      this.recentlyConfirmedRing[this.recentlyConfirmedHead] = hashHex;
+      this.recentlyConfirmedHead = (this.recentlyConfirmedHead + 1) % this.recentlyConfirmedRing.length;
+    } else {
+      this.recentlyConfirmedRing.push(hashHex);
     }
+    this.recentlyConfirmedTxs.add(hashHex);
   }
   onBlockDisconnected() {
     this.recentlyConfirmedTxs.clear();
+    this.recentlyConfirmedRing = [];
+    this.recentlyConfirmedHead = 0;
     this.onActiveTipChange();
   }
   onActiveTipChange() {
@@ -34134,7 +34119,7 @@ init_messages();
 init_hmac();
 init_sha2();
 
-// node_modules/@noble/hashes/pbkdf2.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/hashes/pbkdf2.js
 init_hmac();
 init_utils();
 function pbkdf2Init(hash, _password, _salt, _opts) {
@@ -34181,7 +34166,7 @@ function pbkdf2(hash, password, salt, opts) {
   return pbkdf2Output(PRF, PRFSalt, DK, prfW, u);
 }
 
-// node_modules/@noble/ciphers/_polyval.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/ciphers/_polyval.js
 init_utils3();
 var BLOCK_SIZE = 16;
 var ZEROS162 = /* @__PURE__ */ new Uint8Array(16);
@@ -34377,7 +34362,7 @@ function wrapConstructorWithKey2(hashCons) {
 var ghash = wrapConstructorWithKey2((key, expectedLength) => new GHASH(key, expectedLength));
 var polyval = wrapConstructorWithKey2((key, expectedLength) => new Polyval(key, expectedLength));
 
-// node_modules/@noble/ciphers/aes.js
+// ../../../../../home/work/hashhog/hotbuns/node_modules/@noble/ciphers/aes.js
 init_utils3();
 var BLOCK_SIZE2 = 16;
 var BLOCK_SIZE32 = 4;
@@ -45297,6 +45282,15 @@ var INT64_MIN = Number.MIN_SAFE_INTEGER;
 var INT64_MAX = Number.MAX_SAFE_INTEGER;
 var UINT32_MAX = 4294967295;
 var MAX_BATCH_SIZE = 1000;
+function isStrictHex(value) {
+  return value.length > 0 && value.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(value);
+}
+function coreDefaultSequence(replaceable, lockTime) {
+  const rbf = replaceable === undefined || replaceable === null ? true : replaceable === true;
+  if (rbf)
+    return 4294967293;
+  return lockTime !== 0 ? 4294967294 : 4294967295;
+}
 function jsonTypeName(value) {
   if (value === null || value === undefined)
     return "null";
@@ -46143,19 +46137,13 @@ class RPCServer {
     let height;
     let hash;
     if (blockhashParam !== undefined && blockhashParam !== null) {
-      if (typeof blockhashParam !== "string") {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
-      }
-      const hashBuf = Buffer.from(blockhashParam, "hex");
-      if (hashBuf.length !== 32) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
-      }
+      const hashBuf = this.parseHashV(blockhashParam, "blockhash");
       const blockIndex = await this.db.getBlockIndex(hashBuf);
       if (!blockIndex) {
         throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found");
       }
       height = blockIndex.height;
-      hash = blockhashParam;
+      hash = Buffer.from(hashBuf).reverse().toString("hex");
     } else {
       const bestBlock = this.chainState.getBestBlock();
       height = bestBlock.height;
@@ -47048,29 +47036,57 @@ class RPCServer {
     });
     return result.ok;
   }
+  chainTxCountCache = new Map;
   async chainTxCountAtHeight(height) {
     let total = 0;
-    for (let h = 0;h <= height; h++) {
+    const walked = [];
+    for (let h = height;h >= 0; h--) {
       const hash = await this.db.getBlockHashByHeight(h);
       if (!hash) {
         return null;
+      }
+      const key = hash.toString("hex");
+      const cached = this.chainTxCountCache.get(key);
+      if (cached !== undefined) {
+        total += cached;
+        break;
+      }
+      const au = this.params.assumeutxo?.get(key);
+      if (au && au.height === h && au.nChainTx > 0n) {
+        total += Number(au.nChainTx);
+        break;
       }
       const idx = await this.db.getBlockIndex(hash);
       if (!idx) {
         return null;
       }
       let nTx = idx.nTx;
-      if (nTx === 0) {
+      if (!nTx) {
         const rawBlock = await this.db.getBlock(hash);
-        if (rawBlock !== null) {
-          try {
-            const blk = deserializeBlock(new BufferReader(rawBlock));
-            nTx = blk.transactions.length;
-            await this.db.updateBlockIndexNTx(hash, nTx);
-          } catch {}
+        if (rawBlock === null) {
+          return null;
         }
+        try {
+          nTx = deserializeBlock(new BufferReader(rawBlock)).transactions.length;
+        } catch {
+          return null;
+        }
+        if (!nTx) {
+          return null;
+        }
+        await this.db.updateBlockIndexNTx(hash, nTx);
       }
+      walked.push([key, nTx]);
       total += nTx;
+      if (h === 0)
+        break;
+    }
+    let running = total;
+    if (this.chainTxCountCache.size > 50000)
+      this.chainTxCountCache.clear();
+    for (const [key, nTx] of walked) {
+      this.chainTxCountCache.set(key, running);
+      running -= nTx;
     }
     return total;
   }
@@ -48425,79 +48441,85 @@ class RPCServer {
       }
       maxFeeRate = maxfeerateParam;
     }
-    const results = [];
+    const txs = [];
     for (const rawtx of rawtxsParam) {
       if (typeof rawtx !== "string") {
-        results.push({
-          txid: "",
-          allowed: false,
-          "reject-reason": "TX decode failed: not a string"
-        });
+        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, `JSON value of type ${jsonTypeName(rawtx)} is not of expected type string`);
+      }
+      const tx = this.decodeHexTxStrict(rawtx);
+      if (!tx) {
+        throw this.rpcError(RPCErrorCodes.DESERIALIZATION_ERROR, `TX decode failed: ${rawtx} Make sure the tx has at least one input.`);
+      }
+      txs.push(tx);
+    }
+    const maxFeeRateSatPerKvB = Math.round(maxFeeRate * 1e8);
+    const results = [];
+    let exitEarly = false;
+    for (const tx of txs) {
+      const txidHex = Buffer.from(getTxId(tx)).reverse().toString("hex");
+      const wtxidHex = Buffer.from(getWTxId(tx)).reverse().toString("hex");
+      const entry = { txid: txidHex, wtxid: wtxidHex };
+      if (exitEarly) {
+        results.push(entry);
         continue;
       }
-      try {
-        const txData = Buffer.from(rawtx, "hex");
-        const reader = new BufferReader(txData);
-        const tx = deserializeTx(reader);
-        const txid = getTxId(tx);
-        const txidHex = Buffer.from(txid).reverse().toString("hex");
-        if (this.mempool.hasTransaction(txid)) {
-          results.push({
-            txid: txidHex,
-            allowed: false,
-            "reject-reason": "txn-already-in-mempool"
-          });
+      const reject = (reason2, details) => {
+        entry.allowed = false;
+        entry["reject-reason"] = reason2;
+        if (details !== undefined)
+          entry["reject-details"] = details;
+        results.push(entry);
+      };
+      if (this.mempool.hasTransaction(getTxId(tx))) {
+        reject("txn-already-in-mempool", "txn-already-in-mempool");
+        continue;
+      }
+      if (await this.mempool.isTransactionConfirmed(getTxId(tx))) {
+        reject("txn-already-known", "txn-already-known");
+        continue;
+      }
+      const result = await this.mempool.addTransaction(tx, { testAccept: true });
+      if (result.accepted && result.fee !== undefined && result.vsize !== undefined) {
+        const fee = Number(result.fee);
+        const vsize = result.vsize;
+        const maxFee = Math.ceil(maxFeeRateSatPerKvB * vsize / 1000);
+        if (maxFee > 0 && fee > maxFee) {
+          entry.allowed = false;
+          entry["reject-reason"] = "max-fee-exceeded";
+          results.push(entry);
+          exitEarly = true;
           continue;
         }
-        const isConfirmed = await this.mempool.isTransactionConfirmed(txid);
-        if (isConfirmed) {
-          results.push({
-            txid: txidHex,
-            allowed: false,
-            "reject-reason": "txn-already-known"
-          });
-          continue;
-        }
-        const result = await this.mempool.addTransaction(tx, { testAccept: true });
-        if (result.accepted) {
-          const vsize = getTxVSize(tx);
-          const feeRate = 0;
-          const feeRateBTCkvB = feeRate * 1000 / 1e8;
-          if (maxFeeRate > 0 && feeRateBTCkvB > maxFeeRate) {
-            results.push({
-              txid: txidHex,
-              allowed: false,
-              "reject-reason": `max-fee-exceeded`
-            });
-          } else {
-            const resultEntry = {
-              txid: txidHex,
-              wtxid: getWTxId(tx).toString("hex"),
-              allowed: true,
-              vsize,
-              fees: {
-                base: 0
-              }
-            };
-            results.push(resultEntry);
-          }
-        } else {
-          results.push({
-            txid: txidHex,
-            allowed: false,
-            "reject-reason": result.error || "rejected"
-          });
-        }
-      } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        results.push({
-          txid: "",
-          allowed: false,
-          "reject-reason": `TX decode failed: ${message}`
-        });
+        entry.allowed = true;
+        entry.vsize = vsize;
+        entry.fees = {
+          base: fee / 1e8,
+          "effective-feerate": Math.floor(fee * 1000 / vsize) / 1e8,
+          "effective-includes": [wtxidHex]
+        };
+        results.push(entry);
+        continue;
+      }
+      const err = result.error || "rejected";
+      const sep = err.indexOf(": ");
+      const reason = sep >= 0 ? err.slice(0, sep) : err;
+      if (reason === "bad-txns-inputs-missingorspent") {
+        reject("missing-inputs");
+      } else {
+        reject(reason, sep >= 0 ? `${reason}, ${err.slice(sep + 2)}` : reason);
       }
     }
     return results;
+  }
+  decodeHexTxStrict(hex) {
+    if (!isStrictHex(hex))
+      return null;
+    try {
+      const tx = decodeTxWitnessAware(Buffer.from(hex, "hex"), false, true);
+      return tx.inputs.length === 0 ? null : tx;
+    } catch {
+      return null;
+    }
   }
   async saveMempool() {
     if (!this.config.datadir) {
@@ -51178,32 +51200,61 @@ class RPCServer {
     }
     const network = this.getNetworkType();
     let range;
-    if (rangeParam !== undefined) {
-      if (typeof rangeParam === "number") {
-        range = [0, rangeParam];
-      } else if (Array.isArray(rangeParam) && rangeParam.length === 2) {
-        const [start, end] = rangeParam;
-        if (typeof start !== "number" || typeof end !== "number") {
-          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "range must be [start, end] numbers");
-        }
-        range = [start, end];
-      } else {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "range must be a number or [start, end]");
-      }
-      if (range[0] < 0 || range[1] < range[0]) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "invalid range");
-      }
-      if (range[1] - range[0] > 1e4) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "range too large (max 10000)");
-      }
+    if (rangeParam !== undefined && rangeParam !== null) {
+      range = this.parseDescriptorRange(rangeParam);
     }
+    let isRange;
     try {
-      const addresses = deriveAddresses(descriptorParam, network, range);
-      return addresses;
+      checkDescriptorChecksum(descriptorParam, true);
+      isRange = parseDescriptor(descriptorParam, network).descriptor.isRange();
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, message);
     }
+    if (!isRange && params.length > 1) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Range should not be specified for an un-ranged descriptor");
+    }
+    if (isRange && range === undefined) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Range must be specified for a ranged descriptor");
+    }
+    try {
+      return deriveAddresses(descriptorParam, network, isRange ? range : undefined);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, message);
+    }
+  }
+  parseDescriptorRange(value) {
+    const int = (v) => {
+      if (!Number.isSafeInteger(v)) {
+        throw this.rpcError(RPCErrorCodes.MISC_ERROR, "JSON integer out of range");
+      }
+      return v;
+    };
+    let low;
+    let high;
+    if (typeof value === "number") {
+      low = 0;
+      high = int(value);
+    } else if (Array.isArray(value) && value.length === 2 && typeof value[0] === "number" && typeof value[1] === "number") {
+      low = int(value[0]);
+      high = int(value[1]);
+      if (low > high) {
+        throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Range specified as [begin,end] must not have begin after end");
+      }
+    } else {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Range must be specified as end or as [begin,end]");
+    }
+    if (low < 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Range should be greater or equal than 0");
+    }
+    if (high >= 2147483648) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "End of range is too high");
+    }
+    if (high >= low + 1e6) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Range is too large");
+    }
+    return [low, high];
   }
   async createMultisig(params) {
     const [nrequiredParam, pubkeysParam, addressTypeParam] = params;
@@ -51639,14 +51690,8 @@ class RPCServer {
       if (typeof item !== "string") {
         throw this.rpcError(RPCErrorCodes.TYPE_ERROR, `JSON value of type ${jsonTypeName(item)} is not of expected type string`);
       }
-      let tx;
-      try {
-        const bytes = Buffer.from(item, "hex");
-        tx = decodeTxWitnessAware(bytes, false, true);
-        if (tx.inputs.length === 0) {
-          throw new Error("no inputs");
-        }
-      } catch {
+      const tx = this.decodeHexTxStrict(item);
+      if (!tx) {
         throw this.rpcError(-22, `TX decode failed for tx ${idx}. Make sure the tx has at least one input.`);
       }
       variants.push(tx);
@@ -51655,6 +51700,17 @@ class RPCServer {
       throw this.rpcError(-22, "Missing transactions");
     }
     const template = variants[0];
+    const utxoManager = this.liveUTXOManager();
+    for (const vin of template.inputs) {
+      const mp = this.mempool.getTransaction(vin.prevOut.txid);
+      const inMempool = mp !== undefined && mp !== null && vin.prevOut.vout < mp.tx.outputs.length;
+      if (inMempool)
+        continue;
+      const coin = await utxoManager.getUTXOAsync({ txid: vin.prevOut.txid, vout: vin.prevOut.vout });
+      if (!coin) {
+        throw this.rpcError(RPCErrorCodes.RPC_TRANSACTION_ERROR, "Input not found or already spent");
+      }
+    }
     const mergedInputs = [];
     for (let i = 0;i < template.inputs.length; i++) {
       const base = template.inputs[i];
@@ -51705,6 +51761,9 @@ class RPCServer {
       throw this.rpcError(-22, "Script decode failed");
     }
     const hexStr = params[0];
+    if (hexStr.length > 0 && !isStrictHex(hexStr)) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, `argument must be hexadecimal string (not '${hexStr}')`);
+    }
     const script = Buffer.from(hexStr, "hex");
     return decodeScriptRPC(script, this.getNetworkType());
   }
@@ -53084,9 +53143,8 @@ class RPCServer {
     if (!Array.isArray(inputsParam)) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "inputs must be an array");
     }
-    const replaceable = replaceableParam === true;
     const lockTime = this.parseLocktimeArg(locktimeParam);
-    const sequenceDefault = replaceable ? 4294967293 : 4294967294;
+    const sequenceDefault = coreDefaultSequence(replaceableParam, lockTime);
     const txInputs = [];
     for (const inUnknown of inputsParam) {
       if (!inUnknown || typeof inUnknown !== "object") {
@@ -53318,8 +53376,7 @@ class RPCServer {
     const wallet = this.getCurrentWallet();
     const lockTime = this.parseLocktimeArg(locktimeParam);
     const options = typeof optionsParam === "object" && optionsParam ? optionsParam : {};
-    const replaceable = options.replaceable === true;
-    const sequenceDefault = replaceable ? 4294967293 : 4294967294;
+    const sequenceDefault = coreDefaultSequence(options.replaceable, lockTime);
     const outputsList = [];
     let totalOutputSats = 0n;
     const outArray = Array.isArray(outputsParam) ? outputsParam : [outputsParam];
