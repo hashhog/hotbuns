@@ -7109,7 +7109,13 @@ export class RPCServer {
       const entry: Record<string, unknown> = {
         id: index,
         addr: `${peer.host}:${peer.port}`,
-        addrlocal: `127.0.0.1:${this.config.port}`,
+        // Core rpc/net.cpp:233: the address the PEER says it sees us at
+        // (its VERSION addr_recv), omitted when unknown/unspecified. This
+        // used to be a fabricated `127.0.0.1:<rpc port>`.
+        ...(() => {
+          const addrLocal = this.peerManager.getPeerAddrLocal?.(peer) ?? null;
+          return addrLocal !== null ? { addrlocal: addrLocal } : {};
+        })(),
         addrbind: `0.0.0.0:${peer.port}`,
         // Core rpc/net.cpp:235 pushes network derived from stats.m_network (GetNetworkName).
         // Compute from the peer's address string — matches getNetworkTypeFromAddress()
@@ -7592,7 +7598,9 @@ export class RPCServer {
       //   DEFAULT_INCREMENTAL_RELAY_FEE=100 sat/kvB = 0.00000100 BTC/kvB.
       relayfee: 0.000001,
       incrementalfee: 0.000001,
-      localaddresses: [],
+      // Core rpc/net.cpp: our own advertised addresses (--externalip +
+      // discovered), [{address, port, score}], best first.
+      localaddresses: this.peerManager.getLocalAddresses?.() ?? [],
       // warnings: ARRAY of warning strings (Core v31.99 GetWarningsForRpc).
       warnings: [],
     };
@@ -10117,6 +10125,20 @@ export class RPCServer {
 
     const bits = blockIndex.header.readUInt32LE(72);
     return this.calculateDifficultyFromBits(bits);
+  }
+
+  /**
+   * Current IBD status, the same latched value getblockchaininfo reports as
+   * `initialblockdownload`. Used by the P2P layer to hold back
+   * self-address advertisement during IBD (Core MaybeSendAddr).
+   */
+  isInitialBlockDownload(): boolean {
+    const bestBlock = this.chainState.getBestBlock();
+    const headerEntry = this.headerSync.getHeader(bestBlock.hash);
+    const tipTimestamp = headerEntry
+      ? headerEntry.header.timestamp
+      : Math.floor(Date.now() / 1000);
+    return this.computeInitialBlockDownload(bestBlock.chainWork, tipTimestamp);
   }
 
   /**

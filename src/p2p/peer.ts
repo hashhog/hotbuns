@@ -256,6 +256,14 @@ export class Peer {
   wantsAddrV2: boolean;
 
   /**
+   * When our own address is next announced to this peer, ms since epoch
+   * (Core Peer::m_next_local_addr_send). 0 = never sent yet, so the first
+   * self-announcement goes out as soon as the gates (listening, not in IBD)
+   * allow. Driven by PeerManager.maybeSendLocalAddr.
+   */
+  nextLocalAddrSend: number;
+
+  /**
    * Whether this peer negotiated BIP-339 wtxid-relay.
    * Set when we receive a `wtxidrelay` message during the handshake
    * (before VERACK).  When true, tx inv announcements must use MSG_WTX (=5)
@@ -433,6 +441,7 @@ export class Peer {
     this.syncedHeaders = -1;
     this.syncedBlocks = -1;
     this.wantsAddrV2 = false;
+    this.nextLocalAddrSend = 0;
     this.wtxidRelay = false;
     // BIP133 feefilter state
     this.feeFilterReceived = 0n;

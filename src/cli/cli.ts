@@ -22,6 +22,7 @@ import { OrphanPool } from "../mempool/orphan_pool.js";
 import { dumpMempool, loadMempool } from "../mempool/persist.js";
 import { FeeEstimator } from "../fees/estimator.js";
 import { PeerManager, DEFAULT_MAX_CONNECTIONS } from "../p2p/manager.js";
+import { parseExternalIP } from "../p2p/localaddr.js";
 import {
   ProxyManager,
   type MultiProxyConfig,
@@ -75,6 +76,18 @@ export interface NodeConfig {
    * skips DNS regardless). Plumbed into PeerManager as `dnsSeed`.
    */
   dnsSeed?: boolean;
+  /**
+   * Core `-externalip=<ip>[:port]`: our own public address(es) to advertise
+   * to peers. Repeatable and/or comma-separated. A bare IP uses the P2P
+   * listen port. Implies `discover=false` unless `--discover` is given.
+   */
+  externalIP?: string[];
+  /**
+   * Core `-discover`: learn our public address from what outbound peers
+   * report (VERSION addr_recv). Default on; off when `--externalip` is set
+   * unless given explicitly (see {@link resolveDiscover}).
+   */
+  discover?: boolean;
   /**
    * Force FULL script verification of all history by disabling assume-valid.
    * Mirrors Bitcoin Core `-assumevalid=0`. Set true by `--noassumevalid`,
@@ -480,6 +493,22 @@ export function parseArgs(argv: string[]): ParsedArgs {
           // main.zig:267 sets config.dns_seed=false.
           config.dnsSeed = false;
           break;
+        case "externalip":
+          // Core `-externalip=<ip>[:port]`, repeatable and comma-separated.
+          if (value) {
+            config.externalIP = config.externalIP || [];
+            for (const part of value.split(",")) {
+              if (part.trim()) config.externalIP.push(part.trim());
+            }
+          }
+          break;
+        case "discover":
+          // Core `-discover` (bare = on, =0/false = off).
+          config.discover = !(value === "0" || value === "false");
+          break;
+        case "nodiscover":
+          config.discover = false;
+          break;
         case "assumevalid":
           // Mirrors Bitcoin Core `-assumevalid=<hex>`. Only the disable form
           // (`=0`) is honored here — used by the mainnet-replay harness to
@@ -770,6 +799,16 @@ export function parseArgs(argv: string[]): ParsedArgs {
 }
 
 /**
+ * Effective Core `-discover`: an explicit setting wins; otherwise on, except
+ * that `-externalip` soft-sets it off (Core init.cpp:815
+ * `SoftSetBoolArg("-discover", false)` when -externalip is given).
+ */
+export function resolveDiscover(config: Pick<NodeConfig, "externalIP" | "discover">): boolean {
+  if (config.discover !== undefined) return config.discover;
+  return !(config.externalIP && config.externalIP.length > 0);
+}
+
+/**
  * Parse a flag argument like --key=value or --key value.
  */
 function parseFlag(arg: string): [string, string | undefined] {
@@ -858,6 +897,17 @@ export async function loadConfig(
           break;
         case "dnsseed":
           config.dnsSeed = !(value === "0" || value === "false");
+          break;
+        case "externalip":
+          if (value) {
+            config.externalIP = config.externalIP || [];
+            for (const part of value.split(",")) {
+              if (part.trim()) config.externalIP.push(part.trim());
+            }
+          }
+          break;
+        case "discover":
+          config.discover = !(value === "0" || value === "false");
           break;
         case "port":
           config.port = parseInt(value, 10);
@@ -1994,6 +2044,17 @@ async function startNode(config: NodeConfig): Promise<void> {
     asmapPath: resolvedAsmapPath,
     proxyManager,
     cjdnsReachable: mergedConfig.cjdnsReachable ?? false,
+    // Self-address advertisement (Core -externalip / -discover). Parsed here
+    // so a malformed --externalip fails startup instead of being ignored.
+    discover: resolveDiscover(mergedConfig),
+    externalIPs: (mergedConfig.externalIP ?? []).map((v) => {
+      try {
+        return parseExternalIP(v);
+      } catch (err) {
+        console.error(`Error: --externalip=${v}: ${(err as Error).message}`);
+        process.exit(1);
+      }
+    }),
   });
 
   if (peerManager.usingASMap()) {
@@ -2736,6 +2797,11 @@ async function startNode(config: NodeConfig): Promise<void> {
   };
 
   const rpcServer = new RPCServer(rpcConfig, rpcDeps);
+
+  // Our address is not advertised during IBD (Core MaybeSendAddr). Use the
+  // same latched predicate getblockchaininfo.initialblockdownload reports, so
+  // the gate and the RPC can never disagree.
+  peerManager.setIBDProvider(() => rpcServer.isInitialBlockDownload());
 
   // Wallet UTXO ledger: scan every block that connects to the active tip for
   // outputs paying wallet addresses (credit) and inputs spending wallet coins
@@ -3538,6 +3604,8 @@ OPTIONS:
   --printtoconsole      Force log output to stdout/stderr
   --connect=<host:port> Connect ONLY to this peer (repeatable); disables DNS seeding + auto-outbound dialing
   --nodnsseed           Disable DNS seed resolution (alias: --dnsseed=0)
+  --externalip=<ip>[:port]  Advertise this public address to peers (repeatable / comma-separated; bare IP = P2P port). Implies --discover=0 unless --discover is given
+  --discover[=0|1]      Learn own public address from outbound peers' view of us (default: 1 unless --externalip)
   --proxy=<host:port>   Route outbound connections through SOCKS5 proxy
   --onion=<host:port>   Dedicated SOCKS5 proxy for .onion (overrides --proxy)
   --i2psam=<host:port>  I2P SAM v3.1 bridge endpoint

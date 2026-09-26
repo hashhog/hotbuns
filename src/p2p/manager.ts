@@ -20,7 +20,17 @@ import {
   MAX_OUTBOUND_PEERS_TO_PROTECT,
 } from "./peer.js";
 import type { NetworkMessage, AddrPayload, NetworkAddress, AddrV2Payload, FeeFilterPayload } from "./messages.js";
-import { ipv4ToBuffer } from "./messages.js";
+import { ipv4ToBuffer, hostToBuffer } from "./messages.js";
+import {
+  LocalAddrTable,
+  LOCAL_ADDR_CHECK_INTERVAL_MS,
+  LOCAL_MANUAL,
+  type LocalAddress,
+  isRoutableAddr,
+  normalizeHost,
+  nextLocalAddrDelayMs,
+  peerAddrLocal,
+} from "./localaddr.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { BanManager, DEFAULT_BAN_TIME, type BanEntry } from "./banman.js";
@@ -183,6 +193,26 @@ export interface PeerManagerConfig {
    * are filtered out of {@link getCandidateAddresses}.
    */
   cjdnsReachable?: boolean;
+  /**
+   * Core `-discover` (default true): learn our public address from the
+   * addr_recv field of OUTBOUND peers' VERSION messages. cli.ts turns it off
+   * when `--externalip` is given unless `--discover` is passed explicitly
+   * (Core init.cpp:815 soft-set).
+   */
+  discover?: boolean;
+  /**
+   * Core `-externalip`: our own public address(es) to advertise. Added to the
+   * local address table at LOCAL_MANUAL when {@link PeerManager.start} runs
+   * (after the listeners bind, so port 0 resolves to the real listen port).
+   * Parsed by localaddr.parseExternalIP; port 0 = the P2P listen port.
+   */
+  externalIPs?: { host: string; port: number }[];
+  /**
+   * Reports initial block download. Our address is not advertised during IBD
+   * (Core MaybeSendAddr `!m_chainman.IsInitialBlockDownload()`). May also be
+   * installed later via {@link PeerManager.setIBDProvider}. Unset = never IBD.
+   */
+  isIBD?: () => boolean;
 }
 
 /** Stored information about a known peer address. */
@@ -747,6 +777,17 @@ export class PeerManager {
   private asmapHealthCheckInterval: ReturnType<typeof setInterval> | null;
   /** TCP listeners for inbound P2P connections (Bun.listen). */
   private tcpListeners: TCPSocketListener<{ peer: Peer | null }>[];
+  /**
+   * The port the inbound listener actually bound (Core GetListenPort). Differs
+   * from config.port when that is 0 (OS-assigned). null until start() binds.
+   */
+  private boundListenPort: number | null = null;
+  /** Our own address table (Core mapLocalHost); see localaddr.ts. */
+  private localAddrs: LocalAddrTable = new LocalAddrTable();
+  /** IBD predicate for the self-announcement gate (see PeerManagerConfig.isIBD). */
+  private isIBDFn: (() => boolean) | null = null;
+  /** Timer that re-announces our address to peers whose Poisson slot is due. */
+  private localAddrInterval: ReturnType<typeof setInterval> | null = null;
 
   /**
    * Per-address v1-only cache.  After a failed BIP-324 v2 outbound
@@ -835,7 +876,10 @@ export class PeerManager {
       // NODE_NETWORK_LIMITED service bit (advertised unconditionally for this
       // full node via params.services = 0x409, per Core init.cpp:863/1950).
       pruneMode: config.pruneMode ?? false,
+      discover: config.discover ?? true,
+      externalIPs: config.externalIPs,
     };
+    this.isIBDFn = config.isIBD ?? null;
     this.peers = new Map();
     this.knownAddresses = new Map();
     this.messageHandlers = new Map();
@@ -1224,6 +1268,19 @@ export class PeerManager {
       this.startListeners();
     }
 
+    // --externalip (Core AddLocal(LOCAL_MANUAL)). After the listeners bind so
+    // a bare IP picks up the real listen port.
+    for (const ext of this.config.externalIPs ?? []) {
+      const shown = ext.host.includes(":") ? `[${ext.host}]` : ext.host;
+      if (this.addExternalIP(ext.host, ext.port)) {
+        console.log(`P2P: externalip — advertising ${shown}:${ext.port || this.getListenPort()}`);
+      } else {
+        console.warn(
+          `P2P: WARNING: --externalip=${shown} ignored (not publicly routable, or not listening)`
+        );
+      }
+    }
+
     // Load ban list and persisted addresses
     await this.banManager.load();
     await this.loadAddresses();
@@ -1336,6 +1393,20 @@ export class PeerManager {
       this.asmapHealthCheck();
     }
 
+    // Periodic self-address re-announcement (Core MaybeSendAddr timer). Also
+    // delivers the FIRST announcement to peers that connected during IBD.
+    this.localAddrInterval = setInterval(() => {
+      const now = Date.now();
+      for (const peer of this.peers.values()) {
+        if (!peer.handshakeComplete) continue;
+        try {
+          this.maybeSendLocalAddr(peer, now);
+        } catch {
+          // never let one peer's send failure stop the loop
+        }
+      }
+    }, LOCAL_ADDR_CHECK_INTERVAL_MS);
+
     // Start maintenance loop (every 30 seconds)
     this.maintainInterval = setInterval(() => {
       this.maintain().catch((err) => {
@@ -1376,6 +1447,11 @@ export class PeerManager {
       listener.stop(true);
     }
     this.tcpListeners = [];
+
+    if (this.localAddrInterval) {
+      clearInterval(this.localAddrInterval);
+      this.localAddrInterval = null;
+    }
 
     // Stop maintenance loop
     if (this.maintainInterval) {
@@ -2950,6 +3026,12 @@ export class PeerManager {
     }
 
     const connType = this.peerConnectionType.get(key);
+    const isInbound = this.inboundPeers.has(key);
+
+    // Learn our own address from the peer's VERSION addr_recv (Core VERSION
+    // processing: SetAddrLocal / SeenLocal). Runs for feelers too — they are
+    // outbound and add netgroup diversity to the confirmations.
+    this.noteVersionAddrRecv(peer, isInbound, Date.now());
 
     // FEELER promotion: a successful feeler handshake confirms the NEW-table
     // address is live, so promote it NEW->TRIED in the bucketed addrman (Core
@@ -2986,6 +3068,10 @@ export class PeerManager {
       this.creditGetaddrResponse(peer);
       peer.send({ type: "getaddr", payload: null });
     }
+
+    // Initial self-announcement (Core MaybeSendAddr, first SendMessages after
+    // the handshake). Gated inside on listening / IBD / connection type.
+    this.maybeSendLocalAddr(peer, Date.now());
 
     // Emit connect event to handlers
     const handlers = this.messageHandlers.get("__connect__") ?? [];
@@ -3728,6 +3814,166 @@ export class PeerManager {
     return this.tcpListeners.map((l) => ({ host: l.hostname, port: l.port }));
   }
 
+  // ==========================================================================
+  // Self-address advertisement (Core -externalip / -discover / MaybeSendAddr)
+  // ==========================================================================
+
+  /**
+   * The port we accept connections on (Core GetListenPort), or 0 when not
+   * listening (Core fListen=false). Before start() binds, the configured port.
+   */
+  getListenPort(): number {
+    if (!this.config.listen) return 0;
+    if (this.boundListenPort !== null) return this.boundListenPort;
+    if (this.running && this.tcpListeners.length === 0) return 0; // bind failed
+    return this.config.port ?? 0;
+  }
+
+  /** Core fListen. */
+  private isListening(): boolean {
+    return this.getListenPort() !== 0;
+  }
+
+  /** Install the IBD predicate (cli.ts wires it once the RPC server exists). */
+  setIBDProvider(fn: (() => boolean) | null): void {
+    this.isIBDFn = fn;
+  }
+
+  /**
+   * Record an `--externalip` address at LOCAL_MANUAL. Port 0 = the listen
+   * port. Returns false when the address is not publicly routable (Core
+   * AddLocal refuses those) or we are not listening.
+   */
+  addExternalIP(host: string, port: number = 0): boolean {
+    const listenPort = this.getListenPort();
+    if (listenPort === 0) return false;
+    return this.localAddrs.addManual(host, port || listenPort);
+  }
+
+  /** getnetworkinfo.localaddresses: [{address, port, score}], best first. */
+  getLocalAddresses(): LocalAddress[] {
+    return this.localAddrs.list(Date.now());
+  }
+
+  /**
+   * getpeerinfo.addrlocal: the address this peer told us (VERSION addr_recv)
+   * that it sees us at, as "ip:port"; null when unknown (Core omits the key).
+   */
+  getPeerAddrLocal(peer: Peer): string | null {
+    const a = peerAddrLocal(peer);
+    if (!a) return null;
+    return a.host.includes(":") ? `[${a.host}]:${a.port}` : `${a.host}:${a.port}`;
+  }
+
+  /**
+   * Handle the addr_recv field of a peer's VERSION: an OUTBOUND peer's view of
+   * us is a discovery (only with discover on, only when both ends are
+   * publicly routable — Core IsPeerAddrLocalGood), stored with OUR LISTEN
+   * PORT (the peer cannot observe it on a connection we initiated); an
+   * INBOUND peer's view only scores an address we already know (Core
+   * SeenLocal). The score is the number of distinct peer netgroups.
+   */
+  noteVersionAddrRecv(peer: Peer, isInbound: boolean, now: number): void {
+    if (!this.config.discover || !this.isListening()) return;
+    const seen = peerAddrLocal(peer);
+    if (!seen) return;
+    const remote = normalizeHost(peer.host);
+    if (!isRoutableAddr(remote) || !isRoutableAddr(seen.host)) return;
+    this.localAddrs.confirm(
+      seen.host,
+      this.getListenPort(),
+      this.getNetGroupForAddr(remote),
+      !isInbound,
+      now
+    );
+  }
+
+  /**
+   * Pick the address to advertise to `peer` (Core GetLocalAddrForPeer,
+   * net.cpp:240-268): the best usable table entry; but when the peer's own
+   * view of us is good (discover on, both routable) use that instead if the
+   * table has nothing, and otherwise at 1/2 odds (1/8 when the best entry
+   * scores above LOCAL_MANUAL) — IP only for outbound (the peer cannot see
+   * our listen port), IP+port for inbound (it dialed our listen port).
+   * Returns null when nothing routable results.
+   */
+  getLocalAddrForPeer(
+    peer: Peer,
+    isInbound: boolean,
+    now: number,
+    rand: () => number = Math.random
+  ): { host: string; port: number } | null {
+    const remote = normalizeHost(peer.host);
+    const best = this.localAddrs.best(remote, now);
+    let host: string | null = best ? best.address : null;
+    let port = best ? best.port : this.getListenPort();
+    const seen = peerAddrLocal(peer);
+    const peerGood =
+      this.config.discover === true &&
+      seen !== null &&
+      isRoutableAddr(remote) &&
+      isRoutableAddr(seen.host);
+    if (peerGood && seen) {
+      const bits = best && best.score > LOCAL_MANUAL ? 3 : 1;
+      if (!best || Math.floor(rand() * (1 << bits)) === 0) {
+        host = seen.host;
+        if (isInbound) port = seen.port;
+      }
+    }
+    if (host === null || !isRoutableAddr(host) || port === 0) return null;
+    return { host, port };
+  }
+
+  /**
+   * Core MaybeSendAddr's self-announcement block (net_processing.cpp:5445-
+   * 5479). If `peer` is due, send it ONE addr (or addrv2 if it sent
+   * sendaddrv2) carrying our address, the services we sent in VERSION, time
+   * now and the LISTEN port. Gates: listening; never to block-relay-only or
+   * feeler connections (Core m_addr_relay_enabled is false for them); not in
+   * IBD — and the IBD gate leaves the per-peer slot untouched so the first
+   * announcement goes out on the first timer tick after IBD ends. After a
+   * send (or a due slot with nothing routable to say) the next slot is drawn
+   * from an exponential distribution averaging 24h.
+   *
+   * Returns true when a message was sent.
+   */
+  maybeSendLocalAddr(peer: Peer, now: number): boolean {
+    if (!this.isListening()) return false;
+    const key = `${peer.host}:${peer.port}`;
+    const isInbound = this.inboundPeers.has(key);
+    if (!isInbound) {
+      const connType = this.peerConnectionType.get(key);
+      if (connType === "block_relay" || connType === "feeler") return false;
+    }
+    if (this.isIBDFn && this.isIBDFn()) return false;
+    if (peer.nextLocalAddrSend !== 0 && now < peer.nextLocalAddrSend) return false;
+    peer.nextLocalAddrSend = now + nextLocalAddrDelayMs();
+
+    const local = this.getLocalAddrForPeer(peer, isInbound, now);
+    if (!local) return false;
+
+    const services = this.config.params.services;
+    const timestamp = Math.floor(now / 1000);
+    const ip = hostToBuffer(local.host);
+    if (peer.wantsAddrV2) {
+      return peer.send({
+        type: "addrv2",
+        payload: {
+          addrs: [
+            {
+              timestamp,
+              addr: legacyAddressToNetworkAddressV2(ip, local.port, services),
+            },
+          ],
+        },
+      });
+    }
+    return peer.send({
+      type: "addr",
+      payload: { addrs: [{ timestamp, addr: { services, ip, port: local.port } }] },
+    });
+  }
+
   /**
    * Start TCP listeners for inbound P2P connections using Bun.listen.
    *
@@ -3752,7 +3998,10 @@ export class PeerManager {
       try {
         const listener = this.bindOne(addr.host, port);
         this.tcpListeners.push(listener);
-        if (sharedPort === undefined) sharedPort = listener.port;
+        if (sharedPort === undefined) {
+          sharedPort = listener.port;
+          this.boundListenPort = listener.port;
+        }
         const shown = addr.host.includes(":") ? `[${addr.host}]` : addr.host;
         console.log(`P2P listening on ${shown}:${listener.port}`);
       } catch (err) {
