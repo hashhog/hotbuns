@@ -2357,7 +2357,9 @@ describe("RPCServer", () => {
       const result = await rpcRequest(testPort, "getdeploymentinfo", [12345]);
 
       expect(result.error).toBeDefined();
-      expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+      // Core: a STR_HEX argument given a number fails the RPCHelpMan type
+      // check -> RPC_TYPE_ERROR (-3), same as every ParseHashV caller here.
+      expect(result.error.code).toBe(RPCErrorCodes.TYPE_ERROR);
     });
   });
 

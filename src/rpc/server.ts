@@ -425,6 +425,27 @@ export const MAX_BATCH_SIZE = 1000;
  * type-error messages. Core distinguishes null / bool / number / string /
  * array / object.
  */
+/**
+ * Core util/strencodings.cpp IsHex: non-empty, even length, hex digits only.
+ * Buffer.from(x, "hex") must never be the only gate: it silently truncates at
+ * the first non-hex character ("zz" decodes to an EMPTY buffer).
+ */
+function isStrictHex(value: string): boolean {
+  return value.length > 0 && value.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(value);
+}
+
+/**
+ * Core rpc/rawtransaction_util.cpp AddInputs:49-55 default nSequence:
+ * rbf.value_or(true) ? MAX_BIP125_RBF_SEQUENCE (0xfffffffd)
+ * : nLockTime != 0 ? MAX_SEQUENCE_NONFINAL (0xfffffffe) : SEQUENCE_FINAL.
+ * `replaceable` undefined/null is rbf == nullopt, i.e. TRUE.
+ */
+function coreDefaultSequence(replaceable: unknown, lockTime: number): number {
+  const rbf = replaceable === undefined || replaceable === null ? true : replaceable === true;
+  if (rbf) return 0xfffffffd;
+  return lockTime !== 0 ? 0xfffffffe : 0xffffffff;
+}
+
 function jsonTypeName(value: unknown): string {
   if (value === null || value === undefined) return "null";
   if (typeof value === "boolean") return "bool";
@@ -1911,19 +1932,17 @@ export class RPCServer {
     let hash: string;
 
     if (blockhashParam !== undefined && blockhashParam !== null) {
-      if (typeof blockhashParam !== "string") {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "blockhash must be a string");
-      }
-      const hashBuf = Buffer.from(blockhashParam, "hex");
-      if (hashBuf.length !== 32) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid blockhash length");
-      }
+      // Core getdeploymentinfo: ParseHashV (display order -> internal) then
+      // LookupBlockIndex, -5 when absent. The DISPLAY-order hex used to be
+      // passed straight to getBlockIndex (no byte reversal), so every real
+      // block hash missed and answered -5 "Block not found".
+      const hashBuf = this.parseHashV(blockhashParam, "blockhash");
       const blockIndex = await this.db.getBlockIndex(hashBuf);
       if (!blockIndex) {
         throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Block not found");
       }
       height = blockIndex.height;
-      hash = blockhashParam;
+      hash = Buffer.from(hashBuf).reverse().toString("hex");
     } else {
       const bestBlock = this.chainState.getBestBlock();
       height = bestBlock.height;
@@ -3738,46 +3757,73 @@ export class RPCServer {
   }
 
   /**
-   * Cumulative transaction count from genesis (inclusive) up to and including
-   * the active-chain block at `height` — the analogue of Bitcoin Core's
-   * `CBlockIndex::m_chain_tx_count` (chain.h:129). Computed by summing the
-   * per-block `nTx` over the active chain `[0, height]`.
+   * Bitcoin Core `CBlockIndex::m_chain_tx_count` (chain.h:129) for the
+   * active-chain block at `height`, or null when it is UNKNOWN (Core's 0).
    *
-   * Per-block `nTx` is persisted at connect time (sync/blocks.ts and
-   * chain/state.ts). For robustness against blocks indexed before nTx storage
-   * was wired (where the stored value is 0), this falls back to counting txs
-   * from the raw block data — mirroring the getblockheader nTx-resolution path.
-   *
-   * Returns null if any block in the range cannot be resolved at all (so the
-   * caller can omit the optional txcount/window_tx_count fields, exactly as
-   * Core omits them when m_chain_tx_count is 0/unknown, e.g. under assumeutxo).
+   * Core knows the count only when every block back to an anchor has a known
+   * nTx: genesis, or an assumeutxo base carrying a chainparams count
+   * (node/blockstorage.cpp:440-487 seeds `base->m_chain_tx_count =
+   * au_data.m_chain_tx_count`, the rest is pprev + nTx). So this walks DOWN
+   * from `height` to the nearest anchor — a cached result, a chainparams
+   * assumeutxo base whose hash is on this chain, or genesis. A missing height
+   * or block-index row, or an nTx that cannot be established, is UNKNOWN:
+   * nothing is counted as 0 (the old walk kept going on an unreadable block,
+   * under-counting), and nothing is summed from height 0 on every call (the
+   * old O(height) async walk hung the live mainnet node for >300 s).
    */
+  private chainTxCountCache = new Map<string, number>();
+
   private async chainTxCountAtHeight(height: number): Promise<number | null> {
     let total = 0;
-    for (let h = 0; h <= height; h++) {
+    const walked: Array<[string, number]> = [];
+    for (let h = height; h >= 0; h--) {
       const hash = await this.db.getBlockHashByHeight(h);
       if (!hash) {
         return null;
+      }
+      const key = hash.toString("hex");
+      const cached = this.chainTxCountCache.get(key);
+      if (cached !== undefined) {
+        total += cached;
+        break;
+      }
+      const au = this.params.assumeutxo?.get(key);
+      if (au && au.height === h && au.nChainTx > 0n) {
+        total += Number(au.nChainTx);
+        break;
       }
       const idx = await this.db.getBlockIndex(hash);
       if (!idx) {
         return null;
       }
       let nTx = idx.nTx;
-      if (nTx === 0) {
-        // Pre-migration fallback: count from raw block data and persist.
+      if (!nTx) {
+        // Pre-migration datadir: count from the stored body and persist.
         const rawBlock = await this.db.getBlock(hash);
-        if (rawBlock !== null) {
-          try {
-            const blk = deserializeBlock(new BufferReader(rawBlock));
-            nTx = blk.transactions.length;
-            await this.db.updateBlockIndexNTx(hash, nTx);
-          } catch {
-            // Leave nTx as 0 if the block is unreadable.
-          }
+        if (rawBlock === null) {
+          return null;
         }
+        try {
+          nTx = deserializeBlock(new BufferReader(rawBlock)).transactions.length;
+        } catch {
+          return null;
+        }
+        if (!nTx) {
+          return null;
+        }
+        await this.db.updateBlockIndexNTx(hash, nTx);
       }
+      walked.push([key, nTx]);
       total += nTx;
+      if (h === 0) break;
+    }
+    // m_chain_tx_count is a property of the block (its ancestry), so a
+    // hash-keyed entry never goes stale across a reorg.
+    let running = total;
+    if (this.chainTxCountCache.size > 50_000) this.chainTxCountCache.clear();
+    for (const [key, nTx] of walked) {
+      this.chainTxCountCache.set(key, running);
+      running -= nTx;
     }
     return total;
   }
@@ -6013,94 +6059,118 @@ export class RPCServer {
       maxFeeRate = maxfeerateParam;
     }
 
-    const results: Array<Record<string, unknown>> = [];
-
+    // Core rpc/mempool.cpp testmempoolaccept: EVERY rawtx is decoded before
+    // any validation, and a decode failure throws RPC_DESERIALIZATION_ERROR
+    // (-22) for the whole call. This returned a success array with txid ""
+    // and reject-reason "TX decode failed: ..." — an answer Core never gives.
+    const txs: Transaction[] = [];
     for (const rawtx of rawtxsParam) {
       if (typeof rawtx !== "string") {
-        results.push({
-          txid: "",
-          allowed: false,
-          "reject-reason": "TX decode failed: not a string",
-        });
+        throw this.rpcError(
+          RPCErrorCodes.TYPE_ERROR,
+          `JSON value of type ${jsonTypeName(rawtx)} is not of expected type string`
+        );
+      }
+      const tx = this.decodeHexTxStrict(rawtx);
+      if (!tx) {
+        throw this.rpcError(
+          RPCErrorCodes.DESERIALIZATION_ERROR,
+          `TX decode failed: ${rawtx} Make sure the tx has at least one input.`
+        );
+      }
+      txs.push(tx);
+    }
+
+    // maxfeerate (BTC/kvB) -> sat/kvB; CFeeRate::GetFee rounds UP.
+    const maxFeeRateSatPerKvB = Math.round(maxFeeRate * 100_000_000);
+    const results: Array<Record<string, unknown>> = [];
+    let exitEarly = false;
+
+    for (const tx of txs) {
+      const txidHex = Buffer.from(getTxId(tx)).reverse().toString("hex");
+      // getWTxId returns INTERNAL byte order, like getTxId: reverse for display
+      // (the old accepted-path wtxid was emitted un-reversed).
+      const wtxidHex = Buffer.from(getWTxId(tx)).reverse().toString("hex");
+      // Core pushes txid + wtxid for EVERY result, first.
+      const entry: Record<string, unknown> = { txid: txidHex, wtxid: wtxidHex };
+      if (exitEarly) {
+        // Core: after a max-fee-exceeded, the rest are left blank.
+        results.push(entry);
         continue;
       }
 
-      try {
-        const txData = Buffer.from(rawtx, "hex");
-        const reader = new BufferReader(txData);
-        const tx = deserializeTx(reader);
-        const txid = getTxId(tx);
-        const txidHex = Buffer.from(txid).reverse().toString("hex");
+      const reject = (reason: string, details?: string) => {
+        entry.allowed = false;
+        entry["reject-reason"] = reason;
+        // Core: TX_MISSING_INPUTS -> "missing-inputs" with no details;
+        // otherwise reject-details = TxValidationState::ToString().
+        if (details !== undefined) entry["reject-details"] = details;
+        results.push(entry);
+      };
 
-        // Check if already in mempool
-        if (this.mempool.hasTransaction(txid)) {
-          results.push({
-            txid: txidHex,
-            allowed: false,
-            "reject-reason": "txn-already-in-mempool",
-          });
+      if (this.mempool.hasTransaction(getTxId(tx))) {
+        reject("txn-already-in-mempool", "txn-already-in-mempool");
+        continue;
+      }
+      if (await this.mempool.isTransactionConfirmed(getTxId(tx))) {
+        reject("txn-already-known", "txn-already-known");
+        continue;
+      }
+
+      // Dry-run AcceptToMemoryPool (test_accept=true): validate, do not commit.
+      const result = await this.mempool.addTransaction(tx, { testAccept: true });
+      if (result.accepted && result.fee !== undefined && result.vsize !== undefined) {
+        const fee = Number(result.fee);
+        const vsize = result.vsize;
+        const maxFee = Math.ceil((maxFeeRateSatPerKvB * vsize) / 1000);
+        if (maxFee > 0 && fee > maxFee) {
+          entry.allowed = false;
+          entry["reject-reason"] = "max-fee-exceeded";
+          results.push(entry);
+          exitEarly = true;
           continue;
         }
-
-        // Check if already confirmed
-        const isConfirmed = await this.mempool.isTransactionConfirmed(txid);
-        if (isConfirmed) {
-          results.push({
-            txid: txidHex,
-            allowed: false,
-            "reject-reason": "txn-already-known",
-          });
-          continue;
-        }
-
-        // Test mempool acceptance — dry-run: validate but do NOT commit.
-        // Mirrors Bitcoin Core's testmempoolaccept using test_accept=true in
-        // AcceptToMemoryPool (validation.cpp).
-        const result = await this.mempool.addTransaction(tx, { testAccept: true });
-
-        if (result.accepted) {
-          const vsize = getTxVSize(tx);
-          // Fee is not returned by addTransaction; report 0 for now
-          const feeRate = 0;
-          const feeRateBTCkvB = (feeRate * 1000) / 100_000_000;
-
-          // Check maxfeerate
-          if (maxFeeRate > 0 && feeRateBTCkvB > maxFeeRate) {
-            results.push({
-              txid: txidHex,
-              allowed: false,
-              "reject-reason": `max-fee-exceeded`,
-            });
-          } else {
-            const resultEntry: Record<string, unknown> = {
-              txid: txidHex,
-              wtxid: getWTxId(tx).toString("hex"),
-              allowed: true,
-              vsize,
-              fees: {
-                base: 0,
-              },
-            };
-            results.push(resultEntry);
-          }
-        } else {
-          results.push({
-            txid: txidHex,
-            allowed: false,
-            "reject-reason": result.error || "rejected",
-          });
-        }
-      } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        results.push({
-          txid: "",
-          allowed: false,
-          "reject-reason": `TX decode failed: ${message}`,
-        });
+        entry.allowed = true;
+        entry.vsize = vsize;
+        entry.fees = {
+          base: fee / 100_000_000,
+          // CFeeRate(fee, vsize).GetFeePerK() rounds DOWN.
+          "effective-feerate": Math.floor((fee * 1000) / vsize) / 100_000_000,
+          "effective-includes": [wtxidHex],
+        };
+        results.push(entry);
+        continue;
+      }
+      const err = result.error || "rejected";
+      const sep = err.indexOf(": ");
+      const reason = sep >= 0 ? err.slice(0, sep) : err;
+      if (reason === "bad-txns-inputs-missingorspent") {
+        reject("missing-inputs");
+      } else {
+        reject(reason, sep >= 0 ? `${reason}, ${err.slice(sep + 2)}` : reason);
       }
     }
 
     return results;
+  }
+
+  /**
+   * Core core_io.cpp DecodeHexTx: the string must be strict hex (IsHex:
+   * non-empty, even length, only [0-9a-fA-F]) and decode to a transaction
+   * with no trailing bytes. Node's Buffer.from(x, "hex") silently stops at the
+   * first non-hex character ("zz" -> empty buffer, "00zz" -> [0x00]), so it
+   * must never be the only gate on user hex. Returns null on any failure.
+   */
+  private decodeHexTxStrict(hex: string): Transaction | null {
+    if (!isStrictHex(hex)) return null;
+    try {
+      const tx = decodeTxWitnessAware(Buffer.from(hex, "hex"), false, true);
+      // A zero-input tx is the ambiguous segwit-marker case DecodeHexTx
+      // (try_witness only) rejects — hence Core's "at least one input" hint.
+      return tx.inputs.length === 0 ? null : tx;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -11203,41 +11273,97 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "descriptor must be a string");
     }
 
-    // Determine network from params
     const network = this.getNetworkType();
 
-    // Parse range parameter
+    // Core rpc/output_script.cpp deriveaddresses, in Core's order:
+    //   1. ParseDescriptorRange(params[1]) when non-null (-8 / -1),
+    //   2. Parse(desc, ..., require_checksum = true): ANY parse error, incl.
+    //      "Missing checksum", is RPC_INVALID_ADDRESS_OR_KEY (-5),
+    //   3. un-ranged descriptor with params.size() > 1 -> -8; ranged
+    //      descriptor with no range -> -8.
+    // This accepted a checksum-less descriptor and ignored a range given for
+    // an un-ranged one, answering where Core refuses.
     let range: [number, number] | undefined;
-    if (rangeParam !== undefined) {
-      if (typeof rangeParam === "number") {
-        // Single number means [0, rangeParam]
-        range = [0, rangeParam];
-      } else if (Array.isArray(rangeParam) && rangeParam.length === 2) {
-        const [start, end] = rangeParam;
-        if (typeof start !== "number" || typeof end !== "number") {
-          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "range must be [start, end] numbers");
-        }
-        range = [start, end];
-      } else {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "range must be a number or [start, end]");
-      }
-
-      // Validate range
-      if (range[0] < 0 || range[1] < range[0]) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "invalid range");
-      }
-      if (range[1] - range[0] > 10000) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "range too large (max 10000)");
-      }
+    if (rangeParam !== undefined && rangeParam !== null) {
+      range = this.parseDescriptorRange(rangeParam);
     }
-
+    let isRange: boolean;
     try {
-      const addresses = deriveAddresses(descriptorParam, network, range);
-      return addresses;
+      checkDescriptorChecksum(descriptorParam, true);
+      isRange = parseDescriptor(descriptorParam, network).descriptor.isRange();
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, message);
     }
+    if (!isRange && params.length > 1) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Range should not be specified for an un-ranged descriptor"
+      );
+    }
+    if (isRange && range === undefined) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Range must be specified for a ranged descriptor"
+      );
+    }
+
+    try {
+      return deriveAddresses(descriptorParam, network, isRange ? range : undefined);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, message);
+    }
+  }
+
+  /**
+   * Core rpc/util.cpp ParseRange + ParseDescriptorRange: N means [0, N]; a
+   * 2-array of numbers is [begin, end]. begin > end, begin < 0, end >= 2^31 or
+   * a span of 1,000,000+ are RPC_INVALID_PARAMETER (-8); a non-integer number
+   * fails getInt<int64_t> (-1 "JSON integer out of range").
+   */
+  private parseDescriptorRange(value: unknown): [number, number] {
+    const int = (v: number): number => {
+      if (!Number.isSafeInteger(v)) {
+        throw this.rpcError(RPCErrorCodes.MISC_ERROR, "JSON integer out of range");
+      }
+      return v;
+    };
+    let low: number;
+    let high: number;
+    if (typeof value === "number") {
+      low = 0;
+      high = int(value);
+    } else if (
+      Array.isArray(value) &&
+      value.length === 2 &&
+      typeof value[0] === "number" &&
+      typeof value[1] === "number"
+    ) {
+      low = int(value[0]);
+      high = int(value[1]);
+      if (low > high) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          "Range specified as [begin,end] must not have begin after end"
+        );
+      }
+    } else {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Range must be specified as end or as [begin,end]"
+      );
+    }
+    if (low < 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Range should be greater or equal than 0");
+    }
+    if (high >= 2 ** 31) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "End of range is too high");
+    }
+    if (high >= low + 1_000_000) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Range is too large");
+    }
+    return [low, high];
   }
 
   /**
@@ -12117,14 +12243,9 @@ export class RPCServer {
    * scriptSig rather than splicing the two sig sets; that input is therefore NOT
    * guaranteed byte-identical to Core.
    *
-   * DEVIATION (flagged): Core resolves every input's prevout from its own UTXO +
-   * mempool CCoinsViewCache and throws RPC_VERIFY_ERROR (-25) "Input not found
-   * or already spent" for a missing/spent coin. This handler does NOT consult
-   * chainstate — combine is a pure function of the provided variants here — so
-   * it does NOT raise -25 for unresolvable prevouts. Consequence: the
-   * byte-identical SUCCESS vector must be run against a Core oracle whose UTXO
-   * actually resolves the prevouts. The -22 empty / -22 decode-failure / -3
-   * type error paths DO match Core.
+   * Prevouts: like Core, every input's coin must resolve in the chain UTXO
+   * set or the mempool, else RPC_VERIFY_ERROR (-25) "Input not found or
+   * already spent".
    */
   private async combineRawTransaction(params: unknown[]): Promise<string> {
     // Param shape: Core does request.params[0].get_array(); a non-array (incl.
@@ -12149,17 +12270,10 @@ export class RPCServer {
           `JSON value of type ${jsonTypeName(item)} is not of expected type string`,
         );
       }
-      let tx: Transaction;
-      try {
-        const bytes = Buffer.from(item, "hex");
-        // Core DecodeHexTx defaults: try_no_witness=false, try_witness=true.
-        tx = decodeTxWitnessAware(bytes, false, true);
-        if (tx.inputs.length === 0) {
-          // Core's "Make sure the tx has at least one input." — a zero-input tx
-          // is the ambiguous segwit-marker case DecodeHexTx rejects.
-          throw new Error("no inputs");
-        }
-      } catch {
+      // Core DecodeHexTx (try_no_witness=false, try_witness=true) on STRICT
+      // hex — Buffer.from alone truncates at the first non-hex character.
+      const tx = this.decodeHexTxStrict(item);
+      if (!tx) {
         throw this.rpcError(
           -22,
           `TX decode failed for tx ${idx}. Make sure the tx has at least one input.`,
@@ -12178,6 +12292,22 @@ export class RPCServer {
     //    version / locktime / vin / vout define the result; only each input's
     //    scriptSig + witness get rebuilt below).
     const template = variants[0];
+
+    // Core :628-649: every input's prevout is fetched from the chain UTXO set
+    // + mempool (CCoinsViewMemPool); a missing/spent coin is RPC_VERIFY_ERROR
+    // (-25) "Input not found or already spent". This handler used to treat
+    // combine as a pure function of the variants and returned a "combined"
+    // transaction spending coins that do not exist.
+    const utxoManager = this.liveUTXOManager();
+    for (const vin of template.inputs) {
+      const mp = this.mempool.getTransaction(vin.prevOut.txid);
+      const inMempool = mp !== undefined && mp !== null && vin.prevOut.vout < mp.tx.outputs.length;
+      if (inMempool) continue;
+      const coin = await utxoManager.getUTXOAsync({ txid: vin.prevOut.txid, vout: vin.prevOut.vout });
+      if (!coin) {
+        throw this.rpcError(RPCErrorCodes.RPC_TRANSACTION_ERROR, "Input not found or already spent");
+      }
+    }
     const mergedInputs: TxIn[] = [];
 
     for (let i = 0; i < template.inputs.length; i++) {
@@ -12244,7 +12374,17 @@ export class RPCServer {
       throw this.rpcError(-22, "Script decode failed");
     }
     const hexStr = params[0] as string;
-    // Allow empty string (Core handles it as an empty script)
+    // Core rpc/rawtransaction.cpp decodescript: an empty string is the empty
+    // script; anything else goes through ParseHexV(params[0], "argument") and
+    // a non-hex / odd-length string is RPC_INVALID_PARAMETER (-8). Buffer.from
+    // silently truncated at the first bad character, so 'zz' decoded as the
+    // EMPTY script and was answered with a fabricated result.
+    if (hexStr.length > 0 && !isStrictHex(hexStr)) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        `argument must be hexadecimal string (not '${hexStr}')`
+      );
+    }
     const script = Buffer.from(hexStr, "hex");
     // Thread the active network so desc/address/p2sh use the regtest/testnet
     // prefix (bcrt / 0x6f / 0xc4) instead of mainnet (bc / 0x00 / 0x05).
@@ -14573,9 +14713,12 @@ export class RPCServer {
     if (!Array.isArray(inputsParam)) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "inputs must be an array");
     }
-    const replaceable = replaceableParam === true;
     const lockTime = this.parseLocktimeArg(locktimeParam);
-    const sequenceDefault = replaceable ? 0xfffffffd : 0xfffffffe;
+    // Core rawtransaction_util.cpp AddInputs:49-55 — the SAME rule
+    // createrawtransaction uses: rbf.value_or(true) ? 0xfffffffd (BIP125)
+    // : nLockTime ? 0xfffffffe : 0xffffffff. `replaceable` omitted means
+    // rbf = nullopt = TRUE; this defaulted to 0xfffffffe (non-signalling).
+    const sequenceDefault = coreDefaultSequence(replaceableParam, lockTime);
 
     const txInputs: TxIn[] = [];
     for (const inUnknown of inputsParam) {
@@ -14984,8 +15127,9 @@ export class RPCServer {
     const wallet = this.getCurrentWallet();
     const lockTime = this.parseLocktimeArg(locktimeParam);
     const options = (typeof optionsParam === "object" && optionsParam) ? optionsParam as Record<string, unknown> : {};
-    const replaceable = options.replaceable === true;
-    const sequenceDefault = replaceable ? 0xfffffffd : 0xfffffffe;
+    // Same Core AddInputs rule via ConstructTransaction(..., rbf): options
+    // .replaceable omitted = rbf nullopt = BIP125-signalling 0xfffffffd.
+    const sequenceDefault = coreDefaultSequence(options.replaceable, lockTime);
 
     // Parse outputs into {address, amountSats}[].
     const outputsList: Array<{ scriptPubKey: Buffer; value: bigint; address?: string }> = [];

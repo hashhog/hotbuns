@@ -813,7 +813,9 @@ export const MAINNET: ConsensusParams = {
           "a888bcbc200384747c0813c8e7f4650d9bc0847b5147791c3ca869567271af2e",
           "hex"
         ),
-        nChainTx: 1_334_000_000n,
+        // Core getchaintxstats txcount at this hash. Was the 1_334_000_000
+        // progress-display placeholder (1,914,531 short).
+        nChainTx: 1_335_914_531n,
         blockHash: Buffer.from(
           "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817",
           "hex"

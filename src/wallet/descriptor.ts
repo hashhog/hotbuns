@@ -239,11 +239,11 @@ export function validateChecksum(desc: string): string {
  * error strings. Returns the checksum-less payload on success.
  *
  * Unlike `validateChecksum` (which tolerates a missing checksum — the correct
- * default for getdescriptorinfo / deriveaddresses, Core Parse with
- * require_checksum=false), `requireChecksum=true` enforces the BIP-380
- * checksum's PRESENCE — Core's importdescriptors parses with
- * require_checksum=true (wallet/rpc/backup.cpp:158), so an unchecksummed
- * descriptor must fail there with "Missing checksum".
+ * default for getdescriptorinfo, Core Parse with require_checksum=false),
+ * `requireChecksum=true` enforces the BIP-380 checksum's PRESENCE — Core's
+ * importdescriptors (wallet/rpc/backup.cpp:158) AND deriveaddresses
+ * (rpc/output_script.cpp:315) parse with require_checksum=true, so an
+ * unchecksummed descriptor must fail there with "Missing checksum".
  */
 export function checkDescriptorChecksum(
   desc: string,

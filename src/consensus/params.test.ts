@@ -330,7 +330,7 @@ describe("m_assumeutxo_data lookup (byte-order regression)", () => {
     {
       height: 944183,
       displayHash: "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817",
-      nChainTx: 1_334_000_000n,
+      nChainTx: 1_335_914_531n,
     },
   ];
 

@@ -1491,7 +1491,7 @@ export class Mempool {
   async addTransaction(
     tx: Transaction,
     options?: AcceptToMemoryPoolOptions,
-  ): Promise<{ accepted: boolean; error?: string }> {
+  ): Promise<{ accepted: boolean; error?: string; fee?: bigint; vsize?: number }> {
     // 1. Basic structural validation
     const basicResult = validateTxBasic(tx);
     if (!basicResult.valid) {
@@ -2429,8 +2429,11 @@ export class Mempool {
 
     // Dry-run path: validation passed but caller only wants a yes/no answer.
     // Do NOT commit anything to the pool (mirrors Core's test_accept=true path).
+    // Report the base fee + sigop-adjusted vsize the checks above used
+    // (Core MempoolAcceptResult m_base_fees / m_vsize), so testmempoolaccept
+    // answers the real numbers instead of a placeholder 0.
     if (options?.testAccept) {
-      return { accepted: true };
+      return { accepted: true, fee, vsize };
     }
 
     // Add to mempool
