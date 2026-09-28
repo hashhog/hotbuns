@@ -562,6 +562,14 @@ export class ChainDB {
     await this.db.put(key, rawBlock);
   }
 
+  /**
+   * True when this node holds the raw body of `hash` (LevelDB has(): an
+   * iterator seek, no value copy into JS).
+   */
+  async hasBlock(hash: Buffer): Promise<boolean> {
+    return this.db.has(makeKey(DBPrefix.BLOCK_DATA, hash));
+  }
+
   async getBlock(hash: Buffer): Promise<Buffer | null> {
     const key = makeKey(DBPrefix.BLOCK_DATA, hash);
     const value = await this.db.get(key);
@@ -1158,6 +1166,19 @@ export class ChainDB {
       // not touch the active height->hash index.  Active-connect callers that
       // rely on the height index being advanced write it explicitly (see
       // BlockSync.connectBlock's non-flush path).
+      await this.putBlockIndex(hash, record, { writeHeightIndex: false });
+    }
+  }
+
+  /**
+   * Overwrite the nTx field of a block index record (any value, including 0 =
+   * Core's "block data never received"). Used only by the startup nTx
+   * provenance reconcile; metadata-only, never touches the height index.
+   */
+  async setBlockIndexNTx(hash: Buffer, nTx: number): Promise<void> {
+    const record = await this.getBlockIndex(hash);
+    if (record && record.nTx !== nTx) {
+      record.nTx = nTx;
       await this.putBlockIndex(hash, record, { writeHeightIndex: false });
     }
   }

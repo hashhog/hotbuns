@@ -3918,6 +3918,9 @@ class ChainDB {
     const key = makeKey(100 /* BLOCK_DATA */, hash);
     await this.db.put(key, rawBlock);
   }
+  async hasBlock(hash) {
+    return this.db.has(makeKey(100 /* BLOCK_DATA */, hash));
+  }
   async getBlock(hash) {
     const key = makeKey(100 /* BLOCK_DATA */, hash);
     const value = await this.db.get(key);
@@ -4276,6 +4279,13 @@ class ChainDB {
   async updateBlockIndexNTx(hash, nTx) {
     const record = await this.getBlockIndex(hash);
     if (record && record.nTx === 0 && nTx > 0) {
+      record.nTx = nTx;
+      await this.putBlockIndex(hash, record, { writeHeightIndex: false });
+    }
+  }
+  async setBlockIndexNTx(hash, nTx) {
+    const record = await this.getBlockIndex(hash);
+    if (record && record.nTx !== nTx) {
       record.nTx = nTx;
       await this.putBlockIndex(hash, record, { writeHeightIndex: false });
     }
@@ -17264,6 +17274,85 @@ class PruneManager {
     }
     return result;
   }
+}
+
+// src/storage/ntx_provenance.ts
+init_database();
+init_serialization();
+function txCountFromRawBlock(raw) {
+  if (raw.length < 81)
+    throw new Error("block body shorter than header+count");
+  return new BufferReader(raw.subarray(80)).readVarInt();
+}
+function isSnapshotBaseShaped(hashHex, status, height, assumeutxoBases) {
+  if (assumeutxoBases.has(hashHex))
+    return true;
+  if (height === 0)
+    return false;
+  return (status & 4 /* TXS_VALID */) !== 0 && (status & 2 /* TXS_KNOWN */) === 0 && (status & 16 /* HAVE_UNDO */) === 0;
+}
+async function reconcileNTxProvenance(db, assumeutxoBases = new Set) {
+  const r = {
+    scanned: 0,
+    keptValidated: 0,
+    recounted: 0,
+    corrected: 0,
+    filled: 0,
+    reset: 0,
+    unreadable: 0
+  };
+  const writes = [];
+  const lookups = [];
+  for await (const [hash, rec] of db.iterateBlockIndexEntries()) {
+    r.scanned++;
+    const validatedHere = (rec.status & 4 /* TXS_VALID */) !== 0 && !isSnapshotBaseShaped(hash.toString("hex"), rec.status, rec.height, assumeutxoBases);
+    if (rec.nTx > 0 && validatedHere && (rec.status & 8 /* HAVE_DATA */) === 0) {
+      r.keptValidated++;
+      continue;
+    }
+    lookups.push([hash, rec.nTx, validatedHere]);
+  }
+  for (const [hash, nTx, validatedHere] of lookups) {
+    if (!await db.hasBlock(hash)) {
+      if (nTx > 0) {
+        if (validatedHere) {
+          r.keptValidated++;
+        } else {
+          writes.push([hash, 0]);
+          r.reset++;
+        }
+      }
+      continue;
+    }
+    const raw = await db.getBlock(hash);
+    if (raw === null)
+      continue;
+    let count;
+    try {
+      count = txCountFromRawBlock(raw);
+    } catch {
+      r.unreadable++;
+      continue;
+    }
+    if (count <= 0) {
+      r.unreadable++;
+      continue;
+    }
+    if (nTx === 0) {
+      writes.push([hash, count]);
+      r.filled++;
+    } else {
+      r.recounted++;
+      if (nTx !== count) {
+        writes.push([hash, count]);
+        r.corrected++;
+      }
+    }
+  }
+  for (const [hash, n] of writes) {
+    await db.setBlockIndexNTx(hash, n);
+  }
+  return r;
 }
 
 // src/cli/cli.ts
@@ -64504,83 +64593,6 @@ function removePidFileSync(pidPath) {
   } catch {}
 }
 var activePidPath = null;
-async function migrateNTxBackfill(db, network, datadir) {
-  const missing = [];
-  for await (const [hash, record] of db.iterateBlockIndexEntries()) {
-    if (record.nTx === 0 && record.height > 0) {
-      missing.push({ hash, height: record.height });
-    }
-  }
-  if (missing.length === 0) {
-    return;
-  }
-  console.log(`[nTx-migrate] ${missing.length} block index entries with nTx=0 — backfilling...`);
-  let fixedFromBlock = 0;
-  let fixedFromCore = 0;
-  let failed = 0;
-  const stillMissing = [];
-  for (const { hash, height } of missing) {
-    const rawBlock = await db.getBlock(hash);
-    if (rawBlock !== null) {
-      try {
-        const blk = deserializeBlock(new BufferReader(rawBlock));
-        await db.updateBlockIndexNTx(hash, blk.transactions.length);
-        fixedFromBlock++;
-      } catch {
-        failed++;
-      }
-    } else {
-      stillMissing.push({ hash, height });
-    }
-  }
-  if (stillMissing.length > 0 && network === "mainnet") {
-    const coreDatadir = path3.join(path3.dirname(datadir), "bitcoin-core");
-    const cookiePath = path3.join(coreDatadir, ".cookie");
-    let cookie = null;
-    try {
-      cookie = (await Bun.file(cookiePath).text()).trim();
-    } catch {}
-    if (cookie) {
-      for (const { hash, height } of stillMissing) {
-        const hashHex = Buffer.from(hash).reverse().toString("hex");
-        try {
-          const resp = await fetch("http://127.0.0.1:8332/", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: "Basic " + Buffer.from(cookie).toString("base64")
-            },
-            body: JSON.stringify({
-              jsonrpc: "1.0",
-              id: "ntx-migrate",
-              method: "getblockheader",
-              params: [hashHex, true]
-            })
-          });
-          if (resp.ok) {
-            const data = await resp.json();
-            const nTx = data?.result?.nTx;
-            if (typeof nTx === "number" && nTx > 0) {
-              await db.updateBlockIndexNTx(hash, nTx);
-              fixedFromCore++;
-            } else {
-              failed++;
-            }
-          } else {
-            failed++;
-          }
-        } catch {
-          failed++;
-        }
-      }
-    } else {
-      failed += stillMissing.length;
-    }
-  } else if (stillMissing.length > 0) {
-    failed += stillMissing.length;
-  }
-  console.log(`[nTx-migrate] done: ${fixedFromBlock} from block data, ${fixedFromCore} from Core RPC, ${failed} unreachable`);
-}
 async function startNode(config) {
   if (config.daemon && !config.internalDaemonChild) {
     daemonizeAndExit(Bun.argv);
@@ -64635,7 +64647,14 @@ async function startNode(config) {
   const dbPath = path3.join(mergedConfig.datadir, "blocks.db");
   const db = new ChainDB(dbPath);
   await db.open();
-  await migrateNTxBackfill(db, mergedConfig.network, mergedConfig.datadir).catch((e) => console.warn("[nTx-migrate] migration failed:", e?.message));
+  try {
+    const t0 = Date.now();
+    const bases = new Set(params.assumeutxo ? [...params.assumeutxo.keys()] : []);
+    const r = await reconcileNTxProvenance(db, bases);
+    console.log(`[nTx-provenance] scanned ${r.scanned} index entries in ${Date.now() - t0}ms: ${r.keptValidated} kept (validated here, body not retained), ${r.recounted} recounted from local bodies (${r.corrected} corrected), ${r.filled} filled from local bodies, ${r.reset} reset to 0 (no local body, not validated here), ${r.unreadable} unreadable`);
+  } catch (e) {
+    console.warn("[nTx-provenance] reconcile failed:", e?.message);
+  }
   let pruneManager;
   if (mergedConfig.prune !== undefined && mergedConfig.prune > 0) {
     const pruneTargetBytes = mergedConfig.prune === 1 ? PRUNE_TARGET_MANUAL : mergedConfig.prune * 1024 * 1024;
