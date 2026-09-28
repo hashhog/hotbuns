@@ -140,3 +140,31 @@ export async function reconcileNTxProvenance(
   }
   return r;
 }
+
+/**
+ * Done-marker for {@link reconcileNTxProvenance}. The reconcile only has to
+ * undo values the removed Core-proxy migration wrote; every writer since
+ * derives nTx locally, so once a pass completes cleanly there is nothing left
+ * for a later pass to find. Without the marker each boot re-walked the whole
+ * index (970,935 entries, 885 s on mainnet 2026-09-28) before RPC came up.
+ */
+export const NTX_PROVENANCE_MARKER = "ntx_provenance_v1";
+
+/**
+ * Run the reconcile unless it has already completed on this datadir.
+ * Returns null when skipped. The marker is written only after a pass with no
+ * unreadable bodies, so an incomplete pass is retried on the next boot.
+ */
+export async function reconcileNTxProvenanceOnce(
+  db: ChainDB,
+  assumeutxoBases: ReadonlySet<string> = new Set(),
+): Promise<NTxReconcileResult | null> {
+  if ((await db.getMarker(NTX_PROVENANCE_MARKER)) !== null) return null;
+  const r = await reconcileNTxProvenance(db, assumeutxoBases);
+  if (r.unreadable === 0) {
+    const rec = Buffer.alloc(8);
+    rec.writeBigUInt64LE(BigInt(Math.floor(Date.now() / 1000)), 0);
+    await db.putMarker(NTX_PROVENANCE_MARKER, rec);
+  }
+  return r;
+}

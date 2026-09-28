@@ -11,7 +11,7 @@ import { EventEmitter } from "events";
 
 import { ChainDB, BlockStatus, DBPrefix } from "../storage/database.js";
 import { PruneManager, PRUNE_TARGET_MANUAL } from "../storage/pruning.js";
-import { reconcileNTxProvenance } from "../storage/ntx_provenance.js";
+import { reconcileNTxProvenanceOnce } from "../storage/ntx_provenance.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { deserializeBlock } from "../validation/block.js";
 import { ChainStateManager } from "../chain/state.js";
@@ -1668,14 +1668,18 @@ async function startNode(config: NodeConfig): Promise<void> {
   try {
     const t0 = Date.now();
     const bases = new Set(params.assumeutxo ? [...params.assumeutxo.keys()] : []);
-    const r = await reconcileNTxProvenance(db, bases);
-    console.log(
+    const r = await reconcileNTxProvenanceOnce(db, bases);
+    if (r === null) {
+      console.log("[nTx-provenance] already reconciled on this datadir (marker present), skipped");
+    } else {
+      console.log(
       `[nTx-provenance] scanned ${r.scanned} index entries in ${Date.now() - t0}ms: ` +
         `${r.keptValidated} kept (validated here, body not retained), ` +
         `${r.recounted} recounted from local bodies (${r.corrected} corrected), ` +
         `${r.filled} filled from local bodies, ${r.reset} reset to 0 ` +
         `(no local body, not validated here), ${r.unreadable} unreadable`,
-    );
+      );
+    }
   } catch (e) {
     console.warn("[nTx-provenance] reconcile failed:", (e as Error)?.message);
   }

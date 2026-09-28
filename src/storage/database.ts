@@ -109,6 +109,7 @@ export const enum DBPrefix {
   BLOCK_POS = 0x70, // 'p' - block hash -> file position
   PRUNE_STATE = 0x50, // 'P' - pruning state metadata
   CHAIN_WORK = 0x77, // 'w' - block hash -> cumulative chain work (32-byte big-endian uint256)
+  MARKER = 0x4d, // 'M' - one-time migration done-markers (name -> completion record)
 }
 
 /** Block status flags (matches Bitcoin Core). */
@@ -1077,6 +1078,22 @@ export class ChainDB {
   }
 
   // Pruning state operations
+
+  /**
+   * One-time migration done-marker. Returns the stored record (opaque bytes)
+   * or null when the named migration has not completed on this datadir.
+   */
+  async getMarker(name: string): Promise<Buffer | null> {
+    const key = makeKey(DBPrefix.MARKER, Buffer.from(name, "utf8"));
+    const value = await this.db.get(key);
+    return value === undefined ? null : value;
+  }
+
+  /** Record that the named one-time migration completed. */
+  async putMarker(name: string, record: Buffer): Promise<void> {
+    const key = makeKey(DBPrefix.MARKER, Buffer.from(name, "utf8"));
+    await this.db.put(key, record);
+  }
 
   /**
    * Store pruning state metadata.

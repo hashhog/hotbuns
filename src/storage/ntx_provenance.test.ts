@@ -3,7 +3,9 @@ import { mkdtemp, rm, readFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { ChainDB, BlockStatus } from "./database.js";
-import { reconcileNTxProvenance, txCountFromRawBlock } from "./ntx_provenance.js";
+import {
+  reconcileNTxProvenance, reconcileNTxProvenanceOnce, txCountFromRawBlock, NTX_PROVENANCE_MARKER,
+} from "./ntx_provenance.js";
 
 const H = (b: number) => Buffer.alloc(32, b);
 const rawBlock = (n: number) => Buffer.concat([Buffer.alloc(80, 1), Buffer.from([n]), Buffer.alloc(10, 2)]);
@@ -70,6 +72,28 @@ describe("reconcileNTxProvenance (R3: no Core-sourced nTx survives)", () => {
     expect((await db.getBlockHashByHeight(11))!.equals(H(0xaa))).toBe(true);
   });
 
+  test("once-wrapper: first boot reconciles and marks, later boots skip", async () => {
+    await put(H(2), 11, 7, BlockStatus.HEADER_VALID);
+    const r1 = await reconcileNTxProvenanceOnce(db);
+    expect(r1).not.toBeNull();
+    expect(r1!.reset).toBe(1);
+    expect(await db.getMarker(NTX_PROVENANCE_MARKER)).not.toBeNull();
+    // A value planted after the marker is NOT rescanned: proves the skip.
+    await put(H(3), 12, 9, BlockStatus.HEADER_VALID);
+    expect(await reconcileNTxProvenanceOnce(db)).toBeNull();
+    expect(await nTxOf(H(3))).toBe(9);
+  });
+
+  test("once-wrapper: an unreadable body leaves the marker unset (retry next boot)", async () => {
+    await db.putBlockIndex(H(4), { height: 13, header: Buffer.alloc(80), nTx: 0,
+      status: V | BlockStatus.HAVE_DATA, dataPos: 1 }, { writeHeightIndex: false });
+    await db.putBlock(H(4), Buffer.alloc(80)); // header only: tx count unreadable
+    const r = await reconcileNTxProvenanceOnce(db);
+    expect(r!.unreadable).toBe(1);
+    expect(await db.getMarker(NTX_PROVENANCE_MARKER)).toBeNull();
+    expect(await reconcileNTxProvenanceOnce(db)).not.toBeNull();
+  });
+
   test("tx count is the CompactSize after the 80-byte header", () => {
     expect(txCountFromRawBlock(rawBlock(1))).toBe(1);
     const big = Buffer.concat([Buffer.alloc(80), Buffer.from([0xfd, 0x10, 0x27])]);
@@ -82,6 +106,6 @@ describe("reconcileNTxProvenance (R3: no Core-sourced nTx survives)", () => {
     expect(cli.includes("function migrateNTxBackfill")).toBe(false);
     expect(cli.includes('"bitcoin-core"')).toBe(false);
     expect(/fetch\("http:\/\/127\.0\.0\.1:8332/.test(cli)).toBe(false);
-    expect(cli.includes("reconcileNTxProvenance(db")).toBe(true);
+    expect(cli.includes("reconcileNTxProvenanceOnce(db")).toBe(true);
   });
 });
