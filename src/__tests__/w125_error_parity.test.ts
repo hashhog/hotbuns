@@ -449,25 +449,22 @@ describe("W125-G25: RPC_DESERIALIZATION_ERROR (-22) — PARTIAL (BUG-2)", () => 
     expect("DESERIALIZATION_ERROR" in RPCErrorCodes).toBe(true);
     expect(RPCErrorCodes.DESERIALIZATION_ERROR).toBe(-22);
   });
-  it("BUG-2: sendrawtransaction TX-decode uses RPC_TRANSACTION_REJECTED (should be -22)", () => {
+  it("BUG-2 FIXED: sendrawtransaction TX-decode uses RPC_DESERIALIZATION_ERROR (-22)", () => {
     const idx = RPC_SERVER_SRC.indexOf(
       "private async sendRawTransaction(params: unknown[])"
     );
     expect(idx).toBeGreaterThan(0);
     const window = RPC_SERVER_SRC.slice(idx, idx + 3000);
-    // The TX-decode catch raises TRANSACTION_REJECTED; Core uses
-    // RPC_DESERIALIZATION_ERROR for decode failures.
-    expect(window).toMatch(
-      /TRANSACTION_REJECTED[\s\S]{0,200}TX decode failed/
-    );
+    // Core uses RPC_DESERIALIZATION_ERROR for decode failures.
+    expect(window).toMatch(/DESERIALIZATION_ERROR[\s\S]{0,200}TX decode failed/);
+    expect(window).not.toMatch(/TRANSACTION_REJECTED[\s\S]{0,200}TX decode failed/);
   });
-  it("BUG-2: submitPackage TX-decode also uses RPC_TRANSACTION_REJECTED", () => {
+  it("BUG-2 FIXED: submitPackage TX-decode uses RPC_DESERIALIZATION_ERROR (-22)", () => {
     const idx = RPC_SERVER_SRC.indexOf("private async submitPackage(");
     expect(idx).toBeGreaterThan(0);
     const window = RPC_SERVER_SRC.slice(idx, idx + 4000);
-    expect(window).toMatch(
-      /TRANSACTION_REJECTED[\s\S]{0,200}TX decode failed/
-    );
+    expect(window).toMatch(/DESERIALIZATION_ERROR[\s\S]{0,200}TX decode failed/);
+    expect(window).not.toMatch(/TRANSACTION_REJECTED[\s\S]{0,200}TX decode failed/);
   });
 });
 

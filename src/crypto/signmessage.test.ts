@@ -86,8 +86,21 @@ describe("signmessage helpers", () => {
     );
   });
 
-  it("returns ERR_MALFORMED_SIGNATURE for wrong-length sigs", () => {
+  // Core common/signmessage.cpp:40-48: well-formed base64 of the wrong length
+  // is a signature RecoverCompact cannot use -> NOT_RECOVERED (verifymessage
+  // answers false); only a string that is not base64 at all is MALFORMED
+  // (verifymessage -3 "Malformed base64 encoding").
+  it("returns ERR_PUBKEY_NOT_RECOVERED for wrong-length (valid base64) sigs", () => {
     expect(messageVerify(REGTEST_ADDR, "AAAA", "msg")).toBe(
+      MessageVerificationResult.ERR_PUBKEY_NOT_RECOVERED
+    );
+  });
+
+  it("returns ERR_MALFORMED_SIGNATURE only for non-base64 sigs", () => {
+    expect(messageVerify(REGTEST_ADDR, "not-base64!!", "msg")).toBe(
+      MessageVerificationResult.ERR_MALFORMED_SIGNATURE
+    );
+    expect(messageVerify(REGTEST_ADDR, "AAA", "msg")).toBe(
       MessageVerificationResult.ERR_MALFORMED_SIGNATURE
     );
   });

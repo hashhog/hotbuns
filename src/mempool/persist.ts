@@ -413,6 +413,71 @@ export async function loadMempool(
   return result;
 }
 
+/** Options of Core's `importmempool` (node::ImportMempoolOptions). */
+export interface ImportMempoolOptions {
+  /** Use the current time as each entry's time (Core default: true). */
+  useCurrentTime: boolean;
+  /** Apply the fee deltas stored in the file (Core default: false). */
+  applyFeeDeltaPriority: boolean;
+  /** Restore the file's unbroadcast set (Core default: false). */
+  applyUnbroadcastSet: boolean;
+  /** Mempool expiry window in seconds (Core -mempoolexpiry, 336h). */
+  expirySeconds?: number;
+}
+
+/**
+ * Core node/mempool_persist.cpp LoadMempool(pool, load_path, ..., opts) as
+ * the `importmempool` RPC uses it: read an arbitrary mempool.dat. Returns
+ * null exactly where Core returns false -- the file cannot be opened, or it
+ * does not deserialize -- and the caller turns that into
+ * RPC_MISC_ERROR "Unable to import mempool file, see debug log for details."
+ */
+export async function importMempoolFile(
+  mempool: Mempool,
+  filePath: string,
+  opts: ImportMempoolOptions
+): Promise<LoadResult | null> {
+  const result: LoadResult = { succeeded: 0, failed: 0, expired: 0, unbroadcast: 0 };
+  let buf: Buffer;
+  try {
+    buf = await fsp.readFile(filePath);
+  } catch {
+    console.error(`[mempool] Failed to open mempool file ${filePath}. Continuing anyway.`);
+    return null;
+  }
+  let decoded: ReturnType<typeof decodeMempoolDump>;
+  try {
+    decoded = decodeMempoolDump(buf);
+  } catch (err) {
+    console.error(
+      `[mempool] Failed to deserialize mempool data on file ${filePath}: ${(err as Error).message}. Continuing anyway.`
+    );
+    return null;
+  }
+  const expirySeconds = opts.expirySeconds ?? 336 * 60 * 60;
+  const nowSec = Math.floor(Date.now() / 1000);
+  for (const { tx, time, feeDelta } of decoded.entries) {
+    const entryTime = opts.useCurrentTime ? nowSec : Number(time);
+    if (entryTime <= nowSec - expirySeconds) {
+      result.expired++;
+      continue;
+    }
+    if (opts.applyFeeDeltaPriority && feeDelta !== 0n) {
+      mempool.loadFeeDelta(getTxId(tx), feeDelta);
+    }
+    const accept = await mempool.acceptToMemoryPool(tx);
+    if (accept.accepted) result.succeeded++;
+    else result.failed++;
+  }
+  if (opts.applyFeeDeltaPriority) {
+    for (const [txidHex, delta] of decoded.mapDeltas) {
+      mempool.loadFeeDelta(Buffer.from(txidHex, "hex"), delta);
+    }
+  }
+  if (opts.applyUnbroadcastSet) result.unbroadcast = decoded.unbroadcast.size;
+  return result;
+}
+
 /**
  * Check whether `<datadir>/mempool.dat` exists.  Tiny helper used by the
  * `loadmempool` RPC so it can return INVALID_PARAMETER instead of a

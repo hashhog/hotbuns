@@ -196,7 +196,10 @@ describe("wallet/PSBT RPC wiring", () => {
     it("rejects malformed createpsbt inputs", async () => {
       const r = await rpc(port, "createpsbt", [[{ vout: 0 }], []]);
       expect(r.error).toBeDefined();
-      expect(r.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+      // Core-verified 2026-09-27: ParseHashO on a missing txid is get_str()
+      // on null -> -3 "JSON value of type null is not of expected type string".
+      expect(r.error.code).toBe(RPCErrorCodes.TYPE_ERROR);
+      expect(r.error.message).toBe("JSON value of type null is not of expected type string");
     });
 
     it("rejects malformed decodepsbt input", async () => {
@@ -234,7 +237,8 @@ describe("wallet/PSBT RPC wiring", () => {
     it("rejects empty input array", async () => {
       const r = await rpc(port, "combinepsbt", [[]]);
       expect(r.error).toBeDefined();
-      expect(r.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+      // Core rpc/rawtransaction.cpp combinepsbt: -8 "Parameter 'txs' cannot be empty".
+      expect(r.error.code).toBe(RPCErrorCodes.INVALID_PARAMETER);
     });
   });
 

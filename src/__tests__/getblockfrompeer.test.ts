@@ -232,12 +232,12 @@ describe("getblockfrompeer", () => {
   });
 
   // (extra) bad arg types are rejected before any send
-  it("rejects a non-integer peer_id with -32602", async () => {
+  it("rejects a non-integer peer_id with -3 (Core's central type check)", async () => {
     mockPeerManager.addPeer(new CapturePeer("10.0.0.1", 8333));
 
     const result = await rpcRequest(testPort, "getblockfrompeer", [displayHashHex, "zero"]);
 
     expect(result.error).toBeDefined();
-    expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS); // -32602
+    expect(result.error.code).toBe(RPCErrorCodes.TYPE_ERROR); // -3, Core-verified 2026-09-27
   });
 });

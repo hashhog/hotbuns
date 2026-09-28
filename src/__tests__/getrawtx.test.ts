@@ -583,7 +583,7 @@ describe("getrawtransaction", () => {
 
       expect(res.error).toBeDefined();
       expect(res.error?.code).toBe(RPCErrorCodes.INVALID_PARAMETER);
-      expect(res.error?.message).toContain("txid must be of length 64");
+      expect(res.error?.message).toContain("parameter 1 must be of length 64");
     });
 
     it("should error -8 with wrong txid length", async () => {
@@ -593,7 +593,7 @@ describe("getrawtransaction", () => {
 
       expect(res.error).toBeDefined();
       expect(res.error?.code).toBe(RPCErrorCodes.INVALID_PARAMETER);
-      expect(res.error?.message).toContain("txid must be of length 64 (not 8");
+      expect(res.error?.message).toContain("parameter 1 must be of length 64 (not 8");
     });
 
     it("should error -8 with a 64-char non-hex txid", async () => {
@@ -604,7 +604,7 @@ describe("getrawtransaction", () => {
 
       expect(res.error).toBeDefined();
       expect(res.error?.code).toBe(RPCErrorCodes.INVALID_PARAMETER);
-      expect(res.error?.message).toContain("txid must be hexadecimal string");
+      expect(res.error?.message).toContain("parameter 1 must be hexadecimal string");
     });
 
     it("should error -8 with a malformed blockhash arg (non-hex 64)", async () => {

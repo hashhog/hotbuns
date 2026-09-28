@@ -115,7 +115,7 @@ describe("Descriptor Checksum", () => {
 
   test("validateChecksum throws on invalid checksum", () => {
     const desc = `pk(${TEST_PUBKEY})#00000000`;
-    expect(() => validateChecksum(desc)).toThrow("Invalid checksum");
+    expect(() => validateChecksum(desc)).toThrow("does not match computed checksum");
   });
 
   test("validateChecksum accepts descriptor without checksum", () => {

@@ -18,6 +18,7 @@ import {
   type OutPoint,
   serializeTx,
   deserializeTx,
+  deserializeTxLegacy,
   getTxId,
   getWTxId,
   getTxWeight,
@@ -1196,8 +1197,16 @@ export function deserializePSBT(data: Buffer): PSBT {
         if (keyData.length !== 0) {
           throw new Error("Unsigned tx key must have no data");
         }
+        // Core psbt.h:1272 UnserializeFromVector(s, TX_NO_WITNESS(mtx)): the
+        // unsigned tx is ALWAYS legacy-serialized and must fill the value
+        // exactly. A witness-aware decode misreads a zero-input tx (the
+        // 0x00 input count looks like a segwit marker), so a valid PSBT
+        // with no inputs -- e.g. a joinpsbts operand -- failed to decode.
         const txReader = new BufferReader(value);
-        tx = deserializeTx(txReader);
+        tx = deserializeTxLegacy(txReader);
+        if (!txReader.eof) {
+          throw new Error("Size of value was not the stated size");
+        }
 
         // Verify all inputs have empty scriptSig and witness
         for (const input of tx.inputs) {

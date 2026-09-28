@@ -12,7 +12,12 @@ import type { ChainDB } from "../storage/database.js";
 import { DBPrefix, BlockStatus } from "../storage/database.js";
 import type { Mempool, MempoolEntry } from "../mempool/mempool.js";
 import { PackageValidationResult, MAX_PACKAGE_COUNT } from "../mempool/mempool.js";
-import { dumpMempool, loadMempool, mempoolDumpExists } from "../mempool/persist.js";
+import {
+  dumpMempool,
+  importMempoolFile,
+  loadMempool,
+  mempoolDumpExists,
+} from "../mempool/persist.js";
 import type { OrphanPool, OrphanEntry } from "../mempool/orphan_pool.js";
 import { RBFTransactionState } from "../mempool/rbf.js";
 import type { PeerManager } from "../p2p/manager.js";
@@ -73,7 +78,7 @@ import {
   SIGHASH_SINGLE,
   SIGHASH_ANYONECANPAY,
 } from "../validation/tx.js";
-import { hash256, hash160 } from "../crypto/primitives.js";
+import { hash256, hash160, sha256Hash } from "../crypto/primitives.js";
 import { getLogger } from "../logger/logger.js";
 import { BufferReader } from "../wire/serialization.js";
 import type { InvPayload, NetworkMessage } from "../p2p/messages.js";
@@ -99,12 +104,16 @@ import {
   WSHDescriptor,
   ConstPubkeyProvider,
   type NetworkType,
+  collectConstPrivateKeys,
+  type ExpandedOutput,
 } from "../wallet/descriptor.js";
 import {
   type PSBT,
+  type KeyOriginInfo,
   createPSBT,
   encodePSBTBase64,
   decodePSBTBase64,
+  deserializePSBT,
   combinePSBTs,
   finalizePSBT,
   signPSBTInput,
@@ -115,6 +124,7 @@ import {
   joinPSBTs,
   updateInputUTXO,
   isInputFinalized,
+  finalizePSBTInput,
   getInputUTXO,
   analyzePSBTCore,
   BTC_AMOUNT_SENTINEL,
@@ -143,9 +153,10 @@ import {
   messageSign,
   messageVerify,
   MessageVerificationResult,
+  strictBase64Decode,
 } from "../crypto/signmessage.js";
 import { base58CheckDecode, decodeAddress, AddressType } from "../address/encoding.js";
-import { isValidPrivateKey, privateKeyToPublicKey } from "../crypto/primitives.js";
+import { isValidPrivateKey, isValidPublicKey, privateKeyToPublicKey } from "../crypto/primitives.js";
 import { GCSFilter } from "../storage/indexes.js";
 import {
   handlePayJoinRequest,
@@ -165,10 +176,12 @@ import {
 // ---------------------------------------------------------------------------
 // Core's central argument-count gate (#103)
 // ---------------------------------------------------------------------------
-// Maps method -> (required, declared), derived from Core's own `help` signature
-// line by tools/core-arity.py. Coverage is 87 of 103 methods; a method absent
-// from the table FAILS OPEN, because treating an unlisted method as zero-arg
-// would reject calls Core accepts.
+// Maps method -> (required, declared, per-argument types, help text), derived
+// from a running Core's `help <method>` "Arguments:" section by
+// scripts/gen-core-rpc-table.py. Covers every method Core's `help` lists; a
+// method absent from the table (hotbuns-only, or hidden in Core) FAILS OPEN,
+// because treating an unlisted method as zero-arg would reject calls Core
+// accepts.
 import CORE_ARITY_TABLE from "./core-arity.json";
 
 export interface CoreArity {
@@ -204,6 +217,56 @@ export function coreSignatureFor(method: string): string | undefined {
     method
   ];
   return e && typeof e.sig === "string" ? e.sig : undefined;
+}
+
+/**
+ * Core's full help text for a method -- the exact message of its -1 arity
+ * error (rpc/util.cpp:644-645 throws HelpResult{ToString()}). Falls back to
+ * the signature line.
+ */
+export function coreHelpFor(method: string): string | undefined {
+  const e = (CORE_ARITY_TABLE as Record<string, { help?: unknown } | undefined>)[
+    method
+  ];
+  return e && typeof e.help === "string" ? e.help : coreSignatureFor(method);
+}
+
+/**
+ * Core's central argument TYPE check (rpc/util.cpp:647-657, RPCArg::
+ * MatchesType at :899). Runs after the arity check and before the handler:
+ * every positional argument whose declared type maps to a single JSON type
+ * must have that type unless it is optional and null. All mismatches are
+ * reported together as
+ *   -3 "Wrong type passed:\n{\n    \"Position 1 (height)\": \"JSON value of
+ *       type string is not of expected type number\"\n}"
+ * Returns that message, or undefined when every argument matches (or the
+ * method is not in the table). Arguments Core declares with skip_type_check,
+ * AMOUNT and RANGE carry a null type and are never checked here.
+ */
+export function coreArgTypeMismatch(
+  method: string,
+  params: unknown[],
+): string | undefined {
+  const e = (
+    CORE_ARITY_TABLE as Record<string, { args?: unknown } | undefined>
+  )[method];
+  if (!e || !Array.isArray(e.args)) return undefined;
+  const mismatch: Record<string, string> = {};
+  let any = false;
+  (e.args as Array<[string, string | null, boolean]>).forEach(
+    ([name, type, required], i) => {
+      if (!type) return;
+      const v = i < params.length ? params[i] : null;
+      if (!required && (v === null || v === undefined)) return;
+      const got = jsonTypeName(v);
+      if (got !== type) {
+        mismatch[`Position ${i + 1} (${name})`] =
+          `JSON value of type ${got} is not of expected type ${type}`;
+        any = true;
+      }
+    },
+  );
+  return any ? `Wrong type passed:\n${JSON.stringify(mismatch, null, 4)}` : undefined;
 }
 
 
@@ -433,6 +496,7 @@ export const MAX_BATCH_SIZE = 1000;
 function isStrictHex(value: string): boolean {
   return value.length > 0 && value.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(value);
 }
+
 
 /**
  * Core rpc/rawtransaction_util.cpp AddInputs:49-55 default nSequence:
@@ -1286,8 +1350,18 @@ export class RPCServer {
           error: {
             code: -1,
             // Core's message IS the help text (first line = signature).
-            message: coreSignatureFor(request.method) ?? "Wrong number of arguments",
+            message: coreHelpFor(request.method) ?? "Wrong number of arguments",
           },
+        };
+      }
+      // Then the central type check (rpc/util.cpp:647-657), still before
+      // the handler: -3 "Wrong type passed:\n{...}".
+      const typeErr = coreArgTypeMismatch(request.method, request.params);
+      if (typeErr !== undefined) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: { code: RPCErrorCodes.TYPE_ERROR, message: typeErr },
         };
       }
     }
@@ -1456,6 +1530,7 @@ export class RPCServer {
     this.registerMethod("savemempool", () => this.saveMempool());
     this.registerMethod("dumpmempool", () => this.saveMempool());
     this.registerMethod("loadmempool", () => this.doLoadMempool());
+    this.registerMethod("importmempool", (params) => this.importMempool(params));
     this.registerMethod("getorphantxs", (params) => this.getOrphanTxs(params));
     this.registerMethod("prioritisetransaction", (params) =>
       this.prioritiseTransaction(params)
@@ -1646,6 +1721,12 @@ export class RPCServer {
     this.registerMethod("analyzepsbt", (params) => this.analyzePSBTRpc(params));
     this.registerMethod("converttopsbt", (params) => this.convertToPSBTRpc(params));
     this.registerMethod("joinpsbts", (params) => this.joinPSBTsRpc(params));
+    // utxoupdatepsbt / descriptorprocesspsbt: Core rpc/rawtransaction.cpp,
+    // both driven by ProcessPSBT (UTXO fill + descriptor-provider update).
+    this.registerMethod("utxoupdatepsbt", (params) => this.utxoUpdatePSBTRpc(params));
+    this.registerMethod("descriptorprocesspsbt", (params) =>
+      this.descriptorProcessPSBTRpc(params)
+    );
 
     // Utility methods
     this.registerMethod("help", (params) => this.help(params));
@@ -2770,34 +2851,22 @@ export class RPCServer {
         typeof optionsParam !== "object" ||
         Array.isArray(optionsParam)
       ) {
-        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Expected type object for options");
+        throw this.rpcError(
+          RPCErrorCodes.TYPE_ERROR,
+          `JSON value of type ${jsonTypeName(optionsParam)} is not of expected type object`
+        );
       }
       const opts = optionsParam as Record<string, unknown>;
-      // fStrict: reject unknown keys with RPC_TYPE_ERROR (-3).
-      for (const key of Object.keys(opts)) {
-        if (key !== "mempool_only" && key !== "return_spending_tx") {
-          throw this.rpcError(
-            RPCErrorCodes.TYPE_ERROR,
-            `Unexpected key ${key}`
-          );
-        }
-      }
-      if ("mempool_only" in opts) {
-        if (typeof opts.mempool_only !== "boolean") {
-          throw this.rpcError(
-            RPCErrorCodes.TYPE_ERROR,
-            "Expected type bool for mempool_only"
-          );
-        }
-        mempoolOnlyOpt = opts.mempool_only;
-      }
-      if ("return_spending_tx" in opts) {
-        if (typeof opts.return_spending_tx !== "boolean") {
-          throw this.rpcError(
-            RPCErrorCodes.TYPE_ERROR,
-            "Expected type bool for return_spending_tx"
-          );
-        }
+      // Core: RPCTypeCheckObj(options, {mempool_only: bool,
+      // return_spending_tx: bool}, fAllowNull=true, fStrict=true).
+      this.rpcTypeCheckObj(
+        opts,
+        { mempool_only: "bool", return_spending_tx: "bool" },
+        true,
+        true,
+      );
+      if (typeof opts.mempool_only === "boolean") mempoolOnlyOpt = opts.mempool_only;
+      if (typeof opts.return_spending_tx === "boolean") {
         returnSpendingTxOpt = opts.return_spending_tx;
       }
     }
@@ -2819,24 +2888,20 @@ export class RPCServer {
     }
     const prevouts: Prevout[] = [];
     for (const raw of outputsParam) {
+      // Core: get_obj(), RPCTypeCheckObj(o, {txid: str, vout: num},
+      // fAllowNull=false, fStrict=true), ParseHashO(o, "txid") (-8),
+      // vout getInt<int>() (-1 out of range), then the sign check (-8).
       if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Expected type object");
-      }
-      const o = raw as Record<string, unknown>;
-      const txidVal = o.txid;
-      const voutVal = o.vout;
-      if (typeof txidVal !== "string") {
-        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Expected type string for txid");
-      }
-      if (!/^[0-9a-fA-F]{64}$/.test(txidVal)) {
         throw this.rpcError(
-          RPCErrorCodes.INVALID_PARAMETER,
-          txidVal.length !== 64 ? "txid must be of length 64" : "txid must be hexadecimal string"
+          RPCErrorCodes.TYPE_ERROR,
+          `JSON value of type ${jsonTypeName(raw)} is not of expected type object`
         );
       }
-      if (typeof voutVal !== "number" || !Number.isInteger(voutVal)) {
-        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Expected type number for vout");
-      }
+      const o = raw as Record<string, unknown>;
+      this.rpcTypeCheckObj(o, { txid: "string", vout: "number" }, false, true);
+      const txidVal = o.txid as string;
+      this.parseHashV(txidVal, "txid");
+      const voutVal = this.uvGetInt(o.vout, "vout", INT32_MIN, INT32_MAX);
       if (voutVal < 0) {
         // Core: RPC_INVALID_PARAMETER (-8).
         throw this.rpcError(
@@ -4425,7 +4490,8 @@ export class RPCServer {
     // Core ParseHashV: a malformed txid (wrong length / non-hex) -> -8 at the
     // parse boundary, BEFORE any mempool/txindex lookup.  A well-formed but
     // absent txid still falls through to the -5 "No such ... transaction".
-    const txid = this.parseHashV(txidParam, "txid");
+    // Core rpc/rawtransaction.cpp:287 names it "parameter 1", not "txid".
+    const txid = this.parseHashV(txidParam, "parameter 1");
 
     // Special exception for the genesis-block coinbase transaction.  Core
     // refuses to retrieve it because the genesis coinbase is never stored
@@ -5483,33 +5549,18 @@ export class RPCServer {
       maxFeeRate = maxfeerateParam;
     }
 
-    // Parse the hex string
-    let txData: Buffer;
-    try {
-      txData = Buffer.from(hexstringParam, "hex");
-    } catch {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid hex encoding");
-    }
-
-    // Validate hex has even length (each byte = 2 hex chars)
-    if (hexstringParam.length % 2 !== 0) {
+    // Core rpc/mempool.cpp sendrawtransaction: DecodeHexTx(mtx, hex) (strict
+    // hex, witness form, full consumption); any failure -- non-hex, odd
+    // length, truncated -- is RPC_DESERIALIZATION_ERROR (-22)
+    // "TX decode failed. Make sure the tx has at least one input."
+    const decoded = this.decodeHexTxStrict(hexstringParam);
+    if (!decoded) {
       throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
-        "Invalid hex encoding (odd length)"
+        RPCErrorCodes.DESERIALIZATION_ERROR,
+        "TX decode failed. Make sure the tx has at least one input."
       );
     }
-
-    // Deserialize the transaction
-    let tx: Transaction;
-    try {
-      const reader = new BufferReader(txData);
-      tx = deserializeTx(reader);
-    } catch (e) {
-      throw this.rpcError(
-        RPCErrorCodes.RPC_TRANSACTION_REJECTED,
-        `TX decode failed: ${(e as Error).message}`
-      );
-    }
+    const tx: Transaction = decoded;
 
     const txid = getTxId(tx);
     const txidHex = Buffer.from(txid).reverse().toString("hex");
@@ -5584,9 +5635,10 @@ export class RPCServer {
       );
     }
 
+    // Core rpc/mempool.cpp:1361 -- RPC_INVALID_PARAMETER (-8).
     if (packageParam.length === 0 || packageParam.length > MAX_PACKAGE_COUNT) {
       throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
+        RPCErrorCodes.INVALID_PARAMETER,
         `Array must contain between 1 and ${MAX_PACKAGE_COUNT} transactions.`
       );
     }
@@ -5625,40 +5677,23 @@ export class RPCServer {
     for (let i = 0; i < packageParam.length; i++) {
       const rawtx = packageParam[i];
 
+      // Core rpc/mempool.cpp:1380-1384: rawtx.get_str() (a non-string is a
+      // UniValue type error, -3), then DecodeHexTx; a failure is
+      // RPC_DESERIALIZATION_ERROR (-22) naming the offending hex.
       if (typeof rawtx !== "string") {
         throw this.rpcError(
-          RPCErrorCodes.INVALID_PARAMS,
-          `Transaction at index ${i} must be a hex string`
+          RPCErrorCodes.TYPE_ERROR,
+          `JSON value of type ${jsonTypeName(rawtx)} is not of expected type string`
         );
       }
-
-      let txData: Buffer;
-      try {
-        txData = Buffer.from(rawtx, "hex");
-      } catch {
+      const decodedTx = this.decodeHexTxStrict(rawtx);
+      if (!decodedTx) {
         throw this.rpcError(
-          RPCErrorCodes.INVALID_PARAMS,
-          `TX decode failed at index ${i}: Invalid hex encoding`
+          RPCErrorCodes.DESERIALIZATION_ERROR,
+          `TX decode failed: ${rawtx} Make sure the tx has at least one input.`
         );
       }
-
-      if (rawtx.length % 2 !== 0) {
-        throw this.rpcError(
-          RPCErrorCodes.INVALID_PARAMS,
-          `TX decode failed at index ${i}: Odd hex length`
-        );
-      }
-
-      let tx: Transaction;
-      try {
-        const reader = new BufferReader(txData);
-        tx = deserializeTx(reader);
-      } catch (e) {
-        throw this.rpcError(
-          RPCErrorCodes.RPC_TRANSACTION_REJECTED,
-          `TX decode failed at index ${i}: ${(e as Error).message}`
-        );
-      }
+      const tx: Transaction = decodedTx;
 
       // Check max burn amount for OP_RETURN outputs
       for (const out of tx.outputs) {
@@ -5971,31 +6006,25 @@ export class RPCServer {
   private async prioritiseTransaction(params: unknown[]): Promise<boolean> {
     const [txidParam, dummyParam, feeDeltaParam] = params;
 
-    if (typeof txidParam !== "string" || txidParam.length !== 64 || !/^[0-9a-fA-F]+$/.test(txidParam)) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "txid must be a 64-character hex string");
-    }
+    // Core rpc/mining.cpp:525-531, in order: ParseHashV(txid) (-8 with
+    // Core's length/hex message), fee_delta getInt<int64_t>() (a
+    // non-integer is UniValue's -1 "JSON integer out of range"), then the
+    // legacy dummy (-8 unless 0). Argument TYPES were already checked by the
+    // dispatcher (coreArgTypeMismatch).
+    // parseHashV returns internal (wire) order, which is how the mempool keys.
+    const txid = this.parseHashV(txidParam, "txid");
 
-    // Legacy priority "dummy" arg: must be zero or null/omitted. Core throws
-    // RPC_INVALID_PARAMETER otherwise (mining.cpp:529-531).
+    if (typeof feeDeltaParam !== "number" || !Number.isInteger(feeDeltaParam)) {
+      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "JSON integer out of range");
+    }
+    const feeDelta = BigInt(feeDeltaParam);
+
     if (dummyParam !== undefined && dummyParam !== null && dummyParam !== 0) {
       throw this.rpcError(
         RPCErrorCodes.INVALID_PARAMETER,
         "Priority is no longer supported, dummy argument to prioritisetransaction must be 0."
       );
     }
-
-    // fee_delta is an integer number of satoshis (Core: getInt<int64_t>()).
-    if (typeof feeDeltaParam !== "number" || !Number.isInteger(feeDeltaParam)) {
-      throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMETER,
-        "fee_delta must be an integer number of satoshis"
-      );
-    }
-    const feeDelta = BigInt(feeDeltaParam);
-
-    // JSON-RPC txids are display order (big-endian); the mempool keys in
-    // internal byte order, so reverse before applying.
-    const txid = Buffer.from(txidParam, "hex").reverse();
     this.mempool.prioritiseTransaction(txid, feeDelta);
     return true;
   }
@@ -6240,6 +6269,53 @@ export class RPCServer {
         `Unable to load mempool from disk: ${(err as Error).message}`
       );
     }
+  }
+
+  /**
+   * importmempool: import the mempool from a file (Core rpc/mempool.cpp
+   * importmempool). Refused during IBD with RPC_CLIENT_IN_INITIAL_DOWNLOAD
+   * (-10); a file that cannot be opened or deserialized is RPC_MISC_ERROR
+   * (-1) "Unable to import mempool file, see debug log for details.";
+   * success returns an empty object. Options (all bool, get_bool -> -3):
+   * use_current_time (default true), apply_fee_delta_priority (false),
+   * apply_unbroadcast_set (false).
+   */
+  private async importMempool(params: unknown[]): Promise<Record<string, unknown>> {
+    if (this.isInitialBlockDownload()) {
+      throw this.rpcError(
+        -10,
+        "Can only import the mempool after the block download and sync is done."
+      );
+    }
+    const filepath = params[0] as string;
+    const options =
+      params[1] !== null && typeof params[1] === "object" && !Array.isArray(params[1])
+        ? (params[1] as Record<string, unknown>)
+        : {};
+    const optBool = (key: string, dflt: boolean): boolean => {
+      const v = options[key];
+      if (v === undefined || v === null) return dflt;
+      if (typeof v !== "boolean") {
+        throw this.rpcError(
+          RPCErrorCodes.TYPE_ERROR,
+          `JSON value of type ${jsonTypeName(v)} is not of expected type bool`
+        );
+      }
+      return v;
+    };
+    const opts = {
+      useCurrentTime: optBool("use_current_time", true),
+      applyFeeDeltaPriority: optBool("apply_fee_delta_priority", false),
+      applyUnbroadcastSet: optBool("apply_unbroadcast_set", false),
+    };
+    const result = await importMempoolFile(this.mempool, filepath, opts);
+    if (!result) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        "Unable to import mempool file, see debug log for details."
+      );
+    }
+    return {};
   }
 
   /**
@@ -6741,19 +6817,11 @@ export class RPCServer {
           RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
           "Invalid address"
         );
+      // Core rpc/signmessage.cpp:46-49: both are RPC_TYPE_ERROR (-3).
       case MessageVerificationResult.ERR_ADDRESS_NO_KEY:
-        // Core uses RPC_TYPE_ERROR (-3); we do not export that constant
-        // separately, so reuse INVALID_ADDRESS_OR_KEY which is the
-        // closest semantic match.
-        throw this.rpcError(
-          RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
-          "Address does not refer to key"
-        );
+        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Address does not refer to key");
       case MessageVerificationResult.ERR_MALFORMED_SIGNATURE:
-        throw this.rpcError(
-          RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
-          "Malformed base64 encoding"
-        );
+        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Malformed base64 encoding");
       case MessageVerificationResult.ERR_PUBKEY_NOT_RECOVERED:
       case MessageVerificationResult.ERR_NOT_SIGNED:
         return false;
@@ -7913,16 +7981,19 @@ export class RPCServer {
   private async addNode(params: unknown[]): Promise<null> {
     const [nodeParam, commandParam] = params;
 
+    // Core rpc/net.cpp addnode: the command is checked FIRST and
+    // case-sensitively; anything but "onetry"/"add"/"remove" throws the help
+    // text as a runtime_error, i.e. RPC_MISC_ERROR (-1). Argument TYPES were
+    // already checked by the dispatcher.
+    const command = commandParam;
+    if (command !== "add" && command !== "remove" && command !== "onetry") {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        coreHelpFor("addnode") ?? 'addnode "node" "command" ( v2transport )',
+      );
+    }
     if (typeof nodeParam !== "string" || nodeParam.length === 0) {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Node address required");
-    }
-    if (typeof commandParam !== "string") {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, 'Command required ("add", "remove", or "onetry")');
-    }
-
-    const command = commandParam.toLowerCase();
-    if (command !== "add" && command !== "remove" && command !== "onetry") {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, 'Command must be "add", "remove", or "onetry"');
     }
 
     // Parse host:port
@@ -8460,7 +8531,7 @@ export class RPCServer {
       // Core v31.99 pushKV order for an invalid address: isvalid, error_locations,
       // error (error_locations BEFORE error — rpc/util.cpp validateaddress).
       result.error_locations = [];
-      result.error = "Invalid or unsupported Segwit (Bech32) or Base58 encoding.";
+      result.error = this.coreBase58AddressError(address);
       return result;
     }
 
@@ -8697,6 +8768,57 @@ export class RPCServer {
       witnessVersion,
       witnessProgram,
     };
+  }
+
+  /**
+   * Core key_io.cpp DecodeDestination's error_str for an address that did not
+   * decode. Only the Base58 branch (the string does not start with the
+   * network's Bech32 HRP, case-insensitively) is reproduced exactly:
+   *   - Base58Check decodes (<= 21 payload bytes) but is not a P2PKH/P2SH
+   *     payload: "Invalid length for Base58 address (P2PKH or P2SH)" when the
+   *     version byte is ours, else "Invalid or unsupported Base58-encoded
+   *     address."
+   *   - otherwise plain Base58 (no checksum, <= 100 bytes) decodes:
+   *     "Invalid checksum or length of Base58 address (P2PKH or P2SH)"
+   *   - otherwise "Invalid or unsupported Segwit (Bech32) or Base58 encoding."
+   * For HRP-prefixed strings Core runs bech32::LocateErrors (message plus
+   * error_locations), which is not implemented here; those keep the generic
+   * message.
+   */
+  private coreBase58AddressError(str: string): string {
+    const generic = "Invalid or unsupported Segwit (Bech32) or Base58 encoding.";
+    const hrp = this.getBech32HRP();
+    if (str.slice(0, hrp.length).toLowerCase() === hrp) return generic;
+    const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    const b58 = (maxLen: number): Buffer | null => {
+      let zeroes = 0;
+      while (zeroes < str.length && str[zeroes] === "1") zeroes++;
+      let num = 0n;
+      for (const c of str.slice(zeroes)) {
+        const idx = ALPHABET.indexOf(c);
+        if (idx === -1) return null;
+        num = num * 58n + BigInt(idx);
+      }
+      let hex = num === 0n ? "" : num.toString(16);
+      if (hex.length % 2) hex = "0" + hex;
+      const out = Buffer.concat([Buffer.alloc(zeroes, 0), Buffer.from(hex, "hex")]);
+      return out.length > maxLen ? null : out;
+    };
+    const withCheck = b58(21 + 4);
+    if (withCheck && withCheck.length >= 4) {
+      const payload = withCheck.subarray(0, withCheck.length - 4);
+      const check = withCheck.subarray(withCheck.length - 4);
+      if (hash256(payload).subarray(0, 4).equals(check)) {
+        if (
+          payload.length >= 1 &&
+          (payload[0] === this.getP2PKHVersion() || payload[0] === this.getP2SHVersion())
+        ) {
+          return "Invalid length for Base58 address (P2PKH or P2SH)";
+        }
+        return "Invalid or unsupported Base58-encoded address.";
+      }
+    }
+    return b58(100) ? "Invalid checksum or length of Base58 address (P2PKH or P2SH)" : generic;
   }
 
   /**
@@ -9112,9 +9234,11 @@ export class RPCServer {
     if (templateRequest && typeof templateRequest === "object") {
       const request = templateRequest as Record<string, unknown>;
 
-      if (request.mode !== undefined) {
+      // Core rpc/mining.cpp getblocktemplate: a string mode is taken as-is,
+      // null means "template", any other type is -8 "Invalid mode".
+      if (request.mode !== undefined && request.mode !== null) {
         if (typeof request.mode !== "string") {
-          throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid mode");
+          throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Invalid mode");
         }
         mode = request.mode;
       }
@@ -9130,13 +9254,26 @@ export class RPCServer {
 
     // Only "template" mode is supported (proposal mode would need block validation)
     if (mode !== "template") {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Only 'template' mode is supported");
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Invalid mode");
     }
 
-    // Check that segwit rule is set
+    // Core: on the main chain only (!IsTestChain), refuse to build a template
+    // with no peers (RPC_CLIENT_NOT_CONNECTED -9) or during IBD
+    // (RPC_CLIENT_IN_INITIAL_DOWNLOAD -10) -- before the rule checks. Core
+    // names itself via CLIENT_NAME; we name ourselves.
+    if (this.params.networkMagic === 0xd9b4bef9) {
+      if (this.peerManager.getConnectedPeers().length === 0) {
+        throw this.rpcError(-9, "hotbuns is not connected!");
+      }
+      if (this.isInitialBlockDownload()) {
+        throw this.rpcError(-10, "hotbuns is in initial sync and waiting for blocks...");
+      }
+    }
+
+    // Check that segwit rule is set -- RPC_INVALID_PARAMETER (-8).
     if (!clientRules.has("segwit")) {
       throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
+        RPCErrorCodes.INVALID_PARAMETER,
         "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})"
       );
     }
@@ -9981,9 +10118,11 @@ export class RPCServer {
    */
   private parseHashV(value: unknown, name: string): Buffer {
     if (typeof value !== "string") {
-      // Core's get_str() would raise a type error; we keep the existing
-      // "<name> must be a string" surface for the non-string case.
-      throw this.rpcError(RPCErrorCodes.TYPE_ERROR, `${name} must be a string`);
+      // Core: v.get_str() -- UniValue's own -3 type error message.
+      throw this.rpcError(
+        RPCErrorCodes.TYPE_ERROR,
+        `JSON value of type ${jsonTypeName(value)} is not of expected type string`
+      );
     }
     if (value.length !== 64) {
       throw this.rpcError(
@@ -9999,6 +10138,63 @@ export class RPCServer {
     }
     // Display order (big-endian) hex -> internal (wire/little-endian) buffer.
     return Buffer.from(value, "hex").reverse();
+  }
+
+  /**
+   * Core rpc/util.cpp:56-81 RPCTypeCheckObj. Keys are visited in sorted
+   * order (std::map); a null/absent key is -3 "Missing <key>" unless
+   * allowNull; a wrong type is -3 "JSON value of type X for field K is not of
+   * expected type Y"; with strict, any other key is -3 "Unexpected key K".
+   */
+  private rpcTypeCheckObj(
+    o: Record<string, unknown>,
+    expected: Record<string, string>,
+    allowNull: boolean,
+    strict: boolean,
+  ): void {
+    for (const key of Object.keys(expected).sort()) {
+      const v = o[key];
+      const isNull = v === undefined || v === null;
+      if (!allowNull && isNull) {
+        throw this.rpcError(RPCErrorCodes.TYPE_ERROR, `Missing ${key}`);
+      }
+      if (!(isNull && allowNull) && jsonTypeName(v) !== expected[key]) {
+        throw this.rpcError(
+          RPCErrorCodes.TYPE_ERROR,
+          `JSON value of type ${jsonTypeName(v)} for field ${key} is not of expected type ${expected[key]}`,
+        );
+      }
+    }
+    if (strict) {
+      for (const key of Object.keys(o)) {
+        if (!(key in expected)) {
+          throw this.rpcError(RPCErrorCodes.TYPE_ERROR, `Unexpected key ${key}`);
+        }
+      }
+    }
+  }
+
+  /**
+   * Core psbt.cpp DecodeBase64PSBT as the PSBT RPCs use it: a failure is
+   * RPC_DESERIALIZATION_ERROR (-22) "TX decode failed <error>", where
+   * <error> is "invalid base64" when the string is not strict base64 and
+   * the parser's reason otherwise (rpc/rawtransaction.cpp decodepsbt,
+   * combinepsbt, finalizepsbt, analyzepsbt, joinpsbts, utxoupdatepsbt,
+   * descriptorprocesspsbt; wallet walletprocesspsbt).
+   */
+  private decodePsbtRpcArg(base64: string): PSBT {
+    const raw = strictBase64Decode(base64);
+    if (!raw) {
+      throw this.rpcError(RPCErrorCodes.DESERIALIZATION_ERROR, "TX decode failed invalid base64");
+    }
+    try {
+      return deserializePSBT(raw);
+    } catch (e) {
+      throw this.rpcError(
+        RPCErrorCodes.DESERIALIZATION_ERROR,
+        `TX decode failed ${(e as Error).message}`,
+      );
+    }
   }
 
   /**
@@ -11399,71 +11595,112 @@ export class RPCServer {
   private async createMultisig(params: unknown[]): Promise<Record<string, unknown>> {
     const [nrequiredParam, pubkeysParam, addressTypeParam] = params;
 
-    // Validate nrequired
-    if (typeof nrequiredParam !== "number" || !Number.isInteger(nrequiredParam)) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "nrequired must be an integer");
-    }
-    // Core answers -1 for an out-of-int32 nrequired even when pubkeys is ALSO
-    // empty: the conversion runs before the array is examined.
-    this.uvGetInt(nrequiredParam, "nrequired", INT32_MIN, INT32_MAX);
-    const nRequired = nrequiredParam;
+    // Core rpc/output_script.cpp createmultisig + rpc/util.cpp, IN ORDER:
+    //   1. nrequired getInt<int>()                  (-3 type / -1 range)
+    //   2. every key: get_str() (-3), HexToPubKey   (-5, three messages)
+    //   3. address_type: ParseOutputType            (-5 unknown / bech32m)
+    //   4. AddAndGetMultisigDestination bounds      (-8, three messages)
+    // So createmultisig(3, ["deadbeef","deadbeef"]) is -5 (a key problem),
+    // not -8, and a bounds error is only reported once every key is valid.
+    const nRequired = this.uvGetInt(nrequiredParam, "nrequired", INT32_MIN, INT32_MAX);
 
-    // Validate pubkeys array
     if (!Array.isArray(pubkeysParam)) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "keys must be an array");
-    }
-    const pubkeyHexes = pubkeysParam as unknown[];
-    if (pubkeyHexes.length === 0) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "keys array must not be empty");
-    }
-    if (nRequired < 1 || nRequired > pubkeyHexes.length) {
       throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
-        `nrequired (${nRequired}) must be between 1 and ${pubkeyHexes.length}`
+        RPCErrorCodes.TYPE_ERROR,
+        `JSON value of type ${jsonTypeName(pubkeysParam)} is not of expected type array`
       );
     }
-    if (pubkeyHexes.length > 20) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Number of keys exceeds 20");
-    }
-
-    // Parse + validate each pubkey (must be compressed, 33-byte)
     const pubkeyBuffers: Buffer[] = [];
-    for (let i = 0; i < pubkeyHexes.length; i++) {
-      const hex = pubkeyHexes[i];
+    for (const hex of pubkeysParam as unknown[]) {
       if (typeof hex !== "string") {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, `Key ${i} must be a hex string`);
-      }
-      if (!/^[0-9a-fA-F]+$/.test(hex) || hex.length % 2 !== 0) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, `Key ${i} is not valid hex`);
-      }
-      const buf = Buffer.from(hex, "hex");
-      if (buf.length !== 33) {
         throw this.rpcError(
-          RPCErrorCodes.INVALID_PARAMS,
-          `Key ${i} must be a compressed public key (33 bytes)`
+          RPCErrorCodes.TYPE_ERROR,
+          `JSON value of type ${jsonTypeName(hex)} is not of expected type string`
         );
       }
-      const prefix = buf[0];
-      if (prefix !== 0x02 && prefix !== 0x03) {
+      // HexToPubKey (rpc/util.cpp:219-232).
+      if (!isStrictHex(hex)) {
         throw this.rpcError(
-          RPCErrorCodes.INVALID_PARAMS,
-          `Key ${i} is not a compressed public key`
+          RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+          `Pubkey "${hex}" must be a hex string`
+        );
+      }
+      if (hex.length !== 66 && hex.length !== 130) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+          `Pubkey "${hex}" must have a length of either 33 or 65 bytes`
+        );
+      }
+      const buf = Buffer.from(hex, "hex");
+      if (!isValidPublicKey(buf)) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+          `Pubkey "${hex}" must be cryptographically valid.`
         );
       }
       pubkeyBuffers.push(buf);
     }
 
-    // Parse address_type (default: "legacy")
-    const addressType = addressTypeParam === undefined ? "legacy" : addressTypeParam;
+    // ParseOutputType (outputtype.cpp): legacy | p2sh-segwit | bech32 |
+    // bech32m; default "legacy".
+    const requestedType =
+      addressTypeParam === undefined || addressTypeParam === null
+        ? "legacy"
+        : String(addressTypeParam);
     if (
-      addressType !== "legacy" &&
-      addressType !== "bech32" &&
-      addressType !== "p2sh-segwit"
+      requestedType !== "legacy" &&
+      requestedType !== "bech32" &&
+      requestedType !== "p2sh-segwit" &&
+      requestedType !== "bech32m"
     ) {
       throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
-        `Invalid address_type: ${addressType}. Must be legacy, bech32, or p2sh-segwit`
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        `Unknown address type '${requestedType}'`
       );
+    }
+    if (requestedType === "bech32m") {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "createmultisig cannot create bech32m multisig addresses"
+      );
+    }
+
+    // AddAndGetMultisigDestination (rpc/util.cpp:236-256).
+    if (nRequired < 1) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "a multisignature address must require at least one key to redeem"
+      );
+    }
+    if (pubkeyBuffers.length < nRequired) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        `not enough keys supplied (got ${pubkeyBuffers.length} keys, but need at least ${nRequired} to redeem)`
+      );
+    }
+    if (pubkeyBuffers.length > 20) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Number of keys involved in the multisignature address creation > 20\nReduce the number"
+      );
+    }
+    // Any uncompressed key forces a legacy (P2SH) address, and Core then
+    // warns that the requested type could not be made.
+    const hasUncompressed = pubkeyBuffers.some((k) => k.length === 65);
+    const addressType = hasUncompressed ? "legacy" : requestedType;
+    const warnings: string[] =
+      addressType !== requestedType
+        ? ["Unable to make chosen address type, please ensure no uncompressed public keys are present."]
+        : [];
+    if (addressType === "legacy") {
+      // GetScriptForMultisig size: OP_m + (push + key)* + OP_n + OP_CHECKMULTISIG.
+      const scriptSize = 3 + pubkeyBuffers.reduce((a, k) => a + 1 + k.length, 0);
+      if (scriptSize > 520) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          `redeemScript exceeds size limit: ${scriptSize} > 520`
+        );
+      }
     }
 
     const network = this.getNetworkType();
@@ -11516,11 +11753,13 @@ export class RPCServer {
         descriptor = addChecksum(`sh(wsh(${multiDesc.toString()}))`);
       }
 
-      return {
+      const result: Record<string, unknown> = {
         address,
         redeemScript: redeemScriptHex,
         descriptor,
       };
+      if (warnings.length > 0) result.warnings = warnings;
+      return result;
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, message);
@@ -12159,12 +12398,24 @@ export class RPCServer {
   }
 
   private async decodeRawTransaction(params: unknown[]): Promise<Record<string, unknown>> {
-    if (!params[0] || typeof params[0] !== "string") {
+    // Core rpc/rawtransaction.cpp decoderawtransaction: DecodeHexTx(hex,
+    // try_no_witness, try_witness) -- strict IsHex, full consumption -- and
+    // any failure is RPC_DESERIALIZATION_ERROR "TX decode failed". iswitness
+    // null tries both forms; true only witness; false only legacy.
+    if (typeof params[0] !== "string") {
       throw this.rpcError(-22, "TX decode failed");
     }
-    const txBytes = Buffer.from(params[0] as string, "hex");
-    const reader = new BufferReader(txBytes);
-    const tx = deserializeTx(reader);
+    const isWitness = params[1];
+    const tryWitness = isWitness === undefined || isWitness === null ? true : isWitness === true;
+    const tryNoWitness = isWitness === undefined || isWitness === null ? true : isWitness !== true;
+    let tx: Transaction;
+    try {
+      if (!isStrictHex(params[0])) throw new Error("not hex");
+      tx = decodeTxWitnessAware(Buffer.from(params[0], "hex"), tryNoWitness, tryWitness);
+    } catch {
+      throw this.rpcError(RPCErrorCodes.DESERIALIZATION_ERROR, "TX decode failed");
+    }
+    const txBytes = Buffer.from(params[0], "hex");
     const txid = getTxId(tx);
     const wtxid = getWTxId(tx);
 
@@ -12482,6 +12733,16 @@ export class RPCServer {
    * Returns the serialized (non-witness; the tx is unsigned) transaction hex.
    */
   private async createRawTransaction(params: unknown[]): Promise<string> {
+    return serializeTx(this.constructTransaction(params), false).toString("hex");
+  }
+
+  /**
+   * Core rawtransaction_util.cpp ConstructTransaction -- the one builder
+   * behind BOTH createrawtransaction and createpsbt (rpc/rawtransaction.cpp
+   * createpsbt calls ConstructTransaction with the same five arguments), so
+   * the two RPCs share every argument check and error code.
+   */
+  private constructTransaction(params: unknown[]): Transaction {
     const [inputsParam, outputsParam, locktimeParam, replaceableParam, versionParam] =
       params;
 
@@ -12723,7 +12984,7 @@ export class RPCServer {
       );
     }
 
-    return serializeTx(tx, false).toString("hex");
+    return tx;
   }
 
   /**
@@ -14702,125 +14963,13 @@ export class RPCServer {
    * @param params [inputs, outputs, locktime?, replaceable?]
    */
   private async createPSBTRpc(params: unknown[]): Promise<string> {
-    const [inputsParam, outputsParam, locktimeParam, replaceableParam, versionParam] =
-      params;
-
-    // version (Core's 5th argument, rpc/rawtransaction.cpp:122).
-    //
-    // This handler hardcoded `version: 2` and IGNORED the argument, so a caller
-    // asking for version 3 got a version 2 transaction and a success reply, and
-    // version 4 -- which Core rejects -- was accepted. Version 3 is TRUC
-    // (BIP 431) and carries different policy rules, so the transaction returned
-    // had different relay behaviour from the one requested.
-    //
-    // Core reads it as self.Arg<uint32_t>("version") -- UNSIGNED 32-bit, unlike
-    // the int32 used for vout -- then bounds it to
-    // [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]
-    // (policy/policy.h:152-153) inside ConstructTransaction
-    // (rawtransaction_util.cpp:158-161). The unsigned width decides the error:
-    // 2147483648 fits a uint32, survives the conversion and reaches the DOMAIN
-    // error (-8), while -1 and 4294967296 fail the CONVERSION first (-1).
-    let txVersion = 2; // Core's DEFAULT_RAWTX_VERSION (CURRENT_VERSION)
-    if (versionParam !== undefined && versionParam !== null) {
-      const v = this.uvGetInt(versionParam, "version", 0, UINT32_MAX);
-      if (v < 1 || v > 3) {
-        throw this.rpcError(
-          RPCErrorCodes.INVALID_PARAMETER,
-          "Invalid parameter, version out of range(1~3)"
-        );
-      }
-      txVersion = v;
-    }
-
-    if (!Array.isArray(inputsParam)) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "inputs must be an array");
-    }
-    const lockTime = this.parseLocktimeArg(locktimeParam);
-    // Core rawtransaction_util.cpp AddInputs:49-55 — the SAME rule
-    // createrawtransaction uses: rbf.value_or(true) ? 0xfffffffd (BIP125)
-    // : nLockTime ? 0xfffffffe : 0xffffffff. `replaceable` omitted means
-    // rbf = nullopt = TRUE; this defaulted to 0xfffffffe (non-signalling).
-    const sequenceDefault = coreDefaultSequence(replaceableParam, lockTime);
-
-    const txInputs: TxIn[] = [];
-    for (const inUnknown of inputsParam) {
-      if (!inUnknown || typeof inUnknown !== "object") {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "input must be object");
-      }
-      const inObj = inUnknown as Record<string, unknown>;
-      if (typeof inObj.txid !== "string" || typeof inObj.vout !== "number") {
-        throw this.rpcError(
-          RPCErrorCodes.INVALID_PARAMS,
-          "input requires {txid, vout}"
-        );
-      }
-      // RPC txid is big-endian display hex; reverse to internal little-endian.
-      const txidLE = Buffer.from(inObj.txid as string, "hex").reverse();
-      if (txidLE.length !== 32) {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid txid length");
-      }
-      const seqOverride = typeof inObj.sequence === "number"
-        ? (inObj.sequence as number)
-        : sequenceDefault;
-      txInputs.push({
-        prevOut: { txid: txidLE, vout: inObj.vout as number },
-        scriptSig: Buffer.alloc(0),
-        sequence: seqOverride >>> 0,
-        witness: [],
-      });
-    }
-
-    // Outputs: array of {address: amount} objects, or {data: hex} for OP_RETURN.
-    if (!Array.isArray(outputsParam) && (typeof outputsParam !== "object" || !outputsParam)) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "outputs must be array or object");
-    }
-    const txOutputs: TxOut[] = [];
-    const outArray: Array<Record<string, unknown>> = Array.isArray(outputsParam)
-      ? (outputsParam as Array<Record<string, unknown>>)
-      : [outputsParam as Record<string, unknown>];
-
-    for (const out of outArray) {
-      for (const [k, v] of Object.entries(out)) {
-        if (k === "data") {
-          if (typeof v !== "string") {
-            throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "data output must be hex string");
-          }
-          // OP_RETURN <data>
-          const data = Buffer.from(v, "hex");
-          const script = Buffer.concat([Buffer.from([0x6a]), this.encodePushData(data)]);
-          txOutputs.push({ value: 0n, scriptPubKey: script });
-        } else {
-          if (typeof v !== "number") {
-            throw this.rpcError(
-              RPCErrorCodes.INVALID_PARAMS,
-              "output amount must be number (BTC)"
-            );
-          }
-          let decoded;
-          try {
-            decoded = decodeAddress(k);
-          } catch (e) {
-            throw this.rpcError(
-              RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
-              `Invalid address: ${k}`
-            );
-          }
-          const scriptHex = this.buildScriptPubKeyHex(decoded.type, decoded.hash);
-          txOutputs.push({
-            value: BigInt(Math.round(v * 100_000_000)),
-            scriptPubKey: Buffer.from(scriptHex, "hex"),
-          });
-        }
-      }
-    }
-
-    const tx: Transaction = {
-      // Was hardcoded 2, discarding the caller's `version`.
-      version: txVersion,
-      inputs: txInputs,
-      outputs: txOutputs,
-      lockTime: lockTime >>> 0,
-    };
+    // Core rpc/rawtransaction.cpp createpsbt: ConstructTransaction(inputs,
+    // outputs, locktime, replaceable, version) -- the createrawtransaction
+    // builder, with its ParseHashV txid check (-8), vout/sequence/locktime/
+    // version checks and output decoding -- then wraps the result as a PSBT.
+    // This handler used to carry its own looser copy (e.g. a bad txid was
+    // -32602 "Invalid txid length").
+    const tx = this.constructTransaction(params);
     const psbt = createPSBT(tx);
     return encodePSBTBase64(psbt);
   }
@@ -14859,15 +15008,7 @@ export class RPCServer {
     if (typeof psbtParam !== "string") {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "psbt must be a string");
     }
-    let psbt: PSBT;
-    try {
-      psbt = decodePSBTBase64(psbtParam);
-    } catch (e) {
-      throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
-        `PSBT decode failed: ${(e as Error).message}`
-      );
-    }
+    const psbt: PSBT = this.decodePsbtRpcArg(psbtParam);
     return decodePSBTToJSON(psbt) as unknown as Record<string, unknown>;
   }
 
@@ -14880,25 +15021,27 @@ export class RPCServer {
    */
   private async combinePSBTRpc(params: unknown[]): Promise<string> {
     const [psbtsParam] = params;
-    if (!Array.isArray(psbtsParam) || psbtsParam.length === 0) {
+    // Core rpc/rawtransaction.cpp combinepsbt: get_array() (type checked by
+    // the dispatcher), each element get_str() (-3) and DecodeBase64PSBT
+    // (-22), and an empty array is -8 "Parameter 'txs' cannot be empty".
+    if (!Array.isArray(psbtsParam)) {
       throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
-        "txs must be a non-empty array of base64 PSBTs"
+        RPCErrorCodes.TYPE_ERROR,
+        `JSON value of type ${jsonTypeName(psbtsParam)} is not of expected type array`
       );
     }
     const psbts: PSBT[] = [];
     for (const s of psbtsParam) {
       if (typeof s !== "string") {
-        throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "every PSBT must be base64 string");
-      }
-      try {
-        psbts.push(decodePSBTBase64(s));
-      } catch (e) {
         throw this.rpcError(
-          RPCErrorCodes.INVALID_PARAMS,
-          `PSBT decode failed: ${(e as Error).message}`
+          RPCErrorCodes.TYPE_ERROR,
+          `JSON value of type ${jsonTypeName(s)} is not of expected type string`
         );
       }
+      psbts.push(this.decodePsbtRpcArg(s));
+    }
+    if (psbts.length === 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Parameter 'txs' cannot be empty");
     }
     let combined: PSBT;
     try {
@@ -15000,11 +15143,7 @@ export class RPCServer {
       if (typeof s !== "string") {
         throw this.rpcError(-22, "TX decode failed");
       }
-      try {
-        psbts.push(decodePSBTBase64(s));
-      } catch (e) {
-        throw this.rpcError(-22, `TX decode failed ${(e as Error).message}`);
-      }
+      psbts.push(this.decodePsbtRpcArg(s));
     }
     let joined: PSBT;
     try {
@@ -15049,15 +15188,7 @@ export class RPCServer {
     }
     const extract = extractParam === undefined ? true : extractParam === true;
 
-    let psbt: PSBT;
-    try {
-      psbt = decodePSBTBase64(psbtParam);
-    } catch (e) {
-      throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
-        `PSBT decode failed: ${(e as Error).message}`
-      );
-    }
+    const psbt: PSBT = this.decodePsbtRpcArg(psbtParam);
 
     const complete = finalizePSBT(psbt);
 
@@ -15106,15 +15237,7 @@ export class RPCServer {
     if (typeof psbtParam !== "string") {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "psbt must be a string");
     }
-    let psbt: PSBT;
-    try {
-      psbt = decodePSBTBase64(psbtParam);
-    } catch (e) {
-      throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
-        `TX decode failed ${(e as Error).message}`
-      );
-    }
+    const psbt: PSBT = this.decodePsbtRpcArg(psbtParam);
     const analysis = analyzePSBTCore(psbt);
     // Cast through unknown — `AnalyzedPSBT` is a structurally-compatible
     // JSON object (string-keyed, JSON-safe values).
@@ -15415,6 +15538,359 @@ export class RPCServer {
    *
    * @param params [psbt, sign?, sighashtype?, bip32derivs?, finalize?]
    */
+  /**
+   * Core rpc/util.cpp EvalDescriptorStringOrObject over a `descriptors`
+   * array, accumulated into one signing provider:
+   *   - element: a string, or {desc, range?}; anything else is -8 "Scan
+   *     object needs to be either a string or an object"; an object without
+   *     desc is -8 "Descriptor needs to be provided in scan object";
+   *   - Parse failure is -5 with the parser's reason;
+   *   - an unranged descriptor is expanded at index 0 only, a ranged one over
+   *     `range` (default [0, 1000]).
+   */
+  private buildDescriptorProvider(descsParam: unknown): {
+    pubkeys: Map<string, { pubkey: Buffer; origin: KeyOriginInfo | undefined }>;
+    byHash160: Map<string, Buffer>;
+    scripts160: Map<string, Buffer>;
+    scripts256: Map<string, Buffer>;
+    privkeys: Map<string, Buffer>;
+  } {
+    const provider = {
+      pubkeys: new Map<string, { pubkey: Buffer; origin: KeyOriginInfo | undefined }>(),
+      byHash160: new Map<string, Buffer>(),
+      scripts160: new Map<string, Buffer>(),
+      scripts256: new Map<string, Buffer>(),
+      privkeys: new Map<string, Buffer>(),
+    };
+    if (descsParam === undefined || descsParam === null) return provider;
+    if (!Array.isArray(descsParam)) {
+      throw this.rpcError(
+        RPCErrorCodes.TYPE_ERROR,
+        `JSON value of type ${jsonTypeName(descsParam)} is not of expected type array`
+      );
+    }
+    const network = this.getNetworkType();
+    const addScript = (script: Buffer | undefined) => {
+      if (!script) return;
+      this.psbtProviderAddScript(provider, script);
+    };
+    for (const item of descsParam) {
+      let descStr: string;
+      let range: [number, number] = [0, 1000];
+      if (typeof item === "string") {
+        descStr = item;
+      } else if (item !== null && typeof item === "object" && !Array.isArray(item)) {
+        const o = item as Record<string, unknown>;
+        if (o.desc === undefined || o.desc === null) {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_PARAMETER,
+            "Descriptor needs to be provided in scan object"
+          );
+        }
+        if (typeof o.desc !== "string") {
+          throw this.rpcError(
+            RPCErrorCodes.TYPE_ERROR,
+            `JSON value of type ${jsonTypeName(o.desc)} is not of expected type string`
+          );
+        }
+        descStr = o.desc;
+        if (o.range !== undefined && o.range !== null) {
+          range = this.parseDescriptorRange(o.range);
+        }
+      } else {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          "Scan object needs to be either a string or an object"
+        );
+      }
+      let desc;
+      try {
+        desc = parseDescriptor(descStr, network).descriptor;
+      } catch (e) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+          e instanceof Error ? e.message : String(e)
+        );
+      }
+      if (!desc.isRange()) range = [0, 0];
+      for (let idx = range[0]; idx <= range[1]; idx++) {
+        let outs: ExpandedOutput[];
+        try {
+          outs = desc.expand(idx, network);
+        } catch {
+          throw this.rpcError(
+            RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+            `Cannot derive script without private keys: '${descStr}'`
+          );
+        }
+        for (const out of outs) {
+          for (const pk of out.pubkeys) {
+            const hex = pk.toString("hex");
+            if (!provider.pubkeys.has(hex)) {
+              provider.pubkeys.set(hex, { pubkey: pk, origin: out.origins.get(hex) });
+              provider.byHash160.set(hash160(pk).toString("hex"), pk);
+            }
+          }
+          addScript(out.redeemScript);
+          addScript(out.witnessScript);
+        }
+      }
+      for (const { pubkey, privkey } of collectConstPrivateKeys(desc)) {
+        provider.privkeys.set(pubkey.toString("hex"), privkey);
+      }
+    }
+    return provider;
+  }
+
+  private psbtProviderAddScript(
+    provider: { scripts160: Map<string, Buffer>; scripts256: Map<string, Buffer> },
+    script: Buffer
+  ): void {
+    provider.scripts160.set(hash160(script).toString("hex"), script);
+    provider.scripts256.set(sha256Hash(script).toString("hex"), script);
+  }
+
+  /**
+   * The provider-side update Core's SignPSBTInput / UpdatePSBTOutput perform
+   * without a signature: walk `spk` through P2SH -> redeemScript and P2WSH ->
+   * witnessScript when the provider knows them, and record a BIP-32
+   * derivation for every provider key the solved script involves (unless
+   * origins are hidden). Returns whether the solved script is segwit (Core's
+   * SignatureData.witness) and the single key a signature would use.
+   */
+  private psbtUpdateFromProvider(
+    spk: Buffer,
+    provider: ReturnType<RPCServer["buildDescriptorProvider"]>,
+    target: {
+      redeemScript?: Buffer;
+      witnessScript?: Buffer;
+      bip32Derivation: Map<string, { pubkey: Buffer; origin: KeyOriginInfo }>;
+    },
+    includeOrigins: boolean
+  ): { witness: boolean; signKey?: Buffer } {
+    const addKey = (pk: Buffer) => {
+      const e = provider.pubkeys.get(pk.toString("hex"));
+      if (!e || !includeOrigins) return;
+      const origin = e.origin ?? { fingerprint: hash160(pk).subarray(0, 4), path: [] };
+      target.bip32Derivation.set(pk.toString("hex"), { pubkey: pk, origin });
+    };
+    const isP2PKH = (s: Buffer) =>
+      s.length === 25 && s[0] === 0x76 && s[1] === 0xa9 && s[2] === 0x14 && s[23] === 0x88 && s[24] === 0xac;
+    const isP2WPKH = (s: Buffer) => s.length === 22 && s[0] === 0x00 && s[1] === 0x14;
+    const isP2SH = (s: Buffer) => s.length === 23 && s[0] === 0xa9 && s[1] === 0x14 && s[22] === 0x87;
+    const isP2WSH = (s: Buffer) => s.length === 34 && s[0] === 0x00 && s[1] === 0x20;
+    const isP2TR = (s: Buffer) => s.length === 34 && s[0] === 0x51 && s[1] === 0x20;
+    const keyInScript = (s: Buffer): Buffer[] => {
+      // Keys pushed directly in the script (P2PK, bare/wrapped multisig).
+      const found: Buffer[] = [];
+      let i = 0;
+      while (i < s.length) {
+        const op = s[i]!;
+        if (op >= 1 && op <= 75) {
+          const data = s.subarray(i + 1, i + 1 + op);
+          if ((op === 33 || op === 65) && provider.pubkeys.has(data.toString("hex"))) found.push(data);
+          i += 1 + op;
+        } else {
+          i += 1;
+        }
+      }
+      return found;
+    };
+    const solveInner = (s: Buffer, inWitness: boolean): { witness: boolean; signKey?: Buffer } => {
+      if (isP2PKH(s) || isP2WPKH(s)) {
+        const h = (isP2PKH(s) ? s.subarray(3, 23) : s.subarray(2, 22)).toString("hex");
+        const pk = provider.byHash160.get(h);
+        if (pk) addKey(pk);
+        return { witness: inWitness || isP2WPKH(s), signKey: pk };
+      }
+      if (isP2WSH(s)) {
+        const ws = provider.scripts256.get(s.subarray(2, 34).toString("hex"));
+        if (ws) {
+          if (!target.witnessScript) target.witnessScript = ws;
+          keyInScript(ws).forEach(addKey);
+        }
+        return { witness: true };
+      }
+      if (isP2TR(s)) return { witness: true };
+      const keys = keyInScript(s);
+      keys.forEach(addKey);
+      return { witness: inWitness, signKey: keys.length === 1 && s.length === keys[0]!.length + 2 ? keys[0] : undefined };
+    };
+    if (isP2SH(spk)) {
+      const rs = provider.scripts160.get(spk.subarray(2, 22).toString("hex"));
+      if (!rs) return { witness: false };
+      if (!target.redeemScript) target.redeemScript = rs;
+      return solveInner(rs, false);
+    }
+    return solveInner(spk, false);
+  }
+
+  /**
+   * Core rpc/rawtransaction.cpp ProcessPSBT for utxoupdatepsbt /
+   * descriptorprocesspsbt:
+   *   1. decode (-22 "TX decode failed <error>");
+   *   2. every input without non_witness_utxo: the previous tx from the
+   *      txindex, else the mempool, becomes non_witness_utxo; inputs still
+   *      unresolved take the UTXO-set coin as witness_utxo when it is a
+   *      segwit output;
+   *   3. every input not yet signed (final scriptSig/witness) with a known
+   *      UTXO gets the provider's scripts and key origins, witness_utxo when
+   *      the solved script is segwit, and -- when `sign` -- a signature from a
+   *      provider key, finalized when `finalize`;
+   *   4. every output gets the provider's scripts and key origins;
+   *   5. RemoveUnnecessaryTransactions (psbt.cpp): drop non_witness_utxo
+   *      only when EVERY input is segwit v1+ with a witness_utxo and none
+   *      signs ANYONECANPAY.
+   * Taproot key/leaf metadata and keys derived from xprv expressions are not
+   * produced (known gap).
+   */
+  private async processPSBTWithProvider(
+    psbtStr: string,
+    provider: ReturnType<RPCServer["buildDescriptorProvider"]>,
+    opts: { sign: boolean; sighashType: number; finalize: boolean; includeOrigins: boolean }
+  ): Promise<PSBT> {
+    const psbt = this.decodePsbtRpcArg(psbtStr);
+
+    // 2. UTXO fill.
+    const unresolved: number[] = [];
+    for (let i = 0; i < psbt.tx.inputs.length; i++) {
+      const input = psbt.inputs[i]!;
+      if (input.nonWitnessUtxo) continue;
+      const prev = psbt.tx.inputs[i]!.prevOut;
+      let prevTx: Transaction | undefined;
+      try {
+        const entry = await this.db.getTxIndex(prev.txid);
+        if (entry) {
+          const raw = await this.db.getBlock(entry.blockHash);
+          if (raw) {
+            const block = deserializeBlock(new BufferReader(raw));
+            prevTx = block.transactions.find((t) => getTxId(t).equals(prev.txid));
+          }
+        }
+      } catch {
+        prevTx = undefined;
+      }
+      if (!prevTx) prevTx = this.mempool.getTransaction(prev.txid)?.tx;
+      if (prevTx) input.nonWitnessUtxo = prevTx;
+      else unresolved.push(i);
+    }
+    const isWitnessProgram = (s: Buffer) =>
+      s.length >= 4 && s.length <= 42 && (s[0] === 0x00 || (s[0]! >= 0x51 && s[0]! <= 0x60)) && s[1] === s.length - 2;
+    for (const i of unresolved) {
+      const prev = psbt.tx.inputs[i]!.prevOut;
+      let coin;
+      try {
+        coin = await this.liveUTXOManager().getUTXOAsync({ txid: prev.txid, vout: prev.vout });
+      } catch {
+        coin = undefined;
+      }
+      if (!coin) continue;
+      const spk = coin.scriptPubKey;
+      let segwit = isWitnessProgram(spk);
+      if (!segwit && spk.length === 23 && spk[0] === 0xa9 && spk[1] === 0x14 && spk[22] === 0x87) {
+        const rs = provider.scripts160.get(spk.subarray(2, 22).toString("hex"));
+        segwit = !!rs && isWitnessProgram(rs);
+      }
+      if (segwit) psbt.inputs[i]!.witnessUtxo = { value: coin.amount, scriptPubKey: spk };
+    }
+
+    // 3. Inputs.
+    for (let i = 0; i < psbt.tx.inputs.length; i++) {
+      const input = psbt.inputs[i]!;
+      if (input.finalScriptSig || input.finalScriptWitness) continue;
+      const utxo = getInputUTXO(psbt, i);
+      if (!utxo) continue;
+      const solved = this.psbtUpdateFromProvider(utxo.scriptPubKey, provider, input, opts.includeOrigins);
+      if (solved.witness && !input.witnessUtxo) {
+        input.witnessUtxo = { value: utxo.value, scriptPubKey: utxo.scriptPubKey };
+      }
+      if (opts.sign && solved.signKey) {
+        const priv = provider.privkeys.get(solved.signKey.toString("hex"));
+        if (priv) {
+          try {
+            signPSBTInput(psbt, i, priv, solved.signKey, opts.sighashType);
+          } catch {
+            // Core records per-input signing failures without aborting.
+          }
+        }
+      }
+      if (opts.finalize) {
+        try {
+          finalizePSBTInput(psbt, i);
+        } catch {
+          // Not finalizable yet (missing signatures) -- leave as is.
+        }
+      }
+    }
+
+    // 4. Outputs.
+    for (let i = 0; i < psbt.tx.outputs.length; i++) {
+      this.psbtUpdateFromProvider(
+        psbt.tx.outputs[i]!.scriptPubKey,
+        provider,
+        psbt.outputs[i]!,
+        opts.includeOrigins
+      );
+    }
+
+    // 5. RemoveUnnecessaryTransactions.
+    let drop = psbt.inputs.length > 0;
+    for (const input of psbt.inputs) {
+      const wu = input.witnessUtxo;
+      if (!wu || !isWitnessProgram(wu.scriptPubKey) || wu.scriptPubKey[0] === 0x00) {
+        drop = false;
+        break;
+      }
+      if (input.sighashType !== undefined && (input.sighashType & 0x80) === 0x80) {
+        drop = false;
+        break;
+      }
+    }
+    if (drop) for (const input of psbt.inputs) input.nonWitnessUtxo = undefined;
+    return psbt;
+  }
+
+  /**
+   * utxoupdatepsbt "psbt" ( descriptors ): Core rpc/rawtransaction.cpp --
+   * descriptors are parsed FIRST (-5 / -8), then ProcessPSBT with secrets
+   * hidden and no finalization; returns the updated PSBT as base64.
+   */
+  private async utxoUpdatePSBTRpc(params: unknown[]): Promise<string> {
+    const provider = this.buildDescriptorProvider(params[1]);
+    const psbt = await this.processPSBTWithProvider(params[0] as string, provider, {
+      sign: false,
+      sighashType: SIGHASH_ALL,
+      finalize: false,
+      includeOrigins: true,
+    });
+    return encodePSBTBase64(psbt);
+  }
+
+  /**
+   * descriptorprocesspsbt "psbt" descriptors ( "sighashtype" bip32derivs
+   * finalize ): Core rpc/rawtransaction.cpp -- descriptors parsed FIRST
+   * (expand_priv), then ProcessPSBT signing with the descriptors' keys.
+   * Returns {psbt, complete, hex?}; `complete` is every input carrying a
+   * final scriptSig or witness, and `hex` the extracted tx when complete.
+   */
+  private async descriptorProcessPSBTRpc(params: unknown[]): Promise<Record<string, unknown>> {
+    const [psbtParam, descsParam, sighashParam, bip32Param, finalizeParam] = params;
+    const provider = this.buildDescriptorProvider(descsParam);
+    const sighashType = this.parseSighashType(sighashParam);
+    const psbt = await this.processPSBTWithProvider(psbtParam as string, provider, {
+      sign: true,
+      sighashType,
+      finalize: finalizeParam === undefined || finalizeParam === null ? true : finalizeParam === true,
+      includeOrigins: bip32Param === undefined || bip32Param === null ? true : bip32Param === true,
+    });
+    const complete = psbt.inputs.every((inp) => !!(inp.finalScriptSig || inp.finalScriptWitness));
+    const result: Record<string, unknown> = { psbt: encodePSBTBase64(psbt), complete };
+    if (complete) {
+      result.hex = serializeTx(extractTransaction(psbt), true).toString("hex");
+    }
+    return result;
+  }
+
   private async walletProcessPSBT(params: unknown[]): Promise<Record<string, unknown>> {
     const [psbtParam, signParam, sighashParam, , finalizeParam] = params;
     if (typeof psbtParam !== "string") {
@@ -15432,16 +15908,8 @@ export class RPCServer {
       );
     }
 
-    let psbt: PSBT;
-    try {
-      psbt = decodePSBTBase64(psbtParam);
-    } catch (e) {
-      // Core: RPC_DESERIALIZATION_ERROR (-22) "TX decode failed".
-      throw this.rpcError(
-        RPCErrorCodes.DESERIALIZATION_ERROR,
-        `TX decode failed ${(e as Error).message}`
-      );
-    }
+    // Core: RPC_DESERIALIZATION_ERROR (-22) "TX decode failed <error>".
+    const psbt: PSBT = this.decodePsbtRpcArg(psbtParam);
 
     const utxoManager = this.liveUTXOManager();
 
@@ -15868,7 +16336,7 @@ export class RPCServer {
         // not a valid hash_type") (rpc/blockchain.cpp).
         throw this.rpcError(
           RPCErrorCodes.INVALID_PARAMETER,
-          `${hashTypeArg} is not a valid hash_type`,
+          `'${hashTypeArg}' is not a valid hash_type`,
         );
       }
     } else {
@@ -16088,8 +16556,9 @@ export class RPCServer {
       return false;
     }
     if (action !== "start") {
+      // Core rpc/blockchain.cpp:2471 -- RPC_INVALID_PARAMETER (-8).
       throw this.rpcError(
-        RPCErrorCodes.INVALID_PARAMS,
+        RPCErrorCodes.INVALID_PARAMETER,
         `Invalid action '${String(action)}'`,
       );
     }
@@ -16110,9 +16579,10 @@ export class RPCServer {
       // we support the bare string form (range descriptors are out of scope).
       const desc = typeof obj === "string" ? obj : (obj as { desc?: unknown })?.desc;
       if (typeof desc !== "string") {
+        // Core rpc/util.cpp:1354 -- RPC_INVALID_PARAMETER (-8).
         throw this.rpcError(
-          RPCErrorCodes.INVALID_PARAMS,
-          "Scan object must be either a string or an object",
+          RPCErrorCodes.INVALID_PARAMETER,
+          "Scan object needs to be either a string or an object",
         );
       }
       const spk = this.scanObjectToScriptPubKey(desc);
@@ -16313,9 +16783,10 @@ export class RPCServer {
       // the bare string and the {desc} form (range descriptors out of scope).
       const desc = typeof obj === "string" ? obj : (obj as { desc?: unknown })?.desc;
       if (typeof desc !== "string") {
+        // Core rpc/util.cpp:1354 -- RPC_INVALID_PARAMETER (-8).
         throw this.rpcError(
-          RPCErrorCodes.INVALID_PARAMS,
-          "Scan object must be either a string or an object",
+          RPCErrorCodes.INVALID_PARAMETER,
+          "Scan object needs to be either a string or an object",
         );
       }
       const spk = this.scanObjectToScriptPubKey(desc);
@@ -16531,14 +17002,35 @@ export class RPCServer {
    * gettxoutproof: Returns a CMerkleBlock hex proof that a txid is in a block.
    */
   private async getTxOutProof(params: unknown[]): Promise<string> {
-    if (!Array.isArray(params) || !Array.isArray(params[0])) {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameters: expected [txids] or [txids, blockhash]");
+    // Core rpc/txoutproof.cpp gettxoutproof argument handling: an empty
+    // array is -8, every txid goes through ParseHashV (-8), and a repeated
+    // txid is -8. (The array TYPE was checked by the dispatcher.)
+    if (!Array.isArray(params[0])) {
+      throw this.rpcError(
+        RPCErrorCodes.TYPE_ERROR,
+        `JSON value of type ${jsonTypeName(params[0])} is not of expected type array`,
+      );
     }
-    const txidHexList: string[] = params[0] as string[];
-    const blockHashHexParam = typeof params[1] === "string" ? params[1] : null;
-
-    // Convert display-order txids to internal order
-    const reqTxids = txidHexList.map((h) => Buffer.from(h, "hex").reverse());
+    const txidList = params[0] as unknown[];
+    if (txidList.length === 0) {
+      throw this.rpcError(RPCErrorCodes.INVALID_PARAMETER, "Parameter 'txids' cannot be empty");
+    }
+    const reqTxids: Buffer[] = [];
+    const seen = new Set<string>();
+    for (const t of txidList) {
+      const txid = this.parseHashV(t, "txid");
+      const key = txid.toString("hex");
+      if (seen.has(key)) {
+        throw this.rpcError(
+          RPCErrorCodes.INVALID_PARAMETER,
+          `Invalid parameter, duplicated txid: ${String(t)}`,
+        );
+      }
+      seen.add(key);
+      reqTxids.push(txid);
+    }
+    const blockHashHexParam =
+      params[1] === undefined || params[1] === null ? null : params[1];
 
     // Find the block containing the first txid
     let blockHashInternal: Buffer;
@@ -16547,11 +17039,20 @@ export class RPCServer {
       // -32602); returns internal (reversed) bytes.
       blockHashInternal = this.parseHashV(blockHashHexParam, "blockhash");
     } else {
-      const first = reqTxids[0];
-      if (!first) throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "No txids provided");
-      const entry = await this.db.getTxIndex(first);
-      if (!entry) throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Transaction not found in block index");
-      blockHashInternal = entry.blockHash;
+      // Core locates the block from the UTXO set, then the txindex; a txid
+      // found in neither is -5 "Transaction not yet in block".
+      let found: Buffer | null = null;
+      for (const txid of reqTxids) {
+        const entry = await this.db.getTxIndex(txid);
+        if (entry) {
+          found = entry.blockHash;
+          break;
+        }
+      }
+      if (!found) {
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Transaction not yet in block");
+      }
+      blockHashInternal = found;
     }
 
     const blockData = await this.db.getBlock(blockHashInternal);
@@ -16580,6 +17081,12 @@ export class RPCServer {
     const matchFlags = allTxids.map((txid) =>
       reqTxids.some((req) => req.equals(txid))
     );
+    if (matchFlags.filter(Boolean).length !== reqTxids.length) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "Not all transactions found in specified or retrieved block",
+      );
+    }
 
     const { hashes, bits } = w47bTraverseAndBuild(nTx, allTxids, matchFlags);
 
@@ -16604,58 +17111,62 @@ export class RPCServer {
    * verifytxoutproof: Verifies a CMerkleBlock proof and returns matched txids.
    */
   private async verifyTxOutProof(params: unknown[]): Promise<string[]> {
-    if (typeof params[0] !== "string") {
-      throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "Invalid parameters: expected [proof_hex]");
+    // Core rpc/txoutproof.cpp verifytxoutproof:
+    //   SpanReader{ParseHexV(proof, "proof")} >> merkleBlock
+    // ParseHexV: non-hex -> -8 "proof must be hexadecimal string (not '..')".
+    // A stream that runs out of bytes throws std::ios_base::failure, which
+    // the RPC server reports as RPC_MISC_ERROR (-1).
+    if (typeof params[0] !== "string" || !isStrictHex(params[0])) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        `proof must be hexadecimal string (not '${String(params[0])}')`,
+      );
     }
-    const proofBuf = Buffer.from(params[0] as string, "hex");
-    if (proofBuf.length < 84) {
-      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Proof too short");
-    }
+    const proofBuf = Buffer.from(params[0], "hex");
+    const endOfData = () =>
+      this.rpcError(RPCErrorCodes.MISC_ERROR, "SpanReader::read(): end of data: iostream error");
+    if (proofBuf.length < 84) throw endOfData();
 
     const nTx = proofBuf.readUInt32LE(80);
-    if (nTx === 0) {
-      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Something wrong with merkleblock");
-    }
 
     let pos = 84;
-    const [hashCount, pos2] = w47bReadVarInt(proofBuf, pos);
+    const readVarInt = (at: number): [number, number] => {
+      try {
+        if (at >= proofBuf.length) throw new RangeError("eof");
+        return w47bReadVarInt(proofBuf, at);
+      } catch {
+        throw endOfData();
+      }
+    };
+    const [hashCount, pos2] = readVarInt(pos);
     pos = pos2;
-    if (proofBuf.length < pos + hashCount * 32) {
-      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Proof truncated (hashes)");
-    }
+    if (proofBuf.length < pos + hashCount * 32) throw endOfData();
     const hashes: Buffer[] = [];
     for (let i = 0; i < hashCount; i++) {
       hashes.push(proofBuf.subarray(pos + i * 32, pos + i * 32 + 32));
     }
     pos += hashCount * 32;
 
-    const [flagCount, pos3] = w47bReadVarInt(proofBuf, pos);
+    const [flagCount, pos3] = readVarInt(pos);
     pos = pos3;
-    if (proofBuf.length < pos + flagCount) {
-      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Proof truncated (flags)");
-    }
+    if (proofBuf.length < pos + flagCount) throw endOfData();
     const flagBytes = proofBuf.subarray(pos, pos + flagCount);
 
-    // Outer guards (Core ExtractMatches merkleblock.cpp:97-105).
+    // CPartialMerkleTree::ExtractMatches (merkleblock.cpp:97-105) returns a
+    // NULL root for a malformed tree (no transactions, too many, more hashes
+    // than transactions, too few flag bits, or leftover data), and the RPC
+    // then answers an EMPTY array whenever the root does not equal the
+    // header's hashMerkleRoot -- Core never throws for a forged or malformed
+    // tree (rpc/txoutproof.cpp: `if (ExtractMatches(..) != hashMerkleRoot)
+    // return res;`).
     const MAX_MERKLEBLOCK_TXS = Math.floor(4_000_000 / 60); // MAX_BLOCK_WEIGHT / MIN_TRANSACTION_WEIGHT
-    if (nTx > MAX_MERKLEBLOCK_TXS) {
-      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Something wrong with merkleblock");
+    if (nTx === 0 || nTx > MAX_MERKLEBLOCK_TXS || hashCount > nTx || flagCount * 8 < hashCount) {
+      return [];
     }
-    if (hashCount > nTx) {
-      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Something wrong with merkleblock");
-    }
-    if (flagCount * 8 < hashCount) {
-      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Something wrong with merkleblock");
-    }
-
     const { root, matched, bad } = w47bExtractMatches(nTx, hashes, flagBytes);
-    // The computed root MUST equal the proof header's merkle root — the old
-    // code returned matches unconditionally, blessing any forged proof
-    // (w134 BUG-26; Core rpc/txoutproof.cpp compares against
-    // header.hashMerkleRoot and throws).
     const headerMerkleRoot = proofBuf.subarray(36, 68);
     if (bad || !root.equals(headerMerkleRoot)) {
-      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Something wrong with merkleblock");
+      return [];
     }
     // The proven block must be on the ACTIVE chain (Core: LookupBlockIndex +
     // chain contains -> 'Block not found in chain', RPC -5).

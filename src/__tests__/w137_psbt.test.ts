@@ -892,9 +892,9 @@ describe("W137-G32: joinpsbts RPC (BUG-14, P1-API)", () => {
 // =============================================================================
 
 describe("W137-G33: utxoupdatepsbt RPC (BUG-15, P1-API)", () => {
-  it("BUG-15: no registerMethod for 'utxoupdatepsbt'", () => {
+  it("BUG-15 FIXED: utxoupdatepsbt is registered", () => {
     const src = readSrc("rpc/server.ts");
-    expect(src).not.toMatch(/registerMethod\("utxoupdatepsbt"/);
+    expect(src).toMatch(/registerMethod\("utxoupdatepsbt"/);
   });
 });
 

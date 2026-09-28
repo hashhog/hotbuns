@@ -139,20 +139,24 @@ export function messageVerify(
     return MessageVerificationResult.ERR_INVALID_ADDRESS;
   }
 
-  // Decode the base64 signature.
-  let sigBytes: Buffer;
-  try {
-    sigBytes = Buffer.from(signatureBase64, "base64");
-  } catch {
+  // Decode the base64 signature. Core common/signmessage.cpp:40-48: ONLY a
+  // string that is not strict base64 (DecodeBase64 -> nullopt) is
+  // ERR_MALFORMED_SIGNATURE. Well-formed base64 of the wrong length or with
+  // a bad header byte is a signature CPubKey::RecoverCompact cannot recover
+  // from -> ERR_PUBKEY_NOT_RECOVERED (the RPC answers `false`, not an
+  // error). Buffer.from(x, "base64") accepts almost anything, so it cannot
+  // be the gate.
+  const sigBytes = strictBase64Decode(signatureBase64);
+  if (!sigBytes) {
     return MessageVerificationResult.ERR_MALFORMED_SIGNATURE;
   }
   if (sigBytes.length !== 65) {
-    return MessageVerificationResult.ERR_MALFORMED_SIGNATURE;
+    return MessageVerificationResult.ERR_PUBKEY_NOT_RECOVERED;
   }
 
   const header = sigBytes[0];
   if (header < 27 || header > 34) {
-    return MessageVerificationResult.ERR_MALFORMED_SIGNATURE;
+    return MessageVerificationResult.ERR_PUBKEY_NOT_RECOVERED;
   }
   const compressed = header >= 31;
   const recovery = (header - 27) & 0x03;
@@ -210,4 +214,25 @@ export function privateKeyToP2PKHAddress(
   const pubkey = privateKeyToPublicKey(privateKey, compressed);
   const h = hash160(pubkey);
   return base58CheckEncode(P2PKH_VERSIONS[network], h);
+}
+
+/**
+ * Core util/strencodings.cpp DecodeBase64: length a multiple of 4, at most two
+ * trailing '=', only the 64 alphabet characters otherwise, and zero leftover
+ * bits (ConvertBits<6, 8, false>). Returns null where Core returns nullopt.
+ */
+export function strictBase64Decode(str: string): Buffer | null {
+  if (str.length % 4 !== 0) return null;
+  let body = str;
+  if (body.endsWith("=")) body = body.slice(0, -1);
+  if (body.endsWith("=")) body = body.slice(0, -1);
+  if (!/^[A-Za-z0-9+/]*$/.test(body)) return null;
+  const leftoverBits = (body.length * 6) % 8;
+  if (leftoverBits >= 6) return null;
+  if (leftoverBits > 0) {
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const last = alphabet.indexOf(body[body.length - 1]!);
+    if ((last & ((1 << leftoverBits) - 1)) !== 0) return null;
+  }
+  return Buffer.from(body, "base64");
 }

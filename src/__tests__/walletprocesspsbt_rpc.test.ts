@@ -292,6 +292,7 @@ describe("walletprocesspsbt RPC", () => {
   it("rejects a non-string psbt param", async () => {
     const r = await rpc(port, "walletprocesspsbt", [12345]);
     expect(r.error).toBeDefined();
-    expect(r.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+    // Core-verified 2026-09-27: central type check, -3.
+    expect(r.error.code).toBe(RPCErrorCodes.TYPE_ERROR);
   });
 });

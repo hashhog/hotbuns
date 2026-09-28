@@ -266,7 +266,7 @@ export function deserializeTx(reader: BufferReader): Transaction {
  * with the `0x00 0x01` marker/flag, i.e. a zero-input vin under legacy rules)
  * therefore parses differently here — exactly as Core's two decoders diverge.
  */
-function deserializeTxLegacy(reader: BufferReader): Transaction {
+export function deserializeTxLegacy(reader: BufferReader): Transaction {
   const version = reader.readInt32LE();
 
   // Input count varint (no segwit-marker special-casing).

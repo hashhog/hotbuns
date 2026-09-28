@@ -952,7 +952,8 @@ describe("RPCServer", () => {
       const result = await rpcRequest(testPort, "estimatesmartfee", ["not a number"]);
 
       expect(result.error).toBeDefined();
-      expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+      // Core-verified 2026-09-27 (R5 errcode): the dispatcher's central type check.
+      expect(result.error.code).toBe(RPCErrorCodes.TYPE_ERROR);
     });
   });
 
@@ -1162,7 +1163,8 @@ describe("RPCServer", () => {
         "msg",
       ]);
       expect(result.error).toBeDefined();
-      expect(result.error.code).toBe(RPCErrorCodes.INVALID_ADDRESS_OR_KEY);
+      // Core rpc/signmessage.cpp:48: RPC_TYPE_ERROR (-3).
+      expect(result.error.code).toBe(RPCErrorCodes.TYPE_ERROR);
       expect(result.error.message).toContain("Malformed");
     });
 
@@ -1402,7 +1404,8 @@ describe("RPCServer", () => {
       const result = await rpcRequest(testPort, "getblockhash", ["not a number"]);
 
       expect(result.error).toBeDefined();
-      expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+      // Core-verified 2026-09-27 (R5 errcode): the dispatcher's central type check.
+      expect(result.error.code).toBe(RPCErrorCodes.TYPE_ERROR);
     });
   });
 
@@ -1439,7 +1442,8 @@ describe("RPCServer", () => {
       const result = await rpcRequest(testPort, "sendrawtransaction", [123]);
 
       expect(result.error).toBeDefined();
-      expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+      // Core-verified 2026-09-27 (R5 errcode): the dispatcher's central type check.
+      expect(result.error.code).toBe(RPCErrorCodes.TYPE_ERROR);
     });
   });
 
@@ -1548,7 +1552,8 @@ describe("RPCServer", () => {
       const result = await rpcRequest(testPort, "validateaddress", [123]);
 
       expect(result.error).toBeDefined();
-      expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+      // Core-verified 2026-09-27 (R5 errcode): the dispatcher's central type check.
+      expect(result.error.code).toBe(RPCErrorCodes.TYPE_ERROR);
     });
   });
 
@@ -2673,7 +2678,8 @@ describe("RPCServer", () => {
     it("non-hex submitblock param returns JSON-RPC error, not BIP-22 string", async () => {
       const result = await rpcRequest(testPort, "submitblock", [12345]);
       expect(result.error).toBeDefined();
-      expect(result.error.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+      // Core-verified 2026-09-27 (R5 errcode): the dispatcher's central type check.
+      expect(result.error.code).toBe(RPCErrorCodes.TYPE_ERROR);
     });
 
     // BIP-34 side-branch / Pattern X regression

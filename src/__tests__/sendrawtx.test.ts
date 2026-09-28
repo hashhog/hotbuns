@@ -407,30 +407,32 @@ describe("sendrawtransaction", () => {
       const result = await rpcRequest(testPort, "sendrawtransaction", [12345]);
 
       expect(result.error).toBeDefined();
-      expect(result.error!.code).toBe(RPCErrorCodes.INVALID_PARAMS);
-      expect(result.error!.message).toContain("hexstring must be a string");
+      // Core-verified 2026-09-27: central type check, -3 "Wrong type passed".
+      expect(result.error!.code).toBe(RPCErrorCodes.TYPE_ERROR);
+      expect(result.error!.message).toContain("Position 1 (hexstring)");
     });
 
     it("should reject invalid hex encoding", async () => {
       const result = await rpcRequest(testPort, "sendrawtransaction", ["not-valid-hex"]);
 
       expect(result.error).toBeDefined();
-      expect(result.error!.code).toBe(RPCErrorCodes.INVALID_PARAMS);
+      // Core DecodeHexTx failure: RPC_DESERIALIZATION_ERROR (-22).
+      expect(result.error!.code).toBe(RPCErrorCodes.DESERIALIZATION_ERROR);
     });
 
     it("should reject odd-length hex string", async () => {
       const result = await rpcRequest(testPort, "sendrawtransaction", ["abc"]);
 
       expect(result.error).toBeDefined();
-      expect(result.error!.code).toBe(RPCErrorCodes.INVALID_PARAMS);
-      expect(result.error!.message).toContain("odd length");
+      expect(result.error!.code).toBe(RPCErrorCodes.DESERIALIZATION_ERROR);
+      expect(result.error!.message).toBe("TX decode failed. Make sure the tx has at least one input.");
     });
 
     it("should reject malformed transaction data", async () => {
       const result = await rpcRequest(testPort, "sendrawtransaction", ["0011223344"]);
 
       expect(result.error).toBeDefined();
-      expect(result.error!.code).toBe(RPCErrorCodes.RPC_TRANSACTION_REJECTED);
+      expect(result.error!.code).toBe(RPCErrorCodes.DESERIALIZATION_ERROR);
       expect(result.error!.message).toContain("decode failed");
     });
   });

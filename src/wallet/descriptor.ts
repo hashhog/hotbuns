@@ -222,12 +222,15 @@ export function validateChecksum(desc: string): string {
   const checksum = desc.slice(hashIdx + 1);
 
   if (checksum.length !== 8) {
-    throw new Error("Invalid checksum length");
+    throw new Error(`Expected 8 character checksum, not ${checksum.length} characters`);
   }
 
   const expected = descriptorChecksum(base);
   if (checksum !== expected) {
-    throw new Error(`Invalid checksum: expected ${expected}, got ${checksum}`);
+    // Core script/descriptor.cpp:2862 wording.
+    throw new Error(
+      `Provided checksum '${checksum}' does not match computed checksum '${expected}'`
+    );
   }
 
   return base;
@@ -331,6 +334,14 @@ export interface PubkeyProvider {
   toPrivateString(): string;
   /** Get the origin info ([fingerprint/path]) if present */
   getOrigin(): KeyOriginInfo | undefined;
+  /**
+   * The FULL key origin of the key produced at `index` -- what Core's
+   * PubkeyProvider::GetPubKey writes into KeyOriginInfo and a signing
+   * provider's `origins` (script/descriptor.cpp): the fingerprint of the
+   * origin (or, without one, of the key itself / the extended key), and the
+   * origin path followed by the derivation path and the range index.
+   */
+  getKeyOrigin(index: number, pubkey: Buffer): KeyOriginInfo;
   /** Get the private key if available */
   getPrivKey(): Buffer | undefined;
 }
@@ -392,6 +403,15 @@ export class ConstPubkeyProvider implements PubkeyProvider {
 
   getOrigin(): KeyOriginInfo | undefined {
     return this.origin;
+  }
+
+  getKeyOrigin(_index: number, pubkey: Buffer): KeyOriginInfo {
+    // Core ConstPubkeyProvider::GetPubKey: the explicit origin, else the
+    // first four bytes of the key's own hash160 with an empty path.
+    if (this.origin) {
+      return { fingerprint: Buffer.from(this.origin.fingerprint), path: [...this.origin.path] };
+    }
+    return { fingerprint: hash160(pubkey).subarray(0, 4), path: [] };
   }
 
   getPrivKey(): Buffer | undefined {
@@ -615,6 +635,22 @@ export class BIP32PubkeyProvider implements PubkeyProvider {
     return this.origin;
   }
 
+  getKeyOrigin(index: number, _pubkey: Buffer): KeyOriginInfo {
+    // Core BIP32PubkeyProvider::GetPubKey: origin fingerprint (else the
+    // extended key's own fingerprint), then origin path + derivation path +
+    // the range index.
+    const rootPub = this.extkey.isPrivate
+      ? privateKeyToPublicKey(this.extkey.key, true)
+      : this.extkey.key;
+    const fingerprint = this.origin
+      ? Buffer.from(this.origin.fingerprint)
+      : hash160(rootPub).subarray(0, 4);
+    const path = [...(this.origin?.path ?? []), ...this.path];
+    if (this.deriveType === DeriveType.UNHARDENED) path.push(index);
+    else if (this.deriveType === DeriveType.HARDENED) path.push(index + HARDENED_OFFSET);
+    return { fingerprint, path };
+  }
+
   getPrivKey(): Buffer | undefined {
     return this.extkey.isPrivate ? this.extkey.key : undefined;
   }
@@ -748,10 +784,7 @@ export class PKDescriptor implements Descriptor {
     const pubkey = this.pubkeyProvider.getPubKey(index);
     const script = buildP2PKScript(pubkey);
     const origins = new Map<string, KeyOriginInfo>();
-    const origin = this.pubkeyProvider.getOrigin();
-    if (origin) {
-      origins.set(pubkey.toString("hex"), origin);
-    }
+    origins.set(pubkey.toString("hex"), this.pubkeyProvider.getKeyOrigin(index, pubkey));
 
     return [
       {
@@ -812,10 +845,7 @@ export class PKHDescriptor implements Descriptor {
       network,
     });
     const origins = new Map<string, KeyOriginInfo>();
-    const origin = this.pubkeyProvider.getOrigin();
-    if (origin) {
-      origins.set(pubkey.toString("hex"), origin);
-    }
+    origins.set(pubkey.toString("hex"), this.pubkeyProvider.getKeyOrigin(index, pubkey));
 
     return [
       {
@@ -880,10 +910,7 @@ export class WPKHDescriptor implements Descriptor {
     const hrp = getHrp(network);
     const address = bech32Encode(hrp, 0, pubkeyHash);
     const origins = new Map<string, KeyOriginInfo>();
-    const origin = this.pubkeyProvider.getOrigin();
-    if (origin) {
-      origins.set(pubkey.toString("hex"), origin);
-    }
+    origins.set(pubkey.toString("hex"), this.pubkeyProvider.getKeyOrigin(index, pubkey));
 
     return [
       {
@@ -1173,10 +1200,7 @@ export class RawtrDescriptor implements Descriptor {
     const address = bech32Encode(hrp, 1, xOnly);
 
     const origins = new Map<string, KeyOriginInfo>();
-    const origin = this.pubkeyProvider.getOrigin();
-    if (origin) {
-      origins.set(pubkey.toString("hex"), origin);
-    }
+    origins.set(pubkey.toString("hex"), this.pubkeyProvider.getKeyOrigin(index, pubkey));
 
     return [
       {
@@ -1246,10 +1270,10 @@ export class MultiDescriptor implements Descriptor {
     const script = buildMultisigScript(this.threshold, pubkeys);
     const origins = new Map<string, KeyOriginInfo>();
     for (let i = 0; i < this.pubkeyProviders.length; i++) {
-      const origin = this.pubkeyProviders[i].getOrigin();
-      if (origin) {
-        origins.set(pubkeys[i].toString("hex"), origin);
-      }
+      origins.set(
+        pubkeys[i].toString("hex"),
+        this.pubkeyProviders[i].getKeyOrigin(index, pubkeys[i])
+      );
     }
 
     return [
@@ -1445,13 +1469,11 @@ export class ComboDescriptor implements Descriptor {
   expand(index: number, network: NetworkType): ExpandedOutput[] {
     const pubkey = this.pubkeyProvider.getPubKey(index);
     const results: ExpandedOutput[] = [];
-    const origin = this.pubkeyProvider.getOrigin();
+    const origin = this.pubkeyProvider.getKeyOrigin(index, pubkey);
 
     const makeOrigins = () => {
       const origins = new Map<string, KeyOriginInfo>();
-      if (origin) {
-        origins.set(pubkey.toString("hex"), origin);
-      }
+      origins.set(pubkey.toString("hex"), origin);
       return origins;
     };
 
@@ -2062,7 +2084,8 @@ function parseDescriptorInner(
     return parseMiniscriptDescriptor(desc, pos, context);
   }
 
-  throw new Error(`Unknown descriptor at position ${pos}: ${desc.slice(pos)}`);
+  // Core script/descriptor.cpp:2671 wording.
+  throw new Error(`'${desc.slice(pos)}' is not a valid descriptor function`);
 }
 
 function parseFunction(
@@ -2806,4 +2829,35 @@ export function deriveAddresses(
   }
 
   return addresses;
+}
+
+/**
+ * Every private key a parsed descriptor carries in a NON-extended key
+ * expression (WIF), as {pubkey, privkey} pairs -- the part of Core's
+ * FlatSigningProvider.keys that `descriptorprocesspsbt` can sign with
+ * directly. Walks the descriptor's object graph, so it covers every
+ * descriptor class (sh/wsh wrappers, multi, combo, miniscript) without each
+ * one exposing its providers. Keys inside xprv expressions are NOT returned
+ * (their derived child keys are not materialized here).
+ */
+export function collectConstPrivateKeys(
+  desc: Descriptor
+): Array<{ pubkey: Buffer; privkey: Buffer }> {
+  const out: Array<{ pubkey: Buffer; privkey: Buffer }> = [];
+  const seen = new Set<unknown>();
+  const visit = (v: unknown): void => {
+    if (v === null || typeof v !== "object" || seen.has(v) || Buffer.isBuffer(v)) return;
+    seen.add(v);
+    if (v instanceof ConstPubkeyProvider) {
+      const priv = v.getPrivKey();
+      if (priv) out.push({ pubkey: v.getPubKey(0), privkey: priv });
+      return;
+    }
+    if (v instanceof BIP32PubkeyProvider) return;
+    for (const child of Array.isArray(v) ? v : Object.values(v as Record<string, unknown>)) {
+      visit(child);
+    }
+  };
+  visit(desc);
+  return out;
 }
