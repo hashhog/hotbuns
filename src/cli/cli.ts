@@ -1422,7 +1422,11 @@ async function runSnapshotLoad(
   console.log(`Loading Core-format UTXO snapshot: ${snapshotPath}`);
 
   const manager = new ChainstateManager(db, params);
-  const result = await manager.loadSnapshot(snapshotPath);
+  // Startup load: nothing else writes the store yet, so the import may
+  // displace the rows above the UTXO prefix (ChainDB.prepareSortedBulkLoad).
+  const result = await manager.loadSnapshot(snapshotPath, undefined, {
+    isolateBulkLoad: true,
+  });
 
   console.log(`Loaded ${result.coinsLoaded} coins`);
   console.log(`  Base height: ${result.baseHeight}`);

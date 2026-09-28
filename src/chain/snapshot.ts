@@ -1154,7 +1154,16 @@ export class ChainstateManager {
    */
   async loadSnapshot(
     filePath: string,
-    interruptCheck?: () => boolean
+    interruptCheck?: () => boolean,
+    opts?: {
+      /**
+       * Startup load into a store nobody else is writing: displace the rows
+       * above the UTXO prefix for the import (see
+       * {@link ChainDB.prepareSortedBulkLoad}). Not for RPC loadtxoutset,
+       * where a running node reads CHAIN_WORK concurrently.
+       */
+      isolateBulkLoad?: boolean;
+    }
   ): Promise<LoadSnapshotResult> {
     // BUG-5: double-activation guard.
     // Mirrors validation.cpp:5600 — "Can't activate a snapshot-based
@@ -1193,6 +1202,7 @@ export class ChainstateManager {
     let baseHeight: number;
     let snapshotChainstate: Chainstate;
     let streamedHash: Buffer | null = null;
+    let bulkLoad: Awaited<ReturnType<ChainDB["prepareSortedBulkLoad"]>> = null;
     const loadStats: SnapshotLoadStats = {
       txouts: 0n,
       transactions: 0n,
@@ -1273,6 +1283,16 @@ export class ChainstateManager {
       });
       snapshotChainstate.tipHash = metadata.baseBlockHash;
       snapshotChainstate.tipHeight = baseHeight;
+
+      bulkLoad = opts?.isolateBulkLoad
+        ? await this.db.prepareSortedBulkLoad(DBPrefix.UTXO)
+        : null;
+      if (bulkLoad && bulkLoad.displaced > 0) {
+        console.log(
+          `[snapshot] displaced ${bulkLoad.displaced} row(s) above the UTXO prefix ` +
+            `for the sorted import (restored after load)`
+        );
+      }
 
       let batch = this.db.newChainedBatch();
       const valueScratch = Buffer.allocUnsafe(16 * 1024);
@@ -1425,6 +1445,8 @@ export class ChainstateManager {
       }
     } finally {
       await fh.close().catch(() => { /* close-on-error best-effort */ });
+      // Put the displaced rows back whether the load succeeded or threw.
+      await bulkLoad?.restore();
     }
 
     // Strict snapshot content-hash check.

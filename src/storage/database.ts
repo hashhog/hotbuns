@@ -780,6 +780,99 @@ export class ChainDB {
   }
 
   /**
+   * Prepare an EMPTY key prefix for a bulk load whose keys arrive in sorted
+   * order (the UTXO snapshot import: Core writes the dump in chainstate key
+   * order, txid ascending, and our UTXO key is prefix + txid + vout).
+   *
+   * WHY: LevelDB can place a sorted stream of tables with trivial moves (no
+   * rewrite) only while no existing table's key range overlaps the new
+   * keys. A fresh datadir already holds genesis rows on BOTH sides of the
+   * UTXO prefix ('b'/'h'/'s' below 'u', CHAIN_WORK 'w' above), so the first
+   * table spans 'b'..'w' and overlaps every table the import writes after
+   * it. Every imported table then went through a real L1->L2 merge with
+   * that wide table (and the wide tail re-formed each time): the import ran
+   * at compaction speed ("Current memtable full; waiting..."), and it ended
+   * with ~60 tables (~2 GB) in L1 against LevelDB's fixed 10 MB L1 target.
+   * LevelDB compacts the highest-scoring level first (L1 ~200 vs L0 = files
+   * / 4 <= 3), so once block sync filled L0 to 12 tables every write stopped
+   * ("Too many L0 files; waiting...") until L1 drained: 20-40 min with no
+   * block connected and no header stored (R4 675000->710000, 2026-09-27).
+   *
+   * The rows above the prefix are displaced (deleted, and the tombstones
+   * compacted away, see {@link purgeTombstonesBelow}) for the duration of the
+   * load and put back by `restore()`. Then nothing overlaps the import and
+   * every table it writes is placed without a rewrite.
+   *
+   * Only for a store nobody else is writing (startup `--load-snapshot`): a
+   * running node reads CHAIN_WORK concurrently. Returns null (do nothing)
+   * when the prefix already has keys or more than `maxDisplaced` rows sit
+   * above it (not a fresh datadir — then displacing them is not worth the
+   * risk). If the process dies mid-load the store is a partial import and
+   * must be re-created either way.
+   */
+  async prepareSortedBulkLoad(
+    prefix: DBPrefix,
+    maxDisplaced: number = 1024
+  ): Promise<{ displaced: number; restore: () => Promise<void> } | null> {
+    const lo = Buffer.from([prefix]);
+    const hi = Buffer.from([prefix + 1]);
+    for await (const _k of this.db.keys({ gte: lo, lt: hi, limit: 1 })) {
+      return null;
+    }
+    const displaced: [Buffer, Buffer][] = [];
+    for await (const [k, v] of this.db.iterator({ gte: hi, limit: maxDisplaced + 1 })) {
+      displaced.push([Buffer.from(k), Buffer.from(v)]);
+    }
+    if (displaced.length > maxDisplaced) return null;
+    if (displaced.length > 0) {
+      const del = this.db.batch();
+      for (const [k] of displaced) del.del(k);
+      await del.write();
+      await this.purgeTombstonesBelow(lo, maxDisplaced * 64);
+    }
+    let restored = false;
+    return {
+      displaced: displaced.length,
+      restore: async (): Promise<void> => {
+        if (restored || displaced.length === 0) return;
+        restored = true;
+        const put = this.db.batch();
+        for (const [k, v] of displaced) put.put(k, v);
+        await put.write();
+      },
+    };
+  }
+
+  /**
+   * Make the deletes of {@link prepareSortedBulkLoad} physical before the
+   * import starts. A tombstone is itself a key: flushed together with the
+   * genesis rows below the prefix it forms a table spanning 'b'..'w' — the
+   * very overlap being removed. `compactRange` first flushes the memtable,
+   * but the table lands directly in L2 (nothing overlaps it) and a manual
+   * compaction never rewrites the deepest level that holds the range, so
+   * the tombstone would survive. Re-putting one row below the prefix makes
+   * the next flush overlap that table; it lands one level up and the second
+   * `compactRange` merges the two, dropping the tombstone and the value it
+   * shadows (no deeper level holds the key). Skipped when the store has more
+   * than `maxBelow` rows below the prefix (not a fresh datadir).
+   */
+  private async purgeTombstonesBelow(prefixKey: Buffer, maxBelow: number): Promise<void> {
+    let first: [Buffer, Buffer] | null = null;
+    let below = 0;
+    for await (const [k, v] of this.db.iterator({ lt: prefixKey, limit: maxBelow + 1 })) {
+      if (first === null) first = [Buffer.from(k), Buffer.from(v)];
+      below++;
+    }
+    if (below > maxBelow) return;
+    const all = [Buffer.from([0x00]), Buffer.alloc(8, 0xff)] as const;
+    await this.db.compactRange(all[0], all[1]);
+    if (first !== null) {
+      await this.db.put(first[0], first[1]);
+      await this.db.compactRange(all[0], all[1]);
+    }
+  }
+
+  /**
    * Chained LevelDB batch for bulk UTXO import.
    *
    * `putUTXO` encodes the prefixed key and hands the pair to the native
