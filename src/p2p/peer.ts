@@ -1424,8 +1424,17 @@ export class Peer {
         throw deserErr;
       }
 
-      this.recvBuffer = Buffer.from(this.recvBuffer.subarray(totalLength));
+      // O(1) view, not a copy: copying the remainder after EVERY message made
+      // one socket read of N small messages cost O(N * bytes) — 2.4 s of a
+      // 50k-tx burst went to this line alone (flood-regtest profile). The
+      // remainder is compacted once, below.
+      this.recvBuffer = this.recvBuffer.subarray(totalLength);
       this.handleMessage(msg);
+    }
+    // Compact the unconsumed tail (a partial message) into its own buffer so
+    // it does not pin the large read buffer it was sliced from.
+    if (this.recvBuffer.length > 0 && this.recvBuffer.byteOffset !== 0) {
+      this.recvBuffer = Buffer.from(this.recvBuffer);
     }
   }
 

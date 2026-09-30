@@ -41,6 +41,8 @@ import { Wallet, WalletManager } from "../wallet/wallet.js";
 import { MAINNET, TESTNET, TESTNET4, REGTEST, disableAssumeValid, type ConsensusParams } from "../consensus/params.js";
 import { Logger, setLogger } from "../logger/logger.js";
 import { runSupervisorFromArgv } from "./supervisor.js";
+import { TxIngressQueue } from "../p2p/tx_ingress.js";
+import { LoopLagMonitor } from "../logger/loop_lag.js";
 
 /**
  * Node configuration options.
@@ -2415,7 +2417,15 @@ async function startNode(config: NodeConfig): Promise<void> {
   // Reason: during IBD the UTXO set is incomplete so we cannot validate scripts or
   // check coinbase maturity; accepting into the mempool would pollute it with txs
   // that may be unconfirmable once the full chain is known.
-  peerManager.onMessage("tx", async (peer: import("../p2p/peer.js").Peer, msg: NetworkMessage) => {
+  //
+  // The handler is not called from the socket callback directly: `tx`
+  // messages go through a TxIngressQueue (src/p2p/tx_ingress.ts) that runs
+  // them one at a time, round-robin one-per-peer, yielding to the event loop
+  // between them — Core's ProcessMessages shape. Before this, every tx in a
+  // socket read started its own concurrent acceptToMemoryPool and the burst
+  // ran to completion ahead of RPC requests and timers (RPC starvation,
+  // getblockcount timing out at 90 s on mainnet 2026-09-30).
+  const handleTxMessage = async (peer: import("../p2p/peer.js").Peer, msg: NetworkMessage): Promise<void> => {
     if (msg.type !== "tx") return;
     // IBD skip gate — mirrors Core net_processing.cpp:4395
     if (!blockSync.isIBDComplete()) return;
@@ -2493,6 +2503,16 @@ async function startNode(config: NodeConfig): Promise<void> {
       // cannot escape as an unhandled rejection and flood the event loop.
       logTxAcceptThrow(err);
     }
+  };
+
+  const txIngress = new TxIngressQueue<import("../p2p/peer.js").Peer, NetworkMessage>({
+    process: handleTxMessage,
+    onError: logTxAcceptThrow,
+  });
+  nodeTxIngress = txIngress;
+  peerManager.onMessage("tx", (peer: import("../p2p/peer.js").Peer, msg: NetworkMessage) => {
+    if (msg.type !== "tx") return;
+    txIngress.enqueue(peer, msg);
   });
 
   /**
@@ -2927,6 +2947,12 @@ async function startNode(config: NodeConfig): Promise<void> {
     gracefulShutdown();
   });
 
+  // Event-loop lag: logs "[loop-lag] event loop blocked N ms" past 2 s. The
+  // RPC server shares this thread, so this is the queueing delay any RPC
+  // request saw at that moment.
+  nodeLoopLag = new LoopLagMonitor();
+  nodeLoopLag.start();
+
   // Start services
   await peerManager.start();
   await blockSync.start();
@@ -3016,7 +3042,19 @@ async function startNode(config: NodeConfig): Promise<void> {
           `bitcoin_mem_external_bytes ${mem.external}\n` +
           `# HELP bitcoin_mem_arraybuffers_bytes ArrayBuffer/Buffer memory in bytes\n` +
           `# TYPE bitcoin_mem_arraybuffers_bytes gauge\n` +
-          `bitcoin_mem_arraybuffers_bytes ${mem.arrayBuffers}\n`;
+          `bitcoin_mem_arraybuffers_bytes ${mem.arrayBuffers}\n` +
+          `# HELP bitcoin_event_loop_lag_ms Lateness of the last event-loop probe timer\n` +
+          `# TYPE bitcoin_event_loop_lag_ms gauge\n` +
+          `bitcoin_event_loop_lag_ms ${Math.round(nodeLoopLag?.stats.lastMs ?? 0)}\n` +
+          `# HELP bitcoin_event_loop_lag_max_ms Worst event-loop probe lateness since start\n` +
+          `# TYPE bitcoin_event_loop_lag_max_ms gauge\n` +
+          `bitcoin_event_loop_lag_max_ms ${Math.round(nodeLoopLag?.stats.maxMs ?? 0)}\n` +
+          `# HELP bitcoin_rpc_request_max_ms Slowest RPC request (arrival to response) since start\n` +
+          `# TYPE bitcoin_rpc_request_max_ms gauge\n` +
+          `bitcoin_rpc_request_max_ms ${Math.round(rpcServer.getRequestTimingStats().maxMs)}\n` +
+          `# HELP bitcoin_tx_ingress_queued Relayed transactions waiting for validation\n` +
+          `# TYPE bitcoin_tx_ingress_queued gauge\n` +
+          `bitcoin_tx_ingress_queued ${nodeTxIngress?.size() ?? 0}\n`;
         return new Response(body, {
           headers: {
             "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
@@ -3058,6 +3096,11 @@ async function startNode(config: NodeConfig): Promise<void> {
  */
 let shutdownInProgress = false;
 
+/** Relayed-tx ingress queue of the running node (stopped on shutdown). */
+let nodeTxIngress: TxIngressQueue<import("../p2p/peer.js").Peer, NetworkMessage> | null = null;
+/** Event-loop lag monitor of the running node. */
+let nodeLoopLag: LoopLagMonitor | null = null;
+
 async function gracefulShutdown(): Promise<void> {
   // RPC `stop` and SIGTERM/SIGINT (systemd, stop_mainnet.sh, the dispatcher)
   // all land here. A second request while the first is still waiting for the
@@ -3074,6 +3117,10 @@ async function gracefulShutdown(): Promise<void> {
   }
 
   console.log("Stopping services...");
+
+  // 0. Stop draining relayed transactions and the lag monitor.
+  nodeTxIngress?.stop();
+  nodeLoopLag?.stop();
 
   // 1. Stop RPC + REST servers
   runningNode.rpcServer.stop();

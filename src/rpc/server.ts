@@ -482,6 +482,9 @@ const UINT32_MAX = 4294967295;
  */
 export const MAX_BATCH_SIZE = 1000;
 
+/** An RPC request slower than this (arrival to response) is logged. */
+export const RPC_SLOW_REQUEST_MS = 2000;
+
 /**
  * Map a JSON value to Bitcoin Core's UniValue type name (univalue's
  * `uvTypeName`), used in "JSON value of type X is not of expected type Y"
@@ -1029,7 +1032,7 @@ export class RPCServer {
     this.server = Bun.serve({
       port: this.config.port,
       hostname: this.config.host,
-      fetch: (req) => this.handleRequest(req),
+      fetch: (req) => this.timedHandleRequest(req),
       ...(tlsConfig ? { tls: tlsConfig } : {}),
     });
 
@@ -1145,6 +1148,36 @@ export class RPCServer {
   /**
    * Handle an incoming HTTP request.
    */
+  /**
+   * Request timing: from the moment Bun hands us the request to the moment
+   * the response is ready. A request that sat in the socket because the event
+   * loop was busy is NOT covered (JS cannot see the accept time) — that part
+   * is what the [loop-lag] monitor reports. Logged when over
+   * RPC_SLOW_REQUEST_MS; totals are exposed via getRequestTimingStats().
+   */
+  private readonly requestTiming = { count: 0, lastMs: 0, maxMs: 0, slow: 0 };
+
+  getRequestTimingStats(): { count: number; lastMs: number; maxMs: number; slow: number } {
+    return { ...this.requestTiming };
+  }
+
+  private async timedHandleRequest(req: Request): Promise<Response> {
+    const start = performance.now();
+    try {
+      return await this.handleRequest(req);
+    } finally {
+      const ms = performance.now() - start;
+      const t = this.requestTiming;
+      t.count++;
+      t.lastMs = ms;
+      if (ms > t.maxMs) t.maxMs = ms;
+      if (ms > RPC_SLOW_REQUEST_MS) {
+        t.slow++;
+        console.warn(`[rpc] slow request: ${Math.round(ms)} ms from arrival to response`);
+      }
+    }
+  }
+
   private async handleRequest(req: Request): Promise<Response> {
     // Only accept POST requests
     if (req.method !== "POST") {

@@ -1053,11 +1053,22 @@ export class UnionFind {
   private rank: Map<string, number>;
   /** Size of each set (number of elements). */
   private size: Map<string, number>;
+  /**
+   * Member list of each NON-singleton root (a singleton root's only member is
+   * itself, so it has no entry). Maintained by {@link union} — the smaller
+   * list is appended to the larger — so enumerating one cluster costs
+   * O(cluster) instead of the O(mempool) scan-and-find it replaces in
+   * checkClusterSizeLimit / improvesFeerateDiagram. Like `parent`, it only
+   * ever grows until {@link clear}: callers filter by mempool membership,
+   * exactly as the scan they replace filtered by `find(txid) === root`.
+   */
+  private memberLists: Map<string, string[]>;
 
   constructor() {
     this.parent = new Map();
     this.rank = new Map();
     this.size = new Map();
+    this.memberLists = new Map();
   }
 
   /**
@@ -1112,17 +1123,43 @@ export class UnionFind {
     if (rankA < rankB) {
       this.parent.set(rootA, rootB);
       this.size.set(rootB, sizeA + sizeB);
+      this.mergeMembers(rootB, rootA);
       return rootB;
     } else if (rankA > rankB) {
       this.parent.set(rootB, rootA);
       this.size.set(rootA, sizeA + sizeB);
+      this.mergeMembers(rootA, rootB);
       return rootA;
     } else {
       this.parent.set(rootB, rootA);
       this.rank.set(rootA, rankA + 1);
       this.size.set(rootA, sizeA + sizeB);
+      this.mergeMembers(rootA, rootB);
       return rootA;
     }
+  }
+
+  /** Move `absorbed`'s members under `newRoot` (smaller list into larger). */
+  private mergeMembers(newRoot: string, absorbed: string): void {
+    const a = this.memberLists.get(newRoot) ?? [newRoot];
+    const b = this.memberLists.get(absorbed) ?? [absorbed];
+    this.memberLists.delete(absorbed);
+    if (a.length >= b.length) {
+      for (const id of b) a.push(id);
+      this.memberLists.set(newRoot, a);
+    } else {
+      for (const id of a) b.push(id);
+      this.memberLists.set(newRoot, b);
+    }
+  }
+
+  /**
+   * Every element ever placed in the set whose root is `root` (which MUST be
+   * a current root, i.e. a value returned by {@link find}). Equivalent to
+   * `{ id in parent : find(id) === root }`, without touching other sets.
+   */
+  membersOfRoot(root: string): readonly string[] {
+    return this.memberLists.get(root) ?? [root];
   }
 
   /**
@@ -1148,6 +1185,7 @@ export class UnionFind {
     this.parent.delete(id);
     this.rank.delete(id);
     this.size.delete(id);
+    this.memberLists.delete(id);
   }
 
   /**
@@ -1157,6 +1195,7 @@ export class UnionFind {
     this.parent.clear();
     this.rank.clear();
     this.size.clear();
+    this.memberLists.clear();
   }
 
   /**
@@ -1327,6 +1366,15 @@ export class Mempool {
 
   /** Whether cluster cache needs to be rebuilt. */
   private clusterCacheDirty: boolean;
+  /**
+   * Position of each entry in `entries`' iteration order (a Map iterates in
+   * key-insertion order; re-setting an existing key keeps its position).
+   * Lets an O(cluster) member walk reproduce the exact order the former
+   * O(mempool) scan visited cluster members in — the RBF feerate-diagram
+   * linearization stable-sorts on feerate, so ties depend on that order.
+   */
+  private entryOrder = new WeakMap<MempoolEntry, number>();
+  private nextEntryOrder = 0;
 
   /** Optional event emitter for ZMQ notifications. */
   private notificationEmitter: EventEmitter | null;
@@ -2437,6 +2485,7 @@ export class Mempool {
     }
 
     // Add to mempool
+    this.recordEntryOrder(txidHex, entry);
     this.entries.set(txidHex, entry);
     this.indexWtxid(txidHex, tx);
     this.currentSize += vsize;
@@ -2848,6 +2897,7 @@ export class Mempool {
         sigOpCost: 0,
       };
 
+      this.recordEntryOrder(txidHex, entry);
       this.entries.set(txidHex, entry);
       this.indexWtxid(txidHex, tx);
       this.currentSize += vsize;
@@ -4029,14 +4079,22 @@ export class Mempool {
 
     // Accumulate the merged cluster's count and sigop-adjusted WEIGHT.
     // The running total is never divided or rounded — see clusterWeightContribution.
+    // Walk only the members of the touched clusters. This used to scan the
+    // WHOLE mempool calling find() on every entry — O(mempool) per admitted
+    // tx, ~95% of accept CPU at 15k entries and the event-loop starver on the
+    // live node (80k entries). membersOfRoot(r) is exactly
+    // { id : find(id) === r }, so filtering it by `entries` gives the same
+    // set the scan produced.
     let mergedCount = 1; // +1 for the new tx
     let mergedWeight = newTxAdjWeight;
-    for (const [txidHex, entry] of this.entries) {
-      const root = this.clusters.find(txidHex);
-      if (!clusterRoots.has(root)) continue;
-      if (excluded.has(txidHex)) continue;
-      mergedCount += 1;
-      mergedWeight += this.clusterWeightContribution(entry);
+    for (const root of clusterRoots) {
+      for (const txidHex of this.clusters.membersOfRoot(root)) {
+        const entry = this.entries.get(txidHex);
+        if (entry === undefined) continue;
+        if (excluded.has(txidHex)) continue;
+        mergedCount += 1;
+        mergedWeight += this.clusterWeightContribution(entry);
+      }
     }
 
     // Gate 1: cluster count. Strict `>` — 64 accepts, 65 rejects.
@@ -4050,6 +4108,48 @@ export class Mempool {
     }
 
     return { valid: true };
+  }
+
+  /** Record `entry`'s position in `entries` iteration order (before set). */
+  private recordEntryOrder(txidHex: string, entry: MempoolEntry): void {
+    const existing = this.entries.get(txidHex);
+    const seq =
+      existing !== undefined ? this.entryOrder.get(existing) : undefined;
+    this.entryOrder.set(entry, seq ?? this.nextEntryOrder++);
+  }
+
+  /**
+   * In-mempool members of the given union-find roots, in `entries` iteration
+   * order: the same Set, in the same order, as
+   * `for (id of entries) if (roots.has(find(id))) add(id)`, in O(cluster).
+   * Falls back to that scan if an entry has no recorded order (an entry
+   * placed into `entries` by something other than the two insertion sites).
+   */
+  private clusterMembersInEntryOrder(roots: Set<string>): Set<string> {
+    const found: Array<{ seq: number; txidHex: string }> = [];
+    let complete = true;
+    outer: for (const root of roots) {
+      for (const txidHex of this.clusters.membersOfRoot(root)) {
+        const entry = this.entries.get(txidHex);
+        if (entry === undefined) continue;
+        const seq = this.entryOrder.get(entry);
+        if (seq === undefined) {
+          complete = false;
+          break outer;
+        }
+        found.push({ seq, txidHex });
+      }
+    }
+    const out = new Set<string>();
+    if (!complete) {
+      for (const txidHex of this.entries.keys()) {
+        if (roots.has(this.clusters.find(txidHex))) out.add(txidHex);
+      }
+      return out;
+    }
+    found.sort((a, b) => a.seq - b.seq);
+    for (const f of found) out.add(f.txidHex);
+    return out;
   }
 
   /**
@@ -4413,13 +4513,10 @@ export class Mempool {
     }
 
     // Gather all txids in those clusters.
-    const clusterTxids = new Set<string>();
-    for (const [txidHex] of this.entries) {
-      const root = this.clusters.find(txidHex);
-      if (touchedClusterRoots.has(root)) {
-        clusterTxids.add(txidHex);
-      }
-    }
+    // Same O(cluster) member walk as checkClusterSizeLimit (was an
+    // O(mempool) scan-and-find per RBF candidate). Members are then put back
+    // into `entries` iteration order, which is the order the scan produced.
+    const clusterTxids = this.clusterMembersInEntryOrder(touchedClusterRoots);
 
     if (clusterTxids.size === 0) return null; // nothing to compare
 
