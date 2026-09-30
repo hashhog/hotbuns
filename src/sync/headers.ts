@@ -139,6 +139,15 @@ export class HeaderSync {
   /** Callbacks invoked after headers are successfully processed. */
   private headersProcessedCallbacks: Array<(newTipHeight: number) => void>;
 
+  /**
+   * Source of the ACTIVE (fully validated) chain tip, used by
+   * {@link getAntiDoSWorkThreshold}. Core measures the near-tip buffer from
+   * `ActiveChain().Tip()`, not from m_best_header. Wired by the node to
+   * `ChainStateManager.getBestBlock`; when unset (unit tests) the best
+   * header stands in for the tip.
+   */
+  private activeTipProvider: (() => { hash: Buffer; chainWork: bigint } | null) | null = null;
+
   constructor(db: ChainDB, params: ConsensusParams, syncParams?: HeadersSyncParams) {
     this.db = db;
     this.params = params;
@@ -1331,6 +1340,97 @@ export class HeaderSync {
     return this.bestHeader.chainWork < this.params.nMinimumChainWork;
   }
 
+  /** Wire the active-chain tip source for the anti-DoS work threshold. */
+  setActiveTipProvider(fn: () => { hash: Buffer; chainWork: bigint } | null): void {
+    this.activeTipProvider = fn;
+  }
+
+  /**
+   * Minimum work a received headers chain must claim before we store any of
+   * it. Bitcoin Core `PeerManagerImpl::GetAntiDoSWorkThreshold`
+   * (net_processing.cpp:2633):
+   *
+   *   near_chaintip_work = tip->nChainWork - min(144 * GetBlockProof(*tip), tip->nChainWork);
+   *   return max(near_chaintip_work, MinimumChainWork());
+   *
+   * The 144-block buffer lets honest forks from near our tip through; anything
+   * that forks deeper must bring (claimed) work to match.
+   */
+  getAntiDoSWorkThreshold(): bigint {
+    let nearTipWork = 0n;
+    const tip = this.activeTipProvider?.() ?? this.bestHeader;
+    if (tip) {
+      const tipEntry = this.headerChain.get(tip.hash.toString("hex"));
+      if (tipEntry) {
+        const buffer = 144n * this.getHeaderWork(tipEntry.header.bits);
+        nearTipWork = tip.chainWork - (buffer < tip.chainWork ? buffer : tip.chainWork);
+      }
+    }
+    const minWork = this.params.nMinimumChainWork;
+    return nearTipWork > minWork ? nearTipWork : minWork;
+  }
+
+  /**
+   * Low-work headers gate for a peer with no PRESYNC/REDOWNLOAD in progress.
+   * Bitcoin Core `ProcessHeadersMessage` → `TryLowWorkHeadersSync`
+   * (net_processing.cpp:2765-2808, called at :3066):
+   *
+   *   total_work = chain_start->nChainWork + CalculateClaimedHeadersWork(headers)
+   *   if (total_work < GetAntiDoSWorkThreshold()) {
+   *     if (headers.size() == MAX_HEADERS_RESULTS) start a HeadersSyncState
+   *     else "Ignoring low-work chain"
+   *     headers = {};   // nothing from this message is stored
+   *   }
+   *
+   * Skipped (Core `already_validated_work`) when the last header is already
+   * on our best-header chain, and for headers that do not connect (those take
+   * the unconnecting path in processHeaders).
+   *
+   * Returns "proceed" (enough work — store as usual), "ignore" (drop the
+   * message), or the newly created PRESYNC state to run the message through.
+   */
+  private checkLowWorkHeaders(
+    peerKey: string,
+    headers: BlockHeader[],
+    fullMessage: boolean
+  ): "proceed" | "ignore" | PeerSyncState {
+    const chainStart = this.headerChain.get(headers[0].prevBlock.toString("hex"));
+    if (!chainStart) return "proceed";
+
+    // Core IsAncestorOfBestHeaderOrTip: already-known best-chain headers use
+    // no new memory, so they skip the work check.
+    if (this.isOnBestHeaderChain(getBlockHash(headers[headers.length - 1]))) return "proceed";
+
+    let totalWork = chainStart.chainWork;
+    for (const h of headers) totalWork += this.getHeaderWork(h.bits);
+    const threshold = this.getAntiDoSWorkThreshold();
+    if (totalWork >= threshold) return "proceed";
+
+    if (!fullMessage) {
+      console.warn(
+        `Ignoring low-work chain (height=${chainStart.height + headers.length}) from ${peerKey}: ` +
+          `claimed work ${totalWork} < anti-DoS threshold ${threshold}`
+      );
+      return "ignore";
+    }
+
+    const state: PeerSyncState = {
+      syncState: new HeadersSyncState(
+        this.params,
+        this.syncParams,
+        chainStart.hash,
+        chainStart.height,
+        chainStart.header.bits,
+        chainStart.chainWork,
+        threshold,
+        this.getMedianTimePast(chainStart)
+      ),
+      startTime: Date.now(),
+    };
+    this.peerSyncStates.set(peerKey, state);
+    return state;
+  }
+
   /**
    * Handle incoming headers message.
    *
@@ -1350,8 +1450,14 @@ export class HeaderSync {
       return;
     }
 
-    const peerState = this.peerSyncStates.get(peerKey);
+    let peerState = this.peerSyncStates.get(peerKey);
     const fullMessage = headers.length >= MAX_HEADERS_RESULTS;
+
+    if (!peerState || peerState.syncState.getState() === HeadersSyncStateEnum.FINAL) {
+      const gate = this.checkLowWorkHeaders(peerKey, headers, fullMessage);
+      if (gate === "ignore") return;
+      if (gate !== "proceed") peerState = gate;
+    }
 
     if (peerState && peerState.syncState.getState() !== HeadersSyncStateEnum.FINAL) {
       // Process through anti-DoS state machine
@@ -1391,8 +1497,11 @@ export class HeaderSync {
       this.resetUnconnectingHeaders(peerKey);
 
       if (result.requestMore) {
-        // Anti-DoS state needs more headers
-        this.requestHeaders(peer);
+        // Anti-DoS state needs more headers. force: a low-work sync started
+        // post-IBD (checkLowWorkHeaders) may be for a peer whose handshake
+        // startHeight is below our header tip, which would otherwise gate the
+        // follow-up getheaders off and leave the state machine hanging.
+        this.requestHeaders(peer, true);
       } else {
         // Sync complete (either finished or aborted)
         this.cleanupPeerSyncState(peerKey);

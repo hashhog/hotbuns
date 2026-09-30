@@ -1853,6 +1853,9 @@ async function startNode(config: NodeConfig): Promise<void> {
 
   // 5. Initialize header sync
   const headerSync = new HeaderSync(db, params);
+  // Anti-DoS header threshold is measured from the ACTIVE tip (Core
+  // GetAntiDoSWorkThreshold uses ActiveChain().Tip()).
+  headerSync.setActiveTipProvider(() => chainState.getBestBlock());
   await headerSync.loadFromDB();
   // Snapshot-first boot: AddToBlockIndex must leave m_best_header on the
   // loaded base before any peer headers arrive. loadFromDB reconstructs
