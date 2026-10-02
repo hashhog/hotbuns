@@ -2086,7 +2086,12 @@ export async function persistAssumeutxoTailHeaders(
  * with an existing entry (same internal-order block hash OR same height,
  * built-in or previously-loaded-campaign) is refused with a thrown Error,
  * which aborts startup (`main().catch` in index.ts logs "Fatal error" and
- * exits 1) — campaign data may never override a production hash. Callable
+ * exits 1) — campaign data may never override a production hash. The one
+ * exception is an entry whose commitment (height, blockhash,
+ * hash_serialized, m_chain_tx_count) is IDENTICAL to the existing row: that
+ * is a confirmation, accepted with the commitment untouched, and its
+ * verified base_header / chainwork / base_tail_headers fill only gaps in the
+ * row (any contradiction still refuses). Callable
  * against ANY network's params (mainnet included: the M2 campaign boots
  * "mainnet params" by design), unlike {@link registerRegtestAssumeutxo},
  * which stays regtest-only and untouched by this function.
@@ -2131,6 +2136,8 @@ export async function loadCampaignAssumeutxo(params: ConsensusParams): Promise<v
   }
 
   const loadedHeights: number[] = [];
+  const confirmedHeights: number[] = [];
+  const fileSeen: { height: number; key: string }[] = [];
   for (const [i, entry] of (parsed as CampaignAssumeutxoEntry[]).entries()) {
     if (typeof entry !== "object" || entry === null) {
       throw new Error(`loadCampaignAssumeutxo: entry ${i} in ${fixturePath} is not an object`);
@@ -2204,25 +2211,105 @@ export async function loadCampaignAssumeutxo(params: ConsensusParams): Promise<v
       baseHeader = baseTailHeaders[baseTailHeaders.length - 1];
     }
 
-    if (assumeutxo.has(key)) {
-      throw new Error(
-        `loadCampaignAssumeutxo: entry ${i} blockhash ${entry.blockhash} collides with an ` +
-          `existing assumeutxo entry — refusing to override a production/loaded hash`,
-      );
-    }
-    for (const existing of assumeutxo.values()) {
-      if (existing.height === entry.height) {
+    // Refuse a duplicate inside the campaign file itself (by height OR
+    // blockhash), before any comparison with the existing table — otherwise
+    // a repeated confirming entry would be "confirmed" twice.
+    for (const prev of fileSeen) {
+      if (prev.height === entry.height || prev.key === key) {
         throw new Error(
-          `loadCampaignAssumeutxo: entry ${i} height ${entry.height} collides with an ` +
-            `existing assumeutxo entry — refusing to override a production/loaded hash`,
+          `loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) duplicates an ` +
+            `earlier entry in the same campaign file — refusing`,
         );
       }
+    }
+    fileSeen.push({ height: entry.height, key });
+
+    // Collision with an existing (built-in) entry: campaign data may never
+    // override a production hash. Checked by blockhash (any height) and by
+    // height (any blockhash).
+    //
+    // The ONE non-refusal: an entry whose whole commitment — height,
+    // blockhash, hash_serialized AND m_chain_tx_count — is IDENTICAL to the
+    // existing row is not an override but a second source agreeing with the
+    // first (Core keys an m_assumeutxo_data row by height+blockhash and checks
+    // the snapshot against its hash_serialized; a byte-identical row adds no
+    // trust). The R4 rung at 910,000 was minted by dumping a Core clone there
+    // and came out equal to Core's own hardcoded anchor (kernel/chainparams.cpp,
+    // mirrored in consensus/params.ts); refusing it BLOCKED slice 910000-920000.
+    const nChainTx = BigInt(entry.m_chain_tx_count);
+    let confirms: AssumeutxoData | undefined;
+    for (const [existingKey, existing] of assumeutxo) {
+      if (existingKey !== key && existing.height !== entry.height) continue;
+      const identical =
+        existingKey === key &&
+        existing.height === entry.height &&
+        existing.hashSerialized.equals(hashSerialized) &&
+        existing.nChainTx === nChainTx;
+      if (!identical) {
+        throw new Error(
+          `loadCampaignAssumeutxo: entry ${i} (height ${entry.height}, blockhash ` +
+            `${entry.blockhash}) collides with an existing assumeutxo entry at height ` +
+            `${existing.height} (blockhash/hash_serialized/m_chain_tx_count differ) — ` +
+            `refusing to override a production/loaded hash`,
+        );
+      }
+      confirms = existing;
+    }
+
+    if (confirms) {
+      // Keep the existing commitment; fill ONLY gaps the boot path needs
+      // (cli.ts snapshot stitch: baseHeader, chainWork, baseTailHeaders — the
+      // built-in rows carry none, and a missing baseHeader is stitched as an
+      // all-zero header). Any value the row already pins must agree.
+      if (baseHeader && !hash256(baseHeader).equals(blockHash)) {
+        throw new Error(
+          `loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) matches the existing ` +
+            `commitment but its base_header hashes to ` +
+            `${Buffer.from(hash256(baseHeader)).reverse().toString("hex")}, not ${entry.blockhash}`,
+        );
+      }
+      const contradiction = (field: string) =>
+        new Error(
+          `loadCampaignAssumeutxo: entry ${i} (height ${entry.height}) matches the existing ` +
+            `commitment but its ${field} contradicts the existing row — refusing`,
+        );
+      if (baseHeader && confirms.baseHeader && !confirms.baseHeader.equals(baseHeader)) {
+        throw contradiction("base_header");
+      }
+      if (chainWork !== undefined && confirms.chainWork !== undefined && confirms.chainWork !== chainWork) {
+        throw contradiction("chainwork");
+      }
+      if (baseTailHeaders.length > 0 && confirms.baseTailHeaders && confirms.baseTailHeaders.length > 0) {
+        const a = confirms.baseTailHeaders;
+        if (a.length !== baseTailHeaders.length || a.some((h, j) => !h.equals(baseTailHeaders[j]))) {
+          throw contradiction("base_tail_headers");
+        }
+      }
+      const filled: string[] = [];
+      const merged: AssumeutxoData = { ...confirms };
+      if (baseHeader && !confirms.baseHeader) { merged.baseHeader = baseHeader; filled.push("baseHeader"); }
+      if (chainWork !== undefined && confirms.chainWork === undefined) { merged.chainWork = chainWork; filled.push("chainWork"); }
+      if (baseTailHeaders.length > 0 && !(confirms.baseTailHeaders && confirms.baseTailHeaders.length > 0)) {
+        merged.baseTailHeaders = baseTailHeaders;
+        filled.push("baseTailHeaders");
+      }
+      // Replace the map value with a merged COPY: the built-in row object
+      // (consensus/params.ts) is never mutated.
+      assumeutxo.set(key, merged);
+      console.log(
+        `[CAMPAIGN-ASSUMEUTXO] entry ${i} height ${entry.height} is IDENTICAL to the existing ` +
+          `assumeutxo commitment (blockhash, hash_serialized, m_chain_tx_count) — accepted as a ` +
+          `confirmation; commitment kept, filled: [${filled.join(",")}]`,
+      );
+      confirmedHeights.push(entry.height);
+      loadedHeights.push(entry.height);
+      continue;
     }
 
     assumeutxo.set(key, {
       height: entry.height,
       hashSerialized,
-      nChainTx: BigInt(entry.m_chain_tx_count),
+      nChainTx,
       blockHash,
       baseHeader,
       chainWork,
@@ -2233,7 +2320,7 @@ export async function loadCampaignAssumeutxo(params: ConsensusParams): Promise<v
 
   console.log(
     `[CAMPAIGN-ASSUMEUTXO] loaded ${loadedHeights.length} entries from ${fixturePath} ` +
-      `heights=[${loadedHeights.join(",")}]`,
+      `heights=[${loadedHeights.join(",")}] (confirming existing: [${confirmedHeights.join(",")}])`,
   );
 }
 
