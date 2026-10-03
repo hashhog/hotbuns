@@ -96,7 +96,9 @@ describe("P0-4 header diffbits strict equality", () => {
       hash: TEST_PARAMS.genesisBlockHash,
       header: {
         version: 4,
-        prevBlock: Buffer.alloc(32, 0),
+        // Ancestry must end at genesis — validateHeader refuses a truncated
+        // MTP window (missing-ancestor-header). MTP stays parent.timestamp.
+        prevBlock: TEST_PARAMS.genesisBlockHash,
         merkleRoot: Buffer.alloc(32, 0xab),
         timestamp,
         bits: PARENT_BITS,

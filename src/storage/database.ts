@@ -474,6 +474,22 @@ export class ChainDB {
   }
 
   /**
+   * Build a {@link BatchOperation} that writes a block-index record (hash ->
+   * metadata) WITHOUT the active-chain height -> hash entry. Used by the
+   * snapshot pre-base header backfill (sync/headers.ts), which stores a whole
+   * 2,000-header message in one batch instead of two awaited round-trips per
+   * header.
+   */
+  buildBlockIndexPutOp(hash: Buffer, record: BlockIndexRecord): BatchOperation {
+    return {
+      type: 'put',
+      prefix: DBPrefix.BLOCK_INDEX,
+      key: hash,
+      value: serializeBlockIndex(record),
+    };
+  }
+
+  /**
    * Build a {@link BatchOperation} that deletes the active-chain height -> hash
    * mapping at `height`.  Used to clear stale entries ABOVE the new tip after a
    * reorg to a shorter (heavier) chain, and on pure disconnect

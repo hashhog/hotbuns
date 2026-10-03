@@ -33,6 +33,7 @@ import {
   getSigOpsAdjustedWeight,
 } from "../validation/tx.js";
 import { isFinalTx } from "../mining/template.js";
+import { MissingAncestorHeaderError } from "../consensus/pow.js";
 import { sha256Hash } from "../crypto/primitives.js";
 import {
   verifyScript,
@@ -1950,7 +1951,9 @@ export class Mempool {
       tx.version >= 2 &&
       this.tipHeight >= (this.params.csvHeight ?? 0);
     if (enforceBIP68) {
-      const utxoConfirmations: UTXOConfirmation[] = inputUtxos.map(({ utxo, isMempool: isMp }) => {
+      let utxoConfirmations: UTXOConfirmation[];
+      try {
+      utxoConfirmations = inputUtxos.map(({ utxo, isMempool: isMp }) => {
         if (isMp) {
           // Unconfirmed parent: treat as mined at tipHeight + 1 with currentMTP.
           return { height: nextHeight, medianTimePast: currentMTP };
@@ -1962,19 +1965,26 @@ export class Mempool {
           // is not found — tipMTP is conservative (may over-reject near the
           // boundary, never false-accept).  Relay divergence only (BUG-5);
           // does NOT affect block-validation consensus.
+          //
+          // 2026-10-03: a header that IS present but whose 11-block window is
+          // not (snapshot-booted island) used to yield a truncated median;
+          // getCoinMedianTimePast refuses instead (caught below).
           const confirmedUtxo = utxo as UTXOEntry;
           let coinMTP = currentMTP;
           if (this.headerSync && confirmedUtxo.height > 0) {
-            const coinPrevHeader = this.headerSync.getHeaderByHeight(
-              confirmedUtxo.height - 1
-            );
-            if (coinPrevHeader) {
-              coinMTP = this.headerSync.getMedianTimePast(coinPrevHeader);
+            if (this.headerSync.getHeaderByHeight(confirmedUtxo.height - 1)) {
+              coinMTP = this.headerSync.getCoinMedianTimePast(confirmedUtxo.height);
             }
           }
           return { height: confirmedUtxo.height, medianTimePast: coinMTP };
         }
       });
+      } catch (err) {
+        if (err instanceof MissingAncestorHeaderError) {
+          return { accepted: false, error: err.message };
+        }
+        throw err;
+      }
       if (!checkSequenceLocks(tx, enforceBIP68, nextHeight, currentMTP, utxoConfirmations)) {
         return {
           accepted: false,

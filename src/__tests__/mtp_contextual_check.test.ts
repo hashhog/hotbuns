@@ -89,7 +89,11 @@ function makeParent(
     hash: params.genesisBlockHash,
     header: {
       version: 4,
-      prevBlock: Buffer.alloc(32, 0),
+      // Parent's ancestry must END AT GENESIS: validateHeader now refuses a
+      // median over a window that stops anywhere else (missing-ancestor-header,
+      // getMedianTimePastChecked). Window = [parent, genesis]; genesis is older
+      // than every fixture timestamp, so the MTP is still parent.timestamp.
+      prevBlock: params.genesisBlockHash,
       merkleRoot: Buffer.alloc(32, 0xab),
       timestamp: opts.timestamp ?? 1_700_000_000,
       bits: opts.bits ?? params.powLimitBits,

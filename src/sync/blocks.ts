@@ -15,7 +15,7 @@ import type { PeerManager } from "../p2p/manager.js";
 import type { NetworkMessage, InvVector } from "../p2p/messages.js";
 import { InvType } from "../p2p/messages.js";
 import { BanScores } from "../p2p/manager.js";
-import { HeaderSync, type HeaderChainEntry } from "./headers.js";
+import { HeaderSync, MissingAncestorHeaderError, type HeaderChainEntry } from "./headers.js";
 import type { ChainStateManager } from "../chain/state.js";
 import type { Mempool } from "../mempool/mempool.js";
 import {
@@ -1406,6 +1406,12 @@ export class BlockSync {
     // This replaces the old "headers" message handler which suffered from a
     // race condition: the message handler ran before headerSync finished
     // processing headers asynchronously, so bestHeader was stale.
+    // Pre-base header backfill done: release the held connect loop.
+    this.headerSync.onPreBaseBackfillComplete(() => {
+      if (!this.running) return;
+      void this.processOrderedBlocks();
+    });
+
     this.headerSync.onHeadersProcessed((newTipHeight: number) => {
       if (!this.running) return;
       // GAP2 fix (reorg-drop part 1/2): a heavier competing branch that forks
@@ -1786,6 +1792,12 @@ export class BlockSync {
     if (injectedHeight === heightBefore && this.state.nextHeightToProcess <= heightBefore) {
       const err = this.lastConnectError;
       const errL = err.toLowerCase();
+      // Not validated, not rejected: the connect loop is held for the
+      // snapshot pre-base header backfill, or a consensus check refused to
+      // decide on a missing ancestor header. BIP-22 "inconclusive".
+      if (this.headerSync.hasPreBaseHeaderGap() || errL.includes("missing-ancestor-header")) {
+        return "inconclusive";
+      }
       if (errL.includes("non-final") || errL.includes("nonfinal") || errL.includes("bad-txns-nonfinal") ||
           errL.includes("sequence locks not satisfied") || errL.includes("sequence lock")) {
         return "bad-txns-nonfinal";
@@ -2856,6 +2868,30 @@ export class BlockSync {
     }
   }
 
+  /**
+   * Snapshot boot whose header chain does not yet reach genesis: hold block
+   * connection (downloads continue) until the pre-base header backfill links
+   * genesis to the snapshot's header island. Core never validates a block
+   * without the full header tree behind it (headers-first; loadtxoutset
+   * requires the base header in the index), so every ancestor a consensus
+   * check reads — BIP-68 coin MTPs, BIP-113 windows, retarget period starts —
+   * exists. Logged at most once a minute.
+   */
+  private preBaseHoldLogMs = 0;
+  private holdForPreBaseHeaders(): boolean {
+    const st = this.headerSync.getPreBaseBackfillStatus();
+    if (!st) return false;
+    const now = Date.now();
+    if (now - this.preBaseHoldLogMs >= 60_000) {
+      this.preBaseHoldLogMs = now;
+      console.log(
+        `[assumeutxo] holding block connection at height ${this.state.nextHeightToProcess}: ` +
+          `pre-base header backfill at ${st.frontierHeight}/${st.rootHeight}`
+      );
+    }
+    return true;
+  }
+
   private async processOrderedBlocks(): Promise<void> {
     // Shutdown requested: never start another block (see stop()).
     if (this.stopRequested) {
@@ -2867,6 +2903,9 @@ export class BlockSync {
       return;
     }
     if (this.utxoScanPause > 0) {
+      return;
+    }
+    if (this.holdForPreBaseHeaders()) {
       return;
     }
     // Prevent concurrent block processing - multiple handleBlock calls can
@@ -2929,6 +2968,9 @@ export class BlockSync {
         return;
       }
       if (this.utxoScanPause > 0) {
+        return;
+      }
+      if (this.holdForPreBaseHeaders()) {
         return;
       }
       const bestHeader = this.headerSync.getBestHeader();
@@ -4084,12 +4126,19 @@ export class BlockSync {
         return false;
       }
       // Get prevMTP for the intermediate block.
-      let intermPrevMTP = 0;
-      const intermPrevHeaderEntry = this.headerSync.getHeaderByHeight(
-        intermediate.height - 1
-      );
-      if (intermPrevHeaderEntry) {
-        intermPrevMTP = this.headerSync.getMedianTimePast(intermPrevHeaderEntry);
+      // Core-exact window or a refusal (MissingAncestorHeaderError); never
+      // a 0 / truncated-median stand-in (see getMedianTimePastChecked).
+      let intermPrevMTP: number;
+      try {
+        intermPrevMTP = this.headerSync.getMedianTimePastAtHeight(
+          intermediate.height - 1,
+          "BIP-113 prev-block median-time-past"
+        );
+      } catch (err) {
+        console.warn(
+          `[reorg] intermediate block ${intermediate.hash.toString("hex").slice(0, 16)} at height ${intermediate.height}: ${(err as Error).message}`
+        );
+        return false;
       }
       const intermResult = await coreConnectBlockChecks(
         intermBlock,
@@ -4114,8 +4163,19 @@ export class BlockSync {
           verifyCLTV: intermediate.height >= this.params.bip65Height,
           verifyCSV: intermediate.height >= this.params.csvHeight,
           verifyNullDummy: intermediate.height >= this.params.segwitHeight,
+          // BIP-68 time locks need each coin's MTP. This path used to omit
+          // it, so coreConnectBlockChecks defaulted every coin time to 0 and
+          // a reorg's intermediate blocks never enforced a time-based
+          // relative lock (fail-open).
+          getUTXOMTP: (coinHeight: number) =>
+            this.headerSync.getCoinMedianTimePast(coinHeight),
         }
-      );
+      ).catch((err: unknown) => {
+        if (err instanceof MissingAncestorHeaderError) {
+          return { ok: false as const, error: err.message };
+        }
+        throw err;
+      });
       if (!intermResult.ok) {
         console.warn(
           `[reorg] intermediate block ${intermediate.hash.toString("hex").slice(0, 16)} at height ${intermediate.height} failed connect: ${intermResult.error}`
@@ -4516,12 +4576,23 @@ export class BlockSync {
 
     // Get the previous block's MTP for BIP-68 time-based locks and IsFinalTx.
     // IsFinalTx always needs MTP when CSV is active (BIP-113), even under assumevalid.
-    let blockPrevMTP = 0;
-    {
-      const prevHeaderEntry = this.headerSync.getHeaderByHeight(height - 1);
-      if (prevHeaderEntry) {
-        blockPrevMTP = this.headerSync.getMedianTimePast(prevHeaderEntry);
-      }
+    // Core-exact 11-block window, or fail CLOSED without a verdict: a
+    // missing ancestor is missing data, not an invalid block. The old code
+    // used 0 when the parent header was absent (every time-locked tx
+    // non-final) and a truncated median when an ancestor was.
+    let blockPrevMTP: number;
+    try {
+      blockPrevMTP = this.headerSync.getMedianTimePastAtHeight(
+        height - 1,
+        "BIP-113 prev-block median-time-past"
+      );
+    } catch (err) {
+      if (!(err instanceof MissingAncestorHeaderError)) throw err;
+      const m = `Block ${hashHex.slice(0, 16)}... at height ${height} not connected: ${err.message}`;
+      console.warn(m);
+      this.recordConnectError(m);
+      abortFailedReorg();
+      return false;
     }
 
     // ── assumevalid gate for script verification ──
@@ -4613,13 +4684,21 @@ export class BlockSync {
         utxoBestBlockHashHex: utxoBestBlockHashHexLE,
         // Per-coin MTP for accurate BIP-68 time-based sequence lock enforcement.
         // Uses HeaderSync to look up the MTP at (coinHeight - 1).
-        getUTXOMTP: (coinHeight: number) => {
-          if (coinHeight <= 0) return 0;
-          const coinPrevHeader = this.headerSync.getHeaderByHeight(coinHeight - 1);
-          return coinPrevHeader ? this.headerSync.getMedianTimePast(coinPrevHeader) : 0;
-        },
+        // Core CalculateSequenceLocks: GetAncestor(max(coinHeight-1,0))
+        // ->GetMedianTimePast(). Throws MissingAncestorHeaderError (caught
+        // below) instead of answering from a partial window — 2026-10-03,
+        // valid block 942168 was rejected bad-txns-nonfinal on a
+        // snapshot-booted slice because coin 937977's MTP was the median of
+        // the 3 indexed headers 937974..937976.
+        getUTXOMTP: (coinHeight: number) =>
+          this.headerSync.getCoinMedianTimePast(coinHeight),
       }
-    );
+    ).catch((err: unknown) => {
+      if (err instanceof MissingAncestorHeaderError) {
+        return { ok: false as const, error: `Block ${hashHex.slice(0, 16)}... at height ${height} not connected: ${err.message}` };
+      }
+      throw err;
+    });
 
     if (!coreResult.ok) {
       const m = coreResult.error;

@@ -35,6 +35,7 @@ import {
   DisconnectResult,
 } from "./utxo.js";
 import { ConsensusError, ConsensusErrorCode } from "../validation/errors.js";
+import { MissingAncestorHeaderError } from "../consensus/pow.js";
 import { BufferReader } from "../wire/serialization.js";
 import { globalSigCache } from "../validation/sig_cache.js";
 import {
@@ -488,12 +489,19 @@ export class ChainStateManager {
     let computedPrevMTP = block.header.timestamp;
     if (this.headerSync && height > 0) {
       try {
-        const prevHeader = this.headerSync.getHeaderByHeight(height - 1);
-        if (prevHeader) {
-          computedPrevMTP = this.headerSync.getMedianTimePast(prevHeader);
+        computedPrevMTP = this.headerSync.getMedianTimePastAtHeight(
+          height - 1,
+          "BIP-113 prev-block median-time-past"
+        );
+      } catch (err) {
+        // A truncated window is missing data, not a verdict: refuse.
+        if (err instanceof MissingAncestorHeaderError) {
+          throw new ConsensusError(
+            ConsensusErrorCode.CONNECT_BLOCK_FAILED,
+            `block at height ${height} not connected: ${err.message}`
+          );
         }
-      } catch {
-        // header-sync lookup failed — keep the fallback
+        // other header-sync lookup failure — keep the fallback
       }
     }
 
@@ -526,16 +534,22 @@ export class ChainStateManager {
       // (genesis-ancestor, blocked by coinbase maturity anyway) or when no
       // header entry at (coinHeight-1) exists (data-integrity issue; conservatively
       // allows the lock rather than crash-rejecting).
+      //
+      // 2026-10-03: the partial walk and the 0 fallback were both wrong —
+      // a truncated median rejected a VALID block (942168 on a
+      // snapshot-booted slice) and 0 accepts any time lock. getCoinMedianTimePast
+      // is Core's GetAncestor(max(h-1,0))->GetMedianTimePast() or throws
+      // MissingAncestorHeaderError, which is surfaced below as a
+      // non-consensus "not connected" error.
       getUTXOMTP: this.headerSync
-        ? (coinHeight: number): number => {
-            if (coinHeight <= 0) return 0;
-            const coinPrevHeader =
-              this.headerSync!.getHeaderByHeight(coinHeight - 1);
-            return coinPrevHeader
-              ? this.headerSync!.getMedianTimePast(coinPrevHeader)
-              : 0;
-          }
+        ? (coinHeight: number): number =>
+            this.headerSync!.getCoinMedianTimePast(coinHeight)
         : undefined,
+    }).catch((err: unknown) => {
+      if (err instanceof MissingAncestorHeaderError) {
+        return { ok: false as const, error: `block at height ${height} not connected: ${err.message}` };
+      }
+      throw err;
     });
 
     if (!result.ok) {

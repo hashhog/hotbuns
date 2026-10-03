@@ -67,6 +67,35 @@ function headerFromRaw(buf: Buffer): BlockHeader {
   };
 }
 
+/**
+ * Seed the 10 headers 60469..60478 below the parent, hash-linked on top of
+ * `below` (zeros = parentless). validateHeader's time-too-old check needs
+ * the parent's full 11-block MTP window and now REFUSES a truncated one
+ * (getMedianTimePastChecked), so a diffbits fixture must supply it.
+ */
+async function seedMtpWindow(hs: HeaderSync, below: Buffer): Promise<Buffer> {
+  let prev = below;
+  for (let i = 0; i < 10; i++) {
+    const h: BlockHeader = {
+      version: 4,
+      prevBlock: prev,
+      merkleRoot: Buffer.alloc(32, 0x40 + i),
+      timestamp: PARENT_TIME - (10 - i) * 600,
+      bits: PARENT_BITS,
+      nonce: 100 + i,
+    };
+    const hash = getBlockHash(h);
+    await hs.seedHeader({
+      hash,
+      header: h,
+      height: PARENT_HEIGHT - 10 + i,
+      chainWork: 0x100n + BigInt(i),
+    });
+    prev = hash;
+  }
+  return prev;
+}
+
 describe("snapshot-boot base_tail_headers (retarget 60480)", () => {
   let dbPath: string;
   let db: ChainDB;
@@ -85,10 +114,11 @@ describe("snapshot-boot base_tail_headers (retarget 60480)", () => {
   test("negative: 60480 header with 60479 bits is rejected when 58464 is missing", async () => {
     const hs = new HeaderSync(db, MAINNET);
     hs.initGenesis();
+    const windowTop = await seedMtpWindow(hs, Buffer.alloc(32, 0));
 
     const parentHeader: BlockHeader = {
       version: 4,
-      prevBlock: Buffer.alloc(32, 0),
+      prevBlock: windowTop,
       merkleRoot: Buffer.alloc(32, 0x11),
       timestamp: PARENT_TIME,
       bits: PARENT_BITS,
@@ -178,14 +208,12 @@ describe("snapshot-boot base_tail_headers (retarget 60480)", () => {
     const firstHash = getBlockHash(first);
     const parentHeader: BlockHeader = {
       version: 4,
-      prevBlock: firstHash,
+      prevBlock: Buffer.alloc(32, 0), // set below, once the window is seeded
       merkleRoot: Buffer.alloc(32, 0x02),
       timestamp: PARENT_TIME,
       bits: PARENT_BITS,
       nonce: 2,
     };
-    const parentHash = getBlockHash(parentHeader);
-
     const hs = new HeaderSync(db, MAINNET);
     hs.initGenesis();
     await hs.seedHeader({
@@ -194,6 +222,8 @@ describe("snapshot-boot base_tail_headers (retarget 60480)", () => {
       height: PERIOD_START,
       chainWork: 0x1000n,
     });
+    parentHeader.prevBlock = await seedMtpWindow(hs, firstHash);
+    const parentHash = getBlockHash(parentHeader);
     await hs.seedHeader({
       hash: parentHash,
       header: parentHeader,

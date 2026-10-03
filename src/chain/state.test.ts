@@ -785,6 +785,16 @@ describe("ChainStateManager", () => {
           timestamps.sort((a, b) => a - b);
           return timestamps[Math.floor(timestamps.length / 2)];
         },
+        // The checked accessors ChainStateManager now calls. A sequential
+        // chain from genesis has every window, so they reduce to the above.
+        getMedianTimePastAtHeight(h: number): number {
+          const e = mockHeaderSync.getHeaderByHeight(h);
+          if (!e) throw new Error(`mock: no header at ${h}`);
+          return mockHeaderSync.getMedianTimePast(e);
+        },
+        getCoinMedianTimePast(coinHeight: number): number {
+          return mockHeaderSync.getMedianTimePastAtHeight(Math.max(coinHeight - 1, 0));
+        },
       // Chain/state.ts holds the reference as HeaderSync; structural cast is
       // safe here because only getHeaderByHeight + getMedianTimePast are called.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any

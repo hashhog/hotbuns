@@ -64,6 +64,44 @@ export class MissingRetargetAncestorError extends Error {
 }
 
 /**
+ * A consensus check needs an ancestor header that is not in the header index.
+ *
+ * Bitcoin Core never reaches this state: its chainstate always sits on a
+ * header tree that reaches genesis (headers-first sync; `loadtxoutset`
+ * refuses a snapshot whose base header is not already indexed), so
+ * `CBlockIndex::GetAncestor(h)` and `GetMedianTimePast()` (chain.h, which
+ * walks `pprev` 11 times and stops only at genesis) are always complete.
+ * A snapshot-booted hotbuns can hold an island instead: the
+ * `base_tail_headers` band below the base with no parent. Computing a
+ * median from whatever part of the 11-block window happens to be indexed,
+ * or substituting 0 for an absent ancestor, turns MISSING DATA into a
+ * consensus verdict — 2026-10-03, R4 slice 940000-950000: the coin MTP for a
+ * 30-day BIP-68 time lock was taken from 3 of 11 timestamps, came out 2,133 s
+ * late, and valid block 942168 was rejected `bad-txns-nonfinal`.
+ *
+ * Callers must treat this as "cannot decide yet", never as invalid. The
+ * message deliberately carries no consensus reject token so
+ * `classifyCallbackError` files it as non-consensus (no header
+ * invalidation, no peer punishment).
+ */
+export class MissingAncestorHeaderError extends Error {
+  readonly height: number;
+  readonly missingHeight: number;
+
+  constructor(what: string, height: number, missingHeight: number) {
+    super(
+      `missing-ancestor-header: ${what} for height ${height} needs header ` +
+        `${missingHeight}, which is not in the header index (snapshot ` +
+        `pre-base header backfill incomplete) — refusing to decide from a ` +
+        `partial window`,
+    );
+    this.name = "MissingAncestorHeaderError";
+    this.height = height;
+    this.missingHeight = missingHeight;
+  }
+}
+
+/**
  * Calculate the next required work target for a block.
  *
  * This is the main entry point for difficulty adjustment, implementing

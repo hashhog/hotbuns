@@ -10,7 +10,7 @@
  * - REDOWNLOAD: Once sufficient work is demonstrated, re-fetch and store permanently
  */
 
-import type { ChainDB, BlockIndexRecord } from "../storage/database.js";
+import type { ChainDB, BlockIndexRecord, BatchOperation } from "../storage/database.js";
 import { DBPrefix } from "../storage/database.js";
 import {
   ConsensusParams,
@@ -24,6 +24,7 @@ import {
 } from "../chain/state.js";
 import {
   getNextWorkRequired,
+  MissingAncestorHeaderError,
   MissingRetargetAncestorError,
   type BlockInfo,
   type BlockLookup,
@@ -61,6 +62,21 @@ export interface HeaderChainEntry {
 
 /** Database key for storing the header chain tip (separate from validated chain tip). */
 const HEADER_TIP_KEY = "header_tip";
+
+/**
+ * The hole below a snapshot-booted header island: heights
+ * [0 .. rootHeight-1] are not (all) linked to the island root.
+ */
+export interface PreBaseHeaderGap {
+  /** Lowest header of the island (its parent is not indexed). */
+  rootHash: Buffer;
+  rootHeight: number;
+  /** Hash the header at rootHeight-1 must have (root.prevBlock). */
+  linkHash: Buffer;
+}
+
+/** Re-send a pre-base backfill getheaders that has not been answered. */
+const PRE_BASE_BACKFILL_TIMEOUT_MS = 60_000;
 
 /**
  * Bitcoin Core's MAX_NUM_UNCONNECTING_HEADERS_MSGS (net_processing.cpp).
@@ -147,6 +163,19 @@ export class HeaderSync {
    * header stands in for the tip.
    */
   private activeTipProvider: (() => { hash: Buffer; chainWork: bigint } | null) | null = null;
+
+  /**
+   * Snapshot pre-base header backfill state (see {@link refreshPreBaseGap}).
+   * `preBaseGap` non-null means the active header chain does not reach
+   * genesis; `preBaseFrontier` is the highest header linked to genesis
+   * below the gap, which the next backfill getheaders continues from.
+   */
+  private preBaseGap: PreBaseHeaderGap | null = null;
+  private preBaseFrontier: HeaderChainEntry | null = null;
+  private preBaseInFlight: { peerKey: string; sentAt: number } | null = null;
+  private preBaseFailedPeers: Set<string> = new Set();
+  private preBaseLastLogMs = 0;
+  private preBaseCompleteCallbacks: Array<() => void> = [];
 
   constructor(db: ChainDB, params: ConsensusParams, syncParams?: HeadersSyncParams) {
     this.db = db;
@@ -275,6 +304,7 @@ export class HeaderSync {
     // On handshake complete, request headers
     peerManager.onMessage("__connect__", (peer) => {
       this.requestHeaders(peer);
+      this.maybeRequestPreBaseHeaders(peer);
     });
 
     // On peer disconnect, clear per-peer header-sync state so a future peer
@@ -842,7 +872,15 @@ export class HeaderSync {
     // Core validation.cpp:4092-4093:
     //   if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())
     //     return state.Invalid(..., "time-too-old", ...);
-    const mtp = this.getMedianTimePast(parent);
+    let mtp: number;
+    try {
+      mtp = this.getMedianTimePastChecked(parent, "time-too-old median-time-past");
+    } catch (err) {
+      if (err instanceof MissingAncestorHeaderError) {
+        return { valid: false, error: err.message };
+      }
+      throw err;
+    }
     if (header.timestamp <= mtp) {
       return {
         valid: false,
@@ -973,6 +1011,67 @@ export class HeaderSync {
     return timestamps[Math.floor(timestamps.length / 2)];
   }
 
+  /**
+   * Median Time Past with Core's exact window, or a refusal.
+   *
+   * Core `CBlockIndex::GetMedianTimePast` (chain.h) walks `pprev` up to 11
+   * times and stops early ONLY at genesis, because every index entry's
+   * ancestors are present. {@link getMedianTimePast} instead returns the
+   * median of however many ancestors happen to be indexed, which on a
+   * snapshot-booted island is a different (later) number. Consensus callers
+   * use this variant: it throws {@link MissingAncestorHeaderError} when the
+   * walk stops short of 11 entries anywhere but genesis.
+   */
+  getMedianTimePastChecked(
+    entry: HeaderChainEntry,
+    what: string = "median-time-past",
+  ): number {
+    const timestamps: number[] = [];
+    let current: HeaderChainEntry | undefined = entry;
+    let last: HeaderChainEntry = entry;
+    for (let i = 0; i < 11 && current; i++) {
+      timestamps.push(current.header.timestamp);
+      last = current;
+      current = this.headerChain.get(current.header.prevBlock.toString("hex"));
+    }
+    if (timestamps.length < 11 && last.height !== 0) {
+      throw new MissingAncestorHeaderError(what, entry.height, last.height - 1);
+    }
+    timestamps.sort((a, b) => a - b);
+    return timestamps[Math.floor(timestamps.length / 2)];
+  }
+
+  /**
+   * MTP of the best-chain header at `height`, or a refusal when that header
+   * or any of its 10 predecessors is not indexed.
+   */
+  getMedianTimePastAtHeight(
+    height: number,
+    what: string = "median-time-past",
+  ): number {
+    const entry = this.headersByHeight.get(height);
+    if (!entry) {
+      throw new MissingAncestorHeaderError(what, height, height);
+    }
+    return this.getMedianTimePastChecked(entry, what);
+  }
+
+  /**
+   * BIP-68 coin time: Core `CalculateSequenceLocks` (consensus/tx_verify.cpp)
+   *   nCoinTime = block.GetAncestor(std::max(nCoinHeight - 1, 0))->GetMedianTimePast();
+   * Throws {@link MissingAncestorHeaderError} rather than returning 0 (which
+   * made every time lock trivially satisfied — fail-OPEN) or a truncated
+   * median (fail-closed on a VALID block — the 942168 rejection).
+   */
+  getCoinMedianTimePast(coinHeight: number): number {
+    return this.getMedianTimePastAtHeight(
+      Math.max(coinHeight - 1, 0),
+      "BIP-68 coin median-time-past",
+    );
+  }
+
+  /**
+   * Calculate the expected difficulty target for a given height.
   /**
    * Calculate the expected difficulty target for a given height.
    *
@@ -1177,6 +1276,15 @@ export class HeaderSync {
    * tip *and* the oldest tail is already indexed.
    */
   async adoptChainTipAsBestHeader(hash: Buffer, height: number): Promise<void> {
+    await this.adoptChainTipAsBestHeaderInner(hash, height);
+    // Snapshot base adopted: if the header chain below it is an island,
+    // arm the pre-base header backfill (Core holds the full header tree
+    // before any snapshot is activated).
+    this.refreshPreBaseGap();
+    this.maybeRequestPreBaseHeaders();
+  }
+
+  private async adoptChainTipAsBestHeaderInner(hash: Buffer, height: number): Promise<void> {
     const au = this.params.assumeutxo?.get(hash.toString("hex"));
     const storedWork = await this.db.getChainWork(hash);
     const chainState = await this.db.getChainState();
@@ -1241,6 +1349,333 @@ export class HeaderSync {
     return this.headersByHeight.get(height);
   }
 
+  // ── Snapshot pre-base header backfill ────────────────────────────────────
+  //
+  // Bitcoin Core only ever activates a UTXO snapshot on top of a header tree
+  // that reaches genesis: headers-first sync runs before `loadtxoutset`, which
+  // refuses a base whose header is not already indexed. Every consensus walk
+  // (GetMedianTimePast, GetAncestor for BIP-68 coin heights, the retarget
+  // period start) therefore finds its data. A hotbuns snapshot boot instead
+  // seeds the base plus a fixed `base_tail_headers` band and nothing below
+  // it — an island. Any lookup that runs off the island's bottom used to be
+  // answered from partial data. The backfill below fetches the missing
+  // headers [1 .. rootHeight] from peers, linking them to the island by
+  // HASH, and {@link hasPreBaseHeaderGap} lets block connection wait for it
+  // the way Core's validation never starts without the header chain.
+
+  /** True while the active header chain does not reach genesis. */
+  hasPreBaseHeaderGap(): boolean {
+    return this.preBaseGap !== null;
+  }
+
+  /** Gap + backfill frontier, for logging / tests (null when complete). */
+  getPreBaseBackfillStatus(): {
+    rootHeight: number;
+    frontierHeight: number;
+  } | null {
+    if (!this.preBaseGap) return null;
+    return {
+      rootHeight: this.preBaseGap.rootHeight,
+      frontierHeight: this.preBaseFrontier?.height ?? 0,
+    };
+  }
+
+  /** Invoked once when the backfill links genesis to the island root. */
+  onPreBaseBackfillComplete(cb: () => void): void {
+    this.preBaseCompleteCallbacks.push(cb);
+  }
+
+  /**
+   * Detect an island below the best header: walk `prevBlock` from the best
+   * header; if the walk stops anywhere but genesis, that entry is the
+   * island root. Also recovers the backfill frontier a previous run
+   * persisted (loadFromDB re-links those records to genesis).
+   *
+   * O(chain) — called at boot (loadFromDB, snapshot adoption), not per
+   * block.
+   */
+  refreshPreBaseGap(): PreBaseHeaderGap | null {
+    this.preBaseGap = null;
+    this.preBaseFrontier = null;
+    this.preBaseInFlight = null;
+    const genesis = this.headerChain.get(
+      this.params.genesisBlockHash.toString("hex"),
+    );
+    let cur = this.bestHeader;
+    if (!cur || !genesis || cur.height === 0) return null;
+    for (;;) {
+      if (cur.height === 0) return null; // reaches genesis: no gap
+      const parent = this.headerChain.get(cur.header.prevBlock.toString("hex"));
+      if (!parent) break;
+      cur = parent;
+    }
+    const root = cur;
+    this.preBaseGap = {
+      rootHash: root.hash,
+      rootHeight: root.height,
+      linkHash: Buffer.from(root.header.prevBlock),
+    };
+
+    // Frontier: the highest genesis-linked header below the root. A backfill
+    // interrupted by a restart persisted its batches; loadFromDB linked them
+    // back to genesis, so resume from the top of that run.
+    let best: HeaderChainEntry = genesis;
+    for (const e of this.headerChain.values()) {
+      if (e.status === "invalid") continue;
+      if (e.height > best.height && e.height < root.height) best = e;
+    }
+    // Confirm it really descends from genesis (a stray low header that does
+    // not would make every backfill reply unroutable).
+    let walk: HeaderChainEntry | undefined = best;
+    while (walk && walk.height > 0) {
+      walk = this.headerChain.get(walk.header.prevBlock.toString("hex"));
+    }
+    this.preBaseFrontier = walk === genesis ? best : genesis;
+
+    console.log(
+      `[assumeutxo] header chain does not reach genesis: island root at ` +
+        `height ${root.height} (${Buffer.from(root.hash).reverse().toString("hex").slice(0, 16)}...); ` +
+        `pre-base header backfill will fetch heights ` +
+        `${this.preBaseFrontier.height + 1}..${root.height} before blocks above the base are connected`,
+    );
+    return this.preBaseGap;
+  }
+
+  /**
+   * Send the next pre-base backfill getheaders, if one is due.
+   *
+   * Locator is the frontier (then genesis); hashStop is the island root, so
+   * a Core-like peer stops exactly at the header we link on. One request in
+   * flight at a time; an unanswered one is re-sent to another peer after
+   * PRE_BASE_BACKFILL_TIMEOUT_MS.
+   */
+  maybeRequestPreBaseHeaders(preferred?: Peer): void {
+    const gap = this.preBaseGap;
+    const frontier = this.preBaseFrontier;
+    if (!gap || !frontier) return;
+    const now = Date.now();
+    if (this.preBaseInFlight) {
+      if (now - this.preBaseInFlight.sentAt < PRE_BASE_BACKFILL_TIMEOUT_MS) return;
+      console.warn(
+        `[assumeutxo] pre-base header backfill request to ${this.preBaseInFlight.peerKey} ` +
+          `unanswered for ${PRE_BASE_BACKFILL_TIMEOUT_MS / 1000}s — trying another peer`,
+      );
+      this.preBaseFailedPeers.add(this.preBaseInFlight.peerKey);
+      this.preBaseInFlight = null;
+    }
+    const candidates: Peer[] = [];
+    if (preferred) candidates.push(preferred);
+    const pm = this.peerManager as unknown as { getConnectedPeers?: () => Peer[] } | null;
+    if (pm?.getConnectedPeers) candidates.push(...pm.getConnectedPeers());
+    if (candidates.length === 0) return;
+    const key = (p: Peer) => `${p.host}:${p.port}`;
+    let peer = candidates.find((p) => !this.preBaseFailedPeers.has(key(p)));
+    if (!peer) {
+      // Every connected peer failed once: start over rather than stall.
+      this.preBaseFailedPeers.clear();
+      peer = candidates[0];
+    }
+    const locator = [frontier.hash];
+    if (!frontier.hash.equals(this.params.genesisBlockHash)) {
+      locator.push(this.params.genesisBlockHash);
+    }
+    const msg: NetworkMessage = {
+      type: "getheaders",
+      payload: {
+        version: this.params.protocolVersion,
+        locatorHashes: locator,
+        hashStop: gap.rootHash,
+      },
+    };
+    if (peer.send(msg)) {
+      this.preBaseInFlight = { peerKey: key(peer), sentAt: now };
+    }
+  }
+
+  /**
+   * Store one backfill `headers` reply. Every header must extend the
+   * frontier and pass the full contextual header check (PoW, exact nBits,
+   * time-too-old over a COMPLETE 11-block window, checkpoints).
+   *
+   * Anti-DoS: these headers bypass the low-work PRESYNC gate because their
+   * acceptance is anchored by hash, not by claimed work — they are kept only
+   * as a chain that must arrive at the island root's own hash at
+   * `rootHeight`, a header whose PoW we already trust (assumeutxo base or
+   * its committed tail). Memory is bounded by `rootHeight` headers, the same
+   * index a Core node holds. A chain that reaches `rootHeight` with another
+   * hash is discarded from the frontier and its peer skipped.
+   */
+  private async processPreBaseHeaders(
+    peer: Peer,
+    headers: BlockHeader[],
+  ): Promise<void> {
+    const gap = this.preBaseGap;
+    let parent: HeaderChainEntry | null = this.preBaseFrontier;
+    if (!gap || !parent) return;
+    const peerKey = `${peer.host}:${peer.port}`;
+    this.preBaseInFlight = null;
+    const ops: BatchOperation[] = [];
+    const flush = async () => {
+      if (ops.length > 0 && !this.db.isClosing()) {
+        await this.db.batch(ops.splice(0));
+      }
+    };
+    const reject = (why: string) => {
+      console.warn(`[assumeutxo] pre-base header backfill from ${peerKey} rejected: ${why}`);
+      this.preBaseFailedPeers.add(peerKey);
+    };
+
+    for (const header of headers) {
+      if (!header.prevBlock.equals(parent.hash)) {
+        await flush();
+        this.preBaseFrontier = parent;
+        reject(`non-contiguous header after height ${parent.height}`);
+        return;
+      }
+      const height: number = parent.height + 1;
+      if (height > gap.rootHeight) break;
+      const hash = getBlockHash(header);
+      const v = this.validateHeader(header, parent);
+      if (!v.valid) {
+        await flush();
+        this.preBaseFrontier = parent;
+        reject(`invalid header at height ${height}: ${v.error}`);
+        return;
+      }
+      const cp = verifyCheckpoint(hash, height, this.params);
+      if (!cp.valid) {
+        await flush();
+        this.preBaseFrontier = parent;
+        reject(`checkpoint mismatch at height ${height}: ${cp.error}`);
+        return;
+      }
+
+      if (height === gap.rootHeight) {
+        await flush();
+        if (!hash.equals(gap.rootHash)) {
+          // A valid-PoW chain that is not ours. Drop the frontier back to
+          // genesis so the next peer is asked from scratch.
+          this.preBaseFrontier = this.headerChain.get(
+            this.params.genesisBlockHash.toString("hex"),
+          )!;
+          reject(
+            `header at island-root height ${height} is ` +
+              `${Buffer.from(hash).reverse().toString("hex").slice(0, 16)}..., ` +
+              `not the snapshot chain's ${Buffer.from(gap.rootHash).reverse().toString("hex").slice(0, 16)}...`,
+          );
+          return;
+        }
+        await this.linkPreBaseBackfill(header, parent);
+        return;
+      }
+
+      const hashHex = hash.toString("hex");
+      let entry: HeaderChainEntry | undefined = this.headerChain.get(hashHex);
+      if (!entry) {
+        entry = {
+          hash,
+          header,
+          height,
+          chainWork: parent.chainWork + this.getHeaderWork(header.bits),
+          status: "valid-header",
+        };
+        this.headerChain.set(hashHex, entry);
+        ops.push(
+          this.db.buildBlockIndexPutOp(hash, {
+            height,
+            header: serializeBlockHeader(header),
+            nTx: 0,
+            status: 1,
+            dataPos: 0,
+          }),
+        );
+      }
+      parent = entry;
+    }
+    await flush();
+    this.preBaseFrontier = parent;
+
+    const now = Date.now();
+    if (now - this.preBaseLastLogMs >= 10_000) {
+      this.preBaseLastLogMs = now;
+      console.log(
+        `[assumeutxo] pre-base header backfill: ${parent.height}/${gap.rootHeight} headers`,
+      );
+    }
+    this.maybeRequestPreBaseHeaders(peer);
+  }
+
+  /**
+   * The backfill reached the island root by hash: make the header chain one
+   * tree from genesis (Core's invariant) and release block connection.
+   */
+  private async linkPreBaseBackfill(
+    rootHeader: BlockHeader,
+    rootParent: HeaderChainEntry,
+  ): Promise<void> {
+    const gap = this.preBaseGap!;
+    const root = this.headerChain.get(gap.rootHash.toString("hex"));
+    if (!root) return;
+
+    // A snapshot base stored without its real header (a zero-prevBlock
+    // placeholder) gets the real one: its hash already matched.
+    if (!root.header.prevBlock.equals(rootParent.hash)) {
+      root.header = rootHeader;
+      await this.saveHeaderEntry(root);
+    }
+
+    // By-height index for [0 .. rootHeight-1].
+    let e: HeaderChainEntry | undefined = rootParent;
+    while (e) {
+      const at = this.headersByHeight.get(e.height);
+      if (at && at.hash.equals(e.hash)) break;
+      this.headersByHeight.set(e.height, e);
+      e = this.headerChain.get(e.header.prevBlock.toString("hex"));
+    }
+
+    // Real cumulative work up the best chain (Core: nChainWork is always
+    // parent + GetBlockProof). The band carried synthetic work and the
+    // base the snapshot's claimed work; derive both from headers now.
+    let parent = rootParent;
+    let h = gap.rootHeight;
+    let baseWorkNote = "";
+    for (;;) {
+      const cur = this.headersByHeight.get(h);
+      if (!cur || !cur.header.prevBlock.equals(parent.hash)) break;
+      const derived = parent.chainWork + this.getHeaderWork(cur.header.bits);
+      const au = this.params.assumeutxo?.get(cur.hash.toString("hex"));
+      if (au?.chainWork && au.chainWork > 0n && au.chainWork !== derived) {
+        baseWorkNote =
+          ` WARNING: snapshot base ${cur.height} claimed chainwork ${au.chainWork.toString(16)} ` +
+          `but its headers sum to ${derived.toString(16)}; using the header-derived value`;
+      }
+      cur.chainWork = derived;
+      parent = cur;
+      h++;
+    }
+    if (this.bestHeader) {
+      const tipWork = this.headerChain.get(this.bestHeader.hash.toString("hex"))?.chainWork;
+      if (tipWork !== undefined) this.bestHeader.chainWork = tipWork;
+    }
+
+    console.log(
+      `[assumeutxo] pre-base header backfill COMPLETE: genesis..${gap.rootHeight - 1} ` +
+        `linked to the snapshot header chain at height ${gap.rootHeight} by hash; ` +
+        `header chain now reaches genesis (${this.headerChain.size} headers)${baseWorkNote}`,
+    );
+    this.preBaseGap = null;
+    this.preBaseFrontier = null;
+    this.preBaseInFlight = null;
+    this.preBaseFailedPeers.clear();
+    for (const cb of this.preBaseCompleteCallbacks) {
+      try {
+        cb();
+      } catch {
+        // Ignore callback errors
+      }
+    }
+  }
+
   /**
    * Check if we need more headers (peer's best height > our header height).
    */
@@ -1260,6 +1695,9 @@ export class HeaderSync {
    */
   requestHeaders(peer: Peer, force?: boolean): void {
     const peerKey = `${peer.host}:${peer.port}`;
+    // Piggy-back: a pre-base backfill request that timed out is re-sent here
+    // (this runs on every inv/headers round, so no separate timer is needed).
+    if (this.preBaseGap && this.preBaseInFlight) this.maybeRequestPreBaseHeaders();
 
     // Get peer's best height from version message
     const peerBestHeight = peer.versionPayload?.startHeight ?? 0;
@@ -1469,6 +1907,20 @@ export class HeaderSync {
     headers: BlockHeader[]
   ): Promise<void> {
     const peerKey = `${peer.host}:${peer.port}`;
+
+    // Snapshot pre-base backfill reply: it extends the backfill frontier,
+    // not our best chain. Routed before the normal-sync latch so it does not
+    // release a getheaders that is still in flight.
+    if (
+      this.preBaseGap &&
+      this.preBaseFrontier &&
+      headers.length > 0 &&
+      headers[0].prevBlock.equals(this.preBaseFrontier.hash)
+    ) {
+      await this.processPreBaseHeaders(peer, headers);
+      return;
+    }
+
     this.syncingPeers.delete(peerKey);
 
     if (headers.length === 0) {
@@ -1797,6 +2249,11 @@ export class HeaderSync {
     if (this.bestHeader) {
       this.updateBestChain(this.bestHeader);
     }
+
+    // A snapshot-booted datadir whose pre-base header backfill has not
+    // completed is still an island: re-arm it (resuming from the persisted
+    // frontier) before any block above the base is connected.
+    this.refreshPreBaseGap();
   }
 
   /**
@@ -1974,6 +2431,8 @@ export class HeaderSync {
     return atHeight !== undefined && atHeight.hash.equals(hash);
   }
 }
+
+export { MissingAncestorHeaderError } from "../consensus/pow.js";
 
 // Re-export anti-DoS types for convenience
 export {
