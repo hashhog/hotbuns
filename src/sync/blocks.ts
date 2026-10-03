@@ -149,6 +149,53 @@ export function classifyCallbackError(
   return "unknown";
 }
 
+/** A reorg intermediate that failed a consensus rule (see BlockSync). */
+type ReorgInvalidIntermediate = { hash: Buffer; height: number; error: string };
+
+/**
+ * True when a connect failure is a BLOCK_MUTATED-class rejection: the bytes we
+ * received do not commit to the header (bad merkle root, duplicate-tx merkle
+ * malleation, witness commitment / nonce malleation, unexpected witness).
+ *
+ * Bitcoin Core (validation.cpp CheckBlock / CheckWitnessMalleation ->
+ * BLOCK_MUTATED; InvalidBlockFound skips BLOCK_FAILED_VALID for it): the peer
+ * is punished, but the BLOCK is NOT marked invalid — the same header may be
+ * served correctly by an honest peer. Marking it would permanently refuse a
+ * valid block because one peer garbled it.
+ */
+export function isBlockMutationError(err: string): boolean {
+  const s = err.toLowerCase();
+  return (
+    s.includes("merkle root mismatch") ||
+    s.includes("bad-txnmrklroot") ||
+    s.includes("bad-txns-duplicate") ||
+    s.includes("bad-witness-merkle-match") ||
+    s.includes("bad-witness-nonce-size") ||
+    s.includes("witness commitment mismatch") ||
+    s.includes("unexpected-witness")
+  );
+}
+
+/**
+ * True when a connect failure is a consensus VERDICT on the block (Core
+ * state.IsInvalid() with a result other than BLOCK_MUTATED) — the block may be
+ * marked failed (InvalidBlockFound) and never fetched again. False for
+ * mutation, for "cannot decide yet" refusals (missing ancestor header /
+ * partial MTP window), for the view-out-of-sync coordination gate, and for
+ * local I/O or chainstate errors: those are retried, never marked.
+ */
+export function isInvalidBlockVerdict(err: string): boolean {
+  if (classifyCallbackError(err) !== "consensus") return false;
+  if (isBlockMutationError(err)) return false;
+  const s = err.toLowerCase();
+  if (s.includes("missing-ancestor-header")) return false;
+  if (s.includes("view-out-of-sync")) return false;
+  // Scheduling mismatch (body is not the block on the header chain at that
+  // height), not a rule the block broke.
+  if (s.includes("does not match expected header")) return false;
+  return true;
+}
+
 /**
  * Map a connectBlock error string to a canonical BIP-22 result token.
  * Returns the most specific BIP-22 string possible, or "rejected" as fallback.
@@ -474,6 +521,26 @@ export class BlockSync {
    *  (`processOrderedBlocksInner`) keeps the fork-tip block buffered, re-requests
    *  the missing bodies, and NEVER bans the peer. Consumed + reset by the caller. */
   private reorgDeferredMissingBodies: boolean = false;
+
+  /** Core InvalidBlockFound parity for a reorg INTERMEDIATE (validation.cpp
+   *  ActivateBestChainStep -> ConnectTip failure on a block below the new tip).
+   *  When `handleReorgUtxoAndCollect` connects a stored side-branch body (e.g.
+   *  B1) and it fails a CONSENSUS rule, the verdict belongs to THAT block, not
+   *  to the fork tip being connected (B2x). Set here, consumed by
+   *  `processOrderedBlocksInner`, which marks the intermediate invalid (its
+   *  descendants become FAILED_CHILD), punishes the peer that delivered the
+   *  intermediate (Core BlockChecked via mapBlockSource) and returns to the
+   *  most-work valid chain. Never set for a non-verdict (missing ancestor
+   *  header, missing body, mutation, I/O). */
+  private reorgInvalidIntermediate: ReorgInvalidIntermediate | null = null;
+
+  /** Core mapBlockSource analogue for competing-fork bodies stored to disk by
+   *  `maybeStoreForkBody`: hashHex -> peerKey of the deliverer. Those bodies are
+   *  only validated later, as a reorg intermediate, after the download-buffer
+   *  peer record is gone; this lets that late verdict still reach the peer.
+   *  Bounded FIFO (FORK_BODY_SOURCE_MAX). */
+  private forkBodySource: Map<string, string> = new Map();
+  private static readonly FORK_BODY_SOURCE_MAX = 1024;
 
   /** Sticky record that the most recent processing pass DEFERRED a block
    *  (fork tip awaiting bridging bodies) rather than rejecting it.
@@ -1244,6 +1311,8 @@ export class BlockSync {
         // Compute depth below current tip.
         const tipHeight = this.state.nextHeightToProcess - 1;
         const headerEntry = this.headerSync.getHeader(blockHash);
+        // Known-invalid block: never fetch it again (Core BLOCK_CACHED_INVALID).
+        if (headerEntry?.status === "invalid") return;
         const blockHeight = headerEntry?.height;
         const depth = blockHeight !== undefined ? tipHeight - blockHeight : 0;
 
@@ -1466,6 +1535,14 @@ export class BlockSync {
         return;
       }
 
+      // A body for a block already known invalid: Core AcceptBlockHeader
+      // answers "duplicate-invalid" (BLOCK_CACHED_INVALID) and never stores or
+      // re-validates it. Drop it without punishing (inbound announcement of a
+      // cached-invalid block is not punished in Core).
+      if (headerEntry.status === "invalid") {
+        return;
+      }
+
       // G19c: fTooFarAhead — Core's MIN_BLOCKS_TO_KEEP=288 cap.
       // Unrequested blocks that are more than 288 heights ahead of the
       // active tip cannot advance chain selection soon and could be used
@@ -1482,7 +1559,7 @@ export class BlockSync {
       // `height >= nextHeightToProcess` gate below — it is a bridging body the
       // reorg dispatch needs on disk. Persist it as a side branch; the fork tip
       // (which is at/above the frontier) then drives the reorg.
-      if (await this.maybeStoreForkBody(block, blockHash, hashHex)) {
+      if (await this.maybeStoreForkBody(block, blockHash, hashHex, peerKey)) {
         await this.processOrderedBlocks();
         return;
       }
@@ -1625,7 +1702,8 @@ export class BlockSync {
   private async maybeStoreForkBody(
     block: Block,
     blockHash: Buffer,
-    hashHex: string
+    hashHex: string,
+    peerKey?: string
   ): Promise<boolean> {
     // Only side-branch a competing fork once the node has synced at least once
     // (NOT during genuine initial IBD). Use the one-way hasCompletedInitialSync
@@ -1673,6 +1751,15 @@ export class BlockSync {
     // in-memory copy (it will be re-read from disk during the reorg).
     await this.storeSideBranchBlock(block, blockHash, hashHex);
     this.forkBodiesOnDisk.add(hashHex);
+    const source = peerKey ?? this.downloadedBlockPeers.get(hashHex);
+    if (source !== undefined) {
+      this.forkBodySource.delete(hashHex);
+      this.forkBodySource.set(hashHex, source);
+      if (this.forkBodySource.size > BlockSync.FORK_BODY_SOURCE_MAX) {
+        const oldest = this.forkBodySource.keys().next().value;
+        if (oldest !== undefined) this.forkBodySource.delete(oldest);
+      }
+    }
     this.state.downloadedBlocks.delete(hashHex);
     this.downloadedBlockPeers.delete(hashHex);
     console.log(
@@ -1888,6 +1975,14 @@ export class BlockSync {
           // about the new chain, then the onHeadersProcessed callback will
           // trigger block downloads.
           needHeaders = true;
+          continue;
+        }
+        // Already known to be invalid (failed itself or descends from a failed
+        // block): Core never fetches a BLOCK_FAILED block again, and does not
+        // punish an INBOUND peer for merely announcing it (BLOCK_CACHED_INVALID
+        // in MaybePunishNodeForBlock). Without this every reconnect of the
+        // peer that holds the invalid chain re-downloaded and re-validated it.
+        if (headerEntry.status === "invalid") {
           continue;
         }
 
@@ -2683,6 +2778,15 @@ export class BlockSync {
 
       const hashHex = headerEntry.hash.toString("hex");
 
+      // Never request a block whose header is known invalid (Core
+      // FindNextBlocksToDownload skips BLOCK_FAILED_MASK). invalidateHeader
+      // normally re-seats the by-height index off such a branch; this is the
+      // belt-and-braces guard for the request walk itself.
+      if (headerEntry.status === "invalid") {
+        this.state.nextHeightToRequest++;
+        continue;
+      }
+
       // Skip if already pending or downloaded
       if (
         this.state.pendingBlocks.has(hashHex) ||
@@ -2702,6 +2806,19 @@ export class BlockSync {
         continue;
       }
 
+      // Core FindNextBlocksToDownload only asks a peer for a block on ITS best
+      // known chain (pindexBestKnownBlock). hotbuns tracks that per peer as a
+      // height (bestKnownHeight, raised by its headers/inv): when some peer
+      // has announced this height, do not ask peers that have not — they
+      // answer NOTFOUND (an invalid block announced by one peer was fetched
+      // from the honest peer first, twice). Peers with no recorded height, or
+      // no announcer at all, keep the old any-peer behaviour.
+      const announced = (p: Peer): boolean =>
+        typeof p.bestKnownHeight !== "number" || p.bestKnownHeight >= height;
+      const someoneAnnounced = peerList.some(
+        (p) => typeof p.bestKnownHeight === "number" && p.bestKnownHeight >= height
+      );
+
       // For blocks near the processing frontier, strongly prefer the best peer
       const isCritical = (height - this.state.nextHeightToProcess) < criticalWindow;
       const startIdx = isCritical ? 0 : peerIndex;
@@ -2713,6 +2830,11 @@ export class BlockSync {
         const peer = peerList[idx % peerList.length];
         const peerKey = `${peer.host}:${peer.port}`;
         const peerInfo = this.peerInFlight.get(peerKey)!;
+
+        if (someoneAnnounced && !announced(peer)) {
+          if (!isCritical) peerIndex++;
+          continue;
+        }
 
         // Skip peers that have been persistently stalling — they likely can't
         // serve blocks at these heights (e.g. pruned nodes).
@@ -2756,6 +2878,10 @@ export class BlockSync {
           const peer = peerList[peerIndex % peerList.length];
           const fbKey = `${peer.host}:${peer.port}`;
           const fbInfo = this.peerInFlight.get(fbKey)!;
+          if (someoneAnnounced && !announced(peer)) {
+            peerIndex++;
+            continue;
+          }
           if (fbInfo.count < MAX_IN_FLIGHT_PER_PEER) {
             const queue = peerQueues.get(fbKey)!;
             queue.push(headerEntry.hash);
@@ -3120,6 +3246,12 @@ export class BlockSync {
         // state — the classifier needs the raw error string to pick the
         // right banner.
         const failureMsg = this.lastConnectError;
+        // A reorg intermediate (a stored side-branch body below this fork tip)
+        // carried the consensus failure; the verdict and the punishment belong
+        // to it, not to the tip (Core InvalidBlockFound on the ConnectTip that
+        // failed + BlockChecked for that block's mapBlockSource entry).
+        const invalidIntermediate = this.reorgInvalidIntermediate;
+        this.reorgInvalidIntermediate = null;
 
         // ── Reorg-to-ancestor HALT (crash-recovery / reorg-integrity class) ──
         //
@@ -3183,14 +3315,26 @@ export class BlockSync {
         // Never while shutting down: a connect that fails after stop() began is
         // not evidence the block is invalid (Core never calls InvalidBlockFound
         // for an interrupted connect).
+        //
+        // Mutation (BLOCK_MUTATED) and non-verdicts are excluded via
+        // isInvalidBlockVerdict: Core never marks a mutated block failed (an
+        // honest peer may serve the real one), and "cannot decide yet" errors
+        // must be retried. For a reorg whose INTERMEDIATE failed, the
+        // intermediate is the failed block; invalidateHeader propagates the
+        // failure to every known descendant (the fork tip included), so the
+        // whole invalid branch leaves best-header selection and is never
+        // re-requested.
         if (
           !this.stopRequested &&
           this.chainStateManager &&
           headerEntry &&
-          classifyCallbackError(failureMsg) === "consensus"
+          isInvalidBlockVerdict(failureMsg)
         ) {
           const activeTip = this.chainStateManager.getBestBlock();
-          this.headerSync.invalidateHeader(headerEntry.hash, activeTip.hash);
+          this.headerSync.invalidateHeader(
+            invalidIntermediate ? invalidIntermediate.hash : headerEntry.hash,
+            activeTip.hash
+          );
         }
 
         // Track consecutive failures at the same height to detect permanent
@@ -3218,7 +3362,9 @@ export class BlockSync {
         // path above already returns early for the specific missing-bridge case;
         // this gate is the defence-in-depth generalisation: a non-consensus
         // connect failure must never punish the delivering peer.
-        const blockPeerKey = this.downloadedBlockPeers.get(hashHex);
+        const blockPeerKey = invalidIntermediate
+          ? this.forkBodySource.get(invalidIntermediate.hash.toString("hex"))
+          : this.downloadedBlockPeers.get(hashHex);
         if (
           !this.stopRequested &&
           blockPeerKey &&
@@ -3235,8 +3381,15 @@ export class BlockSync {
           }
         }
 
+        if (invalidIntermediate) {
+          this.forkBodySource.delete(invalidIntermediate.hash.toString("hex"));
+        }
         console.error(
-          `Block validation failed at height ${height} (attempt ${this.consecutiveFailures})${coords}, discarding and re-requesting: ${failureMsg}`
+          `Block validation failed at height ${height} (attempt ${this.consecutiveFailures})${coords}, ` +
+            (isInvalidBlockVerdict(failureMsg)
+              ? `marked invalid (not re-requested): `
+              : `discarding and re-requesting: `) +
+            failureMsg
         );
         this.state.downloadedBlocks.delete(hashHex);
         this.downloadedBlockPeers.delete(hashHex);
@@ -4172,7 +4325,7 @@ export class BlockSync {
         }
       ).catch((err: unknown) => {
         if (err instanceof MissingAncestorHeaderError) {
-          return { ok: false as const, error: err.message };
+          return { ok: false as const, error: err.message, noVerdict: true as const };
         }
         throw err;
       });
@@ -4180,6 +4333,23 @@ export class BlockSync {
         console.warn(
           `[reorg] intermediate block ${intermediate.hash.toString("hex").slice(0, 16)} at height ${intermediate.height} failed connect: ${intermResult.error}`
         );
+        // Core ActivateBestChainStep: a ConnectTip failure with
+        // state.IsInvalid() on ANY block of the new branch is a verdict on
+        // THAT block (InvalidBlockFound). Record it so the caller marks the
+        // intermediate (and so its descendants) invalid instead of retrying the
+        // fork tip forever against a view the failed reorg left behind. A
+        // "cannot decide yet" refusal (MissingAncestorHeaderError) and a block
+        // mutation are not verdicts and stay unmarked.
+        if (
+          !("noVerdict" in intermResult) &&
+          isInvalidBlockVerdict(intermResult.error)
+        ) {
+          this.reorgInvalidIntermediate = {
+            hash: intermediate.hash,
+            height: intermediate.height,
+            error: intermResult.error,
+          };
+        }
         return false;
       }
       // Persist undo data for the intermediate so a subsequent
@@ -4407,6 +4577,7 @@ export class BlockSync {
     // ActivateBestChainStep parity — see the field doc + the reorg-abort
     // restore below).
     this.reorgAbortRestoredTip = null;
+    this.reorgInvalidIntermediate = null;
     // Reset the reorg-deferral signal for this attempt (Core AcceptBlock /
     // ActivateBestChain parity — set by the reorg dispatch when a bridging body
     // is not yet on disk; see the field doc + the deferral handling below).
@@ -4550,6 +4721,26 @@ export class BlockSync {
     // always called, and ConnectBlock where only
     //   bool fScriptChecks = !fJustCheck && !fAssumeValid;
     // is gated on assumevalid.
+    // A reorg intermediate failed a consensus rule: the new branch is invalid
+    // from that block up, so this fork tip cannot connect. Abort now with the
+    // INTERMEDIATE's reject reason (Core ActivateBestChainStep breaks out on
+    // the ConnectTip failure). Falling through used to surface only the
+    // secondary `view-out-of-sync` gate error, which the caller treats as a
+    // non-verdict and retries forever (the B2x hot loop).
+    // (Read through a widened alias: TS narrows the field to `null` from the
+    // reset at the top of this method and cannot see the await that set it.)
+    const bad = this.reorgInvalidIntermediate as ReorgInvalidIntermediate | null;
+    if (bad !== null) {
+      const m =
+        `Block ${hashHex.slice(0, 16)}... at height ${height} not connected: ` +
+        `reorg intermediate ${bad.hash.toString("hex").slice(0, 16)} at height ` +
+        `${bad.height} is invalid: ${bad.error}`;
+      console.warn(m);
+      this.recordConnectError(m);
+      abortFailedReorg();
+      return false;
+    }
+
     const validation = validateBlock(block, height, this.params);
     if (!validation.valid) {
       const m = `Block ${hashHex.slice(0, 16)}... at height ${height} failed validation: ${validation.error}`;

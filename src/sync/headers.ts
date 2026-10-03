@@ -764,6 +764,12 @@ export class HeaderSync {
     if (!badEntry) return;
 
     badEntry.status = "invalid";
+    // Core SetBlockFailureFlags / BLOCK_FAILED_CHILD: every header already in
+    // the index that descends from the failed block is invalid too. Only
+    // propagating at insert time (processHeaders) left an already-known
+    // heavier descendant (a fork tip B2x on the failed B1) "valid", so it
+    // stayed selectable and its body was requested again and again.
+    const descendants = this.markDescendantsInvalid(badEntry);
 
     const newBest = this.headerChain.get(newBestHash.toString("hex"));
     if (!newBest) {
@@ -806,11 +812,58 @@ export class HeaderSync {
     console.log(
       `[invalidate-header] ${badHash
         .toString("hex")
-        .slice(0, 16)} (height ${badEntry.height}) marked invalid; ` +
+        .slice(0, 16)} (height ${badEntry.height}) marked invalid` +
+        (descendants > 0 ? ` (+${descendants} descendant(s) failed-child)` : ``) +
+        `; ` +
         `best header re-seated on ${newBestHash
           .toString("hex")
           .slice(0, 16)} (height ${newBest.height})`
     );
+  }
+
+  /**
+   * Flag every indexed header that descends from `bad` as "invalid" (Core
+   * BLOCK_FAILED_CHILD). Only entries ABOVE `bad.height` can descend from it;
+   * each is resolved by walking its parents down to `bad.height`, memoising
+   * the verdict per hash so shared ancestry is walked once. Returns the number
+   * of headers newly flagged. Invalidation is rare, so one pass over the index
+   * is acceptable.
+   */
+  private markDescendantsInvalid(bad: HeaderChainEntry): number {
+    const badHex = bad.hash.toString("hex");
+    const memo = new Map<string, boolean>();
+    memo.set(badHex, true);
+    let flagged = 0;
+    for (const [hex, entry] of this.headerChain) {
+      if (entry.height <= bad.height) continue;
+      const path: string[] = [];
+      let cur: HeaderChainEntry | undefined = entry;
+      let curHex = hex;
+      let verdict = false;
+      while (cur) {
+        const known = memo.get(curHex);
+        if (known !== undefined) {
+          verdict = known;
+          break;
+        }
+        if (cur.height <= bad.height) {
+          verdict = false;
+          break;
+        }
+        path.push(curHex);
+        curHex = cur.header.prevBlock.toString("hex");
+        cur = this.headerChain.get(curHex);
+      }
+      for (const p of path) memo.set(p, verdict);
+      if (verdict && entry.status !== "invalid") {
+        entry.status = "invalid";
+        flagged++;
+      }
+    }
+    if (flagged > 0 && this.mostWorkValid && this.mostWorkValid.status === "invalid") {
+      this.mostWorkValid = null;
+    }
+    return flagged;
   }
 
   /**
