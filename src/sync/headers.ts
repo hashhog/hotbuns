@@ -413,6 +413,33 @@ export class HeaderSync {
   }
 
   /**
+   * Rate-limited "Orphan header received" line: at most one per
+   * ORPHAN_LOG_INTERVAL_MS, carrying the count suppressed since the last.
+   *
+   * A peer re-delivering a 2,000-header batch whose first header we reject
+   * makes the other 1,999 orphans on every delivery. Logged per header
+   * synchronously, that was ~6.8M lines / ~495 MB in an hour on the
+   * 2026-10-02 rung-900000 wedge, and ~100 ms/block of console time.
+   */
+  private orphanLogLastMs = 0;
+  private orphanLogSuppressed = 0;
+  private static readonly ORPHAN_LOG_INTERVAL_MS = 10_000;
+  private logOrphanHeader(hashHex: string): void {
+    const now = Date.now();
+    if (now - this.orphanLogLastMs < HeaderSync.ORPHAN_LOG_INTERVAL_MS) {
+      this.orphanLogSuppressed++;
+      return;
+    }
+    const more =
+      this.orphanLogSuppressed > 0
+        ? ` (+${this.orphanLogSuppressed} more since last line)`
+        : "";
+    console.warn(`Orphan header received: ${hashHex.slice(0, 16)}...${more}`);
+    this.orphanLogLastMs = now;
+    this.orphanLogSuppressed = 0;
+  }
+
+  /**
    * Process incoming headers message. Validate and store each header.
    * Returns new valid headers count.
    */
@@ -446,7 +473,7 @@ export class HeaderSync {
       if (!parent) {
         // Orphan header - we don't have the parent
         // In a full implementation, we'd track orphans and try to connect later
-        console.warn(`Orphan header received: ${hashHex.slice(0, 16)}...`);
+        this.logOrphanHeader(hashHex);
         continue;
       }
 
@@ -1653,6 +1680,12 @@ export class HeaderSync {
       (a, b) => a.record.height - b.record.height,
     );
 
+    // Roots of anchored islands (hashHex -> chainWork), computed lazily on
+    // the first parentless record so a normal genesis-linked index never
+    // pays for the walk. See computeIslandRoots.
+    let islandRoots: Map<string, bigint> | null = null;
+    let missingParentCount = 0;
+
     for (const { record, hash } of sorted) {
       const headerBuf = record.header;
       const header: BlockHeader = {
@@ -1672,28 +1705,43 @@ export class HeaderSync {
         // (validation.cpp:4919). A dummy prevBlock (zeros) must not
         // leave the pointer at genesis.
         const hashHex = hash.toString("hex");
+        islandRoots ??= await this.computeIslandRoots(
+          records,
+          chainState?.bestBlockHash ?? null,
+          chainState?.totalWork ?? null,
+        );
+        const rootWork = islandRoots.get(hashHex);
         const au = this.params.assumeutxo?.get(hashHex);
         const isChainTip =
           chainState !== null && chainState.bestBlockHash.equals(hash);
         const isHeaderTip = headerTip !== null && headerTip.equals(hash);
-        if (!isChainTip && !isHeaderTip && !au) {
-          console.warn(
-            `Missing parent for header at height ${record.height} ` +
-              `(${hash.toString("hex").slice(0, 16)}...)`,
-          );
+        if (rootWork === undefined && !isChainTip && !isHeaderTip && !au) {
+          // One line per boot, not per record: a dropped band of N headers
+          // used to print N lines.
+          if (missingParentCount++ < 3) {
+            console.warn(
+              `Missing parent for header at height ${record.height} ` +
+                `(${hash.toString("hex").slice(0, 16)}...)`,
+            );
+          }
           continue;
         }
         let hdr = header;
         if (au?.baseHeader && au.baseHeader.length >= 80) {
           hdr = this.headerFromBytes(au.baseHeader);
         }
-        const storedWork = await this.db.getChainWork(hash);
-        const chainWork = this.heavierThanGenesis(
-          storedWork ??
-            au?.chainWork ??
-            chainState?.totalWork ??
-            this.params.nMinimumChainWork,
-        );
+        let chainWork: bigint;
+        if (rootWork !== undefined) {
+          chainWork = this.heavierThanGenesis(rootWork);
+        } else {
+          const storedWork = await this.db.getChainWork(hash);
+          chainWork = this.heavierThanGenesis(
+            storedWork ??
+              au?.chainWork ??
+              chainState?.totalWork ??
+              this.params.nMinimumChainWork,
+          );
+        }
         let status: HeaderStatus = "valid-header";
         if ((record.status & 1) === 0) {
           status = "invalid";
@@ -1738,10 +1786,87 @@ export class HeaderSync {
       }
     }
 
+    if (missingParentCount > 3) {
+      console.warn(
+        `Missing parent for ${missingParentCount} header(s) in total ` +
+          `(first 3 logged); they are not part of any anchored chain`,
+      );
+    }
+
     // Rebuild headersByHeight for best chain
     if (this.bestHeader) {
       this.updateBestChain(this.bestHeader);
     }
+  }
+
+  /**
+   * Find the parentless roots of index islands that a work reference
+   * descends from, and the chainwork each root must carry.
+   *
+   * A snapshot-booted datadir holds an island: the `base_tail_headers`
+   * band persisted below the base (persistAssumeutxoTailHeaders), whose
+   * lowest header's parent was never indexed. loadFromDB walks in height
+   * order and connects each record to its parent, so without an anchor at
+   * the band's root it dropped the root, then every later band entry (no
+   * parent), and only the base survived via the assumeutxo/tip special
+   * case. GetNextWorkRequired for the first retarget above the base then
+   * could not reach its period-start ancestor, and the node wedged one
+   * header short of it (2026-10-02, rung 900000: 901,151).
+   *
+   * References are records whose cumulative work is authoritative: every
+   * assumeutxo base present in the index (au.chainWork, else its stored
+   * work) and the active chain tip (CHAIN_STATE.totalWork). Walking back by
+   * prevBlock from a reference to the first record whose parent is not
+   * indexed gives the island's root; the root's work is the reference's
+   * work minus the per-header work of every record above it, so the
+   * forward pass reproduces the reference's work exactly and every band
+   * header carries its real cumulative work (Core: nChainWork). A walk that
+   * reaches genesis means the reference is not on an island.
+   */
+  private async computeIslandRoots(
+    records: Map<string, { record: BlockIndexRecord; hash: Buffer }>,
+    chainTip: Buffer | null,
+    chainTipWork: bigint | null,
+  ): Promise<Map<string, bigint>> {
+    const roots = new Map<string, bigint>();
+    const genesisHex = this.params.genesisBlockHash.toString("hex");
+
+    const refs: { hex: string; work: bigint }[] = [];
+    if (this.params.assumeutxo) {
+      for (const [hex, au] of this.params.assumeutxo) {
+        if (!records.has(hex)) continue;
+        const work =
+          au.chainWork && au.chainWork > 0n
+            ? au.chainWork
+            : await this.db.getChainWork(au.blockHash);
+        if (work !== null && work > 0n) refs.push({ hex, work });
+      }
+    }
+    if (chainTip && chainTipWork !== null && chainTipWork > 0n) {
+      const hex = chainTip.toString("hex");
+      if (records.has(hex)) refs.push({ hex, work: chainTipWork });
+    }
+
+    for (const ref of refs) {
+      let curHex = ref.hex;
+      let work = ref.work;
+      // Bounded by the record count: hashes cannot cycle, but a corrupt
+      // index must not spin forever.
+      for (let steps = 0; steps <= records.size; steps++) {
+        const cur = records.get(curHex)!;
+        const parentHex = cur.record.header.subarray(4, 36).toString("hex");
+        if (parentHex === genesisHex) break; // connected; not an island
+        const parent = records.get(parentHex);
+        if (!parent) {
+          // First reference wins: an assumeutxo base outranks the tip.
+          if (!roots.has(curHex)) roots.set(curHex, work);
+          break;
+        }
+        work -= this.getHeaderWork(cur.record.header.readUInt32LE(72));
+        curHex = parentHex;
+      }
+    }
+    return roots;
   }
 
   /**

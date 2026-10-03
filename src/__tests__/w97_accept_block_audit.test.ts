@@ -137,7 +137,8 @@ describe("W97 AcceptBlockHeader — duplicate, prev-blk, contextual gates", () =
     const idx = HEADERS_SRC.indexOf("async processHeaders(");
     const slice = HEADERS_SRC.slice(idx, idx + 4000);
     // Orphan handling block:
-    expect(slice).toContain("Orphan header received:");
+    expect(slice).toContain("this.logOrphanHeader(hashHex)");
+    expect(HEADERS_SRC).toContain("Orphan header received:");
     // Core's canonical token:
     expect(slice).not.toContain("prev-blk-not-found");
     // No peer.misbehaving for orphan flood:
