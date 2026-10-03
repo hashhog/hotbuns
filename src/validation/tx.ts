@@ -17,6 +17,33 @@ import { globalSigCache, type CacheKey } from "./sig_cache.js";
 // runtime interpreter.ts ↔ tx.ts cycle that the lazy require()s below avoid.
 import type { TaprootContext } from "../script/interpreter.js";
 
+type InterpreterModule = typeof import("../script/interpreter.js");
+let _interpreterModule: InterpreterModule | null = null;
+
+/**
+ * The script interpreter, resolved by require() exactly ONCE per isolate.
+ *
+ * It is lazy because interpreter.ts imports tx.ts (a static import here
+ * would be a cycle). It must not be a require() per call: in Bun (1.3.11
+ * through at least 1.4.2, oven-sh/bun#43279) every require() of an
+ * already-cached module appends the child to the requiring module's native
+ * JSCommonJSModule::m_children vector with no dedup, and that vector is
+ * walked by the GC's marker (JSCommonJSModule::visitChildren). This was
+ * called once per verified input on the main thread and in all 15
+ * script-check workers — tens of millions of appends per R4 slice. Measured
+ * on bun 1.3.11: 8M require()s add ~350 MB RSS and take full-GC from ~1 ms
+ * to 60–120 ms; with the module held here both stay flat. One of the three
+ * R4 Bun segfaults (401723, 2026-09-18) faulted inside
+ * JSCommonJSModule::visitChildrenImpl -> appendValues on a parallel GC
+ * marker thread.
+ */
+function interpreterModule(): InterpreterModule {
+  return (_interpreterModule ??= require("../script/interpreter.js") as InterpreterModule);
+}
+
+/** Test hook: the cached interpreter module (no-hot-require.test.ts). */
+export const __interpreterModuleForTest = interpreterModule;
+
 /**
  * Script verification flags.
  */
@@ -1853,8 +1880,8 @@ export function verifyInputSignature(
     // vs script-path) + control-block walk + tapscript exec.
     const taprootCtx = buildTaprootContext(tx, inputIndex, prevOuts, tprCache);
 
-    // Lazy require to avoid a circular import (interpreter.ts ↔ tx.ts).
-    const interp = require("../script/interpreter.js") as typeof import("../script/interpreter.js");
+    // Lazy (once) to avoid a circular import (interpreter.ts ↔ tx.ts).
+    const interp = interpreterModule();
     // Build interpreter flags from the per-block bitmask so that pre-activation
     // blocks are not validated with rules that were not yet active.
     const flags = interp.scriptFlagsFromBitmask(scriptVerifyFlags);
@@ -1897,7 +1924,7 @@ export function verifyInputSignature(
     return { valid: false, inputIndex, error: "Script verify requires all prev-outputs" };
   }
 
-  const interp = require("../script/interpreter.js") as typeof import("../script/interpreter.js");
+  const interp = interpreterModule();
   // Build interpreter flags from the per-block bitmask so that pre-activation
   // blocks are not validated with rules that were not yet active (BUG-11/BUG-30
   // fix: was hardcoded getConsensusFlags(709632) which applied Taproot/SegWit/P2SH
