@@ -610,8 +610,12 @@ describe("W123-G30: getnetworkhashps window — PRESENT", () => {
     // A fixed line count is a brittle way to look at a function; widen it.
     const fn = rpcSlice("private async getNetworkHashPS(params:", 80);
     expect(fn).toContain("hiEntry.chainWork - loEntry.chainWork");
-    expect(fn).toContain("hiEntry.header.timestamp - loEntry.header.timestamp");
-    expect(fn).toContain("Number(hashps)");
+    // 2026-10-04: Core's min/max time over the window and getdouble of the
+    // work difference (was endpoint times + BigInt division, which truncated
+    // sub-1 H/s rates to 0). Value parity is pinned against Core in
+    // getnetworkhashps_core_values.test.ts.
+    expect(fn).toContain("maxTime - minTime");
+    expect(fn).toContain("arithGetDouble(workDiff) / timeDiff");
   });
 });
 

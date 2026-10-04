@@ -496,6 +496,21 @@ export const RPC_SLOW_REQUEST_MS = 2000;
  * Buffer.from(x, "hex") must never be the only gate: it silently truncates at
  * the first non-hex character ("zz" decodes to an EMPTY buffer).
  */
+/**
+ * arith_uint256::getdouble (Core arith_uint256.cpp): sum the eight 32-bit
+ * limbs least-significant first, each scaled by 2^(32*i), rounding at every
+ * step exactly as Core does.  Exported for the getnetworkhashps tests.
+ */
+export function arithGetDouble(v: bigint): number {
+  let ret = 0;
+  let fact = 1;
+  for (let i = 0; i < 8; i++) {
+    ret += fact * Number((v >> BigInt(32 * i)) & 0xffffffffn);
+    fact *= 4294967296;
+  }
+  return ret;
+}
+
 function isStrictHex(value: string): boolean {
   return value.length > 0 && value.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(value);
 }
@@ -17015,20 +17030,31 @@ export class RPCServer {
     if (lookup > hiHeight) lookup = hiHeight;
     const loHeight = hiHeight - lookup;
 
+    // Core walks pb0 back `lookup` steps from pb, tracking the MIN and MAX
+    // block time over the whole window (timestamps are not monotonic), and
+    // divides the work difference by maxTime - minTime as a double.  The old
+    // code used only the two endpoint timestamps and BigInt division, which
+    // truncated every rate below 1 H/s to 0 -- e.g. a window that reaches the
+    // 2011 regtest/testnet genesis timestamp (work ~2e2 over ~5e8 s).
     const hiEntry = this.headerSync.getHeaderByHeight(hiHeight);
-    const loEntry = this.headerSync.getHeaderByHeight(loHeight);
-    if (!hiEntry || !loEntry) return 0;
+    if (!hiEntry) return 0;
+    let minTime = hiEntry.header.timestamp;
+    let maxTime = minTime;
+    let loEntry = hiEntry;
+    for (let h = hiHeight - 1; h >= loHeight; h--) {
+      const e = this.headerSync.getHeaderByHeight(h);
+      if (!e) return 0;
+      const t = e.header.timestamp;
+      if (t < minTime) minTime = t;
+      if (t > maxTime) maxTime = t;
+      loEntry = e;
+    }
+    // Core: avoid a divide by zero.
+    if (minTime === maxTime) return 0;
 
     const workDiff = hiEntry.chainWork - loEntry.chainWork;
-    const timeDiff = hiEntry.header.timestamp - loEntry.header.timestamp;
-    if (timeDiff <= 0) return 0;
-
-    // workDiff is bigint; divide using bigint arithmetic, convert to number for JSON
-    const hashps = workDiff / BigInt(timeDiff);
-    // Number() is safe here: Bitcoin mainnet hashrate is ~10^21 H/s which exceeds
-    // Number.MAX_SAFE_INTEGER but JSON clients expect a numeric result. Use Number()
-    // which converts to float — same as Bitcoin Core's return type.
-    return Number(hashps);
+    const timeDiff = maxTime - minTime;
+    return arithGetDouble(workDiff) / timeDiff;
   }
 
   /**
