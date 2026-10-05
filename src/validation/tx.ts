@@ -1769,6 +1769,16 @@ export function setInputSigCacheEnabled(on: boolean): void {
   inputSigCacheEnabled = on;
 }
 
+/**
+ * Gate-6 fault injection (tests only; `hook` is null in production). Invoked
+ * inside the interpreter try-blocks of {@link verifyInputSignature}, so a throw
+ * from it is indistinguishable from a fault raised inside the interpreter
+ * (OOM RangeError, an FFI TypeError, ...).
+ */
+export const scriptFaultInjection: { hook: ((inputIndex: number) => void) | null } = {
+  hook: null,
+};
+
 export function verifyInputSignature(
   tx: Transaction,
   inputIndex: number,
@@ -1900,6 +1910,7 @@ export function verifyInputSignature(
     };
 
     try {
+      scriptFaultInjection.hook?.(inputIndex);
       const ok = interp.verifyTaproot(scriptPubKey, input.witness, flags, taprootCtx, txContext);
       if (!ok) {
         return { valid: false, inputIndex, error: "Taproot verify returned false" };
@@ -1955,6 +1966,7 @@ export function verifyInputSignature(
   };
 
   try {
+    scriptFaultInjection.hook?.(inputIndex);
     const ok = interp.verifyScript(
       input.scriptSig,
       scriptPubKey,
