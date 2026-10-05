@@ -273,17 +273,18 @@ describe("W132-G8: time-based nMinTime formula — PARTIAL (BUG-2a + BUG-2b)", (
       "from coreConnectBlockChecks options — time-based BIP-68 always passes " +
       "on regtest / reorg-reconnect paths",
     () => {
-      // Static evidence: chain/state.ts builds the options object without
-      // a getUTXOMTP key. (sync/blocks.ts does pass one — line 2582.)
+      // FIXED 2026-10-05: chain/state.ts passes a per-coin MTP provider
+      // resolved from the block's own parent (HeaderSync or the persisted
+      // block index) — never the old "no getUTXOMTP -> coin MTP 0" default.
+      // Behavioural proof: src/chain/mtp_wiring.test.ts and
+      // src/__tests__/mtp_wiring_e2e.test.ts (--import-blocks path).
       const stateOptsRegion = STATE_SRC.slice(
         STATE_SRC.indexOf("coreConnectBlockChecks(block, height, this.utxo, this.params, {"),
-        STATE_SRC.indexOf("coreConnectBlockChecks(block, height, this.utxo, this.params, {") + 1500,
+        STATE_SRC.indexOf("coreConnectBlockChecks(block, height, this.utxo, this.params, {") + 2500,
       );
-      expect(stateOptsRegion).not.toMatch(/getUTXOMTP\s*:/);
-      // And the callee defaults missing getUTXOMTP to 0, which makes
-      // every time-based BIP-68 lock evaluate as < currentMTP.
+      expect(stateOptsRegion).toMatch(/getUTXOMTP\s*:\s*timeCtx\.coinMTP/);
       expect(CONNECT_SRC).toMatch(
-        /const\s+coinMTP\s*=\s*getUTXOMTP\s*\?\s*getUTXOMTP\([^)]*\)\s*:\s*0/,
+        /const\s+coinMTP\s*=\s*getUTXOMTP\s*\?\s*await\s+getUTXOMTP\([^)]*\)\s*:\s*0/,
       );
     },
   );
@@ -763,10 +764,13 @@ describe("W132-G34: sync/blocks.ts getUTXOMTP wiring — PRESENT", () => {
 // G35 — Mempool computes currentMTP from best header — PRESENT
 // ===========================================================================
 describe("W132-G35: mempool currentMTP wiring — PRESENT", () => {
-  test("mempool.ts uses headerSync.getMedianTimePast for currentMTP", () => {
-    expect(MEMPOOL_SRC).toMatch(
-      /const\s+bestHdr\s*=\s*this\.headerSync\.getBestHeader\(\)[\s\S]{0,200}currentMTP\s*=\s*this\.headerSync\.getMedianTimePast\(\s*bestHdr\s*\)/,
-    );
+  // 2026-10-05: the old pin asserted the best-HEADER MTP path, which was
+  // never wired (tipMTP stayed 0 in production) and would have been wrong
+  // (Core reads the ACTIVE tip). The mempool now reads the active-chain
+  // provider cli.ts wires; behaviour: src/__tests__/mtp_wiring_e2e.test.ts.
+  test("mempool.ts reads currentMTP from the active-chain provider, not the best header", () => {
+    expect(MEMPOOL_SRC).toMatch(/currentMTP\s*=\s*this\.chainMTPProvider\s*\?\s*this\.chainMTPProvider\.tipMTP\(\)/);
+    expect(MEMPOOL_SRC).not.toMatch(/currentMTP\s*=\s*this\.headerSync\.getMedianTimePast\(\s*bestHdr\s*\)/);
   });
 });
 
