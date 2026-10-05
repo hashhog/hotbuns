@@ -287,7 +287,7 @@ export interface ConnectBlockOpts {
    * HeaderSync.loadFromDB() on startup) so it is correct post-restart.
    * The getMedianTimePast partial walk never returns 0 on a short walk.
    */
-  getUTXOMTP?: (utxoHeight: number) => number;
+  getUTXOMTP?: (utxoHeight: number) => number | Promise<number>;
 
   /**
    * W93 gate — hash of the genesis block on this network.  When supplied,
@@ -376,13 +376,15 @@ export async function coreConnectBlockChecks(
   // time-type relative locks (see needsCoinTime below), and many inputs of
   // one block share a coin height.  The memo lives for one ConnectBlock, so
   // it cannot outlive a header reorg.
-  let getUTXOMTP: ((utxoHeight: number) => number) | undefined;
+  // The provider may be async (chain/state.ts falls back to a block-index
+  // DB walk when no HeaderSync holds the parent — the --import-blocks path).
+  let getUTXOMTP: ((utxoHeight: number) => number | Promise<number>) | undefined;
   if (getUTXOMTPRaw) {
     const mtpByHeight = new Map<number, number>();
-    getUTXOMTP = (utxoHeight: number): number => {
+    getUTXOMTP = async (utxoHeight: number): Promise<number> => {
       let v = mtpByHeight.get(utxoHeight);
       if (v === undefined) {
-        v = getUTXOMTPRaw(utxoHeight);
+        v = await getUTXOMTPRaw(utxoHeight);
         mtpByHeight.set(utxoHeight, v);
       }
       return v;
@@ -662,7 +664,7 @@ export async function coreConnectBlockChecks(
             ((input.sequence >>> 0) & SEQUENCE_LOCKTIME_DISABLE_FLAG) === 0 &&
             (input.sequence & SEQUENCE_LOCKTIME_TYPE_FLAG) !== 0;
           if (needsCoinTime) {
-            const coinMTP = getUTXOMTP ? getUTXOMTP(utxo.height) : 0;
+            const coinMTP = getUTXOMTP ? await getUTXOMTP(utxo.height) : 0;
             utxoConfirmations.push({ height: utxo.height, medianTimePast: coinMTP });
           } else {
             utxoConfirmations.push({ height: utxo.height, medianTimePast: 0 });

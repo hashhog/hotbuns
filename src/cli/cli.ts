@@ -1868,6 +1868,15 @@ async function startNode(config: NodeConfig): Promise<void> {
     await headerSync.adoptChainTipAsBestHeader(bestBlock.hash, bestBlock.height);
   }
 
+  // 5a. BIP-113 / BIP-68 time context for ChainStateManager.connectBlock
+  // (generateblock fallback, dumptxoutset re-apply, chain-state reorganize):
+  // it reads the connecting block's parent by HASH from HeaderSync.  Until
+  // 2026-10-05 this was never wired and connectBlock used the block's OWN
+  // timestamp as prevMTP and coin MTP 0 — blocks Core rejects were accepted.
+  // (--import-blocks runs before HeaderSync exists and uses the persisted
+  // block-index walk instead.)
+  chainState.setHeaderSync(headerSync);
+
   // 6. Start peer manager (DNS seed resolution, connect to peers)
   // BIP-159: when prune mode is on, PeerManager OR's NODE_NETWORK_LIMITED
   // (1<<10 = 0x400) into the advertised services bitfield.  Mirrors Core's

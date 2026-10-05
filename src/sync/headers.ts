@@ -1124,6 +1124,56 @@ export class HeaderSync {
   }
 
   /**
+   * Checked MTP of the header with this hash — Core
+   * `CBlockIndex::GetMedianTimePast` on a block named by HASH, so the answer
+   * follows that block's own ancestry rather than whichever chain
+   * `headersByHeight` currently describes (the best HEADER chain, which can
+   * differ from the active chain). Throws {@link MissingAncestorHeaderError}
+   * when the header or its 11-block window is not indexed.
+   */
+  getMedianTimePastOfHash(
+    hash: Buffer,
+    what: string = "median-time-past",
+  ): number {
+    const entry = this.headerChain.get(hash.toString("hex"));
+    if (!entry) {
+      throw new MissingAncestorHeaderError(what, -1, -1);
+    }
+    return this.getMedianTimePastChecked(entry, what);
+  }
+
+  /**
+   * BIP-68 coin time on the chain ending at `tipHash`:
+   * Core `CalculateSequenceLocks` with `block.pprev == tip`, i.e.
+   *   tip->GetAncestor(max(coinHeight - 1, 0))->GetMedianTimePast().
+   * When `tipHash` is on the best header chain the height index answers in
+   * O(1); otherwise (headers ahead on a fork) walk the tip's own ancestry.
+   */
+  getCoinMedianTimePastOnChain(tipHash: Buffer, coinHeight: number): number {
+    const what = "BIP-68 coin median-time-past";
+    const tip = this.headerChain.get(tipHash.toString("hex"));
+    if (!tip) {
+      throw new MissingAncestorHeaderError(what, coinHeight, -1);
+    }
+    const target = Math.max(coinHeight - 1, 0);
+    if (target > tip.height) {
+      throw new MissingAncestorHeaderError(what, coinHeight, target);
+    }
+    const onBest = this.headersByHeight.get(tip.height);
+    if (onBest && onBest.hash.equals(tip.hash)) {
+      return this.getMedianTimePastAtHeight(target, what);
+    }
+    let cur: HeaderChainEntry | undefined = tip;
+    while (cur && cur.height > target) {
+      cur = this.headerChain.get(cur.header.prevBlock.toString("hex"));
+    }
+    if (!cur || cur.height !== target) {
+      throw new MissingAncestorHeaderError(what, coinHeight, target);
+    }
+    return this.getMedianTimePastChecked(cur, what);
+  }
+
+  /**
    * Calculate the expected difficulty target for a given height.
   /**
    * Calculate the expected difficulty target for a given height.

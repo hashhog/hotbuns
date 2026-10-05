@@ -20,6 +20,7 @@ import {
   serializeBlock,
   serializeBlockHeader,
   deserializeBlock,
+  deserializeBlockHeader,
 } from "../validation/block.js";
 import type { Transaction } from "../validation/tx.js";
 import {
@@ -418,6 +419,112 @@ export class ChainStateManager {
   }
 
   /**
+   * Checked Median Time Past of the ACTIVE chain tip (Core
+   * `m_chain.Tip()->GetMedianTimePast()`, the cutoff CheckFinalTxAtTip and
+   * CheckSequenceLocksAtTip use). Read on demand so it is never stale after
+   * a connect, disconnect, invalidateblock or reorg. Throws
+   * MissingAncestorHeaderError when HeaderSync is not wired or the window is
+   * not indexed — the mempool refuses a time-locked tx on that, never admits.
+   */
+  getTipMedianTimePast(): number {
+    if (!this.headerSync) {
+      throw new MissingAncestorHeaderError("active-tip median-time-past", this.bestBlock.height, this.bestBlock.height);
+    }
+    if (this.bestBlock.height === 0) {
+      // Genesis: Core's window is the genesis block alone.
+      const g = this.headerSync.getHeader(this.bestBlock.hash);
+      if (g) return g.header.timestamp;
+    }
+    return this.headerSync.getMedianTimePastOfHash(this.bestBlock.hash, "active-tip median-time-past");
+  }
+
+  /**
+   * BIP-68 coin time for a CONFIRMED coin at `coinHeight`, on the active
+   * chain: tip->GetAncestor(max(coinHeight-1,0))->GetMedianTimePast()
+   * (Core CalculateSequenceLocks with the next block's pprev = tip).
+   */
+  getCoinMedianTimePastAtTip(coinHeight: number): number {
+    if (!this.headerSync) {
+      throw new MissingAncestorHeaderError("BIP-68 coin median-time-past", coinHeight, Math.max(coinHeight - 1, 0));
+    }
+    return this.headerSync.getCoinMedianTimePastOnChain(this.bestBlock.hash, coinHeight);
+  }
+
+  /**
+   * MTP of the block with this hash from the PERSISTED block index (header
+   * bytes carry prevBlock + timestamp). Used when no HeaderSync holds the
+   * block — the --import-blocks path runs before HeaderSync exists. Exact
+   * 11-block window or MissingAncestorHeaderError.
+   */
+  private async mtpFromBlockIndex(hash: Buffer, what: string): Promise<number> {
+    const timestamps: number[] = [];
+    let cur: Buffer | null = hash;
+    let lastHeight = -1;
+    for (let i = 0; i < 11 && cur; i++) {
+      const rec = await this.db.getBlockIndex(cur);
+      if (!rec) break;
+      const hdr = deserializeBlockHeader(new BufferReader(rec.header));
+      timestamps.push(hdr.timestamp);
+      lastHeight = rec.height;
+      if (rec.height === 0) break;
+      cur = hdr.prevBlock;
+    }
+    if (timestamps.length === 0 || (timestamps.length < 11 && lastHeight !== 0)) {
+      throw new MissingAncestorHeaderError(what, -1, lastHeight - 1);
+    }
+    timestamps.sort((a, b) => a - b);
+    return timestamps[Math.floor(timestamps.length / 2)];
+  }
+
+  /**
+   * prevMTP + per-coin MTP provider for connecting `block` at `height`.
+   * Resolution order: HeaderSync (parent by HASH), then the persisted block
+   * index. Never the block's own timestamp, never 0.
+   */
+  private async resolveConnectTimeContext(
+    block: Block,
+    height: number
+  ): Promise<{ prevMTP: number; coinMTP: (h: number) => number | Promise<number> }> {
+    if (height === 0) {
+      // Genesis connects no transactions (Core validation.cpp:2339).
+      return { prevMTP: block.header.timestamp, coinMTP: () => 0 };
+    }
+    const parentHash = block.header.prevBlock;
+    const hs = this.headerSync;
+    if (hs && typeof hs.getHeader === "function" && hs.getHeader(parentHash)) {
+      return {
+        prevMTP: hs.getMedianTimePastOfHash(parentHash, "BIP-113 prev-block median-time-past"),
+        coinMTP: (coinHeight: number) => hs.getCoinMedianTimePastOnChain(parentHash, coinHeight),
+      };
+    }
+    if (hs && typeof hs.getHeader !== "function") {
+      // Height-indexed HeaderSync stand-in (unit tests): the original
+      // by-height lookups, which are exact on a single linear chain.
+      return {
+        prevMTP: hs.getMedianTimePastAtHeight(height - 1, "BIP-113 prev-block median-time-past"),
+        coinMTP: (coinHeight: number) => hs.getCoinMedianTimePast(coinHeight),
+      };
+    }
+    const prevMTP = await this.mtpFromBlockIndex(parentHash, "BIP-113 prev-block median-time-past");
+    return {
+      prevMTP,
+      coinMTP: async (coinHeight: number) => {
+        const target = Math.max(coinHeight - 1, 0);
+        // Height index (written for every connected block) names the
+        // ancestor; it must be at or below the parent.
+        if (target > height - 1) {
+          throw new MissingAncestorHeaderError("BIP-68 coin median-time-past", coinHeight, target);
+        }
+        const h = await this.db.getBlockHashByHeight(target);
+        if (!h) {
+          throw new MissingAncestorHeaderError("BIP-68 coin median-time-past", coinHeight, target);
+        }
+        return this.mtpFromBlockIndex(h, "BIP-68 coin median-time-past");
+      },
+    };
+  }
+
+  /**
    * Get the UTXO manager for direct access if needed.
    */
   getUTXOManager(): UTXOManager {
@@ -483,27 +590,32 @@ export class ChainStateManager {
       utxoBestBlockHashHexLE = undefined;
     }
 
-    // W93: prefer prev block's Median Time Past from HeaderSync when wired.
-    // Falls back to the block's own timestamp only when HeaderSync is absent
-    // (e.g. regtest generateblock pre-tip-sync).
-    let computedPrevMTP = block.header.timestamp;
-    if (this.headerSync && height > 0) {
-      try {
-        computedPrevMTP = this.headerSync.getMedianTimePastAtHeight(
-          height - 1,
-          "BIP-113 prev-block median-time-past"
+    // BIP-113 / BIP-68 time context for this block, from the block's OWN
+    // parent (Core: pindex->pprev->GetMedianTimePast() and, per coin,
+    // pindex->pprev->GetAncestor(max(h-1,0))->GetMedianTimePast()).
+    //
+    // 2026-10-05: this used to fall back to the block's OWN timestamp for
+    // prevMTP and to coin MTP 0 whenever HeaderSync was not wired — and
+    // cli.ts never wired it, so --import-blocks, the generateblock fallback,
+    // dumptxoutset re-apply and the chain-state reorganize path all ran with
+    // a lock-time cutoff later than Core's and every time-type relative lock
+    // trivially satisfied: blocks Core rejects were ACCEPTED. Now: HeaderSync
+    // when it holds the parent, else a walk of the persisted block index;
+    // when neither can produce Core's exact 11-block window the block is not
+    // connected (missing data is a refusal, never a verdict or a guess).
+    let timeCtx: { prevMTP: number; coinMTP: (h: number) => number | Promise<number> };
+    try {
+      timeCtx = await this.resolveConnectTimeContext(block, height);
+    } catch (err) {
+      if (err instanceof MissingAncestorHeaderError) {
+        throw new ConsensusError(
+          ConsensusErrorCode.CONNECT_BLOCK_FAILED,
+          `block at height ${height} not connected: ${err.message}`
         );
-      } catch (err) {
-        // A truncated window is missing data, not a verdict: refuse.
-        if (err instanceof MissingAncestorHeaderError) {
-          throw new ConsensusError(
-            ConsensusErrorCode.CONNECT_BLOCK_FAILED,
-            `block at height ${height} not connected: ${err.message}`
-          );
-        }
-        // other header-sync lookup failure — keep the fallback
       }
+      throw err;
     }
+    const computedPrevMTP = timeCtx.prevMTP;
 
     const result = await coreConnectBlockChecks(block, height, this.utxo, this.params, {
       assumeValid: false,
@@ -541,10 +653,7 @@ export class ChainStateManager {
       // is Core's GetAncestor(max(h-1,0))->GetMedianTimePast() or throws
       // MissingAncestorHeaderError, which is surfaced below as a
       // non-consensus "not connected" error.
-      getUTXOMTP: this.headerSync
-        ? (coinHeight: number): number =>
-            this.headerSync!.getCoinMedianTimePast(coinHeight)
-        : undefined,
+      getUTXOMTP: timeCtx.coinMTP,
     }).catch((err: unknown) => {
       if (err instanceof MissingAncestorHeaderError) {
         return { ok: false as const, error: `block at height ${height} not connected: ${err.message}` };
