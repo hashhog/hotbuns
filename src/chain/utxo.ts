@@ -253,6 +253,31 @@ export abstract class CoinsView {
 }
 
 /**
+ * Coins-DB write generation, per ChainDB (F0, receipts/arch-f6-f7-design-2026-10-05.md).
+ *
+ * Bumped by {@link CoinsViewDB.batchWrite} once a coins batch has LANDED (and
+ * also if it threw — the write may have partially reached the store's
+ * memtable as far as a reader can tell, so treat it as a write).  Keyed by the
+ * ChainDB object, not the CoinsViewDB, because more than one UTXOManager can
+ * sit on the same LevelDB (BlockSync's and ChainStateManager's) and a write
+ * through either one invalidates every in-flight read of either.
+ *
+ * A populate-after-miss read records the generation BEFORE it issues the DB
+ * get; if the generation moved by the time the get resolves, the value may
+ * predate a committed DELETE (the spend was flushed and its DIRTY spent
+ * entry dropped from the cache while the read was in flight), so the result
+ * is discarded and the read is repeated.  This is Core's cs_main ordering
+ * (CCoinsViewCache::FetchCoin, coins.cpp:69-82, never straddles BatchWrite)
+ * restated for an async cache.
+ */
+const coinsWriteGeneration = new WeakMap<object, number>();
+
+/** Current coins-DB write generation for `db` (0 until the first write). */
+export function coinsDBWriteGeneration(db: object): number {
+  return coinsWriteGeneration.get(db) ?? 0;
+}
+
+/**
  * CoinsView backed by the database.
  * Corresponds to Bitcoin Core's CCoinsViewDB.
  */
@@ -294,6 +319,11 @@ export class CoinsViewDB extends CoinsView {
 
   async getBestBlock(): Promise<Buffer> {
     return this.bestBlockHash;
+  }
+
+  /** See {@link coinsDBWriteGeneration}. */
+  writeGeneration(): number {
+    return coinsDBWriteGeneration(this.db);
   }
 
   /**
@@ -344,7 +374,13 @@ export class CoinsViewDB extends CoinsView {
     }
 
     if (ops.length > 0) {
-      await this.db.batch(ops);
+      try {
+        await this.db.batch(ops);
+      } finally {
+        // AFTER the batch landed: a read issued before this point may have
+        // seen the pre-write value (F0).
+        coinsWriteGeneration.set(this.db, coinsDBWriteGeneration(this.db) + 1);
+      }
     }
 
     this.bestBlockHash = hashBlock;
@@ -430,18 +466,20 @@ export class CoinsViewCache extends CoinsView {
     this.misses++;
 
     // Fetch from backing store
-    const coin = await this.base.getCoin(outpoint);
-    if (coin) {
-      // A concurrent caller may have inserted this key while we awaited the
-      // backing store (parallel preloads of the same outpoint, or an addCoin
-      // / spend in between).  Never clobber that entry: it is at least as new
-      // as the DB, and overwriting a DIRTY one with a clean copy would drop a
+    const fetched = await this.fetchFromBase(key, outpoint);
+    if (fetched.entry !== undefined) {
+      // A concurrent caller inserted this key while we awaited the backing
+      // store (parallel preloads of the same outpoint, or an addCoin / spend
+      // in between).  Never clobber that entry: it is at least as new as the
+      // DB, and overwriting a DIRTY one with a clean copy would drop a
       // pending write (and leak its dirtyKeys membership).
-      const raced = this.cache.get(key);
-      if (raced !== undefined) {
-        return raced.coin;
-      }
-      // Cache for future lookups (not dirty, not fresh)
+      return fetched.entry.coin;
+    }
+    const coin = fetched.coin;
+    if (coin) {
+      // Cache for future lookups (not dirty, not fresh).  Safe: no coins-DB
+      // write landed since the read was issued (fetchFromBase) and no cache
+      // entry appeared, so this is what a read under the chain lock returns.
       const entry: CoinEntry = {
         coin,
         dirty: false,
@@ -452,6 +490,44 @@ export class CoinsViewCache extends CoinsView {
     }
 
     return coin;
+  }
+
+  /**
+   * Coins-DB write generation of the backing store (0 for a non-DB base,
+   * which has no asynchronous writer).
+   */
+  private baseWriteGeneration(): number {
+    return this.base instanceof CoinsViewDB ? this.base.writeGeneration() : 0;
+  }
+
+  /**
+   * F0 — the populate-after-miss read, made equivalent to a read under the
+   * chain lock (Core: FetchCoin/FetchCoinFromBase, coins.cpp:63-82, under
+   * cs_main).
+   *
+   * After the DB get resolves:
+   *   - if a cache entry for the key now exists, it wins (it is at least as
+   *     new as the DB: unspent, DIRTY-spent, or re-added) → `{ entry }`;
+   *   - else if a coins-DB write landed since the get was issued, the value
+   *     may be the pre-DELETE copy of a coin whose spend was just committed
+   *     and whose spent entry the sync/flush then dropped → read again;
+   *   - else the value is current → `{ coin }` (null = absent; "absent" is
+   *     never cached by the callers).
+   *
+   * Terminates: each retry is issued after the previous write landed, and
+   * coins writes happen at most once per block / memory flush.
+   */
+  private async fetchFromBase(
+    key: string,
+    outpoint: OutPoint,
+  ): Promise<{ entry?: CoinEntry; coin: Coin | null }> {
+    for (;;) {
+      const gen = this.baseWriteGeneration();
+      const coin = await this.base.getCoin(outpoint);
+      const raced = this.cache.get(key);
+      if (raced !== undefined) return { entry: raced, coin: raced.coin };
+      if (this.baseWriteGeneration() === gen) return { coin };
+    }
   }
 
   /**
@@ -466,8 +542,14 @@ export class CoinsViewCache extends CoinsView {
       return cached.coin !== null;
     }
 
-    // Check backing store
-    return this.base.haveCoin(outpoint);
+    // Check backing store (same straddle rule as getCoin; nothing is cached)
+    for (;;) {
+      const gen = this.baseWriteGeneration();
+      const have = await this.base.haveCoin(outpoint);
+      const raced = this.cache.get(key);
+      if (raced !== undefined) return raced.coin !== null;
+      if (this.baseWriteGeneration() === gen) return have;
+    }
   }
 
   /**
@@ -585,11 +667,12 @@ export class CoinsViewCache extends CoinsView {
     let entry = this.cache.get(key);
 
     if (entry === undefined) {
-      // Try to fetch from backing store
-      const coin = await this.base.getCoin(outpoint);
-      // Re-read after the await: another caller may have populated (or
-      // spent) this key meanwhile — its entry wins over our DB copy.
-      entry = this.cache.get(key);
+      // Try to fetch from backing store.  Another caller may have populated
+      // (or spent) this key meanwhile — its entry wins over our DB copy — and
+      // a copy read before a committed spend is never used (F0).
+      const fetched = await this.fetchFromBase(key, outpoint);
+      const coin = fetched.coin;
+      entry = fetched.entry;
       if (entry === undefined) {
         if (!coin) return false;
 

@@ -14250,7 +14250,9 @@ export class RPCServer {
     }
 
     const psbt = convertToPSBT(tx);
-    const utxoManager = this.chainState.getUTXOManager();
+    // The live view (BlockSync's): ChainStateManager's cache is never told
+    // about block-connect spends, so it can report a spent prevout (F0).
+    const utxoManager = this.liveUTXOManager();
     const errors: Array<Record<string, unknown>> = [];
 
     // PASS 1: wire EVERY input's prevout (scriptPubKey + amount) into the PSBT
@@ -14495,7 +14497,9 @@ export class RPCServer {
     const sighashType = this.parseSighashType(sighashParam);
 
     const psbt = convertToPSBT(tx);
-    const utxoManager = this.chainState.getUTXOManager();
+    // The live view (BlockSync's): ChainStateManager's cache is never told
+    // about block-connect spends, so it can report a spent prevout (F0).
+    const utxoManager = this.liveUTXOManager();
     const errors: Array<Record<string, unknown>> = [];
 
     for (let i = 0; i < tx.inputs.length; i++) {

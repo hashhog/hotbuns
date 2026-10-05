@@ -1475,6 +1475,21 @@ export class Mempool {
   }
 
   /**
+   * Re-point the mempool at the node's AUTHORITATIVE coin view (F0).
+   *
+   * cli.ts builds the mempool before BlockSync exists, over
+   * ChainStateManager's UTXOManager.  Blocks connect through BlockSync's own
+   * UTXOManager, and nothing propagates a spend into the first view's cache:
+   * a coin the mempool once looked up stayed "unspent" there after a block
+   * spent it, so a re-spend of a confirmed-spent coin was accepted.  Core has
+   * one CCoinsViewCache (pcoinsTip) that the mempool reads through
+   * CCoinsViewMemPool; BlockSync.setMempool calls this to get the same.
+   */
+  setUTXOManager(utxo: UTXOManager): void {
+    this.utxo = utxo;
+  }
+
+  /**
    * Set the notification event emitter for ZMQ.
    */
   setNotificationEmitter(emitter: EventEmitter): void {

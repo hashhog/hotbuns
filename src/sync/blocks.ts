@@ -815,6 +815,11 @@ export class BlockSync {
    */
   setMempool(mempool: Mempool): void {
     this.mempool = mempool;
+    // One coin view (F0): the mempool must read the view blocks connect
+    // through, not ChainStateManager's second cache, which block connect
+    // never updates (a confirmed-spent coin stayed "unspent" there).
+    // (Optional call only for test doubles that stub a few Mempool methods.)
+    mempool.setUTXOManager?.(this.utxoManager);
   }
 
   /**
