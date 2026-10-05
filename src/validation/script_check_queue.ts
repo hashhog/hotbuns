@@ -32,6 +32,7 @@ import {
 	type WorkerOut,
 } from "./script_check_wire.js";
 import { globalSigCache } from "./sig_cache.js";
+import { SystemFaultError } from "../chain/fatal.js";
 import type { Transaction } from "./tx.js";
 import {
 	computeInputSigCacheKey,
@@ -510,12 +511,11 @@ export async function verifyScriptChecks(
 	for (const job of jobs) {
 		const utxo = job.utxos[job.inputIndex];
 		if (!utxo) {
-			return {
-				valid: false,
-				error: "UTXO count mismatch",
-				failedInput: job.inputIndex,
-				failedTxidHex: job.txidHex,
-			};
+			// Gate 6: a job without its prevout is a broken caller invariant —
+			// no script was evaluated, so it cannot be a script-failure verdict.
+			throw new SystemFaultError(
+				`script check job has no prevout (input ${job.inputIndex} of ${job.txidHex ?? "?"})`,
+			);
 		}
 		const key = computeInputSigCacheKey(
 			job.tx,
@@ -542,8 +542,13 @@ export async function verifyScriptChecks(
 		}
 		return result;
 	} catch (e) {
+		// A worker that crashed, timed out or produced no result is a fault of
+		// this node, not of the block (gate 6): re-run the SAME jobs once,
+		// sequentially on this thread. A system fault there propagates out of
+		// verifyScriptChecks (verifyInputSignature re-throws it) and the caller
+		// retries the block / halts — it never becomes a script verdict.
 		console.warn(
-			`[script-check] worker pool failed (${e instanceof Error ? e.message : String(e)}); falling back to sequential`,
+			`[script-check] worker pool failed (${e instanceof Error ? e.message : String(e)}); re-running sequentially`,
 		);
 		return verifySequential(pending);
 	}

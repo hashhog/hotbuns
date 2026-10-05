@@ -9,6 +9,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { isResourceExhaustion } from "../chain/fatal.js";
 import { sha256 as nobleSha256 } from "@noble/hashes/sha2.js";
 import { ripemd160 } from "@noble/hashes/legacy.js";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
@@ -296,7 +297,10 @@ export function ecdsaVerify(
   // Fallback to @noble/curves
   try {
     return secp256k1.verify(signature, msgHash, publicKey, { prehash: false, format: "der" });
-  } catch {
+  } catch (e) {
+    // Gate 6: a malformed key/signature is `false`; running out of memory is
+    // not a signature verdict (a NOT'd CHECKSIG would otherwise pass).
+    if (isResourceExhaustion(e)) throw e;
     return false;
   }
 }
@@ -451,7 +455,8 @@ export function ecdsaVerifyLaxNoble(
     if (!parsed) return false;
     const strictDer = encodeStrictDER(parsed.r, parsed.s);
     return secp256k1.verify(strictDer, msgHash, pk, { prehash: false, format: "der", lowS: false });
-  } catch {
+  } catch (e) {
+    if (isResourceExhaustion(e)) throw e;   // gate 6, see ecdsaVerify
     return false;
   }
 }
@@ -575,7 +580,8 @@ export function schnorrVerify(
   // Fallback to @noble/curves
   try {
     return schnorr.verify(signature, msgHash, publicKey);
-  } catch {
+  } catch (e) {
+    if (isResourceExhaustion(e)) throw e;   // gate 6, see ecdsaVerify
     return false;
   }
 }

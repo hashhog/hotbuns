@@ -5,6 +5,7 @@
  */
 
 import * as os from "os";
+import { fatalMessage, isFatal, setAbortAction } from "../chain/fatal.js";
 import * as path from "path";
 import * as fs from "fs";
 import { EventEmitter } from "events";
@@ -2384,6 +2385,10 @@ async function startNode(config: NodeConfig): Promise<void> {
     if (result.accepted) {
       // Core: MempoolAcceptedTx → ForgetTxHash(txid), ForgetTxHash(wtxid).
       blockSync.onMempoolAcceptedTx(txidHex, wtxidHex);
+    } else if (typeof result.error === "string" && result.error.startsWith("fatal-error")) {
+      // Gate 6: the node is shutting down after a fatal error — not a
+      // rejection; only free the request slot.
+      blockSync.clearTxRequestInFlight(txidHex, wtxidHex);
     } else if (isAlreadyHaveError(result.error)) {
       // "We already have it" is not a rejection — in Core these never reach
       // ATMP at all, AlreadyHaveTx catches them first. Putting them in the
@@ -2939,6 +2944,14 @@ async function startNode(config: NodeConfig): Promise<void> {
     gracefulShutdown();
   });
 
+  // Gate 6 (Core AbortNode -> StartShutdown): a latched fatal system fault
+  // runs the SAME shutdown as RPC `stop` / SIGTERM; gracefulShutdown sees the
+  // latch, skips every UTXO flush, and exits 1 so systemd restarts the node
+  // from its last durable state.
+  setAbortAction(() => {
+    void gracefulShutdown();
+  });
+
   // 9. Register signal handlers (SIGINT, SIGTERM) for graceful shutdown
   process.on("SIGINT", () => {
     console.log("\nReceived SIGINT, shutting down...");
@@ -3115,7 +3128,7 @@ async function gracefulShutdown(): Promise<void> {
   }
   shutdownInProgress = true;
   if (!runningNode) {
-    process.exit(0);
+    process.exit(isFatal() ? 1 : 0);
     return;
   }
 
@@ -3188,9 +3201,14 @@ async function gracefulShutdown(): Promise<void> {
     console.error("Failed to persist wallets:", e);
   }
 
-  // 5. Flush UTXO cache
-  const utxo = runningNode.chainState.getUTXOManager();
-  await utxo.flush();
+  // 5. Flush UTXO cache — never after AbortNode (gate 6: the in-memory view
+  // may be exactly what could not be made durable).
+  if (isFatal()) {
+    console.error(`[shutdown] FATAL error latched (${fatalMessage()}) — skipping the UTXO flush`);
+  } else {
+    const utxo = runningNode.chainState.getUTXOManager();
+    await utxo.flush();
+  }
 
   // 6. Close database
   await runningNode.db.close();
@@ -3201,7 +3219,8 @@ async function gracefulShutdown(): Promise<void> {
 
   console.log("Shutdown complete.");
   runningNode = null;
-  process.exit(0);
+  // Gate 6: exit non-zero after AbortNode (systemd Restart=on-failure).
+  process.exit(isFatal() ? 1 : 0);
 }
 
 /**

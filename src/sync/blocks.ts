@@ -31,6 +31,12 @@ import type { Transaction } from "../validation/tx.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { UTXOManager } from "../chain/utxo.js";
 import {
+  FATAL_ERROR_TOKEN,
+  abortNode,
+  fatalRefusal,
+  isFatal,
+} from "../chain/fatal.js";
+import {
   shouldSkipScripts,
   type AssumeValidContext,
 } from "../consensus/assumevalid.js";
@@ -85,6 +91,13 @@ export function classifyCallbackError(
   if (raw.length === 0) return "unknown";
   const s = raw.toLowerCase();
 
+  // Gate 6: a system fault is never a verdict, whatever else the string
+  // carries. Checked BEFORE the consensus list so a fault message that
+  // happens to embed a consensus-looking word ("script verification failed:
+  // RangeError ...", "missing utxo" after a torn cache) can never be
+  // classified "consensus". (It may still be "chainstate" below.)
+  const systemFault = isSystemFaultMessage(s);
+
   // Consensus / script / tx-validation rule failures. Deterministic
   // mismatches with Core's rules → bug in script.ts / tx.ts / block.ts,
   // NOT a corrupt chainstate.
@@ -123,8 +136,10 @@ export function classifyCallbackError(
     "sequence locks not satisfied",
     "does not match expected header",
   ];
-  for (const pat of consensusPatterns) {
-    if (s.includes(pat)) return "consensus";
+  if (!systemFault) {
+    for (const pat of consensusPatterns) {
+      if (s.includes(pat)) return "consensus";
+    }
   }
 
   // Genuine chainstate / on-disk corruption. The persisted chain tip has
@@ -147,6 +162,36 @@ export function classifyCallbackError(
   }
 
   return "unknown";
+}
+
+/**
+ * Gate 6: markers of a fault of THIS node (the latch, an explicit
+ * SystemFaultError, OOM, an I/O / LevelDB error, a dead or timed-out script
+ * worker). Lower-cased input. Any match makes a connect failure a
+ * non-verdict: no BLOCK_FAILED mark, no punishment.
+ */
+const SYSTEM_FAULT_MARKERS = [
+  FATAL_ERROR_TOKEN,
+  "systemfaulterror",
+  "system fault",
+  "out of memory",
+  "maximum call stack",
+  "no space left",
+  "enospc",
+  "i/o error",
+  "io error:",
+  "level_",
+  "leveldb",
+  "worker result timeout",
+  "worker pool failed",
+  "script-check pool shutdown",
+];
+
+export function isSystemFaultMessage(lower: string): boolean {
+  for (const m of SYSTEM_FAULT_MARKERS) {
+    if (lower.includes(m)) return true;
+  }
+  return false;
 }
 
 /** A reorg intermediate that failed a consensus rule (see BlockSync). */
@@ -505,6 +550,12 @@ export class BlockSync {
    *  the node on the wrong branch. Set on a reorg-abort restore, consumed + reset
    *  by the caller. Null when the last connect performed no reorg-abort. */
   private reorgAbortRestoredTip: Buffer | null;
+  /** Gate 6: the active tip a reorg-in-progress connect must restore if it
+   *  THROWS (abortFailedReorg only runs on the return-false paths). */
+  private connectReorgRestoreTip: Buffer | null = null;
+  /** Gate 6: height of the last connect that threw a system fault. A second
+   *  fault at the same height (after the view was rewound) latches AbortNode. */
+  private systemFaultHeight = -1;
 
   /** Reorg-deferral signal (Core AcceptBlock/ActivateBestChain parity). A
    *  heavier competing fork tip (e.g. B105) can reach `connectBlock` BEFORE its
@@ -1156,6 +1207,16 @@ export class BlockSync {
         );
         nextLog = Date.now() + 10_000;
       }
+    }
+    // Gate 6 (Core: no FlushStateToDisk after AbortNode): the in-memory view
+    // may be exactly the state that could not be made durable. Leave the
+    // disk at its last committed flush; the restart replays from there.
+    if (isFatal()) {
+      console.error(
+        `[shutdown] FATAL error latched — NOT flushing the UTXO cache ` +
+          `(disk stays at height ${this.lastFlushedHeight})`
+      );
+      return;
     }
     const extraOps = await this.buildViewTipChainStateOps();
     await this.utxoManager.flush(extraOps);
@@ -1888,6 +1949,12 @@ export class BlockSync {
       if (errL.includes("non-final") || errL.includes("nonfinal") || errL.includes("bad-txns-nonfinal") ||
           errL.includes("sequence locks not satisfied") || errL.includes("sequence lock")) {
         return "bad-txns-nonfinal";
+      }
+      // Gate 6: a system fault / the AbortNode latch is not a BIP-22 reject
+      // reason. Return the bare fatal token; submitblock answers
+      // RPC_VERIFY_ERROR (-25) for it.
+      if (isFatal() || err.startsWith(FATAL_ERROR_TOKEN)) {
+        return FATAL_ERROR_TOKEN;
       }
       if (err) {
         // Map other connectBlock failures to BIP-22 strings.
@@ -3023,6 +3090,10 @@ export class BlockSync {
     if (this.stopRequested) {
       return;
     }
+    // Gate 6: AbortNode latched — the chain does not advance any more.
+    if (isFatal()) {
+      return;
+    }
     // Reorg-to-ancestor HALT (crash-recovery / reorg-integrity class): once the
     // sync loop has hard-failed on an impossible reorg it must NOT keep spinning.
     if (this.syncHalted !== null) {
@@ -3207,8 +3278,16 @@ export class BlockSync {
         break;
       }
 
-      // Validate and connect the block
-      const success = await this.connectBlock(block, height);
+      // Validate and connect the block. A THROW is a system fault (I/O, OOM,
+      // a script check with no result), never a verdict: see
+      // handleConnectSystemFault.
+      let success: boolean;
+      try {
+        success = await this.connectBlock(block, height);
+      } catch (err) {
+        this.handleConnectSystemFault(height, hashHex, err);
+        break;
+      }
 
       if (!success) {
         // Core AcceptBlock / ActivateBestChain parity — DEFERRAL, not failure.
@@ -3433,30 +3512,7 @@ export class BlockSync {
           );
           this.reorgAbortRestoredTip = null;
         } else {
-        const flushedTipEntry = this.headerSync.getHeaderByHeight(
-          this.lastFlushedHeight
-        );
-        if (flushedTipEntry && this.lastFlushedHeight > 0) {
-          this.utxoManager.clearCache(flushedTipEntry.hash);
-        } else if (this.lastFlushedHeight === 0) {
-          // Pre-first-flush: the on-disk UTXO set is the genesis state.
-          // The all-zero "fresh view" sentinel is correct here. Set it
-          // explicitly: a bare clear leaves CoinsViewDB's pointer on the
-          // last CONNECTED block, so the fresh cache would lazy-load a tip
-          // whose coins were just discarded (and a shutdown flush would
-          // then persist CHAIN_STATE for it).
-          this.utxoManager.clearCache(Buffer.alloc(32));
-        } else {
-          // lastFlushedHeight > 0 but its header is missing — should not
-          // happen (headers are synced before blocks).  Bare clear keeps
-          // the old behaviour; the consecutive-failure banner below will
-          // still surface the stall to the operator.
-          console.warn(
-            `[connect-fail] could not resolve header for lastFlushedHeight=` +
-              `${this.lastFlushedHeight}; UTXO view best-block left unreconciled`
-          );
-          this.utxoManager.clearCache();
-        }
+          this.discardUnflushedView();
         }
 
         if (this.consecutiveFailures >= 3) {
@@ -3551,6 +3607,7 @@ export class BlockSync {
       // Advance to next height
       this.state.nextHeightToProcess++;
       this.blocksProcessed++;
+      if (height >= this.systemFaultHeight) this.systemFaultHeight = -1;
 
       // GAP3 fix (reorg-drop part 2/2): a successful connect at this height may
       // have been the fork tip whose pre-connect reorg dispatch incorporated the
@@ -3605,7 +3662,9 @@ export class BlockSync {
           });
         }
 
-        await this.utxoManager.flushDirty(extraOps);
+        if (!(await this.durableFlushDirty(extraOps, `UTXO memory flush at height ${height}`))) {
+          break;
+        }
         this.lastFlushedHeight = height;
 
         // Incremental GC only. Full GC (true) while 15 bun:ffi script-check
@@ -3647,6 +3706,105 @@ export class BlockSync {
       this.state.downloadedBlocks.size === 0
     ) {
       await this.completeIBD();
+    }
+  }
+
+  /**
+   * Throw away every in-memory UTXO mutation since the last flush and
+   * re-point the view at the block the on-disk UTXO set reflects
+   * (`lastFlushedHeight`). Shared by the verdict path and the system-fault
+   * path of processOrderedBlocksInner.
+   */
+  private discardUnflushedView(): void {
+    const flushedTipEntry = this.headerSync.getHeaderByHeight(
+      this.lastFlushedHeight
+    );
+    if (flushedTipEntry && this.lastFlushedHeight > 0) {
+      this.utxoManager.clearCache(flushedTipEntry.hash);
+    } else if (this.lastFlushedHeight === 0) {
+      // Pre-first-flush: the on-disk UTXO set is the genesis state.
+      // The all-zero "fresh view" sentinel is correct here. Set it
+      // explicitly: a bare clear leaves CoinsViewDB's pointer on the
+      // last CONNECTED block, so the fresh cache would lazy-load a tip
+      // whose coins were just discarded (and a shutdown flush would
+      // then persist CHAIN_STATE for it).
+      this.utxoManager.clearCache(Buffer.alloc(32));
+    } else {
+      // lastFlushedHeight > 0 but its header is missing — should not
+      // happen (headers are synced before blocks).  Bare clear keeps
+      // the old behaviour; the consecutive-failure banner below will
+      // still surface the stall to the operator.
+      console.warn(
+        `[connect-fail] could not resolve header for lastFlushedHeight=` +
+          `${this.lastFlushedHeight}; UTXO view best-block left unreconciled`
+      );
+      this.utxoManager.clearCache();
+    }
+  }
+
+  /**
+   * Gate 6 — a connect that THREW (blocks.ts:4886 class: a LevelDB read or
+   * write error, OOM, a script check that produced no result twice, a broken
+   * invariant). It says nothing about the block:
+   *   - no BLOCK_FAILED mark, no header invalidation, no punishment;
+   *   - the half-applied in-memory view is DISCARDED (Core throws the
+   *     CCoinsViewCache away). Before this, the throw escaped with the cache
+   *     torn mid-block, the retry of the SAME valid block found its own inputs
+   *     spent -> bad-txns-inputs-missingorspent -> marked invalid + the
+   *     deliverer banned, and a shutdown / completeIBD flush could persist
+   *     the torn cache;
+   *   - the block is retried once from the last durable state; a second fault
+   *     at the same height is AbortNode (stop, no flush, exit 1).
+   */
+  private handleConnectSystemFault(height: number, hashHex: string, err: unknown): void {
+    const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    this.lastConnectError = `${FATAL_ERROR_TOKEN}: system fault connecting block: ${msg}`;
+    console.error(
+      `[SYSTEM-FAULT] connecting block ${hashHex.slice(0, 16)} at height ${height} ` +
+        `threw — NOT a block verdict (no mark, no punishment); discarding the ` +
+        `unflushed view and retrying from height ${this.lastFlushedHeight + 1}: ${msg}`
+    );
+    if (this.reorgAbortRestoredTip !== null) {
+      // connectBlock already restored the original active tip (reorg).
+      this.reorgAbortRestoredTip = null;
+    } else {
+      this.discardUnflushedView();
+    }
+    this.reorgInvalidIntermediate = null;
+    const rewindTo = this.lastFlushedHeight + 1;
+    this.state.nextHeightToProcess = rewindTo;
+    this.state.nextHeightToRequest = rewindTo;
+    this.state.downloadedBlocks.clear();
+    this.downloadedBlockPeers.clear();
+
+    if (this.systemFaultHeight === height) {
+      abortNode(`connecting block at height ${height} failed twice on a system fault: ${msg}`);
+      return;
+    }
+    this.systemFaultHeight = height;
+  }
+
+  /**
+   * Gate 6: a coins + CHAIN_STATE flush, retried once; a second failure is
+   * AbortNode. CoinsViewCache.sync/flush only forget dirty state after the
+   * LevelDB batch has returned, so a failed attempt loses nothing and the
+   * retry rewrites the same batch. Returns false once the node is latched.
+   */
+  private async durableFlushDirty(extraOps: BatchOperation[], what: string): Promise<boolean> {
+    try {
+      await this.utxoManager.flushDirty(extraOps);
+      return true;
+    } catch (e1) {
+      const m1 = e1 instanceof Error ? e1.message : String(e1);
+      console.warn(`[flush] ${what} failed; retrying once: ${m1}`);
+      try {
+        await this.utxoManager.flushDirty(extraOps);
+        return true;
+      } catch (e2) {
+        const m2 = e2 instanceof Error ? e2.message : String(e2);
+        abortNode(`${what} failed twice: ${m1} / ${m2}`);
+        return false;
+      }
     }
   }
 
@@ -4567,6 +4725,32 @@ export class BlockSync {
    * this.lastConnectError for classifyCallbackError / bip22FromConnectError.
    */
   async connectBlock(block: Block, height: number): Promise<boolean> {
+    // Gate 6 (Core AbortNode): after a fatal system fault nothing connects.
+    // fatal-error is a non-verdict in every classifier.
+    if (isFatal()) {
+      this.lastConnectError = fatalRefusal();
+      return false;
+    }
+    this.connectReorgRestoreTip = null;
+    try {
+      return await this.connectBlockInner(block, height);
+    } catch (err) {
+      // A THROW is never a verdict (verdicts return false with a reason). If
+      // the reorg dispatch had already rewritten the in-memory view for this
+      // connect, restore the original active tip exactly as abortFailedReorg
+      // does on the return-false paths, then let the caller treat the throw
+      // as a system fault.
+      const restore = this.connectReorgRestoreTip;
+      this.connectReorgRestoreTip = null;
+      if (restore !== null) {
+        this.utxoManager.clearCache(restore);
+        this.reorgAbortRestoredTip = restore;
+      }
+      throw err;
+    }
+  }
+
+  private async connectBlockInner(block: Block, height: number): Promise<boolean> {
     const blockHash = getBlockHash(block.header);
     const hashHex = blockHash.toString("hex");
 
@@ -4650,6 +4834,7 @@ export class BlockSync {
       !block.header.prevBlock.equals(oldTipBeforeConnect)
     ) {
       reorgAttempted = true;
+      this.connectReorgRestoreTip = oldTipBeforeConnect;
       reorgUtxoFixed = await this.handleReorgUtxoAndCollect(
         block,
         height,
@@ -5843,15 +6028,21 @@ export class BlockSync {
     this.logProgress();
     console.log("IBD complete! Switching to normal operation.");
 
+    if (isFatal()) return;
+    // Coins + CHAIN_STATE in one batch (never coins alone). Gate 6: retried
+    // once, then AbortNode (it used to log and carry on).
+    let ops: BatchOperation[];
     try {
-      // Coins + CHAIN_STATE in one batch (never coins alone).
-      await this.utxoManager.flushDirty(await this.buildViewTipChainStateOps());
+      ops = await this.buildViewTipChainStateOps();
+    } catch (err) {
+      console.error("Error building chain-state ops for the IBD-complete flush:", err);
+      return;
+    }
+    if (await this.durableFlushDirty(ops, "IBD-complete UTXO flush")) {
       const flushedAt = this.state.nextHeightToProcess - 1;
       if (flushedAt > this.lastFlushedHeight) {
         this.lastFlushedHeight = flushedAt;
       }
-    } catch (err) {
-      console.error("Error flushing UTXO cache:", err);
     }
   }
 

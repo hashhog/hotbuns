@@ -11,6 +11,7 @@
  */
 
 import { EventEmitter } from "events";
+import { fatalRefusal, isFatal, isSystemFault } from "../chain/fatal.js";
 import type { UTXOEntry } from "../storage/database.js";
 import type { UTXOManager } from "../chain/utxo.js";
 import type { ConsensusParams } from "../consensus/params.js";
@@ -1541,6 +1542,11 @@ export class Mempool {
     tx: Transaction,
     options?: AcceptToMemoryPoolOptions,
   ): Promise<{ accepted: boolean; error?: string; fee?: bigint; vsize?: number }> {
+    // Gate 6: after AbortNode the mempool accepts nothing. fatal-error is not
+    // a rejection reason (callers must not add it to recent-rejects).
+    if (isFatal()) {
+      return { accepted: false, error: fatalRefusal() };
+    }
     // 1. Basic structural validation
     const basicResult = validateTxBasic(tx);
     if (!basicResult.valid) {
@@ -2400,6 +2406,10 @@ export class Mempool {
           // block path keeps around its verifyScript/verifyTaproot calls in
           // validation/tx.ts. Core maps script failures to a
           // TxValidationState reject reason, never an escaping exception.
+          // Gate 6: a system fault (OOM, FFI pin failure, ...) is NOT a
+          // reject reason — it propagates, so the tx is not put in
+          // recent-rejects and its relayer is not penalised.
+          if (isSystemFault(e)) throw e;
           return {
             ok: false,
             reason: `Script validation failed for input ${i}: ${(e as Error).message}`,

@@ -404,4 +404,37 @@ describe("AssumeUTXO dual-chainstate (real background 2nd chainstate)", () => {
     expect(snapshotCS.status).toBe(ChainstateStatus.INVALID);
     expect(snapshotCS.status).not.toBe(ChainstateStatus.VALIDATED);
   });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // (e) gate 6 — a block we cannot read is not evidence against the snapshot
+  // ───────────────────────────────────────────────────────────────────────────
+
+  it("(e) gate 6: a missing / unreadable block keeps the snapshot PENDING, never INVALID", async () => {
+    const tc = buildTestChain();
+    const { active, correctHash } = await buildActiveSnapshot(tc);
+    const baseHash = Buffer.alloc(32, 0xba);
+    const snapshotCS = makeSnapshotChainstate(active, baseHash);
+    const au: AssumeutxoData = { height: tc.baseHeight, hashSerialized: correctHash, nChainTx: 0n, blockHash: baseHash };
+    const real = getBlockFn(tc);
+    for (const fault of ["missing", "io"] as const) {
+      const bgDB = await freshDB(`background-${fault}`);
+      const getBlock = async (h: number) => {
+        if (h === 2) {
+          if (fault === "missing") return null;
+          const e = new Error("IO error: No space left on device") as Error & { code: string };
+          e.code = "LEVEL_IO_ERROR";
+          throw e;
+        }
+        return real(h);
+      };
+      const activation = activateSnapshotWithBackground(snapshotCS, bgDB, au, getBlock);
+      const res = await activation.background.runToBase();
+      // PRE-FIX: INVALID -> the snapshot chainstate was marked invalid.
+      expect(res).toBe(BackgroundValidationResult.PENDING);
+      expect(activation.background.error()).not.toBeNull();
+      const { validated } = finishSnapshotActivation(activation);
+      expect(validated).toBe(false);
+      expect(snapshotCS.status).toBe(ChainstateStatus.UNVALIDATED);
+    }
+  });
 });

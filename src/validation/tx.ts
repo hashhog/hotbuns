@@ -13,6 +13,7 @@ import { BufferReader, BufferWriter, varIntSize } from "../wire/serialization.js
 import { hash256, sha256Hash, ecdsaVerify, schnorrVerify, taggedHash } from "../crypto/primitives.js";
 import type { UTXOEntry } from "../storage/database.js";
 import { globalSigCache, type CacheKey } from "./sig_cache.js";
+import { isSystemFault, SystemFaultError } from "../chain/fatal.js";
 // Type-only import — erased at compile time, so it does NOT create the
 // runtime interpreter.ts ↔ tx.ts cycle that the lazy require()s below avoid.
 import type { TaprootContext } from "../script/interpreter.js";
@@ -1875,7 +1876,9 @@ export function verifyInputSignature(
       // non-PKH script type (BIP-341 P0). Without per-input prevouts we can't
       // compute sha_amounts/sha_scriptpubkeys, so we can't verify the Schnorr
       // sig. Refuse rather than accept-anything.
-      return { valid: false, inputIndex, error: "Taproot verify requires all prev-outputs" };
+      // Gate 6: this is a broken caller invariant, not a property of the
+      // script — it must not surface as a script-failure verdict either.
+      throw new SystemFaultError("Taproot verify requires all prev-outputs");
     }
 
     const prevOuts = utxos.map(u => ({
@@ -1918,6 +1921,12 @@ export function verifyInputSignature(
       if (cacheKey !== null) globalSigCache.insert(cacheKey);
       return { valid: true, inputIndex };
     } catch (e) {
+      // Gate 6 — three outcomes. A ScriptError (or the interpreter's plain
+      // script-parse / script-number Error) is a consensus failure. A runtime
+      // or I/O fault (RangeError incl. OOM, TypeError from an FFI binding, a
+      // SystemFaultError) is NOT: it propagates so the block is retried and,
+      // if it recurs, the node halts — it is never "invalid signature".
+      if (isSystemFault(e)) throw e;
       return {
         valid: false,
         inputIndex,
@@ -1932,7 +1941,8 @@ export function verifyInputSignature(
   // any non-PKH/P2TR script type, silently accepting all P2WSH/P2SH
   // inputs at consensus level.
   if (!utxos || utxos.length !== tx.inputs.length) {
-    return { valid: false, inputIndex, error: "Script verify requires all prev-outputs" };
+    // Gate 6: a broken caller invariant, never a script verdict.
+    throw new SystemFaultError("Script verify requires all prev-outputs");
   }
 
   const interp = interpreterModule();
@@ -1983,6 +1993,8 @@ export function verifyInputSignature(
     if (cacheKey !== null) globalSigCache.insert(cacheKey);
     return { valid: true, inputIndex };
   } catch (e) {
+    // Gate 6: a system fault propagates (see the P2TR branch above).
+    if (isSystemFault(e)) throw e;
     return {
       valid: false,
       inputIndex,

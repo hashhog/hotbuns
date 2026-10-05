@@ -6,6 +6,7 @@
  */
 
 import * as path from "path";
+import { FATAL_ERROR_TOKEN, fatalRefusal, isFatal } from "../chain/fatal.js";
 import * as fs from "fs";
 import type { ChainStateManager } from "../chain/state.js";
 import type { ChainDB } from "../storage/database.js";
@@ -8958,6 +8959,12 @@ export class RPCServer {
    * @returns null on success, string error message on failure
    */
   private async submitBlock(params: unknown[]): Promise<unknown> {
+    // Gate 6: after AbortNode no block is accepted. Core answers a
+    // state.IsError() submitblock with RPC_VERIFY_ERROR (-25), never a BIP-22
+    // token (rpc/mining.cpp BIP22ValidationResult).
+    if (isFatal()) {
+      throw this.rpcError(-25, fatalRefusal());
+    }
     // NetworkDisable gate: refuse submissions while a `dumptxoutset
     // rollback` rewind→dump→replay dance is in progress. Mirrors Bitcoin
     // Core's NetworkDisable RAII around TemporaryRollback in
@@ -9163,6 +9170,14 @@ export class RPCServer {
     // injectBlock returns: null = success, "duplicate" = known, "inconclusive" = orphan/full
     if (this.blockSync) {
       const result = await this.blockSync.injectBlock(block);
+      // Gate 6: a system fault while connecting (or the latch) is an RPC
+      // error, not a reject reason.
+      if (isFatal() || (typeof result === "string" && result.startsWith(FATAL_ERROR_TOKEN))) {
+        throw this.rpcError(
+          -25,
+          isFatal() ? fatalRefusal() : `${FATAL_ERROR_TOKEN}: system fault while connecting the block (retrying; not a verdict)`,
+        );
+      }
       // injectBlock already returns BIP-22 canonical strings for the cases it handles.
       return result;
     }

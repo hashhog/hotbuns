@@ -13,6 +13,7 @@ import { sha256Hash, hash256, hash160, ecdsaVerifyLax, schnorrVerify, taggedHash
 import { ripemd160, sha1 } from "@noble/hashes/legacy.js";
 import { AddressType } from "../address/encoding.js";
 import { schnorr } from "@noble/curves/secp256k1.js";
+import { isSystemFault } from "../chain/fatal.js";
 
 /**
  * Script execution error with a specific error code.
@@ -2431,7 +2432,10 @@ export function verifyScript(
   try {
     parsedSig = parseScript(scriptSig);
     parsedPubKey = parseScript(scriptPubKey);
-  } catch {
+  } catch (e) {
+    // A script that does not parse fails (consensus). An OOM / runtime fault
+    // while parsing is not a property of the script (gate 6): propagate.
+    if (isSystemFault(e)) throw e;
     return false;
   }
 
@@ -2494,7 +2498,8 @@ export function verifyScript(
     let parsedRedeem: Script;
     try {
       parsedRedeem = parseScript(redeemScript);
-    } catch {
+    } catch (e) {
+      if (isSystemFault(e)) throw e;
       return false;
     }
 
@@ -2872,7 +2877,11 @@ function verifyTaprootScriptPath(
     const result = tweakPublicKeyWithParity(internalPubKey, tweak);
     tweakedKey = result.key;
     tweakedKeyParity = result.parity;
-  } catch {
+  } catch (e) {
+    // Core CheckTapTweak: an internal key that does not lift, or a tweak that
+    // overflows, fails the commitment (consensus). A runtime fault inside the
+    // point arithmetic is not a commitment mismatch (gate 6): propagate.
+    if (isSystemFault(e)) throw e;
     throw new ScriptError("WITNESS_PROGRAM_MISMATCH");
   }
 
@@ -3082,7 +3091,8 @@ function executeTapscript(
   let parsedScript: Script;
   try {
     parsedScript = parseScript(script);
-  } catch {
+  } catch (e) {
+    if (isSystemFault(e)) throw e;
     return false;
   }
 
@@ -3231,7 +3241,8 @@ function verifyWitnessV0(
     let parsedScript: Script;
     try {
       parsedScript = parseScript(witnessScript);
-    } catch {
+    } catch (e) {
+      if (isSystemFault(e)) throw e;
       return false;
     }
 

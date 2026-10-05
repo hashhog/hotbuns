@@ -12,6 +12,7 @@
  */
 
 import { promises as fsp } from "node:fs";
+import { isSystemFault, SystemFaultError } from "./fatal.js";
 import type { FileHandle } from "node:fs/promises";
 import { sha256Hash, hash256 } from "../crypto/primitives.js";
 import { BufferWriter, BufferReader, varIntSize } from "../wire/serialization.js";
@@ -2559,7 +2560,8 @@ export class BackgroundValidator {
     const next = this.currentHeightVal + 1;
     const block = await this.getBlock(next);
     if (!block) {
-      throw new Error(`background validation: missing block at height ${next}`);
+      // Gate 6: data we do not have is not evidence against the snapshot.
+      throw new SystemFaultError(`background validation: missing block at height ${next}`);
     }
 
     const cache = this.bgUTXO.getCoinsViewCache();
@@ -2617,7 +2619,9 @@ export class BackgroundValidator {
       computed = res.hash;
     } catch (e) {
       this.errVal = e instanceof Error ? e : new Error(String(e));
-      this.resultVal = BackgroundValidationResult.INVALID;
+      // Gate 6: a flush / read fault while hashing says nothing about the
+      // snapshot — stay PENDING (retry after restart), never INVALID.
+      if (!isSystemFault(e)) this.resultVal = BackgroundValidationResult.INVALID;
       return;
     }
 
@@ -2655,7 +2659,9 @@ export class BackgroundValidator {
       }
     } catch (e) {
       this.errVal = e instanceof Error ? e : new Error(String(e));
-      this.resultVal = BackgroundValidationResult.INVALID;
+      // Gate 6: an I/O fault or a block we do not have is not a verdict on the
+      // snapshot (Core only invalidates on a hash mismatch / invalid block).
+      if (!isSystemFault(e)) this.resultVal = BackgroundValidationResult.INVALID;
       return this.resultVal;
     }
     await this.finalizeAtBase();

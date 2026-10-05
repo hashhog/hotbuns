@@ -24,6 +24,7 @@
  */
 
 import { dlopen, FFIType, ptr } from "bun:ffi";
+import { SystemFaultError } from "../chain/fatal.js";
 
 // ---------------------------------------------------------------------------
 // Library path
@@ -224,14 +225,33 @@ if (FFI_AVAILABLE) {
  * not a demonstrated tagged-pointer crash.)
  */
 function nativePtr(buf: Uint8Array): number | null {
-  if (buf.byteLength === 0) return null;
-  try {
-    const p = ptr(buf);
-    if (typeof p !== "number" || !Number.isFinite(p)) return null;
-    return p;
-  } catch {
+  if (buf.byteLength === 0) {
+    // Gate 6: a DETACHED buffer also reports byteLength 0, but it is not an
+    // empty key or message — it is memory this node lost track of. Reading it
+    // as "invalid signature" turns a fault into a verdict (and a NOT'd
+    // CHECKSIG into an accept). Only a genuinely empty view returns null.
+    const ab = buf.buffer as ArrayBuffer & { detached?: boolean };
+    if (ab && ab.detached === true) {
+      throw new SystemFaultError("secp256k1 FFI: buffer is detached");
+    }
     return null;
   }
+  let p: unknown;
+  try {
+    p = ptr(buf);
+  } catch (e) {
+    throw new SystemFaultError(
+      `secp256k1 FFI: cannot pin a ${buf.byteLength}-byte buffer: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+  if (typeof p !== "number" || !Number.isFinite(p)) {
+    // A non-empty, attached buffer that bun:ffi cannot pin is a runtime
+    // fault, never a statement about the key or signature (gate 6).
+    throw new SystemFaultError(
+      `secp256k1 FFI: ptr() returned ${typeof p} for a ${buf.byteLength}-byte buffer`,
+    );
+  }
+  return p;
 }
 
 /**
