@@ -32,9 +32,27 @@ import {
   serializeTx,
   checkSequenceLocks,
   getSigOpsAdjustedWeight,
+  SEQUENCE_LOCKTIME_DISABLE_FLAG,
+  SEQUENCE_LOCKTIME_TYPE_FLAG,
+  SEQUENCE_FINAL,
 } from "../validation/tx.js";
 import { isFinalTx } from "../mining/template.js";
 import { MissingAncestorHeaderError } from "../consensus/pow.js";
+
+/** nLockTime values at or above this are UNIX times (Core LOCKTIME_THRESHOLD). */
+const LOCKTIME_THRESHOLD_MTP = 500_000_000;
+
+/**
+ * Active-chain time source for mempool admission (Core CheckFinalTxAtTip /
+ * CalculateLockPointsAtTip read m_chain.Tip()). Both may throw
+ * MissingAncestorHeaderError.
+ */
+export interface ChainMTPProvider {
+  /** Median-time-past of the active tip. */
+  tipMTP(): number;
+  /** tip->GetAncestor(max(coinHeight-1,0))->GetMedianTimePast(). */
+  coinMTP(coinHeight: number): number;
+}
 import { sha256Hash } from "../crypto/primitives.js";
 import {
   verifyScript,
@@ -1354,8 +1372,12 @@ export class Mempool {
   /** Current chain tip height. */
   private tipHeight: number;
 
-  /** Median Time Past of the current chain tip (BIP-113 / BIP-68). */
+  /** Median Time Past of the current chain tip (BIP-113 / BIP-68).
+   *  Fallback only — used when no chain-MTP provider is wired (unit tests). */
   private tipMTP: number;
+
+  /** Active-chain time source wired by cli.ts (see setChainMTPProvider). */
+  private chainMTPProvider: ChainMTPProvider | null = null;
 
   /** Incremental relay fee rate (sat/vB). Replacement must pay this per vbyte over replaced fees. */
   private incrementalRelayFee: number;
@@ -1502,6 +1524,18 @@ export class Mempool {
    */
   setTipMTP(mtp: number): void {
     this.tipMTP = mtp;
+  }
+
+  /**
+   * Wire the ACTIVE-chain time source (cli.ts). `tipMTP()` is the active
+   * tip's median-time-past; `coinMTP(h)` is the BIP-68 coin time of a
+   * confirmed coin at height h on the active chain. Both are read on demand
+   * per admission, so they follow every connect / disconnect / reorg with no
+   * update hook to forget. Either may throw MissingAncestorHeaderError,
+   * which refuses a time-locked tx.
+   */
+  setChainMTPProvider(provider: ChainMTPProvider | null): void {
+    this.chainMTPProvider = provider;
   }
 
   /**
@@ -1929,17 +1963,45 @@ export class Mempool {
     }
 
     // 8c. BIP-113 IsFinalTx: nLockTime must be satisfied at the next block.
-    //     Reference: Bitcoin Core CheckFinalTxAtTip() (validation.cpp).
-    //     nextHeight = tipHeight + 1; lockTimeCutoff = MTP (BIP-113 MTP rule).
-    //     If headerSync is available, compute MTP from the best header; otherwise
-    //     fall back to the cached tipMTP value (set via setTipMTP).
+    //     Reference: Bitcoin Core CheckFinalTxAtTip() (validation.cpp):
+    //     IsFinalTx(tx, tip->nHeight + 1, tip->GetMedianTimePast()).
+    //
+    //     The MTP is the ACTIVE tip's, read on demand from the chain-MTP
+    //     provider cli.ts wires (setChainMTPProvider). 2026-10-05: before
+    //     that wiring existed nothing in production ever set tipMTP, so it
+    //     stayed 0 and every time-based nLockTime tx and every time-type
+    //     relative lock was refused; the headerSync fallback that was here
+    //     read the best HEADER, not the active tip, and was never wired
+    //     either. Without a provider (unit tests) the setTipMTP value is used.
     const nextHeight = this.tipHeight + 1;
-    let currentMTP = this.tipMTP;
-    if (this.headerSync) {
-      const bestHdr = this.headerSync.getBestHeader();
-      if (bestHdr) {
-        currentMTP = this.headerSync.getMedianTimePast(bestHdr);
+    let currentMTP: number;
+    try {
+      currentMTP = this.chainMTPProvider
+        ? this.chainMTPProvider.tipMTP()
+        : this.tipMTP;
+    } catch (err) {
+      if (err instanceof MissingAncestorHeaderError) {
+        // Only a tx whose finality actually depends on time needs the MTP;
+        // without the window we refuse such a tx, never guess.
+        currentMTP = Number.NaN;
+      } else {
+        throw err;
       }
+    }
+    const needsTime =
+      ((tx.lockTime >>> 0) >= LOCKTIME_THRESHOLD_MTP &&
+        tx.inputs.some((i) => (i.sequence >>> 0) !== SEQUENCE_FINAL)) ||
+      (tx.version >= 2 && tx.inputs.some((i) =>
+        ((i.sequence >>> 0) & SEQUENCE_LOCKTIME_DISABLE_FLAG) === 0 &&
+        ((i.sequence >>> 0) & SEQUENCE_LOCKTIME_TYPE_FLAG) !== 0));
+    if (Number.isNaN(currentMTP)) {
+      if (needsTime) {
+        return {
+          accepted: false,
+          error: "non-final: active-tip median-time-past unavailable (missing-ancestor-header)",
+        };
+      }
+      currentMTP = 0; // never read for a tx with no time-based lock
     }
     if (!isFinalTx(tx, nextHeight, currentMTP)) {
       return {
@@ -1949,41 +2011,44 @@ export class Mempool {
     }
 
     // 8d. BIP-68 SequenceLocks: per-input relative locktimes (CSV).
-    //     Reference: Bitcoin Core CheckSequenceLocksAtTip() (validation.cpp).
-    //     For confirmed UTXOs: use tipMTP conservatively as coin MTP (may
-    //     false-reject time-locked txs near the boundary but never false-admits).
-    //     For mempool parents: synthetic height = tipHeight + 1 (Core convention).
+    //     Reference: Bitcoin Core CalculateLockPointsAtTip +
+    //     CheckSequenceLocksAtTip (validation.cpp):
+    //       - mempool parent  -> coin height tip+1 (MEMPOOL_HEIGHT), coin
+    //         time = GetAncestor(tip+1-1 = tip)->MTP = tip MTP;
+    //       - confirmed coin  -> its own height, coin time =
+    //         tip->GetAncestor(max(h-1,0))->GetMedianTimePast().
     const enforceBIP68 =
       tx.version >= 2 &&
       this.tipHeight >= (this.params.csvHeight ?? 0);
     if (enforceBIP68) {
       let utxoConfirmations: UTXOConfirmation[];
       try {
-      utxoConfirmations = inputUtxos.map(({ utxo, isMempool: isMp }) => {
+      utxoConfirmations = inputUtxos.map(({ utxo, isMempool: isMp }, idx) => {
+        const seq = tx.inputs[idx].sequence >>> 0;
+        const timeLocked =
+          (seq & SEQUENCE_LOCKTIME_DISABLE_FLAG) === 0 &&
+          (seq & SEQUENCE_LOCKTIME_TYPE_FLAG) !== 0;
         if (isMp) {
-          // Unconfirmed parent: treat as mined at tipHeight + 1 with currentMTP.
           return { height: nextHeight, medianTimePast: currentMTP };
-        } else {
-          // Confirmed UTXO: use MTP at (coinHeight-1) for parity with Core's
-          // CheckSequenceLocksAtTip (validation.cpp), which indexes into a
-          // pre-built mediants[] array keyed by coin creation height.
-          // Falls back to currentMTP when headerSync is absent or the header
-          // is not found — tipMTP is conservative (may over-reject near the
-          // boundary, never false-accept).  Relay divergence only (BUG-5);
-          // does NOT affect block-validation consensus.
-          //
-          // 2026-10-03: a header that IS present but whose 11-block window is
-          // not (snapshot-booted island) used to yield a truncated median;
-          // getCoinMedianTimePast refuses instead (caught below).
-          const confirmedUtxo = utxo as UTXOEntry;
-          let coinMTP = currentMTP;
-          if (this.headerSync && confirmedUtxo.height > 0) {
-            if (this.headerSync.getHeaderByHeight(confirmedUtxo.height - 1)) {
-              coinMTP = this.headerSync.getCoinMedianTimePast(confirmedUtxo.height);
-            }
-          }
-          return { height: confirmedUtxo.height, medianTimePast: coinMTP };
         }
+        const confirmedUtxo = utxo as UTXOEntry;
+        // Coin time is only read for time-type inputs (Core computes it
+        // inside the TYPE_FLAG branch only); skip the lookup otherwise.
+        if (!timeLocked) {
+          return { height: confirmedUtxo.height, medianTimePast: 0 };
+        }
+        let coinMTP: number;
+        if (this.chainMTPProvider) {
+          coinMTP = this.chainMTPProvider.coinMTP(confirmedUtxo.height);
+        } else if (this.headerSync && confirmedUtxo.height > 0 &&
+                   this.headerSync.getHeaderByHeight(confirmedUtxo.height - 1)) {
+          coinMTP = this.headerSync.getCoinMedianTimePast(confirmedUtxo.height);
+        } else {
+          // No chain source at all (bare unit-test mempool): the tip MTP is
+          // >= every coin MTP, so this can only over-reject, never admit.
+          coinMTP = currentMTP;
+        }
+        return { height: confirmedUtxo.height, medianTimePast: coinMTP };
       });
       } catch (err) {
         if (err instanceof MissingAncestorHeaderError) {

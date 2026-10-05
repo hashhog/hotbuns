@@ -1761,25 +1761,6 @@ async function startNode(config: NodeConfig): Promise<void> {
   let bestBlock = chainState.getBestBlock();
   mempool.setTipHeight(bestBlock.height);
 
-  // 4a-bis. Restore persisted mempool from <datadir>/mempool.dat (if any).
-  // Mirrors Bitcoin Core's `LoadMempool` call from init.cpp's `ImportBlocks`
-  // path: each tx is replayed through `acceptToMemoryPool`, so a stale
-  // dump never bypasses tightened relay rules.  Skipped silently on the
-  // one-shot import paths below — those exits do not run a node.
-  if (!mergedConfig.importBlocks && !mergedConfig.loadSnapshot) {
-    try {
-      const loaded = await loadMempool(mempool, mergedConfig.datadir);
-      if (loaded.succeeded + loaded.failed + loaded.expired > 0) {
-        console.log(
-          `[mempool] Loaded ${loaded.succeeded} txs (${loaded.failed} failed, ` +
-            `${loaded.expired} expired, ${loaded.unbroadcast} unbroadcast) from mempool.dat`
-        );
-      }
-    } catch (e) {
-      console.error("[mempool] Load skipped:", (e as Error).message);
-    }
-  }
-
   // 4b. Block import mode (--import-blocks)
   if (mergedConfig.importBlocks) {
     await runBlockImport(mergedConfig.importBlocks, db, chainState, params);
@@ -1868,14 +1849,42 @@ async function startNode(config: NodeConfig): Promise<void> {
     await headerSync.adoptChainTipAsBestHeader(bestBlock.hash, bestBlock.height);
   }
 
-  // 5a. BIP-113 / BIP-68 time context for ChainStateManager.connectBlock
-  // (generateblock fallback, dumptxoutset re-apply, chain-state reorganize):
-  // it reads the connecting block's parent by HASH from HeaderSync.  Until
-  // 2026-10-05 this was never wired and connectBlock used the block's OWN
-  // timestamp as prevMTP and coin MTP 0 — blocks Core rejects were accepted.
-  // (--import-blocks runs before HeaderSync exists and uses the persisted
-  // block-index walk instead.)
+  // 5a. Active-chain time source (BIP-113 / BIP-68).  Core's
+  // CheckFinalTxAtTip / CalculateLockPointsAtTip / CalculateSequenceLocks
+  // read the ACTIVE tip (m_chain.Tip()) and, per coin, its ancestor's MTP.
+  // Until 2026-10-05 neither of these was ever wired outside tests: the
+  // mempool's tipMTP stayed 0 (every time-locked nLockTime tx and every
+  // time-type relative lock refused) and ChainStateManager.connectBlock
+  // (generateblock fallback, dumptxoutset re-apply, chain-state reorganize)
+  // used the block's OWN timestamp as prevMTP and coin MTP 0.  Both read on
+  // demand from the active tip, so connect / disconnect / invalidateblock /
+  // reorg need no separate update hook.
   chainState.setHeaderSync(headerSync);
+  mempool.setChainMTPProvider({
+    tipMTP: () => chainState.getTipMedianTimePast(),
+    coinMTP: (coinHeight: number) => chainState.getCoinMedianTimePastAtTip(coinHeight),
+  });
+
+  // 5b. (was 4a-bis; moved after 5a so replayed time-locked txs see the
+  // real active-tip MTP) Restore persisted mempool from <datadir>/mempool.dat (if any).
+  // Mirrors Bitcoin Core's `LoadMempool` call from init.cpp's `ImportBlocks`
+  // path: each tx is replayed through `acceptToMemoryPool`, so a stale
+  // dump never bypasses tightened relay rules.  Skipped silently on the
+  // one-shot import paths below — those exits do not run a node.
+  if (!mergedConfig.importBlocks && !mergedConfig.loadSnapshot) {
+    try {
+      const loaded = await loadMempool(mempool, mergedConfig.datadir);
+      if (loaded.succeeded + loaded.failed + loaded.expired > 0) {
+        console.log(
+          `[mempool] Loaded ${loaded.succeeded} txs (${loaded.failed} failed, ` +
+            `${loaded.expired} expired, ${loaded.unbroadcast} unbroadcast) from mempool.dat`
+        );
+      }
+    } catch (e) {
+      console.error("[mempool] Load skipped:", (e as Error).message);
+    }
+  }
+
 
   // 6. Start peer manager (DNS seed resolution, connect to peers)
   // BIP-159: when prune mode is on, PeerManager OR's NODE_NETWORK_LIMITED
