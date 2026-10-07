@@ -10067,7 +10067,14 @@ export class RPCServer {
     // (reversed) bytes; a well-formed-but-absent hash stays -5 "Block not found".
     const blockHash = this.parseHashV(blockhashParam, "blockhash");
 
-    const result = await this.chainState.invalidateBlock(blockHash);
+    // Serialized with block connect (Core holds cs_main / m_chainstate_mutex
+    // for all of InvalidateBlock): BlockSync owns the chain lock, the live coin
+    // view and the header/download layer that must learn the block failed
+    // (audit HB-2 / HB-10). The bare ChainStateManager path is only for a
+    // server running without BlockSync (tooling, unit tests).
+    const result = this.blockSync
+      ? await this.blockSync.invalidateBlock(blockHash)
+      : await this.chainState.invalidateBlock(blockHash);
 
     if (!result.success) {
       // Core (rpc/blockchain.cpp InvalidateBlock): an unknown block hash
@@ -10086,9 +10093,7 @@ export class RPCServer {
     // tip is short-circuited as "duplicate" (side-branch only) and never
     // reaches the connect/reorg path, so the node cannot adopt the more-work
     // chain. Mirrors Core InvalidateBlock re-deriving the candidate tip set.
-    if (this.blockSync) {
-      this.blockSync.resyncFrontierAfterRollback();
-    }
+    // (BlockSync.invalidateBlock already rolled the frontier back.)
 
     return null;
   }
@@ -10108,7 +10113,9 @@ export class RPCServer {
     // (reversed) bytes; a well-formed-but-absent hash stays -5 "Block not found".
     const blockHash = this.parseHashV(blockhashParam, "blockhash");
 
-    const result = await this.chainState.reconsiderBlock(blockHash);
+    const result = this.blockSync
+      ? await this.blockSync.reconsiderBlock(blockHash)
+      : await this.chainState.reconsiderBlock(blockHash);
 
     if (!result.success) {
       // Core (rpc/blockchain.cpp ReconsiderBlock): an unknown block hash
@@ -10138,7 +10145,9 @@ export class RPCServer {
     // (reversed) bytes; a well-formed-but-absent hash stays -5 "Block not found".
     const blockHash = this.parseHashV(blockhashParam, "blockhash");
 
-    const result = await this.chainState.preciousBlock(blockHash);
+    const result = this.blockSync
+      ? await this.blockSync.preciousBlock(blockHash)
+      : await this.chainState.preciousBlock(blockHash);
 
     if (!result.success) {
       // Core (rpc/blockchain.cpp preciousblock, line 1701): an unknown block

@@ -759,9 +759,9 @@ export class HeaderSync {
    * connect/reorg paths (`writeHeightIndex`), and the reorg re-evaluates on
    * restart, so the runtime selection state is the load-bearing surface.
    */
-  invalidateHeader(badHash: Buffer, newBestHash: Buffer): void {
+  invalidateHeader(badHash: Buffer, newBestHash: Buffer): HeaderChainEntry[] {
     const badEntry = this.headerChain.get(badHash.toString("hex"));
-    if (!badEntry) return;
+    if (!badEntry) return [];
 
     badEntry.status = "invalid";
     // Core SetBlockFailureFlags / BLOCK_FAILED_CHILD: every header already in
@@ -769,7 +769,8 @@ export class HeaderSync {
     // propagating at insert time (processHeaders) left an already-known
     // heavier descendant (a fork tip B2x on the failed B1) "valid", so it
     // stayed selectable and its body was requested again and again.
-    const descendants = this.markDescendantsInvalid(badEntry);
+    const flaggedList = this.markDescendantsInvalid(badEntry);
+    const descendants = flaggedList.length;
 
     const newBest = this.headerChain.get(newBestHash.toString("hex"));
     if (!newBest) {
@@ -783,7 +784,7 @@ export class HeaderSync {
           .toString("hex")
           .slice(0, 16)} is unknown; by-height index left as-is`
       );
-      return;
+      return flaggedList;
     }
 
     const oldBestHeight = this.bestHeader
@@ -819,23 +820,26 @@ export class HeaderSync {
           .toString("hex")
           .slice(0, 16)} (height ${newBest.height})`
     );
+    return flaggedList;
   }
 
   /**
-   * Flag every indexed header that descends from `bad` as "invalid" (Core
-   * BLOCK_FAILED_CHILD). Only entries ABOVE `bad.height` can descend from it;
-   * each is resolved by walking its parents down to `bad.height`, memoising
-   * the verdict per hash so shared ancestry is walked once. Returns the number
-   * of headers newly flagged. Invalidation is rare, so one pass over the index
-   * is acceptable.
+   * Every indexed header that descends from `hash` (not including `hash`),
+   * whatever its status.  One in-memory pass over the index with a memoised
+   * ancestor walk (entries at or below `hash`'s height are skipped in O(1)),
+   * the same shape as Core's single m_block_index pass in
+   * InvalidateBlock / ResetBlockFailureFlags (validation.cpp) — never a DB
+   * walk.  Returned in ascending height order.
    */
-  private markDescendantsInvalid(bad: HeaderChainEntry): number {
-    const badHex = bad.hash.toString("hex");
+  collectDescendants(hash: Buffer): HeaderChainEntry[] {
+    const root = this.headerChain.get(hash.toString("hex"));
+    if (!root) return [];
+    const rootHex = root.hash.toString("hex");
     const memo = new Map<string, boolean>();
-    memo.set(badHex, true);
-    let flagged = 0;
+    memo.set(rootHex, true);
+    const out: HeaderChainEntry[] = [];
     for (const [hex, entry] of this.headerChain) {
-      if (entry.height <= bad.height) continue;
+      if (entry.height <= root.height) continue;
       const path: string[] = [];
       let cur: HeaderChainEntry | undefined = entry;
       let curHex = hex;
@@ -846,7 +850,7 @@ export class HeaderSync {
           verdict = known;
           break;
         }
-        if (cur.height <= bad.height) {
+        if (cur.height <= root.height) {
           verdict = false;
           break;
         }
@@ -855,12 +859,62 @@ export class HeaderSync {
         cur = this.headerChain.get(curHex);
       }
       for (const p of path) memo.set(p, verdict);
-      if (verdict && entry.status !== "invalid") {
-        entry.status = "invalid";
-        flagged++;
+      if (verdict) out.push(entry);
+    }
+    out.sort((a, b) => a.height - b.height);
+    return out;
+  }
+
+  /**
+   * reconsiderblock, header layer — Core ResetBlockFailureFlags
+   * (validation.cpp): clear the failure flag on the block, every descendant
+   * AND every ancestor, then re-derive the best header (Core: the cleared
+   * blocks re-enter setBlockIndexCandidates and ActivateBestChain runs).
+   * Returns the entries whose status was cleared.
+   */
+  reconsiderHeader(hash: Buffer): HeaderChainEntry[] {
+    const root = this.headerChain.get(hash.toString("hex"));
+    if (!root) return [];
+    const cleared: HeaderChainEntry[] = [];
+    // Ancestors: walk down while flagged (a valid ancestor has only valid
+    // ancestors, so the walk is bounded by the failed stretch).
+    let cur: HeaderChainEntry | undefined = root;
+    while (cur && cur.status === "invalid") {
+      cur.status = "valid-header";
+      cleared.push(cur);
+      if (cur.height === 0) break;
+      cur = this.headerChain.get(cur.header.prevBlock.toString("hex"));
+    }
+    for (const d of this.collectDescendants(hash)) {
+      if (d.status === "invalid") {
+        d.status = "valid-header";
+        cleared.push(d);
       }
     }
-    if (flagged > 0 && this.mostWorkValid && this.mostWorkValid.status === "invalid") {
+    if (cleared.length > 0) {
+      this.mostWorkValid = this.findMostWorkValidHeader();
+      this.promoteMostWorkHeader();
+    }
+    return cleared;
+  }
+
+  /**
+   * Flag every indexed header that descends from `bad` as "invalid" (Core
+   * BLOCK_FAILED_CHILD). Only entries ABOVE `bad.height` can descend from it;
+   * each is resolved by walking its parents down to `bad.height`, memoising
+   * the verdict per hash so shared ancestry is walked once. Returns the number
+   * of headers newly flagged. Invalidation is rare, so one pass over the index
+   * is acceptable.
+   */
+  private markDescendantsInvalid(bad: HeaderChainEntry): HeaderChainEntry[] {
+    const flagged: HeaderChainEntry[] = [];
+    for (const entry of this.collectDescendants(bad.hash)) {
+      if (entry.status !== "invalid") {
+        entry.status = "invalid";
+        flagged.push(entry);
+      }
+    }
+    if (flagged.length > 0 && this.mostWorkValid && this.mostWorkValid.status === "invalid") {
       this.mostWorkValid = null;
     }
     return flagged;
@@ -2298,7 +2352,10 @@ export class HeaderSync {
           );
         }
         let status: HeaderStatus = "valid-header";
-        if ((record.status & 1) === 0) {
+        // BLOCK_FAILED_VALID (32) | BLOCK_FAILED_CHILD (64): a block that
+        // invalidateblock (or a consensus failure) marked failed stays failed
+        // across a restart (Core LoadBlockIndex keeps BLOCK_FAILED_MASK).
+        if ((record.status & 1) === 0 || (record.status & (32 | 64)) !== 0) {
           status = "invalid";
         }
         const entry: HeaderChainEntry = {
@@ -2317,7 +2374,12 @@ export class HeaderSync {
       const chainWork = parent.chainWork + headerWork;
 
       let status: HeaderStatus = "valid-header";
-      if ((record.status & 1) === 0) {
+      // BLOCK_FAILED_VALID | BLOCK_FAILED_CHILD persist across a restart.
+      if ((record.status & 1) === 0 || (record.status & (32 | 64)) !== 0) {
+        status = "invalid";
+      }
+      // BLOCK_FAILED_CHILD for a child loaded after its failed parent.
+      if (parent.status === "invalid") {
         status = "invalid";
       }
 
@@ -2336,7 +2398,9 @@ export class HeaderSync {
           this.mostWorkValid = entry;
         }
       }
-      if (!this.bestHeader || chainWork > this.bestHeader.chainWork) {
+      // Never seat the best header on a failed block (Core LoadBlockIndex /
+      // RecalculateBestHeader skip BLOCK_FAILED_VALID).
+      if (status !== "invalid" && (!this.bestHeader || chainWork > this.bestHeader.chainWork)) {
         this.bestHeader = entry;
       }
     }

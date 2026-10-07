@@ -1664,6 +1664,18 @@ export class ChainStateManager {
   }
 
   /**
+   * Drop this manager's own coin cache and re-point it at the active tip, so
+   * its next reads come from disk.  BlockSync calls this under the chain lock,
+   * after flushing its live view, before a chain-management call
+   * (invalidateblock / reconsiderblock) mutates chainstate through this view:
+   * blocks connect through BlockSync's view, so anything this cache holds may
+   * describe an older chain.
+   */
+  resetCoinsViewToTip(): void {
+    this.utxo.clearCache(this.bestBlock.hash);
+  }
+
+  /**
    * Get statistics about the current state.
    */
   getStats(): {
@@ -1743,7 +1755,10 @@ export class ChainStateManager {
    * @param blockHash - Hash of the block to invalidate
    * @returns Result indicating success and number of blocks affected
    */
-  async invalidateBlock(blockHash: Buffer): Promise<ChainManagementResult> {
+  async invalidateBlock(
+    blockHash: Buffer,
+    knownDescendants?: Buffer[]
+  ): Promise<ChainManagementResult> {
     // Check if block exists
     const blockIndex = await this.db.getBlockIndex(blockHash);
     if (!blockIndex) {
@@ -1826,8 +1841,21 @@ export class ChainStateManager {
       );
     }
 
-    // Mark all descendants as FAILED_CHILD
-    await this.markDescendantsInvalid(blockHash, blockIndex.height);
+    // Mark all descendants as FAILED_CHILD.  When the caller (BlockSync,
+    // which owns the in-memory header tree) hands us the descendant set, flag
+    // exactly those — O(descendants), as Core's InvalidateBlock does from its
+    // in-memory m_block_index.  The full on-disk block-index walk is only the
+    // fallback for a ChainStateManager running without a header tree.
+    if (knownDescendants) {
+      for (const d of knownDescendants) {
+        const idx = await this.db.getBlockIndex(d);
+        if (idx && !(idx.status & (BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD))) {
+          await this.db.updateBlockStatus(d, idx.status | BlockStatus.FAILED_CHILD);
+        }
+      }
+    } else {
+      await this.markDescendantsInvalid(blockHash, blockIndex.height);
+    }
 
     // Remove conflicting transactions from mempool
     if (this.mempool) {
@@ -1906,16 +1934,21 @@ export class ChainStateManager {
    * @param blockHash - Hash of the block to reconsider
    * @returns Result indicating success and number of blocks affected
    */
-  async reconsiderBlock(blockHash: Buffer): Promise<ChainManagementResult> {
+  async reconsiderBlock(
+    blockHash: Buffer,
+    knownDescendants?: Buffer[]
+  ): Promise<ChainManagementResult> {
     // Check if block exists
     const blockIndex = await this.db.getBlockIndex(blockHash);
     if (!blockIndex) {
       return { success: false, error: "Block not found" };
     }
 
-    // Check if actually invalid
+    // Check if actually invalid.  Core ResetBlockFailureFlags still clears
+    // the descendants (and ancestors) of a block that is itself valid, so
+    // with a known descendant set we fall through instead of returning.
     const isInvalid = blockIndex.status & (BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD);
-    if (!isInvalid) {
+    if (!isInvalid && !knownDescendants) {
       return { success: true, blocksAffected: 0 };
     }
 
@@ -1942,8 +1975,22 @@ export class ChainStateManager {
       currentHash = parentHash;
     }
 
-    // Also clear flags from descendants of the reconsidered block
-    await this.clearDescendantInvalidFlags(blockHash, blockIndex.height);
+    // Also clear flags from descendants of the reconsidered block (Core
+    // ResetBlockFailureFlags clears FAILED on every descendant).
+    if (knownDescendants) {
+      for (const d of knownDescendants) {
+        const idx = await this.db.getBlockIndex(d);
+        if (idx && (idx.status & (BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD))) {
+          await this.db.updateBlockStatus(
+            d,
+            idx.status & ~(BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD)
+          );
+          blocksCleared++;
+        }
+      }
+    } else {
+      await this.clearDescendantInvalidFlags(blockHash, blockIndex.height);
+    }
 
     // Check if we need to reorganize
     // The reconsidered chain might now have more work than our current tip

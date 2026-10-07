@@ -16,7 +16,7 @@ import type { NetworkMessage, InvVector } from "../p2p/messages.js";
 import { InvType } from "../p2p/messages.js";
 import { BanScores } from "../p2p/manager.js";
 import { HeaderSync, MissingAncestorHeaderError, type HeaderChainEntry } from "./headers.js";
-import type { ChainStateManager } from "../chain/state.js";
+import type { ChainStateManager, ChainManagementResult } from "../chain/state.js";
 import type { Mempool } from "../mempool/mempool.js";
 import {
   Block,
@@ -1066,6 +1066,196 @@ export class BlockSync {
     }
   }
 
+  /** RPC chain writers waiting for the chain lock (see withChainLock). */
+  private chainLockWaiters = 0;
+  /** Hashes on the best header chain whose bodies are on disk and that
+   *  reconsiderblock asked to re-activate; the connect loop reads them from
+   *  disk instead of waiting for a peer (bounded by the reconsidered fork). */
+  private reactivateFromDisk: Set<string> = new Set();
+
+  /**
+   * The chain lock — Core's cs_main + m_chainstate_mutex for chain writers.
+   *
+   * The connect loop has always been serialized by the `processing` flag; RPC
+   * chain writers (invalidateblock, reconsiderblock, preciousblock) used to run
+   * beside it as ordinary concurrent tasks (audit HB-2): invalidateblock
+   * disconnected through ChainStateManager's second coin view while the loop
+   * was mid-connect, so the loop's flush could land a block on top of a
+   * rolled-back coin set. A writer now waits for the in-flight block to
+   * finish (the loop yields between blocks once a writer is waiting), holds
+   * `processing` for its whole run, and kicks the loop when it is done.
+   */
+  async withChainLock<T>(fn: () => Promise<T>): Promise<T> {
+    this.chainLockWaiters++;
+    try {
+      while (this.processing) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 2));
+      }
+      this.processing = true;
+    } finally {
+      this.chainLockWaiters--;
+    }
+    try {
+      return await fn();
+    } finally {
+      this.processing = false;
+      if (this.chainLockWaiters === 0) {
+        void this.processOrderedBlocks().catch(() => {});
+        this.requestBlocks();
+      }
+    }
+  }
+
+  /**
+   * Make the on-disk coins + CHAIN_STATE equal the live view (Core: a
+   * FlushStateToDisk before handing chainstate to another writer). Caller
+   * holds the chain lock.
+   */
+  private async flushLiveViewForChainWriter(): Promise<void> {
+    const extraOps = await this.buildViewTipChainStateOps();
+    await this.utxoManager.flush(extraOps);
+    if (extraOps.length > 0 && this.lastViewTipHeight !== null) {
+      this.lastFlushedHeight = this.lastViewTipHeight;
+    }
+  }
+
+  /**
+   * invalidateblock, end to end — Core Chainstate::InvalidateBlock
+   * (validation.cpp) -> InvalidChainFound -> RecalculateBestHeader, under the
+   * chain lock:
+   *   1. flush the live view, reset ChainStateManager's own cache to the tip,
+   *      so the disconnect reads the same coins the connect loop wrote;
+   *   2. disconnect the active branch down to the block's parent and mark the
+   *      block BLOCK_FAILED_VALID and its descendants BLOCK_FAILED_CHILD in the
+   *      block index (descendants from the in-memory header tree: O(fork));
+   *   3. flag the block + descendants failed in the HEADER layer, re-seat the
+   *      best header off the failed branch (and onto any other most-work valid
+   *      branch), so the download scheduler, inv/headers/cmpctblock handlers
+   *      and the connect loop never fetch or connect them again (HB-10);
+   *   4. re-point the live view at the new tip and roll the download frontier
+   *      back.
+   */
+  async invalidateBlock(blockHash: Buffer): Promise<ChainManagementResult> {
+    const cs = this.chainStateManager;
+    if (!cs) return { success: false, error: "chain state unavailable" };
+    return this.withChainLock(async () => {
+      if (isFatal()) {
+        return { success: false, error: "node is in a fatal state (AbortNode latched)" };
+      }
+      const t0 = Date.now();
+      await this.flushLiveViewForChainWriter();
+      const tFlush = Date.now();
+      cs.resetCoinsViewToTip();
+      const known = this.headerSync.getHeader(blockHash);
+      const descendants = known
+        ? this.headerSync.collectDescendants(blockHash).map((e) => e.hash)
+        : undefined;
+      const tDesc = Date.now();
+      let result: ChainManagementResult;
+      try {
+        result = await cs.invalidateBlock(blockHash, descendants);
+        console.log(
+          `[invalidateblock] ${blockHash.toString("hex").slice(0, 16)}: ` +
+            `${result.success ? `disconnected ${result.blocksAffected ?? 0}` : `failed: ${result.error}`}` +
+            `, ${descendants?.length ?? "?"} descendant(s); flush ${tFlush - t0} ms, ` +
+            `descendants ${tDesc - tFlush} ms, disconnect+mark ${Date.now() - tDesc} ms`
+        );
+      } finally {
+        // Whatever happened, the live view must re-read the (possibly
+        // rolled-back) disk state at the manager's tip.
+        this.utxoManager.clearCache(cs.getBestBlock().hash);
+      }
+      if (!result.success) return result;
+      const newTip = cs.getBestBlock();
+      if (known) {
+        this.headerSync.invalidateHeader(blockHash, newTip.hash);
+        this.headerSync.promoteMostWorkHeader();
+      }
+      this.rollFrontierToActiveTip();
+      for (const [hex] of this.state.downloadedBlocks) {
+        const e = this.headerSync.getHeader(Buffer.from(hex, "hex"));
+        if (e && e.status === "invalid") {
+          this.state.downloadedBlocks.delete(hex);
+          this.downloadedBlockPeers.delete(hex);
+        }
+      }
+      for (const [hex] of this.state.pendingBlocks) {
+        const e = this.headerSync.getHeader(Buffer.from(hex, "hex"));
+        if (e && e.status === "invalid") this.state.pendingBlocks.delete(hex);
+      }
+      if (this.peerManager) this.peerManager.updateBestHeight(newTip.height);
+      if (this.mempool) this.mempool.setTipHeight(newTip.height);
+      return result;
+    });
+  }
+
+  /**
+   * reconsiderblock — Core ResetBlockFailureFlags (block, descendants AND
+   * ancestors) + ActivateBestChain, under the chain lock. Bodies of the
+   * reconsidered branch already on disk are connected from disk.
+   */
+  async reconsiderBlock(blockHash: Buffer): Promise<ChainManagementResult> {
+    const cs = this.chainStateManager;
+    if (!cs) return { success: false, error: "chain state unavailable" };
+    return this.withChainLock(async () => {
+      const known = this.headerSync.getHeader(blockHash);
+      const descendants = known
+        ? this.headerSync.collectDescendants(blockHash).map((e) => e.hash)
+        : undefined;
+      const result = await cs.reconsiderBlock(blockHash, descendants);
+      if (!result.success) return result;
+      if (!known) return result;
+      this.headerSync.reconsiderHeader(blockHash);
+      this.headerSync.promoteMostWorkHeader();
+      // Re-activation: stage the best chain above the active tip whose bodies
+      // are on disk (bounded by the reconsidered stretch).
+      this.rollFrontierToActiveTip();
+      const tip = cs.getBestBlock();
+      const best = this.headerSync.getBestHeader();
+      if (best) {
+        for (let h = tip.height + 1; h <= best.height; h++) {
+          const e = this.headerSync.getHeaderByHeight(h);
+          if (!e || e.status === "invalid") break;
+          const idx = await this.db.getBlockIndex(e.hash);
+          if (!idx || !(idx.status & 8 /* HAVE_DATA */) || idx.nTx === 0) break;
+          this.reactivateFromDisk.add(e.hash.toString("hex"));
+        }
+      }
+      // ActivateBestChain before returning (Core reconsiderblock): connect the
+      // re-activated stretch now, while we still hold the chain lock.
+      if (this.reactivateFromDisk.size > 0) {
+        await this.processOrderedBlocksInner();
+      }
+      return result;
+    });
+  }
+
+  /** preciousblock — serialized with connect like every chain writer. */
+  async preciousBlock(blockHash: Buffer): Promise<ChainManagementResult> {
+    const cs = this.chainStateManager;
+    if (!cs) return { success: false, error: "chain state unavailable" };
+    return this.withChainLock(() => cs.preciousBlock(blockHash));
+  }
+
+  /**
+   * Snap the connect/request frontier to the active tip + 1 and re-point the
+   * live view at the tip. Unlike {@link resyncFrontierAfterRollback} this also
+   * runs when the frontier is already below the tip's successor.
+   */
+  private rollFrontierToActiveTip(): void {
+    if (!this.chainStateManager) return;
+    const tip = this.chainStateManager.getBestBlock();
+    const newFrontier = tip.height + 1;
+    this.resyncFrontierAfterRollback();
+    this.state.nextHeightToProcess = newFrontier;
+    if (this.state.nextHeightToRequest > newFrontier) {
+      this.state.nextHeightToRequest = newFrontier;
+    }
+    if (this.lastFlushedHeight > tip.height) {
+      this.lastFlushedHeight = tip.height;
+    }
+  }
+
   resyncFrontierAfterRollback(): void {
     if (!this.chainStateManager) return;
     const tip = this.chainStateManager.getBestBlock();
@@ -1869,6 +2059,19 @@ export class BlockSync {
     this.lastConnectDeferred = false;
 
     let headerEntry = this.headerSync.getHeader(blockHash);
+    // Core AcceptBlockHeader: a known header flagged failed answers
+    // "duplicate-invalid" (BLOCK_CACHED_INVALID) — never re-validated, never
+    // reconnected (submitblock of an invalidateblock'ed block).
+    if (headerEntry && headerEntry.status === "invalid") {
+      return "duplicate-invalid";
+    }
+    // ...and a new header whose parent is failed is "bad-prevblk".
+    if (!headerEntry) {
+      const parentEntry = this.headerSync.getHeader(block.header.prevBlock);
+      if (parentEntry && parentEntry.status === "invalid") {
+        return "bad-prevblk";
+      }
+    }
     if (!headerEntry) {
       // Header not known yet — try to accept it directly from the block.
       // This allows submitblock to work even when header sync is stalled
@@ -3115,6 +3318,12 @@ export class BlockSync {
     if (this.processing) {
       return;
     }
+    // An RPC chain writer (invalidateblock / reconsiderblock / preciousblock)
+    // is waiting for the chain lock: let it in between blocks (Core takes
+    // cs_main per ActivateBestChainStep, so a writer gets in between steps).
+    if (this.chainLockWaiters > 0) {
+      return;
+    }
     this.processing = true;
 
     const heightBefore = this.state.nextHeightToProcess;
@@ -3175,6 +3384,10 @@ export class BlockSync {
       if (this.holdForPreBaseHeaders()) {
         return;
       }
+      // Chain lock requested by an RPC chain writer: stop between blocks.
+      if (this.chainLockWaiters > 0) {
+        return;
+      }
       const bestHeader = this.headerSync.getBestHeader();
       if (!bestHeader || this.state.nextHeightToProcess > bestHeader.height) {
         break;
@@ -3189,6 +3402,35 @@ export class BlockSync {
 
       const hashHex = headerEntry.hash.toString("hex");
       let block = this.state.downloadedBlocks.get(hashHex);
+
+      // Core AcceptBlock / FindMostWorkChain: a block flagged failed
+      // (invalidateblock, or a consensus failure, or a failed ancestor) is
+      // never connected. invalidateHeader re-seats the by-height index off a
+      // failed branch, so this is the belt-and-braces guard.
+      if (headerEntry.status === "invalid") {
+        if (block) {
+          this.state.downloadedBlocks.delete(hashHex);
+          this.downloadedBlockPeers.delete(hashHex);
+        }
+        break;
+      }
+
+      // reconsiderblock re-activation (Core ResetBlockFailureFlags +
+      // ActivateBestChain): the bodies of the reconsidered branch are already
+      // on disk (BLOCK_HAVE_DATA), so connect them from there rather than
+      // waiting for a peer to re-serve them.
+      if (!block && this.reactivateFromDisk.has(hashHex)) {
+        this.reactivateFromDisk.delete(hashHex);
+        const raw = await this.db.getBlock(headerEntry.hash);
+        if (raw) {
+          try {
+            block = deserializeBlock(new BufferReader(raw));
+            this.state.downloadedBlocks.set(hashHex, block);
+          } catch {
+            block = undefined;
+          }
+        }
+      }
 
       if (!block) {
         // P2P fetch path — only while the download loop is running.
@@ -4762,6 +5004,25 @@ export class BlockSync {
     // Reset captured error for this attempt; populated by recordConnectError()
     // at every warn/error → return-false site below.
     this.lastConnectError = "";
+
+    // Core AcceptBlockHeader / AcceptBlock: a block that is itself failed
+    // (BLOCK_FAILED_VALID: "duplicate-invalid") or builds on a failed block
+    // (BLOCK_FAILED_CHILD: "bad-prevblk") is never connected — the gate that
+    // keeps an operator's invalidateblock from being undone by the next
+    // connect (audit HB-10). No view mutation has happened yet.
+    {
+      const selfEntry = this.headerSync.getHeader(blockHash);
+      const parentEntry = this.headerSync.getHeader(block.header.prevBlock);
+      if (selfEntry?.status === "invalid" || parentEntry?.status === "invalid") {
+        const why = parentEntry?.status === "invalid" ? "bad-prevblk" : "duplicate-invalid";
+        this.recordConnectError(why);
+        console.warn(
+          `[connect] refusing block ${hashHex.slice(0, 16)} at height ${height}: ${why} ` +
+            `(block or ancestor is marked failed)`
+        );
+        return false;
+      }
+    }
     // Reset the reorg-atomicity restore signal for this attempt (Core
     // ActivateBestChainStep parity — see the field doc + the reorg-abort
     // restore below).
