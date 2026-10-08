@@ -27,7 +27,7 @@ import {
   validateBlock,
   blockMutation,
 } from "../validation/block.js";
-import { isCoinbase } from "../validation/tx.js";
+import { getTxId, isCoinbase } from "../validation/tx.js";
 import type { Transaction } from "../validation/tx.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { UTXOManager } from "../chain/utxo.js";
@@ -1134,7 +1134,9 @@ export class BlockSync {
    *      branch), so the download scheduler, inv/headers/cmpctblock handlers
    *      and the connect loop never fetch or connect them again (HB-10);
    *   4. re-point the live view at the new tip and roll the download frontier
-   *      back.
+   *      back;
+   *   5. MaybeUpdateMempoolForReorg: the disconnected txs go back to the
+   *      mempool (Mempool.updateForReorg) before the RPC returns.
    */
   async invalidateBlock(blockHash: Buffer): Promise<ChainManagementResult> {
     const cs = this.chainStateManager;
@@ -1143,51 +1145,96 @@ export class BlockSync {
       if (isFatal()) {
         return { success: false, error: "node is in a fatal state (AbortNode latched)" };
       }
-      const t0 = Date.now();
-      await this.flushLiveViewForChainWriter();
-      const tFlush = Date.now();
-      cs.resetCoinsViewToTip();
-      const known = this.headerSync.getHeader(blockHash);
-      const descendants = known
-        ? this.headerSync.collectDescendants(blockHash).map((e) => e.hash)
-        : undefined;
-      const tDesc = Date.now();
-      let result: ChainManagementResult;
+      // Core holds cs_main + mempool.cs across the disconnects and the
+      // mempool update: admissions and mempool readers wait for this.
+      this.mempool?.beginChainUpdate?.();
       try {
-        result = await cs.invalidateBlock(blockHash, descendants);
-        console.log(
-          `[invalidateblock] ${blockHash.toString("hex").slice(0, 16)}: ` +
-            `${result.success ? `disconnected ${result.blocksAffected ?? 0}` : `failed: ${result.error}`}` +
-            `, ${descendants?.length ?? "?"} descendant(s); flush ${tFlush - t0} ms, ` +
-            `descendants ${tDesc - tFlush} ms, disconnect+mark ${Date.now() - tDesc} ms`
-        );
+        return await this.invalidateBlockLocked(blockHash, cs);
       } finally {
-        // Whatever happened, the live view must re-read the (possibly
-        // rolled-back) disk state at the manager's tip.
-        this.utxoManager.clearCache(cs.getBestBlock().hash);
+        this.mempool?.endChainUpdate?.();
       }
-      if (!result.success) return result;
-      const newTip = cs.getBestBlock();
-      if (known) {
-        this.headerSync.invalidateHeader(blockHash, newTip.hash);
-        this.headerSync.promoteMostWorkHeader();
+    });
+  }
+
+  private async invalidateBlockLocked(
+    blockHash: Buffer,
+    cs: ChainStateManager
+  ): Promise<ChainManagementResult> {
+    const t0 = Date.now();
+    await this.flushLiveViewForChainWriter();
+    const tFlush = Date.now();
+    cs.resetCoinsViewToTip();
+    const known = this.headerSync.getHeader(blockHash);
+    const descendants = known
+      ? this.headerSync.collectDescendants(blockHash).map((e) => e.hash)
+      : undefined;
+    const tDesc = Date.now();
+    let result: ChainManagementResult;
+    // Core DisconnectTip -> DisconnectedBlockTransactions, one entry per
+    // disconnected block, tip first.
+    const disconnectedBlocks: Transaction[][] = [];
+    try {
+      result = await cs.invalidateBlock(blockHash, descendants, disconnectedBlocks);
+      console.log(
+        `[invalidateblock] ${blockHash.toString("hex").slice(0, 16)}: ` +
+          `${result.success ? `disconnected ${result.blocksAffected ?? 0}` : `failed: ${result.error}`}` +
+          `, ${descendants?.length ?? "?"} descendant(s); flush ${tFlush - t0} ms, ` +
+          `descendants ${tDesc - tFlush} ms, disconnect+mark ${Date.now() - tDesc} ms`
+      );
+    } finally {
+      // Whatever happened, the live view must re-read the (possibly
+      // rolled-back) disk state at the manager's tip.
+      this.utxoManager.clearCache(cs.getBestBlock().hash);
+    }
+    if (!result.success) return result;
+    const newTip = cs.getBestBlock();
+    if (known) {
+      this.headerSync.invalidateHeader(blockHash, newTip.hash);
+      this.headerSync.promoteMostWorkHeader();
+    }
+    this.rollFrontierToActiveTip();
+    for (const [hex] of this.state.downloadedBlocks) {
+      const e = this.headerSync.getHeader(Buffer.from(hex, "hex"));
+      if (e && e.status === "invalid") {
+        this.state.downloadedBlocks.delete(hex);
+        this.downloadedBlockPeers.delete(hex);
       }
-      this.rollFrontierToActiveTip();
-      for (const [hex] of this.state.downloadedBlocks) {
-        const e = this.headerSync.getHeader(Buffer.from(hex, "hex"));
-        if (e && e.status === "invalid") {
-          this.state.downloadedBlocks.delete(hex);
-          this.downloadedBlockPeers.delete(hex);
+    }
+    for (const [hex] of this.state.pendingBlocks) {
+      const e = this.headerSync.getHeader(Buffer.from(hex, "hex"));
+      if (e && e.status === "invalid") this.state.pendingBlocks.delete(hex);
+    }
+    if (this.peerManager) this.peerManager.updateBestHeight(newTip.height);
+    if (this.mempool) {
+      this.mempool.setTipHeight(newTip.height);
+      // Core InvalidateBlock -> MaybeUpdateMempoolForReorg: the disconnected
+      // txs go back to the pool (earliest-confirmed first), refused ones take
+      // their in-mempool descendants with them, then removeForReorg drops
+      // what is non-final / sequence-locked / immature at the new tip+1.
+      // Core runs it after each disconnected block; the live coin view is
+      // only re-pointed once (above), so it runs once over the whole pool —
+      // the same final mempool, since every check only gets stricter as the
+      // tip goes down. Core passes fAddToMempool = (++disconnected <= 10):
+      // only the txs of the first 10 disconnected blocks are re-accepted.
+      const earliestFirst: Transaction[] = [];
+      const notAddable = new Set<Transaction>();
+      for (let i = disconnectedBlocks.length - 1; i >= 0; i--) {
+        for (const t of disconnectedBlocks[i]) {
+          earliestFirst.push(t);
+          if (i >= 10) notAddable.add(t);
         }
       }
-      for (const [hex] of this.state.pendingBlocks) {
-        const e = this.headerSync.getHeader(Buffer.from(hex, "hex"));
-        if (e && e.status === "invalid") this.state.pendingBlocks.delete(hex);
+      try {
+        await this.mempool.updateForReorg(earliestFirst, (t) => !notAddable.has(t));
+      } catch (err) {
+        console.warn(
+          `[invalidateblock] mempool update after disconnect failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
       }
-      if (this.peerManager) this.peerManager.updateBestHeight(newTip.height);
-      if (this.mempool) this.mempool.setTipHeight(newTip.height);
-      return result;
-    });
+    }
+    return result;
   }
 
   /**
@@ -4574,7 +4621,8 @@ export class BlockSync {
     newTipHeight: number,
     oldTipHash: Buffer,
     disconnectedTxsOut: Transaction[],
-    pendingOps?: BatchOperation[]
+    pendingOps?: BatchOperation[],
+    connectedIntermediatesOut?: Block[]
   ): Promise<boolean> {
     // Core-parity reorg-depth bound (see `reorgDepthCap`): UNBOUNDED on an
     // archive node (follows the most-work chain to the fork point at any depth,
@@ -4737,8 +4785,12 @@ export class BlockSync {
         } catch {
           return false;
         }
-        // Collect non-coinbase txs (camlcoin lib/sync.ml:2304-2308).
-        for (let i = 1; i < oldBlock.transactions.length; i++) {
+        // Collect non-coinbase txs — Core DisconnectTip ->
+        // DisconnectedBlockTransactions::AddTransactionsFromBlock, which
+        // inserts each block's vtx in REVERSE. Blocks come tip first, so the
+        // whole array reversed is earliest-confirmed first, block order within
+        // a block — the order MaybeUpdateMempoolForReorg re-accepts in.
+        for (let i = oldBlock.transactions.length - 1; i >= 1; i--) {
           const tx = oldBlock.transactions[i];
           if (!isCoinbase(tx)) {
             disconnectedTxsOut.push(tx);
@@ -4981,6 +5033,11 @@ export class BlockSync {
         return false;
       }
       this.utxoManager.setBestBlock(intermediate.hash);
+      // Core ConnectTip runs mempool.removeForBlock for EVERY block it
+      // connects, intermediates included. The caller applies it once the whole
+      // reorg has committed (a failed reorg restores the old tip and must
+      // leave the mempool untouched).
+      connectedIntermediatesOut?.push(intermBlock);
       // CChain::SetTip parity — the reconnected intermediate is now on the
       // ACTIVE chain, so update the height->hash active-chain index.  Header
       // reception no longer writes this entry (headers.ts saveHeaderEntry
@@ -5105,6 +5162,11 @@ export class BlockSync {
       return false;
     }
     this.connectReorgRestoreTip = null;
+    // The connect — coins, tip, removeForBlock and a reorg's mempool update —
+    // is one chain update for the mempool (Core cs_main + mempool.cs held
+    // through ConnectTip / MaybeUpdateMempoolForReorg): admissions that read
+    // coins across it re-run, mempool readers wait for it (audit HB-3/HB-8).
+    this.mempool?.beginChainUpdate?.();
     try {
       return await this.connectBlockInner(block, height);
     } catch (err) {
@@ -5120,6 +5182,8 @@ export class BlockSync {
         this.reorgAbortRestoredTip = restore;
       }
       throw err;
+    } finally {
+      this.mempool?.endChainUpdate?.();
     }
   }
 
@@ -5198,6 +5262,7 @@ export class BlockSync {
     // diverges from Core (the pre-fix behaviour).  A loud log line
     // surfaces the divergence.
     let reorgDisconnectedTxs: Transaction[] = [];
+    const reorgConnectedIntermediates: Block[] = [];
     let reorgUtxoFixed = false;
     // Pattern D (multi-block atomicity, post-`9b10550`): collect every
     // disk write the reorg dispatch would otherwise issue piecemeal
@@ -5232,7 +5297,8 @@ export class BlockSync {
         height,
         oldTipBeforeConnect,
         reorgDisconnectedTxs,
-        reorgPendingOps
+        reorgPendingOps,
+        reorgConnectedIntermediates
       );
 
       // Core AcceptBlock / ActivateBestChain parity — DEFER, don't reject.
@@ -5868,14 +5934,26 @@ export class BlockSync {
     // sendrawtransaction (which would otherwise stall or return spurious
     // "already in chain" errors).
     //
-    // Gated on `atTip` because deep-IBD blocks (during the IBD fast path)
-    // are unlikely to overlap with mempool contents — there's no peer feed
-    // until we're synced — so skipping the iteration saves a tiny per-block
-    // overhead.  Tip-extension and reorg-reconnect both run the removal.
+    // Core runs it for EVERY connected block. It used to be gated on
+    // `atTip`, which skipped every block below the best header — a catch-up
+    // or reconsiderblock connecting 111 then 112 left 111's txs (and their
+    // conflicts) in the pool. Now skipped only when the pool is empty (deep
+    // IBD), where it has nothing to remove. A reorg's reconnected
+    // intermediates get theirs first, in connect order (ConnectTip per block).
     //
     // Best-effort: a removeForBlock failure must NOT roll back the connect.
-    if (this.mempool && atTip) {
+    if (
+      this.mempool &&
+      (atTip ||
+        reorgConnectedIntermediates.length > 0 ||
+        (this.mempool.getSize?.() ?? 1) > 0)
+    ) {
       try {
+        if (reorgUtxoFixed) {
+          for (const interm of reorgConnectedIntermediates) {
+            this.mempool.removeForBlock(interm);
+          }
+        }
         this.mempool.removeForBlock(block);
       } catch (err) {
         console.warn(
@@ -5932,33 +6010,35 @@ export class BlockSync {
       }
     }
 
-    // ── Pattern B: mempool refill on reorg ──
+    // ── Pattern B: mempool update on reorg — Core MaybeUpdateMempoolForReorg ──
     //
-    // If the pre-connect reorg dispatch (handleReorgUtxoAndCollect)
-    // ran successfully, `reorgDisconnectedTxs` holds the non-coinbase
-    // txs from blocks that were disconnected.  Feed them back to the
-    // mempool now that the connect of the new tip is complete.
+    // `reorgDisconnectedTxs` holds the non-coinbase txs of the blocks the
+    // reorg disconnected (Core's disconnect pool). Core drops a tx from that
+    // pool when a block it connects confirms it (disconnectpool.removeForBlock
+    // in ConnectTip) — otherwise its re-accept fails and removeRecursive takes
+    // its in-mempool children with it — then, once at the end of
+    // ActivateBestChainStep, re-accepts the rest earliest-first with
+    // bypass_limits, removeRecursive's the refused, and runs removeForReorg.
     //
-    // Two refill paths are wired:
-    //   • reorgUtxoFixed=true → use the FULL-CHECK readdTransactions
-    //     path: input UTXOs were properly restored by the
-    //     disconnect, so the mempool's policy validation succeeds
-    //     normally and we get accurate fee/feeRate/sigOpCost data
-    //     in each entry.  Mirrors camlcoin lib/sync.ml:2354-2363.
-    //   • reorgUtxoFixed=false → fall back to reorgRefillUnchecked
-    //     (no UTXO disconnect happened, so the FULL-CHECK path would
-    //     drop every refill candidate with "Missing input").  This
-    //     keeps the mempool dimension of the corpus passing even
-    //     when undo data is missing on disk, accepting the
-    //     UTXO-divergence vs. Core that occurs as a result.
+    //   • reorgUtxoFixed=true → Mempool.updateForReorg (all of the above).
+    //   • reorgUtxoFixed=false → reorgRefillUnchecked (no UTXO disconnect
+    //     happened, so the checked path would refuse every candidate with
+    //     "Missing input"). Kept as before.
     //
-    // Cross-impl audit:
-    // CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md
-    // Reference shape: camlcoin lib/sync.ml:2304-2363.
+    // Runs inside connectBlock's chain update (begin/endChainUpdate), so no
+    // admission or mempool RPC sees the pool between the tip moving and this.
     if (this.mempool && reorgDisconnectedTxs.length > 0) {
       try {
         if (reorgUtxoFixed) {
-          await this.mempool.readdTransactions(reorgDisconnectedTxs);
+          const confirmed = new Set<string>();
+          for (const b of [...reorgConnectedIntermediates, block]) {
+            for (const t of b.transactions) confirmed.add(getTxId(t).toString("hex"));
+          }
+          const earliestFirst = reorgDisconnectedTxs
+            .slice()
+            .reverse()
+            .filter((t) => !confirmed.has(getTxId(t).toString("hex")));
+          await this.mempool.updateForReorg(earliestFirst);
         } else {
           this.mempool.reorgRefillUnchecked(reorgDisconnectedTxs);
         }
