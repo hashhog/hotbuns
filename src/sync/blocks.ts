@@ -25,6 +25,7 @@ import {
   serializeBlock,
   serializeBlockHeader,
   validateBlock,
+  blockMutation,
 } from "../validation/block.js";
 import { isCoinbase } from "../validation/tx.js";
 import type { Transaction } from "../validation/tx.js";
@@ -1777,21 +1778,56 @@ export class BlockSync {
     const hashHex = blockHash.toString("hex");
     const peerKey = `${peer.host}:${peer.port}`;
 
+    // Core net_processing.cpp ProcessMessage "block": IsBlockMutated on
+    // receipt, BEFORE any download state, header or buffer is touched,
+    // whenever the parent is known (the segwit rule set is
+    // DeploymentActiveAfter(prev, SEGWIT)). A mutated body says nothing about
+    // the block: punish the sender, free only its request, re-request from
+    // another peer; never buffer the body and never mark the block.
+    const parentEntry = this.headerSync.getHeader(block.header.prevBlock);
+    if (parentEntry) {
+      const why = blockMutation(block, parentEntry.height + 1 >= this.params.segwitHeight);
+      if (why !== null) {
+        this.rejectMutatedOnReceipt(peer, peerKey, hashHex, parentEntry.height + 1, why);
+        return;
+      }
+    }
+
     // Check if we requested this block
     const pending = this.state.pendingBlocks.get(hashHex);
     if (!pending) {
       // Unrequested block - could be from inv response post-IBD
       // Check if it's the next block we need
-      const headerEntry = this.headerSync.getHeader(blockHash);
+      let headerEntry = this.headerSync.getHeader(blockHash);
+      if (!headerEntry && parentEntry) {
+        // A block whose header we have not seen yet, but whose PARENT we know
+        // (a miner's block pushed before its header, BBH / rustoshi RU-5).
+        // Core ProcessNewBlock -> AcceptBlock -> AcceptBlockHeader accepts the
+        // header from the block itself; min_pow_checked is set when the claimed
+        // work clears the anti-DoS threshold (net_processing.cpp "block":
+        // prev_block->nChainWork + GetBlockProof >= GetAntiDoSWorkThreshold()).
+        // A header that fails its checks is Core BLOCK_INVALID_HEADER (punish);
+        // a low-work one is BLOCK_HEADER_LOW_WORK (ignored, not punished).
+        const claimed = parentEntry.chainWork + this.headerSync.getHeaderWork(block.header.bits);
+        const minPowChecked = claimed >= this.headerSync.getAntiDoSWorkThreshold();
+        await this.headerSync.processHeaders([block.header], peer, minPowChecked);
+        headerEntry = this.headerSync.getHeader(blockHash);
+        if (!headerEntry) {
+          if (minPowChecked) {
+            peer.misbehaving(100, "block-invalid-header");
+          }
+          return;
+        }
+      }
       if (headerEntry) {
         // Body from this peer for a header we know: last common block
         // (getpeerinfo.synced_blocks) plus last common header.
         peer.updateSyncedBlocks?.(headerEntry.height);
       }
       if (!headerEntry) {
-        // Unknown block — peer sent a block whose header we have never seen.
-        // Core: ProcessNewBlockHeaders returns nBlocksWithValidHeaders==0 and
-        // ProcessBlock calls Misbehaving(pfrom, 100, "invalid header received").
+        // Neither the block's header nor its parent is known. Core:
+        // AcceptBlockHeader -> "prev-blk-not-found" (BLOCK_MISSING_PREV) ->
+        // MaybePunishNodeForBlock -> Misbehaving.
         // G17 fix: score the peer so it cannot flood us with garbage blocks.
         peer.misbehaving(100, "block-invalid-header");
         return;
@@ -1877,6 +1913,57 @@ export class BlockSync {
     await this.processOrderedBlocks();
 
     // Request more blocks if needed
+    this.requestBlocks();
+  }
+
+  /**
+   * A block body that failed Core's IsBlockMutated on receipt (witness
+   * stripped / swapped, merkle mismatch, CVE-2012-2459 duplicate). Core
+   * (net_processing.cpp ProcessMessage "block"): Misbehaving(peer, "mutated
+   * block"), RemoveBlockRequest(hash, peer), return. The block is NOT marked
+   * failed (validation.cpp InvalidBlockFound skips BLOCK_MUTATED) and the body
+   * is not buffered, so the same hash is fetched again from another peer.
+   *
+   * Before 2026-10-08 the body was buffered, failed connect with a
+   * non-verdict, was discarded and re-requested -- from the same peer, which
+   * was never punished: one peer serving one witness-stripped block held the
+   * node at height-1 forever (fleet-conformance MAL).
+   *
+   * The sender is disconnected by misbehaving(), so its other requests are
+   * freed too (Core FinalizeNode releases a peer's vBlocksInFlight) instead of
+   * waiting out the 120 s stall timeout.
+   */
+  private rejectMutatedOnReceipt(
+    peer: Peer,
+    peerKey: string,
+    hashHex: string,
+    height: number,
+    why: string
+  ): void {
+    const mine = this.state.pendingBlocks.get(hashHex);
+    const freedHere = mine !== undefined && mine.peer === peerKey;
+    console.warn(
+      `[mutated-block] ${hashHex.slice(0, 16)} height=${height} from ${peerKey}: ${why} ` +
+        `-- punishing the sender, block NOT marked, re-requesting from another peer`
+    );
+    peer.misbehaving(100, `mutated block: ${why}`);
+    if (!peer.shouldDisconnect && !freedHere) return; // noban / manual peer
+    let lowest = Infinity;
+    let freed = 0;
+    for (const [h, req] of this.state.pendingBlocks) {
+      if (req.peer !== peerKey) continue;
+      // A noban/manual peer stays connected: free only the mutated request.
+      if (!peer.shouldDisconnect && h !== hashHex) continue;
+      this.state.pendingBlocks.delete(h);
+      peer.removeBlockInFlight(h);
+      freed++;
+      if (req.height < lowest) lowest = req.height;
+    }
+    const info = this.peerInFlight.get(peerKey);
+    if (info) info.count = Math.max(0, info.count - freed);
+    if (lowest !== Infinity && lowest < this.state.nextHeightToRequest) {
+      this.state.nextHeightToRequest = Math.max(lowest, this.state.nextHeightToProcess);
+    }
     this.requestBlocks();
   }
 

@@ -411,6 +411,46 @@ export function checkWitnessMalleation(
 }
 
 /**
+ * Bitcoin Core IsBlockMutated(block, check_witness_root)
+ * (validation.cpp 4027-4056), returning Core's reject reason (null = the body
+ * matches what the header commits to).
+ *
+ * A mutated body says NOTHING about the block — the hash commits only to the
+ * header. The receiver must drop the body, punish the peer that sent it and
+ * fetch the block again elsewhere; it must never mark the block failed and
+ * never store or buffer the body (Core net_processing.cpp ProcessMessage
+ * "block" runs this before anything else when the parent is known; Core
+ * InvalidBlockFound skips BLOCK_MUTATED).
+ *
+ * Order exactly as Core:
+ *   1. CheckMerkleRoot: root mismatch "bad-txnmrklroot", CVE-2012-2459
+ *      duplicate "bad-txns-duplicate".
+ *   2. First tx not a coinbase: mutated iff some tx is 64 bytes without
+ *      witness, otherwise NOT mutated (CheckBlock gives the verdict) and the
+ *      witness check is skipped.
+ *   3. CheckWitnessMalleation(check_witness_root).
+ */
+export function blockMutation(block: Block, checkWitnessRoot: boolean): string | null {
+  if (block.transactions.length === 0) return "bad-txnmrklroot";
+  const flag: MerkleMutationFlag = { mutated: false };
+  const root = computeMerkleRoot(block.transactions.map((tx) => getTxId(tx)), flag);
+  if (!root.equals(block.header.merkleRoot)) return "bad-txnmrklroot";
+  if (flag.mutated) return "bad-txns-duplicate";
+  if (!isCoinbase(block.transactions[0])) {
+    return block.transactions.some((tx) => getTxBaseSize(tx) === 64)
+      ? "mutated: 64-byte transaction in a block without a coinbase"
+      : null;
+  }
+  const w = checkWitnessMalleation(block, checkWitnessRoot);
+  return w.valid ? null : (w.error ?? "bad-witness-merkle-match");
+}
+
+/** blockMutation as Core's bool. */
+export function isBlockMutated(block: Block, checkWitnessRoot: boolean): boolean {
+  return blockMutation(block, checkWitnessRoot) !== null;
+}
+
+/**
  * Compute the Median Time Past (BIP-113) from an array of timestamps.
  *
  * Returns the median of up to 11 timestamps (sorted ascending, middle element).

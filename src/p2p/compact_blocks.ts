@@ -23,7 +23,7 @@ import {
   serializeBlockHeader,
   MAX_BLOCK_WEIGHT,
   MIN_SERIALIZABLE_TRANSACTION_WEIGHT,
-  checkWitnessMalleation,
+  isBlockMutated,
 } from "../validation/block.js";
 import { sha256Hash } from "../crypto/primitives.js";
 import { sipHash24 } from "../storage/indexes.js";
@@ -700,8 +700,10 @@ export class PartiallyDownloadedBlock {
     // commitment.  A short-ID collision can produce a syntactically valid
     // compact block that reconstructs into a mutated full block.
     // Core: blockencodings.cpp:219-221
-    const malleation = checkWitnessMalleation(block, segwitActive);
-    if (!malleation.valid) {
+    // Full Core IsBlockMutated (merkle root + CVE-2012-2459 duplicate +
+    // 64-byte rule + witness malleation); the witness check alone let a
+    // reconstruction with the wrong transactions through to validation.
+    if (isBlockMutated(block, segwitActive)) {
       // READ_STATUS_FAILED — possible short-ID collision
       return null;
     }
