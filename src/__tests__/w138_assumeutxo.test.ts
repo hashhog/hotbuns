@@ -692,10 +692,9 @@ describe("W138-G23: MaybeRebalanceCaches (BUG-14, P1-API)", () => {
 
 describe("W138-G24: NetworkDisable on loadSnapshot (BUG-15, P2)", () => {
   it("BUG-15: blockSubmissionPaused is toggled by dumpTxoutset rollback but NOT by loadtxoutset / loadSnapshot", () => {
-    // dumpTxoutset rollback flips the pause flag at server.ts:7162-7165.
-    expect(RPC_SERVER_TS).toMatch(
-      /networkPauseActive = targetHeight < tip\.height/,
-    );
+    // dumpTxoutset holds the chain (P2P connect paused + drained, submitblock
+    // refused) for the whole flush -> rewind -> dump -> replay (HB-1 fix).
+    expect(RPC_SERVER_TS).toContain("await blockSync?.beginExclusiveChainOp()");
     expect(RPC_SERVER_TS).toContain("this.blockSubmissionPaused = true");
     // loadSnapshot has no analog — snapshot.ts never touches submission
     // gates because they live in the RPC layer.

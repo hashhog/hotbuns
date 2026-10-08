@@ -314,3 +314,106 @@ describe("dumptxoutset rollback", () => {
     });
   });
 });
+
+/**
+ * HB-1 / HB-4 / HB-14 (receipts/arch-concurrency-liveness-audit-2026-10-07.md):
+ * the whole dumptxoutset (flush -> rewind -> dump -> replay) runs while the P2P
+ * connect loop is paused and drained (Core: cs_main + NetworkDisable around
+ * TemporaryRollback, rpc/blockchain.cpp dumptxoutset). Before the fix the
+ * loop kept connecting over the rewound coins DB: a block arriving mid-dump
+ * was validated against the rewound view, failed bad-txns-BIP30, and the
+ * restored chain's own block was marked invalid (node wedged below it).
+ */
+describe("dumptxoutset holds the chain (P2P connect paused)", () => {
+  let tempDir: string;
+  let dumpDir: string;
+  let db: ChainDB;
+  let chainState: ChainStateManager;
+  let server: RPCServer;
+  let events: string[];
+  let held: number;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "hotbuns-dumptxoutset-hold-"));
+    dumpDir = await mkdtemp(join(tmpdir(), "hotbuns-dumptxoutset-hold-out-"));
+    db = new ChainDB(tempDir);
+    await db.open();
+    chainState = new ChainStateManager(db, REGTEST);
+    await chainState.load();
+    const mempool = new Mempool(chainState.getUTXOManager(), REGTEST);
+    events = [];
+    held = 0;
+    const fakeSync = {
+      getUTXOManager: () => chainState.getUTXOManager(),
+      beginExclusiveChainOp: async () => { held++; events.push(`begin@${chainState.getBestBlock().height}`); },
+      endExclusiveChainOp: () => { held--; events.push(`end@${chainState.getBestBlock().height}`); },
+      isStopRequested: () => false,
+    };
+    // Record the height of every disconnect/connect and whether the chain was held.
+    const origDis = chainState.disconnectBlock.bind(chainState);
+    const origCon = chainState.connectBlock.bind(chainState);
+    (chainState as any).disconnectBlock = async (b: any, h: number) => {
+      events.push(`dis${h}:${held > 0 ? "held" : "FREE"}`);
+      return origDis(b, h);
+    };
+    (chainState as any).connectBlock = async (b: any, h: number) => {
+      if (held >= 0 && events.length > 0) events.push(`con${h}:${held > 0 ? "held" : "FREE"}`);
+      return origCon(b, h);
+    };
+    server = new RPCServer({ port: 0, host: "127.0.0.1", noAuth: true }, {
+      chainState,
+      mempool,
+      peerManager: new MockPeerManager() as any,
+      feeEstimator: new FeeEstimator(mempool),
+      headerSync: new MockHeaderSync() as any,
+      db,
+      params: REGTEST,
+      chainstateManager: new ChainstateManager(db, REGTEST),
+      blockSync: fakeSync as any,
+    });
+  });
+
+  afterEach(async () => {
+    await db.close();
+    await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    await rm(dumpDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  test("rollback: disconnect tip-first, dump, reconnect upward, all inside the pause", async () => {
+    await buildChain(chainState, 5);
+    events.length = 0;
+    const r = (await callRPC(server, "dumptxoutset", [join(dumpDir, "a.dat"), "rollback", { rollback: 2 }])) as Record<string, unknown>;
+    expect(r.base_height).toBe(2);
+    expect(events).toEqual([
+      "begin@5", "dis5:held", "dis4:held", "dis3:held", "con3:held", "con4:held", "con5:held", "end@5",
+    ]);
+    expect((server as any).isBlockSubmissionPaused()).toBe(false);
+  });
+
+  test("latest: the dump runs inside the pause too (flush/label/walk see one tip)", async () => {
+    await buildChain(chainState, 3);
+    events.length = 0;
+    await callRPC(server, "dumptxoutset", [join(dumpDir, "l.dat"), "latest"]);
+    expect(events).toEqual(["begin@3", "end@3"]);
+  });
+
+  test("error after the rewind still restores the chain and releases the pause", async () => {
+    await buildChain(chainState, 4);
+    const tipBefore = chainState.getBestBlock();
+    const p = join(dumpDir, "exists.dat");
+    await Bun.write(p, "x"); // dumpSnapshot refuses an existing path AFTER the rewind
+    events.length = 0;
+    await expect(callRPC(server, "dumptxoutset", [p, "rollback", { rollback: 1 }])).rejects.toBeDefined();
+    const tipAfter = chainState.getBestBlock();
+    expect(tipAfter.height).toBe(tipBefore.height);
+    expect(tipAfter.hash.equals(tipBefore.hash)).toBe(true);
+    expect(events[events.length - 1]).toBe("end@4");
+    expect(held).toBe(0);
+  });
+
+  test("nchaintx is the base's m_chain_tx_count (genesis + one coinbase per block)", async () => {
+    await buildChain(chainState, 5);
+    const r = (await callRPC(server, "dumptxoutset", [join(dumpDir, "n.dat"), "rollback", { rollback: 3 }])) as Record<string, unknown>;
+    expect(r.nchaintx).toBe(4);
+  });
+});
