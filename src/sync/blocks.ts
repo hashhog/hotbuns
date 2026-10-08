@@ -2125,6 +2125,30 @@ export class BlockSync {
    * buffer for in-order processing.
    */
   async injectBlock(block: Block): Promise<string | null> {
+    // Core ProcessNewBlock: AcceptBlock (the "already have it?" decision) and
+    // ActivateBestChain run under cs_main, so a submitblock racing the SAME
+    // block over P2P sees either "not yet stored" (and connects it itself ->
+    // null) or "stored/connected" (-> "duplicate"), never a half-connected
+    // in-between. This used to run unlocked: when the P2P loop held
+    // `processing` mid-connect of the block, the processOrderedBlocks() call
+    // below returned at once, the frontier had not advanced yet, no connect
+    // error was recorded, and the classifier answered "rejected" for a valid
+    // block (fleet-conformance SUBP2P finding 6, 2026-10-08). Hold the chain
+    // lock for the whole decision + connect.
+    return this.withChainLock(() => this.injectBlockLocked(block));
+  }
+
+  /** Connect buffered in-order bodies while the caller holds the chain lock
+   *  (processOrderedBlocks' guards, minus the `processing` re-entry check). */
+  private async processOrderedBlocksLocked(): Promise<void> {
+    if (this.stopRequested || isFatal() || this.syncHalted !== null ||
+        this.utxoScanPause > 0 || this.holdForPreBaseHeaders()) {
+      return;
+    }
+    await this.processOrderedBlocksInner(true);
+  }
+
+  private async injectBlockLocked(block: Block): Promise<string | null> {
     const blockHash = getBlockHash(block.header);
     const hashHex = blockHash.toString("hex");
 
@@ -2226,11 +2250,9 @@ export class BlockSync {
     const heightBefore = this.state.nextHeightToProcess;
     const injectedHeight = headerEntry.height;
 
-    // Try to process blocks in order
-    await this.processOrderedBlocks();
-
-    // Request more blocks if needed
-    this.requestBlocks();
+    // Try to process blocks in order (we hold the chain lock; withChainLock
+    // kicks the loop and requestBlocks() when it releases it)
+    await this.processOrderedBlocksLocked();
 
     // BIP-22 rejection propagation: if the injected block was next in line
     // but nextHeightToProcess did not advance, connectBlock rejected it.
@@ -3486,7 +3508,7 @@ export class BlockSync {
     }
   }
 
-  private async processOrderedBlocksInner(): Promise<void> {
+  private async processOrderedBlocksInner(holdsChainLock = false): Promise<void> {
     // Re-read the live header tip every iteration. `await connectBlock` yields
     // (script-check workers, LevelDB, the 0-ms yield every 64 blocks), so a
     // snapshot taken at entry can be thousands of headers stale by the time
@@ -3510,8 +3532,10 @@ export class BlockSync {
       if (this.holdForPreBaseHeaders()) {
         return;
       }
-      // Chain lock requested by an RPC chain writer: stop between blocks.
-      if (this.chainLockWaiters > 0) {
+      // Chain lock requested by an RPC chain writer: stop between blocks
+      // (unless the caller IS a chain-lock holder: submitblock must connect
+      // its own block before the next writer gets in).
+      if (this.chainLockWaiters > 0 && !holdsChainLock) {
         return;
       }
       const bestHeader = this.headerSync.getBestHeader();
