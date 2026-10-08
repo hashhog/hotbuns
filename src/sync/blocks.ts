@@ -1393,11 +1393,17 @@ export class BlockSync {
     // in-memory view actually reflects.
     const waitStart = Date.now();
     let nextLog = waitStart + 10_000;
-    while (this.processing) {
+    // A chain operation that rewinds the coins DB under this view
+    // (dumptxoutset rollback: rewind -> dump -> replay) must finish before the
+    // shutdown flush below writes the VIEW's tip as CHAIN_STATE -- flushing
+    // mid-rewind would label the rolled-back coins with the original tip
+    // (HB-14). The operation sees `stopRequested` and interrupts its dump, then
+    // restores the chain (Core: TemporaryRollback's destructor reconsiders).
+    while (this.processing || this.chainOpActive > 0) {
       await new Promise<void>((resolve) => setTimeout(resolve, 10));
       if (Date.now() >= nextLog) {
         console.log(
-          `[shutdown] waiting for the in-flight block connect to finish ` +
+          `[shutdown] waiting for the in-flight block connect / chain operation to finish ` +
             `(${Math.round((Date.now() - waitStart) / 1000)}s)`
         );
         nextLog = Date.now() + 10_000;
@@ -3256,6 +3262,39 @@ export class BlockSync {
    */
   pauseForUTXOScan(): void {
     this.utxoScanPause++;
+  }
+
+  /** Active exclusive chain operations (see {@link beginExclusiveChainOp}). */
+  private chainOpActive = 0;
+
+  /**
+   * Take the chain for an operation that rewrites the active chainstate
+   * outside this loop (dumptxoutset rollback: rewind -> dump -> replay; also a
+   * `latest` dump's flush -> label -> walk). Core holds cs_main and
+   * NetworkDisable for this (rpc/blockchain.cpp dumptxoutset,
+   * TemporaryRollback); here: block-connect is paused (bodies that arrive are
+   * buffered, never validated against the rewound coins and never marked
+   * invalid), then we wait for the in-flight connect to finish so the caller
+   * owns a quiescent chainstate. Pair with {@link endExclusiveChainOp}.
+   */
+  async beginExclusiveChainOp(): Promise<void> {
+    this.utxoScanPause++;
+    this.chainOpActive++;
+    while (this.processing) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  /** Release {@link beginExclusiveChainOp}; buffered bodies connect on top of
+   *  the restored tip (Core: ReconsiderBlock + ActivateBestChain). */
+  endExclusiveChainOp(): void {
+    if (this.chainOpActive > 0) this.chainOpActive--;
+    this.resumeAfterUTXOScan();
+  }
+
+  /** True once stop() has been requested (lets a long chain op interrupt). */
+  isStopRequested(): boolean {
+    return this.stopRequested;
   }
 
   /**

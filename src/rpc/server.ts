@@ -12136,6 +12136,36 @@ export class RPCServer {
       );
     }
 
+    // Exclusive chain access for the whole operation (Core: cs_main +
+    // NetworkDisable around TemporaryRollback -> PrepareUTXOSnapshot ->
+    // WriteUTXOSnapshot, rpc/blockchain.cpp dumptxoutset). The P2P connect
+    // loop is paused and drained BEFORE the tip is read, so (a) no block can
+    // connect over the rewound coins DB -- the race that validated a block
+    // against the rewound view, failed it with bad-txns-BIP30 and marked the
+    // restored chain's own block 111 (+ descendants) invalid, wedging the node
+    // below every later block (HB-1); (b) a `latest` dump's flush, chain-state
+    // label, hash pass and coin walk all see the same tip (HB-4/HB-5); and (c)
+    // shutdown cannot flush the view tip over rolled-back coins (HB-14).
+    // submitblock is refused for the same window (blockSubmissionPaused).
+    const blockSync = this.blockSync;
+    await blockSync?.beginExclusiveChainOp();
+    const prevPaused = this.blockSubmissionPaused;
+    this.blockSubmissionPaused = true;
+    try {
+      return await this.dumpTxoutsetExclusive(pathParam, snapshotType, options, hasRollbackOption);
+    } finally {
+      this.blockSubmissionPaused = prevPaused;
+      blockSync?.endExclusiveChainOp();
+    }
+  }
+
+  /** Body of {@link dumpTxoutset}; caller holds the exclusive chain op. */
+  private async dumpTxoutsetExclusive(
+    pathParam: string,
+    snapshotType: string,
+    options: Record<string, unknown>,
+    hasRollbackOption: boolean
+  ): Promise<Record<string, unknown>> {
     const tip = this.chainState.getBestBlock();
     let targetHeight = tip.height;
     let targetHash: Buffer = tip.hash;
@@ -12170,17 +12200,8 @@ export class RPCServer {
       );
     }
 
-    // Pruned-mode pre-check. Mirrors Bitcoin Core's
-    // rpc/blockchain.cpp:dumptxoutset:
-    //   if (IsPruneMode() &&
-    //       target_index->nHeight <
-    //       node.chainman->m_blockman.GetFirstBlock()->nHeight)
-    //       throw "Block height N not available (pruned data).
-    //              Use a height after M.";
-    // hotbuns tracks `getFirstUnprunedHeight()` (the lowest height with
-    // block data still on disk) on the PruneManager. We fail fast so a
-    // pruned datadir does not begin a rewind that is guaranteed to fail
-    // when disconnectBlock reads a pruned body.
+    // Pruned-mode pre-check (Core rpc/blockchain.cpp dumptxoutset: IsPruneMode()
+    // && target below GetFirstBlock -> refuse before any rewind).
     if (this.pruneManager?.isPruneMode()) {
       const firstAvailable = this.pruneManager.getFirstUnprunedHeight();
       if (targetHeight < firstAvailable) {
@@ -12192,48 +12213,22 @@ export class RPCServer {
       }
     }
 
-    // Lazily construct the snapshot manager, mirroring the existing
-    // loadtxoutset wiring above. Must happen BEFORE the rollback dance
-    // so a setup failure doesn't leave the chainstate disconnected.
     let chainstateManager = this.chainstateManager;
     if (!chainstateManager) {
       chainstateManager = new ChainstateManager(this.db, this.params);
       this.chainstateManager = chainstateManager;
     }
 
-    // Core's PrepareUTXOSnapshot does ForceFlushStateToDisk before it takes
-    // the stats + the coins cursor (rpc/blockchain.cpp:3256), and reads the
-    // dump's base back out of the flushed view
-    // (`tip = LookupBlockIndex(maybe_stats->hashBlock)`). `dumpSnapshot`
-    // likewise reads the persisted chain-state record and iterates the coins
-    // DB, so without this flush a "latest" dump silently captures the last
-    // FLUSHED height (the assumeutxo base, in the boundary-campaign case) and
-    // its coin set instead of the tip's.
-    //
-    // Flushing BEFORE the rollback dance also gives the rewind a complete
-    // starting point: ChainStateManager.disconnectBlock walks the coins DB
-    // through its own view, which cannot see coins still cached in BlockSync's
-    // separate CoinsViewCache (sync/blocks.ts:905-918). Each disconnect then
-    // rewrites the chain-state record down to the target, so the dump's base
-    // follows the rollback exactly as Core's does.
+    // Core PrepareUTXOSnapshot: ForceFlushStateToDisk before the stats + the
+    // coins cursor (rpc/blockchain.cpp:3256). The flush also gives the rewind
+    // a complete starting point: ChainStateManager.disconnectBlock walks the
+    // coins DB through its own view, which cannot see coins still cached in
+    // BlockSync's CoinsViewCache. Done under the exclusive op, so no connect
+    // can dirty the cache between this flush and the rewind / the walk.
     await this.forceFlushChainstateToDisk();
 
-    // NetworkDisable RAII (TS try/finally). Mirrors Bitcoin Core's
-    // NetworkDisable wrapper around TemporaryRollback in
-    // rpc/blockchain.cpp::dumptxoutset. Pause inbound block acceptance
-    // for the duration of the rewind→dump→replay dance and restore on
-    // every exit path (success, error, exception). Only pause when
-    // there's actual rewind work; a "latest" dump doesn't need the gate.
-    const networkPauseActive = targetHeight < tip.height;
-    if (networkPauseActive) {
-      this.blockSubmissionPaused = true;
-    }
-    try {
-
-    // Capture the disconnected blocks top-down (tip → target) so we can
-    // replay them bottom-up (target+1 → tip) after the dump completes.
-    // Reading them up front means a torn read can't strand us in a
-    // partially-disconnected state.
+    // Capture the blocks to disconnect top-down (tip -> target+1) before any
+    // mutation, so a torn read cannot strand a partial rewind.
     const disconnected: Array<{ block: Block; height: number; hash: Buffer }> = [];
     if (targetHeight < tip.height) {
       let cursorHash: Buffer = tip.hash;
@@ -12259,57 +12254,60 @@ export class RPCServer {
       }
     }
 
-    // Disconnect down to target. If anything below fails we still want to
-    // re-apply, so the dump itself goes inside try/finally.
-    for (const { block, height } of disconnected) {
-      await this.chainState.disconnectBlock(block, height);
-    }
-
-    let dumpResult: DumpSnapshotResult;
-    let dumpError: unknown = null;
+    // TemporaryRollback: disconnect tip-first down to the target. `undone`
+    // counts what actually came off so every exit path re-applies exactly
+    // that, bottom-up (Core: the TemporaryRollback destructor reconsiders the
+    // invalidated block on every exit, including exceptions).
+    let undone = 0;
+    let dumpResult: DumpSnapshotResult | null = null;
+    let opError: unknown = null;
     try {
-      dumpResult = await chainstateManager.dumpSnapshot(pathParam);
+      for (const { block, height } of disconnected) {
+        await this.chainState.disconnectBlock(block, height);
+        undone++;
+      }
+      const base = this.chainState.getBestBlock();
+      if (!base.hash.equals(targetHash) || base.height !== targetHeight) {
+        // Core: "Could not roll back to requested height."
+        throw new Error(
+          `Could not roll back to requested height (at ${base.height} ` +
+            `${Buffer.from(base.hash).reverse().toString("hex")})`
+        );
+      }
+      dumpResult = await chainstateManager.dumpSnapshot(
+        pathParam,
+        () => this.blockSync?.isStopRequested() ?? false
+      );
     } catch (e) {
-      dumpError = e;
-      // We still need to fall through to the finally-equivalent below so
-      // the chain is restored. Use a sentinel to avoid TS complaining
-      // about uninitialized `dumpResult`.
-      dumpResult = {
-        coinsWritten: 0n,
-        baseHash: "",
-        baseHeight: 0,
-        path: pathParam,
-        txoutsetHash: "",
-        nChainTx: 0n,
-      };
+      opError = e;
     }
 
-    // Re-apply: bottom-up (target+1 → tip).
-    for (let i = disconnected.length - 1; i >= 0; i--) {
+    // Restore: reconnect bottom-up (target+1 -> original tip).
+    for (let i = undone - 1; i >= 0; i--) {
       const { block, height } = disconnected[i];
       try {
         await this.chainState.connectBlock(block, height);
       } catch (reapplyErr) {
-        // Re-application failure leaves the chain partially restored —
-        // this is recoverable on restart but we surface it loudly so the
-        // operator sees both the original dump error (if any) and the
-        // reapply error. Mirrors Core's
-        // "dumptxoutset failed to roll back to requested height" path.
         const msg = reapplyErr instanceof Error ? reapplyErr.message : String(reapplyErr);
         throw this.rpcError(
           RPCErrorCodes.INTERNAL_ERROR,
           `dumptxoutset rollback re-apply failed at height ${height}: ${msg}` +
-            (dumpError
-              ? ` (original dump error: ${dumpError instanceof Error ? dumpError.message : String(dumpError)})`
+            (opError
+              ? ` (original error: ${opError instanceof Error ? opError.message : String(opError)})`
               : "")
         );
       }
     }
 
-    if (dumpError) {
-      const message = dumpError instanceof Error ? dumpError.message : String(dumpError);
+    if (opError || !dumpResult) {
+      const message = opError instanceof Error ? opError.message : String(opError);
       throw this.rpcError(RPCErrorCodes.INTERNAL_ERROR, `Failed to dump snapshot: ${message}`);
     }
+
+    // nchaintx = m_chain_tx_count of the BASE block (Core WriteUTXOSnapshot:
+    // result.pushKV("nchaintx", tip->m_chain_tx_count)). The base is an
+    // ancestor of the restored tip, so the active-chain walk resolves it.
+    const nChainTx = await this.chainTxCountAtHeight(dumpResult.baseHeight);
 
     return {
       coins_written: Number(dumpResult.coinsWritten),
@@ -12317,17 +12315,8 @@ export class RPCServer {
       base_height: dumpResult.baseHeight,
       path: dumpResult.path,
       txoutset_hash: dumpResult.txoutsetHash,
-      nchaintx: Number(dumpResult.nChainTx),
+      nchaintx: nChainTx ?? Number(dumpResult.nChainTx),
     };
-
-    } finally {
-      // NetworkDisable RAII restore: clear the pause flag on every exit
-      // path of the rollback dance (success, error, exception). Mirrors
-      // Core's NetworkDisable destructor.
-      if (networkPauseActive) {
-        this.blockSubmissionPaused = false;
-      }
-    }
   }
 
   /**
