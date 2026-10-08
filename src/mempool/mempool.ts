@@ -788,6 +788,12 @@ export interface MempoolEntry {
    * Reference: Bitcoin Core GetTransactionSigOpCost()
    */
   sigOpCost: number;
+  /**
+   * Spends a confirmed coinbase output (Core CTxMemPoolEntry::spendsCoinbase).
+   * removeForReorg re-checks maturity only for these; undefined = unknown
+   * (entry built by a path that did not look at the coins) = always re-check.
+   */
+  spendsCoinbase?: boolean;
 }
 
 /**
@@ -1298,7 +1304,25 @@ export interface AcceptToMemoryPoolOptions {
    * (validation.cpp — ATMPArgs::m_test_accept).
    */
   testAccept?: boolean;
+  /**
+   * Core ATMPArgs::m_bypass_limits — the reorg re-accept of disconnected
+   * transactions (MaybeUpdateMempoolForReorg) skips the min-relay / rolling
+   * minimum fee floors and the size trim; every other check still runs.
+   */
+  bypassLimits?: boolean;
+  /**
+   * Internal: the caller IS the chain writer (BlockSync, under the chain lock,
+   * inside begin/endChainUpdate). The admission neither waits for the chain to
+   * go idle nor retries on a chain-generation change.
+   */
+  chainWriter?: boolean;
 }
+
+/** Sentinel: the chain moved under an admission's awaits — re-run it. */
+const CHAIN_MOVED = Object.freeze({ accepted: false as const, error: "chain-moved" });
+/** Re-runs of one admission before giving up (each one needed a whole block
+ *  connect to land inside the admission's coin reads). */
+const MAX_CHAIN_MOVED_RETRIES = 64;
 
 /**
  * Transaction memory pool.
@@ -1591,6 +1615,77 @@ export class Mempool {
     tx: Transaction,
     options?: AcceptToMemoryPoolOptions,
   ): Promise<{ accepted: boolean; error?: string; fee?: bigint; vsize?: number }> {
+    // The chain writer (reorg re-accept) runs inside its own chain update.
+    if (options?.chainWriter) {
+      return this.addTransactionAttempt(tx, options, null);
+    }
+    // Audit HB-3 — Core runs ATMP under cs_main, so a block can never connect
+    // between the coin reads and the insert. Here the coin reads are awaits,
+    // so a whole block connect (spends + removeForBlock) could land inside
+    // them and the tx would be inserted spending a coin the block just spent,
+    // or be a block tx itself. Never start while a block connect / reorg is
+    // mid-flight, and re-run the attempt from scratch when the chain
+    // generation moved under it.
+    for (let attempt = 0; ; attempt++) {
+      await this.waitForChainIdle();
+      const generation = this.chainGeneration;
+      const r = await this.addTransactionAttempt(tx, options, generation);
+      if (r !== CHAIN_MOVED) return r;
+      if (attempt >= MAX_CHAIN_MOVED_RETRIES) {
+        return { accepted: false, error: "chain-moved: chain tip kept changing during admission" };
+      }
+    }
+  }
+
+  // ==========================================================================
+  // Chain-consistency gate (Core: cs_main + mempool.cs held across ConnectTip /
+  // DisconnectTip / MaybeUpdateMempoolForReorg). BlockSync brackets every block
+  // connect, reorg and invalidate with begin/endChainUpdate; admissions wait
+  // for it and re-run if the generation moved; mempool-reading RPCs wait for it
+  // so they never see a mempool that disagrees with the tip.
+  // ==========================================================================
+
+  /** Bumped at every begin and end of a chain update. */
+  private chainGeneration = 0;
+  /** Nesting depth of in-flight chain updates. */
+  private chainUpdateDepth = 0;
+  private chainIdleWaiters: Array<() => void> = [];
+
+  beginChainUpdate(): void {
+    this.chainUpdateDepth++;
+    this.chainGeneration++;
+  }
+
+  endChainUpdate(): void {
+    if (this.chainUpdateDepth > 0) this.chainUpdateDepth--;
+    this.chainGeneration++;
+    if (this.chainUpdateDepth === 0 && this.chainIdleWaiters.length > 0) {
+      const waiters = this.chainIdleWaiters;
+      this.chainIdleWaiters = [];
+      for (const w of waiters) w();
+    }
+  }
+
+  getChainGeneration(): number {
+    return this.chainGeneration;
+  }
+
+  isChainUpdateInProgress(): boolean {
+    return this.chainUpdateDepth > 0;
+  }
+
+  /** Resolve once no block connect / reorg / invalidate is mid-flight. */
+  async waitForChainIdle(): Promise<void> {
+    while (this.chainUpdateDepth > 0) {
+      await new Promise<void>((resolve) => this.chainIdleWaiters.push(resolve));
+    }
+  }
+
+  private async addTransactionAttempt(
+    tx: Transaction,
+    options: AcceptToMemoryPoolOptions | undefined,
+    generation: number | null,
+  ): Promise<{ accepted: boolean; error?: string; fee?: bigint; vsize?: number }> {
     // Gate 6: after AbortNode the mempool accepts nothing. fatal-error is not
     // a rejection reason (callers must not add it to recent-rejects).
     if (isFatal()) {
@@ -1875,7 +1970,9 @@ export class Mempool {
 
         // Check coinbase maturity
         if (utxo.coinbase) {
-          const confirmations = this.tipHeight - utxo.height;
+          // Core CheckTxInputs(nSpendHeight = tip + 1):
+          // nSpendHeight - coin.nHeight < COINBASE_MATURITY.
+          const confirmations = this.tipHeight + 1 - utxo.height;
           if (confirmations < this.params.coinbaseMaturity) {
             return {
               accepted: false,
@@ -1895,6 +1992,14 @@ export class Mempool {
         }
         inputUtxos.push({ utxo, input, isMempool: false });
       }
+    }
+
+    // HB-3: the coin reads above were awaits. If a block connected (or a
+    // reorg / invalidate ran) meanwhile, the coins and mempool parents just
+    // read may be stale — re-run the whole admission against the new tip.
+    // No await follows this point, so the insert below is atomic with it.
+    if (generation !== null && generation !== this.chainGeneration) {
+      return CHAIN_MOVED;
     }
 
     // 5. Calculate fee
@@ -2102,13 +2207,13 @@ export class Mempool {
     const feeRate = Number(fee) / vsize;
     // getMinFee() returns sat/kvB; convert to sat/vB for the gate.
     const rollingMinSatPerVB = this.getMinFee() / 1000;
-    if (rollingMinSatPerVB > 0 && feeRate < rollingMinSatPerVB) {
+    if (!options?.bypassLimits && rollingMinSatPerVB > 0 && feeRate < rollingMinSatPerVB) {
       return {
         accepted: false,
         error: `mempool min fee not met: ${feeRate.toFixed(8)} sat/vB < ${rollingMinSatPerVB.toFixed(8)} sat/vB`,
       };
     }
-    if (feeRate < this.minFeeRate) {
+    if (!options?.bypassLimits && feeRate < this.minFeeRate) {
       return {
         accepted: false,
         error: `min relay fee not met: ${feeRate.toFixed(8)} sat/vB < ${this.minFeeRate} sat/vB`,
@@ -2573,6 +2678,9 @@ export class Mempool {
       ephemeralDustParents,
       hasEphemeralDust: txHasEphemeralDust,
       sigOpCost,
+      spendsCoinbase: inputUtxos.some(
+        (u) => !u.isMempool && (u.utxo as UTXOEntry).coinbase === true
+      ),
     };
 
     // Dry-run path: validation passed but caller only wants a yes/no answer.
@@ -2614,7 +2722,12 @@ export class Mempool {
     // Evict if over size limit. Core trims on DynamicMemoryUsage()
     // (txmempool.cpp:868); the vsize check is kept as a belt-and-braces
     // lower bound (usage >= vsize always, so it is normally redundant).
-    if (this.currentUsage > this.maxSize || this.currentSize > this.maxSize) {
+    // (bypass_limits: the reorg re-accept trims once at the end, Core
+    // MaybeUpdateMempoolForReorg -> LimitMempoolSize.)
+    if (
+      !options?.bypassLimits &&
+      (this.currentUsage > this.maxSize || this.currentSize > this.maxSize)
+    ) {
       this.evict();
     }
 
@@ -3014,6 +3127,210 @@ export class Mempool {
         `[mempool-reorg-refill] re-admitted disconnected tx ${txidHex.slice(0, 16)}... (vsize=${vsize})`
       );
     }
+  }
+
+  /**
+   * Core Chainstate::MaybeUpdateMempoolForReorg (validation.cpp) for the
+   * transactions of the blocks a disconnect / reorg / invalidateblock took off
+   * the active chain. The caller is the chain writer: it holds the chain lock,
+   * has bracketed the whole update with begin/endChainUpdate, has already run
+   * removeForBlock for every block it CONNECTED, and has dropped those blocks'
+   * txs from `disconnected` (Core disconnectpool.removeForBlock in ConnectTip).
+   *
+   * `disconnected` must be EARLIEST-CONFIRMED FIRST (Core walks the
+   * disconnect pool in reverse insertion order) so a parent is re-accepted
+   * before its child.
+   *
+   *   1. re-accept each through the full ATMP checks with bypass_limits; a tx
+   *      that is refused is removeRecursive'd — its in-mempool spenders (e.g. a
+   *      mempool child of a block tx the new branch conflicts) go with it;
+   *   2. UpdateTransactionsFromBlock: re-link in-mempool children of the
+   *      re-accepted txs (they entered while the parent was confirmed);
+   *   3. removeForReorg: drop (with descendants) every entry that at tip+1 is
+   *      non-final (BIP113), sequence-locked (BIP68) or spends an immature
+   *      coinbase;
+   *   4. LimitMempoolSize.
+   */
+  async updateForReorg(
+    disconnected: Transaction[],
+    addToMempool: boolean | ((tx: Transaction) => boolean) = true
+  ): Promise<{ readded: number; refused: number; removedForReorg: number }> {
+    const readded: string[] = [];
+    let refused = 0;
+    for (const tx of disconnected) {
+      if (isCoinbase(tx)) continue;
+      const txidHex = getTxId(tx).toString("hex");
+      if (this.entries.has(txidHex)) continue;
+      let accepted = false;
+      if (typeof addToMempool === "function" ? addToMempool(tx) : addToMempool) {
+        const r = await this.addTransaction(tx, { bypassLimits: true, chainWriter: true });
+        accepted = r.accepted;
+        if (!accepted) {
+          console.log(
+            `[mempool-reorg] disconnected tx ${txidHex.slice(0, 16)}... not re-accepted (${r.error}); removing its in-mempool descendants`
+          );
+        }
+      }
+      if (accepted) {
+        readded.push(txidHex);
+      } else {
+        refused++;
+        this.removeRecursiveForTx(tx);
+      }
+    }
+    this.updateTransactionsFromBlock(readded);
+    const removedForReorg = await this.removeForReorg();
+    if (this.currentUsage > this.maxSize || this.currentSize > this.maxSize) {
+      this.evict();
+    }
+    console.log(
+      `[mempool-reorg] MaybeUpdateMempoolForReorg: ${disconnected.length} disconnected, ` +
+        `${readded.length} re-accepted, ${refused} refused, ${removedForReorg} removed for reorg ` +
+        `(tip ${this.tipHeight}, mempool ${this.entries.size})`
+    );
+    return { readded: readded.length, refused, removedForReorg };
+  }
+
+  /**
+   * Core CTxMemPool::removeRecursive(tx): remove `tx` with all its
+   * descendants; when `tx` itself is not in the pool (a disconnected block tx
+   * that failed re-acceptance) remove every in-mempool spender of its outputs,
+   * with descendants.
+   */
+  removeRecursiveForTx(tx: Transaction): void {
+    const txid = getTxId(tx);
+    const txidHex = txid.toString("hex");
+    if (this.entries.has(txidHex)) {
+      this.removeTransaction(txid, true);
+      return;
+    }
+    for (let vout = 0; vout < tx.outputs.length; vout++) {
+      const spender = this.outpointIndex.get(`${txidHex}:${vout}`);
+      if (spender && this.entries.has(spender)) {
+        this.removeTransaction(Buffer.from(spender, "hex"), true);
+      }
+    }
+  }
+
+  /**
+   * Core CTxMemPool::UpdateTransactionsFromBlock: a re-accepted tx may already
+   * have children in the pool (they were admitted while it was confirmed);
+   * wire parent/child links so ancestor/descendant/cluster state includes them.
+   */
+  private updateTransactionsFromBlock(readded: string[]): void {
+    if (readded.length === 0) return;
+    for (const parentHex of readded) {
+      const parent = this.entries.get(parentHex);
+      if (!parent) continue;
+      for (let vout = 0; vout < parent.tx.outputs.length; vout++) {
+        const childHex = this.outpointIndex.get(`${parentHex}:${vout}`);
+        if (!childHex || childHex === parentHex) continue;
+        const child = this.entries.get(childHex);
+        if (!child) continue;
+        parent.spentBy.add(childHex);
+        child.dependsOn.add(parentHex);
+      }
+    }
+    this.recalculateAllStats();
+    this.rebuildClusters();
+  }
+
+  /**
+   * Core CTxMemPool::removeForReorg (txmempool.cpp) with the
+   * check_final_and_mature filter of MaybeUpdateMempoolForReorg: remove, with
+   * descendants, every entry that at tip+1 is non-final (CheckFinalTxAtTip,
+   * BIP113), fails its sequence locks (CheckSequenceLocksAtTip, BIP68) or
+   * spends a coinbase that is immature at tip+1. A confirmed input that is no
+   * longer in the coin view also removes the entry (it can no longer be
+   * mined). Returns the number of entries removed (descendants included).
+   */
+  async removeForReorg(): Promise<number> {
+    if (this.entries.size === 0) return 0;
+    const nextHeight = this.tipHeight + 1;
+    let tipMTP: number;
+    try {
+      tipMTP = this.chainMTPProvider ? this.chainMTPProvider.tipMTP() : this.tipMTP;
+    } catch (err) {
+      if (!(err instanceof MissingAncestorHeaderError)) throw err;
+      tipMTP = Number.NaN;
+    }
+    const enforceBIP68 = this.tipHeight >= (this.params.csvHeight ?? 0);
+    const remove: string[] = [];
+    for (const [txidHex, entry] of Array.from(this.entries)) {
+      const tx = entry.tx;
+      // A time-based nLockTime with no MTP available is refused, never guessed
+      // (same rule as admission).
+      const timeLocked =
+        (tx.lockTime >>> 0) >= LOCKTIME_THRESHOLD_MTP &&
+        tx.inputs.some((i) => (i.sequence >>> 0) !== SEQUENCE_FINAL);
+      if (timeLocked && Number.isNaN(tipMTP)) {
+        remove.push(txidHex);
+        continue;
+      }
+      if (!isFinalTx(tx, nextHeight, Number.isNaN(tipMTP) ? 0 : tipMTP)) {
+        remove.push(txidHex);
+        continue;
+      }
+      const hasRelativeLock =
+        enforceBIP68 &&
+        tx.version >= 2 &&
+        tx.inputs.some((i) => ((i.sequence >>> 0) & SEQUENCE_LOCKTIME_DISABLE_FLAG) === 0);
+      const needCoins = hasRelativeLock || entry.spendsCoinbase !== false;
+      if (!needCoins) continue;
+      let bad = false;
+      const confs: UTXOConfirmation[] = [];
+      for (const input of tx.inputs) {
+        if (this.entries.has(input.prevOut.txid.toString("hex"))) {
+          confs.push({ height: nextHeight, medianTimePast: tipMTP });
+          continue;
+        }
+        const coin = await this.utxo.getUTXOAsync(input.prevOut);
+        if (!coin) {
+          bad = true;
+          break;
+        }
+        if (coin.coinbase && nextHeight - coin.height < this.params.coinbaseMaturity) {
+          bad = true;
+          break;
+        }
+        if (!hasRelativeLock) continue;
+        const seq = input.sequence >>> 0;
+        const timeType =
+          (seq & SEQUENCE_LOCKTIME_DISABLE_FLAG) === 0 &&
+          (seq & SEQUENCE_LOCKTIME_TYPE_FLAG) !== 0;
+        let coinMTP = 0;
+        if (timeType) {
+          try {
+            coinMTP = this.chainMTPProvider
+              ? this.chainMTPProvider.coinMTP(coin.height)
+              : tipMTP;
+          } catch (err) {
+            if (!(err instanceof MissingAncestorHeaderError)) throw err;
+            coinMTP = Number.NaN;
+          }
+          if (Number.isNaN(coinMTP) || Number.isNaN(tipMTP)) {
+            bad = true;
+            break;
+          }
+        }
+        confs.push({ height: coin.height, medianTimePast: coinMTP });
+      }
+      if (
+        !bad &&
+        hasRelativeLock &&
+        !checkSequenceLocks(tx, true, nextHeight, Number.isNaN(tipMTP) ? 0 : tipMTP, confs)
+      ) {
+        bad = true;
+      }
+      if (bad) remove.push(txidHex);
+    }
+    const before = this.entries.size;
+    for (const txidHex of remove) {
+      if (this.entries.has(txidHex)) {
+        this.removeTransaction(Buffer.from(txidHex, "hex"), true);
+      }
+    }
+    return before - this.entries.size;
   }
 
   /**

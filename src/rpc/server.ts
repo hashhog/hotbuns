@@ -1569,13 +1569,23 @@ export class RPCServer {
       this.combineRawTransaction(params)
     );
 
-    // Mempool methods
-    this.registerMethod("getmempoolinfo", () => this.getMempoolInfo());
-    this.registerMethod("getrawmempool", (params) => this.getRawMempool(params));
-    this.registerMethod("getmempoolentry", (params) => this.getMempoolEntry(params));
+    // Mempool methods. The readers wait out an in-flight block connect /
+    // reorg / invalidate (Core: they take cs_main + mempool.cs), so they never
+    // answer with a mempool that disagrees with the tip they would report.
+    const consistent = async <T>(fn: () => T | Promise<T>): Promise<T> => {
+      await this.mempool.waitForChainIdle?.();
+      return fn();
+    };
+    this.registerMethod("getmempoolinfo", () => consistent(() => this.getMempoolInfo()));
+    this.registerMethod("getrawmempool", (params) => consistent(() => this.getRawMempool(params)));
+    this.registerMethod("getmempoolentry", (params) => consistent(() => this.getMempoolEntry(params)));
     this.registerMethod("testmempoolaccept", (params) => this.testMempoolAccept(params));
-    this.registerMethod("getmempoolancestors", (params) => this.getMempoolAncestors(params));
-    this.registerMethod("getmempooldescendants", (params) => this.getMempoolDescendants(params));
+    this.registerMethod("getmempoolancestors", (params) =>
+      consistent(() => this.getMempoolAncestors(params))
+    );
+    this.registerMethod("getmempooldescendants", (params) =>
+      consistent(() => this.getMempoolDescendants(params))
+    );
     this.registerMethod("savemempool", () => this.saveMempool());
     this.registerMethod("dumpmempool", () => this.saveMempool());
     this.registerMethod("loadmempool", () => this.doLoadMempool());
@@ -1626,7 +1636,12 @@ export class RPCServer {
     this.registerMethod("validateaddress", (params) => this.validateAddress(params));
 
     // Mining methods
-    this.registerMethod("getblocktemplate", (params) => this.getBlockTemplate(params));
+    this.registerMethod("getblocktemplate", async (params) => {
+      // Template = tip + mempool: build it only between chain updates (Core
+      // holds cs_main + mempool.cs in CreateNewBlock).
+      await this.mempool.waitForChainIdle?.();
+      return this.getBlockTemplate(params);
+    });
     this.registerMethod("generatetoaddress", (params) => this.generateToAddress(params));
     this.registerMethod("generateblock", (params) => this.generateBlock(params));
     this.registerMethod("generatetodescriptor", (params) => this.generateToDescriptor(params));
