@@ -135,6 +135,8 @@ curl -s http://127.0.0.1:18601/rest/chaininfo.json
 curl -s --user user:pass -d '{"method":"stop","params":[]}' http://127.0.0.1:18600/
 ```
 
+RPC answers on 18600 (`{"jsonrpc":"2.0","result":0}`) and REST on 18601, the RPC port plus one. Both the cookie and the default `user` / `pass` are accepted, and `stop` returns `"hotbuns stopping"`.
+
 ## Environment variables
 
 | Variable | Effect |
@@ -156,6 +158,8 @@ curl -s http://127.0.0.1:19332/metrics | grep bitcoin_blocks_total
 curl -s http://127.0.0.1:19332/health
 curl -s --user "$(cat "$DATADIR/.cookie")" -d '{"method":"stop","params":[]}' http://127.0.0.1:18443/
 ```
+
+The `grep` prints the `# HELP` and `# TYPE` lines and then `bitcoin_blocks_total 0`. `/health` returns `{"status":"ok","network":"regtest","height":0,"peers":0,"pid":<pid>}`.
 
 For sync progress use the RPCs `getblockchaininfo` (`blocks`, `headers`, `verificationprogress`) and `getpeerinfo`. A periodic `IBD:` log line reports height, block rate, peer count and memory.
 

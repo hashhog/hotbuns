@@ -33,7 +33,7 @@ curl -s --user "$(cat "$DATADIR/.cookie")" -d '{"method":"getblockchaininfo","pa
 curl -s --user "$(cat "$DATADIR/.cookie")" -d '{"method":"stop","params":[]}' http://127.0.0.1:18443/
 ```
 
-The first `curl` prints the regtest genesis state (`"chain":"regtest","blocks":0`). `--metrics-port=0` turns off the Prometheus endpoint, which otherwise listens on all interfaces on port 9332. There is no compile step: Bun runs the TypeScript directly.
+The first `curl` prints the regtest genesis state (`"chain":"regtest","blocks":0`). The second returns `"hotbuns stopping"`, and the node logs `Shutdown complete.` before it exits. `--metrics-port=0` turns off the Prometheus endpoint, which otherwise listens on all interfaces on port 9332. There is no compile step: Bun runs the TypeScript directly.
 
 ## Running
 
@@ -59,7 +59,7 @@ curl -s --user "$(cat "$DATADIR/.cookie")" -d '{"method":"createwallet","params"
 curl -s --user "$(cat "$DATADIR/.cookie")" -d '{"method":"getnewaddress","params":[]}' http://127.0.0.1:18443/wallet/demo
 ```
 
-As in Core, wallet calls go to a named wallet through the `/wallet/<name>` URL path. Responses always carry `"jsonrpc":"2.0"`, even for 1.0-style requests. A read-only REST interface is available with `--rest`. The method list and known differences from Core are in [docs/rpc.md](docs/rpc.md).
+`createwallet` returns `{"name":"demo"}` and `getnewaddress` a new `bcrt1q...` address. As in Core, wallet calls go to a named wallet through the `/wallet/<name>` URL path. Responses always carry `"jsonrpc":"2.0"`, even for 1.0-style requests. A read-only REST interface is available with `--rest`. The method list and known differences from Core are in [docs/rpc.md](docs/rpc.md).
 
 ## Development
 

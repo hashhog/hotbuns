@@ -18,13 +18,15 @@ On 2026-10-17 this ran 6,736 tests in 247 files: 6,668 passed, 2 failed, 47 were
 Ran 6736 tests across 247 files.
 ```
 
-The two failures are in `src/__tests__/w125_error_parity.test.ts`, which checks that the wallet error codes -35 and -36 exist; they do not yet. `src/validation/script-verify-parallelism.test.ts` measures a speed-up from worker threads and can also fail on a heavily loaded machine.
+The two failures are in `src/__tests__/w125_error_parity.test.ts`, which checks that the wallet error codes -35 and -36 exist; they do not yet. Because of them, `bun test` exits with status 1 on `master`. `src/validation/script-verify-parallelism.test.ts` measures a speed-up from worker threads and can also fail on a heavily loaded machine.
 
 `bunfig.toml` runs every test file in its own process and excludes 21 files (`pathIgnorePatterns`) that are known to fail or need a live node. To run a single file in-process:
 
 ```bash
 HOTBUNS_UNIT_CHILD=1 bun test ./src/script/interpreter.test.ts
 ```
+
+On 2026-10-17 this file ran 113 tests: 113 passed, 0 failed.
 
 ## Script interpreter against Core's vectors
 

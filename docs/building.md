@@ -18,7 +18,7 @@ export PATH=$HOME/.bun/bin:$PATH
 bun --version
 ```
 
-The installer puts Bun in `~/.bun` and adds it to your shell profile. Set `BUN_INSTALL=<dir>` before running it to install somewhere else.
+`pkg-config` prints the library version (`0.5.0` on Debian 13) and `bun --version` prints `1.3.11`. The installer puts Bun in `~/.bun` and adds it to your shell profile. Set `BUN_INSTALL=<dir>` before running it to install somewhere else.
 
 ## Dependencies
 
