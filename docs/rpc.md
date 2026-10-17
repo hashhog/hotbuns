@@ -15,7 +15,7 @@ curl -s --user "$COOKIE" -d '[{"method":"getblockcount","id":1},{"method":"getbe
 curl -s --user "$COOKIE" -d '{"method":"help","params":[]}' http://127.0.0.1:18443/
 ```
 
-`help` returns every method name, one per line. The table below is the dispatch table in `src/rpc/server.ts` (`registerMethod` calls): 139 methods.
+The first call returns the regtest genesis hash, `0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206`, with `"id":1`. The batch returns an array with one response per request, in request order: block count 0, then the same genesis hash. `help` returns every method name, one per line. The table below is the dispatch table in `src/rpc/server.ts` (`registerMethod` calls): 139 methods.
 
 ## REST
 
@@ -31,6 +31,8 @@ curl -s http://127.0.0.1:18450/rest/chaininfo.json
 curl -s http://127.0.0.1:18450/rest/blockhashbyheight/0.hex
 curl -s --user "$(cat "$DATADIR/.cookie")" -d '{"method":"stop","params":[]}' http://127.0.0.1:18443/
 ```
+
+`chaininfo.json` starts `{"chain":"regtest","blocks":0,"headers":0,"bestblockhash":"0f9188f1...`, and `blockhashbyheight/0.hex` prints the genesis hash on its own. Some `chaininfo.json` fields differ from Core's; see [Known differences from Core](#known-differences-from-core).
 
 ## ZMQ
 
@@ -61,3 +63,4 @@ Core v31.1 wallet methods hotbuns does not implement include `abandontransaction
 - Some error codes and messages differ from Core's for invalid or missing parameters. The wallet "already loaded" (-35) and "already exists" (-36) codes are not defined yet; `src/__tests__/w125_error_parity.test.ts` tracks this.
 - `help` returns a flat list of names rather than Core's grouped listing, and ignores a method-name argument: `help getblockhash` also returns the full list.
 - `--rpc-tls-cert` / `--rpc-tls-key` serve RPC over HTTPS directly. Core has no built-in TLS.
+- REST `chaininfo.json` is a reduced object, not the `getblockchaininfo` result that Core's REST returns: `mediantime` is always 0, `pruned` is always `false`, `softforks` is an empty object (Core's `getblockchaininfo` has not returned that field since v24), and `difficulty` never goes below 1. At the regtest genesis it reports `"difficulty":1,"mediantime":0`, where the `getblockchaininfo` RPC reports `"difficulty":4.656542373906925e-10,"mediantime":1296688602`. Use the RPC for these fields.
