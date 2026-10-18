@@ -124,6 +124,54 @@ export function exceedsRssBudget(
 	cacheBytes: number,
 ): boolean {
 	if (!(cacheBytes > 0)) return false;
-	const pressure = snap.rssAnon ?? snap.nonHeap;
-	return pressure > RSS_PRESSURE_MULTIPLE * cacheBytes;
+	return rssPressure(snap) > RSS_PRESSURE_MULTIPLE * cacheBytes;
+}
+
+function rssPressure(snap: MemorySnapshot): number {
+	return snap.rssAnon ?? snap.nonHeap;
+}
+
+/** Smallest growth that re-arms the RSS trigger after it has fired. */
+export const RSS_REARM_MIN_BYTES = 256 * 1024 * 1024;
+
+/**
+ * Stateful RSS flush trigger for the IBD connect loop.
+ *
+ * {@link exceedsRssBudget} alone is a level trigger, and a UTXO sync under
+ * the coins-cache budget evicts nothing (CoinsViewCache.sync). When memory a
+ * flush cannot free holds anon RSS over the line, the level trigger fires on
+ * every block with dirty coins. The pre-base header backfill (088f392) does
+ * exactly that: ~940k HeaderChainEntry objects lift anon to 4.1–4.7 GB
+ * against 4 × --dbcache=1024, and the 852000/930000 slices flushed 5,920
+ * times in 12,235 blocks and 2,903 in 10,000 (0–1 before the backfill).
+ *
+ * After an RSS flush the gate re-arms only once pressure has grown by
+ * max(cacheBytes, RSS_REARM_MIN_BYTES) above the lowest pressure seen since
+ * that flush. A flat baseline (header index, worker isolates) fires once;
+ * memory that keeps growing still forces a flush per re-arm step. Core's
+ * FlushStateToDisk has no RSS trigger at all; the coins-cache trigger
+ * (shouldFlush) is unaffected by this gate.
+ */
+export class RssFlushGate {
+	private floor: number | null = null;
+	private fired = 0;
+
+	shouldFlush(snap: MemorySnapshot, cacheBytes: number): boolean {
+		if (!(cacheBytes > 0)) return false;
+		const pressure = rssPressure(snap);
+		if (this.floor !== null && pressure < this.floor) this.floor = pressure;
+		if (pressure <= RSS_PRESSURE_MULTIPLE * cacheBytes) return false;
+		if (this.floor === null) return true;
+		return pressure - this.floor >= Math.max(cacheBytes, RSS_REARM_MIN_BYTES);
+	}
+
+	/** Record an RSS-triggered flush; `snap` is the pressure it fired at. */
+	recordFlush(snap: MemorySnapshot): void {
+		this.floor = rssPressure(snap);
+		this.fired++;
+	}
+
+	get flushes(): number {
+		return this.fired;
+	}
 }
