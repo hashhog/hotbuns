@@ -47,7 +47,7 @@ import {
   scriptCheckPoolSize,
 } from "../validation/script_check_queue.js";
 import {
-  exceedsRssBudget,
+  RssFlushGate,
   formatMemoryBreakdown,
   snapshotMemory,
 } from "../chain/memory_snapshot.js";
@@ -528,6 +528,8 @@ export class BlockSync {
 
   /** Last height at which UTXO cache was flushed to disk. */
   private lastFlushedHeight: number;
+  /** RSS flush trigger with re-arm; see RssFlushGate. */
+  private readonly rssFlushGate = new RssFlushGate();
 
   /** Consecutive failures at the same height — used to detect permanent UTXO
    *  corruption that cannot be fixed by cache-clearing alone. */
@@ -4008,12 +4010,18 @@ export class BlockSync {
       // leaves the DB in an unrecoverable state: spent coins deleted but
       // bestHeight pointing before the spend, causing "Missing UTXO" on
       // restart. This was the root cause of the height 380001 corruption.
+      //
+      // The RSS arm goes through rssFlushGate: a flush under the coins-cache
+      // budget frees nothing, so a level trigger on anon RSS refires every
+      // block once a flat baseline (the pre-base header index) sits over it.
       const memSnap = snapshotMemory(this.utxoManager, scriptCheckPoolSize());
-      const memoryFlush =
-        this.utxoManager.shouldFlush() ||
-        exceedsRssBudget(memSnap, this.utxoManager.getMaxCacheBytes());
-      if (memoryFlush && this.utxoManager.getDirtyCount() > 0) {
-        const why = this.utxoManager.shouldFlush() ? "cache" : "rss";
+      const cacheFlush = this.utxoManager.shouldFlush();
+      const rssFlush = this.rssFlushGate.shouldFlush(
+        memSnap,
+        this.utxoManager.getMaxCacheBytes(),
+      );
+      if ((cacheFlush || rssFlush) && this.utxoManager.getDirtyCount() > 0) {
+        const why = cacheFlush ? "cache" : "rss";
         console.log(
           `UTXO memory flush (${why}) at height ${height}: ${this.utxoManager.getCacheSize()} entries | ${formatMemoryBreakdown(memSnap)}`,
         );
@@ -4039,6 +4047,7 @@ export class BlockSync {
           break;
         }
         this.lastFlushedHeight = height;
+        if (!cacheFlush) this.rssFlushGate.recordFlush(memSnap);
 
         // Incremental GC only. Full GC (true) while 15 bun:ffi script-check
         // workers are live is the 340890 SIGSEGV class: compacting the
