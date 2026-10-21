@@ -2515,14 +2515,17 @@ export class HeaderSync {
       status |= 1;
     }
 
-    // Preserve nTx and dataPos if connectBlock already stored them.
+    // Preserve nTx, dataPos and status if connectBlock already stored them.
     // saveHeaderEntry is called during header sync (before we have block data),
-    // but connectBlock may have already written nTx > 0 and dataPos > 0 for
-    // this block. Overwriting with nTx: 0 / dataPos: 0 would lose that info.
+    // but connectBlock may have already written nTx > 0 for this block.
+    // Overwriting with nTx: 0 would lose that info. Gate on nTx alone: blocks
+    // outside the reorg-retention window are connected with dataPos 0 (no body
+    // kept), and zeroing those made getblockheader report nTx 0 for old blocks
+    // that Core reports (chain.h CBlockIndex::nTx stays set after pruning).
     let nTx = 0;
     let dataPos = 0;
     const existing = await this.db.getBlockIndex(entry.hash);
-    if (existing !== null && existing.nTx > 0 && existing.dataPos > 0) {
+    if (existing !== null && existing.nTx > 0) {
       nTx = existing.nTx;
       dataPos = existing.dataPos;
       // Merge in any existing status bits (e.g. TXS_VALID, HAVE_DATA)
