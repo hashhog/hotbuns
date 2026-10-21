@@ -78,7 +78,7 @@ import {
 } from "../validation/tx.js";
 import {
   clampScriptThreads,
-  verifyScriptChecks,
+  beginScriptChecks,
   type ScriptCheckJob,
 } from "../validation/script_check_queue.js";
 import type { UTXOEntry } from "../storage/database.js";
@@ -586,296 +586,309 @@ export async function coreConnectBlockChecks(
   // matches Core's gate ordering.
   let nFees = 0n;
   const MAX_MONEY_FEE = 2_100_000_000_000_000n;
-  const scriptJobs: ScriptCheckJob[] = [];
   // Tests / reorg / RPC omit this and stay serial. BlockSync always passes
   // a clamped value (0 = auto → hardware, max 15).
   const effectiveScriptThreads = clampScriptThreads(
     scriptThreads === undefined ? 1 : scriptThreads,
     utxoManager.getMaxCacheBytes(),
   );
+  // CCheckQueueControl: each tx's checks are queued as the loop produces
+  // them and full batches go to the workers at once, so script verification
+  // overlaps the rest of the loop. The verdict is still read only after the
+  // loop, sigops and coinbase checks (Wait() below), so the reject reason
+  // and its precedence are unchanged.
+  const scriptChecks = skipScripts
+    ? null
+    : beginScriptChecks(effectiveScriptThreads, utxoManager.getMaxCacheBytes());
+  try {
 
-  for (let txIndex = 0; txIndex < block.transactions.length; txIndex++) {
-    const tx = block.transactions[txIndex];
-    const txid = getTxId(tx);
-    const txidHex = txid.toString("hex");
-    const isCoinbaseTx = isCoinbase(tx);
+    for (let txIndex = 0; txIndex < block.transactions.length; txIndex++) {
+      const tx = block.transactions[txIndex];
+      const txid = getTxId(tx);
+      const txidHex = txid.toString("hex");
+      const isCoinbaseTx = isCoinbase(tx);
 
-    const prevOutputs: Buffer[] = [];
+      const prevOutputs: Buffer[] = [];
 
-    if (!isCoinbaseTx) {
-      // Ensure all inputs are in cache (may need individual load for intra-block
-      // chaining where a tx spends outputs of an earlier tx in the same block).
-      for (let inputIdx = 0; inputIdx < tx.inputs.length; inputIdx++) {
-        const input = tx.inputs[inputIdx];
-        if (!utxoManager.hasUTXO(input.prevOut)) {
-          const loaded = await utxoManager.preloadUTXO(input.prevOut);
-          if (!loaded) {
-            // W93: match Core's canonical reject reason
-            // (consensus/tx_verify.cpp:168 — bad-txns-inputs-missingorspent).
-            // This is the HaveInputs() precondition gate at the entry to
-            // Consensus::CheckTxInputs.
-            // Bug #132 (2026-05-26): prior message labelled `input.prevOut.vout`
-            // as "input N" — that's the prevout's vout, NOT the vin-index.
-            // Now logs both: `vin[i]` is the input index, `prevout txid:vout`
-            // is the spent coin's identity.
-            return {
-              ok: false,
-              error: `bad-txns-inputs-missingorspent: vin[${inputIdx}] of tx ${txidHex.slice(0, 16)} spends prevout ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout} at height ${height}`,
-            };
-          }
-        }
-      }
-
-      const utxoConfirmations: UTXOConfirmation[] = [];
-      const inputUTXOs: UTXOEntry[] = [];
-      // calculateSequenceLocks reads an input's coin MTP only when BIP-68 is
-      // enforced for this tx AND that input has the disable flag clear AND the
-      // time-type flag set (Core CalculateSequenceLocks, tx_verify.cpp:66-99 —
-      // the only caller of GetAncestor(...)->GetMedianTimePast()).  Compute it
-      // for exactly those inputs; everywhere else the value is never read, so
-      // 0 is recorded without the 11-header walk.
-      const seqLocksApply = enforceBIP68 && bip68VersionActive(tx.version);
-
-      for (const input of tx.inputs) {
-        const utxo = utxoManager.getUTXO(input.prevOut);
-        if (utxo) {
-          prevOutputs.push(utxo.scriptPubKey);
-          inputUTXOs.push(utxo);
-
-          // ── Coinbase maturity (COINBASE_MATURITY = 100 confirmations).
-          if (utxo.coinbase) {
-            const maturity = height - utxo.height;
-            if (maturity < params.coinbaseMaturity) {
+      if (!isCoinbaseTx) {
+        // Ensure all inputs are in cache (may need individual load for intra-block
+        // chaining where a tx spends outputs of an earlier tx in the same block).
+        for (let inputIdx = 0; inputIdx < tx.inputs.length; inputIdx++) {
+          const input = tx.inputs[inputIdx];
+          if (!utxoManager.hasUTXO(input.prevOut)) {
+            const loaded = await utxoManager.preloadUTXO(input.prevOut);
+            if (!loaded) {
+              // W93: match Core's canonical reject reason
+              // (consensus/tx_verify.cpp:168 — bad-txns-inputs-missingorspent).
+              // This is the HaveInputs() precondition gate at the entry to
+              // Consensus::CheckTxInputs.
+              // Bug #132 (2026-05-26): prior message labelled `input.prevOut.vout`
+              // as "input N" — that's the prevout's vout, NOT the vin-index.
+              // Now logs both: `vin[i]` is the input index, `prevout txid:vout`
+              // is the spent coin's identity.
               return {
                 ok: false,
-                error: `Immature coinbase spend in tx ${txidHex.slice(0, 16)}: maturity ${maturity} < ${params.coinbaseMaturity}`,
+                error: `bad-txns-inputs-missingorspent: vin[${inputIdx}] of tx ${txidHex.slice(0, 16)} spends prevout ${input.prevOut.txid.toString("hex").slice(0, 16)}:${input.prevOut.vout} at height ${height}`,
               };
             }
           }
+        }
 
-          // Collect (height, medianTimePast) for BIP-68.
-          // getUTXOMTP provides the MTP of the block at (utxoHeight - 1) when
-          // available (sync/blocks.ts wires HeaderSync here).  Without it we
-          // default to 0, which makes block-height-based locks work correctly
-          // and time-based locks conservative (never spuriously fails, may miss
-          // a time-lock violation at the exact MTP boundary).
-          const needsCoinTime =
-            seqLocksApply &&
-            ((input.sequence >>> 0) & SEQUENCE_LOCKTIME_DISABLE_FLAG) === 0 &&
-            (input.sequence & SEQUENCE_LOCKTIME_TYPE_FLAG) !== 0;
-          if (needsCoinTime) {
-            const coinMTP = getUTXOMTP ? await getUTXOMTP(utxo.height) : 0;
-            utxoConfirmations.push({ height: utxo.height, medianTimePast: coinMTP });
-          } else {
-            utxoConfirmations.push({ height: utxo.height, medianTimePast: 0 });
+        const utxoConfirmations: UTXOConfirmation[] = [];
+        const inputUTXOs: UTXOEntry[] = [];
+        // calculateSequenceLocks reads an input's coin MTP only when BIP-68 is
+        // enforced for this tx AND that input has the disable flag clear AND the
+        // time-type flag set (Core CalculateSequenceLocks, tx_verify.cpp:66-99 —
+        // the only caller of GetAncestor(...)->GetMedianTimePast()).  Compute it
+        // for exactly those inputs; everywhere else the value is never read, so
+        // 0 is recorded without the 11-header walk.
+        const seqLocksApply = enforceBIP68 && bip68VersionActive(tx.version);
+
+        for (const input of tx.inputs) {
+          const utxo = utxoManager.getUTXO(input.prevOut);
+          if (utxo) {
+            prevOutputs.push(utxo.scriptPubKey);
+            inputUTXOs.push(utxo);
+
+            // ── Coinbase maturity (COINBASE_MATURITY = 100 confirmations).
+            if (utxo.coinbase) {
+              const maturity = height - utxo.height;
+              if (maturity < params.coinbaseMaturity) {
+                return {
+                  ok: false,
+                  error: `Immature coinbase spend in tx ${txidHex.slice(0, 16)}: maturity ${maturity} < ${params.coinbaseMaturity}`,
+                };
+              }
+            }
+
+            // Collect (height, medianTimePast) for BIP-68.
+            // getUTXOMTP provides the MTP of the block at (utxoHeight - 1) when
+            // available (sync/blocks.ts wires HeaderSync here).  Without it we
+            // default to 0, which makes block-height-based locks work correctly
+            // and time-based locks conservative (never spuriously fails, may miss
+            // a time-lock violation at the exact MTP boundary).
+            const needsCoinTime =
+              seqLocksApply &&
+              ((input.sequence >>> 0) & SEQUENCE_LOCKTIME_DISABLE_FLAG) === 0 &&
+              (input.sequence & SEQUENCE_LOCKTIME_TYPE_FLAG) !== 0;
+            if (needsCoinTime) {
+              const coinMTP = getUTXOMTP ? await getUTXOMTP(utxo.height) : 0;
+              utxoConfirmations.push({ height: utxo.height, medianTimePast: coinMTP });
+            } else {
+              utxoConfirmations.push({ height: utxo.height, medianTimePast: 0 });
+            }
           }
         }
-      }
 
-      // ── BIP-68 / CSV sequence locks. Version compared unsigned (Core uint32_t).
-      if (enforceBIP68 && bip68VersionActive(tx.version)) {
-        const seqLockValid = checkSequenceLocks(
-          tx,
-          enforceBIP68,
-          height,
-          prevMTP,
-          utxoConfirmations
-        );
-        if (!seqLockValid) {
-          // Core ConnectBlock emits the SAME reject reason for a BIP-68
-          // SequenceLocks failure as for an IsFinalTx failure:
-          // state.Invalid(BLOCK_CONSENSUS, "bad-txns-nonfinal",
-          //   "contains a non-BIP68-final transaction ...")
-          // (validation.cpp:2557-2559). Carry the canonical `bad-txns-nonfinal`
-          // token in the error string so the BIP-22 reason mapper
-          // (ConsensusErrorCode.SEQUENCE_LOCK_NOT_SATISFIED -> "bad-txns-nonfinal")
-          // and any token-matching consumer surface the correct Core reason —
-          // matching the sibling IsFinalTx message above and rustoshi.
-          return {
-            ok: false,
-            error: `Sequence locks not satisfied (bad-txns-nonfinal): non-BIP68-final tx ${txidHex.slice(0, 16)} at height ${height}`,
-          };
-        }
-      }
-
-      // ── Script verification (skipped when skipScripts=true).
-      // Collect checks for the whole block and Wait() after the UTXO loop,
-      // matching Core CCheckQueue (validation.cpp ConnectBlock). Per-tx
-      // Promise.all cannot parallelise the common 1-input transaction.
-      if (!skipScripts) {
-        const copied = inputUTXOs.slice();
-        for (let i = 0; i < tx.inputs.length; i++) {
-          scriptJobs.push({
+        // ── BIP-68 / CSV sequence locks. Version compared unsigned (Core uint32_t).
+        if (enforceBIP68 && bip68VersionActive(tx.version)) {
+          const seqLockValid = checkSequenceLocks(
             tx,
-            inputIndex: i,
-            utxos: copied,
-            flags: blockScriptFlags,
-            txidHex,
+            enforceBIP68,
+            height,
+            prevMTP,
+            utxoConfirmations
+          );
+          if (!seqLockValid) {
+            // Core ConnectBlock emits the SAME reject reason for a BIP-68
+            // SequenceLocks failure as for an IsFinalTx failure:
+            // state.Invalid(BLOCK_CONSENSUS, "bad-txns-nonfinal",
+            //   "contains a non-BIP68-final transaction ...")
+            // (validation.cpp:2557-2559). Carry the canonical `bad-txns-nonfinal`
+            // token in the error string so the BIP-22 reason mapper
+            // (ConsensusErrorCode.SEQUENCE_LOCK_NOT_SATISFIED -> "bad-txns-nonfinal")
+            // and any token-matching consumer surface the correct Core reason —
+            // matching the sibling IsFinalTx message above and rustoshi.
+            return {
+              ok: false,
+              error: `Sequence locks not satisfied (bad-txns-nonfinal): non-BIP68-final tx ${txidHex.slice(0, 16)} at height ${height}`,
+            };
+          }
+        }
+
+        // ── Script verification (skipped when skipScripts=true).
+        // Queue this tx's checks (CCheckQueueControl::Add); the verdict is read
+        // at Wait() after the UTXO loop, matching Core CCheckQueue
+        // (validation.cpp ConnectBlock). Per-tx Promise.all cannot parallelise
+        // the common 1-input transaction.
+        if (scriptChecks) {
+          const copied = inputUTXOs.slice();
+          const txJobs: ScriptCheckJob[] = [];
+          for (let i = 0; i < tx.inputs.length; i++) {
+            txJobs.push({
+              tx,
+              inputIndex: i,
+              utxos: copied,
+              flags: blockScriptFlags,
+              txidHex,
+            });
+          }
+          scriptChecks.add(txJobs);
+        }
+
+        // ── Spend inputs; collect undo data.
+        // Also enforce per-coin and accumulated input MoneyRange checks.
+        // Core consensus/tx_verify.cpp::CheckTxInputs:184-188:
+        //   nValueIn += coin.out.nValue;
+        //   if (!MoneyRange(coin.out.nValue) || !MoneyRange(nValueIn))
+        //     → "bad-txns-inputvalues-outofrange"
+        const MAX_MONEY_INPUT = 2_100_000_000_000_000n; // 21_000_000 * COIN
+        for (const input of tx.inputs) {
+          const spentEntry = utxoManager.spendOutput(input.prevOut);
+          // Gate: individual coin value must be in MoneyRange.
+          if (spentEntry.amount < 0n || spentEntry.amount > MAX_MONEY_INPUT) {
+            return {
+              ok: false,
+              error: `bad-txns-inputvalues-outofrange in tx ${txidHex.slice(0, 16)}`,
+            };
+          }
+          totalInputValue += spentEntry.amount;
+          // Gate: accumulated input value must stay in MoneyRange.
+          if (totalInputValue > MAX_MONEY_INPUT) {
+            return {
+              ok: false,
+              error: `bad-txns-inputvalues-outofrange (accumulated) in tx ${txidHex.slice(0, 16)}`,
+            };
+          }
+          spentOutputs.push({
+            txid: input.prevOut.txid,
+            vout: input.prevOut.vout,
+            entry: spentEntry,
           });
         }
       }
 
-      // ── Spend inputs; collect undo data.
-      // Also enforce per-coin and accumulated input MoneyRange checks.
-      // Core consensus/tx_verify.cpp::CheckTxInputs:184-188:
-      //   nValueIn += coin.out.nValue;
-      //   if (!MoneyRange(coin.out.nValue) || !MoneyRange(nValueIn))
-      //     → "bad-txns-inputvalues-outofrange"
-      const MAX_MONEY_INPUT = 2_100_000_000_000_000n; // 21_000_000 * COIN
-      for (const input of tx.inputs) {
-        const spentEntry = utxoManager.spendOutput(input.prevOut);
-        // Gate: individual coin value must be in MoneyRange.
-        if (spentEntry.amount < 0n || spentEntry.amount > MAX_MONEY_INPUT) {
+      // ── Sigops cost (P2SH and witness sigop counting).
+      const txSigOpsCost = getTransactionSigOpCost(
+        tx,
+        prevOutputs,
+        sigopsP2SH,
+        sigopsWitness
+      );
+      totalSigOpsCost += txSigOpsCost;
+
+      // ── Add outputs as new UTXOs BEFORE processing subsequent transactions
+      //    so that block-internal chaining works correctly.
+      utxoManager.addTransaction(txid, tx, height, isCoinbaseTx);
+
+      // ── Sum output values; bump per-tx fee accumulator + MoneyRange check.
+      let txOutputValue = 0n;
+      for (const output of tx.outputs) {
+        totalOutputValue += output.value;
+        txOutputValue += output.value;
+      }
+      if (!isCoinbaseTx) {
+        // W93 Gate H: per-tx accumulated nFees MoneyRange check.
+        // Core consensus/tx_verify.cpp:196-199 computes
+        //   value_out = tx.GetValueOut(); if (nValueIn < value_out) → bad-txns-in-belowout.
+        // We track txValueIn locally to mirror this gate per tx (the cumulative
+        // bad-txns-in-belowout check still runs post-loop for safety).
+        let txValueIn = 0n;
+        for (const sp of spentOutputs.slice(-(tx.inputs.length))) {
+          txValueIn += sp.entry.amount;
+        }
+        if (txValueIn < txOutputValue) {
           return {
             ok: false,
-            error: `bad-txns-inputvalues-outofrange in tx ${txidHex.slice(0, 16)}`,
+            error: `bad-txns-in-belowout: value in (${txValueIn}) < value out (${txOutputValue}) in tx ${txidHex.slice(0, 16)} at height ${height}`,
           };
         }
-        totalInputValue += spentEntry.amount;
-        // Gate: accumulated input value must stay in MoneyRange.
-        if (totalInputValue > MAX_MONEY_INPUT) {
+        const txFee = txValueIn - txOutputValue;
+        nFees += txFee;
+        // Core validation.cpp:2543-2547 — MoneyRange check on the running
+        // total, NOT just the per-tx fee.  Match that exactly.
+        if (nFees < 0n || nFees > MAX_MONEY_FEE) {
           return {
             ok: false,
-            error: `bad-txns-inputvalues-outofrange (accumulated) in tx ${txidHex.slice(0, 16)}`,
+            error: `bad-txns-accumulated-fee-outofrange at tx ${txidHex.slice(0, 16)} (h=${height})`,
           };
         }
-        spentOutputs.push({
-          txid: input.prevOut.txid,
-          vout: input.prevOut.vout,
-          entry: spentEntry,
-        });
       }
     }
 
-    // ── Sigops cost (P2SH and witness sigop counting).
-    const txSigOpsCost = getTransactionSigOpCost(
-      tx,
-      prevOutputs,
-      sigopsP2SH,
-      sigopsWitness
-    );
-    totalSigOpsCost += txSigOpsCost;
-
-    // ── Add outputs as new UTXOs BEFORE processing subsequent transactions
-    //    so that block-internal chaining works correctly.
-    utxoManager.addTransaction(txid, tx, height, isCoinbaseTx);
-
-    // ── Sum output values; bump per-tx fee accumulator + MoneyRange check.
-    let txOutputValue = 0n;
-    for (const output of tx.outputs) {
-      totalOutputValue += output.value;
-      txOutputValue += output.value;
-    }
-    if (!isCoinbaseTx) {
-      // W93 Gate H: per-tx accumulated nFees MoneyRange check.
-      // Core consensus/tx_verify.cpp:196-199 computes
-      //   value_out = tx.GetValueOut(); if (nValueIn < value_out) → bad-txns-in-belowout.
-      // We track txValueIn locally to mirror this gate per tx (the cumulative
-      // bad-txns-in-belowout check still runs post-loop for safety).
-      let txValueIn = 0n;
-      for (const sp of spentOutputs.slice(-(tx.inputs.length))) {
-        txValueIn += sp.entry.amount;
-      }
-      if (txValueIn < txOutputValue) {
-        return {
-          ok: false,
-          error: `bad-txns-in-belowout: value in (${txValueIn}) < value out (${txOutputValue}) in tx ${txidHex.slice(0, 16)} at height ${height}`,
-        };
-      }
-      const txFee = txValueIn - txOutputValue;
-      nFees += txFee;
-      // Core validation.cpp:2543-2547 — MoneyRange check on the running
-      // total, NOT just the per-tx fee.  Match that exactly.
-      if (nFees < 0n || nFees > MAX_MONEY_FEE) {
-        return {
-          ok: false,
-          error: `bad-txns-accumulated-fee-outofrange at tx ${txidHex.slice(0, 16)} (h=${height})`,
-        };
-      }
-    }
-  }
-
-  // ── 5. Sigops ceiling.
-  //
-  // Bitcoin Core validation.cpp:2569-2572:
-  //   if (nSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
-  //     state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-sigops", ...);
-  //   }
-  // W93: emit canonical "bad-blk-sigops" prefix so cross-impl diff-test
-  // corpus and BIP-22 token mapping (bip22FromConnectError) catch it.
-  if (totalSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
-    return {
-      ok: false,
-      error: `bad-blk-sigops: cost ${totalSigOpsCost} exceeds maximum ${MAX_BLOCK_SIGOPS_COST} at height ${height}`,
-    };
-  }
-
-  // ── 6. Coinbase value ≤ subsidy + fees (consensus-critical).
-  //
-  // Reference: Bitcoin Core validation.cpp:2610-2614:
-  //   CAmount blockReward = nFees + GetBlockSubsidy(pindex->nHeight, ...);
-  //   if (block.vtx[0]->GetValueOut() > blockReward && state.IsValid())
-  //     state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount", ...);
-  // Never skipped by assumevalid — fScriptChecks only gates signature verification.
-  const coinbaseTx = block.transactions[0];
-  let coinbaseOutputValue = 0n;
-  for (const output of coinbaseTx.outputs) {
-    coinbaseOutputValue += output.value;
-  }
-  const subsidy = getBlockSubsidy(height, params);
-
-  // W93: nFees was tracked per-tx with MoneyRange check inside the loop, so
-  // any range / bad-txns-in-belowout error already returned above.  This
-  // post-loop check is the consensus-critical Core gate at validation.cpp:
-  // 2611.  The legacy `fees = totalInputValue - (totalOutputValue -
-  // coinbaseOutputValue)` arithmetic is kept as a defensive sanity check —
-  // it MUST equal nFees if the per-tx loop computed correctly.
-  const feesByTotals = totalInputValue - (totalOutputValue - coinbaseOutputValue);
-  if (feesByTotals !== nFees) {
-    // This would indicate an internal arithmetic mismatch — would only fire
-    // under a programmer bug, but match Core's "bad-cb-amount" semantics.
-    return {
-      ok: false,
-      error: `bad-cb-amount: internal fee accounting mismatch nFees=${nFees} vs totals-derived=${feesByTotals} at h=${height}`,
-    };
-  }
-
-  const blockReward = subsidy + nFees;
-  if (coinbaseOutputValue > blockReward) {
-    return {
-      ok: false,
-      error: `bad-cb-amount: coinbase pays too much (actual=${coinbaseOutputValue} vs limit=${blockReward}) at height ${height}`,
-    };
-  }
-
-  // CCheckQueue::Wait() — after UTXO apply / sigops / coinbase value, Core
-  // joins the script-check threads (validation.cpp:2618-2626). A failure
-  // here leaves the in-memory view dirty; the caller must not flush.
-  if (scriptJobs.length > 0) {
-    const scriptResult = await verifyScriptChecks(
-      scriptJobs,
-      effectiveScriptThreads,
-      utxoManager.getMaxCacheBytes(),
-    );
-    if (!scriptResult.valid) {
-      const who = scriptResult.failedTxidHex?.slice(0, 16) ?? "unknown";
-      const errSuffix =
-        (scriptResult.failedInput !== undefined
-          ? ` (input ${scriptResult.failedInput})`
-          : "") +
-        (scriptResult.error ? `: ${scriptResult.error}` : "");
+    // ── 5. Sigops ceiling.
+    //
+    // Bitcoin Core validation.cpp:2569-2572:
+    //   if (nSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
+    //     state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-sigops", ...);
+    //   }
+    // W93: emit canonical "bad-blk-sigops" prefix so cross-impl diff-test
+    // corpus and BIP-22 token mapping (bip22FromConnectError) catch it.
+    if (totalSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
       return {
         ok: false,
-        error: `Script verification failed in tx ${who} at height ${height}${errSuffix}`,
+        error: `bad-blk-sigops: cost ${totalSigOpsCost} exceeds maximum ${MAX_BLOCK_SIGOPS_COST} at height ${height}`,
       };
     }
-  }
 
-  return {
-    ok: true,
-    spentOutputs,
-    totalInputValue,
-    totalOutputValue,
-    coinbaseOutputValue,
-  };
+    // ── 6. Coinbase value ≤ subsidy + fees (consensus-critical).
+    //
+    // Reference: Bitcoin Core validation.cpp:2610-2614:
+    //   CAmount blockReward = nFees + GetBlockSubsidy(pindex->nHeight, ...);
+    //   if (block.vtx[0]->GetValueOut() > blockReward && state.IsValid())
+    //     state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount", ...);
+    // Never skipped by assumevalid — fScriptChecks only gates signature verification.
+    const coinbaseTx = block.transactions[0];
+    let coinbaseOutputValue = 0n;
+    for (const output of coinbaseTx.outputs) {
+      coinbaseOutputValue += output.value;
+    }
+    const subsidy = getBlockSubsidy(height, params);
+
+    // W93: nFees was tracked per-tx with MoneyRange check inside the loop, so
+    // any range / bad-txns-in-belowout error already returned above.  This
+    // post-loop check is the consensus-critical Core gate at validation.cpp:
+    // 2611.  The legacy `fees = totalInputValue - (totalOutputValue -
+    // coinbaseOutputValue)` arithmetic is kept as a defensive sanity check —
+    // it MUST equal nFees if the per-tx loop computed correctly.
+    const feesByTotals = totalInputValue - (totalOutputValue - coinbaseOutputValue);
+    if (feesByTotals !== nFees) {
+      // This would indicate an internal arithmetic mismatch — would only fire
+      // under a programmer bug, but match Core's "bad-cb-amount" semantics.
+      return {
+        ok: false,
+        error: `bad-cb-amount: internal fee accounting mismatch nFees=${nFees} vs totals-derived=${feesByTotals} at h=${height}`,
+      };
+    }
+
+    const blockReward = subsidy + nFees;
+    if (coinbaseOutputValue > blockReward) {
+      return {
+        ok: false,
+        error: `bad-cb-amount: coinbase pays too much (actual=${coinbaseOutputValue} vs limit=${blockReward}) at height ${height}`,
+      };
+    }
+
+    // CCheckQueue::Wait() — after UTXO apply / sigops / coinbase value, Core
+    // joins the script-check threads (validation.cpp:2618-2626). A failure
+    // here leaves the in-memory view dirty; the caller must not flush.
+    if (scriptChecks) {
+      const scriptResult = await scriptChecks.finish();
+      if (!scriptResult.valid) {
+        const who = scriptResult.failedTxidHex?.slice(0, 16) ?? "unknown";
+        const errSuffix =
+          (scriptResult.failedInput !== undefined
+            ? ` (input ${scriptResult.failedInput})`
+            : "") +
+          (scriptResult.error ? `: ${scriptResult.error}` : "");
+        return {
+          ok: false,
+          error: `Script verification failed in tx ${who} at height ${height}${errSuffix}`,
+        };
+      }
+    }
+
+    return {
+      ok: true,
+      spentOutputs,
+      totalInputValue,
+      totalOutputValue,
+      coinbaseOutputValue,
+    };
+  } finally {
+    // A block that fails another check before the script Wait(), or throws,
+    // still has checks queued for the workers: stop dispatching and let the
+    // in-flight batches drain before the next block. A no-op after finish().
+    await scriptChecks?.abandon();
+  }
 }

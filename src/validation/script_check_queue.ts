@@ -130,6 +130,16 @@ function hardwareThreads(): number {
 	return clampScriptThreads(0);
 }
 
+/** An open CCheckQueue stream on the pool (see VerifyPool.openStream). */
+interface ScriptCheckStream {
+	/** Queue jobs; full batches go to idle workers immediately. */
+	push(jobs: ScriptCheckJob[]): void;
+	/** No more jobs: dispatch the rest and wait for every result. */
+	close(): Promise<ScriptCheckResult>;
+	/** Stop dispatching and wait for in-flight batches; results are dropped. */
+	cancel(): Promise<void>;
+}
+
 interface Inflight {
 	resolve: (results: WorkerOut) => void;
 	reject: (err: Error) => void;
@@ -195,6 +205,11 @@ class VerifyPool {
 		pending.resolve(msg);
 	}
 
+	/** Every worker is up and none has failed (no await needed). */
+	isReady(): boolean {
+		return this.readyCount >= this.size && this.failed === null;
+	}
+
 	async waitReady(): Promise<void> {
 		await this.ready;
 		if (this.failed) throw this.failed;
@@ -218,31 +233,66 @@ class VerifyPool {
 	}
 
 	/**
-	 * CCheckQueue-style drain: a bounded FIFO of per-input jobs, at most
-	 * `nWorkers` in-flight batches of SCRIPTCHECK_BATCH_SIZE (and never more
-	 * than `budget` bytes each). On the first failure we stop dispatching
-	 * later-index jobs but wait for in-flight work, then return the
-	 * earliest-index failure so the reject reason does not depend on the
-	 * split. Core's queue is LIFO; we FIFO so serial and N-worker paths
-	 * report the same first failure without racing a later-index job.
+	 * CCheckQueue-style drain of a complete job list: a stream that is closed
+	 * as soon as every job is queued.
 	 */
 	private async drain(
 		jobs: ScriptCheckJob[],
 		nWorkers: number,
 		budget: number,
 	): Promise<ScriptCheckResult> {
+		const stream = this.openStream(nWorkers, budget);
+		stream.push(jobs);
+		return stream.close();
+	}
+
+	/**
+	 * Open a CCheckQueue-style stream: a bounded FIFO of per-input jobs fed
+	 * WHILE the caller is still collecting them, at most `nWorkers` in-flight
+	 * batches of SCRIPTCHECK_BATCH_SIZE (and never more than `budget` bytes
+	 * each).
+	 *
+	 * ConnectBlock used to collect every job of the block and only then hand
+	 * them to the pool, so the workers sat idle for the whole tx loop
+	 * (ARCH-2.5: script wait 31% of block time at 900k, workers ~50% used).
+	 * Core's CCheckQueueControl::Add hands checks to the threads as the loop
+	 * produces them. Here `push` dispatches synchronously (postMessage) to any
+	 * idle worker once a full batch is queued, so the workers run while the
+	 * main thread continues the loop; `close` dispatches the remainder split
+	 * across the pool and waits.
+	 *
+	 * On the first failure we stop dispatching later-index jobs but wait for
+	 * in-flight work, then return the earliest-index failure so the reject
+	 * reason does not depend on the split or on when jobs were pushed. Core's
+	 * queue is LIFO; we FIFO so serial and N-worker paths report the same
+	 * first failure without racing a later-index job.
+	 */
+	openStream(nWorkers: number, budget: number): ScriptCheckStream {
 		peakInFlightJobs = 0;
 		peakInFlightBytes = 0;
 		lastDispatchWorkers = 0;
 
+		const jobs: ScriptCheckJob[] = [];
 		let qHead = 0;
+		let closed = false;
+		let cancelled = false;
 		let earliestFailIndex = Number.POSITIVE_INFINITY;
 		let failResult: ScriptCheckResult | null = null;
+		let fault: unknown = null;
+		let inFlightBatches = 0;
 		let inFlightJobs = 0;
 		let inFlightBytes = 0;
 		const used = new Set<number>();
+		const idle: number[] = [];
+		for (let w = nWorkers - 1; w >= 0; w--) idle.push(w);
+		let settle: ((r: ScriptCheckResult) => void) | null = null;
+		let fail: ((e: unknown) => void) | null = null;
+		const done = new Promise<ScriptCheckResult>((resolve, reject) => {
+			settle = resolve;
+			fail = reject;
+		});
 
-		// Per-tx packed size (tx + its UTXO vector), computed once per drain.
+		// Per-tx packed size (tx + its UTXO vector), computed once per stream.
 		// takeBatch used to rebuild and re-measure the whole candidate batch
 		// for every job it appended — O(batch²) wire conversions per batch on
 		// the main thread. Sizes are now exact and accumulated incrementally.
@@ -261,15 +311,24 @@ class VerifyPool {
 			origIndices: number[];
 			bytes: number;
 		} | null => {
+			if (cancelled || fault !== null) return null;
 			const items: ScriptCheckJob[] = [];
 			const origIndices: number[] = [];
 			const remaining = jobs.length - qHead;
 			if (remaining <= 0) return null;
-			// Core: nNow = max(1, min(nBatchSize, queue / (nTotal+nIdle+1))).
-			// Split leftover work across the pool so a 256-input block still
-			// uses all requested workers instead of two 128-job chunks.
-			const adaptive = Math.max(1, Math.ceil(remaining / nWorkers));
-			const cap = Math.min(SCRIPTCHECK_BATCH_SIZE, adaptive);
+			// While the caller is still pushing, send only full batches; once
+			// closed, Core's nNow = max(1, min(nBatchSize, queue /
+			// (nTotal+nIdle+1))) splits the leftover across the pool so a
+			// 256-input block still uses all requested workers instead of two
+			// 128-job chunks.
+			let cap: number;
+			if (closed) {
+				const adaptive = Math.max(1, Math.ceil(remaining / nWorkers));
+				cap = Math.min(SCRIPTCHECK_BATCH_SIZE, adaptive);
+			} else {
+				if (remaining < SCRIPTCHECK_BATCH_SIZE) return null;
+				cap = SCRIPTCHECK_BATCH_SIZE;
+			}
 			const inBatch = new Set<Transaction>();
 			let bytes = PACKED_HEADER_BYTES;
 			while (qHead < jobs.length && items.length < cap) {
@@ -292,52 +351,84 @@ class VerifyPool {
 			return { items, origIndices, bytes };
 		};
 
-		const workerLoop = async (w: number): Promise<void> => {
-			while (true) {
+		const onResult = (
+			batch: { items: ScriptCheckJob[]; origIndices: number[] },
+			out: WorkerOut,
+		): void => {
+			if (out.kind === "crash") {
+				throw new Error(out.error);
+			}
+			if (out.kind !== "result") {
+				throw new Error(`unexpected worker message ${out.kind}`);
+			}
+			for (const item of out.results) {
+				if (item.valid) continue;
+				const origIndex = batch.origIndices[item.jobIndex]!;
+				if (origIndex >= earliestFailIndex) continue;
+				const job = batch.items[item.jobIndex]!;
+				earliestFailIndex = origIndex;
+				failResult = {
+					valid: false,
+					error: item.error ?? "Input verification failed",
+					failedInput: job.inputIndex,
+					failedTxidHex: job.txidHex,
+				};
+			}
+		};
+
+		const pump = (): void => {
+			while (idle.length > 0) {
 				const batch = takeBatch();
-				if (!batch) return;
+				if (!batch) break;
+				const w = idle.pop()!;
 				used.add(w);
+				inFlightBatches++;
 				inFlightJobs += batch.items.length;
 				inFlightBytes += batch.bytes;
 				if (inFlightJobs > peakInFlightJobs) peakInFlightJobs = inFlightJobs;
 				if (inFlightBytes > peakInFlightBytes) peakInFlightBytes = inFlightBytes;
-				try {
-					const out = await this.sendChunk(this.workers[w]!, batch.items);
-					if (out.kind === "crash") {
-						throw new Error(out.error);
-					}
-					if (out.kind !== "result") {
-						throw new Error(`unexpected worker message ${out.kind}`);
-					}
-					for (const item of out.results) {
-						if (item.valid) continue;
-						const origIndex = batch.origIndices[item.jobIndex]!;
-						if (origIndex >= earliestFailIndex) continue;
-						const job = batch.items[item.jobIndex]!;
-						earliestFailIndex = origIndex;
-						failResult = {
-							valid: false,
-							error: item.error ?? "Input verification failed",
-							failedInput: job.inputIndex,
-							failedTxidHex: job.txidHex,
-						};
-					}
-				} finally {
-					inFlightJobs -= batch.items.length;
-					inFlightBytes -= batch.bytes;
-				}
+				this.sendChunk(this.workers[w]!, batch.items)
+					.then((out) => onResult(batch, out))
+					.catch((e) => {
+						if (fault === null) fault = e;
+					})
+					.finally(() => {
+						inFlightBatches--;
+						inFlightJobs -= batch.items.length;
+						inFlightBytes -= batch.bytes;
+						idle.push(w);
+						pump();
+					});
 			}
+			if (!closed || inFlightBatches > 0) return;
+			if (fault === null && !cancelled && qHead < jobs.length) return;
+			lastDispatchWorkers = used.size;
+			const s = settle;
+			const f = fail;
+			settle = null;
+			fail = null;
+			if (fault !== null && !cancelled) f?.(fault);
+			else s?.(failResult ?? { valid: true });
 		};
 
-		const settled = await Promise.allSettled(
-			Array.from({ length: nWorkers }, (_, w) => workerLoop(w)),
-		);
-		lastDispatchWorkers = used.size;
-		const rejected = settled.find((s) => s.status === "rejected");
-		if (rejected && rejected.status === "rejected") {
-			throw rejected.reason;
-		}
-		return failResult ?? { valid: true };
+		return {
+			push: (more: ScriptCheckJob[]): void => {
+				if (closed) throw new Error("script-check stream already closed");
+				for (const j of more) jobs.push(j);
+				pump();
+			},
+			close: (): Promise<ScriptCheckResult> => {
+				closed = true;
+				pump();
+				return done;
+			},
+			cancel: async (): Promise<void> => {
+				cancelled = true;
+				closed = true;
+				pump();
+				await done.catch(() => {});
+			},
+		};
 	}
 
 	private sendChunk(
@@ -552,4 +643,138 @@ export async function verifyScriptChecks(
 		);
 		return verifySequential(pending);
 	}
+}
+
+/**
+ * Block-level script checks fed during ConnectBlock's tx loop (Core
+ * CCheckQueueControl: Add() per tx, Wait() after the loop).
+ *
+ * Same decisions as {@link verifyScriptChecks} over the full job list:
+ * threads <= 1 or fewer than MIN_JOBS_FOR_POOL jobs run serially at
+ * `finish`; otherwise sig-cache hits are skipped and the misses run on the
+ * pool, with the same earliest-index failure and the same sequential re-run
+ * if the pool faults. The difference is WHEN the pool sees them: once
+ * SCRIPTCHECK_BATCH_SIZE cache misses are queued, full batches are posted
+ * to idle workers from inside `add`, so the workers verify while the main
+ * thread is still in the tx loop.
+ */
+export interface ScriptCheckSession {
+	/** Queue one transaction's input checks (in block order). */
+	add(jobs: ScriptCheckJob[]): void;
+	/** Every job is queued: wait for the verdict. */
+	finish(): Promise<ScriptCheckResult>;
+	/** The block failed another check first: drop the jobs, quiesce. */
+	abandon(): Promise<void>;
+}
+
+export function beginScriptChecks(
+	threads?: number,
+	cacheBytes?: number,
+): ScriptCheckSession {
+	const n = clampScriptThreads(threads ?? hardwareThreads(), cacheBytes);
+	const all: ScriptCheckJob[] = [];
+	const pending: ScriptCheckJob[] = [];
+	const pendingKeys: ReturnType<typeof computeInputSigCacheKey>[] = [];
+	let fault: SystemFaultError | null = null;
+	let stream: ScriptCheckStream | null = null;
+	let opening: Promise<void> | null = null;
+	let streamFault: unknown = null;
+	let fed = 0; // pending[0..fed) went to the stream
+
+	const feed = (): void => {
+		if (!stream || fed >= pending.length) return;
+		stream.push(pending.slice(fed));
+		fed = pending.length;
+	};
+
+	const open = (): Promise<void> => {
+		// The pool is long-lived: once it is up, open the stream in this tick
+		// so the first full batch leaves inside add(). Waiting on getPool()
+		// would defer it to the loop's next await, and a block whose inputs
+		// are all cached may have none before finish().
+		if (!opening && globalPool && globalPool.size >= n && globalPool.isReady()) {
+			stream = globalPool.openStream(n, scriptCheckWireBudget(cacheBytes));
+			feed();
+			opening = Promise.resolve();
+		}
+		if (!opening) {
+			opening = getPool(n)
+				.then((pool) => {
+					stream = pool.openStream(n, scriptCheckWireBudget(cacheBytes));
+					feed();
+				})
+				.catch((e) => {
+					streamFault = e;
+				});
+		}
+		return opening;
+	};
+
+	const sequentialRerun = (e: unknown): ScriptCheckResult => {
+		// Same as verifyScriptChecks: a worker that crashed, timed out or
+		// produced no result is a fault of this node, not of the block
+		// (gate 6) — re-run the SAME jobs once, on this thread.
+		console.warn(
+			`[script-check] worker pool failed (${e instanceof Error ? e.message : String(e)}); re-running sequentially`,
+		);
+		return verifySequential(pending);
+	};
+
+	return {
+		add(jobs: ScriptCheckJob[]): void {
+			for (const job of jobs) all.push(job);
+			if (n <= 1 || fault !== null) return;
+			for (const job of jobs) {
+				const utxo = job.utxos[job.inputIndex];
+				if (!utxo) {
+					// Gate 6 (as verifyScriptChecks): a job without its prevout
+					// is a broken caller invariant, reported at finish().
+					fault = new SystemFaultError(
+						`script check job has no prevout (input ${job.inputIndex} of ${job.txidHex ?? "?"})`,
+					);
+					return;
+				}
+				const key = computeInputSigCacheKey(
+					job.tx,
+					job.inputIndex,
+					utxo,
+					job.flags,
+				);
+				if (!globalSigCache.lookup(key)) {
+					pending.push(job);
+					pendingKeys.push(key);
+				}
+			}
+			if (stream) feed();
+			else if (pending.length >= SCRIPTCHECK_BATCH_SIZE) void open();
+		},
+
+		async finish(): Promise<ScriptCheckResult> {
+			if (all.length === 0) return { valid: true };
+			const usePool = n > 1 && all.length >= MIN_JOBS_FOR_POOL;
+			if (!usePool) return verifySequential(all);
+			if (fault !== null) {
+				await this.abandon();
+				throw fault;
+			}
+			if (!stream && !opening && pending.length === 0) return { valid: true };
+			await open();
+			if (!stream) return sequentialRerun(streamFault);
+			feed();
+			try {
+				const result = await (stream as ScriptCheckStream).close();
+				if (result.valid) {
+					for (const key of pendingKeys) globalSigCache.insert(key);
+				}
+				return result;
+			} catch (e) {
+				return sequentialRerun(e);
+			}
+		},
+
+		async abandon(): Promise<void> {
+			if (opening) await opening;
+			if (stream) await (stream as ScriptCheckStream).cancel();
+		},
+	};
 }
