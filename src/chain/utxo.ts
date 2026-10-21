@@ -367,6 +367,15 @@ export class CoinsViewDB extends CoinsView {
       }
     }
 
+    // Height index + nTx of the blocks these coins reflect (ChainDB
+    // stageConnectedBlock). Snapshotted here, in the same tick that collected
+    // the dirty coins above, so the batch carries the metadata of exactly
+    // those blocks: the height index never reaches disk ahead of its coins.
+    // Before extraOps, so the caller's own ops for the same keys win.
+    const staged = this.db.takeStagedConnects();
+    const stagedOps = await staged.build();
+    ops.push(...stagedOps);
+
     // Append any extra operations so they are committed atomically
     // with the UTXO changes (e.g., chain state update).
     if (extraOps) {
@@ -376,6 +385,7 @@ export class CoinsViewDB extends CoinsView {
     if (ops.length > 0) {
       try {
         await this.db.batch(ops);
+        this.db.commitStagedConnects(staged.seq);
       } finally {
         // AFTER the batch landed: a read issued before this point may have
         // seen the pre-write value (F0).

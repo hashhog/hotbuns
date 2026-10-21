@@ -1166,7 +1166,7 @@ export class BlockSync {
       } finally {
         // Whatever happened, the live view must re-read the (possibly
         // rolled-back) disk state at the manager's tip.
-        this.utxoManager.clearCache(cs.getBestBlock().hash);
+        this.discardView(cs.getBestBlock().hash);
       }
       if (!result.success) return result;
       const newTip = cs.getBestBlock();
@@ -1279,7 +1279,7 @@ export class BlockSync {
     // `view-out-of-sync` gate (the cached view-best != the new block's prev).
     // Drop BlockSync's stale cache and re-point its view at the now-persisted
     // fork tip so subsequent connects lazy-load the correct rolled-back coins.
-    this.utxoManager.clearCache(tip.hash);
+    this.discardView(tip.hash);
     this.state.nextHeightToProcess = newFrontier;
     if (this.state.nextHeightToRequest > newFrontier) {
       this.state.nextHeightToRequest = newFrontier;
@@ -4121,12 +4121,25 @@ export class BlockSync {
    * (`lastFlushedHeight`). Shared by the verdict path and the system-fault
    * path of processOrderedBlocksInner.
    */
+  /**
+   * Throw the live UTXO view away (UTXOManager.clearCache) together with the
+   * height index + nTx staged for the blocks it described
+   * (ChainDB.stageConnectedBlock): those blocks are no longer reflected by
+   * any coins a flush could write, and are connected again. Only BlockSync
+   * stages, so only BlockSync discards; ChainStateManager's own view on the
+   * same ChainDB must not drop BlockSync's staged entries.
+   */
+  private discardView(bestBlockAfterClear?: Buffer): void {
+    this.utxoManager.clearCache(bestBlockAfterClear);
+    this.db.discardStagedConnects();
+  }
+
   private discardUnflushedView(): void {
     const flushedTipEntry = this.headerSync.getHeaderByHeight(
       this.lastFlushedHeight
     );
     if (flushedTipEntry && this.lastFlushedHeight > 0) {
-      this.utxoManager.clearCache(flushedTipEntry.hash);
+      this.discardView(flushedTipEntry.hash);
     } else if (this.lastFlushedHeight === 0) {
       // Pre-first-flush: the on-disk UTXO set is the genesis state.
       // The all-zero "fresh view" sentinel is correct here. Set it
@@ -4134,7 +4147,7 @@ export class BlockSync {
       // last CONNECTED block, so the fresh cache would lazy-load a tip
       // whose coins were just discarded (and a shutdown flush would
       // then persist CHAIN_STATE for it).
-      this.utxoManager.clearCache(Buffer.alloc(32));
+      this.discardView(Buffer.alloc(32));
     } else {
       // lastFlushedHeight > 0 but its header is missing — should not
       // happen (headers are synced before blocks).  Bare clear keeps
@@ -4144,7 +4157,7 @@ export class BlockSync {
         `[connect-fail] could not resolve header for lastFlushedHeight=` +
           `${this.lastFlushedHeight}; UTXO view best-block left unreconciled`
       );
-      this.utxoManager.clearCache();
+      this.discardView();
     }
   }
 
@@ -5149,7 +5162,7 @@ export class BlockSync {
       const restore = this.connectReorgRestoreTip;
       this.connectReorgRestoreTip = null;
       if (restore !== null) {
-        this.utxoManager.clearCache(restore);
+        this.discardView(restore);
         this.reorgAbortRestoredTip = restore;
       }
       throw err;
@@ -5310,7 +5323,7 @@ export class BlockSync {
       // Discard the dirty reorg mutations and re-point the view (cache +
       // CoinsViewDB) at the on-disk active tip.  `reorgPendingOps` is dropped
       // on the floor by returning before the flush — no disk write occurred.
-      this.utxoManager.clearCache(oldTipBeforeConnect);
+      this.discardView(oldTipBeforeConnect);
       // Signal the caller (processOrderedBlocks) to SKIP its own clearCache,
       // which would otherwise re-point to the competing branch.
       this.reorgAbortRestoredTip = oldTipBeforeConnect;
@@ -5748,20 +5761,20 @@ export class BlockSync {
       }
     }
 
-    // Always persist nTx for this block so getblockheader can return it
-    // without re-reading the block body.  This is a tiny write (4 bytes)
-    // and is idempotent — updateBlockIndexNTx no-ops if nTx is already set.
-    // The full block index (including status + dataPos) is written in the
-    // shouldFlush batch below; this covers the non-flush IBD path.
+    // Non-flush IBD path: record this block's nTx (getblockheader without the
+    // body) and its active-chain height->hash entry (CChain::SetTip, so
+    // getblockhash(h) resolves every connected height). The full block index
+    // is written in the shouldFlush batch below.
+    //
+    // Staged, not written: both ride the next coins flush batch with the
+    // coins and CHAIN_STATE (Core FlushStateToDisk writes the block index and
+    // the coins together). They used to be two awaited LevelDB writes per
+    // block, 25% of block time at 900k (ARCH-2.5), and they put the height
+    // index AHEAD of the durable coins: an unclean stop left heights above
+    // CHAIN_STATE that load() had to roll back (cf3b7dd). Readers see staged
+    // entries through ChainDB.getBlockHashByHeight / getBlockIndex.
     if (!shouldFlush) {
-      await this.db.updateBlockIndexNTx(blockHash, block.transactions.length);
-      // CChain::SetTip parity for the non-flush IBD path.  This block is being
-      // connected on the ACTIVE chain, so its height->hash active-chain index
-      // entry must advance now.  Previously updateBlockIndexNTx wrote this as a
-      // side effect (putBlockIndex), but that write is now gated off (it also
-      // fired for fork/metadata updates and clobbered the active tip); write it
-      // explicitly here so getblockhash(h) resolves every connected IBD height.
-      await this.db.putBlockHashByHeight(height, blockHash);
+      this.db.stageConnectedBlock(height, blockHash, block.transactions.length);
     }
 
     if (shouldFlush) {

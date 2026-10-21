@@ -362,6 +362,21 @@ export class ChainDB {
    *  background chainstate, which derives a SEPARATE store path from it). */
   private readonly dbPath: string;
 
+  /**
+   * Active-chain metadata of blocks connected since the last coins flush:
+   * the height -> hash entry (Core `CChain::SetTip`) and the block's nTx.
+   * Deep-IBD blocks used to write both with two awaited LevelDB round-trips
+   * per block (ARCH-2.5: 25% of block time at 900k), ahead of their coins.
+   * They are now kept here and written by {@link CoinsViewDB.batchWrite} in
+   * the same batch as the coins and CHAIN_STATE (Core FlushStateToDisk), so
+   * the height index never leads the durable UTXO tip. Readers see them
+   * through {@link getBlockHashByHeight} / {@link getBlockIndex}.
+   * `seq` orders a staged entry against a later direct write.
+   */
+  private stagedHeights = new Map<number, { hash: Buffer; seq: number }>();
+  private stagedNTx = new Map<string, { hash: Buffer; nTx: number; seq: number }>();
+  private stagedSeq = 0;
+
   constructor(dbPath: string) {
     this.dbPath = dbPath;
     this.db = new ClassicLevel<Buffer, Buffer>(dbPath, {
@@ -510,6 +525,7 @@ export class ChainDB {
     if (this.closing) {
       return;
     }
+    this.stagedHeights.delete(height);
     const key = makeKey(DBPrefix.HEADER, encodeHeight(height));
     await this.db.del(key);
   }
@@ -520,6 +536,9 @@ export class ChainDB {
    * rewind the height index to the durable UTXO tip after an unclean stop.
    */
   async deleteBlockHashesAbove(height: number): Promise<number[]> {
+    for (const h of [...this.stagedHeights.keys()]) {
+      if (h > height) this.stagedHeights.delete(h);
+    }
     const it = this.db.iterator({
       gt: makeKey(DBPrefix.HEADER, encodeHeight(height)),
       lt: Buffer.from([DBPrefix.HEADER + 1]),
@@ -550,6 +569,7 @@ export class ChainDB {
     if (this.closing) {
       return;
     }
+    this.stagedHeights.delete(height);
     const key = makeKey(DBPrefix.HEADER, encodeHeight(height));
     await this.db.put(key, hash);
   }
@@ -560,10 +580,88 @@ export class ChainDB {
     if (value === undefined) {
       return null;
     }
-    return deserializeBlockIndex(value);
+    const record = deserializeBlockIndex(value);
+    if (record.nTx === 0) {
+      const staged = this.stagedNTx.get(hash.toString('hex'));
+      if (staged) record.nTx = staged.nTx;
+    }
+    return record;
+  }
+
+  /**
+   * Record an active-chain connect without writing it: the height -> hash
+   * entry and the block's nTx (what {@link putBlockHashByHeight} and
+   * {@link updateBlockIndexNTx} wrote per block before). They reach disk with
+   * the next coins flush, atomically with the coins and CHAIN_STATE they
+   * belong to. See {@link stagedHeights}.
+   */
+  stageConnectedBlock(height: number, hash: Buffer, nTx: number): void {
+    const seq = ++this.stagedSeq;
+    this.stagedHeights.set(height, { hash, seq });
+    if (nTx > 0) this.stagedNTx.set(hash.toString('hex'), { hash, nTx, seq });
+  }
+
+  /** Number of connects staged and not yet flushed (tests, diagnostics). */
+  stagedConnectCount(): number {
+    return this.stagedHeights.size;
+  }
+
+  /**
+   * Drop every staged connect. Called when the in-memory UTXO view is thrown
+   * away (UTXOManager.clearCache): the blocks it described are no longer
+   * reflected by any coins that could be flushed, and are connected again.
+   */
+  discardStagedConnects(): void {
+    this.stagedHeights.clear();
+    this.stagedNTx.clear();
+  }
+
+  /**
+   * Snapshot the staged connects for a coins flush. Taken synchronously, at
+   * the same point the flush collects its dirty coins, so the batch carries
+   * the metadata of exactly the blocks whose coins it carries. The nTx ops
+   * read-modify-write the stored record (updateBlockIndexNTx semantics: only
+   * a record that exists and has nTx 0). Pass `seq` to
+   * {@link commitStagedConnects} once the batch is written.
+   */
+  takeStagedConnects(): { seq: number; build: () => Promise<BatchOperation[]> } {
+    const seq = this.stagedSeq;
+    const heights = [...this.stagedHeights.entries()];
+    const ntx = [...this.stagedNTx.values()];
+    const build = async (): Promise<BatchOperation[]> => {
+      const ops: BatchOperation[] = [];
+      for (const [height, { hash }] of heights) {
+        ops.push(this.buildHeightHashPutOp(height, hash));
+      }
+      const values = await Promise.all(
+        ntx.map((s) => this.db.get(makeKey(DBPrefix.BLOCK_INDEX, s.hash)))
+      );
+      for (let i = 0; i < ntx.length; i++) {
+        const value = values[i];
+        if (value === undefined) continue;
+        const record = deserializeBlockIndex(value);
+        if (record.nTx !== 0) continue;
+        record.nTx = ntx[i]!.nTx;
+        ops.push(this.buildBlockIndexPutOp(ntx[i]!.hash, record));
+      }
+      return ops;
+    };
+    return { seq, build };
+  }
+
+  /** Forget staged connects at or below `seq`: they are on disk now. */
+  commitStagedConnects(seq: number): void {
+    for (const [h, s] of this.stagedHeights) {
+      if (s.seq <= seq) this.stagedHeights.delete(h);
+    }
+    for (const [k, s] of this.stagedNTx) {
+      if (s.seq <= seq) this.stagedNTx.delete(k);
+    }
   }
 
   async getBlockHashByHeight(height: number): Promise<Buffer | null> {
+    const staged = this.stagedHeights.get(height);
+    if (staged) return staged.hash;
     const key = makeKey(DBPrefix.HEADER, encodeHeight(height));
     const value = await this.db.get(key);
     if (value === undefined) {
@@ -789,6 +887,7 @@ export class ChainDB {
    * Execute batch operations atomically.
    */
   async batch(ops: BatchOperation[]): Promise<void> {
+    const seqAtStart = this.stagedSeq;
     const batch = this.db.batch();
     for (const op of ops) {
       const key = makeKey(op.prefix, op.key);
@@ -802,6 +901,16 @@ export class ChainDB {
       }
     }
     await batch.write();
+    // A height -> hash write in this batch supersedes a connect staged before
+    // it (reorg ops, invalidateblock); a later stage still wins.
+    if (this.stagedHeights.size > 0) {
+      for (const op of ops) {
+        if (op.prefix !== DBPrefix.HEADER || op.key.length !== 4) continue;
+        const h = op.key.readUInt32BE(0);
+        const s = this.stagedHeights.get(h);
+        if (s && s.seq <= seqAtStart) this.stagedHeights.delete(h);
+      }
+    }
   }
 
   /**
