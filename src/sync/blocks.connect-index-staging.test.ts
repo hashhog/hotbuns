@@ -748,5 +748,141 @@ describe("staged connects under a disconnect or a shorter-chain reorg", () => {
     },
     30_000,
   );
-});
 
+  test(
+    "a status update of a staged block writes its durable nTx, not the staged one",
+    async () => {
+      // Review #1 on hotbuns#16: getBlockIndex overlays the staged nTx, and
+      // updateBlockStatus wrote that record back with its own put, outside
+      // the coins batch (submitblock -> storeSideBranchBlock during deep IBD).
+      const utxo = new UTXOManager(db);
+      await connect(utxo, 1, F(1));
+      await db.updateBlockStatus(F(1), 8 /* HAVE_DATA */);
+      // Readers still see the staged nTx.
+      expect((await db.getBlockIndex(F(1)))?.nTx).toBe(2);
+      await reopen(); // the process drops before any coins flush
+      const rec = await db.getBlockIndex(F(1));
+      expect(rec?.status).toBe(8);
+      expect(rec?.nTx).toBe(0);
+      expect(await db.getBlockHashByHeight(1)).toBeNull();
+    },
+    30_000,
+  );
+
+  test(
+    "a status op built for a staged block and written on its own carries the durable nTx",
+    async () => {
+      const utxo = new UTXOManager(db);
+      await connect(utxo, 1, F(1));
+      const op = await db.buildBlockIndexOrStatusOp(F(1), 8 | 16);
+      await db.batch([op!]);
+      await reopen();
+      const rec = await db.getBlockIndex(F(1));
+      expect(rec?.status).toBe(24);
+      expect(rec?.nTx).toBe(0);
+    },
+    30_000,
+  );
+
+  test(
+    "a header re-save (read-modify-write) of a staged block writes its durable nTx",
+    async () => {
+      const utxo = new UTXOManager(db);
+      await connect(utxo, 1, F(1));
+      const rec = (await db.getBlockIndex(F(1)))!;
+      expect(rec.nTx).toBe(2);
+      await db.putBlockIndex(F(1), { ...rec, status: rec.status | 1 }, { writeHeightIndex: false });
+      await reopen();
+      const after = await db.getBlockIndex(F(1));
+      expect(after?.status).toBe(1);
+      expect(after?.nTx).toBe(0);
+    },
+    30_000,
+  );
+
+  test(
+    "after a status update the owning view's flush still writes the nTx with the coins",
+    async () => {
+      const utxo = new UTXOManager(db);
+      await connect(utxo, 1, F(1));
+      await db.updateBlockStatus(F(1), 8);
+      // A status op riding the flush itself (reorg pendingOps) must not
+      // undo the staged nTx the same batch carries either.
+      const op = await db.buildBlockIndexOrStatusOp(F(1), 16);
+      await utxo.flushDirty([op!]);
+      await reopen();
+      const rec = await db.getBlockIndex(F(1));
+      expect(rec?.nTx).toBe(2);
+      expect(rec?.status).toBe(24);
+      expect((await db.getBlockHashByHeight(1))!.equals(F(1))).toBe(true);
+      expect(await new UTXOManager(db).preloadUTXO(coinOf(F(1)))).toBe(true);
+    },
+    30_000,
+  );
+
+  test(
+    "a direct height put naming the staged block keeps its nTx for the coins flush",
+    async () => {
+      // Review #2 on hotbuns#16: the height still names F(8), so F(8)'s coin
+      // and its nTx belong in the same flush.
+      const utxo = await stagedChain();
+      disconnect(utxo, H(8));
+      await connect(utxo, 8, F(8)); // nTx 9
+      await db.putBlockHashByHeight(8, F(8));
+      expect((await db.getBlockIndex(F(8)))?.nTx).toBe(9);
+      await utxo.flushDirty();
+      expect(db.stagedConnectCount()).toBe(0);
+      await reopen();
+      expect((await db.getBlockHashByHeight(8))!.equals(F(8))).toBe(true);
+      expect(await new UTXOManager(db).preloadUTXO(coinOf(F(8)))).toBe(true);
+      expect((await db.getBlockIndex(F(8)))?.nTx).toBe(9);
+      expect((await db.getBlockIndex(H(8)))?.nTx).toBe(0);
+    },
+    30_000,
+  );
+
+  test(
+    "a block index write or a batch op naming the staged block at its height keeps its nTx",
+    async () => {
+      const utxo = await stagedChain();
+      // putBlockIndex with the height index: same block as staged at 9.
+      const rec9 = { height: 9, header: Buffer.alloc(80), nTx: 0, status: 0, dataPos: 0 };
+      await db.putBlockIndex(H(9), rec9);
+      // A batch() height put of the same block as staged at 10.
+      await db.batch([db.buildHeightHashPutOp(10, H(10))]);
+      await utxo.flushDirty();
+      expect(db.stagedConnectCount()).toBe(0);
+      await reopen();
+      await expectDurable(
+        Array.from({ length: 10 }, (_, i) => [i + 1, H(i + 1)] as [number, Buffer]),
+        [],
+        [],
+      );
+    },
+    30_000,
+  );
+
+  test(
+    "once the height is written directly, a later delete or re-stage there still drops the old nTx",
+    async () => {
+      const utxo = await stagedChain();
+      await db.putBlockHashByHeight(10, H(10));
+      await db.putBlockHashByHeight(9, H(9));
+      disconnect(utxo, H(10));
+      await db.deleteBlockHashByHeight(10);
+      disconnect(utxo, H(9));
+      await connect(utxo, 9, F(9));
+      await utxo.flushDirty();
+      expect(db.stagedConnectCount()).toBe(0);
+      await reopen();
+      expect((await db.getBlockHashByHeight(9))!.equals(F(9))).toBe(true);
+      expect((await db.getBlockIndex(F(9)))?.nTx).toBe(10);
+      await expectDurable(
+        Array.from({ length: 8 }, (_, i) => [i + 1, H(i + 1)] as [number, Buffer]),
+        [10],
+        [H(9), H(10)],
+      );
+    },
+    30_000,
+  );
+});
