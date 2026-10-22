@@ -48,12 +48,18 @@ class FakeChainDB {
     };
   }
 
-  // ChainDB's staged-connect surface used by CoinsViewDB.batchWrite; this
+  // ChainDB's coins-flush entry point used by CoinsViewDB.batchWrite; this
   // fake stores coins only, so nothing is staged.
-  takeStagedConnects(): { seq: number; build: () => Promise<BatchOperation[]> } {
-    return { seq: 0, build: async () => [] };
+  async writeCoinsBatch(
+    _owner: object,
+    coinOps: BatchOperation[],
+    extraOps: BatchOperation[] = [],
+  ): Promise<boolean> {
+    const ops = coinOps.concat(extraOps);
+    if (ops.length === 0) return false;
+    await this.batch(ops);
+    return true;
   }
-  commitStagedConnects(_seq: number): void {}
 
   async batch(ops: BatchOperation[]): Promise<void> {
     for (const op of ops) {

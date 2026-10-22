@@ -33,6 +33,8 @@ import { Transaction, getTxId } from "../validation/tx.js";
 import { HeaderSync } from "./headers.js";
 import { BlockSync } from "./blocks.js";
 import { ChainStateManager } from "../chain/state.js";
+import { UTXOManager } from "../chain/utxo.js";
+import type { BatchOperation } from "../storage/database.js";
 
 const OP_TRUE = Buffer.from([0x51]);
 const MATURE = 101; // coinbase of height h is spendable from h + 100
@@ -386,4 +388,365 @@ describe("deep-IBD connect stages its height index and nTx into the coins flush"
     },
     120_000,
   );
+
+  /** Make the next `n` LevelDB batch writes reject (recorded first). */
+  function failNextBatchWrites(n: number): () => number {
+    const level = (db as any).db;
+    const mkBatch = level.batch.bind(level);
+    let left = n;
+    let failed = 0;
+    level.batch = (...args: unknown[]) => {
+      const b = mkBatch(...args);
+      const write = b.write.bind(b);
+      b.write = (...w: unknown[]) => {
+        if (left > 0) {
+          left--;
+          failed++;
+          return Promise.reject(new Error("injected LevelDB write failure"));
+        }
+        return write(...w);
+      };
+      return b;
+    };
+    return () => failed;
+  }
+
+  async function durableHeightsAbove(height: number): Promise<number[]> {
+    const out: number[] = [];
+    for (let h = height + 1; h <= HEADERS; h++) {
+      if ((await db.getBlockHashByHeight(h)) !== null) out.push(h);
+    }
+    return out;
+  }
+
+  test(
+    "a failed coins flush writes nothing and keeps every staged connect",
+    async () => {
+      const bs = await connectAll();
+      const failed = failNextBatchWrites(1);
+      const ops = await (bs as any).buildViewTipChainStateOps();
+      await expect((bs as any).utxoManager.flushDirty(ops)).rejects.toThrow(
+        "injected LevelDB write failure",
+      );
+      expect(failed()).toBe(1);
+      expect(db.stagedConnectCount()).toBe(CONNECT);
+      await crashAndReopen();
+      const cs = await db.getChainState();
+      const durable = cs ? cs.bestHeight : 0;
+      expect(durable).toBe(0);
+      expect(await durableHeightsAbove(durable)).toEqual([]);
+      const idx = await db.getBlockIndex(getBlockHash(chain[CONNECT - 1].header));
+      expect(idx?.nTx).toBe(0);
+    },
+    120_000,
+  );
+
+  test(
+    "durableFlushDirty's retry writes the staged heights and nTx in the same batch as the coins",
+    async () => {
+      const bs = await connectAll();
+      const failed = failNextBatchWrites(1); // outside the recorder: not recorded
+      writes = [];
+      const ops = await (bs as any).buildViewTipChainStateOps();
+      expect(await (bs as any).durableFlushDirty(ops, "test flush")).toBe(true);
+      expect(failed()).toBe(1);
+      const csBatches = writes.filter(
+        (w) => w.kind === "batch" && w.prefixes.includes(DBPrefix.CHAIN_STATE),
+      );
+      // The retry (the failed attempt never reached the recorder): the whole
+      // flush, coins and the staged metadata together.
+      expect(csBatches.length).toBe(1);
+      for (const b of csBatches) {
+        expect(b.prefixes.includes(DBPrefix.UTXO)).toBe(true);
+        expect(b.prefixes.filter((p) => p === DBPrefix.HEADER).length).toBe(CONNECT);
+        expect(b.prefixes.filter((p) => p === DBPrefix.BLOCK_INDEX).length).toBe(CONNECT);
+      }
+      expect(db.stagedConnectCount()).toBe(0);
+      await crashAndReopen();
+      expect((await db.getChainState())!.bestHeight).toBe(CONNECT);
+      for (let h = 1; h <= CONNECT; h++) {
+        const hash = getBlockHash(chain[h - 1].header);
+        expect([h, (await db.getBlockHashByHeight(h))?.toString("hex")]).toEqual([h, hash.toString("hex")]);
+        expect([h, (await db.getBlockIndex(hash))?.nTx]).toEqual([h, chain[h - 1].transactions.length]);
+      }
+      expect(await durableHeightsAbove(CONNECT)).toEqual([]);
+    },
+    120_000,
+  );
+
+  test(
+    "a direct height-index write issued while a coins flush is stalled lands after it",
+    async () => {
+      const bs = await connectAll();
+      // Stall the flush inside its nTx read-modify-write, i.e. after it has
+      // snapshotted the staged connects and before its batch is written.
+      const level = (db as any).db;
+      const get = level.get.bind(level);
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      let stalled = false;
+      level.get = async (k: Buffer, ...rest: unknown[]) => {
+        if (k[0] === DBPrefix.BLOCK_INDEX && !stalled) {
+          stalled = true;
+          await gate;
+        }
+        return get(k, ...rest);
+      };
+      const ops = await (bs as any).buildViewTipChainStateOps();
+      const flush = (bs as any).utxoManager.flushDirty(ops);
+      for (let i = 0; i < 200 && !stalled; i++) await new Promise((r) => setTimeout(r, 5));
+      expect(stalled).toBe(true);
+
+      const viaIndex = Buffer.alloc(32, 0x6b);
+      const direct = Buffer.alloc(32, 0x5a);
+      const w1 = db.putBlockIndex(viaIndex, {
+        height: CONNECT - 2,
+        header: Buffer.alloc(80),
+        nTx: 1,
+        status: 0,
+        dataPos: 0,
+      });
+      const w2 = db.putBlockHashByHeight(CONNECT - 3, direct);
+      const w3 = db.deleteBlockHashByHeight(CONNECT - 4);
+      release();
+      await Promise.all([flush, w1, w2, w3]);
+      level.get = get;
+
+      await crashAndReopen();
+      expect((await db.getChainState())!.bestHeight).toBe(CONNECT);
+      expect((await db.getBlockHashByHeight(CONNECT - 2))!.equals(viaIndex)).toBe(true);
+      expect((await db.getBlockHashByHeight(CONNECT - 3))!.equals(direct)).toBe(true);
+      expect(await db.getBlockHashByHeight(CONNECT - 4)).toBeNull();
+      // The superseded blocks' coins WERE in that batch (the snapshot was
+      // taken with them), so their nTx is a fact about blocks that batch
+      // connected and is written; see the next test for the case where it
+      // is not.
+      const old = getBlockHash(chain[CONNECT - 3].header);
+      expect((await db.getBlockIndex(old))?.nTx).toBe(chain[CONNECT - 3].transactions.length);
+      const h = CONNECT - 5;
+      expect((await db.getBlockHashByHeight(h))!.equals(getBlockHash(chain[h - 1].header))).toBe(true);
+    },
+    120_000,
+  );
+
+  test(
+    "a flush of ChainStateManager's own view does not persist BlockSync's staged connects",
+    async () => {
+      const bs = await connectAll();
+      const csm = (bs as any).chainStateManager as ChainStateManager;
+      // ChainStateManager's view flushes (it re-puts the durable CHAIN_STATE,
+      // as its connect/disconnect flushes do) while BlockSync's 1..140 are
+      // staged and BlockSync's coins are not flushed.
+      const level = (db as any).db;
+      const csKey = Buffer.from([DBPrefix.CHAIN_STATE]);
+      const csRaw: Buffer | undefined = await level.get(csKey);
+      expect(csRaw).toBeDefined();
+      writes = [];
+      await csm
+        .getUTXOManager()
+        .flush([{ type: "put", prefix: DBPrefix.CHAIN_STATE, key: Buffer.alloc(0), value: csRaw! }]);
+      const csBatches = writes.filter((w) => w.kind === "batch" && w.prefixes.includes(DBPrefix.CHAIN_STATE));
+      expect(csBatches.length).toBe(1);
+      expect(csBatches[0]!.prefixes.filter((p) => p === DBPrefix.HEADER).length).toBe(0);
+      expect(db.stagedConnectCount()).toBe(CONNECT);
+
+      await crashAndReopen();
+      const cs = await db.getChainState();
+      const durable = cs ? cs.bestHeight : 0;
+      expect(durable).toBe(0);
+      // Nothing for load() to roll back: no height leads the durable coins.
+      expect(await durableHeightsAbove(durable)).toEqual([]);
+      const realDelete = db.deleteBlockHashesAbove.bind(db);
+      const removed: number[][] = [];
+      db.deleteBlockHashesAbove = async (h: number) => {
+        const r = await realDelete(h);
+        removed.push(r);
+        return r;
+      };
+      const csm2 = new ChainStateManager(db, REGTEST);
+      await csm2.load();
+      expect(csm2.getBestBlock().height).toBe(durable);
+      expect(removed.flat()).toEqual([]);
+      expect(await durableHeightsAbove(durable)).toEqual([]);
+    },
+    120_000,
+  );
 });
+
+/**
+ * Disconnects and reorgs while connects are still only staged. BlockSync
+ * itself cannot get here today: staging happens only for blocks deeper than
+ * MIN_BLOCKS_TO_KEEP below the best header, which keep no undo data (so
+ * disconnectBlockUtxo refuses them), every reorg-window connect flushes, and
+ * invalidateblock flushes the live view first. These tests therefore drive
+ * the ChainDB directly with the exact writes the reorg / disconnect paths
+ * issue: height puts/deletes riding the coins flush as extraOps
+ * (handleReorgUtxoAndCollect with pendingOps, ChainStateManager.disconnect),
+ * and the standalone putBlockHashByHeight / deleteBlockHashByHeight.
+ */
+describe("staged connects under a disconnect or a shorter-chain reorg", () => {
+  let dbPath: string;
+  let db: ChainDB;
+
+  const H = (h: number) => Buffer.alloc(32, h); // main chain block at h
+  const F = (h: number) => Buffer.alloc(32, 0x80 + h); // fork block at h
+  const coinOf = (hash: Buffer) => ({ txid: hash, vout: 0 });
+
+  beforeEach(async () => {
+    dbPath = await mkdtemp(join(tmpdir(), "hotbuns-staged-reorg-"));
+    db = new ChainDB(dbPath);
+    await db.open();
+  });
+  afterEach(async () => {
+    try {
+      await db.close();
+    } catch {}
+    await rm(dbPath, { recursive: true, force: true });
+  });
+
+  async function reopen(): Promise<void> {
+    await db.close();
+    db = new ChainDB(dbPath);
+    await db.open();
+  }
+
+  /** A view whose blocks 1..10 are connected and staged (nTx = h + 1). */
+  async function stagedChain(): Promise<UTXOManager> {
+    const utxo = new UTXOManager(db);
+    for (let h = 1; h <= 10; h++) await connect(utxo, h, H(h));
+    return utxo;
+  }
+
+  async function connect(utxo: UTXOManager, h: number, hash: Buffer): Promise<void> {
+    await db.putBlockIndex(
+      hash,
+      { height: h, header: Buffer.alloc(80), nTx: 0, status: 0, dataPos: 0 },
+      { writeHeightIndex: false },
+    );
+    utxo.getCoinsViewCache().addCoin(
+      coinOf(hash),
+      { txOut: { value: 1000n, scriptPubKey: OP_TRUE }, height: h, isCoinbase: true },
+      false,
+    );
+    db.stageConnectedBlock(utxo.getCoinsViewDB(), h, hash, h + 1);
+  }
+
+  function disconnect(utxo: UTXOManager, hash: Buffer): void {
+    expect(utxo.getCoinsViewCache().spendCoinSync(coinOf(hash))).toBe(true);
+  }
+
+  async function expectDurable(
+    active: Array<[number, Buffer]>,
+    gone: number[],
+    stale: Buffer[],
+  ): Promise<void> {
+    const fresh = new UTXOManager(db);
+    for (const [h, hash] of active) {
+      expect([h, (await db.getBlockHashByHeight(h))?.toString("hex")]).toEqual([h, hash.toString("hex")]);
+      expect([h, (await db.getBlockIndex(hash))?.nTx]).toEqual([h, h + 1]);
+      expect([h, await fresh.preloadUTXO(coinOf(hash))]).toEqual([h, true]);
+    }
+    for (const h of gone) {
+      expect([h, await db.getBlockHashByHeight(h)]).toEqual([h, null]);
+    }
+    for (const hash of stale) {
+      // Its coins are not in the durable set, so neither is its nTx.
+      expect([hash[0], await fresh.preloadUTXO(coinOf(hash))]).toEqual([hash[0], false]);
+      expect([hash[0], (await db.getBlockIndex(hash))?.nTx]).toEqual([hash[0], 0]);
+    }
+  }
+
+  test(
+    "a disconnect riding the coins flush: the disconnected heights and their nTx are not durable",
+    async () => {
+      const utxo = await stagedChain();
+      const extraOps: BatchOperation[] = [];
+      for (let h = 10; h >= 8; h--) {
+        disconnect(utxo, H(h));
+        extraOps.push(db.buildHeightHashDeleteOp(h));
+      }
+      await utxo.flushDirty(extraOps);
+      expect(db.stagedConnectCount()).toBe(0);
+      await reopen();
+      await expectDurable(
+        Array.from({ length: 7 }, (_, i) => [i + 1, H(i + 1)] as [number, Buffer]),
+        [8, 9, 10],
+        [H(8), H(9), H(10)],
+      );
+    },
+    30_000,
+  );
+
+  test(
+    "a shorter-chain reorg with the new branch staged: the height index follows the surviving chain",
+    async () => {
+      const utxo = await stagedChain();
+      // Disconnect 6..10, connect fork blocks 6 and 7 (staged, as a deep-IBD
+      // connect stages), and drop the old entries above the new tip (the
+      // reorg's CChain::SetTip sweep).
+      const extraOps: BatchOperation[] = [];
+      for (let h = 10; h >= 6; h--) disconnect(utxo, H(h));
+      await connect(utxo, 6, F(6));
+      await connect(utxo, 7, F(7));
+      for (let h = 8; h <= 10; h++) extraOps.push(db.buildHeightHashDeleteOp(h));
+      await utxo.flushDirty(extraOps);
+      expect(db.stagedConnectCount()).toBe(0);
+      await reopen();
+      await expectDurable(
+        [
+          [1, H(1)], [2, H(2)], [3, H(3)], [4, H(4)], [5, H(5)],
+          [6, F(6)], [7, F(7)],
+        ],
+        [8, 9, 10],
+        [H(6), H(7), H(8), H(9), H(10)],
+      );
+    },
+    30_000,
+  );
+
+  test(
+    "standalone height writes during a disconnect supersede staged connects, nTx included",
+    async () => {
+      const utxo = await stagedChain();
+      // The reorg path without pendingOps: direct puts and deletes, then the
+      // next coins flush.
+      for (let h = 10; h >= 8; h--) disconnect(utxo, H(h));
+      await db.deleteBlockHashByHeight(10);
+      await db.deleteBlockHashByHeight(9);
+      await connect(utxo, 8, F(8));
+      await db.putBlockHashByHeight(8, F(8));
+      expect((await db.getBlockIndex(H(9)))?.nTx).toBe(0);
+      await utxo.flushDirty();
+      await reopen();
+      // F(8)'s height entry was written directly (not staged), and its nTx
+      // with it was superseded too: only the height is asserted for it.
+      expect((await db.getBlockHashByHeight(8))!.equals(F(8))).toBe(true);
+      await expectDurable(
+        Array.from({ length: 7 }, (_, i) => [i + 1, H(i + 1)] as [number, Buffer]),
+        [9, 10],
+        [H(8), H(9), H(10)],
+      );
+    },
+    30_000,
+  );
+
+  test(
+    "a block index write that supersedes a staged height before the flush keeps the old block's nTx at 0",
+    async () => {
+      const utxo = await stagedChain();
+      disconnect(utxo, H(10));
+      await db.putBlockIndex(F(10), { height: 10, header: Buffer.alloc(80), nTx: 11, status: 0, dataPos: 0 });
+      await utxo.flushDirty();
+      await reopen();
+      expect((await db.getBlockHashByHeight(10))!.equals(F(10))).toBe(true);
+      expect((await db.getBlockIndex(F(10)))?.nTx).toBe(11);
+      await expectDurable(
+        Array.from({ length: 9 }, (_, i) => [i + 1, H(i + 1)] as [number, Buffer]),
+        [],
+        [H(10)],
+      );
+    },
+    30_000,
+  );
+});
+

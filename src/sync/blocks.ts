@@ -4131,7 +4131,7 @@ export class BlockSync {
    */
   private discardView(bestBlockAfterClear?: Buffer): void {
     this.utxoManager.clearCache(bestBlockAfterClear);
-    this.db.discardStagedConnects();
+    this.db.discardStagedConnects(this.utxoManager.getCoinsViewDB());
   }
 
   private discardUnflushedView(): void {
@@ -5774,7 +5774,12 @@ export class BlockSync {
     // CHAIN_STATE that load() had to roll back (cf3b7dd). Readers see staged
     // entries through ChainDB.getBlockHashByHeight / getBlockIndex.
     if (!shouldFlush) {
-      this.db.stageConnectedBlock(height, blockHash, block.transactions.length);
+      this.db.stageConnectedBlock(
+        this.utxoManager.getCoinsViewDB(),
+        height,
+        blockHash,
+        block.transactions.length
+      );
     }
 
     if (shouldFlush) {

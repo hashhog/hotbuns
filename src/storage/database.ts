@@ -348,6 +348,15 @@ function bufferToBigInt(buf: Buffer): bigint {
  * - Chain state
  * - Undo data for reorgs
  */
+/** A connect staged by {@link ChainDB.stageConnectedBlock}. */
+interface StagedConnect {
+  owner: object;
+  height: number;
+  hash: Buffer;
+  nTx: number;
+  seq: number;
+}
+
 export class ChainDB {
   private db: ClassicLevel<Buffer, Buffer>;
   /**
@@ -371,11 +380,27 @@ export class ChainDB {
    * the same batch as the coins and CHAIN_STATE (Core FlushStateToDisk), so
    * the height index never leads the durable UTXO tip. Readers see them
    * through {@link getBlockHashByHeight} / {@link getBlockIndex}.
-   * `seq` orders a staged entry against a later direct write.
+   *
+   * Each entry belongs to the UTXO view (`owner`, a CoinsViewDB) whose coins
+   * reflect that block; only that view's flush writes it. ChainStateManager
+   * and BlockSync each own a view on this ChainDB, and a flush of the other
+   * view does not carry BlockSync's coins. `seq` orders a staged entry
+   * against a later direct write. `stagedNTx` indexes the same entries by
+   * block hash; an entry superseded at its height takes its nTx with it.
    */
-  private stagedHeights = new Map<number, { hash: Buffer; seq: number }>();
-  private stagedNTx = new Map<string, { hash: Buffer; nTx: number; seq: number }>();
+  private stagedHeights = new Map<number, StagedConnect>();
+  private stagedNTx = new Map<string, StagedConnect>();
   private stagedSeq = 0;
+  /**
+   * Serializes every height-index write (direct puts/deletes, batch() ops on
+   * HEADER heights, the coins flush that carries staged connects). Without
+   * it a direct write issued while a flush is between its snapshot and its
+   * LevelDB write could land first and be overwritten by the stale staged
+   * value; with it the write issued later always lands later.
+   */
+  private heightWriteTail: Promise<void> = Promise.resolve();
+  /** Block hashes whose staged nTx a running coins flush is writing. */
+  private flushingNTx = new Set<string>();
 
   constructor(dbPath: string) {
     this.dbPath = dbPath;
@@ -451,9 +476,7 @@ export class ChainDB {
     }
     const key = makeKey(DBPrefix.BLOCK_INDEX, hash);
     const value = serializeBlockIndex(record);
-    await this.db.put(key, value);
-
-    // Also store the height -> hash (active-chain) mapping — hotbuns's analogue
+    // The height -> hash (active-chain) mapping — hotbuns's analogue
     // of Bitcoin Core's `CChain m_chain` (the height-indexed active chain),
     // which is kept STRICTLY SEPARATE from `mapBlockIndex` (all headers by
     // hash).  Core only mutates `m_chain` via `CChain::SetTip` inside
@@ -465,13 +488,27 @@ export class ChainDB {
     // the active tip overwrites the height->hash entry and getblockhash(h)
     // returns an abandoned-branch block while getbestblockhash returns the
     // active tip (the stale-index bug this parameter closes).
-    if (opts?.writeHeightIndex !== false) {
-      // Supersedes a connect staged for this height (stageConnectedBlock),
-      // as putBlockHashByHeight and batch() do.
-      this.stagedHeights.delete(record.height);
-      const heightKey = makeKey(DBPrefix.HEADER, encodeHeight(record.height));
-      await this.db.put(heightKey, hash);
+    const writeHeight = opts?.writeHeightIndex !== false;
+    const hex = hash.toString('hex');
+    if (!writeHeight && !this.stagedNTx.has(hex) && !this.flushingNTx.has(hex)) {
+      // Header reception: no height-index write and no staged nTx this
+      // record could race with, so no need to queue behind a coins flush.
+      await this.db.put(key, value);
+      return;
     }
+    // Queued behind a running coins flush, which may read-modify-write this
+    // record (staged nTx) or write this height (staged connect).
+    const seq = this.stagedSeq;
+    await this.withHeightIndexLock(async () => {
+      await this.db.put(key, value);
+      if (writeHeight) {
+        const heightKey = makeKey(DBPrefix.HEADER, encodeHeight(record.height));
+        await this.db.put(heightKey, hash);
+        // Supersedes a connect staged for this height before this call
+        // (stageConnectedBlock), as putBlockHashByHeight and batch() do.
+        this.dropStagedHeight(record.height, seq);
+      }
+    });
   }
 
   /**
@@ -528,9 +565,12 @@ export class ChainDB {
     if (this.closing) {
       return;
     }
-    this.stagedHeights.delete(height);
-    const key = makeKey(DBPrefix.HEADER, encodeHeight(height));
-    await this.db.del(key);
+    const seq = this.stagedSeq;
+    await this.withHeightIndexLock(async () => {
+      const key = makeKey(DBPrefix.HEADER, encodeHeight(height));
+      await this.db.del(key);
+      this.dropStagedHeight(height, seq);
+    });
   }
 
   /**
@@ -539,8 +579,12 @@ export class ChainDB {
    * rewind the height index to the durable UTXO tip after an unclean stop.
    */
   async deleteBlockHashesAbove(height: number): Promise<number[]> {
+    return this.withHeightIndexLock(() => this.deleteBlockHashesAboveLocked(height));
+  }
+
+  private async deleteBlockHashesAboveLocked(height: number): Promise<number[]> {
     for (const h of [...this.stagedHeights.keys()]) {
-      if (h > height) this.stagedHeights.delete(h);
+      if (h > height) this.dropStagedHeight(h);
     }
     const it = this.db.iterator({
       gt: makeKey(DBPrefix.HEADER, encodeHeight(height)),
@@ -572,9 +616,12 @@ export class ChainDB {
     if (this.closing) {
       return;
     }
-    this.stagedHeights.delete(height);
-    const key = makeKey(DBPrefix.HEADER, encodeHeight(height));
-    await this.db.put(key, hash);
+    const seq = this.stagedSeq;
+    await this.withHeightIndexLock(async () => {
+      const key = makeKey(DBPrefix.HEADER, encodeHeight(height));
+      await this.db.put(key, hash);
+      this.dropStagedHeight(height, seq);
+    });
   }
 
   async getBlockIndex(hash: Buffer): Promise<BlockIndexRecord | null> {
@@ -595,13 +642,16 @@ export class ChainDB {
    * Record an active-chain connect without writing it: the height -> hash
    * entry and the block's nTx (what {@link putBlockHashByHeight} and
    * {@link updateBlockIndexNTx} wrote per block before). They reach disk with
-   * the next coins flush, atomically with the coins and CHAIN_STATE they
-   * belong to. See {@link stagedHeights}.
+   * the next flush of `owner` (the CoinsViewDB whose coins reflect this
+   * block), atomically with those coins and CHAIN_STATE. See
+   * {@link stagedHeights}. A connect staged earlier at this height (a block
+   * since disconnected) is replaced, nTx included.
    */
-  stageConnectedBlock(height: number, hash: Buffer, nTx: number): void {
-    const seq = ++this.stagedSeq;
-    this.stagedHeights.set(height, { hash, seq });
-    if (nTx > 0) this.stagedNTx.set(hash.toString('hex'), { hash, nTx, seq });
+  stageConnectedBlock(owner: object, height: number, hash: Buffer, nTx: number): void {
+    this.dropStagedHeight(height);
+    const entry: StagedConnect = { owner, height, hash, nTx, seq: ++this.stagedSeq };
+    this.stagedHeights.set(height, entry);
+    if (nTx > 0) this.stagedNTx.set(hash.toString('hex'), entry);
   }
 
   /** Number of connects staged and not yet flushed (tests, diagnostics). */
@@ -610,56 +660,108 @@ export class ChainDB {
   }
 
   /**
-   * Drop every staged connect. Called when the in-memory UTXO view is thrown
-   * away (UTXOManager.clearCache): the blocks it described are no longer
-   * reflected by any coins that could be flushed, and are connected again.
+   * Drop every connect staged by `owner`. Called when that UTXO view is
+   * thrown away (BlockSync.discardView): the blocks it described are no
+   * longer reflected by any coins that could be flushed, and are connected
+   * again.
    */
-  discardStagedConnects(): void {
-    this.stagedHeights.clear();
-    this.stagedNTx.clear();
+  discardStagedConnects(owner: object): void {
+    for (const [h, s] of this.stagedHeights) {
+      if (s.owner === owner) this.dropStagedHeight(h);
+    }
   }
 
   /**
-   * Snapshot the staged connects for a coins flush. Taken synchronously, at
-   * the same point the flush collects its dirty coins, so the batch carries
-   * the metadata of exactly the blocks whose coins it carries. The nTx ops
-   * read-modify-write the stored record (updateBlockIndexNTx semantics: only
-   * a record that exists and has nTx 0). Pass `seq` to
-   * {@link commitStagedConnects} once the batch is written.
+   * Forget the staged connect at `height` (and its nTx), if it was staged at
+   * or before `seq`: a direct write issued after that stage has superseded it.
    */
-  takeStagedConnects(): { seq: number; build: () => Promise<BatchOperation[]> } {
-    const seq = this.stagedSeq;
-    const heights = [...this.stagedHeights.entries()];
-    const ntx = [...this.stagedNTx.values()];
-    const build = async (): Promise<BatchOperation[]> => {
-      const ops: BatchOperation[] = [];
-      for (const [height, { hash }] of heights) {
-        ops.push(this.buildHeightHashPutOp(height, hash));
-      }
-      const values = await Promise.all(
-        ntx.map((s) => this.db.get(makeKey(DBPrefix.BLOCK_INDEX, s.hash)))
-      );
-      for (let i = 0; i < ntx.length; i++) {
-        const value = values[i];
-        if (value === undefined) continue;
-        const record = deserializeBlockIndex(value);
-        if (record.nTx !== 0) continue;
-        record.nTx = ntx[i]!.nTx;
-        ops.push(this.buildBlockIndexPutOp(ntx[i]!.hash, record));
-      }
-      return ops;
-    };
-    return { seq, build };
+  private dropStagedHeight(height: number, seq = Number.POSITIVE_INFINITY): void {
+    const s = this.stagedHeights.get(height);
+    if (!s || s.seq > seq) return;
+    this.stagedHeights.delete(height);
+    const k = s.hash.toString('hex');
+    if (this.stagedNTx.get(k) === s) this.stagedNTx.delete(k);
   }
 
-  /** Forget staged connects at or below `seq`: they are on disk now. */
-  commitStagedConnects(seq: number): void {
-    for (const [h, s] of this.stagedHeights) {
-      if (s.seq <= seq) this.stagedHeights.delete(h);
-    }
-    for (const [k, s] of this.stagedNTx) {
-      if (s.seq <= seq) this.stagedNTx.delete(k);
-    }
+  private withHeightIndexLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.heightWriteTail.then(fn);
+    this.heightWriteTail = run.then(
+      () => {},
+      () => {}
+    );
+    return run;
+  }
+
+  /**
+   * The coins flush of UTXO view `owner` (CoinsViewDB.batchWrite): one
+   * LevelDB batch of `coinOps`, the height index + nTx of every connect
+   * `owner` staged, then `extraOps` (CHAIN_STATE, reorg ops).
+   *
+   * The staged entries are snapshotted under the height-index lock, so the
+   * batch carries exactly the blocks staged before the flush started, and a
+   * direct height-index write issued meanwhile waits and lands after it. A
+   * staged height that `extraOps` writes (a reorg's put/delete) is left out
+   * with its nTx: that block is no longer on the active chain this batch
+   * describes. The nTx ops read-modify-write the stored record
+   * (updateBlockIndexNTx semantics: only a record that exists and has nTx
+   * 0). On a failed write nothing is forgotten, so the retry carries the
+   * same entries; on success the snapshotted entries are dropped. Returns
+   * false when there was nothing to write.
+   */
+  async writeCoinsBatch(
+    owner: object,
+    coinOps: BatchOperation[],
+    extraOps: BatchOperation[] = []
+  ): Promise<boolean> {
+    return this.withHeightIndexLock(async () => {
+      const seq = this.stagedSeq;
+      const overwritten = new Set<number>();
+      for (const op of extraOps) {
+        if (op.prefix === DBPrefix.HEADER && op.key.length === 4) {
+          overwritten.add(op.key.readUInt32BE(0));
+        }
+      }
+      const mine: StagedConnect[] = [];
+      for (const s of this.stagedHeights.values()) {
+        if (s.owner === owner) mine.push(s);
+      }
+      const written = mine.filter((s) => !overwritten.has(s.height));
+      const ntx = written.filter((s) => s.nTx > 0 && this.stagedNTx.get(s.hash.toString('hex')) === s);
+      for (const s of ntx) this.flushingNTx.add(s.hash.toString('hex'));
+      try {
+        const stagedOps: BatchOperation[] = [];
+        for (const s of written) {
+          stagedOps.push(this.buildHeightHashPutOp(s.height, s.hash));
+        }
+        const values = await Promise.all(
+          ntx.map((s) => this.db.get(makeKey(DBPrefix.BLOCK_INDEX, s.hash)))
+        );
+        for (let i = 0; i < ntx.length; i++) {
+          const value = values[i];
+          if (value === undefined) continue;
+          const record = deserializeBlockIndex(value);
+          if (record.nTx !== 0) continue;
+          record.nTx = ntx[i]!.nTx;
+          stagedOps.push(this.buildBlockIndexPutOp(ntx[i]!.hash, record));
+        }
+        // Coins, then the staged metadata, then the caller's ops: for the
+        // same key the later op wins in a LevelDB batch.
+        const ops = coinOps.concat(stagedOps, extraOps);
+        if (ops.length === 0) return false;
+        await this.writeBatchLocked(ops);
+        for (const s of mine) {
+          if (s.seq <= seq && this.stagedHeights.get(s.height) === s) {
+            this.dropStagedHeight(s.height, seq);
+          }
+        }
+        // A height this batch wrote directly supersedes a connect any view
+        // staged before the flush started (as batch() does).
+        for (const h of overwritten) this.dropStagedHeight(h, seq);
+        return true;
+      } finally {
+        for (const s of ntx) this.flushingNTx.delete(s.hash.toString('hex'));
+      }
+    });
   }
 
   async getBlockHashByHeight(height: number): Promise<Buffer | null> {
@@ -890,7 +992,27 @@ export class ChainDB {
    * Execute batch operations atomically.
    */
   async batch(ops: BatchOperation[]): Promise<void> {
-    const seqAtStart = this.stagedSeq;
+    const heights: number[] = [];
+    for (const op of ops) {
+      if (op.prefix === DBPrefix.HEADER && op.key.length === 4) {
+        heights.push(op.key.readUInt32BE(0));
+      }
+    }
+    if (heights.length === 0) {
+      await this.writeBatchLocked(ops);
+      return;
+    }
+    // A height -> hash write in this batch (reorg ops, invalidateblock)
+    // supersedes a connect staged before this call; a later stage still wins.
+    const seq = this.stagedSeq;
+    await this.withHeightIndexLock(async () => {
+      await this.writeBatchLocked(ops);
+      for (const h of heights) this.dropStagedHeight(h, seq);
+    });
+  }
+
+  /** The LevelDB write behind {@link batch} / {@link writeCoinsBatch}. */
+  private async writeBatchLocked(ops: BatchOperation[]): Promise<void> {
     const batch = this.db.batch();
     for (const op of ops) {
       const key = makeKey(op.prefix, op.key);
@@ -904,16 +1026,6 @@ export class ChainDB {
       }
     }
     await batch.write();
-    // A height -> hash write in this batch supersedes a connect staged before
-    // it (reorg ops, invalidateblock); a later stage still wins.
-    if (this.stagedHeights.size > 0) {
-      for (const op of ops) {
-        if (op.prefix !== DBPrefix.HEADER || op.key.length !== 4) continue;
-        const h = op.key.readUInt32BE(0);
-        const s = this.stagedHeights.get(h);
-        if (s && s.seq <= seqAtStart) this.stagedHeights.delete(h);
-      }
-    }
   }
 
   /**

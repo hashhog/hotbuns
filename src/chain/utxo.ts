@@ -367,30 +367,17 @@ export class CoinsViewDB extends CoinsView {
       }
     }
 
-    // Height index + nTx of the blocks these coins reflect (ChainDB
-    // stageConnectedBlock). Snapshotted here, in the same tick that collected
-    // the dirty coins above, so the batch carries the metadata of exactly
-    // those blocks: the height index never reaches disk ahead of its coins.
-    // Before extraOps, so the caller's own ops for the same keys win.
-    const staged = this.db.takeStagedConnects();
-    const stagedOps = await staged.build();
-    ops.push(...stagedOps);
-
-    // Append any extra operations so they are committed atomically
-    // with the UTXO changes (e.g., chain state update).
-    if (extraOps) {
-      ops.push(...extraOps);
-    }
-
-    if (ops.length > 0) {
-      try {
-        await this.db.batch(ops);
-        this.db.commitStagedConnects(staged.seq);
-      } finally {
-        // AFTER the batch landed: a read issued before this point may have
-        // seen the pre-write value (F0).
-        coinsWriteGeneration.set(this.db, coinsDBWriteGeneration(this.db) + 1);
-      }
+    // ChainDB.writeCoinsBatch adds the height index + nTx of the blocks
+    // these coins reflect (connects this view staged, stageConnectedBlock)
+    // between the coins and extraOps, in one batch: the height index never
+    // reaches disk ahead of its coins, and never with another view's coins.
+    let wrote = true;
+    try {
+      wrote = await this.db.writeCoinsBatch(this, ops, extraOps);
+    } finally {
+      // AFTER the batch landed: a read issued before this point may have
+      // seen the pre-write value (F0).
+      if (wrote) coinsWriteGeneration.set(this.db, coinsDBWriteGeneration(this.db) + 1);
     }
 
     this.bestBlockHash = hashBlock;
