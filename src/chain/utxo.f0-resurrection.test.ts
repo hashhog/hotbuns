@@ -48,6 +48,19 @@ class FakeChainDB {
     };
   }
 
+  // ChainDB's coins-flush entry point used by CoinsViewDB.batchWrite; this
+  // fake stores coins only, so nothing is staged.
+  async writeCoinsBatch(
+    _owner: object,
+    coinOps: BatchOperation[],
+    extraOps: BatchOperation[] = [],
+  ): Promise<boolean> {
+    const ops = coinOps.concat(extraOps);
+    if (ops.length === 0) return false;
+    await this.batch(ops);
+    return true;
+  }
+
   async batch(ops: BatchOperation[]): Promise<void> {
     for (const op of ops) {
       if (op.prefix !== DBPrefix.UTXO) continue;

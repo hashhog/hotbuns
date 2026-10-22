@@ -367,20 +367,17 @@ export class CoinsViewDB extends CoinsView {
       }
     }
 
-    // Append any extra operations so they are committed atomically
-    // with the UTXO changes (e.g., chain state update).
-    if (extraOps) {
-      ops.push(...extraOps);
-    }
-
-    if (ops.length > 0) {
-      try {
-        await this.db.batch(ops);
-      } finally {
-        // AFTER the batch landed: a read issued before this point may have
-        // seen the pre-write value (F0).
-        coinsWriteGeneration.set(this.db, coinsDBWriteGeneration(this.db) + 1);
-      }
+    // ChainDB.writeCoinsBatch adds the height index + nTx of the blocks
+    // these coins reflect (connects this view staged, stageConnectedBlock)
+    // between the coins and extraOps, in one batch: the height index never
+    // reaches disk ahead of its coins, and never with another view's coins.
+    let wrote = true;
+    try {
+      wrote = await this.db.writeCoinsBatch(this, ops, extraOps);
+    } finally {
+      // AFTER the batch landed: a read issued before this point may have
+      // seen the pre-write value (F0).
+      if (wrote) coinsWriteGeneration.set(this.db, coinsDBWriteGeneration(this.db) + 1);
     }
 
     this.bestBlockHash = hashBlock;
