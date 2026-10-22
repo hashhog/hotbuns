@@ -466,6 +466,9 @@ export class ChainDB {
     // returns an abandoned-branch block while getbestblockhash returns the
     // active tip (the stale-index bug this parameter closes).
     if (opts?.writeHeightIndex !== false) {
+      // Supersedes a connect staged for this height (stageConnectedBlock),
+      // as putBlockHashByHeight and batch() do.
+      this.stagedHeights.delete(record.height);
       const heightKey = makeKey(DBPrefix.HEADER, encodeHeight(record.height));
       await this.db.put(heightKey, hash);
     }

@@ -360,14 +360,28 @@ describe("deep-IBD connect stages its height index and nTx into the coins flush"
   test(
     "a later direct height-index write supersedes a staged connect",
     async () => {
-      await connectAll();
+      const bs = await connectAll();
       const other = Buffer.alloc(32, 0x5a);
       await db.putBlockHashByHeight(CONNECT, other);
       expect((await db.getBlockHashByHeight(CONNECT))!.equals(other)).toBe(true);
       await db.batch([db.buildHeightHashDeleteOp(CONNECT - 1)]);
       expect(await db.getBlockHashByHeight(CONNECT - 1)).toBeNull();
+      // putBlockIndex writes the height index too (ChainStateManager connect).
+      const viaIndex = Buffer.alloc(32, 0x6b);
+      await db.putBlockIndex(viaIndex, {
+        height: CONNECT - 2,
+        header: Buffer.alloc(80),
+        nTx: 1,
+        status: 0,
+        dataPos: 0,
+      });
+      expect((await db.getBlockHashByHeight(CONNECT - 2))!.equals(viaIndex)).toBe(true);
+      // The next coins flush must not write the staged hash back over it.
+      await bs.stop();
+      await crashAndReopen();
+      expect((await db.getBlockHashByHeight(CONNECT - 2))!.equals(viaIndex)).toBe(true);
       // Untouched heights still resolve to the connected chain.
-      const h = CONNECT - 2;
+      const h = CONNECT - 3;
       expect((await db.getBlockHashByHeight(h))!.equals(getBlockHash(chain[h - 1].header))).toBe(true);
     },
     120_000,
