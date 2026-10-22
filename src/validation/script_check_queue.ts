@@ -361,6 +361,24 @@ class VerifyPool {
 			if (out.kind !== "result") {
 				throw new Error(`unexpected worker message ${out.kind}`);
 			}
+			// One verdict per job, each job exactly once. A short or garbled
+			// list must not read as "no failures": a job without a verdict was
+			// never verified. Treated as a worker fault, so the caller re-runs
+			// the same jobs on this thread.
+			const n = batch.items.length;
+			if (out.results.length !== n) {
+				throw new Error(
+					`script-check worker returned ${out.results.length} results for ${n} jobs`,
+				);
+			}
+			const seen = new Uint8Array(n);
+			for (const item of out.results) {
+				const j = item.jobIndex;
+				if (!Number.isInteger(j) || j < 0 || j >= n || seen[j] === 1) {
+					throw new Error(`script-check worker returned bad jobIndex ${j} for ${n} jobs`);
+				}
+				seen[j] = 1;
+			}
 			for (const item of out.results) {
 				if (item.valid) continue;
 				const origIndex = batch.origIndices[item.jobIndex]!;
@@ -383,6 +401,7 @@ class VerifyPool {
 				const w = idle.pop()!;
 				used.add(w);
 				inFlightBatches++;
+				inFlightBatchesNow++;
 				inFlightJobs += batch.items.length;
 				inFlightBytes += batch.bytes;
 				if (inFlightJobs > peakInFlightJobs) peakInFlightJobs = inFlightJobs;
@@ -394,6 +413,7 @@ class VerifyPool {
 					})
 					.finally(() => {
 						inFlightBatches--;
+						inFlightBatchesNow--;
 						inFlightJobs -= batch.items.length;
 						inFlightBytes -= batch.bytes;
 						idle.push(w);
@@ -493,6 +513,12 @@ export function scriptCheckPoolSize(): number {
 let peakInFlightJobs = 0;
 let peakInFlightBytes = 0;
 let lastDispatchWorkers = 0;
+let inFlightBatchesNow = 0;
+
+/** Batches posted to a worker whose result has not settled yet (tests). */
+export function scriptCheckInFlightBatches(): number {
+	return inFlightBatchesNow;
+}
 
 export function scriptCheckPeakInFlightJobs(): number {
 	return peakInFlightJobs;
