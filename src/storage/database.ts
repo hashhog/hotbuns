@@ -401,6 +401,13 @@ export class ChainDB {
   private heightWriteTail: Promise<void> = Promise.resolve();
   /** Block hashes whose staged nTx a running coins flush is writing. */
   private flushingNTx = new Set<string>();
+  /**
+   * The op list a running coins flush is handing to {@link batch} while it
+   * holds the height-index lock: batch() writes that exact list without
+   * queueing on the lock again (it would wait for itself). Every other
+   * batch() call queues as usual.
+   */
+  private coinsFlushOps: BatchOperation[] | null = null;
 
   constructor(dbPath: string) {
     this.dbPath = dbPath;
@@ -748,7 +755,13 @@ export class ChainDB {
         // same key the later op wins in a LevelDB batch.
         const ops = coinOps.concat(stagedOps, extraOps);
         if (ops.length === 0) return false;
-        await this.writeBatchLocked(ops);
+        // Through batch(), the one entry point for atomic writes.
+        this.coinsFlushOps = ops;
+        try {
+          await this.batch(ops);
+        } finally {
+          this.coinsFlushOps = null;
+        }
         for (const s of mine) {
           if (s.seq <= seq && this.stagedHeights.get(s.height) === s) {
             this.dropStagedHeight(s.height, seq);
@@ -992,6 +1005,12 @@ export class ChainDB {
    * Execute batch operations atomically.
    */
   async batch(ops: BatchOperation[]): Promise<void> {
+    if (ops === this.coinsFlushOps) {
+      // writeCoinsBatch, already under the height-index lock; it settles the
+      // staged connects itself.
+      await this.writeBatchLocked(ops);
+      return;
+    }
     const heights: number[] = [];
     for (const op of ops) {
       if (op.prefix === DBPrefix.HEADER && op.key.length === 4) {
@@ -1011,7 +1030,7 @@ export class ChainDB {
     });
   }
 
-  /** The LevelDB write behind {@link batch} / {@link writeCoinsBatch}. */
+  /** The LevelDB write behind {@link batch}. */
   private async writeBatchLocked(ops: BatchOperation[]): Promise<void> {
     const batch = this.db.batch();
     for (const op of ops) {
