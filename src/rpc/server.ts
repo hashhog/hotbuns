@@ -23,6 +23,7 @@ import type { OrphanPool, OrphanEntry } from "../mempool/orphan_pool.js";
 import { RBFTransactionState } from "../mempool/rbf.js";
 import type { PeerManager } from "../p2p/manager.js";
 import { ServiceFlags } from "../p2p/manager.js";
+import { recordSnapshotOrigin, snapshotOriginWithoutHistory } from "../chain/snapshot_origin.js";
 import { parseIPv4, parseIPv6 } from "../p2p/asmap.js";
 import { getNetworkTypeFromAddress } from "../p2p/proxy.js";
 import type { FeeEstimator } from "../fees/estimator.js";
@@ -2125,10 +2126,16 @@ export class RPCServer {
       );
     }
 
-    // Get block data
+    // Get block data. A block in the index whose body this node never
+    // received and did not prune (below a UTXO snapshot base, or a header
+    // only) is "not fully downloaded" — Core CheckBlockDataAvailability says
+    // "pruned data" only when the block really was pruned (checked above).
     const blockData = await this.db.getBlock(blockhash);
     if (!blockData) {
-      throw this.rpcError(RPCErrorCodes.MISC_ERROR, "Block not available (pruned data)");
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        "Block not available (not fully downloaded)",
+      );
     }
 
     // Verbosity 0: return hex
@@ -3350,10 +3357,12 @@ export class RPCServer {
    * (rpc/blockchain.cpp::getchainstates + RPCHelpForChainstate). The top-level
    * object is `{ headers, chainstates }` where `chainstates` is an array
    * ordered by work with the most-work (active) chainstate LAST. hotbuns runs a
-   * single, fully-validated chainstate (no active assumeUTXO snapshot — the
-   * snapshot-bootstrap path validates before promotion and never leaves an
-   * unvalidated chainstate live), so the array has exactly one element with
-   * `validated: true` and `snapshot_blockhash` omitted.
+   * single chainstate. For a genesis-synced node it is `validated: true` with
+   * `snapshot_blockhash` omitted. For a node started from a UTXO snapshot it
+   * carries `snapshot_blockhash` and `validated` is the background verdict
+   * (in-process loadtxoutset), or false while the history below the base is
+   * missing (after a restart / --load-snapshot boot; hotbuns runs no
+   * background chainstate there, so none is listed).
    *
    * Field sources (all genuine node state, nothing fabricated):
    *   - headers: best-header height from the header index (-1 if none seen).
@@ -3425,15 +3434,29 @@ export class RPCServer {
     // snapshot_blockhash omitted).
     let snapshotValidated = true;
     let snapshotBlockhashHex: string | null = null;
+    let liveSnapshot = false;
     const snapManager = this.snapshotChainstateManager;
     if (snapManager) {
       const status = snapManager.getStatus();
       if (status.hasSnapshot) {
+        liveSnapshot = true;
         snapshotValidated = status.snapshotValidated;
         const baseHash = snapManager.current().snapshotBaseBlockHash;
         if (baseHash) {
           snapshotBlockhashHex = Buffer.from(baseHash).reverse().toString("hex");
         }
+      }
+    }
+    // After a restart (or a --load-snapshot boot) there is no in-process
+    // snapshot manager, but the chainstate is still the snapshot one and the
+    // history below its base was never validated here: Core keeps reporting
+    // snapshot_blockhash + validated:false until the background chainstate
+    // finishes, which hotbuns never runs for missing bodies.
+    if (!liveSnapshot) {
+      const origin = await snapshotOriginWithoutHistory(this.db, this.params);
+      if (origin) {
+        snapshotValidated = false;
+        snapshotBlockhashHex = Buffer.from(origin.baseHash).reverse().toString("hex");
       }
     }
 
@@ -7684,13 +7707,19 @@ export class RPCServer {
    */
   private async getNetworkInfo(): Promise<Record<string, unknown>> {
     const peers = this.peerManager.getConnectedPeers();
+    // Core CConnman::GetLocalServices: the runtime bits (a snapshot node
+    // without history has NODE_NETWORK removed), not the configured ones.
+    const localServices: bigint =
+      typeof this.peerManager.getLocalServices === "function"
+        ? this.peerManager.getLocalServices()
+        : this.params.services;
 
     return {
       version: this.params.protocolVersion,
       subversion: this.params.userAgent,
       protocolversion: this.params.protocolVersion,
-      localservices: this.params.services.toString(16).padStart(16, "0"),
-      localservicesnames: this.getServiceNames(this.params.services),
+      localservices: localServices.toString(16).padStart(16, "0"),
+      localservicesnames: this.getServiceNames(localServices),
       localrelay: true,
       timeoffset: 0,
       // Mirror connman's fNetworkActive flag (Core net.cpp:709), toggled by
@@ -11978,6 +12007,11 @@ export class RPCServer {
     if (au) {
       await persistAssumeutxoTailHeaders(this.db, au);
     }
+    await recordSnapshotOrigin(this.db, loadResult.baseBlockHash, loadResult.baseHeight);
+    // Core loadtxoutset: RemoveLocalServices(NODE_NETWORK) +
+    // AddLocalServices(NODE_NETWORK_LIMITED) — the history below the base is
+    // not available to serve. (NETWORK_LIMITED is always in params.services.)
+    this.peerManager.removeLocalServices?.(ServiceFlags.NODE_NETWORK);
     // Unconditionally (re-)point the active-chain height->hash index
     // (DBPrefix.HEADER, read by getblockhash / getBlockHashByHeight) at the
     // snapshot base, regardless of the branch above. If a BLOCK_INDEX record
@@ -12061,6 +12095,16 @@ export class RPCServer {
     this.snapshotChainstateManager = manager;
 
     const status = manager.getStatus();
+    // Core init.cpp: once the background chainstate finished (every block
+    // genesis -> base connected and the hash matched) and the node is not
+    // pruning, NODE_NETWORK is advertised again.
+    if (
+      status.snapshotValidated &&
+      !this.pruneManager?.isPruneMode() &&
+      !(await snapshotOriginWithoutHistory(this.db, this.params))
+    ) {
+      this.peerManager.addLocalServices?.(ServiceFlags.NODE_NETWORK);
+    }
     return {
       coins_loaded: Number(loadResult.coinsLoaded),
       tip_hash: Buffer.from(loadResult.baseBlockHash).reverse().toString("hex"),
