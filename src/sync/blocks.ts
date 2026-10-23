@@ -612,6 +612,15 @@ export class BlockSync {
    *  alongside `lastConnectError`. */
   private lastConnectDeferred: boolean = false;
 
+  /** Hash of the reorg intermediate that carried the most recent pass's
+   *  consensus failure (`reorgInvalidIntermediate`, which
+   *  `processOrderedBlocksInner` consumes before `injectBlock` regains
+   *  control). Core's submitblock only listens for BlockChecked of the
+   *  SUBMITTED block (rpc/mining.cpp submitblock_StateCatcher); when ConnectTip
+   *  fails on an intermediate, BlockChecked fires for that block instead and
+   *  submitblock answers "inconclusive". Reset per submission. */
+  private lastConnectFailedIntermediate: Buffer | null = null;
+
   /** Reorg-to-ancestor HALT signal (crash-recovery / reorg-integrity class).
    *  Set by {@link haltSync} when the sync loop detects an IMPOSSIBLE reorg —
    *  the block it keeps being asked to (re)connect at `nextHeightToProcess` is
@@ -2176,6 +2185,7 @@ export class BlockSync {
     // Same per-submission scoping for the deferral marker: a deferral from a
     // previous submitblock must not be reported against this one.
     this.lastConnectDeferred = false;
+    this.lastConnectFailedIntermediate = null;
 
     let headerEntry = this.headerSync.getHeader(blockHash);
     // Core AcceptBlockHeader: a known header flagged failed answers
@@ -2269,6 +2279,14 @@ export class BlockSync {
       // snapshot pre-base header backfill, or a consensus check refused to
       // decide on a missing ancestor header. BIP-22 "inconclusive".
       if (this.headerSync.hasPreBaseHeaderGap() || errL.includes("missing-ancestor-header")) {
+        return "inconclusive";
+      }
+      // The failure was a reorg intermediate's, not this block's: Core's
+      // BlockChecked fired for the intermediate, so submitblock of the fork
+      // tip is "inconclusive" (the tip is a failed child, never checked).
+      // (Cast: TS keeps the per-submission `= null` narrowing across the await.)
+      const failedInterm = this.lastConnectFailedIntermediate as Buffer | null;
+      if (failedInterm && !failedInterm.equals(blockHash)) {
         return "inconclusive";
       }
       if (errL.includes("non-final") || errL.includes("nonfinal") || errL.includes("bad-txns-nonfinal") ||
@@ -3730,6 +3748,8 @@ export class BlockSync {
         // failed + BlockChecked for that block's mapBlockSource entry).
         const invalidIntermediate = this.reorgInvalidIntermediate;
         this.reorgInvalidIntermediate = null;
+        // Survives the clear for injectBlock's BIP-22 answer.
+        this.lastConnectFailedIntermediate = invalidIntermediate ? invalidIntermediate.hash : null;
 
         // ── Reorg-to-ancestor HALT (crash-recovery / reorg-integrity class) ──
         //

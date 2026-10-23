@@ -241,6 +241,41 @@ describe("BlockSync reorg intermediate fails consensus (Core InvalidBlockFound p
   );
 
   test(
+    "submitblock of the fork tip answers 'inconclusive' when the verdict belongs to the intermediate",
+    async () => {
+      const { A1Hash, B1, B1Hash, B2x, B2xHash } = await setup();
+      expect(await blockSync.injectBlock(B1)).toBe("duplicate");
+
+      // Core rpc/mining.cpp submitblock: the state catcher only listens for
+      // BlockChecked(B2x). ConnectTip(B1) fails, so BlockChecked fires for B1
+      // and never for B2x -> "inconclusive", not B1's reject reason.
+      expect(await blockSync.injectBlock(B2x)).toBe("inconclusive");
+
+      // The verdict itself is unchanged: B1 failed, B2x failed child, tip kept.
+      expect(headerSync.getHeader(B1Hash)!.status).toBe("invalid");
+      expect(headerSync.getHeader(B2xHash)!.status).toBe("invalid");
+      expect(chainState.getBestBlock().hash.equals(A1Hash)).toBe(true);
+
+      // Re-submitting the failed intermediate itself is Core's cached verdict.
+      expect(await blockSync.injectBlock(B1)).toBe("duplicate-invalid");
+    },
+    30_000
+  );
+
+  test(
+    "submitblock of a block that itself fails still answers its own reject reason",
+    async () => {
+      const genesis = headerSync.getBestHeader()!;
+      const t0 = genesis.header.timestamp;
+      const A1 = mineBlock(genesis.hash, t0 + 600, 1, 1);
+      expect(await blockSync.injectBlock(A1)).toBeNull();
+      const A2bad = mineBlock(getBlockHash(A1.header), t0 + 1200, 2, 1, REGTEST_SUBSIDY + 1n);
+      expect(await blockSync.injectBlock(A2bad)).toBe("bad-cb-amount");
+    },
+    30_000
+  );
+
+  test(
     "non-verdict: intermediate that cannot be decided (missing ancestor header) is NOT marked",
     async () => {
       const { A1Hash, B1, B1Hash, B2x, B2xHash } = await setup();
