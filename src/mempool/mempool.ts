@@ -4743,10 +4743,20 @@ export class Mempool {
     const idx = cluster?.linearization.txToChunk.get(txidHex);
     if (cluster && idx !== undefined) {
       const chunk = cluster.linearization.chunks[idx];
-      return { fee: chunk.totalFee, size: chunk.totalVsize };
+      // Core's chunk size is the sum of sigop-adjusted WEIGHTS (txgraph feerate
+      // size), not vsize: summing the ceilinged vsize would over-count.
+      let size = 0;
+      for (const id of chunk.txids) {
+        const e = this.entries.get(id);
+        if (e) size += this.clusterWeightContribution(e);
+      }
+      return { fee: chunk.totalFee, size };
     }
     const entry = this.entries.get(txidHex);
-    return { fee: entry ? entry.fee : 0n, size: entry ? entry.vsize : 0 };
+    return {
+      fee: entry ? entry.fee : 0n,
+      size: entry ? this.clusterWeightContribution(entry) : 0,
+    };
   }
 
   /**

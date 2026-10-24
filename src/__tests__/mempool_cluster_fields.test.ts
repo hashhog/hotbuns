@@ -145,18 +145,18 @@ describe("mempool entry cluster fields (chunkweight, fees.chunk)", () => {
 
     const pe = mempool.getTransaction(parentId)!;
     const ce = mempool.getTransaction(childId)!;
-    const chunkVsize = pe.vsize + ce.vsize;
+    const chunkWeight = pe.weight + ce.weight; // no sigop padding in these txs
     const chunkFee = (pe.fee + ce.fee);
 
     const raw = (await rpc("getrawmempool", [true])).result;
     for (const id of [parentId, childId]) {
       const e = raw[displayTxid(id)];
-      expect(e.chunkweight).toBe(chunkVsize);
+      expect(e.chunkweight).toBe(chunkWeight);
       expect(e.fees.chunk).toBeCloseTo(Number(chunkFee) / 1e8, 12);
     }
     for (const id of [parentId, childId]) {
       const e = (await rpc("getmempoolentry", [displayTxid(id)])).result;
-      expect(e.chunkweight).toBe(chunkVsize);
+      expect(e.chunkweight).toBe(chunkWeight);
       expect(e.fees.chunk).toBeCloseTo(Number(chunkFee) / 1e8, 12);
     }
   });
