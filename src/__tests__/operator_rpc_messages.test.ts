@@ -33,6 +33,18 @@ function coinbase(height: number): Transaction {
   };
 }
 
+// Spends the coinbase's only output, so verbosity 3 has a prevout to report.
+function spendOf(cb: Transaction): Transaction {
+  return {
+    version: 2,
+    inputs: [
+      { prevOut: { txid: getTxId(cb), vout: 0 }, scriptSig: Buffer.from([0x51]), sequence: 0xfffffffe, witness: [] },
+    ],
+    outputs: [{ value: 4999990000n, scriptPubKey: Buffer.from([0x51]) }],
+    lockTime: 0,
+  };
+}
+
 class MockChainState {
   getBestBlock() {
     return { hash: Buffer.alloc(32, 0), height: 100, chainWork: 1000n };
@@ -118,6 +130,7 @@ for (const txindex of [false, true]) {
     let mempool: MockMempool;
     let port: number;
     let tx: Transaction;
+    let spender: Transaction;
     let blockHash: Buffer;
 
     beforeEach(() => {
@@ -125,6 +138,7 @@ for (const txindex of [false, true]) {
       db = new MockDB();
       mempool = new MockMempool();
       tx = coinbase(60);
+      spender = spendOf(tx);
       const header: BlockHeader = {
         version: 0x20000000,
         prevBlock: Buffer.alloc(32, 0),
@@ -133,14 +147,14 @@ for (const txindex of [false, true]) {
         bits: 0x207fffff,
         nonce: 0,
       };
-      const block: Block = { header, transactions: [tx] };
+      const block: Block = { header, transactions: [tx, spender] };
       const data = serializeBlock(block);
       blockHash = hash256(data.subarray(0, 80));
       db.blocks.set(blockHash.toString("hex"), data);
       db.indexes.set(blockHash.toString("hex"), {
         height: 60,
         header: data.subarray(0, 80),
-        nTx: 1,
+        nTx: 2,
         status: 7,
         dataPos: 0,
       });
@@ -214,7 +228,7 @@ for (const txindex of [false, true]) {
 
     it("getblock verbosity=true is the txid-list object, like 1", async () => {
       const res = await rpc(port, "getblock", [display(blockHash), true]);
-      expect(res.result.tx).toEqual([display(getTxId(tx))]);
+      expect(res.result.tx).toEqual([display(getTxId(tx)), display(getTxId(spender))]);
     });
 
     it("getblock verbosity above 2 is the full-transaction form", async () => {
@@ -222,6 +236,17 @@ for (const txindex of [false, true]) {
       expect(res.error).toBeUndefined();
       expect(typeof res.result.tx[0]).toBe("object");
       expect(res.result.tx[0].txid).toBe(display(getTxId(tx)));
+      expect(res.result.tx[0].vin[0].prevout).toBeUndefined();
+      // Core TxVerbosity::SHOW_DETAILS_AND_PREVOUT: spent output's details.
+      const prevout = res.result.tx[1].vin[0].prevout;
+      expect(prevout.generated).toBe(true);
+      expect(prevout.value).toBe(50);
+      expect(prevout.scriptPubKey.hex).toBe(tx.outputs[0].scriptPubKey.toString("hex"));
+    });
+
+    it("getblock verbosity 2 does not report prevouts", async () => {
+      const res = await rpc(port, "getblock", [display(blockHash), 2]);
+      expect(res.result.tx[1].vin[0].prevout).toBeUndefined();
     });
 
     it("getblock verbosity below 0 is the raw hex", async () => {

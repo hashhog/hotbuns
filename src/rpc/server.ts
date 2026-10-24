@@ -2236,11 +2236,21 @@ export class RPCServer {
       // blocks connected at tip).  Fallback: resolve via txindex + block
       // fetch for historical blocks where undo data was not persisted during
       // IBD (atTip=false condition in blocks.ts:2372).
-      const spentByOutpoint = await this.buildSpentByOutpointMap(blockhash, block);
-
-      result.tx = block.transactions.map((tx) =>
-        this.formatTxForGetBlock(tx, spentByOutpoint)
-      );
+      // Verbosity >= 3 additionally reports each input's prevout (Core
+      // TxVerbosity::SHOW_DETAILS_AND_PREVOUT), which needs the full UTXO entry.
+      if (verbosity >= 3) {
+        const richPrevouts = await this.buildRichPrevoutMap(blockhash, block);
+        const amounts = new Map<string, bigint>();
+        for (const [key, entry] of richPrevouts) amounts.set(key, entry.amount);
+        result.tx = block.transactions.map((tx) =>
+          this.formatTxForGetBlock(tx, amounts, richPrevouts)
+        );
+      } else {
+        const spentByOutpoint = await this.buildSpentByOutpointMap(blockhash, block);
+        result.tx = block.transactions.map((tx) =>
+          this.formatTxForGetBlock(tx, spentByOutpoint)
+        );
+      }
     }
 
     return result;
@@ -2257,7 +2267,8 @@ export class RPCServer {
    */
   private formatTxForGetBlock(
     tx: Transaction,
-    spentByOutpoint: Map<string, bigint> | null
+    spentByOutpoint: Map<string, bigint> | null,
+    richPrevouts?: Map<string, import("../storage/database.js").UTXOEntry>
   ): Record<string, unknown> {
     const txid = getTxId(tx);
     const wtxid = getWTxId(tx);
@@ -2318,6 +2329,18 @@ export class RPCServer {
           vin.txinwitness = input.witness.map((w) => w.toString("hex"));
         }
         vin.sequence = input.sequence;
+
+        if (richPrevouts && !(isCb && i === 0)) {
+          const entry = richPrevouts.get(`${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`);
+          if (entry !== undefined) {
+            vin.prevout = {
+              generated: entry.coinbase,
+              height: entry.height,
+              value: formatBtcAmount(entry.amount),
+              scriptPubKey: buildScriptPubKeyObj(entry.scriptPubKey, network),
+            };
+          }
+        }
 
         return vin;
       }),
