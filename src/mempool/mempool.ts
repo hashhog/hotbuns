@@ -2056,13 +2056,17 @@ export class Mempool {
           };
         }
 
-        // Check coinbase maturity
+        // Check coinbase maturity. Core CheckTxInputs measures depth from the
+        // spend height, and the mempool spends in the next block: nSpendHeight
+        // = tip + 1 (validation.cpp:891-892, tx_verify.cpp:179-181). Using the
+        // tip itself rejected a coinbase one block after Core accepts it.
         if (utxo.coinbase) {
-          const confirmations = this.tipHeight - utxo.height;
-          if (confirmations < this.params.coinbaseMaturity) {
+          const depth = this.tipHeight + 1 - utxo.height;
+          if (depth < this.params.coinbaseMaturity) {
             return {
               accepted: false,
-              error: `bad-txns-premature-spend-of-coinbase: depth ${confirmations} < ${this.params.coinbaseMaturity}`,
+              // Core TxValidationState::ToString(): "<reason>, <debug>".
+              error: `bad-txns-premature-spend-of-coinbase, tried to spend coinbase at depth ${depth}`,
             };
           }
         }
