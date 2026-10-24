@@ -122,6 +122,13 @@ class MockMempool {
     return entry ? entry.fee : 0n;
   }
 
+  // Mirrors the real Mempool.getMainChunkFeerate. The mock has no cluster
+  // linearization, so every tx is its own chunk (weight = 4 * vsize).
+  getMainChunkFeerate(txid: Buffer): { fee: bigint; size: number } {
+    const entry = this.entries.get(txid.toString("hex"));
+    return entry ? { fee: entry.fee, size: entry.vsize * 4 } : { fee: 0n, size: 0 };
+  }
+
   // Mirrors the real Mempool.getPrioritisedTransactions. The mock holds no
   // deltas, so this is always empty — getprioritisedtransactions returns {}.
   getPrioritisedTransactions(): Array<{
