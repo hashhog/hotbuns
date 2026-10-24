@@ -210,6 +210,11 @@ export interface NodeConfig {
    */
   dbcacheMB: number;
   /**
+   * Mempool size bound in MB (1 MB = 1,000,000 bytes). Mirrors Bitcoin
+   * Core's `-maxmempool` (kernel/mempool_options.h, default 300).
+   */
+  maxMempoolMB: number;
+  /**
    * Enable the read-only REST API server (`/rest/*`). Mirrors Bitcoin
    * Core's `-rest` (default OFF in init.cpp via `DEFAULT_REST_ENABLE =
    * false`). When true, the RESTServer binds on `restPort` (or rpcPort
@@ -355,6 +360,11 @@ export interface ParsedArgs {
   args: string[];
 }
 
+/** Mempool byte bound from `-maxmempool` (MB = 1,000,000 bytes, like Core). */
+export function mempoolMaxBytes(config: Pick<NodeConfig, "maxMempoolMB">): number {
+  return (config.maxMempoolMB ?? 300) * 1_000_000;
+}
+
 /**
  * Default configuration values.
  */
@@ -371,6 +381,7 @@ const DEFAULT_CONFIG: NodeConfig = {
   logLevel: "info",
   peerBloomFilters: false,
   dbcacheMB: 512,
+  maxMempoolMB: 300,
   daemon: false,
   internalDaemonChild: false,
   supervise: false,
@@ -581,6 +592,15 @@ export function parseArgs(argv: string[]): ParsedArgs {
             config.peerBloomFilters = true;
           } else if (value === "0" || value === "false") {
             config.peerBloomFilters = false;
+          }
+          break;
+        case "maxmempool":
+          // Bitcoin Core flag `-maxmempool=N` — mempool bound in MB.
+          if (value !== undefined) {
+            const maxMempoolVal = parseInt(value, 10);
+            if (!isNaN(maxMempoolVal) && maxMempoolVal > 0) {
+              config.maxMempoolMB = maxMempoolVal;
+            }
           }
           break;
         case "dbcache":
@@ -954,6 +974,12 @@ export async function loadConfig(
           break;
         case "peerbloomfilters":
           config.peerBloomFilters = value === "1" || value === "true";
+          break;
+        case "maxmempool":
+          const maxMempoolVal = parseInt(value, 10);
+          if (!isNaN(maxMempoolVal) && maxMempoolVal > 0) {
+            config.maxMempoolMB = maxMempoolVal;
+          }
           break;
         case "dbcache":
           const dbcacheVal = parseInt(value, 10);
@@ -1760,7 +1786,7 @@ async function startNode(config: NodeConfig): Promise<void> {
 
   // 4. Initialize UTXO manager, mempool, fee estimator
   const utxo = chainState.getUTXOManager();
-  const mempool = new Mempool(utxo, params);
+  const mempool = new Mempool(utxo, params, mempoolMaxBytes(mergedConfig));
   const feeEstimator = new FeeEstimator(mempool);
 
   // Load persisted fee estimates
@@ -3658,6 +3684,7 @@ OPTIONS:
   --cjdnsreachable      Opt in to outbound CJDNS (fc00::/8) connects
   --prune=<n>           Prune block storage to n MiB (0=disabled, 1=manual via RPC, ≥550=auto)
   --dbcache=<n>         UTXO cache size in MiB (default: 512)
+  --maxmempool=<n>      Mempool size limit in MB (default: 300)
   --load-snapshot=<path> Load Bitcoin Core-format UTXO snapshot (assumeutxo)
   --daemon              Fork to background and detach (re-execs self under Bun)
   --supervise           Parent watches the node; SIGSEGV/SIGILL is CRASHED (not 'behind') and the child restarts to resume
