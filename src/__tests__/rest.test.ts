@@ -81,6 +81,29 @@ class MockMempool implements Partial<Mempool> {
     const key = `${txid.toString("hex")}:${vout}`;
     return this.outpoints.has(key);
   }
+
+  // The mock holds no prioritisetransaction deltas: modified fee = base fee.
+  getModifiedFee(txid: Buffer): bigint {
+    return this.entries.get(txid.toString("hex"))?.fee ?? 0n;
+  }
+
+  // Mirrors Mempool.getEntryRelatives for the mock's unrelated entries
+  // (the REST tests add no parent/child links): totals are the entry itself.
+  getEntryRelatives(txid: Buffer) {
+    const e = this.entries.get(txid.toString("hex"));
+    if (!e) return null;
+    const toDisplay = (hex: string) => Buffer.from(hex, "hex").reverse().toString("hex");
+    return {
+      ancestorCount: 1,
+      ancestorSize: e.vsize,
+      ancestorFees: e.fee,
+      descendantCount: 1,
+      descendantSize: e.vsize,
+      descendantFees: e.fee,
+      depends: Array.from(e.dependsOn).map(toDisplay).sort(),
+      spentby: Array.from(e.spentBy).sort().map(toDisplay),
+    };
+  }
 }
 
 class MockHeaderSync implements Partial<HeaderSync> {
