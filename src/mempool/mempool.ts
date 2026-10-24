@@ -86,6 +86,7 @@ import {
   MAX_BIP125_RBF_SEQUENCE,
   MAX_REPLACEMENT_CANDIDATES,
 } from "./rbf.js";
+import { nowSeconds } from "../clock.js";
 
 /**
  * Maximum cluster count: maximum number of transactions in a cluster.
@@ -1471,7 +1472,7 @@ export class Mempool {
     // Rolling fee state (txmempool.h:195-197)
     this.rollingMinimumFeeRate = 0;
     this.blockSinceLastRollingFeeBump = false;
-    this.lastRollingFeeUpdate = Math.floor(Date.now() / 1000);
+    this.lastRollingFeeUpdate = nowSeconds();
   }
 
   /**
@@ -2560,7 +2561,7 @@ export class Mempool {
       feeRate,
       vsize,
       weight,
-      addedTime: Math.floor(Date.now() / 1000),
+      addedTime: nowSeconds(),
       height: this.tipHeight,
       spentBy: new Set(),
       dependsOn: parentTxids,
@@ -2815,7 +2816,7 @@ export class Mempool {
     // blockSinceLastRollingFeeBump flag so that GetMinFee() will apply decay
     // going forward.
     // Reference: bitcoin-core/src/txmempool.cpp:426-427
-    this.lastRollingFeeUpdate = Math.floor(Date.now() / 1000);
+    this.lastRollingFeeUpdate = nowSeconds();
     this.blockSinceLastRollingFeeBump = true;
   }
 
@@ -2982,7 +2983,7 @@ export class Mempool {
         feeRate,
         vsize,
         weight,
-        addedTime: Math.floor(Date.now() / 1000),
+        addedTime: nowSeconds(),
         height: this.tipHeight,
         spentBy: new Set<string>(),
         dependsOn: new Set<string>(), // unchecked path: no parent tracking
@@ -3768,7 +3769,7 @@ export class Mempool {
    * @returns Number of transactions removed.
    */
   expire(time?: number): number {
-    const cutoff = time ?? (Math.floor(Date.now() / 1000) - MEMPOOL_EXPIRY_SECONDS);
+    const cutoff = time ?? (nowSeconds() - MEMPOOL_EXPIRY_SECONDS);
 
     // Collect all txids whose addedTime is before the cutoff, in insertion order.
     // We remove in topological order (parents first) to avoid removing children
@@ -3842,7 +3843,7 @@ export class Mempool {
       return this.rollingMinimumFeeRate;
     }
 
-    const now = Math.floor(Date.now() / 1000);
+    const now = nowSeconds();
     if (now > this.lastRollingFeeUpdate + 10) {
       // Choose halflife based on how full the pool is.
       // Reference: txmempool.cpp:836-841
@@ -4052,7 +4053,7 @@ export class Mempool {
     // Reset rolling fee state.
     this.rollingMinimumFeeRate = 0;
     this.blockSinceLastRollingFeeBump = false;
-    this.lastRollingFeeUpdate = Math.floor(Date.now() / 1000);
+    this.lastRollingFeeUpdate = nowSeconds();
   }
 
   /**
