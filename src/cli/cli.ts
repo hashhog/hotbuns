@@ -18,6 +18,7 @@ import { deserializeBlock } from "../validation/block.js";
 import { ChainStateManager } from "../chain/state.js";
 import { TipNotifier } from "../chain/tip_notifier.js";
 import { ChainstateManager, getAssumeutxoData, loadCampaignAssumeutxo, persistAssumeutxoTailHeaders } from "../chain/snapshot.js";
+import { applySnapshotHistoryServices, recordSnapshotOrigin } from "../chain/snapshot_origin.js";
 import { UTXOManager } from "../chain/utxo.js";
 import { Mempool } from "../mempool/mempool.js";
 import { OrphanPool } from "../mempool/orphan_pool.js";
@@ -1471,6 +1472,7 @@ async function runSnapshotLoad(
     dataPos: 0,
   });
   await db.putChainWork(result.baseBlockHash, chainWork);
+  await recordSnapshotOrigin(db, result.baseBlockHash, result.baseHeight);
   if (au) {
     const nTails = await persistAssumeutxoTailHeaders(db, au);
     if (nTails > 0) {
@@ -1990,6 +1992,21 @@ async function startNode(config: NodeConfig): Promise<void> {
       }
     }),
   });
+
+  // A node started from a UTXO snapshot does not hold the block bodies below
+  // the snapshot base: like Core (init.cpp, no NODE_NETWORK while the
+  // historical chainstate is unfinished) it advertises NODE_NETWORK_LIMITED
+  // only, before any peer sees a version message.
+  {
+    const origin = await applySnapshotHistoryServices(db, params, peerManager);
+    if (origin) {
+      console.log(
+        `[snapshot] history below snapshot base ${origin.baseHeight} ` +
+          `(${Buffer.from(origin.baseHash).reverse().toString("hex")}) not downloaded; ` +
+          `not advertising NODE_NETWORK`,
+      );
+    }
+  }
 
   if (peerManager.usingASMap()) {
     console.log(`Using ASMap-aware outbound connection routing (version: ${peerManager.getAsmapVersion()})`);

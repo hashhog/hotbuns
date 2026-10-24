@@ -1251,7 +1251,36 @@ export class PeerManager {
    * at private state.
    */
   getAdvertisedServices(): bigint {
-    return this.config.params.services;
+    return this.getLocalServices();
+  }
+
+  /**
+   * Bits cleared from `params.services` at runtime (Core
+   * CConnman::RemoveLocalServices). A node started from a UTXO snapshot that
+   * lacks the block bodies below the base clears NODE_NETWORK here.
+   */
+  private removedLocalServices = 0n;
+
+  /**
+   * The service bits this node advertises right now: localservices in
+   * getnetworkinfo, and the services field of every version / self-addr
+   * message (Core CConnman::GetLocalServices).
+   */
+  getLocalServices(): bigint {
+    return this.config.params.services & ~this.removedLocalServices;
+  }
+
+  /** Core CConnman::RemoveLocalServices. */
+  removeLocalServices(bits: bigint): void {
+    this.removedLocalServices |= bits;
+  }
+
+  /**
+   * Core CConnman::AddLocalServices. Only re-adds bits previously removed;
+   * the configured `params.services` stay the ceiling.
+   */
+  addLocalServices(bits: bigint): void {
+    this.removedLocalServices &= ~bits;
   }
 
   /**
@@ -1589,7 +1618,7 @@ export class PeerManager {
     // this full node — it is already part of `params.services` (0x409), per
     // Core (init.cpp:863 base g_local_services includes NODE_NETWORK_LIMITED;
     // NODE_NETWORK added for non-prune at init.cpp:1950).  No prune gate here.
-    const advertisedServices = this.config.params.services;
+    const advertisedServices = this.getLocalServices();
 
     const config: PeerConfig = {
       host,
@@ -3972,7 +4001,7 @@ export class PeerManager {
     const local = this.getLocalAddrForPeer(peer, isInbound, now);
     if (!local) return false;
 
-    const services = this.config.params.services;
+    const services = this.getLocalServices();
     const timestamp = Math.floor(now / 1000);
     const ip = hostToBuffer(local.host);
     if (peer.wantsAddrV2) {
@@ -4082,7 +4111,7 @@ export class PeerManager {
           // NODE_NETWORK_LIMITED is advertised UNCONDITIONALLY for this full
           // node — already part of `params.services` (0x409), same as the
           // outbound site.  No prune gate (Core init.cpp:863/1950).
-          const inAdvertisedServices = manager.config.params.services;
+          const inAdvertisedServices = manager.getLocalServices();
 
           // Create a Peer for this inbound connection. Key by the remote
           // ephemeral port so two inbound sockets from the same host do
