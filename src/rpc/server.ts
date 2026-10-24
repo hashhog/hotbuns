@@ -4932,7 +4932,7 @@ export class RPCServer {
                 generated: entry.coinbase,
                 height: entry.height,
                 value: formatBtcAmount(entry.amount),
-                scriptPubKey: buildScriptPubKeyObj(entry.scriptPubKey),
+                scriptPubKey: this.buildScriptPubKeyObjNetworkAware(entry.scriptPubKey),
               };
             } else {
               // No prevout entry: the per-vin `prevout` object is already
@@ -4955,7 +4955,7 @@ export class RPCServer {
         return {
           value: formatBtcAmount(output.value),
           n: i,
-          scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey),
+          scriptPubKey: this.buildScriptPubKeyObjNetworkAware(output.scriptPubKey),
         };
       }),
     };
@@ -16745,7 +16745,7 @@ export class RPCServer {
         //                   hex). getBlockHashByHeight returns internal byte
         //                   order, so reverse for display (same as txid above).
         //   confirmations = active tip height - coin height + 1.
-        const desc = buildScriptPubKeyObj(scriptPubKey).desc;
+        const desc = buildScriptPubKeyObj(scriptPubKey, this.getNetworkType()).desc;
         const blockHashBuf = await this.db.getBlockHashByHeight(height);
         unspents.push({
           txid: Buffer.from(txidInternal).reverse().toString("hex"),
