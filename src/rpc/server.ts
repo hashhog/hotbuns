@@ -8,6 +8,7 @@
 import * as path from "path";
 import { FATAL_ERROR_TOKEN, fatalRefusal, isFatal } from "../chain/fatal.js";
 import * as fs from "fs";
+import { setMockTime } from "../clock.js";
 import type { ChainStateManager } from "../chain/state.js";
 import type { ChainDB } from "../storage/database.js";
 import { DBPrefix, BlockStatus } from "../storage/database.js";
@@ -1658,6 +1659,7 @@ export class RPCServer {
     // Control methods
     this.registerMethod("stop", (params) => this.stopNode(params));
     this.registerMethod("uptime", () => this.getUptime());
+    this.registerMethod("setmocktime", (params) => this.setMockTimeRpc(params));
     this.registerMethod("getmemoryinfo", async (params) => this.getMemoryInfo(params));
     this.registerMethod("logging", async (params) => this.logging(params));
 
@@ -13151,6 +13153,33 @@ export class RPCServer {
       },
       warnings: [],
     };
+  }
+
+  /**
+   * setmocktime (Core rpc/node.cpp) -- regtest only. Sets the node clock
+   * (mempool entry times, rolling-fee decay, expiry); 0 restores the system
+   * time. Returns null.
+   */
+  private async setMockTimeRpc(params: unknown[]): Promise<null> {
+    if (this.params.networkMagic !== 0xdab5bffa) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        "setmocktime is for regression testing (-regtest mode) only"
+      );
+    }
+    const t = params[0];
+    if (typeof t !== "number" || !Number.isInteger(t)) {
+      throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "JSON value of type " + typeof t + " is not of expected type number");
+    }
+    const maxTime = 9223372036; // Core: nanoseconds::max() in seconds
+    if (t < 0 || t > maxTime) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        `Mocktime must be in the range [0, ${maxTime}], not ${t}.`
+      );
+    }
+    setMockTime(t);
+    return null;
   }
 
   private async getUptime(): Promise<number> {
