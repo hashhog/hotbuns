@@ -5673,6 +5673,10 @@ export class RPCServer {
       );
     }
 
+    // Core BroadcastTransaction: a freshly accepted local submission is
+    // unbroadcast until a peer fetches it (cleared on getdata).
+    this.mempool.addUnbroadcastTx(txid);
+
     // Broadcast inv to peers
     this.broadcastTxInv(txid);
 
@@ -5863,6 +5867,7 @@ export class RPCServer {
     for (const [wtxid, txResult] of result.txResults) {
       if (txResult.accepted) {
         const txid = Buffer.from(txResult.txid, "hex");
+        this.mempool.addUnbroadcastTx(txid);
         this.broadcastTxInv(txid);
       }
     }
@@ -5940,7 +5945,7 @@ export class RPCServer {
       mempoolminfee: info.minFeeRate / 100_000, // Convert sat/vB to BTC/kvB
       minrelaytxfee: 0.000001, // 0.1 sat/vB = Core's minrelaytxfee default (0.00000100 BTC/kvB)
       incrementalrelayfee: 0.000001, // 0.1 sat/vB = Core's DEFAULT_INCREMENTAL_RELAY_FEE{100} (0.00000100 BTC/kvB)
-      unbroadcastcount: 0,
+      unbroadcastcount: this.mempool.getUnbroadcastTxs().size,
       fullrbf: true,
       // Core v31.99 MempoolInfoToJSON appends these 5 fields after fullrbf
       // (rpc/mempool.cpp). Values are the policy defaults (policy.h):
@@ -6001,7 +6006,7 @@ export class RPCServer {
         depends: Array.from(entry.dependsOn),
         spentby: Array.from(entry.spentBy),
         "bip125-replaceable": this.mempool.getRBFOptInState(txid) === RBFTransactionState.REPLACEABLE_BIP125,
-        unbroadcast: false,
+        unbroadcast: this.mempool.isUnbroadcast(txid),
       };
     }
 
@@ -6054,7 +6059,7 @@ export class RPCServer {
       depends: Array.from(entry.dependsOn),
       spentby: Array.from(entry.spentBy),
       "bip125-replaceable": this.mempool.isReplaceable(txid),
-      unbroadcast: false,
+      unbroadcast: this.mempool.isUnbroadcast(txid),
       // Cluster mempool fields
       miningScore: miningScore, // Effective fee rate (sat/vB) from chunk
     };
@@ -6601,7 +6606,7 @@ export class RPCServer {
           depends: Array.from(ancestorEntry.dependsOn),
           spentby: Array.from(ancestorEntry.spentBy),
           "bip125-replaceable": this.mempool.getRBFOptInState(ancestorTxid) === RBFTransactionState.REPLACEABLE_BIP125,
-          unbroadcast: false,
+          unbroadcast: this.mempool.isUnbroadcast(ancestorTxid),
         };
       }
     }
@@ -6684,7 +6689,7 @@ export class RPCServer {
           depends: Array.from(descendantEntry.dependsOn),
           spentby: Array.from(descendantEntry.spentBy),
           "bip125-replaceable": this.mempool.getRBFOptInState(descendantTxid) === RBFTransactionState.REPLACEABLE_BIP125,
-          unbroadcast: false,
+          unbroadcast: this.mempool.isUnbroadcast(descendantTxid),
         };
       }
     }
