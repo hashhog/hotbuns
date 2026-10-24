@@ -313,6 +313,7 @@ describe("getrawtransaction", () => {
       headerSync: new MockHeaderSync() as any,
       db: mockDB as any,
       params: REGTEST,
+      txindex: true,
     };
 
     server = new RPCServer(config, deps);
@@ -499,7 +500,7 @@ describe("getrawtransaction", () => {
 
       expect(res.error).toBeDefined();
       expect(res.error?.code).toBe(RPCErrorCodes.INVALID_ADDRESS_OR_KEY);
-      expect(res.error?.message).toContain("No such transaction found in the provided block");
+      expect(res.error?.message).toContain("No such transaction found in the provided block. Use gettransaction");
     });
 
     it("should format coinbase input correctly", async () => {

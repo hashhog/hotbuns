@@ -369,6 +369,8 @@ export interface RPCServerDeps {
    * lists indexes that are actually running.
    */
   filterIndex?: import("../storage/indexes.js").BlockFilterIndex;
+  /** -txindex: allow getrawtransaction to look up confirmed txs without a blockhash. Default off, like Core. */
+  txindex?: boolean;
   /**
    * The persistent, reorg-safe coinstatsindex, present only when the operator
    * started the node with `--coinstatsindex=1` (cli.ts constructs and wires
@@ -800,6 +802,8 @@ export class RPCServer {
   private orphanPool?: OrphanPool;
   /** BIP-157/158 basic block filter index (present iff --blockfilterindex). */
   private filterIndex?: import("../storage/indexes.js").BlockFilterIndex;
+  /** Core's -txindex: lets getrawtransaction find a confirmed tx without a blockhash. */
+  private txindexEnabled: boolean;
   /** Per-height UTXO coinstats index (present iff --coinstatsindex). Backs
    *  gettxoutsetinfo at a historical hash_or_height + getindexinfo. */
   private coinStatsIndex?: import("../storage/indexes.js").PersistentCoinStatsIndex;
@@ -906,6 +910,7 @@ export class RPCServer {
     this.blockSync = deps.blockSync;
     this.orphanPool = deps.orphanPool;
     this.filterIndex = deps.filterIndex;
+    this.txindexEnabled = deps.txindex ?? false;
     this.coinStatsIndex = deps.coinStatsIndex;
     this.txoSpenderIndex = deps.txoSpenderIndex;
     this.methods = new Map();
@@ -2110,7 +2115,10 @@ export class RPCServer {
       // found" for an out-of-int32 verbosity where Core answers -1.
       this.uvGetInt(verbosityParam, "verbosity", INT32_MIN, INT32_MAX);
     }
-    const verbosity = typeof verbosityParam === "number" ? verbosityParam : 1;
+    // Core ParseVerbosity(allow_bool=true): false -> 0 (raw hex), true -> 1,
+    // an integer as given; <= 0 is hex and >= 2 is the full-transaction form.
+    const verbosity =
+      typeof verbosityParam === "number" ? verbosityParam : verbosityParam === false ? 0 : 1;
 
     // Get block index record first to check if pruned
     const blockIndex = await this.db.getBlockIndex(blockhash);
@@ -2139,7 +2147,7 @@ export class RPCServer {
     }
 
     // Verbosity 0: return hex
-    if (verbosity === 0) {
+    if (verbosity <= 0) {
       return blockData.toString("hex");
     }
 
@@ -2222,17 +2230,27 @@ export class RPCServer {
     // Add transactions
     if (verbosity === 1) {
       result.tx = block.transactions.map((tx) => Buffer.from(getTxId(tx)).reverse().toString("hex"));
-    } else if (verbosity === 2) {
+    } else if (verbosity >= 2) {
       // Build spentByOutpoint map for fee computation.
       // Primary: undo data stored during block connect (available for recent
       // blocks connected at tip).  Fallback: resolve via txindex + block
       // fetch for historical blocks where undo data was not persisted during
       // IBD (atTip=false condition in blocks.ts:2372).
-      const spentByOutpoint = await this.buildSpentByOutpointMap(blockhash, block);
-
-      result.tx = block.transactions.map((tx) =>
-        this.formatTxForGetBlock(tx, spentByOutpoint)
-      );
+      // Verbosity >= 3 additionally reports each input's prevout (Core
+      // TxVerbosity::SHOW_DETAILS_AND_PREVOUT), which needs the full UTXO entry.
+      if (verbosity >= 3) {
+        const richPrevouts = await this.buildRichPrevoutMap(blockhash, block);
+        const amounts = new Map<string, bigint>();
+        for (const [key, entry] of richPrevouts) amounts.set(key, entry.amount);
+        result.tx = block.transactions.map((tx) =>
+          this.formatTxForGetBlock(tx, amounts, richPrevouts)
+        );
+      } else {
+        const spentByOutpoint = await this.buildSpentByOutpointMap(blockhash, block);
+        result.tx = block.transactions.map((tx) =>
+          this.formatTxForGetBlock(tx, spentByOutpoint)
+        );
+      }
     }
 
     return result;
@@ -2249,7 +2267,8 @@ export class RPCServer {
    */
   private formatTxForGetBlock(
     tx: Transaction,
-    spentByOutpoint: Map<string, bigint> | null
+    spentByOutpoint: Map<string, bigint> | null,
+    richPrevouts?: Map<string, import("../storage/database.js").UTXOEntry>
   ): Record<string, unknown> {
     const txid = getTxId(tx);
     const wtxid = getWTxId(tx);
@@ -2310,6 +2329,18 @@ export class RPCServer {
           vin.txinwitness = input.witness.map((w) => w.toString("hex"));
         }
         vin.sequence = input.sequence;
+
+        if (richPrevouts && !(isCb && i === 0)) {
+          const entry = richPrevouts.get(`${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`);
+          if (entry !== undefined) {
+            vin.prevout = {
+              generated: entry.coinbase,
+              height: entry.height,
+              value: formatBtcAmount(entry.amount),
+              scriptPubKey: buildScriptPubKeyObj(entry.scriptPubKey, network),
+            };
+          }
+        }
 
         return vin;
       }),
@@ -2533,7 +2564,7 @@ export class RPCServer {
 
     // Core ParseHashV: malformed blockhash (wrong length / non-hex) -> -8 at
     // the parse boundary, BEFORE the LookupBlockIndex "Block not found" (-5).
-    const blockhash = this.parseHashV(blockhashParam, "blockhash");
+    const blockhash = this.parseHashV(blockhashParam, "hash");
 
     const verbose = verboseParam !== false;
 
@@ -2824,8 +2855,10 @@ export class RPCServer {
       result[name] = { synced, best_block_height: bestBlockHeight };
     };
 
-    // txindex — always running in hotbuns; tracks the active chain tip.
-    pushIndex("txindex", tipHeight >= headerHeight, tipHeight);
+    // txindex — listed only when --txindex is set; tracks the active chain tip.
+    if (this.txindexEnabled) {
+      pushIndex("txindex", tipHeight >= headerHeight, tipHeight);
+    }
 
     // basic block filter index — running only when --blockfilterindex set.
     if (this.filterIndex && this.filterIndex.isEnabled()) {
@@ -4645,7 +4678,16 @@ export class RPCServer {
 
       throw this.rpcError(
         RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
-        "No such transaction found in the provided block"
+        "No such transaction found in the provided block. Use gettransaction for wallet transactions."
+      );
+    }
+
+    // Core rawtransaction.cpp: without -txindex only the mempool and an
+    // explicit blockhash can answer, and the hint names the missing flag.
+    if (!this.txindexEnabled) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions."
       );
     }
 
@@ -5587,7 +5629,8 @@ export class RPCServer {
    *   - RPC_TRANSACTION_ALREADY_IN_CHAIN (-27): TX already confirmed in blockchain
    */
   private async sendRawTransaction(params: unknown[]): Promise<string> {
-    const [hexstringParam, maxfeerateParam] = params;
+    const [hexstringParam, rawMaxfeerateParam] = params;
+    let maxfeerateParam = rawMaxfeerateParam;
 
     if (typeof hexstringParam !== "string") {
       throw this.rpcError(
@@ -5599,10 +5642,18 @@ export class RPCServer {
     // Parse maxfeerate parameter (default 0.10 BTC/kvB)
     let maxFeeRate = DEFAULT_MAX_FEE_RATE;
     if (maxfeerateParam !== undefined && maxfeerateParam !== null) {
+      // Core ParseFeeRate -> AmountFromValue: -3 for a value that is neither a
+      // number nor a string, "Invalid amount" for an unparsable string.
+      if (typeof maxfeerateParam === "string") {
+        if (!/^(\d+\.?\d*|\.\d+)$/.test(maxfeerateParam)) {
+          throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Invalid amount");
+        }
+        maxfeerateParam = Number(maxfeerateParam);
+      }
       if (typeof maxfeerateParam !== "number") {
         throw this.rpcError(
-          RPCErrorCodes.INVALID_PARAMS,
-          "maxfeerate must be a number"
+          RPCErrorCodes.TYPE_ERROR,
+          "Amount is not a number or string"
         );
       }
       if (maxfeerateParam < 0) {
@@ -5650,7 +5701,7 @@ export class RPCServer {
     if (isConfirmed) {
       throw this.rpcError(
         RPCErrorCodes.RPC_TRANSACTION_ALREADY_IN_CHAIN,
-        "Transaction already in block chain"
+        "Transaction outputs already in utxo set"
       );
     }
 
@@ -5667,6 +5718,13 @@ export class RPCServer {
     const maxFeeRateSatPerVB = maxFeeRate > 0 ? maxFeeRate * 100_000 : undefined;
     const result = await this.mempool.addTransaction(tx, { maxFeeRateSatPerVB });
     if (!result.accepted) {
+      // Core rpc/mempool.cpp DEFAULT_TRANSACTION_MAXFEE / BroadcastTransaction:
+      // missing inputs is TransactionError::MISSING_INPUTS -> RPC_TRANSACTION_ERROR
+      // (-25) with the bare reason; every other rejection is -26 with detail.
+      const MISSING_INPUTS = "bad-txns-inputs-missingorspent";
+      if (result.error?.startsWith(MISSING_INPUTS)) {
+        throw this.rpcError(RPCErrorCodes.RPC_TRANSACTION_ERROR, MISSING_INPUTS);
+      }
       throw this.rpcError(
         RPCErrorCodes.RPC_TRANSACTION_REJECTED,
         result.error || "Transaction rejected"
@@ -6134,7 +6192,14 @@ export class RPCServer {
   private async testMempoolAccept(params: unknown[]): Promise<Array<Record<string, unknown>>> {
     const [rawtxsParam, maxfeerateParam] = params;
 
-    if (!Array.isArray(rawtxsParam) || rawtxsParam.length === 0) {
+    if (Array.isArray(rawtxsParam) && rawtxsParam.length === 0) {
+      // Core rpc/mempool.cpp: an empty package is RPC_INVALID_PARAMETER (-8).
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Array must contain between 1 and 25 transactions."
+      );
+    }
+    if (!Array.isArray(rawtxsParam)) {
       throw this.rpcError(
         RPCErrorCodes.INVALID_PARAMS,
         "rawtxs must be a non-empty array"
