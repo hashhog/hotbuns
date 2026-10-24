@@ -61,6 +61,7 @@ function makeMempool(txs: Transaction[]) {
       const tx = byTxid.get(txid.toString("hex"));
       return tx ? { tx } : null;
     },
+    removeUnbroadcastTx() {},
     getAllTxids(): Buffer[] {
       return Array.from(byTxid.keys()).map((h) => Buffer.from(h, "hex"));
     },
