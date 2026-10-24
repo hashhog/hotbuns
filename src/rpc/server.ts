@@ -9537,7 +9537,7 @@ export class RPCServer {
       bip22Txs.push({
         data: txData.toString("hex"),
         txid: txidHex,
-        hash: getWTxId(entry.tx).toString("hex"),
+        hash: Buffer.from(getWTxId(entry.tx)).reverse().toString("hex"),
         depends,
         fee: Number(entry.fee),
         sigops: entry.sigOpCost ?? 0,
