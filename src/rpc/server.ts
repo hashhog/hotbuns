@@ -6299,7 +6299,9 @@ export class RPCServer {
           txid: displayHex(getTxId(tx)),
           wtxid: displayHex(getWTxId(tx)),
         };
-        if (packageError !== undefined) entry["package-error"] = coreStateString(packageError);
+        // Package messages are already Core's PackageValidationState::ToString()
+        // ("reason" or "reason, debug"); the debug may itself contain ": ".
+        if (packageError !== undefined) entry["package-error"] = packageError;
         const r = pkg.txResults.get(getWTxId(tx).toString("hex"));
         if (exitEarly || r === undefined) {
           // Validation unfinished: just txid and wtxid.

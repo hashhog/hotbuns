@@ -1367,6 +1367,8 @@ export interface AcceptResult {
   mempoolParents?: Set<string>;
   /** Mempool txs this one conflicts with, plus their descendants. */
   conflicts?: MempoolEntry[];
+  /** Only the mempool txs this one spends an input of (Core m_iters_conflicting). */
+  directConflicts?: MempoolEntry[];
   /** Txid hex of the mempool txs it replaced (committed admissions only). */
   replaced?: string[];
 }
@@ -1850,6 +1852,18 @@ export class Mempool {
       // Mark this as a potential RBF replacement - we'll validate the fees later
       isReplacement = true;
 
+      // Rule #5 (Core GetEntriesForConflicts, policy/rbf.cpp): at most
+      // MAX_REPLACEMENT_CANDIDATES distinct CLUSTERS among the direct
+      // conflicts. Their descendants are evicted with no second cap.
+      // TX_MEMPOOL_POLICY: a package cannot retry it.
+      const conflictClusters = this.uniqueClusterCount(conflicts);
+      if (conflictClusters > MAX_REPLACEMENT_CANDIDATES) {
+        return {
+          accepted: false,
+          error: `too many potential replacements: rejecting replacement ${Buffer.from(txid).reverse().toString("hex")}; too many conflicting clusters (${conflictClusters} > ${MAX_REPLACEMENT_CANDIDATES})`,
+        };
+      }
+
       // Gather all conflicts and their descendants
       const allConflictTxids = new Set<string>();
       for (const conflict of conflicts) {
@@ -1858,14 +1872,6 @@ export class Mempool {
         for (const desc of descendants) {
           allConflictTxids.add(desc);
         }
-      }
-
-      // Check eviction limit (Rule #5: max 100 transactions)
-      if (allConflictTxids.size > MAX_REPLACEMENT_CANDIDATES) {
-        return {
-          accepted: false,
-          error: `RBF would evict too many transactions: ${allConflictTxids.size} > ${MAX_REPLACEMENT_CANDIDATES}`,
-        };
       }
 
       // Collect all entries to be evicted
@@ -2345,7 +2351,7 @@ export class Mempool {
         const diagramErr = this.improvesFeerateDiagram(
           txid.toString("hex"),
           fee,
-          vsize,
+          adjWeight,
           parentTxids,
           conflictsToEvict,
         );
@@ -2490,6 +2496,7 @@ export class Mempool {
         adjWeight,
         mempoolParents: parentTxids,
         conflicts: conflictsToEvict,
+        directConflicts: conflicts,
       };
     }
 
@@ -3522,6 +3529,13 @@ export class Mempool {
     }
 
     return conflicts;
+  }
+
+  /** Core CTxMemPool::GetUniqueClusterCount: distinct clusters among `entries`. */
+  private uniqueClusterCount(entries: Iterable<MempoolEntry>): number {
+    const roots = new Set<string>();
+    for (const e of entries) roots.add(this.clusters.find(e.txid.toString("hex")));
+    return roots.size;
   }
 
   // checkAncestorLimits() was REMOVED here (Wave A, cluster limits).
@@ -4615,18 +4629,22 @@ export class Mempool {
   // ─── ImprovesFeerateDiagram helpers ────────────────────────────────────────
 
   /**
-   * Produce the cumulative feerate diagram (list of {totalFee, totalVsize}
-   * points in ascending vsize order) from a linearized cluster.
+   * Produce the cumulative feerate diagram (list of {totalFee, totalSize}
+   * points in ascending size order) from a linearized cluster.
    *
-   * Each element is the *cumulative* fee and vsize at the end of that chunk
+   * Sizes are sigop-adjusted WEIGHT, the TxGraph feerate size Core's
+   * diagram is built from (txmempool.cpp ChangeSet::StageAddition), not the
+   * ceilinged vsize: ceil(w/4) can turn a strict improvement into a loss.
+   *
+   * Each element is the *cumulative* fee and size at the end of that chunk
    * (i.e. the diagram is the staircase of chunk endpoints).
    *
    * Reference: bitcoin-core/src/util/feefrac.h / cluster_linearize.h —
    * FeeFrac-based cumulative diagram used by CompareChunks.
    */
   private linearizeVirtualCluster(
-    virtualEntries: Map<string, { fee: bigint; vsize: number; dependsOn: Set<string> }>,
-  ): Array<{ cumFee: bigint; cumVsize: number }> {
+    virtualEntries: Map<string, { fee: bigint; size: number; dependsOn: Set<string> }>,
+  ): Array<{ cumFee: bigint; cumSize: number }> {
     if (virtualEntries.size === 0) return [];
 
     // Topological sort using Kahn's algorithm over the virtual entries.
@@ -4652,8 +4670,8 @@ export class Mempool {
     queue.sort((a, b) => {
       const ea = virtualEntries.get(a)!;
       const eb = virtualEntries.get(b)!;
-      const lhs = ea.fee * BigInt(eb.vsize);
-      const rhs = eb.fee * BigInt(ea.vsize);
+      const lhs = ea.fee * BigInt(eb.size);
+      const rhs = eb.fee * BigInt(ea.size);
       return lhs > rhs ? -1 : lhs < rhs ? 1 : 0;
     });
     const topoOrder: string[] = [];
@@ -4669,37 +4687,37 @@ export class Mempool {
       queue.sort((a, b) => {
         const ea = virtualEntries.get(a)!;
         const eb = virtualEntries.get(b)!;
-        const lhs = ea.fee * BigInt(eb.vsize);
-        const rhs = eb.fee * BigInt(ea.vsize);
+        const lhs = ea.fee * BigInt(eb.size);
+        const rhs = eb.fee * BigInt(ea.size);
         return lhs > rhs ? -1 : lhs < rhs ? 1 : 0;
       });
     }
 
     // Greedy chunk-merging (same algorithm as linearizeCluster).
-    interface VChunk { fee: bigint; vsize: number }
+    interface VChunk { fee: bigint; size: number }
     const chunks: VChunk[] = [];
     const chunkMergeable = (a: VChunk, b: VChunk): boolean => {
-      // a has higher feerate than b iff a.fee * b.vsize > b.fee * a.vsize
-      return a.fee * BigInt(b.vsize) > b.fee * BigInt(a.vsize);
+      // a has higher feerate than b iff a.fee * b.size > b.fee * a.size
+      return a.fee * BigInt(b.size) > b.fee * BigInt(a.size);
     };
     for (const txidHex of topoOrder) {
       const e = virtualEntries.get(txidHex)!;
-      let cur: VChunk = { fee: e.fee, vsize: e.vsize };
+      let cur: VChunk = { fee: e.fee, size: e.size };
       while (chunks.length > 0 && chunkMergeable(cur, chunks[chunks.length - 1])) {
         const last = chunks.pop()!;
-        cur = { fee: cur.fee + last.fee, vsize: cur.vsize + last.vsize };
+        cur = { fee: cur.fee + last.fee, size: cur.size + last.size };
       }
       chunks.push(cur);
     }
 
     // Build cumulative diagram points (staircase endpoints).
-    const diagram: Array<{ cumFee: bigint; cumVsize: number }> = [];
+    const diagram: Array<{ cumFee: bigint; cumSize: number }> = [];
     let cumFee = 0n;
-    let cumVsize = 0;
+    let cumSize = 0;
     for (const chunk of chunks) {
       cumFee += chunk.fee;
-      cumVsize += chunk.vsize;
-      diagram.push({ cumFee, cumVsize });
+      cumSize += chunk.size;
+      diagram.push({ cumFee, cumSize });
     }
     return diagram;
   }
@@ -4707,15 +4725,15 @@ export class Mempool {
   /**
    * Compare two feerate diagrams.
    *
-   * Returns "better" if `after` strictly dominates `before` at every vsize
+   * Returns "better" if `after` strictly dominates `before` at every size
    * point, "worse" if `before` strictly dominates `after`, "equal" if they
    * are identical, or "incomparable" if neither dominates.
    *
    * Implements bitcoin-core/src/util/feefrac.cpp:10-73 (CompareChunks) in
-   * terms of cumulative {cumFee, cumVsize} staircase diagrams.
+   * terms of cumulative {cumFee, cumSize} staircase diagrams.
    *
    * The interpolation rule: given consecutive staircase endpoints A and B on
-   * one side, the value at a vsize v ∈ (A.cumVsize, B.cumVsize) is linearly
+   * one side, the value at a size v ∈ (A.cumSize, B.cumSize) is linearly
    * interpolated along the line from A to B.  This is equivalent to checking
    * that each chunk-endpoint of one diagram lies above/on/below the piecewise-
    * linear "other" diagram.
@@ -4724,51 +4742,56 @@ export class Mempool {
    * `before` (i.e. the result is "better").
    */
   private compareFeeDiagrams(
-    before: Array<{ cumFee: bigint; cumVsize: number }>,
-    after: Array<{ cumFee: bigint; cumVsize: number }>,
+    before: Array<{ cumFee: bigint; cumSize: number }>,
+    after: Array<{ cumFee: bigint; cumSize: number }>,
   ): "better" | "worse" | "equal" | "incomparable" {
-    // Walk both diagrams in tandem.  At each vsize boundary we interpolate the
+    // Walk both diagrams in tandem.  At each size boundary we interpolate the
     // value of the *other* diagram and compare.  Mirrors feefrac.cpp CompareChunks.
 
     let afterBetterSomewhere = false;
     let beforeBetterSomewhere = false;
 
-    // Evaluate fee of `diag` at cumulative vsize `v` (linear interp).
+    // Fee of `diag` at cumulative size `v` (linear interp), as an exact
+    // fraction num/den: Core's CompareChunks compares FeeFracs by
+    // cross-multiplication, and a truncating division here could hide a
+    // strict improvement of less than one satoshi.
+    type Frac = { num: bigint; den: bigint };
     const feeAt = (
-      diag: Array<{ cumFee: bigint; cumVsize: number }>,
+      diag: Array<{ cumFee: bigint; cumSize: number }>,
       v: number,
-    ): bigint => {
-      if (diag.length === 0) return 0n;
+    ): Frac => {
+      if (diag.length === 0) return { num: 0n, den: 1n };
       // v beyond the last point → use the last fee (tail slope = 0)
-      if (v >= diag[diag.length - 1].cumVsize) return diag[diag.length - 1].cumFee;
+      if (v >= diag[diag.length - 1].cumSize) return { num: diag[diag.length - 1].cumFee, den: 1n };
       // v before the first point → interpolate from origin (0,0)
-      if (v <= 0) return 0n;
+      if (v <= 0) return { num: 0n, den: 1n };
 
       let prevFee = 0n;
-      let prevVsize = 0;
+      let prevSize = 0;
       for (const pt of diag) {
-        if (pt.cumVsize >= v) {
-          // Interpolate: fee = prevFee + (v - prevVsize) * (pt.cumFee - prevFee) / (pt.cumVsize - prevVsize)
-          const dv = pt.cumVsize - prevVsize;
-          if (dv === 0) return pt.cumFee;
+        if (pt.cumSize >= v) {
+          // fee = prevFee + (v - prevSize) * (pt.cumFee - prevFee) / (pt.cumSize - prevSize)
+          const dv = pt.cumSize - prevSize;
+          if (dv === 0) return { num: pt.cumFee, den: 1n };
           const df = pt.cumFee - prevFee;
-          // Use BigInt arithmetic: multiply then divide to avoid fractions.
-          return prevFee + (BigInt(v - prevVsize) * df) / BigInt(dv);
+          return { num: prevFee * BigInt(dv) + BigInt(v - prevSize) * df, den: BigInt(dv) };
         }
         prevFee = pt.cumFee;
-        prevVsize = pt.cumVsize;
+        prevSize = pt.cumSize;
       }
-      return diag[diag.length - 1].cumFee;
+      return { num: diag[diag.length - 1].cumFee, den: 1n };
     };
 
-    // Collect all unique vsize boundaries from both diagrams.
-    const vsizes = new Set<number>();
-    for (const pt of before) vsizes.add(pt.cumVsize);
-    for (const pt of after) vsizes.add(pt.cumVsize);
+    // Collect all unique size boundaries from both diagrams.
+    const sizes = new Set<number>();
+    for (const pt of before) sizes.add(pt.cumSize);
+    for (const pt of after) sizes.add(pt.cumSize);
 
-    for (const v of vsizes) {
-      const bFee = feeAt(before, v);
-      const aFee = feeAt(after, v);
+    for (const v of sizes) {
+      const b = feeAt(before, v);
+      const a = feeAt(after, v);
+      const aFee = a.num * b.den;
+      const bFee = b.num * a.den;
       if (aFee > bFee) afterBetterSomewhere = true;
       if (bFee > aFee) beforeBetterSomewhere = true;
       if (afterBetterSomewhere && beforeBetterSomewhere) return "incomparable";
@@ -4782,8 +4805,10 @@ export class Mempool {
   /**
    * Gate #8: ImprovesFeerateDiagram.
    *
-   * Returns null if the replacement improves (or ties) the feerate diagram,
-   * or an error string if it does not.
+   * Returns null if the replacement strictly improves the feerate diagram,
+   * or an error string if it does not. `replacementSize` is the sigop-adjusted
+   * weight of the replacement (the package's summed weight for package RBF);
+   * mempool entries are sized the same way.
    *
    * Algorithm:
    *   1. Find all cluster txids that are in any cluster touched by a conflict.
@@ -4797,7 +4822,7 @@ export class Mempool {
   private improvesFeerateDiagram(
     replacementTxidHex: string,
     replacementFee: bigint,
-    replacementVsize: number,
+    replacementSize: number,
     replacementParents: Set<string>,   // in-mempool parent txids (hex)
     conflictsToEvict: MempoolEntry[],
   ): string | null {
@@ -4821,7 +4846,7 @@ export class Mempool {
     const conflictSet = new Set<string>(conflictsToEvict.map((e) => e.txid.toString("hex")));
 
     // Build "before" virtual-entries from clusterTxids.
-    type VEntry = { fee: bigint; vsize: number; dependsOn: Set<string> };
+    type VEntry = { fee: bigint; size: number; dependsOn: Set<string> };
     const beforeMap = new Map<string, VEntry>();
     for (const txidHex of clusterTxids) {
       const entry = this.entries.get(txidHex)!;
@@ -4830,7 +4855,7 @@ export class Mempool {
       for (const dep of entry.dependsOn) {
         if (clusterTxids.has(dep)) deps.add(dep);
       }
-      beforeMap.set(txidHex, { fee: entry.fee, vsize: entry.vsize, dependsOn: deps });
+      beforeMap.set(txidHex, { fee: entry.fee, size: this.clusterWeightContribution(entry), dependsOn: deps });
     }
 
     // Build "after" virtual-entries: remove conflicts, add replacement.
@@ -4847,7 +4872,7 @@ export class Mempool {
     }
     afterMap.set(replacementTxidHex, {
       fee: replacementFee,
-      vsize: replacementVsize,
+      size: replacementSize,
       dependsOn: replacementDeps,
     });
 
@@ -5230,6 +5255,7 @@ export class Mempool {
       adjWeight: number;
       mempoolParents: Set<string>;
       conflicts: MempoolEntry[];
+      directConflicts: MempoolEntry[];
     };
     const members: Member[] = [];
     const coins = new Map<string, Transaction>();
@@ -5266,8 +5292,20 @@ export class Mempool {
         adjWeight: pre.adjWeight!,
         mempoolParents: pre.mempoolParents ?? new Set(),
         conflicts: pre.conflicts ?? [],
+        directConflicts: pre.directConflicts ?? [],
       });
       coins.set(txid, tx);
+    }
+
+    // Core PackageTRUCChecks (validation.cpp:1480), once every member's
+    // mempool parents and vsize are known and before anything is evicted
+    // or inserted. PreChecks only saw MEMPOOL parents; here an in-package
+    // parent counts too (once).
+    for (const m of members) {
+      const trucError = this.packageTrucError(m, transactions);
+      if (trucError !== null) {
+        return stop(PackageValidationResult.PCKG_POLICY, `TRUC-violation, ${trucError}`);
+      }
     }
 
     let totalFee = 0n;
@@ -5305,12 +5343,21 @@ export class Mempool {
     // Package RBF (Core PackageRBFChecks, validation.cpp:1037). Each
     // member's conflicts already include their descendants.
     const conflicts = new Map<string, MempoolEntry>();
+    const directConflicts = new Map<string, MempoolEntry>();
     for (const m of members) {
       for (const c of m.conflicts) conflicts.set(c.txid.toString("hex"), c);
+      for (const c of m.directConflicts) directConflicts.set(c.txid.toString("hex"), c);
     }
     const evicted = new Set(conflicts.keys());
     if (conflicts.size > 0) {
-      const rbfError = this.packageRbfError(members, [...conflicts.values()], totalFee, totalVsize, totalWeight);
+      const rbfError = this.packageRbfError(
+        members,
+        [...directConflicts.values()],
+        [...conflicts.values()],
+        totalFee,
+        totalVsize,
+        totalWeight,
+      );
       if (rbfError !== null) return stop(PackageValidationResult.PCKG_POLICY, rbfError);
     }
 
@@ -5399,6 +5446,7 @@ export class Mempool {
    */
   private packageRbfError(
     members: Array<{ tx: Transaction; txid: string; fee: bigint; vsize: number; mempoolParents: Set<string> }>,
+    directConflicts: MempoolEntry[],
     allConflicts: MempoolEntry[],
     totalFee: bigint,
     totalVsize: number,
@@ -5413,8 +5461,11 @@ export class Mempool {
     const [parent, child] = members;
     const childTxid = Buffer.from(child.txid, "hex").reverse().toString("hex");
 
-    if (allConflicts.length > MAX_REPLACEMENT_CANDIDATES) {
-      return `package RBF failed: too many potential replacements, rejecting replacement ${childTxid}; too many potential replacements (${allConflicts.length} > ${MAX_REPLACEMENT_CANDIDATES})`;
+    // Rule #5 on the aggregate DIRECT conflicts, counted in clusters
+    // (GetEntriesForConflicts); their descendants are not capped again.
+    const conflictClusters = this.uniqueClusterCount(directConflicts);
+    if (conflictClusters > MAX_REPLACEMENT_CANDIDATES) {
+      return `package RBF failed: too many potential replacements, rejecting replacement ${childTxid}; too many conflicting clusters (${conflictClusters} > ${MAX_REPLACEMENT_CANDIDATES})`;
     }
 
     // PaysForRBF over the whole package, attributed to the child.
@@ -5440,10 +5491,85 @@ export class Mempool {
       return "too-large-cluster";
     }
 
-    // The package enters as one chunk at the package feerate.
-    const diagramError = this.improvesFeerateDiagram(child.txid, totalFee, totalVsize, new Set(), allConflicts);
+    // The package enters as one chunk at the package feerate, sized (like
+    // every chunk of the diagram) by sigop-adjusted weight.
+    const diagramError = this.improvesFeerateDiagram(child.txid, totalFee, totalWeight, new Set(), allConflicts);
     if (diagramError !== null) {
       return `package RBF failed: ${diagramError}`;
+    }
+    return null;
+  }
+
+  /**
+   * Core PackageTRUCChecks (policy/truc_policy.cpp) for one package member:
+   * the TRUC rules over its mempool parents AND its in-package parents
+   * (earlier members it spends). Returns Core's debug text or null.
+   */
+  private packageTrucError(
+    m: { tx: Transaction; txid: string; vsize: number; mempoolParents: Set<string> },
+    pkg: Transaction[],
+  ): string | null {
+    const desc = (tx: Transaction) =>
+      `${Buffer.from(getTxId(tx)).reverse().toString("hex")} (wtxid=${Buffer.from(getWTxId(tx)).reverse().toString("hex")})`;
+    const self = desc(m.tx);
+    const spent = new Set(m.tx.inputs.map((i) => i.prevOut.txid.toString("hex")));
+    const inPackageParents: Transaction[] = [];
+    for (const tx of pkg) {
+      if (tx === m.tx) break;
+      if (spent.has(getTxId(tx).toString("hex"))) inPackageParents.push(tx);
+    }
+    const mempoolParents: MempoolEntry[] = [];
+    for (const p of m.mempoolParents) {
+      const e = this.entries.get(p);
+      if (e) mempoolParents.push(e);
+    }
+
+    if (m.tx.version !== TRUC_VERSION) {
+      // Non-TRUC transactions cannot have TRUC parents.
+      for (const p of [...mempoolParents.map((e) => e.tx), ...inPackageParents]) {
+        if (p.version === TRUC_VERSION) {
+          return `non-version=3 tx ${self} cannot spend from version=3 tx ${desc(p)}`;
+        }
+      }
+      return null;
+    }
+
+    if (m.vsize > TRUC_MAX_VSIZE) {
+      return `version=3 tx ${self} is too big: ${m.vsize} > ${TRUC_MAX_VSIZE} virtual bytes`;
+    }
+    if (mempoolParents.length + inPackageParents.length + 1 > TRUC_ANCESTOR_LIMIT) {
+      return `tx ${self} would have too many ancestors`;
+    }
+    // ancestorCount includes the parent itself (Core GetAncestorCount).
+    if (mempoolParents.length > 0 && mempoolParents[0].ancestorCount + inPackageParents.length + 1 > TRUC_ANCESTOR_LIMIT) {
+      return `tx ${self} would have too many ancestors`;
+    }
+    if (mempoolParents.length + inPackageParents.length === 0) return null;
+
+    if (m.vsize > TRUC_CHILD_MAX_VSIZE) {
+      return `version=3 child tx ${self} is too big: ${m.vsize} > ${TRUC_CHILD_MAX_VSIZE} virtual bytes`;
+    }
+    // Exactly one parent, in the mempool or in the package.
+    const parent =
+      mempoolParents.length > 0
+        ? { tx: mempoolParents[0].tx, hasMempoolDescendant: mempoolParents[0].descendantCount > 1 }
+        : { tx: inPackageParents[0], hasMempoolDescendant: false };
+    const parentTxid = getTxId(parent.tx).toString("hex");
+    if (parent.tx.version !== TRUC_VERSION) {
+      return `version=3 tx ${self} cannot spend from non-version=3 tx ${desc(parent.tx)}`;
+    }
+    for (const other of pkg) {
+      if (other === m.tx) continue;
+      for (const input of other.inputs) {
+        const spends = input.prevOut.txid.toString("hex");
+        // A sibling in the same package.
+        if (spends === parentTxid) return `tx ${desc(parent.tx)} would exceed descendant count limit`;
+        // This tx cannot have both a parent and an in-package child.
+        if (spends === m.txid) return `tx ${desc(other)} would have too many ancestors`;
+      }
+    }
+    if (parent.hasMempoolDescendant) {
+      return `tx ${desc(parent.tx)} would exceed descendant count limit`;
     }
     return null;
   }
