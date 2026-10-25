@@ -575,7 +575,8 @@ describe("NULLFAIL gate (interpreter.cpp:335-345, :1186-1188)", () => {
       stack: [wrongSig, COMPRESSED_PUBKEY],
       altStack: [], flags, sigHasher, sigVersion: SigVersion.BASE,
     };
-    expect(executeScript(CHECKSIG_SCRIPT, ctx)).toBe(false);
+    // SCRIPT_ERR_SIG_NULLFAIL, like Core's serror (was a bare false).
+    expect(() => executeScript(CHECKSIG_SCRIPT, ctx)).toThrow("SCRIPT_ERR_SIG_NULLFAIL");
   });
 
   test("NULLFAIL: OP_CHECKSIG with empty sig is allowed (pushes false)", () => {
@@ -601,7 +602,8 @@ describe("NULLFAIL gate (interpreter.cpp:335-345, :1186-1188)", () => {
       ],
       altStack: [], flags, sigHasher, sigVersion: SigVersion.BASE,
     };
-    expect(executeScript(CHECKMULTISIG_SCRIPT, ctx)).toBe(false);
+    // SCRIPT_ERR_SIG_NULLFAIL, like Core's serror (was a bare false).
+    expect(() => executeScript(CHECKMULTISIG_SCRIPT, ctx)).toThrow("SCRIPT_ERR_SIG_NULLFAIL");
   });
 
   test("NULLFAIL: OP_CHECKMULTISIG all-empty sigs allowed when failing", () => {

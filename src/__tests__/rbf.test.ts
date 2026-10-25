@@ -563,7 +563,8 @@ describe("RBF - Replace By Fee", () => {
       );
       const result = await mempool.addTransaction(lowerFee);
       expect(result.accepted).toBe(false);
-      expect(result.error).toContain("Rule 3");
+      // Core PaysForRBF wording for Rule 3.
+      expect(result.error).toContain("less fees than conflicting txs");
     });
 
     test("equal fees: Rule #3 passes (>= not >) but Rule #4 rejects zero increment", async () => {
@@ -618,7 +619,8 @@ describe("RBF - Replace By Fee", () => {
       );
       const result = await mempool.addTransaction(replacement);
       expect(result.accepted).toBe(false);
-      expect(result.error).toContain("Rule 3");
+      // Core PaysForRBF wording for Rule 3.
+      expect(result.error).toContain("less fees than conflicting txs");
     });
   });
 

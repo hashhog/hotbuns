@@ -38,6 +38,12 @@ import {
   type Transaction,
 } from "../validation/tx.js";
 import { ecdsaSign, hash160, privateKeyToPublicKey } from "../crypto/primitives.js";
+import {
+  verifyScript,
+  getStandardFlags,
+  scriptFlagsFromBitmask,
+} from "../script/interpreter.js";
+import { getScriptFlagsForBlock } from "../consensus/connect_block.js";
 
 const PRIV = (() => {
   const k = Buffer.alloc(32);
@@ -178,6 +184,31 @@ describe("package semantics match Core (regtest)", () => {
         "reject-reason": NULLFAIL,
         "reject-details": `${NULLFAIL}, input 0 of ${txidOf(bad)} (wtxid ${wtxidOf(bad)}), spending ${display(prev)}:0`,
       });
+    });
+  });
+
+  describe("NULLFAIL stays policy-only (consensus risk check)", () => {
+    // <sig> | <pubkey> OP_CHECKSIG OP_NOT: a failed, non-empty signature.
+    // Consensus has no NULLFAIL: CHECKSIG pushes false, NOT makes it true,
+    // the script passes (a block may contain it). Policy rejects it with
+    // SCRIPT_ERR_SIG_NULLFAIL. The interpreter change (throw instead of a
+    // bare false) must not move the consensus answer.
+    const spk = Buffer.concat([Buffer.from([0x21]), PUB, Buffer.from([0xac, 0x91])]);
+    const wrongSig = Buffer.concat([ecdsaSign(Buffer.alloc(32, 0x07), PRIV), Buffer.from([0x01])]);
+    const scriptSig = Buffer.concat([Buffer.from([wrongSig.length]), wrongSig]);
+    const hasher = () => Buffer.alloc(32, 0x08);
+
+    it("passes under block flags", () => {
+      const blockFlags = scriptFlagsFromBitmask(
+        getScriptFlagsForBlock(REGTEST, "", true, true, true, true),
+      );
+      expect(verifyScript(scriptSig, spk, [], blockFlags, hasher)).toBe(true);
+    });
+
+    it("fails with SIG_NULLFAIL under the mempool's standard flags", () => {
+      expect(() => verifyScript(scriptSig, spk, [], getStandardFlags(Number.MAX_SAFE_INTEGER), hasher)).toThrow(
+        "SCRIPT_ERR_SIG_NULLFAIL",
+      );
     });
   });
 
