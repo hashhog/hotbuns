@@ -6041,6 +6041,7 @@ export class RPCServer {
       const txidHex = Buffer.from(txid).reverse().toString("hex");
       // Modified fee = base fee + prioritisetransaction delta (Core GetModifiedFee).
       const modifiedFeeSats = this.mempool.getModifiedFee(txid);
+      const chunk = this.mempool.getMainChunkFeerate(txid);
       result[txidHex] = {
         vsize: entry.vsize,
         weight: entry.weight,
@@ -6050,6 +6051,7 @@ export class RPCServer {
         descendantsize: entry.vsize, // Simplified
         ancestorcount: entry.dependsOn.size + 1,
         ancestorsize: entry.vsize, // Simplified
+        chunkweight: chunk.size,
         wtxid: txidHex, // Simplified (same as txid for non-witness txs)
         // Core entryToJSON (mempool.cpp:527-533): fees is nested; no top-level fee/modifiedfee.
         fees: {
@@ -6057,6 +6059,7 @@ export class RPCServer {
           modified: Number(modifiedFeeSats) / 100_000_000,
           ancestor: Number(modifiedFeeSats) / 100_000_000,
           descendant: Number(modifiedFeeSats) / 100_000_000,
+          chunk: Number(chunk.fee) / 100_000_000,
         },
         depends: Array.from(entry.dependsOn),
         spentby: Array.from(entry.spentBy),
@@ -6093,6 +6096,7 @@ export class RPCServer {
 
     // Modified fee = base fee + prioritisetransaction delta (Core GetModifiedFee).
     const modifiedFeeSats = this.mempool.getModifiedFee(txid);
+    const chunk = this.mempool.getMainChunkFeerate(txid);
 
     return {
       vsize: entry.vsize,
@@ -6103,6 +6107,7 @@ export class RPCServer {
       descendantsize: entry.vsize,
       ancestorcount: entry.dependsOn.size + 1,
       ancestorsize: entry.vsize,
+      chunkweight: chunk.size,
       wtxid: txidParam,
       // Core entryToJSON (mempool.cpp:527-533): fees is nested; no top-level fee/modifiedfee.
       fees: {
@@ -6110,6 +6115,7 @@ export class RPCServer {
         modified: Number(modifiedFeeSats) / 100_000_000,
         ancestor: Number(modifiedFeeSats) / 100_000_000,
         descendant: Number(modifiedFeeSats) / 100_000_000,
+        chunk: Number(chunk.fee) / 100_000_000,
       },
       depends: Array.from(entry.dependsOn),
       spentby: Array.from(entry.spentBy),

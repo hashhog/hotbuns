@@ -4734,6 +4734,33 @@ export class Mempool {
   }
 
   /**
+   * Fee and size of the chunk a transaction sits in (Core
+   * CTxMemPool::GetMainChunkFeerate, used by entryToJSON for `chunkweight`
+   * and `fees.chunk`). Falls back to the tx alone if it is not in a cluster.
+   */
+  getMainChunkFeerate(txid: Buffer): { fee: bigint; size: number } {
+    const txidHex = txid.toString("hex");
+    const cluster = this.getCluster(txidHex);
+    const idx = cluster?.linearization.txToChunk.get(txidHex);
+    if (cluster && idx !== undefined) {
+      const chunk = cluster.linearization.chunks[idx];
+      // Core's chunk size is the sum of sigop-adjusted WEIGHTS (txgraph feerate
+      // size), not vsize: summing the ceilinged vsize would over-count.
+      let size = 0;
+      for (const id of chunk.txids) {
+        const e = this.entries.get(id);
+        if (e) size += this.clusterWeightContribution(e);
+      }
+      return { fee: chunk.totalFee, size };
+    }
+    const entry = this.entries.get(txidHex);
+    return {
+      fee: entry ? entry.fee : 0n,
+      size: entry ? this.clusterWeightContribution(entry) : 0,
+    };
+  }
+
+  /**
    * Get the cluster containing a transaction.
    */
   getCluster(txidHex: string): Cluster | null {
