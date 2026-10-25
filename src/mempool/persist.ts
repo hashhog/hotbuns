@@ -295,10 +295,8 @@ export function decodeMempoolDump(buf: Buffer): {
  * sibling file first then renames over the target — same crash-safe
  * pattern as Core's `DumpMempool()`.
  *
- * Currently writes empty mapDeltas and unbroadcast sets because hotbuns
- * does not implement PrioritiseTransaction or an unbroadcast tracker.
- * The fields are still present in the file (with count=0) so byte-format
- * compatibility is preserved.
+ * Writes the prioritisation deltas and the unbroadcast set (Core
+ * DumpMempool: GetUnbroadcastTxs()).
  */
 export async function dumpMempool(
   mempool: Mempool,
@@ -333,7 +331,7 @@ export async function dumpMempool(
   }
 
   // Remaining deltas belong to txids not currently in the mempool.
-  const buf = encodeMempoolDump(entries, deltas, new Set(), key);
+  const buf = encodeMempoolDump(entries, deltas, mempool.getUnbroadcastTxs(), key);
 
   await fsp.mkdir(datadir, { recursive: true });
   await fsp.writeFile(newPath, buf);
@@ -408,6 +406,11 @@ export async function loadMempool(
     mempool.loadFeeDelta(Buffer.from(txidHex, "hex"), delta);
   }
 
+  // Core LoadMempool (startup): restore the unbroadcast set for txs that made
+  // it back into the pool.
+  for (const txidHex of decoded.unbroadcast) {
+    mempool.addUnbroadcastTx(Buffer.from(txidHex, "hex"));
+  }
   result.unbroadcast = decoded.unbroadcast.size;
 
   return result;
@@ -474,7 +477,12 @@ export async function importMempoolFile(
       mempool.loadFeeDelta(Buffer.from(txidHex, "hex"), delta);
     }
   }
-  if (opts.applyUnbroadcastSet) result.unbroadcast = decoded.unbroadcast.size;
+  if (opts.applyUnbroadcastSet) {
+    for (const txidHex of decoded.unbroadcast) {
+      mempool.addUnbroadcastTx(Buffer.from(txidHex, "hex"));
+    }
+    result.unbroadcast = decoded.unbroadcast.size;
+  }
   return result;
 }
 

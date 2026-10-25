@@ -38,6 +38,11 @@ class MockChainStateManager {
 }
 class MockMempool {
   getInfo() { return { size: 0, bytes: 0, minFeeRate: 1 }; }
+  private unbroadcast = new Set<string>();
+  addUnbroadcastTx(txid: Buffer) { this.unbroadcast.add(txid.toString("hex")); }
+  removeUnbroadcastTx(txid: Buffer) { this.unbroadcast.delete(txid.toString("hex")); }
+  isUnbroadcast(txid: Buffer) { return this.unbroadcast.has(txid.toString("hex")); }
+  getUnbroadcastTxs() { return new Set(this.unbroadcast); }
   getAllTxids(): Buffer[] { return []; }
   getTransaction(_txid: Buffer) { return null; }
   hasTransaction(_txid: Buffer) { return false; }
