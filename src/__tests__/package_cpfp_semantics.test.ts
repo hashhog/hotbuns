@@ -325,10 +325,12 @@ describe("package semantics match Core (regtest)", () => {
   describe("package RBF (1 parent, 1 child)", () => {
     // O and its child D are in the mempool; P double-spends O's input and
     // pays less than O + D, so P fails RBF alone and is retried with C.
+    // O is wide and cheap (600 outputs, like the harness), so the package
+    // improves the feerate diagram and the cluster limit decides.
     async function conflicts(): Promise<{ coin: Buffer; o: Transaction; d: Transaction }> {
       const coin = await fund();
-      const o = spend(coin, COIN_VALUE, 20_000n);
-      const d = spend(getTxId(o), COIN_VALUE - 20_000n, 1_000n);
+      const o = spend(coin, COIN_VALUE, 20_000n, { script: P2WPKH, value: 1_000n, count: 600 });
+      const d = spend(getTxId(o), o.outputs[0].value, 1_000n);
       expect((await mempool.addTransaction(o)).accepted).toBe(true);
       expect((await mempool.addTransaction(d)).accepted).toBe(true);
       return { coin, o, d };
@@ -342,6 +344,18 @@ describe("package semantics match Core (regtest)", () => {
       const c = spend(getTxId(p), pChange, 200_000n, extraC);
       return { p, c };
     }
+
+    it("testmempoolaccept of a replacement leaves the original in the mempool", async () => {
+      // The dry-run return used to come after the RBF eviction.
+      const coin = await fund();
+      const original = spend(coin, COIN_VALUE, 1_000n);
+      expect((await mempool.addTransaction(original)).accepted).toBe(true);
+      const replacementTx = spend(coin, COIN_VALUE, 50_000n);
+      const res = await rpc(port, "testmempoolaccept", [[hexOf(replacementTx)]]);
+      expect(res.result[0].allowed).toBe(true);
+      expect(inPool(original)).toBe(true);
+      expect(inPool(replacementTx)).toBe(false);
+    });
 
     it("replaces the conflicts when the package pays for them", async () => {
       const { coin, o, d } = await conflicts();

@@ -344,7 +344,7 @@ describe("G7 — testmempoolaccept single-tx baseline", () => {
 // BUG-3: effective-feerate + effective-includes missing from single-tx tma result
 // ---------------------------------------------------------------------------
 describe("G8 — testmempoolaccept fee fields [BUG-2, BUG-3]", () => {
-  test("FAIL: single-tx path in submitPackage returns no fee field", async () => {
+  test("single-tx path in submitPackage returns the base fee", async () => {
     const inputTxid = Buffer.alloc(32, 0x20);
     await addUTXO(inputTxid, 0, 100_000n);
 
@@ -358,9 +358,9 @@ describe("G8 — testmempoolaccept fee fields [BUG-2, BUG-3]", () => {
     expect(txResult).toBeDefined();
     expect(txResult!.accepted).toBe(true);
 
-    // BUG-2: fee is undefined for single-tx path
-    // Core always returns base fee in testmempoolaccept when allowed=true
-    expect(txResult!.fee).toBeUndefined(); // documents the bug
+    // BUG-2 fixed: Core always returns the base fee when accepted
+    // (addTransaction now reports fee and vsize for a committed tx).
+    expect(txResult!.fee).toBe(10_000n);
   });
 
   test("multi-tx package: effectiveFeeRate is set on accepted txs", async () => {
@@ -540,7 +540,7 @@ describe("G13 — submitpackage response shape", () => {
 // BUG-9: single-tx path missing fee in txResult
 // ---------------------------------------------------------------------------
 describe("G14 — submitpackage single-tx path [BUG-9]", () => {
-  test("FAIL: single-tx submitPackage does not include fee in txResult", async () => {
+  test("single-tx submitPackage includes the fee in txResult", async () => {
     const inputTxid = Buffer.alloc(32, 0x80);
     await addUTXO(inputTxid, 0, 100_000n);
 
@@ -551,8 +551,8 @@ describe("G14 — submitpackage single-tx path [BUG-9]", () => {
     expect(r.result).toBe(PackageValidationResult.PCKG_RESULT_UNSET);
 
     const txResult = r.txResults.get(wtxid)!;
-    // BUG-9: fee is undefined for single-tx path (Core always returns fees when accepted)
-    expect(txResult.fee).toBeUndefined(); // documents the bug
+    // BUG-9 fixed: Core always returns fees when accepted.
+    expect(txResult.fee).toBe(10_000n);
   });
 
   test("single-tx submitPackage does set vsize", async () => {
@@ -649,7 +649,7 @@ describe("G18 — Validation fee bypass for package", () => {
 // G19 — Validation: atomic rollback on per-tx failure mid-package
 // ---------------------------------------------------------------------------
 describe("G19 — Validation atomic rollback on mid-package failure", () => {
-  test("submitPackage rolls back accepted txs when a later tx fails", async () => {
+  test("submitPackage keeps a parent that was accepted on its own when the child fails", async () => {
     const p1Input = Buffer.alloc(32, 0xC0);
     await addUTXO(p1Input, 0, 100_000n);
 
@@ -659,10 +659,14 @@ describe("G19 — Validation atomic rollback on mid-package failure", () => {
 
     const r = await mempool.submitPackage([parent, child]);
 
-    // After rollback, parent should NOT be in mempool
-    if (r.result !== PackageValidationResult.PCKG_RESULT_UNSET) {
-      expect(mempool.hasTransaction(getTxId(parent))).toBe(false);
-    }
+    // Core AcceptPackage tries each tx on its own first; the parent pays its
+    // own way, so it is accepted and stays even though the child fails
+    // (Core v31.1 regtest row package/submit/missing-input: the base tx is
+    // in getrawmempool). Only the package-evaluated members are atomic.
+    expect(r.result).toBe(PackageValidationResult.PCKG_TX);
+    expect(r.message).toBe("transaction failed");
+    expect(mempool.hasTransaction(getTxId(parent))).toBe(true);
+    expect(mempool.hasTransaction(getTxId(child))).toBe(false);
   });
 });
 
@@ -725,7 +729,7 @@ describe("G21 — CPFP package fee rate aggregation", () => {
 // (BUG-9 — see G14)
 // ---------------------------------------------------------------------------
 describe("G22 — CPFP single-tx submitPackage fee missing [BUG-9]", () => {
-  test("single-tx accepted result lacks fee (documents BUG-9)", async () => {
+  test("single-tx accepted result carries the fee (BUG-9 fixed)", async () => {
     const inputTxid = Buffer.alloc(32, 0xE1);
     await addUTXO(inputTxid, 0, 100_000n);
 
@@ -735,8 +739,8 @@ describe("G22 — CPFP single-tx submitPackage fee missing [BUG-9]", () => {
     const r = await mempool.submitPackage([tx]);
     const txResult = r.txResults.get(wtxid);
     expect(txResult?.accepted).toBe(true);
-    // fee is undefined for single-tx path — BUG-9
-    expect(txResult?.fee).toBeUndefined();
+    // BUG-9 fixed: the fee is reported.
+    expect(txResult?.fee).toBe(10_000n);
   });
 });
 

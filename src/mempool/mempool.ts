@@ -56,8 +56,10 @@ export interface ChainMTPProvider {
 import { sha256Hash } from "../crypto/primitives.js";
 import {
   verifyScript,
-  getConsensusFlags,
   getStandardFlags,
+  scriptFlagsFromBitmask,
+  scriptErrorString,
+  ScriptError,
   isP2A,
   isP2SH,
   isP2WSH,
@@ -68,6 +70,25 @@ import {
   getBareMultisigParams,
   type ScriptFlags,
 } from "../script/interpreter.js";
+import { getScriptFlagsForBlock } from "../consensus/connect_block.js";
+
+/**
+ * Core util/moneystr.cpp FormatMoney: BTC with 8 decimals, trailing zeros
+ * trimmed to at least two ("0.00006", "1.00").
+ */
+export function formatMoney(sats: bigint): string {
+  const neg = sats < 0n;
+  const abs = neg ? -sats : sats;
+  let str = `${abs / 100_000_000n}.${(abs % 100_000_000n).toString().padStart(8, "0")}`;
+  while (str.endsWith("0") && str[str.length - 3] !== ".") str = str.slice(0, -1);
+  return neg ? `-${str}` : str;
+}
+
+/**
+ * Policy script flags for every mempool admission (Core
+ * STANDARD_SCRIPT_VERIFY_FLAGS is a constant, policy/policy.h:119).
+ */
+const MEMPOOL_STANDARD_FLAGS: ScriptFlags = getStandardFlags(Number.MAX_SAFE_INTEGER);
 import {
   sigHashLegacy,
   sigHashWitnessV0,
@@ -726,6 +747,13 @@ export interface PackageTxResult {
   effectiveFeeRate?: number;
   /** WTXIDs of transactions included in the effective fee rate calculation. */
   effectiveIncludes?: string[];
+  /** Fee and vsize the effective feerate is computed from (Core CFeeRate(fee, vsize)). */
+  effectiveFee?: bigint;
+  effectiveVsize?: number;
+  /** Already in the mempool (Core MEMPOOL_ENTRY): no effective feerate is reported. */
+  alreadyInMempool?: boolean;
+  /** Same txid already in the mempool with this other wtxid (Core DIFFERENT_WITNESS). */
+  otherWtxid?: string;
 }
 
 /**
@@ -1299,6 +1327,48 @@ export interface AcceptToMemoryPoolOptions {
    * (validation.cpp — ATMPArgs::m_test_accept).
    */
   testAccept?: boolean;
+  /**
+   * Package context (Core AcceptMultipleTransactions). Set by the package
+   * paths only; a single-tx caller never passes it.
+   */
+  inPackage?: PackageAcceptContext;
+}
+
+/**
+ * How a tx is evaluated as one member of a package (Core ATMPArgs for
+ * AcceptMultipleTransactions plus its m_viewmempool package coins).
+ */
+export interface PackageAcceptContext {
+  /**
+   * Earlier package txs by txid hex: their outputs are spendable like
+   * mempool coins (CCoinsViewMemPool::PackageAddTransaction).
+   */
+  coins: Map<string, Transaction>;
+  /**
+   * Core m_package_feerates: the individual feerate gate is skipped, the
+   * package feerate is checked instead (submitpackage, not testmempoolaccept).
+   */
+  packageFeerates: boolean;
+  /** Core m_allow_replacement (false for testmempoolaccept packages). */
+  allowReplacement: boolean;
+  /** Return after PreChecks, before any script check. */
+  preChecksOnly?: boolean;
+}
+
+/** What addTransaction reports about a tx it validated. */
+export interface AcceptResult {
+  accepted: boolean;
+  error?: string;
+  fee?: bigint;
+  vsize?: number;
+  /** Sigop-adjusted weight (what the cluster limit counts). */
+  adjWeight?: number;
+  /** In-mempool parents (txid hex). */
+  mempoolParents?: Set<string>;
+  /** Mempool txs this one conflicts with, plus their descendants. */
+  conflicts?: MempoolEntry[];
+  /** Txid hex of the mempool txs it replaced (committed admissions only). */
+  replaced?: string[];
 }
 
 /**
@@ -1591,7 +1661,8 @@ export class Mempool {
   async addTransaction(
     tx: Transaction,
     options?: AcceptToMemoryPoolOptions,
-  ): Promise<{ accepted: boolean; error?: string; fee?: bigint; vsize?: number }> {
+  ): Promise<AcceptResult> {
+    const inPackage = options?.inPackage;
     // Gate 6: after AbortNode the mempool accepts nothing. fatal-error is not
     // a rejection reason (callers must not add it to recent-rejects).
     if (isFatal()) {
@@ -1764,6 +1835,10 @@ export class Mempool {
     let totalConflictingVsize = 0;
 
     if (conflicts.length > 0) {
+      // Core PreChecks: a package that may not replace stops at the conflict.
+      if (inPackage && !inPackage.allowReplacement) {
+        return { accepted: false, error: "txn-mempool-conflict" };
+      }
       // Mark this as a potential RBF replacement - we'll validate the fees later
       isReplacement = true;
 
@@ -1817,7 +1892,32 @@ export class Mempool {
 
       // Check if input is from mempool
       const mempoolParent = this.entries.get(parentTxidHex);
-      if (mempoolParent) {
+      const packageParent = mempoolParent ? undefined : inPackage?.coins.get(parentTxidHex);
+      if (packageParent) {
+        // An earlier tx of the same package: spent like a mempool coin
+        // (unconfirmed, MEMPOOL_HEIGHT for BIP68) but not a mempool parent.
+        if (input.prevOut.vout >= packageParent.outputs.length) {
+          return { accepted: false, error: `bad-txns-inputs-missingorspent: ${outpointKey}` };
+        }
+        const output = packageParent.outputs[input.prevOut.vout];
+        if (!moneyInRange(output.value)) {
+          return { accepted: false, error: "bad-txns-inputvalues-outofrange" };
+        }
+        totalInput += output.value;
+        if (!moneyInRange(totalInput)) {
+          return { accepted: false, error: "bad-txns-inputvalues-outofrange" };
+        }
+        inputUtxos.push({
+          utxo: {
+            amount: output.value,
+            scriptPubKey: output.scriptPubKey,
+            txid: input.prevOut.txid,
+            vout: input.prevOut.vout,
+          },
+          input,
+          isMempool: true,
+        });
+      } else if (mempoolParent) {
         if (input.prevOut.vout >= mempoolParent.tx.outputs.length) {
           return {
             accepted: false,
@@ -2103,13 +2203,16 @@ export class Mempool {
     const feeRate = Number(fee) / vsize;
     // getMinFee() returns sat/kvB; convert to sat/vB for the gate.
     const rollingMinSatPerVB = this.getMinFee() / 1000;
-    if (rollingMinSatPerVB > 0 && feeRate < rollingMinSatPerVB) {
+    // Core PreChecks skips CheckFeeRate when m_package_feerates: the
+    // package's aggregate feerate is checked instead (validation.cpp:1507).
+    const individualFeerate = !inPackage?.packageFeerates;
+    if (individualFeerate && rollingMinSatPerVB > 0 && feeRate < rollingMinSatPerVB) {
       return {
         accepted: false,
         error: `mempool min fee not met: ${feeRate.toFixed(8)} sat/vB < ${rollingMinSatPerVB.toFixed(8)} sat/vB`,
       };
     }
-    if (feeRate < this.minFeeRate) {
+    if (individualFeerate && feeRate < this.minFeeRate) {
       return {
         accepted: false,
         error: `min relay fee not met: ${feeRate.toFixed(8)} sat/vB < ${this.minFeeRate} sat/vB`,
@@ -2132,8 +2235,9 @@ export class Mempool {
       };
     }
 
-    // RBF replacement checks (BIP 125 Rule #2, #3, #4)
-    if (isReplacement) {
+    // RBF replacement checks (BIP 125 Rule #2, #3, #4). In a package Core
+    // runs PackageRBFChecks on the whole package instead (validation.cpp:1515).
+    if (isReplacement && !inPackage) {
       // Rule #2 (BIP-125, ref bitcoin-core/src/policy/rbf.cpp::HasNoNewUnconfirmed
       //         pre-removal era): the replacement may only spend an
       //         unconfirmed input if that input was already known —
@@ -2195,10 +2299,12 @@ export class Mempool {
       // Rule #3: Replacement fees must be >= original fees.
       // (bitcoin-core/src/policy/rbf.cpp:PaysForRBF, line 109: `replacement_fees < original_fees`)
       // Core accepts equal fees here; Rule #4 rejects zero-increment cases.
+      // Core ReplacementChecks: TX_RECONSIDERABLE "insufficient fee" with
+      // PaysForRBF's text, so a package can retry it with its child.
       if (fee < totalConflictingFee) {
         return {
           accepted: false,
-          error: `RBF replacement fee ${fee} must be >= conflicting fees ${totalConflictingFee} (BIP-125 Rule 3)`,
+          error: `insufficient fee: rejecting replacement ${Buffer.from(txid).reverse().toString("hex")}, less fees than conflicting txs; ${formatMoney(fee)} < ${formatMoney(totalConflictingFee)}`, // BIP-125 Rule 3
         };
       }
 
@@ -2305,7 +2411,11 @@ export class Mempool {
         evictedTxidSet.add(e.txid.toString("hex"));
       }
     }
-    const clusterResult = this.checkClusterSizeLimit(parentTxids, adjWeight, evictedTxidSet);
+    // A package checks its cluster as a whole (CheckMemPoolPolicyLimits on
+    // the package changeset); a member alone would undercount its parents.
+    const clusterResult = inPackage
+      ? { valid: true as const, error: undefined }
+      : this.checkClusterSizeLimit(parentTxids, adjWeight, evictedTxidSet);
     if (!clusterResult.valid) {
       return { accepted: false, error: clusterResult.error };
     }
@@ -2357,11 +2467,22 @@ export class Mempool {
     //     spend all of those dust outpoints. Without this gate in the single-tx
     //     path, a CPFP child that doesn't actually pay for the dust gets in,
     //     and the dust parent becomes unprunable.
-    {
+    if (!inPackage) {
       const ephemeralSpendResult = checkEphemeralSpends([tx], this.entries);
       if (!ephemeralSpendResult.valid) {
         return { accepted: false, error: ephemeralSpendResult.error };
       }
+    }
+
+    if (inPackage?.preChecksOnly) {
+      return {
+        accepted: true,
+        fee,
+        vsize,
+        adjWeight,
+        mempoolParents: parentTxids,
+        conflicts: conflictsToEvict,
+      };
     }
 
     // 7. Script validation
@@ -2417,7 +2538,14 @@ export class Mempool {
     }
 
     // Mempool uses standard (policy) flags — stricter than consensus block flags.
-    const flags = getStandardFlags(this.tipHeight);
+    // Core PolicyScriptChecks uses STANDARD_SCRIPT_VERIFY_FLAGS, a constant
+    // (policy/policy.h:119): the policy flags never depend on the tip height.
+    // They used to come from getStandardFlags(tipHeight), whose gates are
+    // MAINNET activation heights, so on regtest (tip ~200) no P2SH, witness
+    // or NULLFAIL rule applied and a P2WPKH spend with a bad signature was
+    // accepted. MEMPOOL_STANDARD_FLAGS is the set getStandardFlags gives
+    // once every deployment is active — what mainnet already used.
+    const flags = MEMPOOL_STANDARD_FLAGS;
 
     // All-prevouts (scriptPubKey, amount) of EVERY input, in input order —
     // already resolved above in step 4 (confirmed UTXO set + mempool
@@ -2441,7 +2569,20 @@ export class Mempool {
     // Helper to verify all inputs under a given flag set. Used twice: once
     // for PolicyScriptChecks (standard flags) and once for
     // ConsensusScriptChecks (consensus block flags).
-    const verifyAllInputs = (flagSet: ScriptFlags): { ok: true } | { ok: false; reason: string } => {
+    // Core CheckInputScripts reports "<token> (<ScriptErrorString>)" with the
+    // CScriptCheck debug "input %u of %s (wtxid %s), spending %s:%u"
+    // (validation.cpp:2120); hotbuns carries the debug after ": ".
+    const txidDisplay = Buffer.from(txid).reverse().toString("hex");
+    const wtxidDisplay = Buffer.from(getWTxId(tx)).reverse().toString("hex");
+    const scriptFailure = (token: string, i: number, code: string | undefined): string => {
+      const prev = tx.inputs[i].prevOut;
+      const prevDisplay = Buffer.from(prev.txid).reverse().toString("hex");
+      return `${token} (${scriptErrorString(code)}): input ${i} of ${txidDisplay} (wtxid ${wtxidDisplay}), spending ${prevDisplay}:${prev.vout}`;
+    };
+    const verifyAllInputs = (
+      flagSet: ScriptFlags,
+      token: string,
+    ): { ok: true } | { ok: false; reason: string } => {
       for (let i = 0; i < tx.inputs.length; i++) {
         const { utxo, input } = inputUtxos[i];
         const sigHasher = (subscript: Buffer, hashType: number): Buffer => {
@@ -2479,7 +2620,9 @@ export class Mempool {
             { txVersion: tx.version, txLockTime: tx.lockTime, txSequence: input.sequence }
           );
           if (!valid) {
-            return { ok: false, reason: `Script validation failed for input ${i}` };
+            // A bare false carries no code; Core would name the rule, hotbuns
+            // cannot, so it says what Core says for an uncoded failure.
+            return { ok: false, reason: scriptFailure(token, i, undefined) };
           }
         } catch (e) {
           // ScriptError (e.g. SCRIPT_ERR_SCHNORR_SIG on an invalid taproot
@@ -2493,7 +2636,7 @@ export class Mempool {
           if (isSystemFault(e)) throw e;
           return {
             ok: false,
-            reason: `Script validation failed for input ${i}: ${(e as Error).message}`,
+            reason: scriptFailure(token, i, e instanceof ScriptError ? e.code : undefined),
           };
         }
       }
@@ -2505,7 +2648,7 @@ export class Mempool {
       // Mirrors bitcoin-core/src/validation.cpp:1135-1156 — uses
       // STANDARD_SCRIPT_VERIFY_FLAGS, the strictest set, and is the
       // "expensive checks last" gate of ATMP.
-      const policyResult = verifyAllInputs(flags);
+      const policyResult = verifyAllInputs(flags, "mempool-script-verify-flag-failed");
       if (!policyResult.ok) {
         return { accepted: false, error: policyResult.reason };
       }
@@ -2519,14 +2662,38 @@ export class Mempool {
       // If policy passed but consensus rejects, we still reject (better safe).
       // Cheap to run since the sig cache (when wired) would already have
       // cached the signature verifications.
-      const consensusFlags = getConsensusFlags(this.tipHeight);
-      const consensusResult = verifyAllInputs(consensusFlags);
+      // Core: GetBlockScriptFlags(*m_chain.Tip()) — this network's
+      // deployment heights, not mainnet's. The tip is never one of the two
+      // historic script_flag_exceptions blocks, so no hash is looked up.
+      const tipHeight = this.tipHeight;
+      const consensusFlags = scriptFlagsFromBitmask(
+        getScriptFlagsForBlock(
+          this.params,
+          "",
+          tipHeight >= this.params.bip66Height,
+          tipHeight >= this.params.bip65Height,
+          tipHeight >= this.params.csvHeight,
+          tipHeight >= this.params.segwitHeight,
+        ),
+      );
+      // Core CheckInputsFromMempoolAndCache under block flags reports
+      // "block-script-verify-flag-failed (...)" (no standard-only flag set).
+      const consensusResult = verifyAllInputs(consensusFlags, "block-script-verify-flag-failed");
       if (!consensusResult.ok) {
-        return {
-          accepted: false,
-          error: `ConsensusScriptChecks: ${consensusResult.reason}`,
-        };
+        return { accepted: false, error: consensusResult.reason };
       }
+    }
+
+    // Dry-run path: validation passed but caller only wants a yes/no answer.
+    // Do NOT commit anything to the pool (mirrors Core's test_accept=true path)
+    // — and that includes evicting RBF conflicts: this return used to come
+    // after the eviction below, so a testmempoolaccept of a replacement
+    // removed the original from the mempool.
+    // Report the base fee + sigop-adjusted vsize the checks above used
+    // (Core MempoolAcceptResult m_base_fees / m_vsize), so testmempoolaccept
+    // answers the real numbers instead of a placeholder 0.
+    if (options?.testAccept) {
+      return { accepted: true, fee, vsize, adjWeight, mempoolParents: parentTxids, conflicts: conflictsToEvict };
     }
 
     // If this is an RBF replacement, remove all conflicting transactions first
@@ -2576,15 +2743,6 @@ export class Mempool {
       sigOpCost,
     };
 
-    // Dry-run path: validation passed but caller only wants a yes/no answer.
-    // Do NOT commit anything to the pool (mirrors Core's test_accept=true path).
-    // Report the base fee + sigop-adjusted vsize the checks above used
-    // (Core MempoolAcceptResult m_base_fees / m_vsize), so testmempoolaccept
-    // answers the real numbers instead of a placeholder 0.
-    if (options?.testAccept) {
-      return { accepted: true, fee, vsize };
-    }
-
     // Add to mempool
     this.recordEntryOrder(txidHex, entry);
     this.entries.set(txidHex, entry);
@@ -2626,7 +2784,12 @@ export class Mempool {
       this.notificationEmitter.emit("txAccepted", tx, seq);
     }
 
-    return { accepted: true };
+    return {
+      accepted: true,
+      fee,
+      vsize,
+      replaced: isReplacement ? conflictsToEvict.map((e) => e.txid.toString("hex")) : [],
+    };
   }
 
   /**
@@ -4156,6 +4319,7 @@ export class Mempool {
     parentTxids: Set<string>,
     newTxAdjWeight: number,
     excludeTxids?: Set<string>,
+    newTxCount = 1,
   ): { valid: boolean; error?: string } {
     // `excludeTxids` is the set of txids that will be removed by this admission
     // (e.g. RBF conflicts and their descendants). They contribute zero to the
@@ -4186,7 +4350,7 @@ export class Mempool {
     // live node (80k entries). membersOfRoot(r) is exactly
     // { id : find(id) === r }, so filtering it by `entries` gives the same
     // set the scan produced.
-    let mergedCount = 1; // +1 for the new tx
+    let mergedCount = newTxCount; // the new tx(s): a package adds all of its members
     let mergedWeight = newTxAdjWeight;
     for (const root of clusterRoots) {
       for (const txidHex of this.clusters.membersOfRoot(root)) {
@@ -4796,18 +4960,27 @@ export class Mempool {
   }
 
   /**
-   * Submit a package of transactions for validation and acceptance.
+   * Submit a package (Core ProcessNewPackage with test_accept=false, i.e.
+   * MemPoolAccept::AcceptPackage, validation.cpp:1622).
    *
-   * Package validation allows related transactions to be validated together,
-   * enabling CPFP (Child-Pays-For-Parent) fee bumping. A parent transaction
-   * with a low fee rate can be accepted if its child pays enough fees to
-   * bring the combined package fee rate above the mempool minimum.
+   * Each transaction is first tried on its own, exactly like a single
+   * submission; one that is accepted is in the mempool and its fee is not
+   * used again. Only a tx that failed for its feerate (Core
+   * TX_RECONSIDERABLE) or for missing inputs (its parent is an earlier
+   * package tx that failed on feerate) is retried, together with the other
+   * retryable ones, as a package (acceptMultiple). Any other failure — a bad
+   * signature, a consensus rule — cannot change in a package, so the package
+   * stops there ("transaction failed") and the rest keep their own results.
+   *
+   * Hashes in the result are hex of the internal byte order, like getTxId.
    *
    * @param transactions - Array of transactions in topological order (parents before children)
    * @returns Package validation result with per-transaction results
    */
-  async submitPackage(transactions: Transaction[]): Promise<PackageResult> {
-    // Initialize result
+  async submitPackage(
+    transactions: Transaction[],
+    options?: { maxFeeRateSatPerVB?: number },
+  ): Promise<PackageResult> {
     const txResults = new Map<string, PackageTxResult>();
     const replacedTxids: string[] = [];
 
@@ -4821,404 +4994,443 @@ export class Mempool {
       };
     }
 
-    // Single transaction - just use regular acceptance
-    if (transactions.length === 1) {
-      const tx = transactions[0];
-      const txid = getTxId(tx).toString("hex");
-      const wtxid = getWTxId(tx).toString("hex");
-
-      // Single transaction with ephemeral dust cannot be accepted alone
-      // It requires a child in the same package to spend the dust
-      if (hasEphemeralDust(tx)) {
-        txResults.set(wtxid, {
-          txid,
-          wtxid,
-          accepted: false,
-          error: "tx has ephemeral dust but no child spending it",
-        });
-
-        return {
-          result: PackageValidationResult.PCKG_POLICY,
-          message: "ephemeral-dust-no-child",
-          txResults,
-          replacedTxids,
-        };
-      }
-
-      const result = await this.addTransaction(tx);
-
+    // Single transaction with ephemeral dust cannot be accepted alone
+    // It requires a child in the same package to spend the dust
+    if (transactions.length === 1 && hasEphemeralDust(transactions[0])) {
+      const { txid, wtxid } = txHashes(transactions[0]);
       txResults.set(wtxid, {
         txid,
         wtxid,
-        accepted: result.accepted,
-        error: result.error,
-        vsize: result.accepted ? getTxVSize(tx) : undefined,
+        accepted: false,
+        error: "tx has ephemeral dust but no child spending it",
       });
-
-      return {
-        result: result.accepted
-          ? PackageValidationResult.PCKG_RESULT_UNSET
-          : PackageValidationResult.PCKG_TX,
-        message: result.accepted ? "success" : result.error || "transaction-rejected",
-        txResults,
-        replacedTxids,
-      };
-    }
-
-    // Validate package structure
-    const packageValidation = validatePackage(transactions);
-    if (!packageValidation.valid) {
-      // Create error results for all transactions
-      for (const tx of transactions) {
-        const txid = getTxId(tx).toString("hex");
-        const wtxid = getWTxId(tx).toString("hex");
-        txResults.set(wtxid, {
-          txid,
-          wtxid,
-          accepted: false,
-          error: "package-not-validated",
-        });
-      }
-
       return {
         result: PackageValidationResult.PCKG_POLICY,
-        message: packageValidation.error!,
+        message: "ephemeral-dust-no-child",
         txResults,
         replacedTxids,
       };
     }
 
-    // BUG-4 (W116): enforce child-with-parents-tree topology.
-    // Core's submitpackage RPC (mempool.cpp:1395) rejects multi-tx packages that are not
-    // IsChildWithParentsTree — i.e. chains (gp→p→c) or packages where parents depend on each other.
-    // validatePackage only checks topo-sort and consistency; this is the additional topology guard.
-    if (!isChildWithParentsTree(transactions)) {
-      for (const tx of transactions) {
-        const txid = getTxId(tx).toString("hex");
-        const wtxid = getWTxId(tx).toString("hex");
-        txResults.set(wtxid, {
-          txid,
-          wtxid,
-          accepted: false,
-          error: "package-not-validated",
-        });
+    // Context-free checks: IsWellFormedPackage, then the child-with-parents
+    // topology (Core's submitpackage RPC, mempool.cpp:1395, wants the tree
+    // form: parents may not depend on each other). No tx is validated.
+    if (transactions.length > 1) {
+      const packageValidation = validatePackage(transactions);
+      const policyError = !packageValidation.valid
+        ? packageValidation.error!
+        : !isChildWithParentsTree(transactions)
+          ? "package topology disallowed. not child-with-parents or parents depend on each other."
+          : undefined;
+      if (policyError !== undefined) {
+        for (const tx of transactions) {
+          const { txid, wtxid } = txHashes(tx);
+          txResults.set(wtxid, { txid, wtxid, accepted: false, error: "package-not-validated" });
+        }
+        return { result: PackageValidationResult.PCKG_POLICY, message: policyError, txResults, replacedTxids };
       }
-
-      return {
-        result: PackageValidationResult.PCKG_POLICY,
-        message: "package topology disallowed. not child-with-parents or parents depend on each other.",
-        txResults,
-        replacedTxids,
-      };
     }
 
-    // Build a map of pending transactions for fee calculation
-    // This allows us to look up outputs from package members that aren't in mempool yet
-    const pendingTxs = new Map<string, Transaction>();
-    for (const tx of transactions) {
-      pendingTxs.set(getTxId(tx).toString("hex"), tx);
-    }
-
-    // First pass: calculate fees for all transactions using the pending map
-    const txFees = new Map<string, bigint>();
-    const txVsizes = new Map<string, number>();
+    const singleOptions: AcceptToMemoryPoolOptions = { maxFeeRateSatPerVB: options?.maxFeeRateSatPerVB };
+    // Core results_final / individual_results_nonfinal.
+    const finalResults = new Map<string, PackageTxResult>();
+    const individualFailures = new Map<string, PackageTxResult>();
+    let quitEarly = false;
+    const toEvaluate: Transaction[] = [];
 
     for (const tx of transactions) {
-      const txid = getTxId(tx).toString("hex");
-      const wtxid = getWTxId(tx).toString("hex");
-
-      // Check if already in mempool
-      if (this.entries.has(txid)) {
-        const entry = this.entries.get(txid)!;
-        txFees.set(txid, entry.fee);
-        txVsizes.set(txid, entry.vsize);
-        txResults.set(wtxid, {
-          txid,
+      const { txid, wtxid } = txHashes(tx);
+      const existing = this.entries.get(txid);
+      if (existing) {
+        const existingWtxid = getWTxId(existing.tx).toString("hex");
+        finalResults.set(
           wtxid,
-          accepted: true,
-          vsize: entry.vsize,
-          fee: entry.fee,
-        });
+          existingWtxid === wtxid
+            // Core MempoolTx: vsize and base fee, no effective feerate.
+            ? { txid, wtxid, accepted: true, alreadyInMempool: true, vsize: existing.vsize, fee: existing.fee }
+            // Same txid, different witness: Core swaps in the mempool tx.
+            : { txid, wtxid, accepted: true, otherWtxid: existingWtxid },
+        );
         continue;
       }
 
-      // Calculate fee for this transaction
-      const feeResult = await this.calculateTxFee(tx, pendingTxs);
-      if (!feeResult.valid) {
-        // Transaction is invalid
-        txResults.set(wtxid, {
-          txid,
-          wtxid,
-          accepted: false,
-          error: feeResult.error,
-        });
-
-        return {
-          result: PackageValidationResult.PCKG_TX,
-          message: feeResult.error || "transaction-invalid",
-          txResults,
-          replacedTxids,
-        };
-      }
-
-      txFees.set(txid, feeResult.fee!);
-      txVsizes.set(txid, getTxVSize(tx));
-
-      // Pre-check ephemeral tx: dust outputs require 0-fee
-      const ephemeralPreCheck = preCheckEphemeralTx(tx, feeResult.fee!);
-      if (!ephemeralPreCheck.valid) {
-        txResults.set(wtxid, {
-          txid,
-          wtxid,
-          accepted: false,
-          error: ephemeralPreCheck.error,
-        });
-
-        return {
-          result: PackageValidationResult.PCKG_POLICY,
-          message: ephemeralPreCheck.error || "ephemeral-policy-violation",
-          txResults,
-          replacedTxids,
-        };
-      }
-    }
-
-    // Check ephemeral spends: all dust from parents must be spent by children
-    const ephemeralCheck = checkEphemeralSpends(transactions, this.entries);
-    if (!ephemeralCheck.valid) {
-      // Find the failing transaction
-      for (const tx of transactions) {
-        const txid = getTxId(tx).toString("hex");
-        const wtxid = getWTxId(tx).toString("hex");
-
-        if (this.entries.has(txid)) {
-          continue; // Already in mempool, not the issue
-        }
-
-        if (wtxid === ephemeralCheck.failedWtxid) {
-          txResults.set(wtxid, {
-            txid,
-            wtxid,
-            accepted: false,
-            error: ephemeralCheck.error,
-          });
-        } else {
-          txResults.set(wtxid, {
-            txid,
-            wtxid,
-            accepted: false,
-            error: "missing-ephemeral-spends",
-          });
-        }
-      }
-
-      return {
-        result: PackageValidationResult.PCKG_POLICY,
-        message: ephemeralCheck.error || "missing-ephemeral-spends",
-        txResults,
-        replacedTxids,
-      };
-    }
-
-    // Calculate total package fee and vsize
-    let totalPackageFee = 0n;
-    let totalPackageVsize = 0;
-    const packageWtxids: string[] = [];
-
-    for (const tx of transactions) {
-      const txid = getTxId(tx).toString("hex");
-      const wtxid = getWTxId(tx).toString("hex");
-
-      // Skip transactions already in mempool (they're already accounted for)
-      if (this.entries.has(txid)) {
+      const single = await this.addTransaction(tx, singleOptions);
+      if (single.accepted) {
+        replacedTxids.push(...(single.replaced ?? []));
+        finalResults.set(wtxid, individualSuccess(tx, single.fee!, single.vsize!));
         continue;
       }
-
-      totalPackageFee += txFees.get(txid)!;
-      totalPackageVsize += txVsizes.get(txid)!;
-      packageWtxids.push(wtxid);
-    }
-
-    // Calculate package fee rate
-    const packageFeeRate = totalPackageVsize > 0
-      ? Number(totalPackageFee) / totalPackageVsize
-      : 0;
-
-    // Check if package fee rate meets minimum
-    if (totalPackageVsize > 0 && packageFeeRate < this.minFeeRate) {
-      // Package fee rate too low
-      for (const tx of transactions) {
-        const txid = getTxId(tx).toString("hex");
-        const wtxid = getWTxId(tx).toString("hex");
-
-        if (this.entries.has(txid)) {
-          continue; // Already in mempool
-        }
-
-        txResults.set(wtxid, {
-          txid,
-          wtxid,
-          accepted: false,
-          error: `Package fee rate ${packageFeeRate.toFixed(2)} sat/vB below minimum ${this.minFeeRate}`,
-        });
-      }
-
-      return {
-        result: PackageValidationResult.PCKG_POLICY,
-        message: "package-fee-too-low",
-        txResults,
-        replacedTxids,
-      };
-    }
-
-    // Now add all transactions to mempool in order
-    // Bypass individual fee checks since we've validated package fee rate
-    const acceptedTxs: Transaction[] = [];
-
-    for (const tx of transactions) {
-      const txid = getTxId(tx).toString("hex");
-      const wtxid = getWTxId(tx).toString("hex");
-
-      // Skip if already in mempool
-      if (this.entries.has(txid)) {
-        continue;
-      }
-
-      // Add with bypassed fee check
-      const result = await this.addTransactionBypassFeeCheck(tx);
-
-      if (result.accepted) {
-        acceptedTxs.push(tx);
-        const entry = this.entries.get(txid)!;
-        txResults.set(wtxid, {
-          txid,
-          wtxid,
-          accepted: true,
-          vsize: entry.vsize,
-          fee: entry.fee,
-          effectiveFeeRate: packageFeeRate,
-          effectiveIncludes: packageWtxids,
-        });
+      individualFailures.set(wtxid, { txid, wtxid, accepted: false, error: single.error });
+      if (transactions.length === 1 || !isPackageRetryable(single.error)) {
+        quitEarly = true;
       } else {
-        txResults.set(wtxid, {
-          txid,
-          wtxid,
-          accepted: false,
-          error: result.error,
-        });
-
-        // Remove already accepted transactions from this package
-        for (const acceptedTx of acceptedTxs) {
-          this.removeTransaction(getTxId(acceptedTx), true);
-        }
-
-        return {
-          result: PackageValidationResult.PCKG_TX,
-          message: result.error || "transaction-rejected",
-          txResults,
-          replacedTxids,
-        };
+        toEvaluate.push(tx);
       }
     }
 
-    return {
-      result: PackageValidationResult.PCKG_RESULT_UNSET,
-      message: "success",
+    // Core AcceptSubPackage(txns_package_eval): one tx is tried alone again,
+    // more than one is validated as a package.
+    let multi: PackageResult = {
+      result: quitEarly ? PackageValidationResult.PCKG_TX : PackageValidationResult.PCKG_RESULT_UNSET,
+      message: quitEarly ? "transaction failed" : "success",
+      txResults: new Map(),
+      replacedTxids: [],
+    };
+    if (!quitEarly && toEvaluate.length === 1) {
+      const tx = toEvaluate[0];
+      const { txid, wtxid } = txHashes(tx);
+      const single = await this.addTransaction(tx, singleOptions);
+      if (single.accepted) {
+        multi.txResults.set(wtxid, individualSuccess(tx, single.fee!, single.vsize!));
+        multi.replacedTxids = single.replaced ?? [];
+      } else {
+        multi.result = PackageValidationResult.PCKG_TX;
+        multi.message = "transaction failed";
+        multi.txResults.set(wtxid, { txid, wtxid, accepted: false, error: single.error });
+      }
+    } else if (!quitEarly && toEvaluate.length > 1) {
+      multi = await this.acceptMultiple(toEvaluate, {
+        testAccept: false,
+        packageFeerates: true,
+        allowReplacement: true,
+        maxFeeRateSatPerVB: options?.maxFeeRateSatPerVB,
+      });
+    }
+
+    let result = multi.result;
+    let message = multi.message;
+    replacedTxids.push(...multi.replacedTxids);
+    for (const tx of transactions) {
+      const { txid, wtxid } = txHashes(tx);
+      let r = multi.txResults.get(wtxid) ?? finalResults.get(wtxid) ?? individualFailures.get(wtxid);
+      // Core: a member trimmed away by LimitMempoolSize after acceptance is
+      // "mempool full" and fails the package.
+      if (r !== undefined && r.accepted && !this.entries.has(txid)) {
+        r = { txid, wtxid, accepted: false, error: "mempool full" };
+        result = PackageValidationResult.PCKG_TX;
+        message = "transaction failed";
+      }
+      if (r !== undefined) txResults.set(wtxid, r);
+    }
+
+    return { result, message, txResults, replacedTxids };
+  }
+
+  /**
+   * testmempoolaccept of more than one transaction (Core ProcessNewPackage
+   * with test_accept=true: AcceptMultipleTransactions with PackageTestAccept
+   * args). Every tx is checked against the mempool plus the earlier package
+   * txs, at its OWN feerate (no package feerate), without replacement, and
+   * nothing is committed. A tx with no result was not reached.
+   */
+  async testAcceptPackage(transactions: Transaction[]): Promise<PackageResult> {
+    return this.acceptMultiple(transactions, {
+      testAccept: true,
+      packageFeerates: false,
+      allowReplacement: false,
+    });
+  }
+
+  /**
+   * Core MemPoolAccept::AcceptMultipleTransactionsInternal
+   * (validation.cpp:1432): PreChecks of every tx first, against a view that
+   * holds the earlier members' outputs; then the package feerate, package
+   * RBF, the cluster limit and ephemeral dust on the package as a whole;
+   * then script checks in order; then (unless test-accept) submission.
+   */
+  private async acceptMultiple(
+    transactions: Transaction[],
+    args: {
+      testAccept: boolean;
+      packageFeerates: boolean;
+      allowReplacement: boolean;
+      maxFeeRateSatPerVB?: number;
+    },
+  ): Promise<PackageResult> {
+    const txResults = new Map<string, PackageTxResult>();
+    const replacedTxids: string[] = [];
+    const stop = (result: PackageValidationResult, message: string): PackageResult => ({
+      result,
+      message,
       txResults,
       replacedTxids,
+    });
+
+    const wellFormed = validatePackage(transactions);
+    if (!wellFormed.valid) {
+      return stop(PackageValidationResult.PCKG_POLICY, wellFormed.error!);
+    }
+
+    type Member = {
+      tx: Transaction;
+      txid: string;
+      wtxid: string;
+      fee: bigint;
+      vsize: number;
+      adjWeight: number;
+      mempoolParents: Set<string>;
+      conflicts: MempoolEntry[];
     };
+    const members: Member[] = [];
+    const coins = new Map<string, Transaction>();
+    for (const tx of transactions) {
+      const { txid, wtxid } = txHashes(tx);
+      const pre = await this.addTransaction(tx, {
+        testAccept: true,
+        inPackage: {
+          coins,
+          packageFeerates: args.packageFeerates,
+          allowReplacement: args.allowReplacement,
+          preChecksOnly: true,
+        },
+      });
+      if (!pre.accepted) {
+        txResults.set(wtxid, { txid, wtxid, accepted: false, error: pre.error });
+        return stop(PackageValidationResult.PCKG_TX, "transaction failed");
+      }
+      // Core validation.cpp:1458: the caller's max feerate, per tx.
+      if (
+        args.maxFeeRateSatPerVB !== undefined &&
+        args.maxFeeRateSatPerVB > 0 &&
+        Number(pre.fee!) / pre.vsize! > args.maxFeeRateSatPerVB
+      ) {
+        txResults.set(wtxid, { txid, wtxid, accepted: false, error: "max feerate exceeded" });
+        return stop(PackageValidationResult.PCKG_TX, "transaction failed");
+      }
+      members.push({
+        tx,
+        txid,
+        wtxid,
+        fee: pre.fee!,
+        vsize: pre.vsize!,
+        adjWeight: pre.adjWeight!,
+        mempoolParents: pre.mempoolParents ?? new Set(),
+        conflicts: pre.conflicts ?? [],
+      });
+      coins.set(txid, tx);
+    }
+
+    let totalFee = 0n;
+    let totalVsize = 0;
+    let totalWeight = 0;
+    for (const m of members) {
+      totalFee += m.fee;
+      totalVsize += m.vsize;
+      totalWeight += m.adjWeight;
+    }
+    const allWtxids = members.map((m) => m.wtxid);
+    const packageSuccess = (m: Member): PackageTxResult => ({
+      txid: m.txid,
+      wtxid: m.wtxid,
+      accepted: true,
+      vsize: m.vsize,
+      fee: m.fee,
+      effectiveFee: totalFee,
+      effectiveVsize: totalVsize,
+      effectiveFeeRate: Number(totalFee) / totalVsize,
+      effectiveIncludes: allWtxids,
+    });
+
+    // Core CheckFeeRate on the package (validation.cpp:1507); the failure is
+    // attributed to the child.
+    if (args.packageFeerates) {
+      const feeError = this.packageFeeRateError(totalVsize, totalFee);
+      if (feeError !== null) {
+        const child = members[members.length - 1];
+        txResults.set(child.wtxid, { txid: child.txid, wtxid: child.wtxid, accepted: false, error: feeError });
+        return stop(PackageValidationResult.PCKG_TX, "transaction failed");
+      }
+    }
+
+    // Package RBF (Core PackageRBFChecks, validation.cpp:1037). Each
+    // member's conflicts already include their descendants.
+    const conflicts = new Map<string, MempoolEntry>();
+    for (const m of members) {
+      for (const c of m.conflicts) conflicts.set(c.txid.toString("hex"), c);
+    }
+    const evicted = new Set(conflicts.keys());
+    if (conflicts.size > 0) {
+      const rbfError = this.packageRbfError(members, [...conflicts.values()], totalFee, totalVsize, totalWeight);
+      if (rbfError !== null) return stop(PackageValidationResult.PCKG_POLICY, rbfError);
+    }
+
+    // Cluster limit on the package changeset (validation.cpp:1520).
+    const mempoolParents = new Set<string>();
+    for (const m of members) for (const p of m.mempoolParents) mempoolParents.add(p);
+    if (!this.checkClusterSizeLimit(mempoolParents, totalWeight, evicted, members.length).valid) {
+      return stop(PackageValidationResult.PCKG_POLICY, "too-large-cluster");
+    }
+
+    // Ephemeral dust must be spent within the package (validation.cpp:1526).
+    const ephemeral = checkEphemeralSpends(transactions, this.entries);
+    if (!ephemeral.valid) {
+      const failed = members.find((m) => m.wtxid === ephemeral.failedWtxid) ?? members[members.length - 1];
+      txResults.set(failed.wtxid, { txid: failed.txid, wtxid: failed.wtxid, accepted: false, error: ephemeral.error });
+      return stop(PackageValidationResult.PCKG_TX, "unspent-dust");
+    }
+
+    // Script checks, in package order (validation.cpp:1536).
+    const scriptCoins = new Map<string, Transaction>();
+    for (const m of members) {
+      const checked = await this.addTransaction(m.tx, {
+        testAccept: true,
+        inPackage: {
+          coins: scriptCoins,
+          packageFeerates: args.packageFeerates,
+          allowReplacement: args.allowReplacement,
+        },
+      });
+      if (!checked.accepted) {
+        txResults.set(m.wtxid, { txid: m.txid, wtxid: m.wtxid, accepted: false, error: checked.error });
+        return stop(PackageValidationResult.PCKG_TX, "transaction failed");
+      }
+      scriptCoins.set(m.txid, m.tx);
+      if (args.testAccept) {
+        txResults.set(
+          m.wtxid,
+          args.packageFeerates ? packageSuccess(m) : individualSuccess(m.tx, m.fee, m.vsize),
+        );
+      }
+    }
+    if (args.testAccept) {
+      return stop(PackageValidationResult.PCKG_RESULT_UNSET, "success");
+    }
+
+    // Submit in order. Parents are in the mempool by the time a child is
+    // added; the package-level checks above stand in for the per-tx ones.
+    const committed: Transaction[] = [];
+    for (const m of members) {
+      const added = await this.addTransaction(m.tx, {
+        inPackage: { coins: new Map(), packageFeerates: true, allowReplacement: true },
+      });
+      if (!added.accepted) {
+        for (const tx of committed.reverse()) this.removeTransaction(getTxId(tx), true);
+        txResults.set(m.wtxid, { txid: m.txid, wtxid: m.wtxid, accepted: false, error: added.error });
+        return stop(PackageValidationResult.PCKG_MEMPOOL_ERROR, "submission failed");
+      }
+      committed.push(m.tx);
+      replacedTxids.push(...(added.replaced ?? []));
+    }
+    for (const m of members) txResults.set(m.wtxid, packageSuccess(m));
+    return stop(PackageValidationResult.PCKG_RESULT_UNSET, "success");
   }
 
   /**
-   * Calculate the fee for a transaction without adding it to mempool.
-   * Used for CPFP package fee rate calculation.
-   *
-   * @param tx - Transaction to calculate fee for
-   * @param pendingTxs - Optional map of txid -> Transaction for transactions
-   *                     in the package that haven't been added to mempool yet.
+   * Core CheckFeeRate(package_size, package_fee) (validation.cpp:699): the
+   * rolling mempool minimum, then the static min relay fee. CFeeRate::GetFee
+   * rounds up. Returns "reason: debug" or null.
    */
-  private async calculateTxFee(
-    tx: Transaction,
-    pendingTxs?: Map<string, Transaction>
-  ): Promise<{ valid: boolean; fee?: bigint; error?: string }> {
-    // Basic validation
-    const basicResult = validateTxBasic(tx);
-    if (!basicResult.valid) {
-      return { valid: false, error: basicResult.error };
+  private packageFeeRateError(vsize: number, fee: bigint): string | null {
+    const mempoolRejectFee = Math.ceil((this.getMinFee() * vsize) / 1000);
+    if (mempoolRejectFee > 0 && fee < BigInt(mempoolRejectFee)) {
+      return `mempool min fee not met: ${fee} < ${mempoolRejectFee}`;
     }
-
-    if (isCoinbase(tx)) {
-      return { valid: false, error: "Coinbase transaction not allowed" };
+    const minRelayFee = Math.ceil((Math.round(this.minFeeRate * 1000) * vsize) / 1000);
+    if (fee < BigInt(minRelayFee)) {
+      return `min relay fee not met: ${fee} < ${minRelayFee}`;
     }
-
-    // Calculate input values
-    let totalInput = 0n;
-
-    for (const input of tx.inputs) {
-      const parentTxidHex = input.prevOut.txid.toString("hex");
-
-      // Check pending transactions first (package members not yet in mempool)
-      if (pendingTxs && pendingTxs.has(parentTxidHex)) {
-        const pendingTx = pendingTxs.get(parentTxidHex)!;
-        if (input.prevOut.vout >= pendingTx.outputs.length) {
-          return { valid: false, error: `Invalid pending input` };
-        }
-        totalInput += pendingTx.outputs[input.prevOut.vout].value;
-        continue;
-      }
-
-      // Check mempool
-      const mempoolParent = this.entries.get(parentTxidHex);
-      if (mempoolParent) {
-        if (input.prevOut.vout >= mempoolParent.tx.outputs.length) {
-          return { valid: false, error: `Invalid mempool input` };
-        }
-        totalInput += mempoolParent.tx.outputs[input.prevOut.vout].value;
-        continue;
-      }
-
-      // Check UTXO set
-      const utxo = await this.utxo.getUTXOAsync(input.prevOut);
-      if (!utxo) {
-        return { valid: false, error: `Missing input` };
-      }
-      totalInput += utxo.amount;
-    }
-
-    // Calculate output values
-    let totalOutput = 0n;
-    for (const output of tx.outputs) {
-      totalOutput += output.value;
-    }
-
-    if (totalInput < totalOutput) {
-      return { valid: false, error: `Insufficient input value` };
-    }
-
-    return { valid: true, fee: totalInput - totalOutput };
+    return null;
   }
 
   /**
-   * Add a transaction bypassing the fee rate check.
-   * Used for CPFP where the package fee rate has already been validated.
+   * Core MemPoolAccept::PackageRBFChecks (validation.cpp:1037) for a package
+   * whose members conflict with the mempool. Returns the package state's
+   * text ("reason, debug") or null when the replacement may go ahead.
    */
-  private async addTransactionBypassFeeCheck(
-    tx: Transaction
-  ): Promise<{ accepted: boolean; error?: string }> {
-    // Save current minFeeRate
-    const savedMinFeeRate = this.minFeeRate;
-
-    // Temporarily set minFeeRate to 0 to bypass the check
-    this.minFeeRate = 0;
-
-    try {
-      const result = await this.addTransaction(tx);
-      return result;
-    } finally {
-      // Restore minFeeRate
-      this.minFeeRate = savedMinFeeRate;
+  private packageRbfError(
+    members: Array<{ tx: Transaction; txid: string; fee: bigint; vsize: number; mempoolParents: Set<string> }>,
+    allConflicts: MempoolEntry[],
+    totalFee: bigint,
+    totalVsize: number,
+    totalWeight: number,
+  ): string | null {
+    if (members.length !== 2 || !isChildWithParents(members.map((m) => m.tx))) {
+      return "package RBF failed: package must be 1-parent-1-child";
     }
+    if (members.some((m) => m.mempoolParents.size > 0)) {
+      return "package RBF failed: new transaction cannot have mempool ancestors";
+    }
+    const [parent, child] = members;
+    const childTxid = Buffer.from(child.txid, "hex").reverse().toString("hex");
+
+    if (allConflicts.length > MAX_REPLACEMENT_CANDIDATES) {
+      return `package RBF failed: too many potential replacements, rejecting replacement ${childTxid}; too many potential replacements (${allConflicts.length} > ${MAX_REPLACEMENT_CANDIDATES})`;
+    }
+
+    // PaysForRBF over the whole package, attributed to the child.
+    let conflictingFees = 0n;
+    for (const c of allConflicts) conflictingFees += c.fee;
+    if (totalFee < conflictingFees) {
+      return `package RBF failed: insufficient anti-DoS fees, rejecting replacement ${childTxid}, less fees than conflicting txs; ${formatMoney(totalFee)} < ${formatMoney(conflictingFees)}`;
+    }
+    const relayFee = BigInt(Math.ceil(this.incrementalRelayFee * totalVsize));
+    if (totalFee - conflictingFees < relayFee) {
+      return `package RBF failed: insufficient anti-DoS fees, rejecting replacement ${childTxid}, not enough additional fees to relay; ${formatMoney(totalFee - conflictingFees)} < ${formatMoney(relayFee)}`;
+    }
+
+    // The two txs must be a chunk on their own: package feerate > parent's.
+    if (totalFee * BigInt(parent.vsize) <= parent.fee * BigInt(totalVsize)) {
+      return `package RBF failed: package feerate is less than or equal to parent feerate, package feerate ${feeRateString(totalFee, totalVsize)} <= parent feerate is ${feeRateString(parent.fee, parent.vsize)}`;
+    }
+
+    // No mempool ancestors, conflicts staged for removal: the new cluster is
+    // the package alone.
+    const evicted = new Set(allConflicts.map((c) => c.txid.toString("hex")));
+    if (!this.checkClusterSizeLimit(new Set(), totalWeight, evicted, members.length).valid) {
+      return "too-large-cluster";
+    }
+
+    // The package enters as one chunk at the package feerate.
+    const diagramError = this.improvesFeerateDiagram(child.txid, totalFee, totalVsize, new Set(), allConflicts);
+    if (diagramError !== null) {
+      return `package RBF failed: ${diagramError}`;
+    }
+    return null;
   }
+}
+
+/** txid / wtxid hex, internal byte order. */
+function txHashes(tx: Transaction): { txid: string; wtxid: string } {
+  return { txid: getTxId(tx).toString("hex"), wtxid: getWTxId(tx).toString("hex") };
+}
+
+/** A tx accepted on its own: effective feerate is its own (Core m_wtxids_fee_calculations = {wtxid}). */
+function individualSuccess(tx: Transaction, fee: bigint, vsize: number): PackageTxResult {
+  const { txid, wtxid } = txHashes(tx);
+  return {
+    txid,
+    wtxid,
+    accepted: true,
+    vsize,
+    fee,
+    effectiveFee: fee,
+    effectiveVsize: vsize,
+    effectiveFeeRate: Number(fee) / vsize,
+    effectiveIncludes: [wtxid],
+  };
+}
+
+/**
+ * Whether a tx that failed on its own may still enter with the rest of its
+ * package (Core AcceptPackage: TX_RECONSIDERABLE or TX_MISSING_INPUTS).
+ * Reconsiderable are the feerate failures (CheckFeeRate) and the RBF fee
+ * failures (ReplacementChecks "insufficient fee" / "replacement-failed").
+ */
+export function isPackageRetryable(error: string | undefined): boolean {
+  if (error === undefined) return false;
+  return (
+    error.startsWith("min relay fee not met") ||
+    error.startsWith("mempool min fee not met") ||
+    error.startsWith("insufficient fee") ||
+    error.startsWith("RBF incremental fee") ||
+    error.startsWith("bad-txns-inputs-missingorspent")
+  );
+}
+
+/** Core CFeeRate::ToString(): "%d.%08d BTC/kvB" of GetFeePerK (rounded down). */
+function feeRateString(fee: bigint, vsize: number): string {
+  const perK = (fee * 1000n) / BigInt(vsize);
+  return `${perK / 100_000_000n}.${(perK % 100_000_000n).toString().padStart(8, "0")} BTC/kvB`;
 }
 
 // ============================================================================
