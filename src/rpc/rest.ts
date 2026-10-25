@@ -837,6 +837,8 @@ export class RESTServer {
       for (const txid of txids) {
         const entry = this.mempool.getTransaction(txid);
         if (entry) {
+          // Core CalculateAncestorData / CalculateDescendantData (transitive, modified fees).
+          const rel = this.mempool.getEntryRelatives(txid)!;
           entries.set(Buffer.from(txid).reverse().toString("hex"), {
             vsize: entry.vsize,
             weight: entry.weight,
@@ -844,19 +846,19 @@ export class RESTServer {
             modifiedfee: Number(entry.fee) / 100000000,
             time: entry.addedTime,
             height: entry.height,
-            descendantcount: entry.descendantCount,
-            descendantsize: entry.descendantSize,
-            ancestorcount: entry.ancestorCount,
-            ancestorsize: entry.ancestorSize,
+            descendantcount: rel.descendantCount,
+            descendantsize: rel.descendantSize,
+            ancestorcount: rel.ancestorCount,
+            ancestorsize: rel.ancestorSize,
             wtxid: Buffer.from(getWTxId(entry.tx)).reverse().toString("hex"),
             fees: {
               base: Number(entry.fee) / 100000000,
-              modified: Number(entry.fee) / 100000000,
-              ancestor: Number(entry.fee) / 100000000,
-              descendant: Number(entry.fee) / 100000000,
+              modified: Number(this.mempool.getModifiedFee(txid)) / 100000000,
+              ancestor: Number(rel.ancestorFees) / 100000000,
+              descendant: Number(rel.descendantFees) / 100000000,
             },
-            depends: Array.from(entry.dependsOn),
-            spentby: Array.from(entry.spentBy),
+            depends: rel.depends,
+            spentby: rel.spentby,
           });
         }
       }

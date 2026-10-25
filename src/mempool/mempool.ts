@@ -792,6 +792,29 @@ export interface MempoolEntry {
 }
 
 /**
+ * Ancestor/descendant accounting of a mempool entry as Core's entryToJSON
+ * reports it (see Mempool.getEntryRelatives).
+ */
+export interface MempoolEntryRelatives {
+  /** Ancestors including self. */
+  ancestorCount: number;
+  /** Total vsize of ancestors including self. */
+  ancestorSize: number;
+  /** Total modified fee of ancestors including self, in satoshis. */
+  ancestorFees: bigint;
+  /** Descendants including self. */
+  descendantCount: number;
+  /** Total vsize of descendants including self. */
+  descendantSize: number;
+  /** Total modified fee of descendants including self, in satoshis. */
+  descendantFees: bigint;
+  /** In-mempool parent txids, display hex, sorted. */
+  depends: string[];
+  /** Child txids, display hex, in internal-byte order. */
+  spentby: string[];
+}
+
+/**
  * UTXO entry from mempool (not yet confirmed).
  */
 interface MempoolUTXO {
@@ -3051,6 +3074,61 @@ export class Mempool {
   getTransaction(txid: Buffer): MempoolEntry | null {
     const txidHex = txid.toString("hex");
     return this.entries.get(txidHex) ?? null;
+  }
+
+  /**
+   * Ancestor/descendant accounting and parent/child lists for one entry, as
+   * Core's entryToJSON reports them (rpc/mempool.cpp).
+   *
+   * Computed from the live graph rather than the cached ancestor/descendant
+   * fields, as Core does (CTxMemPool::CalculateAncestorData /
+   * CalculateDescendantData walk the txgraph): counts, sizes and fees cover
+   * the full transitive set including the entry itself, and fees are
+   * MODIFIED fees (prioritisetransaction deltas included).
+   *
+   * depends: in-mempool parents' txids, display hex, sorted as strings
+   *   (Core collects them in a std::set<std::string>).
+   * spentby: children's txids, display hex, sorted by the txid's internal
+   *   byte order (Core GetChildren sorts by CompareIteratorByHash).
+   */
+  getEntryRelatives(txid: Buffer): MempoolEntryRelatives | null {
+    const txidHex = txid.toString("hex");
+    const entry = this.entries.get(txidHex);
+    if (!entry) return null;
+
+    const sum = (set: Set<string>): { count: number; size: number; fees: bigint } => {
+      let size = entry.vsize;
+      let fees = this.getModifiedFee(entry.txid);
+      let count = 1;
+      for (const hex of set) {
+        const e = this.entries.get(hex);
+        if (!e) continue;
+        count++;
+        size += e.vsize;
+        fees += this.getModifiedFee(e.txid);
+      }
+      return { count, size, fees };
+    };
+
+    const inPool = (set: Set<string>): string[] =>
+      Array.from(set).filter((hex) => this.entries.has(hex));
+    const toDisplay = (hex: string): string =>
+      Buffer.from(hex, "hex").reverse().toString("hex");
+
+    const ancestors = sum(this.getAncestorSet(entry.dependsOn));
+    const descendants = sum(this.getDescendantSet(txidHex));
+
+    return {
+      ancestorCount: ancestors.count,
+      ancestorSize: ancestors.size,
+      ancestorFees: ancestors.fees,
+      descendantCount: descendants.count,
+      descendantSize: descendants.size,
+      descendantFees: descendants.fees,
+      depends: inPool(entry.dependsOn).map(toDisplay).sort(),
+      // Internal hex compares like the internal bytes (memcmp order).
+      spentby: inPool(entry.spentBy).sort().map(toDisplay),
+    };
   }
 
   /**
