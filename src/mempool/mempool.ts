@@ -1347,6 +1347,14 @@ export class Mempool {
    */
   private mapDeltas: Map<string, bigint>;
 
+  /**
+   * Core CTxMemPool::m_unbroadcast_txids: locally submitted transactions
+   * (sendrawtransaction / submitpackage) whose initial broadcast no peer has
+   * acknowledged yet. Internal-order txid hex. Cleared when a peer fetches
+   * the tx via getdata or the tx leaves the pool.
+   */
+  private unbroadcastTxids: Set<string> = new Set();
+
   /** Maximum mempool size in vbytes. */
   private maxSize: number;
 
@@ -2701,6 +2709,7 @@ export class Mempool {
 
     // Remove from entries
     this.entries.delete(txidHex);
+    this.unbroadcastTxids.delete(txidHex);
     this.unindexWtxid(txidHex);
     this.currentSize -= entry.vsize;
     this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
@@ -2756,6 +2765,7 @@ export class Mempool {
 
         // Remove from entries
         this.entries.delete(txidHex);
+        this.unbroadcastTxids.delete(txidHex);
         this.unindexWtxid(txidHex);
         this.currentSize -= entry.vsize;
         this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
@@ -3221,6 +3231,27 @@ export class Mempool {
     return Number(this.getEntryModifiedFee(entry)) / entry.vsize;
   }
 
+  /** Core AddUnbroadcastTx: only meaningful for a tx that is in the pool. */
+  addUnbroadcastTx(txid: Buffer): void {
+    const txidHex = txid.toString("hex");
+    if (this.entries.has(txidHex)) this.unbroadcastTxids.add(txidHex);
+  }
+
+  /** Core RemoveUnbroadcastTx. */
+  removeUnbroadcastTx(txid: Buffer): void {
+    this.unbroadcastTxids.delete(txid.toString("hex"));
+  }
+
+  /** Core IsUnbroadcastTx. */
+  isUnbroadcast(txid: Buffer): boolean {
+    return this.unbroadcastTxids.has(txid.toString("hex"));
+  }
+
+  /** Core GetUnbroadcastTxs: internal-order txid hex snapshot. */
+  getUnbroadcastTxs(): Set<string> {
+    return new Set(this.unbroadcastTxids);
+  }
+
   /**
    * Return the full mapDeltas snapshot (internal-order txid hex -> delta) for
    * persistence (mempool.dat). Caller owns the copy.
@@ -3682,6 +3713,7 @@ export class Mempool {
 
     // Remove from entries
     this.entries.delete(txidHex);
+    this.unbroadcastTxids.delete(txidHex);
     this.unindexWtxid(txidHex);
     this.currentSize -= entry.vsize;
     this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
@@ -4041,6 +4073,7 @@ export class Mempool {
    */
   clear(): void {
     this.entries.clear();
+    this.unbroadcastTxids.clear();
     this.outpointIndex.clear();
     this.wtxidIndex.clear();
     this.txidToWtxid.clear();

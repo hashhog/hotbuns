@@ -51,6 +51,11 @@ class MockMempool {
     };
   }
 
+  private unbroadcast = new Set<string>();
+  addUnbroadcastTx(txid: Buffer) { this.unbroadcast.add(txid.toString("hex")); }
+  removeUnbroadcastTx(txid: Buffer) { this.unbroadcast.delete(txid.toString("hex")); }
+  isUnbroadcast(txid: Buffer) { return this.unbroadcast.has(txid.toString("hex")); }
+  getUnbroadcastTxs() { return new Set(this.unbroadcast); }
   getAllTxids(): Buffer[] {
     return Array.from(this.entries.values()).map(e => e.txid);
   }
