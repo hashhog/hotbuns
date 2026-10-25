@@ -61,6 +61,11 @@ class MockMempool implements Partial<Mempool> {
     return Array.from(this.entries.keys()).map((hex) => Buffer.from(hex, "hex"));
   }
 
+  // The REST tests never announce entries to peers: nothing is unbroadcast.
+  getUnbroadcastTxs(): Set<string> {
+    return new Set();
+  }
+
   getInfo() {
     let bytes = 0;
     for (const entry of this.entries.values()) {

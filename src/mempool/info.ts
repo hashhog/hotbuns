@@ -9,7 +9,7 @@
 import type { Mempool } from "./mempool.js";
 
 export function mempoolInfoToJSON(
-  mempool: Pick<Mempool, "getInfo" | "getAllTxids" | "getTransaction">
+  mempool: Pick<Mempool, "getInfo" | "getAllTxids" | "getTransaction" | "getUnbroadcastTxs">
 ): Record<string, unknown> {
   const info = mempool.getInfo();
 
@@ -30,7 +30,7 @@ export function mempoolInfoToJSON(
     mempoolminfee: info.minFeeRate / 100_000, // Convert sat/vB to BTC/kvB
     minrelaytxfee: 0.000001, // 0.1 sat/vB = Core's minrelaytxfee default (0.00000100 BTC/kvB)
     incrementalrelayfee: 0.000001, // 0.1 sat/vB = Core's DEFAULT_INCREMENTAL_RELAY_FEE{100} (0.00000100 BTC/kvB)
-    unbroadcastcount: 0,
+    unbroadcastcount: mempool.getUnbroadcastTxs().size,
     fullrbf: true,
     // Core v31.99 MempoolInfoToJSON appends these 5 fields after fullrbf
     // (rpc/mempool.cpp). Values are the policy defaults (policy.h):
