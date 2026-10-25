@@ -35,6 +35,8 @@ const mockMempool = {
   getInfo: () => ({ size: 2, bytes: 400, usage: 900, maxmempool: 300_000_000, minFeeRate: 1 }),
   getAllTxids: () => txids,
   getTransaction: (txid: Buffer) => ({ fee: txid[0] === 1 ? feeA : feeB }),
+  // One of the two entries has not been announced to a peer yet.
+  getUnbroadcastTxs: () => new Set([txids[1].toString("hex")]),
 };
 
 describe("rest mempool/info", () => {
@@ -76,7 +78,11 @@ describe("rest mempool/info", () => {
     expect(json.limitclustercount).toBe(64);
     expect(json.limitclustersize).toBe(101_000);
     expect(json.incrementalrelayfee).toBe(0.000001);
-    expect(json.unbroadcastcount).toBe(0);
     expect(json.optimal).toBe(true);
+  });
+
+  test("unbroadcastcount is the live unbroadcast-set size, as in getmempoolinfo", async () => {
+    const json = await (await fetch(`${baseUrl}/rest/mempool/info.json`)).json();
+    expect(json.unbroadcastcount).toBe(1);
   });
 });
