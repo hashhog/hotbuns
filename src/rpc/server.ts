@@ -16674,9 +16674,10 @@ export class RPCServer {
     // before it reads CoinsDB (rpc/blockchain.cpp:1074-1081). Without it the
     // scan below reports the tip's height/bestblock over the LAST FLUSHED coin
     // set — the tip label makes the stale numbers look authoritative.
-    // Pause block-connect for the walk (Core holds cs_main in GetUTXOStats)
-    // so IBD does not starve the scan on the single event loop.
-    this.blockSync?.pauseForUTXOScan();
+    // Take the chain for the walk (Core holds cs_main in GetUTXOStats): pause
+    // block-connect AND wait for the in-flight block, so the flush + coin walk
+    // read one height rather than straddling a block mid-connect.
+    await this.blockSync?.beginExclusiveChainOp();
     try {
       await this.forceFlushChainstateToDisk();
 
@@ -16721,7 +16722,7 @@ export class RPCServer {
 
       return result;
     } finally {
-      this.blockSync?.resumeAfterUTXOScan();
+      this.blockSync?.endExclusiveChainOp();
     }
   }
 
