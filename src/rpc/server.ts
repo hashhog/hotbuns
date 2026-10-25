@@ -6294,6 +6294,15 @@ export class RPCServer {
         results.push(entry);
         continue;
       }
+      if (result.rejectReason !== undefined) {
+        // Refusals that carry Core's reason and debug message separately
+        // (RBF ReplacementChecks): reject-details is TxValidationState::ToString().
+        reject(
+          result.rejectReason,
+          result.rejectDetails ? `${result.rejectReason}, ${result.rejectDetails}` : result.rejectReason,
+        );
+        continue;
+      }
       const err = result.error || "rejected";
       const sep = err.indexOf(": ");
       const reason = sep >= 0 ? err.slice(0, sep) : err;
