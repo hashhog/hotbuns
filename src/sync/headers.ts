@@ -507,6 +507,19 @@ export class HeaderSync {
         continue;
       }
 
+      // Core AcceptBlockHeader (validation.cpp:4219-4223): a header whose
+      // parent is marked failed is refused with "bad-prevblk" and never enters
+      // the block index. Storing it flagged "invalid" was not equivalent:
+      // reconsiderblock of the parent cleared it like any other descendant,
+      // and a header Core never indexed became a body-less best-header
+      // candidate that kept a valid sibling block from connecting.
+      if (parent.status === "invalid") {
+        console.warn(
+          `Invalid header from ${fromPeer?.host ?? "local"}: bad-prevblk (parent ${parentHashHex.slice(0, 16)} is marked invalid)`
+        );
+        continue;
+      }
+
       // Validate header
       const validation = this.validateHeader(header, parent);
       if (!validation.valid) {
@@ -577,16 +590,6 @@ export class HeaderSync {
       if (this.bestHeader && chainWork < this.bestHeader.chainWork) {
         status = "valid-fork";
       }
-      // Bitcoin Core BLOCK_FAILED_CHILD (validation.cpp): a header that builds
-      // on a consensus-invalid ancestor is itself invalid and must never be
-      // selected as the best chain.  `invalidateHeader` flags a failed block's
-      // header "invalid"; propagating that down any extension keeps a later
-      // heavier-but-invalid fork from re-capturing the best-header / by-height
-      // index and re-driving a doomed reorg into the same failure.
-      if (parent.status === "invalid") {
-        status = "invalid";
-      }
-
       // Create entry
       const entry: HeaderChainEntry = {
         hash,

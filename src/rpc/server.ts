@@ -9421,6 +9421,13 @@ export class RPCServer {
       return null;
     }
 
+    // Core AcceptBlockHeader (validation.cpp:4219-4223): a parent marked
+    // failed -> "bad-prevblk", and the header is not indexed. submitheader
+    // throws RPC_VERIFY_ERROR with the reject reason.
+    if (parent.status === "invalid") {
+      throw this.rpcError(RPCErrorCodes.RPC_TRANSACTION_ERROR, "bad-prevblk");
+    }
+
     // --- Step 4: validation via the REAL header validator ---------------------
     // Core: ProcessNewBlockHeaders -> AcceptBlockHeader -> CheckBlockHeader
     // (PoW) + ContextualCheckBlockHeader.  Reuse HeaderSync.validateHeader so we
