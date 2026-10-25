@@ -582,8 +582,11 @@ describe("W120 — mempool strict RBF rules 1-5 (BIP-125)", () => {
         require("node:path").join(__dirname, "..", "mempool", "mempool.ts"),
         "utf8",
       ) as string;
-      expect(src).toMatch(/allConflictTxids\.size\s*>\s*MAX_REPLACEMENT_CANDIDATES/);
-      expect(src).not.toMatch(/allConflictTxids\.size\s*>=\s*MAX_REPLACEMENT_CANDIDATES/);
+      // Core GetEntriesForConflicts caps the CLUSTER count of the direct
+      // conflicts (policy/rbf.cpp), not the evicted-tx count.
+      expect(src).toMatch(/conflictClusters\s*>\s*MAX_REPLACEMENT_CANDIDATES/);
+      expect(src).not.toMatch(/conflictClusters\s*>=\s*MAX_REPLACEMENT_CANDIDATES/);
+      expect(src).not.toMatch(/allConflictTxids\.size\s*>=?\s*MAX_REPLACEMENT_CANDIDATES/);
     });
 
     test("G23: Rule 5 traverses descendants via getDescendantSet (union with direct conflicts)", () => {
@@ -602,13 +605,17 @@ describe("W120 — mempool strict RBF rules 1-5 (BIP-125)", () => {
         "utf8",
       ) as string;
       // The exact error string includes the descriptive prefix and constant name.
-      expect(src).toMatch(/RBF would evict too many transactions[^\n]*MAX_REPLACEMENT_CANDIDATES/);
+      expect(src).toMatch(/too many potential replacements[^\n]*too many conflicting clusters[^\n]*MAX_REPLACEMENT_CANDIDATES/);
     });
 
-    test.skip("G25 (BUG-4): Rule 5 BIP-125 cluster-count semantics — Core counts unique CLUSTERS of direct conflicts via GetUniqueClusterCount; hotbuns counts |direct_conflicts ∪ descendants|. Stricter than Core in non-pathological cases; flagged as PARTIAL. No `-mempoolfullrbf` knob exposed either. Both items deferred.", () => {
-      // Intentional skip: the hotbuns behavior is a stricter Core-subset and
-      // building a >100 entry eviction set is expensive in unit-test form.
-      // Structural divergence noted in audit findings.
+    test("G25 (BUG-4): Rule 5 counts unique CLUSTERS of the direct conflicts (GetUniqueClusterCount)", () => {
+      // Behaviour (100 clusters / 200 evictions accepted, 101 clusters
+      // refused) is pinned in package_rbf_clusters_truc_diagram.test.ts.
+      const src = require("node:fs").readFileSync(
+        require("node:path").join(__dirname, "..", "mempool", "mempool.ts"),
+        "utf8",
+      ) as string;
+      expect(src).toMatch(/const conflictClusters = this\.uniqueClusterCount\(conflicts\)/);
     });
   });
 
