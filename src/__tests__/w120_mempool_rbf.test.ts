@@ -15,23 +15,20 @@
  *           src/mempool/mempool.ts ~1863-1870 (PaysForRBF absolute).
  *   Rule 4 — additional fees cover replacement's own bandwidth at relay fee.
  *           src/mempool/mempool.ts ~1873-1883 (PaysForRBF incremental).
- *   Rule 5 — replacement evicts <= MAX_REPLACEMENT_CANDIDATES (100).
- *           src/mempool/mempool.ts ~1508-1514 (Rule #5 candidate count).
- *           NOTE: Core counts unique CLUSTERS of direct conflicts
- *                 (`GetUniqueClusterCount(iters_conflicting)`); hotbuns counts
- *                 the union of direct conflicts + all their descendants. This
- *                 is a stricter, divergent gate.
+ *   Rule 5 — replacement conflicts directly with <= MAX_REPLACEMENT_CANDIDATES
+ *           (100) distinct CLUSTERS (Core `GetUniqueClusterCount(iters_conflicting)`,
+ *           policy/rbf.cpp GetEntriesForConflicts). The descendants of those
+ *           conflicts are evicted with them but are not counted or capped
+ *           again: five clusters of 21 txs (105 evictions) is five, and passes.
+ *           src/mempool/mempool.ts (`conflictingClusterCount`).
  *
  * Findings (8):
  *
- *   BUG-1  PARTIAL  Rule 5 counts conflicts+descendants vs Core's
- *                   `GetUniqueClusterCount(iters_conflicting)` of direct
- *                   conflicts only. Hotbuns rejects valid replacements that
- *                   evict <=100 direct clusters but >100 total entries when
- *                   descendants are included. Stricter than Core; not a
- *                   relay-incompat (Core accepts more, hotbuns accepts a
- *                   subset), but does drift from BIP-125 / Core wording.
- *                   mempool.ts:1499-1514.
+ *   BUG-1  FIXED    Rule 5 used to count conflicts+descendants and refuse a
+ *                   replacement that evicted >100 txs from <=100 clusters.
+ *                   It now counts Core's `GetUniqueClusterCount(iters_conflicting)`
+ *                   of the direct conflicts, with Core's reject-reason
+ *                   "too many potential replacements" (G22/G24/G25).
  *
  *   BUG-2  PARTIAL  Rule 4 incremental-fee rounding uses
  *                   `BigInt(Math.ceil(incrementalRelayFee * vsize))` instead
@@ -582,10 +579,11 @@ describe("W120 — mempool strict RBF rules 1-5 (BIP-125)", () => {
         require("node:path").join(__dirname, "..", "mempool", "mempool.ts"),
         "utf8",
       ) as string;
-      // Core GetEntriesForConflicts caps the CLUSTER count of the direct
-      // conflicts (policy/rbf.cpp), not the evicted-tx count.
-      expect(src).toMatch(/conflictClusters\s*>\s*MAX_REPLACEMENT_CANDIDATES/);
-      expect(src).not.toMatch(/conflictClusters\s*>=\s*MAX_REPLACEMENT_CANDIDATES/);
+      // Core v31 GetEntriesForConflicts: `num_clusters > MAX_REPLACEMENT_CANDIDATES`
+      // over the CLUSTERS of the direct conflicts (policy/rbf.cpp), not the
+      // evicted-tx count.
+      expect(src).toMatch(/conflictingClusterCount\s*>\s*MAX_REPLACEMENT_CANDIDATES/);
+      expect(src).not.toMatch(/conflictingClusterCount\s*>=\s*MAX_REPLACEMENT_CANDIDATES/);
       expect(src).not.toMatch(/allConflictTxids\.size\s*>=?\s*MAX_REPLACEMENT_CANDIDATES/);
     });
 
@@ -599,23 +597,26 @@ describe("W120 — mempool strict RBF rules 1-5 (BIP-125)", () => {
       expect(src).toMatch(/this\.getDescendantSet\(conflict\.txid\.toString\("hex"\)\)/);
     });
 
-    test("G24: error message references BIP-125 Rule 5 / MAX_REPLACEMENT_CANDIDATES", () => {
+    test("G24: error message is Core's GetEntriesForConflicts text with MAX_REPLACEMENT_CANDIDATES", () => {
       const src = require("node:fs").readFileSync(
         require("node:path").join(__dirname, "..", "mempool", "mempool.ts"),
         "utf8",
       ) as string;
-      // The exact error string includes the descriptive prefix and constant name.
-      expect(src).toMatch(/too many potential replacements[^\n]*too many conflicting clusters[^\n]*MAX_REPLACEMENT_CANDIDATES/);
+      // reject-reason "too many potential replacements", debug message
+      // "rejecting replacement <txid>; too many conflicting clusters (N > 100)".
+      expect(src).toMatch(/"too many potential replacements"/);
+      expect(src).toMatch(/too many conflicting clusters[^\n]*MAX_REPLACEMENT_CANDIDATES/);
     });
 
     test("G25 (BUG-4): Rule 5 counts unique CLUSTERS of the direct conflicts (GetUniqueClusterCount)", () => {
-      // Behaviour (100 clusters / 200 evictions accepted, 101 clusters
-      // refused) is pinned in package_rbf_clusters_truc_diagram.test.ts.
+      // Behaviour is pinned in cluster_rbf.test.ts (five clusters of 21
+      // accepted, 100 accepted, 101 refused) and, for packages, in
+      // package_rbf_clusters_truc_diagram.test.ts.
       const src = require("node:fs").readFileSync(
         require("node:path").join(__dirname, "..", "mempool", "mempool.ts"),
         "utf8",
       ) as string;
-      expect(src).toMatch(/const conflictClusters = this\.uniqueClusterCount\(conflicts\)/);
+      expect(src).toMatch(/conflictingClusterCount = this\.uniqueClusterCount\(conflicts\)/);
     });
   });
 

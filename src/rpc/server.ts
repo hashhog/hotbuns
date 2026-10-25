@@ -6,6 +6,7 @@
  */
 
 import * as path from "path";
+import { mempoolInfoToJSON } from "../mempool/info.js";
 import { FATAL_ERROR_TOKEN, fatalRefusal, isFatal } from "../chain/fatal.js";
 import * as fs from "fs";
 import { setMockTime } from "../clock.js";
@@ -6010,40 +6011,7 @@ export class RPCServer {
    * getmempoolinfo: Returns mempool statistics.
    */
   private async getMempoolInfo(): Promise<Record<string, unknown>> {
-    const info = this.mempool.getInfo();
-
-    // Calculate total fees
-    let totalFee = 0;
-    for (const txid of this.mempool.getAllTxids()) {
-      const entry = this.mempool.getTransaction(txid);
-      if (entry) totalFee += Number(entry.fee);
-    }
-
-    return {
-      loaded: true,
-      size: info.size,
-      bytes: info.bytes,
-      usage: info.usage, // Estimated real heap retention (Core: DynamicMemoryUsage)
-      total_fee: totalFee / 100_000_000, // BTC
-      maxmempool: info.maxmempool,
-      mempoolminfee: info.minFeeRate / 100_000, // Convert sat/vB to BTC/kvB
-      minrelaytxfee: 0.000001, // 0.1 sat/vB = Core's minrelaytxfee default (0.00000100 BTC/kvB)
-      incrementalrelayfee: 0.000001, // 0.1 sat/vB = Core's DEFAULT_INCREMENTAL_RELAY_FEE{100} (0.00000100 BTC/kvB)
-      unbroadcastcount: this.mempool.getUnbroadcastTxs().size,
-      fullrbf: true,
-      // Core v31.99 MempoolInfoToJSON appends these 5 fields after fullrbf
-      // (rpc/mempool.cpp). Values are the policy defaults (policy.h):
-      //   permit_bare_multisig (DEFAULT_PERMIT_BAREMULTISIG=true),
-      //   max_datacarrier_bytes (MAX_OP_RETURN_RELAY=100000),
-      //   limits.cluster_count (DEFAULT_CLUSTER_LIMIT=64),
-      //   limits.cluster_size_vbytes (DEFAULT_CLUSTER_SIZE_LIMIT_KVB*1000=101000),
-      //   optimal (txgraph quick optimality check — true for an empty/clean pool).
-      permitbaremultisig: true,
-      maxdatacarriersize: 100_000,
-      limitclustercount: 64,
-      limitclustersize: 101_000,
-      optimal: true,
-    };
+    return mempoolInfoToJSON(this.mempool);
   }
 
   /**
@@ -6070,28 +6038,30 @@ export class RPCServer {
       const txidHex = Buffer.from(txid).reverse().toString("hex");
       // Modified fee = base fee + prioritisetransaction delta (Core GetModifiedFee).
       const modifiedFeeSats = this.mempool.getModifiedFee(txid);
+      // Core CalculateAncestorData / CalculateDescendantData (transitive, modified fees).
+      const rel = this.mempool.getEntryRelatives(txid)!;
       const chunk = this.mempool.getMainChunkFeerate(txid);
       result[txidHex] = {
         vsize: entry.vsize,
         weight: entry.weight,
         time: entry.addedTime,
         height: entry.height,
-        descendantcount: entry.spentBy.size + 1,
-        descendantsize: entry.vsize, // Simplified
-        ancestorcount: entry.dependsOn.size + 1,
-        ancestorsize: entry.vsize, // Simplified
+        descendantcount: rel.descendantCount,
+        descendantsize: rel.descendantSize,
+        ancestorcount: rel.ancestorCount,
+        ancestorsize: rel.ancestorSize,
         chunkweight: chunk.size,
         wtxid: txidHex, // Simplified (same as txid for non-witness txs)
         // Core entryToJSON (mempool.cpp:527-533): fees is nested; no top-level fee/modifiedfee.
         fees: {
           base: Number(entry.fee) / 100_000_000,
           modified: Number(modifiedFeeSats) / 100_000_000,
-          ancestor: Number(modifiedFeeSats) / 100_000_000,
-          descendant: Number(modifiedFeeSats) / 100_000_000,
+          ancestor: Number(rel.ancestorFees) / 100_000_000,
+          descendant: Number(rel.descendantFees) / 100_000_000,
           chunk: Number(chunk.fee) / 100_000_000,
         },
-        depends: Array.from(entry.dependsOn),
-        spentby: Array.from(entry.spentBy),
+        depends: rel.depends,
+        spentby: rel.spentby,
         "bip125-replaceable": this.mempool.getRBFOptInState(txid) === RBFTransactionState.REPLACEABLE_BIP125,
         unbroadcast: this.mempool.isUnbroadcast(txid),
       };
@@ -6125,6 +6095,8 @@ export class RPCServer {
 
     // Modified fee = base fee + prioritisetransaction delta (Core GetModifiedFee).
     const modifiedFeeSats = this.mempool.getModifiedFee(txid);
+    // Core CalculateAncestorData / CalculateDescendantData (transitive, modified fees).
+    const rel = this.mempool.getEntryRelatives(txid)!;
     const chunk = this.mempool.getMainChunkFeerate(txid);
 
     return {
@@ -6132,23 +6104,25 @@ export class RPCServer {
       weight: entry.weight,
       time: entry.addedTime,
       height: entry.height,
-      descendantcount: entry.spentBy.size + 1,
-      descendantsize: entry.vsize,
-      ancestorcount: entry.dependsOn.size + 1,
-      ancestorsize: entry.vsize,
+      descendantcount: rel.descendantCount,
+      descendantsize: rel.descendantSize,
+      ancestorcount: rel.ancestorCount,
+      ancestorsize: rel.ancestorSize,
       chunkweight: chunk.size,
       wtxid: txidParam,
       // Core entryToJSON (mempool.cpp:527-533): fees is nested; no top-level fee/modifiedfee.
       fees: {
         base: Number(entry.fee) / 100_000_000,
         modified: Number(modifiedFeeSats) / 100_000_000,
-        ancestor: Number(modifiedFeeSats) / 100_000_000,
-        descendant: Number(modifiedFeeSats) / 100_000_000,
+        ancestor: Number(rel.ancestorFees) / 100_000_000,
+        descendant: Number(rel.descendantFees) / 100_000_000,
         chunk: Number(chunk.fee) / 100_000_000,
       },
-      depends: Array.from(entry.dependsOn),
-      spentby: Array.from(entry.spentBy),
-      "bip125-replaceable": this.mempool.isReplaceable(txid),
+      depends: rel.depends,
+      spentby: rel.spentby,
+      // Core IsRBFOptIn: the BIP-125 signal of the tx or an ancestor, not
+      // full-RBF replaceability.
+      "bip125-replaceable": this.mempool.getRBFOptInState(txid) === RBFTransactionState.REPLACEABLE_BIP125,
       unbroadcast: this.mempool.isUnbroadcast(txid),
       // Cluster mempool fields
       miningScore: miningScore, // Effective fee rate (sat/vB) from chunk
@@ -6389,6 +6363,15 @@ export class RPCServer {
           "effective-includes": [wtxidHex],
         };
         results.push(entry);
+        continue;
+      }
+      if (result.rejectReason !== undefined) {
+        // Refusals that carry Core's reason and debug message separately
+        // (RBF ReplacementChecks): reject-details is TxValidationState::ToString().
+        reject(
+          result.rejectReason,
+          result.rejectDetails ? `${result.rejectReason}, ${result.rejectDetails}` : result.rejectReason,
+        );
         continue;
       }
       const err = result.error || "rejected";
@@ -6731,24 +6714,25 @@ export class RPCServer {
       const ancestorTxid = Buffer.from(ancestorHex, "hex");
       const ancestorEntry = this.mempool.getTransaction(ancestorTxid);
       if (ancestorEntry) {
+        const rel = this.mempool.getEntryRelatives(ancestorTxid)!;
         result[ancestorHex] = {
           vsize: ancestorEntry.vsize,
           weight: ancestorEntry.weight,
           time: ancestorEntry.addedTime,
           height: ancestorEntry.height,
-          descendantcount: ancestorEntry.spentBy.size + 1,
-          descendantsize: ancestorEntry.vsize,
-          ancestorcount: ancestorEntry.dependsOn.size + 1,
-          ancestorsize: ancestorEntry.vsize,
+          descendantcount: rel.descendantCount,
+          descendantsize: rel.descendantSize,
+          ancestorcount: rel.ancestorCount,
+          ancestorsize: rel.ancestorSize,
           // Core entryToJSON: fees is nested; no top-level fee/modifiedfee.
           fees: {
             base: Number(ancestorEntry.fee) / 100_000_000,
             modified: Number(this.mempool.getModifiedFee(ancestorTxid)) / 100_000_000,
-            ancestor: Number(ancestorEntry.fee) / 100_000_000,
-            descendant: Number(ancestorEntry.fee) / 100_000_000,
+            ancestor: Number(rel.ancestorFees) / 100_000_000,
+            descendant: Number(rel.descendantFees) / 100_000_000,
           },
-          depends: Array.from(ancestorEntry.dependsOn),
-          spentby: Array.from(ancestorEntry.spentBy),
+          depends: rel.depends,
+          spentby: rel.spentby,
           "bip125-replaceable": this.mempool.getRBFOptInState(ancestorTxid) === RBFTransactionState.REPLACEABLE_BIP125,
           unbroadcast: this.mempool.isUnbroadcast(ancestorTxid),
         };
@@ -6814,24 +6798,25 @@ export class RPCServer {
       const descendantTxid = Buffer.from(descendantHex, "hex");
       const descendantEntry = this.mempool.getTransaction(descendantTxid);
       if (descendantEntry) {
+        const rel = this.mempool.getEntryRelatives(descendantTxid)!;
         result[descendantHex] = {
           vsize: descendantEntry.vsize,
           weight: descendantEntry.weight,
           time: descendantEntry.addedTime,
           height: descendantEntry.height,
-          descendantcount: descendantEntry.spentBy.size + 1,
-          descendantsize: descendantEntry.vsize,
-          ancestorcount: descendantEntry.dependsOn.size + 1,
-          ancestorsize: descendantEntry.vsize,
+          descendantcount: rel.descendantCount,
+          descendantsize: rel.descendantSize,
+          ancestorcount: rel.ancestorCount,
+          ancestorsize: rel.ancestorSize,
           // Core entryToJSON: fees is nested; no top-level fee/modifiedfee.
           fees: {
             base: Number(descendantEntry.fee) / 100_000_000,
             modified: Number(this.mempool.getModifiedFee(descendantTxid)) / 100_000_000,
-            ancestor: Number(descendantEntry.fee) / 100_000_000,
-            descendant: Number(descendantEntry.fee) / 100_000_000,
+            ancestor: Number(rel.ancestorFees) / 100_000_000,
+            descendant: Number(rel.descendantFees) / 100_000_000,
           },
-          depends: Array.from(descendantEntry.dependsOn),
-          spentby: Array.from(descendantEntry.spentBy),
+          depends: rel.depends,
+          spentby: rel.spentby,
           "bip125-replaceable": this.mempool.getRBFOptInState(descendantTxid) === RBFTransactionState.REPLACEABLE_BIP125,
           unbroadcast: this.mempool.isUnbroadcast(descendantTxid),
         };
@@ -9621,7 +9606,7 @@ export class RPCServer {
       bip22Txs.push({
         data: txData.toString("hex"),
         txid: txidHex,
-        hash: getWTxId(entry.tx).toString("hex"),
+        hash: Buffer.from(getWTxId(entry.tx)).reverse().toString("hex"),
         depends,
         fee: Number(entry.fee),
         sigops: entry.sigOpCost ?? 0,

@@ -29,6 +29,7 @@
 import type { ChainStateManager } from "../chain/state.js";
 import type { ChainDB, UTXOEntry } from "../storage/database.js";
 import type { Mempool } from "../mempool/mempool.js";
+import { mempoolInfoToJSON } from "../mempool/info.js";
 import type { HeaderSync } from "../sync/headers.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import type { Block, BlockHeader } from "../validation/block.js";
@@ -817,16 +818,7 @@ export class RESTServer {
     }
 
     if (path === "info") {
-      const info = this.mempool.getInfo();
-      const json = {
-        loaded: true,
-        size: info.size,
-        bytes: info.bytes,
-        usage: info.usage, // Estimated real heap retention (Core: DynamicMemoryUsage)
-        maxmempool: info.maxmempool,
-        mempoolminfee: info.minFeeRate / 100000, // Convert to BTC/kvB
-        minrelaytxfee: 0.000001, // 0.1 sat/vB = Core's minrelaytxfee default (0.00000100 BTC/kvB)
-      };
+      const json = mempoolInfoToJSON(this.mempool);
       return this.formatResponse(json, format);
     }
 
@@ -837,6 +829,8 @@ export class RESTServer {
       for (const txid of txids) {
         const entry = this.mempool.getTransaction(txid);
         if (entry) {
+          // Core CalculateAncestorData / CalculateDescendantData (transitive, modified fees).
+          const rel = this.mempool.getEntryRelatives(txid)!;
           entries.set(Buffer.from(txid).reverse().toString("hex"), {
             vsize: entry.vsize,
             weight: entry.weight,
@@ -844,19 +838,19 @@ export class RESTServer {
             modifiedfee: Number(entry.fee) / 100000000,
             time: entry.addedTime,
             height: entry.height,
-            descendantcount: entry.descendantCount,
-            descendantsize: entry.descendantSize,
-            ancestorcount: entry.ancestorCount,
-            ancestorsize: entry.ancestorSize,
+            descendantcount: rel.descendantCount,
+            descendantsize: rel.descendantSize,
+            ancestorcount: rel.ancestorCount,
+            ancestorsize: rel.ancestorSize,
             wtxid: Buffer.from(getWTxId(entry.tx)).reverse().toString("hex"),
             fees: {
               base: Number(entry.fee) / 100000000,
-              modified: Number(entry.fee) / 100000000,
-              ancestor: Number(entry.fee) / 100000000,
-              descendant: Number(entry.fee) / 100000000,
+              modified: Number(this.mempool.getModifiedFee(txid)) / 100000000,
+              ancestor: Number(rel.ancestorFees) / 100000000,
+              descendant: Number(rel.descendantFees) / 100000000,
             },
-            depends: Array.from(entry.dependsOn),
-            spentby: Array.from(entry.spentBy),
+            depends: rel.depends,
+            spentby: rel.spentby,
           });
         }
       }

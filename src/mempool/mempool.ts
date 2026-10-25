@@ -714,6 +714,29 @@ const DEFAULT_INCREMENTAL_RELAY_FEE = 0.1; // 100 sat/kvB
 // MAX_REPLACEMENT_CANDIDATES (100) is imported from ./rbf.js.
 
 /**
+ * A replacement refusal in Core's TxValidationState shape: `rejectReason` is
+ * the reject-reason testmempoolaccept reports, `rejectDetails` the debug
+ * message, and `error` is TxValidationState::ToString() ("reason, details"),
+ * the text sendrawtransaction returns with -26.
+ */
+function rbfReject(
+  rejectReason: string,
+  rejectDetails: string,
+): { accepted: false; error: string; rejectReason: string; rejectDetails: string } {
+  return {
+    accepted: false,
+    error: `${rejectReason}, ${rejectDetails}`,
+    rejectReason,
+    rejectDetails,
+  };
+}
+
+/** Txid in display (RPC) byte order, as Core's uint256::ToString prints it. */
+function displayTxidHex(txid: Buffer): string {
+  return Buffer.from(txid).reverse().toString("hex");
+}
+
+/**
  * Package validation result types.
  */
 export enum PackageValidationResult {
@@ -817,6 +840,29 @@ export interface MempoolEntry {
    * Reference: Bitcoin Core GetTransactionSigOpCost()
    */
   sigOpCost: number;
+}
+
+/**
+ * Ancestor/descendant accounting of a mempool entry as Core's entryToJSON
+ * reports it (see Mempool.getEntryRelatives).
+ */
+export interface MempoolEntryRelatives {
+  /** Ancestors including self. */
+  ancestorCount: number;
+  /** Total vsize of ancestors including self. */
+  ancestorSize: number;
+  /** Total modified fee of ancestors including self, in satoshis. */
+  ancestorFees: bigint;
+  /** Descendants including self. */
+  descendantCount: number;
+  /** Total vsize of descendants including self. */
+  descendantSize: number;
+  /** Total modified fee of descendants including self, in satoshis. */
+  descendantFees: bigint;
+  /** In-mempool parent txids, display hex, sorted. */
+  depends: string[];
+  /** Child txids, display hex, in internal-byte order. */
+  spentby: string[];
 }
 
 /**
@@ -1359,6 +1405,10 @@ export interface PackageAcceptContext {
 export interface AcceptResult {
   accepted: boolean;
   error?: string;
+  /** Core reject-reason, when the refusal carries one separate from `error`. */
+  rejectReason?: string;
+  /** Core reject debug message paired with `rejectReason`. */
+  rejectDetails?: string;
   fee?: bigint;
   vsize?: number;
   /** Sigop-adjusted weight (what the cluster limit counts). */
@@ -1843,6 +1893,9 @@ export class Mempool {
     let conflictsToEvict: MempoolEntry[] = [];
     let totalConflictingFee = 0n;
     let totalConflictingVsize = 0;
+    // Rule #5 input: distinct clusters among the DIRECT conflicts. Checked in
+    // the replacement block below, where Core's ReplacementChecks runs it.
+    let conflictingClusterCount = 0;
 
     if (conflicts.length > 0) {
       // Core PreChecks: a package that may not replace stops at the conflict.
@@ -1852,17 +1905,12 @@ export class Mempool {
       // Mark this as a potential RBF replacement - we'll validate the fees later
       isReplacement = true;
 
-      // Rule #5 (Core GetEntriesForConflicts, policy/rbf.cpp): at most
-      // MAX_REPLACEMENT_CANDIDATES distinct CLUSTERS among the direct
-      // conflicts. Their descendants are evicted with no second cap.
-      // TX_MEMPOOL_POLICY: a package cannot retry it.
-      const conflictClusters = this.uniqueClusterCount(conflicts);
-      if (conflictClusters > MAX_REPLACEMENT_CANDIDATES) {
-        return {
-          accepted: false,
-          error: `too many potential replacements: rejecting replacement ${Buffer.from(txid).reverse().toString("hex")}; too many conflicting clusters (${conflictClusters} > ${MAX_REPLACEMENT_CANDIDATES})`,
-        };
-      }
+      // Core v31 GetEntriesForConflicts (policy/rbf.cpp) bounds a replacement
+      // by the number of distinct clusters it conflicts with directly
+      // (GetUniqueClusterCount), not by how many transactions it evicts. A
+      // cluster holds at most MAX_CLUSTER_COUNT txs, so the eviction set
+      // gathered below stays bounded and is not capped a second time.
+      conflictingClusterCount = this.uniqueClusterCount(conflicts);
 
       // Gather all conflicts and their descendants
       const allConflictTxids = new Set<string>();
@@ -2310,6 +2358,17 @@ export class Mempool {
         return { accepted: false, error: disjointErr };
       }
 
+      // Rule #5 (bitcoin-core/src/policy/rbf.cpp:GetEntriesForConflicts, run
+      // first in validation.cpp MemPoolAccept::ReplacementChecks): more than
+      // MAX_REPLACEMENT_CANDIDATES distinct conflicting clusters is refused.
+      // Five clusters of 21 txs (105 evictions) is five, and is allowed.
+      if (conflictingClusterCount > MAX_REPLACEMENT_CANDIDATES) {
+        return rbfReject(
+          "too many potential replacements",
+          `rejecting replacement ${displayTxidHex(txid)}; too many conflicting clusters (${conflictingClusterCount} > ${MAX_REPLACEMENT_CANDIDATES})`,
+        );
+      }
+
       // Rule #3: Replacement fees must be >= original fees.
       // (bitcoin-core/src/policy/rbf.cpp:PaysForRBF, line 109: `replacement_fees < original_fees`)
       // Core accepts equal fees here; Rule #4 rejects zero-increment cases.
@@ -2347,7 +2406,18 @@ export class Mempool {
       // "Before" = linearize(affected cluster); "After" = same cluster minus
       // conflicts plus replacement.  After must dominate Before at every
       // cumulative-vsize boundary (CompareChunks(after, before) > 0).
+      //
+      // Core stages the removals and runs CheckMemPoolPolicyLimits BEFORE the
+      // diagram (validation.cpp ReplacementChecks), so a replacement that both
+      // breaks the cluster limit and worsens the diagram is "too-large-cluster",
+      // and a diagram failure always means the fee was insufficient:
+      // "replacement-failed" with the diagram text as the debug message.
       {
+        const stagedRemovals = new Set<string>(conflictsToEvict.map((e) => e.txid.toString("hex")));
+        const stagedCluster = this.checkClusterSizeLimit(parentTxids, adjWeight, stagedRemovals);
+        if (!stagedCluster.valid) {
+          return { accepted: false, error: stagedCluster.error };
+        }
         const diagramErr = this.improvesFeerateDiagram(
           txid.toString("hex"),
           fee,
@@ -2356,7 +2426,7 @@ export class Mempool {
           conflictsToEvict,
         );
         if (diagramErr !== null) {
-          return { accepted: false, error: diagramErr };
+          return rbfReject("replacement-failed", diagramErr);
         }
       }
     }
@@ -2708,11 +2778,21 @@ export class Mempool {
     // (Core MempoolAcceptResult m_base_fees / m_vsize), so testmempoolaccept
     // answers the real numbers instead of a placeholder 0.
     if (options?.testAccept) {
-      return { accepted: true, fee, vsize, adjWeight, mempoolParents: parentTxids, conflicts: conflictsToEvict };
+      return {
+        accepted: true,
+        fee,
+        vsize,
+        adjWeight,
+        mempoolParents: parentTxids,
+        conflicts: conflictsToEvict,
+        directConflicts: conflicts,
+      };
     }
 
-    // If this is an RBF replacement, remove all conflicting transactions first
-    if (isReplacement) {
+    // If this is an RBF replacement, remove all conflicting transactions first.
+    // Not on the test_accept path: testmempoolaccept of a replacement must
+    // leave the conflicts in the pool (Core never stages removals there).
+    if (isReplacement && !options?.testAccept) {
       for (const conflictEntry of conflictsToEvict) {
         // Remove without removing dependents since we're removing all of them
         this.removeTransactionInternal(conflictEntry.txid);
@@ -3221,6 +3301,61 @@ export class Mempool {
   getTransaction(txid: Buffer): MempoolEntry | null {
     const txidHex = txid.toString("hex");
     return this.entries.get(txidHex) ?? null;
+  }
+
+  /**
+   * Ancestor/descendant accounting and parent/child lists for one entry, as
+   * Core's entryToJSON reports them (rpc/mempool.cpp).
+   *
+   * Computed from the live graph rather than the cached ancestor/descendant
+   * fields, as Core does (CTxMemPool::CalculateAncestorData /
+   * CalculateDescendantData walk the txgraph): counts, sizes and fees cover
+   * the full transitive set including the entry itself, and fees are
+   * MODIFIED fees (prioritisetransaction deltas included).
+   *
+   * depends: in-mempool parents' txids, display hex, sorted as strings
+   *   (Core collects them in a std::set<std::string>).
+   * spentby: children's txids, display hex, sorted by the txid's internal
+   *   byte order (Core GetChildren sorts by CompareIteratorByHash).
+   */
+  getEntryRelatives(txid: Buffer): MempoolEntryRelatives | null {
+    const txidHex = txid.toString("hex");
+    const entry = this.entries.get(txidHex);
+    if (!entry) return null;
+
+    const sum = (set: Set<string>): { count: number; size: number; fees: bigint } => {
+      let size = entry.vsize;
+      let fees = this.getModifiedFee(entry.txid);
+      let count = 1;
+      for (const hex of set) {
+        const e = this.entries.get(hex);
+        if (!e) continue;
+        count++;
+        size += e.vsize;
+        fees += this.getModifiedFee(e.txid);
+      }
+      return { count, size, fees };
+    };
+
+    const inPool = (set: Set<string>): string[] =>
+      Array.from(set).filter((hex) => this.entries.has(hex));
+    const toDisplay = (hex: string): string =>
+      Buffer.from(hex, "hex").reverse().toString("hex");
+
+    const ancestors = sum(this.getAncestorSet(entry.dependsOn));
+    const descendants = sum(this.getDescendantSet(txidHex));
+
+    return {
+      ancestorCount: ancestors.count,
+      ancestorSize: ancestors.size,
+      ancestorFees: ancestors.fees,
+      descendantCount: descendants.count,
+      descendantSize: descendants.size,
+      descendantFees: descendants.fees,
+      depends: inPool(entry.dependsOn).map(toDisplay).sort(),
+      // Internal hex compares like the internal bytes (memcmp order).
+      spentby: inPool(entry.spentBy).sort().map(toDisplay),
+    };
   }
 
   /**
@@ -5609,6 +5744,8 @@ export function isPackageRetryable(error: string | undefined): boolean {
     error.startsWith("mempool min fee not met") ||
     error.startsWith("insufficient fee") ||
     error.startsWith("RBF incremental fee") ||
+    // ReplacementChecks' diagram failure: TX_RECONSIDERABLE (validation.cpp).
+    error.startsWith("replacement-failed") ||
     error.startsWith("bad-txns-inputs-missingorspent")
   );
 }

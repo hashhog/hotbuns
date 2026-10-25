@@ -199,8 +199,13 @@ describe("package RBF / TRUC / diagram follow Core (hotbuns#28 review)", () => {
       const r = spend(coins, 1_000_000n);
       const res = await mempool.addTransaction(r);
       expect(res.accepted).toBe(false);
+      // Core TxValidationState: reason and debug message, joined by ", ".
+      expect(res.rejectReason).toBe("too many potential replacements");
+      expect(res.rejectDetails).toBe(
+        `rejecting replacement ${txidOf(r)}; too many conflicting clusters (101 > 100)`,
+      );
       expect(res.error).toBe(
-        `too many potential replacements: rejecting replacement ${txidOf(r)}; too many conflicting clusters (101 > 100)`,
+        `too many potential replacements, rejecting replacement ${txidOf(r)}; too many conflicting clusters (101 > 100)`,
       );
       expect(txs.every(inPool)).toBe(true);
       expect(inPool(r)).toBe(false);
@@ -259,7 +264,9 @@ describe("package RBF / TRUC / diagram follow Core (hotbuns#28 review)", () => {
       const { p } = await setup(100_000n);
       const res = await mempool.addTransaction(p, { testAccept: true });
       expect(res.accepted).toBe(false);
-      expect(res.error).toBe("insufficient feerate: does not improve feerate diagram");
+      // Core ReplacementChecks: TX_RECONSIDERABLE "replacement-failed".
+      expect(res.rejectReason).toBe("replacement-failed");
+      expect(res.error).toBe("replacement-failed, insufficient feerate: does not improve feerate diagram");
     });
 
     it("the package whose chunk improves the diagram is accepted", async () => {
@@ -370,7 +377,9 @@ describe("package RBF / TRUC / diagram follow Core (hotbuns#28 review)", () => {
       const heavy = wshSpend(coin, feeR, pad + 40);
       const res = await mempool.addTransaction(heavy);
       expect(res.accepted).toBe(false);
-      expect(res.error).toBe("insufficient feerate: does not improve feerate diagram");
+      // Core ReplacementChecks: TX_RECONSIDERABLE "replacement-failed".
+      expect(res.rejectReason).toBe("replacement-failed");
+      expect(res.error).toBe("replacement-failed, insufficient feerate: does not improve feerate diagram");
       expect(inPool(o)).toBe(true);
     });
   });

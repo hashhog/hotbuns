@@ -127,6 +127,45 @@ class MockMempool {
     return entry ? entry.fee : 0n;
   }
 
+  // Mirrors the real Mempool.getEntryRelatives (Core entryToJSON accounting):
+  // transitive ancestor/descendant totals including self, depends sorted by
+  // display hex, spentby by internal bytes. Required by every entry-JSON path.
+  getEntryRelatives(txid: Buffer) {
+    const self = this.entries.get(txid.toString("hex"));
+    if (!self) return null;
+    const walk = (start: Set<string>, next: (e: { spentBy: Set<string>; dependsOn: Set<string> }) => Set<string>) => {
+      const seen = new Set<string>();
+      const queue = Array.from(start);
+      while (queue.length > 0) {
+        const hex = queue.shift()!;
+        const e = this.entries.get(hex);
+        if (seen.has(hex) || !e) continue;
+        seen.add(hex);
+        queue.push(...next(e));
+      }
+      return Array.from(seen).map((hex) => this.entries.get(hex)!);
+    };
+    const total = (set: Array<{ vsize: number; fee: bigint }>) => ({
+      count: set.length + 1,
+      size: set.reduce((n, e) => n + e.vsize, self.vsize),
+      fees: set.reduce((n, e) => n + e.fee, self.fee),
+    });
+    const anc = total(walk(self.dependsOn, (e) => e.dependsOn));
+    const desc = total(walk(self.spentBy, (e) => e.spentBy));
+    const toDisplay = (hex: string) => Buffer.from(hex, "hex").reverse().toString("hex");
+    const inPool = (set: Set<string>) => Array.from(set).filter((hex) => this.entries.has(hex));
+    return {
+      ancestorCount: anc.count,
+      ancestorSize: anc.size,
+      ancestorFees: anc.fees,
+      descendantCount: desc.count,
+      descendantSize: desc.size,
+      descendantFees: desc.fees,
+      depends: inPool(self.dependsOn).map(toDisplay).sort(),
+      spentby: inPool(self.spentBy).sort().map(toDisplay),
+    };
+  }
+
   // Mirrors the real Mempool.getMainChunkFeerate. The mock has no cluster
   // linearization, so every tx is its own chunk (weight = 4 * vsize).
   getMainChunkFeerate(txid: Buffer): { fee: bigint; size: number } {
@@ -1760,13 +1799,13 @@ describe("RPCServer", () => {
       expect(dwc.length).toBe(76);
       expect(dwc.startsWith("6a24aa21a9ed")).toBe(true);
 
-      // The `hash` field in each template tx is the wtxid (getWTxId result, hex).
-      // For legacy txs it equals the txid in internal byte order.
+      // The `hash` field in each template tx is the wtxid in display order (Core: GetWitnessHash().GetHex()).
+      // Reverse it back to internal order to compute the expected commitment.
       // Compute the expected commitment from the returned wtxids.
       const templateTxs: Array<{ hash: string }> = result.result.transactions as any;
       const wtxids = [
         Buffer.alloc(32, 0), // coinbase zero
-        ...templateTxs.map(tx => Buffer.from(tx.hash, "hex")),
+        ...templateTxs.map(tx => Buffer.from(tx.hash, "hex").reverse()),
       ];
       const witnessRoot = computeWitnessMerkleRoot(wtxids);
       const commitment = hash256(Buffer.concat([witnessRoot, Buffer.alloc(32, 0)]));
