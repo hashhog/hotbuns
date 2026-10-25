@@ -67,7 +67,8 @@ describe("SCRIPT_VERIFY_NULLFAIL - OP_CHECKSIG", () => {
     };
 
     const script = parseScript(Buffer.from([Opcode.OP_CHECKSIG]));
-    expect(executeScript(script, ctx)).toBe(false);
+    // SCRIPT_ERR_SIG_NULLFAIL, like Core's serror (was a bare false).
+    expect(() => executeScript(script, ctx)).toThrow("SCRIPT_ERR_SIG_NULLFAIL");
   });
 
   test("NULLFAIL: empty signature is allowed (returns false on stack)", () => {
@@ -147,7 +148,8 @@ describe("SCRIPT_VERIFY_NULLFAIL - OP_CHECKSIGVERIFY", () => {
     };
 
     const script = parseScript(Buffer.from([Opcode.OP_CHECKSIGVERIFY]));
-    expect(executeScript(script, ctx)).toBe(false);
+    // SCRIPT_ERR_SIG_NULLFAIL, like Core's serror (was a bare false).
+    expect(() => executeScript(script, ctx)).toThrow("SCRIPT_ERR_SIG_NULLFAIL");
   });
 
   test("NULLFAIL: valid signature succeeds", () => {
@@ -202,7 +204,8 @@ describe("SCRIPT_VERIFY_NULLFAIL - OP_CHECKMULTISIG", () => {
     };
 
     const script = parseScript(Buffer.from([Opcode.OP_CHECKMULTISIG]));
-    expect(executeScript(script, ctx)).toBe(false);
+    // SCRIPT_ERR_SIG_NULLFAIL, like Core's serror (was a bare false).
+    expect(() => executeScript(script, ctx)).toThrow("SCRIPT_ERR_SIG_NULLFAIL");
   });
 
   test("NULLFAIL: all empty signatures allowed when operation fails", () => {
@@ -314,7 +317,8 @@ describe("SCRIPT_VERIFY_NULLFAIL - OP_CHECKMULTISIG", () => {
     };
 
     const script = parseScript(Buffer.from([Opcode.OP_CHECKMULTISIG]));
-    expect(executeScript(script, ctx)).toBe(false);
+    // SCRIPT_ERR_SIG_NULLFAIL, like Core's serror (was a bare false).
+    expect(() => executeScript(script, ctx)).toThrow("SCRIPT_ERR_SIG_NULLFAIL");
   });
 });
 

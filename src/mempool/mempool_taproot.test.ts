@@ -240,7 +240,8 @@ describe("Mempool taproot admission (DIV-hotbuns-044)", () => {
     // unhandled-rejection flood of 2026-07-10).
     const result = await mempool.addTransaction(tx);
     expect(result.accepted).toBe(false);
-    expect(result.error).toContain("SCHNORR_SIG");
+    // Core's ScriptErrorString for SCRIPT_ERR_SCHNORR_SIG.
+    expect(result.error).toContain("Invalid Schnorr signature");
     expect(mempool.getSize()).toBe(0);
     expect(mempool.hasTransaction(getTxId(tx))).toBe(false);
   });

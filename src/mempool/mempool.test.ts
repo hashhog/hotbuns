@@ -285,7 +285,9 @@ describe("Mempool", () => {
       const result = await mempool.addTransaction(tx2);
 
       expect(result.accepted).toBe(false);
-      expect(result.error).toContain("RBF");
+      // Core ReplacementChecks / PaysForRBF wording (Rule 3).
+      expect(result.error).toContain("insufficient fee");
+      expect(result.error).toContain("less fees than conflicting txs");
     });
 
     test("accepts double-spend with higher fee (full RBF)", async () => {

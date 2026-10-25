@@ -165,7 +165,8 @@ describe("Core v31 cluster RBF (ReplacementChecks)", () => {
     const sweep = makeTx(coins.map((txid) => ({ txid, vout: 0 })), [coinValue * 5n - 100_000n]);
     const r = await mempool.addTransaction(sweep, { testAccept: true });
     expect(r.accepted).toBe(false);
-    expect(r.error).toContain("Rule 3");
+    // PaysForRBF's text (Rule 3): 0.001 BTC against all 105 evicted txs' 0.00105.
+    expect(r.error).toContain("less fees than conflicting txs; 0.001 < 0.00105");
     expect(mempool.getSize()).toBe(105);
   });
 

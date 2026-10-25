@@ -521,6 +521,34 @@ function isStrictHex(value: string): boolean {
   return value.length > 0 && value.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(value);
 }
 
+/** A hash in display (RPC) byte order. */
+function displayHex(hash: Buffer): string {
+  return Buffer.from(hash).reverse().toString("hex");
+}
+
+/** Internal-order hash hex (as the mempool keys it) to display order. */
+function internalHexToDisplay(hex: string): string {
+  return displayHex(Buffer.from(hex, "hex"));
+}
+
+/**
+ * Core TxValidationState::ToString() — "reason, debug", or the bare reason
+ * when there is no debug — from a mempool "reason: debug" error. Missing
+ * inputs carry no debug in Core.
+ */
+function coreStateString(error: string): string {
+  const sep = error.indexOf(": ");
+  if (sep < 0) return error;
+  const reason = error.slice(0, sep);
+  if (reason === "bad-txns-inputs-missingorspent") return reason;
+  return `${reason}, ${error.slice(sep + 2)}`;
+}
+
+/** CFeeRate(fee, vsize).GetFeePerK() (rounded down) as BTC/kvB. */
+function feePerKvB(fee: bigint, vsize: number): number {
+  return Number((fee * 1000n) / BigInt(vsize)) / 100_000_000;
+}
+
 
 /**
  * Core rpc/rawtransaction_util.cpp AddInputs:49-55 default nSequence:
@@ -5852,52 +5880,48 @@ export class RPCServer {
     // Submit package to mempool
     const result = await this.mempool.submitPackage(transactions);
 
-    // Build response
+    // Core rpc/mempool.cpp submitpackage: package_msg is "success" or the
+    // package state's text; tx-results is keyed by wtxid; every hash is in
+    // display byte order (the mempool hands back internal-order hex).
     const rpcResult: Record<string, unknown> = {
       package_msg: result.message,
     };
 
-    // Build tx-results object keyed by wtxid
     const txResults: Record<string, Record<string, unknown>> = {};
 
-    for (const [wtxid, txResult] of result.txResults) {
-      const innerResult: Record<string, unknown> = {
-        txid: txResult.txid,
-      };
-
-      if (txResult.error) {
-        innerResult.error = txResult.error;
+    for (const tx of transactions) {
+      const txidHex = displayHex(getTxId(tx));
+      const wtxidHex = displayHex(getWTxId(tx));
+      const txResult = result.txResults.get(getWTxId(tx).toString("hex"));
+      const innerResult: Record<string, unknown> = { txid: txidHex };
+      if (txResult === undefined) {
+        innerResult.error = "package-not-validated";
+      } else if (txResult.otherWtxid !== undefined) {
+        innerResult["other-wtxid"] = internalHexToDisplay(txResult.otherWtxid);
+      } else if (!txResult.accepted) {
+        innerResult.error = coreStateString(txResult.error || "transaction-rejected");
       } else {
-        // Accepted
-        if (txResult.vsize !== undefined) {
-          innerResult.vsize = txResult.vsize;
+        innerResult.vsize = txResult.vsize;
+        const fees: Record<string, unknown> = {
+          base: Number(txResult.fee ?? 0n) / 100_000_000,
+        };
+        // Core: no effective feerate for a tx that was already in the
+        // mempool (MEMPOOL_ENTRY) — it is unknown how it got there.
+        if (!txResult.alreadyInMempool && txResult.effectiveFee !== undefined && txResult.effectiveVsize) {
+          fees["effective-feerate"] = feePerKvB(txResult.effectiveFee, txResult.effectiveVsize);
+          fees["effective-includes"] = (txResult.effectiveIncludes ?? []).map(internalHexToDisplay);
         }
-
-        if (txResult.fee !== undefined) {
-          const fees: Record<string, unknown> = {
-            base: Number(txResult.fee) / 100_000_000,
-          };
-
-          if (txResult.effectiveFeeRate !== undefined) {
-            // Convert sat/vB to BTC/kvB
-            fees["effective-feerate"] = (txResult.effectiveFeeRate * 1000) / 100_000_000;
-
-            if (txResult.effectiveIncludes) {
-              fees["effective-includes"] = txResult.effectiveIncludes;
-            }
-          }
-
-          innerResult.fees = fees;
-        }
+        innerResult.fees = fees;
       }
-
-      txResults[wtxid] = innerResult;
+      txResults[wtxidHex] = innerResult;
     }
 
     rpcResult["tx-results"] = txResults;
 
-    // Add replaced transactions
-    rpcResult["replaced-transactions"] = result.replacedTxids;
+    // Core collects replaced txids in a std::set<Txid>, so they come out in
+    // uint256 order: memcmp of the internal bytes, i.e. the internal-order
+    // hex sorted as strings.
+    rpcResult["replaced-transactions"] = [...new Set(result.replacedTxids)].sort().map(internalHexToDisplay);
 
     // Check fee rate for all accepted transactions if maxFeeRate is set
     if (maxFeeRate > 0) {
@@ -6238,6 +6262,53 @@ export class RPCServer {
     const maxFeeRateSatPerKvB = Math.round(maxFeeRate * 100_000_000);
     const results: Array<Record<string, unknown>> = [];
     let exitEarly = false;
+
+    // Core: more than one tx is validated as a package (ProcessNewPackage
+    // with test_accept=true), so a child may spend an earlier package tx.
+    if (txs.length > 1) {
+      const pkg = await this.mempool.testAcceptPackage(txs);
+      const packageError = pkg.result === PackageValidationResult.PCKG_POLICY ? pkg.message : undefined;
+      for (const tx of txs) {
+        const entry: Record<string, unknown> = {
+          txid: displayHex(getTxId(tx)),
+          wtxid: displayHex(getWTxId(tx)),
+        };
+        // Package messages are already Core's PackageValidationState::ToString()
+        // ("reason" or "reason, debug"); the debug may itself contain ": ".
+        if (packageError !== undefined) entry["package-error"] = packageError;
+        const r = pkg.txResults.get(getWTxId(tx).toString("hex"));
+        if (exitEarly || r === undefined) {
+          // Validation unfinished: just txid and wtxid.
+          results.push(entry);
+          continue;
+        }
+        if (r.accepted) {
+          const fee = Number(r.fee!);
+          const maxFee = Math.ceil((maxFeeRateSatPerKvB * r.vsize!) / 1000);
+          if (maxFee > 0 && fee > maxFee) {
+            entry.allowed = false;
+            entry["reject-reason"] = "max-fee-exceeded";
+            exitEarly = true;
+          } else {
+            entry.allowed = true;
+            entry.vsize = r.vsize;
+            entry.fees = {
+              base: fee / 100_000_000,
+              "effective-feerate": feePerKvB(r.effectiveFee!, r.effectiveVsize!),
+              "effective-includes": (r.effectiveIncludes ?? []).map(internalHexToDisplay),
+            };
+          }
+        } else {
+          entry.allowed = false;
+          const err = r.error || "rejected";
+          const reason = err.split(": ")[0];
+          entry["reject-reason"] = reason === "bad-txns-inputs-missingorspent" ? "missing-inputs" : reason;
+          if (reason !== "bad-txns-inputs-missingorspent") entry["reject-details"] = coreStateString(err);
+        }
+        results.push(entry);
+      }
+      return results;
+    }
 
     for (const tx of txs) {
       const txidHex = Buffer.from(getTxId(tx)).reverse().toString("hex");
