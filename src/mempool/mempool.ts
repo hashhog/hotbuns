@@ -693,6 +693,29 @@ const DEFAULT_INCREMENTAL_RELAY_FEE = 0.1; // 100 sat/kvB
 // MAX_REPLACEMENT_CANDIDATES (100) is imported from ./rbf.js.
 
 /**
+ * A replacement refusal in Core's TxValidationState shape: `rejectReason` is
+ * the reject-reason testmempoolaccept reports, `rejectDetails` the debug
+ * message, and `error` is TxValidationState::ToString() ("reason, details"),
+ * the text sendrawtransaction returns with -26.
+ */
+function rbfReject(
+  rejectReason: string,
+  rejectDetails: string,
+): { accepted: false; error: string; rejectReason: string; rejectDetails: string } {
+  return {
+    accepted: false,
+    error: `${rejectReason}, ${rejectDetails}`,
+    rejectReason,
+    rejectDetails,
+  };
+}
+
+/** Txid in display (RPC) byte order, as Core's uint256::ToString prints it. */
+function displayTxidHex(txid: Buffer): string {
+  return Buffer.from(txid).reverse().toString("hex");
+}
+
+/**
  * Package validation result types.
  */
 export enum PackageValidationResult {
@@ -1599,7 +1622,16 @@ export class Mempool {
   async addTransaction(
     tx: Transaction,
     options?: AcceptToMemoryPoolOptions,
-  ): Promise<{ accepted: boolean; error?: string; fee?: bigint; vsize?: number }> {
+  ): Promise<{
+    accepted: boolean;
+    error?: string;
+    /** Core reject-reason, when the refusal carries one separate from `error`. */
+    rejectReason?: string;
+    /** Core reject debug message paired with `rejectReason`. */
+    rejectDetails?: string;
+    fee?: bigint;
+    vsize?: number;
+  }> {
     // Gate 6: after AbortNode the mempool accepts nothing. fatal-error is not
     // a rejection reason (callers must not add it to recent-rejects).
     if (isFatal()) {
@@ -1770,10 +1802,24 @@ export class Mempool {
     let conflictsToEvict: MempoolEntry[] = [];
     let totalConflictingFee = 0n;
     let totalConflictingVsize = 0;
+    // Rule #5 input: distinct clusters among the DIRECT conflicts. Checked in
+    // the replacement block below, where Core's ReplacementChecks runs it.
+    let conflictingClusterCount = 0;
 
     if (conflicts.length > 0) {
       // Mark this as a potential RBF replacement - we'll validate the fees later
       isReplacement = true;
+
+      // Core v31 GetEntriesForConflicts (policy/rbf.cpp) bounds a replacement
+      // by the number of distinct clusters it conflicts with directly
+      // (GetUniqueClusterCount), not by how many transactions it evicts. A
+      // cluster holds at most MAX_CLUSTER_COUNT txs, so the eviction set
+      // gathered below stays bounded.
+      const conflictingClusters = new Set<string>();
+      for (const conflict of conflicts) {
+        conflictingClusters.add(this.clusters.find(conflict.txid.toString("hex")));
+      }
+      conflictingClusterCount = conflictingClusters.size;
 
       // Gather all conflicts and their descendants
       const allConflictTxids = new Set<string>();
@@ -1783,14 +1829,6 @@ export class Mempool {
         for (const desc of descendants) {
           allConflictTxids.add(desc);
         }
-      }
-
-      // Check eviction limit (Rule #5: max 100 transactions)
-      if (allConflictTxids.size > MAX_REPLACEMENT_CANDIDATES) {
-        return {
-          accepted: false,
-          error: `RBF would evict too many transactions: ${allConflictTxids.size} > ${MAX_REPLACEMENT_CANDIDATES}`,
-        };
       }
 
       // Collect all entries to be evicted
@@ -2200,6 +2238,17 @@ export class Mempool {
         return { accepted: false, error: disjointErr };
       }
 
+      // Rule #5 (bitcoin-core/src/policy/rbf.cpp:GetEntriesForConflicts, run
+      // first in validation.cpp MemPoolAccept::ReplacementChecks): more than
+      // MAX_REPLACEMENT_CANDIDATES distinct conflicting clusters is refused.
+      // Five clusters of 21 txs (105 evictions) is five, and is allowed.
+      if (conflictingClusterCount > MAX_REPLACEMENT_CANDIDATES) {
+        return rbfReject(
+          "too many potential replacements",
+          `rejecting replacement ${displayTxidHex(txid)}; too many conflicting clusters (${conflictingClusterCount} > ${MAX_REPLACEMENT_CANDIDATES})`,
+        );
+      }
+
       // Rule #3: Replacement fees must be >= original fees.
       // (bitcoin-core/src/policy/rbf.cpp:PaysForRBF, line 109: `replacement_fees < original_fees`)
       // Core accepts equal fees here; Rule #4 rejects zero-increment cases.
@@ -2235,7 +2284,18 @@ export class Mempool {
       // "Before" = linearize(affected cluster); "After" = same cluster minus
       // conflicts plus replacement.  After must dominate Before at every
       // cumulative-vsize boundary (CompareChunks(after, before) > 0).
+      //
+      // Core stages the removals and runs CheckMemPoolPolicyLimits BEFORE the
+      // diagram (validation.cpp ReplacementChecks), so a replacement that both
+      // breaks the cluster limit and worsens the diagram is "too-large-cluster",
+      // and a diagram failure always means the fee was insufficient:
+      // "replacement-failed" with the diagram text as the debug message.
       {
+        const stagedRemovals = new Set<string>(conflictsToEvict.map((e) => e.txid.toString("hex")));
+        const stagedCluster = this.checkClusterSizeLimit(parentTxids, adjWeight, stagedRemovals);
+        if (!stagedCluster.valid) {
+          return { accepted: false, error: stagedCluster.error };
+        }
         const diagramErr = this.improvesFeerateDiagram(
           txid.toString("hex"),
           fee,
@@ -2244,7 +2304,7 @@ export class Mempool {
           conflictsToEvict,
         );
         if (diagramErr !== null) {
-          return { accepted: false, error: diagramErr };
+          return rbfReject("replacement-failed", diagramErr);
         }
       }
     }
@@ -2537,8 +2597,10 @@ export class Mempool {
       }
     }
 
-    // If this is an RBF replacement, remove all conflicting transactions first
-    if (isReplacement) {
+    // If this is an RBF replacement, remove all conflicting transactions first.
+    // Not on the test_accept path: testmempoolaccept of a replacement must
+    // leave the conflicts in the pool (Core never stages removals there).
+    if (isReplacement && !options?.testAccept) {
       for (const conflictEntry of conflictsToEvict) {
         // Remove without removing dependents since we're removing all of them
         this.removeTransactionInternal(conflictEntry.txid);

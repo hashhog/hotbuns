@@ -582,8 +582,9 @@ describe("W120 — mempool strict RBF rules 1-5 (BIP-125)", () => {
         require("node:path").join(__dirname, "..", "mempool", "mempool.ts"),
         "utf8",
       ) as string;
-      expect(src).toMatch(/allConflictTxids\.size\s*>\s*MAX_REPLACEMENT_CANDIDATES/);
-      expect(src).not.toMatch(/allConflictTxids\.size\s*>=\s*MAX_REPLACEMENT_CANDIDATES/);
+      // Core v31 GetEntriesForConflicts: `num_clusters > MAX_REPLACEMENT_CANDIDATES`.
+      expect(src).toMatch(/conflictingClusterCount\s*>\s*MAX_REPLACEMENT_CANDIDATES/);
+      expect(src).not.toMatch(/conflictingClusterCount\s*>=\s*MAX_REPLACEMENT_CANDIDATES/);
     });
 
     test("G23: Rule 5 traverses descendants via getDescendantSet (union with direct conflicts)", () => {
@@ -596,20 +597,20 @@ describe("W120 — mempool strict RBF rules 1-5 (BIP-125)", () => {
       expect(src).toMatch(/this\.getDescendantSet\(conflict\.txid\.toString\("hex"\)\)/);
     });
 
-    test("G24: error message references BIP-125 Rule 5 / MAX_REPLACEMENT_CANDIDATES", () => {
+    test("G24: error message is Core's GetEntriesForConflicts text with MAX_REPLACEMENT_CANDIDATES", () => {
       const src = require("node:fs").readFileSync(
         require("node:path").join(__dirname, "..", "mempool", "mempool.ts"),
         "utf8",
       ) as string;
-      // The exact error string includes the descriptive prefix and constant name.
-      expect(src).toMatch(/RBF would evict too many transactions[^\n]*MAX_REPLACEMENT_CANDIDATES/);
+      // reject-reason "too many potential replacements", debug message
+      // "rejecting replacement <txid>; too many conflicting clusters (N > 100)".
+      expect(src).toMatch(/"too many potential replacements"/);
+      expect(src).toMatch(/too many conflicting clusters[^\n]*MAX_REPLACEMENT_CANDIDATES/);
     });
 
-    test.skip("G25 (BUG-4): Rule 5 BIP-125 cluster-count semantics — Core counts unique CLUSTERS of direct conflicts via GetUniqueClusterCount; hotbuns counts |direct_conflicts ∪ descendants|. Stricter than Core in non-pathological cases; flagged as PARTIAL. No `-mempoolfullrbf` knob exposed either. Both items deferred.", () => {
-      // Intentional skip: the hotbuns behavior is a stricter Core-subset and
-      // building a >100 entry eviction set is expensive in unit-test form.
-      // Structural divergence noted in audit findings.
-    });
+    // G25 (BUG-4), formerly skipped: Rule 5 now counts unique clusters of the
+    // direct conflicts. Behavioural coverage (five clusters of 21 accepted,
+    // 100 accepted, 101 refused) is in src/__tests__/cluster_rbf.test.ts.
   });
 
   // ───────── Cross-cutting: opt-in state, full-RBF, feerate-diagram, wallet ─────────
