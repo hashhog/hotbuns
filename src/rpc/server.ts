@@ -5913,8 +5913,10 @@ export class RPCServer {
 
     rpcResult["tx-results"] = txResults;
 
-    // Add replaced transactions
-    rpcResult["replaced-transactions"] = [...new Set(result.replacedTxids)].map(internalHexToDisplay);
+    // Core collects replaced txids in a std::set<Txid>, so they come out in
+    // uint256 order: memcmp of the internal bytes, i.e. the internal-order
+    // hex sorted as strings.
+    rpcResult["replaced-transactions"] = [...new Set(result.replacedTxids)].sort().map(internalHexToDisplay);
 
     // Check fee rate for all accepted transactions if maxFeeRate is set
     if (maxFeeRate > 0) {

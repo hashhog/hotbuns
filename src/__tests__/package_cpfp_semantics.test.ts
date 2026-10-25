@@ -393,7 +393,12 @@ describe("package semantics match Core (regtest)", () => {
       const { p, c } = replacement(coin, 0, 0);
       const res = (await rpc(port, "submitpackage", [[hexOf(p), hexOf(c)]])).result;
       expect(res.package_msg).toBe("success");
-      expect([...res["replaced-transactions"]].sort()).toEqual([txidOf(o), txidOf(d)].sort());
+      // Core: std::set<Txid> order = memcmp of the internal bytes.
+      const setOrder = [o, d]
+        .map((t) => getTxId(t).toString("hex"))
+        .sort()
+        .map((h) => display(Buffer.from(h, "hex")));
+      expect(res["replaced-transactions"]).toEqual(setOrder);
       expect(inPool(p) && inPool(c)).toBe(true);
       expect(inPool(o) || inPool(d)).toBe(false);
     });
