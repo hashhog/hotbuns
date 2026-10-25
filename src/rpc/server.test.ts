@@ -1760,13 +1760,13 @@ describe("RPCServer", () => {
       expect(dwc.length).toBe(76);
       expect(dwc.startsWith("6a24aa21a9ed")).toBe(true);
 
-      // The `hash` field in each template tx is the wtxid (getWTxId result, hex).
-      // For legacy txs it equals the txid in internal byte order.
+      // The `hash` field in each template tx is the wtxid in display order (Core: GetWitnessHash().GetHex()).
+      // Reverse it back to internal order to compute the expected commitment.
       // Compute the expected commitment from the returned wtxids.
       const templateTxs: Array<{ hash: string }> = result.result.transactions as any;
       const wtxids = [
         Buffer.alloc(32, 0), // coinbase zero
-        ...templateTxs.map(tx => Buffer.from(tx.hash, "hex")),
+        ...templateTxs.map(tx => Buffer.from(tx.hash, "hex").reverse()),
       ];
       const witnessRoot = computeWitnessMerkleRoot(wtxids);
       const commitment = hash256(Buffer.concat([witnessRoot, Buffer.alloc(32, 0)]));
