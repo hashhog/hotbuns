@@ -374,6 +374,7 @@ describe("formatRpcRequest", () => {
       blockfilterindex: false,
       coinstatsindex: false,
       txospenderindex: false,
+      txindex: false,
     };
 
     const request = formatRpcRequest(config, "getblockchaininfo", []);
@@ -409,6 +410,7 @@ describe("formatRpcRequest", () => {
       blockfilterindex: false,
       coinstatsindex: false,
       txospenderindex: false,
+      txindex: false,
     };
 
     const request = formatRpcRequest(config, "getblock", ["abc123", 1]);
@@ -438,6 +440,7 @@ describe("formatRpcRequest", () => {
       blockfilterindex: false,
       coinstatsindex: false,
       txospenderindex: false,
+      txindex: false,
     };
 
     const request = formatRpcRequest(config, "test", []);

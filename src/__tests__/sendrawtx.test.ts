@@ -72,6 +72,12 @@ class MockMempool {
     };
   }
 
+  private unbroadcast = new Set<string>();
+  addUnbroadcastTx(txid: Buffer) { this.unbroadcast.add(txid.toString("hex")); }
+  removeUnbroadcastTx(txid: Buffer) { this.unbroadcast.delete(txid.toString("hex")); }
+  isUnbroadcast(txid: Buffer) { return this.unbroadcast.has(txid.toString("hex")); }
+  getUnbroadcastTxs() { return new Set(this.unbroadcast); }
+
   getAllTxids(): Buffer[] {
     return Array.from(this.entries.values()).map((e) => e.txid);
   }
@@ -449,8 +455,9 @@ describe("sendrawtransaction", () => {
       const result = await rpcRequest(testPort, "sendrawtransaction", [txHex, "invalid"]);
 
       expect(result.error).toBeDefined();
-      expect(result.error!.code).toBe(RPCErrorCodes.INVALID_PARAMS);
-      expect(result.error!.message).toContain("maxfeerate must be a number");
+      // Core AmountFromValue: an unparsable string is -3 "Invalid amount".
+      expect(result.error!.code).toBe(RPCErrorCodes.TYPE_ERROR);
+      expect(result.error!.message).toBe("Invalid amount");
     });
 
     it("should reject negative maxfeerate", async () => {
@@ -547,7 +554,7 @@ describe("sendrawtransaction", () => {
 
       expect(result.error).toBeDefined();
       expect(result.error!.code).toBe(RPCErrorCodes.RPC_TRANSACTION_ALREADY_IN_CHAIN);
-      expect(result.error!.message).toContain("already in block chain");
+      expect(result.error!.message).toBe("Transaction outputs already in utxo set");
     });
   });
 

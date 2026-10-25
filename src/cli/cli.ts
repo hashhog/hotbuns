@@ -274,6 +274,12 @@ export interface NodeConfig {
    */
   txospenderindex: boolean;
   /**
+   * Mirrors Bitcoin Core's `-txindex` (DEFAULT_TXINDEX = false). Without it
+   * getrawtransaction answers -5 for a confirmed tx unless the caller passes
+   * the containing block's hash; with it the txid -> block lookup is used.
+   */
+  txindex: boolean;
+  /**
    * Path to an ASMap binary file for ASN-aware peer grouping.
    * Mirrors Bitcoin Core's `-asmap=<file>` (init.cpp:540).
    * Relative paths are resolved against the network-specific datadir.
@@ -373,6 +379,7 @@ const DEFAULT_CONFIG: NodeConfig = {
   blockfilterindex: false,
   coinstatsindex: false,
   txospenderindex: false,
+  txindex: false,
 };
 
 /**
@@ -708,6 +715,15 @@ export function parseArgs(argv: string[]): ParsedArgs {
             config.coinstatsindex = false;
           }
           break;
+        case "txindex":
+          // Bitcoin Core flag `-txindex=1`. Bare flag / `=1` / `=true`
+          // enables; `=0` / `=false` disables. Default OFF.
+          if (value === undefined || value === "1" || value === "true") {
+            config.txindex = true;
+          } else if (value === "0" || value === "false") {
+            config.txindex = false;
+          }
+          break;
         case "txospenderindex":
           // Bitcoin Core flag `-txospenderindex=1`. Bare flag / `=1` / `=true`
           // enables; `=0` / `=false` disables. Default OFF (matches Core's
@@ -978,6 +994,10 @@ export async function loadConfig(
         case "coinstatsindex":
           // Mirror CLI: 0/false = off; 1/true = on.
           config.coinstatsindex = value === "1" || value === "true";
+          break;
+        case "txindex":
+          // Mirror CLI: 0/false = off; 1/true = on.
+          config.txindex = value === "1" || value === "true";
           break;
         case "txospenderindex":
           // Mirror CLI: 0/false = off; 1/true = on.
@@ -2970,6 +2990,7 @@ async function startNode(config: NodeConfig): Promise<void> {
     datadir: mergedConfig.datadir,
     pruneManager,
     filterIndex,
+    txindex: mergedConfig.txindex,
     proxyManager: proxyManager ?? undefined,
     walletManager,
   };

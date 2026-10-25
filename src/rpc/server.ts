@@ -9,6 +9,7 @@ import * as path from "path";
 import { mempoolInfoToJSON } from "../mempool/info.js";
 import { FATAL_ERROR_TOKEN, fatalRefusal, isFatal } from "../chain/fatal.js";
 import * as fs from "fs";
+import { setMockTime } from "../clock.js";
 import type { ChainStateManager } from "../chain/state.js";
 import type { ChainDB } from "../storage/database.js";
 import { DBPrefix, BlockStatus } from "../storage/database.js";
@@ -370,6 +371,8 @@ export interface RPCServerDeps {
    * lists indexes that are actually running.
    */
   filterIndex?: import("../storage/indexes.js").BlockFilterIndex;
+  /** -txindex: allow getrawtransaction to look up confirmed txs without a blockhash. Default off, like Core. */
+  txindex?: boolean;
   /**
    * The persistent, reorg-safe coinstatsindex, present only when the operator
    * started the node with `--coinstatsindex=1` (cli.ts constructs and wires
@@ -801,6 +804,8 @@ export class RPCServer {
   private orphanPool?: OrphanPool;
   /** BIP-157/158 basic block filter index (present iff --blockfilterindex). */
   private filterIndex?: import("../storage/indexes.js").BlockFilterIndex;
+  /** Core's -txindex: lets getrawtransaction find a confirmed tx without a blockhash. */
+  private txindexEnabled: boolean;
   /** Per-height UTXO coinstats index (present iff --coinstatsindex). Backs
    *  gettxoutsetinfo at a historical hash_or_height + getindexinfo. */
   private coinStatsIndex?: import("../storage/indexes.js").PersistentCoinStatsIndex;
@@ -907,6 +912,7 @@ export class RPCServer {
     this.blockSync = deps.blockSync;
     this.orphanPool = deps.orphanPool;
     this.filterIndex = deps.filterIndex;
+    this.txindexEnabled = deps.txindex ?? false;
     this.coinStatsIndex = deps.coinStatsIndex;
     this.txoSpenderIndex = deps.txoSpenderIndex;
     this.methods = new Map();
@@ -1659,6 +1665,7 @@ export class RPCServer {
     // Control methods
     this.registerMethod("stop", (params) => this.stopNode(params));
     this.registerMethod("uptime", () => this.getUptime());
+    this.registerMethod("setmocktime", (params) => this.setMockTimeRpc(params));
     this.registerMethod("getmemoryinfo", async (params) => this.getMemoryInfo(params));
     this.registerMethod("logging", async (params) => this.logging(params));
 
@@ -2111,7 +2118,10 @@ export class RPCServer {
       // found" for an out-of-int32 verbosity where Core answers -1.
       this.uvGetInt(verbosityParam, "verbosity", INT32_MIN, INT32_MAX);
     }
-    const verbosity = typeof verbosityParam === "number" ? verbosityParam : 1;
+    // Core ParseVerbosity(allow_bool=true): false -> 0 (raw hex), true -> 1,
+    // an integer as given; <= 0 is hex and >= 2 is the full-transaction form.
+    const verbosity =
+      typeof verbosityParam === "number" ? verbosityParam : verbosityParam === false ? 0 : 1;
 
     // Get block index record first to check if pruned
     const blockIndex = await this.db.getBlockIndex(blockhash);
@@ -2140,7 +2150,7 @@ export class RPCServer {
     }
 
     // Verbosity 0: return hex
-    if (verbosity === 0) {
+    if (verbosity <= 0) {
       return blockData.toString("hex");
     }
 
@@ -2223,17 +2233,27 @@ export class RPCServer {
     // Add transactions
     if (verbosity === 1) {
       result.tx = block.transactions.map((tx) => Buffer.from(getTxId(tx)).reverse().toString("hex"));
-    } else if (verbosity === 2) {
+    } else if (verbosity >= 2) {
       // Build spentByOutpoint map for fee computation.
       // Primary: undo data stored during block connect (available for recent
       // blocks connected at tip).  Fallback: resolve via txindex + block
       // fetch for historical blocks where undo data was not persisted during
       // IBD (atTip=false condition in blocks.ts:2372).
-      const spentByOutpoint = await this.buildSpentByOutpointMap(blockhash, block);
-
-      result.tx = block.transactions.map((tx) =>
-        this.formatTxForGetBlock(tx, spentByOutpoint)
-      );
+      // Verbosity >= 3 additionally reports each input's prevout (Core
+      // TxVerbosity::SHOW_DETAILS_AND_PREVOUT), which needs the full UTXO entry.
+      if (verbosity >= 3) {
+        const richPrevouts = await this.buildRichPrevoutMap(blockhash, block);
+        const amounts = new Map<string, bigint>();
+        for (const [key, entry] of richPrevouts) amounts.set(key, entry.amount);
+        result.tx = block.transactions.map((tx) =>
+          this.formatTxForGetBlock(tx, amounts, richPrevouts)
+        );
+      } else {
+        const spentByOutpoint = await this.buildSpentByOutpointMap(blockhash, block);
+        result.tx = block.transactions.map((tx) =>
+          this.formatTxForGetBlock(tx, spentByOutpoint)
+        );
+      }
     }
 
     return result;
@@ -2250,7 +2270,8 @@ export class RPCServer {
    */
   private formatTxForGetBlock(
     tx: Transaction,
-    spentByOutpoint: Map<string, bigint> | null
+    spentByOutpoint: Map<string, bigint> | null,
+    richPrevouts?: Map<string, import("../storage/database.js").UTXOEntry>
   ): Record<string, unknown> {
     const txid = getTxId(tx);
     const wtxid = getWTxId(tx);
@@ -2311,6 +2332,18 @@ export class RPCServer {
           vin.txinwitness = input.witness.map((w) => w.toString("hex"));
         }
         vin.sequence = input.sequence;
+
+        if (richPrevouts && !(isCb && i === 0)) {
+          const entry = richPrevouts.get(`${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`);
+          if (entry !== undefined) {
+            vin.prevout = {
+              generated: entry.coinbase,
+              height: entry.height,
+              value: formatBtcAmount(entry.amount),
+              scriptPubKey: buildScriptPubKeyObj(entry.scriptPubKey, network),
+            };
+          }
+        }
 
         return vin;
       }),
@@ -2534,7 +2567,7 @@ export class RPCServer {
 
     // Core ParseHashV: malformed blockhash (wrong length / non-hex) -> -8 at
     // the parse boundary, BEFORE the LookupBlockIndex "Block not found" (-5).
-    const blockhash = this.parseHashV(blockhashParam, "blockhash");
+    const blockhash = this.parseHashV(blockhashParam, "hash");
 
     const verbose = verboseParam !== false;
 
@@ -2825,8 +2858,10 @@ export class RPCServer {
       result[name] = { synced, best_block_height: bestBlockHeight };
     };
 
-    // txindex — always running in hotbuns; tracks the active chain tip.
-    pushIndex("txindex", tipHeight >= headerHeight, tipHeight);
+    // txindex — listed only when --txindex is set; tracks the active chain tip.
+    if (this.txindexEnabled) {
+      pushIndex("txindex", tipHeight >= headerHeight, tipHeight);
+    }
 
     // basic block filter index — running only when --blockfilterindex set.
     if (this.filterIndex && this.filterIndex.isEnabled()) {
@@ -4646,7 +4681,16 @@ export class RPCServer {
 
       throw this.rpcError(
         RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
-        "No such transaction found in the provided block"
+        "No such transaction found in the provided block. Use gettransaction for wallet transactions."
+      );
+    }
+
+    // Core rawtransaction.cpp: without -txindex only the mempool and an
+    // explicit blockhash can answer, and the hint names the missing flag.
+    if (!this.txindexEnabled) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_ADDRESS_OR_KEY,
+        "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions."
       );
     }
 
@@ -4933,7 +4977,7 @@ export class RPCServer {
                 generated: entry.coinbase,
                 height: entry.height,
                 value: formatBtcAmount(entry.amount),
-                scriptPubKey: buildScriptPubKeyObj(entry.scriptPubKey),
+                scriptPubKey: this.buildScriptPubKeyObjNetworkAware(entry.scriptPubKey),
               };
             } else {
               // No prevout entry: the per-vin `prevout` object is already
@@ -4956,7 +5000,7 @@ export class RPCServer {
         return {
           value: formatBtcAmount(output.value),
           n: i,
-          scriptPubKey: buildScriptPubKeyObj(output.scriptPubKey),
+          scriptPubKey: this.buildScriptPubKeyObjNetworkAware(output.scriptPubKey),
         };
       }),
     };
@@ -5588,7 +5632,8 @@ export class RPCServer {
    *   - RPC_TRANSACTION_ALREADY_IN_CHAIN (-27): TX already confirmed in blockchain
    */
   private async sendRawTransaction(params: unknown[]): Promise<string> {
-    const [hexstringParam, maxfeerateParam] = params;
+    const [hexstringParam, rawMaxfeerateParam] = params;
+    let maxfeerateParam = rawMaxfeerateParam;
 
     if (typeof hexstringParam !== "string") {
       throw this.rpcError(
@@ -5600,10 +5645,18 @@ export class RPCServer {
     // Parse maxfeerate parameter (default 0.10 BTC/kvB)
     let maxFeeRate = DEFAULT_MAX_FEE_RATE;
     if (maxfeerateParam !== undefined && maxfeerateParam !== null) {
+      // Core ParseFeeRate -> AmountFromValue: -3 for a value that is neither a
+      // number nor a string, "Invalid amount" for an unparsable string.
+      if (typeof maxfeerateParam === "string") {
+        if (!/^(\d+\.?\d*|\.\d+)$/.test(maxfeerateParam)) {
+          throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "Invalid amount");
+        }
+        maxfeerateParam = Number(maxfeerateParam);
+      }
       if (typeof maxfeerateParam !== "number") {
         throw this.rpcError(
-          RPCErrorCodes.INVALID_PARAMS,
-          "maxfeerate must be a number"
+          RPCErrorCodes.TYPE_ERROR,
+          "Amount is not a number or string"
         );
       }
       if (maxfeerateParam < 0) {
@@ -5651,7 +5704,7 @@ export class RPCServer {
     if (isConfirmed) {
       throw this.rpcError(
         RPCErrorCodes.RPC_TRANSACTION_ALREADY_IN_CHAIN,
-        "Transaction already in block chain"
+        "Transaction outputs already in utxo set"
       );
     }
 
@@ -5668,11 +5721,22 @@ export class RPCServer {
     const maxFeeRateSatPerVB = maxFeeRate > 0 ? maxFeeRate * 100_000 : undefined;
     const result = await this.mempool.addTransaction(tx, { maxFeeRateSatPerVB });
     if (!result.accepted) {
+      // Core rpc/mempool.cpp DEFAULT_TRANSACTION_MAXFEE / BroadcastTransaction:
+      // missing inputs is TransactionError::MISSING_INPUTS -> RPC_TRANSACTION_ERROR
+      // (-25) with the bare reason; every other rejection is -26 with detail.
+      const MISSING_INPUTS = "bad-txns-inputs-missingorspent";
+      if (result.error?.startsWith(MISSING_INPUTS)) {
+        throw this.rpcError(RPCErrorCodes.RPC_TRANSACTION_ERROR, MISSING_INPUTS);
+      }
       throw this.rpcError(
         RPCErrorCodes.RPC_TRANSACTION_REJECTED,
         result.error || "Transaction rejected"
       );
     }
+
+    // Core BroadcastTransaction: a freshly accepted local submission is
+    // unbroadcast until a peer fetches it (cleared on getdata).
+    this.mempool.addUnbroadcastTx(txid);
 
     // Broadcast inv to peers
     this.broadcastTxInv(txid);
@@ -5864,6 +5928,7 @@ export class RPCServer {
     for (const [wtxid, txResult] of result.txResults) {
       if (txResult.accepted) {
         const txid = Buffer.from(txResult.txid, "hex");
+        this.mempool.addUnbroadcastTx(txid);
         this.broadcastTxInv(txid);
       }
     }
@@ -5949,6 +6014,7 @@ export class RPCServer {
       const txidHex = Buffer.from(txid).reverse().toString("hex");
       // Modified fee = base fee + prioritisetransaction delta (Core GetModifiedFee).
       const modifiedFeeSats = this.mempool.getModifiedFee(txid);
+      const chunk = this.mempool.getMainChunkFeerate(txid);
       result[txidHex] = {
         vsize: entry.vsize,
         weight: entry.weight,
@@ -5958,6 +6024,7 @@ export class RPCServer {
         descendantsize: entry.vsize, // Simplified
         ancestorcount: entry.dependsOn.size + 1,
         ancestorsize: entry.vsize, // Simplified
+        chunkweight: chunk.size,
         wtxid: txidHex, // Simplified (same as txid for non-witness txs)
         // Core entryToJSON (mempool.cpp:527-533): fees is nested; no top-level fee/modifiedfee.
         fees: {
@@ -5965,11 +6032,12 @@ export class RPCServer {
           modified: Number(modifiedFeeSats) / 100_000_000,
           ancestor: Number(modifiedFeeSats) / 100_000_000,
           descendant: Number(modifiedFeeSats) / 100_000_000,
+          chunk: Number(chunk.fee) / 100_000_000,
         },
         depends: Array.from(entry.dependsOn),
         spentby: Array.from(entry.spentBy),
         "bip125-replaceable": this.mempool.getRBFOptInState(txid) === RBFTransactionState.REPLACEABLE_BIP125,
-        unbroadcast: false,
+        unbroadcast: this.mempool.isUnbroadcast(txid),
       };
     }
 
@@ -6001,6 +6069,7 @@ export class RPCServer {
 
     // Modified fee = base fee + prioritisetransaction delta (Core GetModifiedFee).
     const modifiedFeeSats = this.mempool.getModifiedFee(txid);
+    const chunk = this.mempool.getMainChunkFeerate(txid);
 
     return {
       vsize: entry.vsize,
@@ -6011,6 +6080,7 @@ export class RPCServer {
       descendantsize: entry.vsize,
       ancestorcount: entry.dependsOn.size + 1,
       ancestorsize: entry.vsize,
+      chunkweight: chunk.size,
       wtxid: txidParam,
       // Core entryToJSON (mempool.cpp:527-533): fees is nested; no top-level fee/modifiedfee.
       fees: {
@@ -6018,11 +6088,12 @@ export class RPCServer {
         modified: Number(modifiedFeeSats) / 100_000_000,
         ancestor: Number(modifiedFeeSats) / 100_000_000,
         descendant: Number(modifiedFeeSats) / 100_000_000,
+        chunk: Number(chunk.fee) / 100_000_000,
       },
       depends: Array.from(entry.dependsOn),
       spentby: Array.from(entry.spentBy),
       "bip125-replaceable": this.mempool.isReplaceable(txid),
-      unbroadcast: false,
+      unbroadcast: this.mempool.isUnbroadcast(txid),
       // Cluster mempool fields
       miningScore: miningScore, // Effective fee rate (sat/vB) from chunk
     };
@@ -6102,7 +6173,14 @@ export class RPCServer {
   private async testMempoolAccept(params: unknown[]): Promise<Array<Record<string, unknown>>> {
     const [rawtxsParam, maxfeerateParam] = params;
 
-    if (!Array.isArray(rawtxsParam) || rawtxsParam.length === 0) {
+    if (Array.isArray(rawtxsParam) && rawtxsParam.length === 0) {
+      // Core rpc/mempool.cpp: an empty package is RPC_INVALID_PARAMETER (-8).
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        "Array must contain between 1 and 25 transactions."
+      );
+    }
+    if (!Array.isArray(rawtxsParam)) {
       throw this.rpcError(
         RPCErrorCodes.INVALID_PARAMS,
         "rawtxs must be a non-empty array"
@@ -6569,7 +6647,7 @@ export class RPCServer {
           depends: Array.from(ancestorEntry.dependsOn),
           spentby: Array.from(ancestorEntry.spentBy),
           "bip125-replaceable": this.mempool.getRBFOptInState(ancestorTxid) === RBFTransactionState.REPLACEABLE_BIP125,
-          unbroadcast: false,
+          unbroadcast: this.mempool.isUnbroadcast(ancestorTxid),
         };
       }
     }
@@ -6652,7 +6730,7 @@ export class RPCServer {
           depends: Array.from(descendantEntry.dependsOn),
           spentby: Array.from(descendantEntry.spentBy),
           "bip125-replaceable": this.mempool.getRBFOptInState(descendantTxid) === RBFTransactionState.REPLACEABLE_BIP125,
-          unbroadcast: false,
+          unbroadcast: this.mempool.isUnbroadcast(descendantTxid),
         };
       }
     }
@@ -13121,6 +13199,33 @@ export class RPCServer {
     };
   }
 
+  /**
+   * setmocktime (Core rpc/node.cpp) -- regtest only. Sets the node clock
+   * (mempool entry times, rolling-fee decay, expiry); 0 restores the system
+   * time. Returns null.
+   */
+  private async setMockTimeRpc(params: unknown[]): Promise<null> {
+    if (this.params.networkMagic !== 0xdab5bffa) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        "setmocktime is for regression testing (-regtest mode) only"
+      );
+    }
+    const t = params[0];
+    if (typeof t !== "number" || !Number.isInteger(t)) {
+      throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "JSON value of type " + typeof t + " is not of expected type number");
+    }
+    const maxTime = 9223372036; // Core: nanoseconds::max() in seconds
+    if (t < 0 || t > maxTime) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        `Mocktime must be in the range [0, ${maxTime}], not ${t}.`
+      );
+    }
+    setMockTime(t);
+    return null;
+  }
+
   private async getUptime(): Promise<number> {
     return Math.floor(Date.now() / 1000) - this.startedAt;
   }
@@ -16713,7 +16818,7 @@ export class RPCServer {
         //                   hex). getBlockHashByHeight returns internal byte
         //                   order, so reverse for display (same as txid above).
         //   confirmations = active tip height - coin height + 1.
-        const desc = buildScriptPubKeyObj(scriptPubKey).desc;
+        const desc = buildScriptPubKeyObj(scriptPubKey, this.getNetworkType()).desc;
         const blockHashBuf = await this.db.getBlockHashByHeight(height);
         unspents.push({
           txid: Buffer.from(txidInternal).reverse().toString("hex"),
