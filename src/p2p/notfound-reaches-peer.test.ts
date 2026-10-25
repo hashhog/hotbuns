@@ -193,6 +193,7 @@ describe("notfound reaches a peer", () => {
         getTransaction(hash: Buffer) {
           return hash.equals(knownTxid) ? { tx } : null;
         },
+        removeUnbroadcastTx() {},
         getTransactionByWtxidHex(hex: string) {
           return hex === getWTxId(tx).toString("hex") ? { tx } : null;
         },
@@ -337,6 +338,7 @@ describe("notfound reaches a peer", () => {
         getTransaction(hash: Buffer) {
           return hash.equals(knownTxid) ? { tx } : null;
         },
+        removeUnbroadcastTx() {},
         getTransactionByWtxidHex() {
           return null;
         },

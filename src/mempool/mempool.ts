@@ -86,6 +86,7 @@ import {
   MAX_BIP125_RBF_SEQUENCE,
   MAX_REPLACEMENT_CANDIDATES,
 } from "./rbf.js";
+import { nowSeconds } from "../clock.js";
 
 /**
  * Maximum cluster count: maximum number of transactions in a cluster.
@@ -1369,6 +1370,14 @@ export class Mempool {
    */
   private mapDeltas: Map<string, bigint>;
 
+  /**
+   * Core CTxMemPool::m_unbroadcast_txids: locally submitted transactions
+   * (sendrawtransaction / submitpackage) whose initial broadcast no peer has
+   * acknowledged yet. Internal-order txid hex. Cleared when a peer fetches
+   * the tx via getdata or the tx leaves the pool.
+   */
+  private unbroadcastTxids: Set<string> = new Set();
+
   /** Maximum mempool size in vbytes. */
   private maxSize: number;
 
@@ -1494,7 +1503,7 @@ export class Mempool {
     // Rolling fee state (txmempool.h:195-197)
     this.rollingMinimumFeeRate = 0;
     this.blockSinceLastRollingFeeBump = false;
-    this.lastRollingFeeUpdate = Math.floor(Date.now() / 1000);
+    this.lastRollingFeeUpdate = nowSeconds();
   }
 
   /**
@@ -2583,7 +2592,7 @@ export class Mempool {
       feeRate,
       vsize,
       weight,
-      addedTime: Math.floor(Date.now() / 1000),
+      addedTime: nowSeconds(),
       height: this.tipHeight,
       spentBy: new Set(),
       dependsOn: parentTxids,
@@ -2723,6 +2732,7 @@ export class Mempool {
 
     // Remove from entries
     this.entries.delete(txidHex);
+    this.unbroadcastTxids.delete(txidHex);
     this.unindexWtxid(txidHex);
     this.currentSize -= entry.vsize;
     this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
@@ -2778,6 +2788,7 @@ export class Mempool {
 
         // Remove from entries
         this.entries.delete(txidHex);
+        this.unbroadcastTxids.delete(txidHex);
         this.unindexWtxid(txidHex);
         this.currentSize -= entry.vsize;
         this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
@@ -2838,7 +2849,7 @@ export class Mempool {
     // blockSinceLastRollingFeeBump flag so that GetMinFee() will apply decay
     // going forward.
     // Reference: bitcoin-core/src/txmempool.cpp:426-427
-    this.lastRollingFeeUpdate = Math.floor(Date.now() / 1000);
+    this.lastRollingFeeUpdate = nowSeconds();
     this.blockSinceLastRollingFeeBump = true;
   }
 
@@ -3005,7 +3016,7 @@ export class Mempool {
         feeRate,
         vsize,
         weight,
-        addedTime: Math.floor(Date.now() / 1000),
+        addedTime: nowSeconds(),
         height: this.tipHeight,
         spentBy: new Set<string>(),
         dependsOn: new Set<string>(), // unchecked path: no parent tracking
@@ -3296,6 +3307,27 @@ export class Mempool {
     if (delta === 0n) return entry.feeRate;
     if (entry.vsize <= 0) return entry.feeRate;
     return Number(this.getEntryModifiedFee(entry)) / entry.vsize;
+  }
+
+  /** Core AddUnbroadcastTx: only meaningful for a tx that is in the pool. */
+  addUnbroadcastTx(txid: Buffer): void {
+    const txidHex = txid.toString("hex");
+    if (this.entries.has(txidHex)) this.unbroadcastTxids.add(txidHex);
+  }
+
+  /** Core RemoveUnbroadcastTx. */
+  removeUnbroadcastTx(txid: Buffer): void {
+    this.unbroadcastTxids.delete(txid.toString("hex"));
+  }
+
+  /** Core IsUnbroadcastTx. */
+  isUnbroadcast(txid: Buffer): boolean {
+    return this.unbroadcastTxids.has(txid.toString("hex"));
+  }
+
+  /** Core GetUnbroadcastTxs: internal-order txid hex snapshot. */
+  getUnbroadcastTxs(): Set<string> {
+    return new Set(this.unbroadcastTxids);
   }
 
   /**
@@ -3759,6 +3791,7 @@ export class Mempool {
 
     // Remove from entries
     this.entries.delete(txidHex);
+    this.unbroadcastTxids.delete(txidHex);
     this.unindexWtxid(txidHex);
     this.currentSize -= entry.vsize;
     this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
@@ -3846,7 +3879,7 @@ export class Mempool {
    * @returns Number of transactions removed.
    */
   expire(time?: number): number {
-    const cutoff = time ?? (Math.floor(Date.now() / 1000) - MEMPOOL_EXPIRY_SECONDS);
+    const cutoff = time ?? (nowSeconds() - MEMPOOL_EXPIRY_SECONDS);
 
     // Collect all txids whose addedTime is before the cutoff, in insertion order.
     // We remove in topological order (parents first) to avoid removing children
@@ -3920,7 +3953,7 @@ export class Mempool {
       return this.rollingMinimumFeeRate;
     }
 
-    const now = Math.floor(Date.now() / 1000);
+    const now = nowSeconds();
     if (now > this.lastRollingFeeUpdate + 10) {
       // Choose halflife based on how full the pool is.
       // Reference: txmempool.cpp:836-841
@@ -4118,6 +4151,7 @@ export class Mempool {
    */
   clear(): void {
     this.entries.clear();
+    this.unbroadcastTxids.clear();
     this.outpointIndex.clear();
     this.wtxidIndex.clear();
     this.txidToWtxid.clear();
@@ -4130,7 +4164,7 @@ export class Mempool {
     // Reset rolling fee state.
     this.rollingMinimumFeeRate = 0;
     this.blockSinceLastRollingFeeBump = false;
-    this.lastRollingFeeUpdate = Math.floor(Date.now() / 1000);
+    this.lastRollingFeeUpdate = nowSeconds();
   }
 
   /**
@@ -4808,6 +4842,33 @@ export class Mempool {
     }
 
     return result;
+  }
+
+  /**
+   * Fee and size of the chunk a transaction sits in (Core
+   * CTxMemPool::GetMainChunkFeerate, used by entryToJSON for `chunkweight`
+   * and `fees.chunk`). Falls back to the tx alone if it is not in a cluster.
+   */
+  getMainChunkFeerate(txid: Buffer): { fee: bigint; size: number } {
+    const txidHex = txid.toString("hex");
+    const cluster = this.getCluster(txidHex);
+    const idx = cluster?.linearization.txToChunk.get(txidHex);
+    if (cluster && idx !== undefined) {
+      const chunk = cluster.linearization.chunks[idx];
+      // Core's chunk size is the sum of sigop-adjusted WEIGHTS (txgraph feerate
+      // size), not vsize: summing the ceilinged vsize would over-count.
+      let size = 0;
+      for (const id of chunk.txids) {
+        const e = this.entries.get(id);
+        if (e) size += this.clusterWeightContribution(e);
+      }
+      return { fee: chunk.totalFee, size };
+    }
+    const entry = this.entries.get(txidHex);
+    return {
+      fee: entry ? entry.fee : 0n,
+      size: entry ? this.clusterWeightContribution(entry) : 0,
+    };
   }
 
   /**

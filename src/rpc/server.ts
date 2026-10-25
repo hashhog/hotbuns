@@ -8,6 +8,7 @@
 import * as path from "path";
 import { FATAL_ERROR_TOKEN, fatalRefusal, isFatal } from "../chain/fatal.js";
 import * as fs from "fs";
+import { setMockTime } from "../clock.js";
 import type { ChainStateManager } from "../chain/state.js";
 import type { ChainDB } from "../storage/database.js";
 import { DBPrefix, BlockStatus } from "../storage/database.js";
@@ -1663,6 +1664,7 @@ export class RPCServer {
     // Control methods
     this.registerMethod("stop", (params) => this.stopNode(params));
     this.registerMethod("uptime", () => this.getUptime());
+    this.registerMethod("setmocktime", (params) => this.setMockTimeRpc(params));
     this.registerMethod("getmemoryinfo", async (params) => this.getMemoryInfo(params));
     this.registerMethod("logging", async (params) => this.logging(params));
 
@@ -5731,6 +5733,10 @@ export class RPCServer {
       );
     }
 
+    // Core BroadcastTransaction: a freshly accepted local submission is
+    // unbroadcast until a peer fetches it (cleared on getdata).
+    this.mempool.addUnbroadcastTx(txid);
+
     // Broadcast inv to peers
     this.broadcastTxInv(txid);
 
@@ -5921,6 +5927,7 @@ export class RPCServer {
     for (const [wtxid, txResult] of result.txResults) {
       if (txResult.accepted) {
         const txid = Buffer.from(txResult.txid, "hex");
+        this.mempool.addUnbroadcastTx(txid);
         this.broadcastTxInv(txid);
       }
     }
@@ -5998,7 +6005,7 @@ export class RPCServer {
       mempoolminfee: info.minFeeRate / 100_000, // Convert sat/vB to BTC/kvB
       minrelaytxfee: 0.000001, // 0.1 sat/vB = Core's minrelaytxfee default (0.00000100 BTC/kvB)
       incrementalrelayfee: 0.000001, // 0.1 sat/vB = Core's DEFAULT_INCREMENTAL_RELAY_FEE{100} (0.00000100 BTC/kvB)
-      unbroadcastcount: 0,
+      unbroadcastcount: this.mempool.getUnbroadcastTxs().size,
       fullrbf: true,
       // Core v31.99 MempoolInfoToJSON appends these 5 fields after fullrbf
       // (rpc/mempool.cpp). Values are the policy defaults (policy.h):
@@ -6041,6 +6048,7 @@ export class RPCServer {
       const modifiedFeeSats = this.mempool.getModifiedFee(txid);
       // Core CalculateAncestorData / CalculateDescendantData (transitive, modified fees).
       const rel = this.mempool.getEntryRelatives(txid)!;
+      const chunk = this.mempool.getMainChunkFeerate(txid);
       result[txidHex] = {
         vsize: entry.vsize,
         weight: entry.weight,
@@ -6050,6 +6058,7 @@ export class RPCServer {
         descendantsize: rel.descendantSize,
         ancestorcount: rel.ancestorCount,
         ancestorsize: rel.ancestorSize,
+        chunkweight: chunk.size,
         wtxid: txidHex, // Simplified (same as txid for non-witness txs)
         // Core entryToJSON (mempool.cpp:527-533): fees is nested; no top-level fee/modifiedfee.
         fees: {
@@ -6057,11 +6066,12 @@ export class RPCServer {
           modified: Number(modifiedFeeSats) / 100_000_000,
           ancestor: Number(rel.ancestorFees) / 100_000_000,
           descendant: Number(rel.descendantFees) / 100_000_000,
+          chunk: Number(chunk.fee) / 100_000_000,
         },
         depends: rel.depends,
         spentby: rel.spentby,
         "bip125-replaceable": this.mempool.getRBFOptInState(txid) === RBFTransactionState.REPLACEABLE_BIP125,
-        unbroadcast: false,
+        unbroadcast: this.mempool.isUnbroadcast(txid),
       };
     }
 
@@ -6095,6 +6105,7 @@ export class RPCServer {
     const modifiedFeeSats = this.mempool.getModifiedFee(txid);
     // Core CalculateAncestorData / CalculateDescendantData (transitive, modified fees).
     const rel = this.mempool.getEntryRelatives(txid)!;
+    const chunk = this.mempool.getMainChunkFeerate(txid);
 
     return {
       vsize: entry.vsize,
@@ -6105,6 +6116,7 @@ export class RPCServer {
       descendantsize: rel.descendantSize,
       ancestorcount: rel.ancestorCount,
       ancestorsize: rel.ancestorSize,
+      chunkweight: chunk.size,
       wtxid: txidParam,
       // Core entryToJSON (mempool.cpp:527-533): fees is nested; no top-level fee/modifiedfee.
       fees: {
@@ -6112,13 +6124,14 @@ export class RPCServer {
         modified: Number(modifiedFeeSats) / 100_000_000,
         ancestor: Number(rel.ancestorFees) / 100_000_000,
         descendant: Number(rel.descendantFees) / 100_000_000,
+        chunk: Number(chunk.fee) / 100_000_000,
       },
       depends: rel.depends,
       spentby: rel.spentby,
       // Core IsRBFOptIn: the BIP-125 signal of the tx or an ancestor, not
       // full-RBF replaceability.
       "bip125-replaceable": this.mempool.getRBFOptInState(txid) === RBFTransactionState.REPLACEABLE_BIP125,
-      unbroadcast: false,
+      unbroadcast: this.mempool.isUnbroadcast(txid),
       // Cluster mempool fields
       miningScore: miningScore, // Effective fee rate (sat/vB) from chunk
     };
@@ -6673,7 +6686,7 @@ export class RPCServer {
           depends: rel.depends,
           spentby: rel.spentby,
           "bip125-replaceable": this.mempool.getRBFOptInState(ancestorTxid) === RBFTransactionState.REPLACEABLE_BIP125,
-          unbroadcast: false,
+          unbroadcast: this.mempool.isUnbroadcast(ancestorTxid),
         };
       }
     }
@@ -6757,7 +6770,7 @@ export class RPCServer {
           depends: rel.depends,
           spentby: rel.spentby,
           "bip125-replaceable": this.mempool.getRBFOptInState(descendantTxid) === RBFTransactionState.REPLACEABLE_BIP125,
-          unbroadcast: false,
+          unbroadcast: this.mempool.isUnbroadcast(descendantTxid),
         };
       }
     }
@@ -13224,6 +13237,33 @@ export class RPCServer {
       },
       warnings: [],
     };
+  }
+
+  /**
+   * setmocktime (Core rpc/node.cpp) -- regtest only. Sets the node clock
+   * (mempool entry times, rolling-fee decay, expiry); 0 restores the system
+   * time. Returns null.
+   */
+  private async setMockTimeRpc(params: unknown[]): Promise<null> {
+    if (this.params.networkMagic !== 0xdab5bffa) {
+      throw this.rpcError(
+        RPCErrorCodes.MISC_ERROR,
+        "setmocktime is for regression testing (-regtest mode) only"
+      );
+    }
+    const t = params[0];
+    if (typeof t !== "number" || !Number.isInteger(t)) {
+      throw this.rpcError(RPCErrorCodes.TYPE_ERROR, "JSON value of type " + typeof t + " is not of expected type number");
+    }
+    const maxTime = 9223372036; // Core: nanoseconds::max() in seconds
+    if (t < 0 || t > maxTime) {
+      throw this.rpcError(
+        RPCErrorCodes.INVALID_PARAMETER,
+        `Mocktime must be in the range [0, ${maxTime}], not ${t}.`
+      );
+    }
+    setMockTime(t);
+    return null;
   }
 
   private async getUptime(): Promise<number> {

@@ -27,7 +27,7 @@ import {
   validateBlock,
   blockMutation,
 } from "../validation/block.js";
-import { isCoinbase } from "../validation/tx.js";
+import { isCoinbase, getTxId as getTxIdOf } from "../validation/tx.js";
 import type { Transaction } from "../validation/tx.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { UTXOManager } from "../chain/utxo.js";
@@ -2512,6 +2512,9 @@ export class BlockSync {
             payload: { tx },
           };
           peer.send(txMsg);
+          // Core ProcessGetData: a peer fetching the tx is the
+          // acknowledgement that ends its unbroadcast state.
+          this.mempool?.removeUnbroadcastTx(getTxIdOf(tx));
         } else {
           notFound.push({ type: inv.type, hash: inv.hash });
         }

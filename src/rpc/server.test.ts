@@ -51,6 +51,11 @@ class MockMempool {
     };
   }
 
+  private unbroadcast = new Set<string>();
+  addUnbroadcastTx(txid: Buffer) { this.unbroadcast.add(txid.toString("hex")); }
+  removeUnbroadcastTx(txid: Buffer) { this.unbroadcast.delete(txid.toString("hex")); }
+  isUnbroadcast(txid: Buffer) { return this.unbroadcast.has(txid.toString("hex")); }
+  getUnbroadcastTxs() { return new Set(this.unbroadcast); }
   getAllTxids(): Buffer[] {
     return Array.from(this.entries.values()).map(e => e.txid);
   }
@@ -159,6 +164,13 @@ class MockMempool {
       depends: inPool(self.dependsOn).map(toDisplay).sort(),
       spentby: inPool(self.spentBy).sort().map(toDisplay),
     };
+  }
+
+  // Mirrors the real Mempool.getMainChunkFeerate. The mock has no cluster
+  // linearization, so every tx is its own chunk (weight = 4 * vsize).
+  getMainChunkFeerate(txid: Buffer): { fee: bigint; size: number } {
+    const entry = this.entries.get(txid.toString("hex"));
+    return entry ? { fee: entry.fee, size: entry.vsize * 4 } : { fee: 0n, size: 0 };
   }
 
   // Mirrors the real Mempool.getPrioritisedTransactions. The mock holds no
