@@ -29,6 +29,7 @@
 import type { ChainStateManager } from "../chain/state.js";
 import type { ChainDB, UTXOEntry } from "../storage/database.js";
 import type { Mempool } from "../mempool/mempool.js";
+import { mempoolInfoToJSON } from "../mempool/info.js";
 import type { HeaderSync } from "../sync/headers.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import type { Block, BlockHeader } from "../validation/block.js";
@@ -817,16 +818,7 @@ export class RESTServer {
     }
 
     if (path === "info") {
-      const info = this.mempool.getInfo();
-      const json = {
-        loaded: true,
-        size: info.size,
-        bytes: info.bytes,
-        usage: info.usage, // Estimated real heap retention (Core: DynamicMemoryUsage)
-        maxmempool: info.maxmempool,
-        mempoolminfee: info.minFeeRate / 100000, // Convert to BTC/kvB
-        minrelaytxfee: 0.000001, // 0.1 sat/vB = Core's minrelaytxfee default (0.00000100 BTC/kvB)
-      };
+      const json = mempoolInfoToJSON(this.mempool);
       return this.formatResponse(json, format);
     }
 
