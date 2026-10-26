@@ -1503,6 +1503,14 @@ export class HeaderSync {
   }
 
   /**
+   * Every entry of the header index (Core m_block_index), whatever its
+   * status. Read-only: callers must not mutate the entries.
+   */
+  allHeaders(): IterableIterator<HeaderChainEntry> {
+    return this.headerChain.values();
+  }
+
+  /**
    * Get a header entry by height (on the best chain).
    */
   getHeaderByHeight(height: number): HeaderChainEntry | undefined {
