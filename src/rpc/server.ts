@@ -188,6 +188,9 @@ import {
 // accepts.
 import CORE_ARITY_TABLE from "./core-arity.json";
 
+/** createwallet positional count with the hotbuns mnemonic + mnemonic_passphrase extension. */
+const CREATEWALLET_MNEMONIC_DECLARED = 9;
+
 export interface CoreArity {
   required: number;
   declared: number;
@@ -1423,7 +1426,17 @@ export class RPCServer {
     // Ordering is Core's: an unknown method is METHOD_NOT_FOUND above.
     // Named params (an object) are exempt -- Core resolves those by name.
     if (Array.isArray(request.params)) {
-      const arity = coreArityFor(request.method);
+      // hotbuns extension: createwallet's BIP-39 mnemonic restore rides on
+      // positions 8-9 (see createWallet). Core's position 8 is the boolean
+      // external_signer, so a STRING there can only be the mnemonic: widen
+      // the count to 9 and type-check just the Core-shaped prefix. A boolean
+      // there is a plain Core call and keeps Core's limit of 8.
+      const mnemonicExt =
+        request.method === "createwallet" &&
+        typeof request.params[7] === "string";
+      const arity = mnemonicExt
+        ? { required: 1, declared: CREATEWALLET_MNEMONIC_DECLARED }
+        : coreArityFor(request.method);
       if (
         arity &&
         (request.params.length < arity.required ||
@@ -1441,7 +1454,10 @@ export class RPCServer {
       }
       // Then the central type check (rpc/util.cpp:647-657), still before
       // the handler: -3 "Wrong type passed:\n{...}".
-      const typeErr = coreArgTypeMismatch(request.method, request.params);
+      const typeErr = coreArgTypeMismatch(
+        request.method,
+        mnemonicExt ? request.params.slice(0, 7) : request.params,
+      );
       if (typeErr !== undefined) {
         return {
           jsonrpc: "2.0",
