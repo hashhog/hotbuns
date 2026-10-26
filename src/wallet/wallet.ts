@@ -476,6 +476,8 @@ export class Wallet {
   private masterKey: { key: Buffer; chainCode: Buffer };
   private keys: Map<string, WalletKey>; // address -> key info
   private utxos: Map<string, WalletUTXO>; // outpoint string -> utxo
+  /** Values of inputs dropped at broadcast (commitUnconfirmedSpend), kept so the confirming block can compute the debit. */
+  private pendingSpentValues: Map<string, bigint> = new Map();
   private config: WalletConfig;
 
   // Per-address-type indices for receive and change
@@ -1660,6 +1662,10 @@ export class Wallet {
   commitUnconfirmedSpend(tx: Transaction): void {
     for (const input of tx.inputs) {
       const key = `${input.prevOut.txid.toString("hex")}:${input.prevOut.vout}`;
+      const utxo = this.utxos.get(key);
+      // Remember the value so processBlock can still compute the debit when
+      // the spending block connects (the UTXO is gone from this.utxos by then).
+      if (utxo) this.pendingSpentValues.set(key, utxo.amount);
       this.utxos.delete(key);
     }
   }
@@ -2829,7 +2835,12 @@ export class Wallet {
         if (spent) {
           debit += spent.amount;
           this.utxos.delete(spentKey);
+        } else {
+          // Inputs dropped at broadcast by commitUnconfirmedSpend.
+          const pending = this.pendingSpentValues.get(spentKey);
+          if (pending !== undefined) debit += pending;
         }
+        this.pendingSpentValues.delete(spentKey);
       }
 
       // ── Record the wallet-history entry if this tx touched the wallet ──────
