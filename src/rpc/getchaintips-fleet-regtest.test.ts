@@ -263,4 +263,38 @@ describe("getchaintips: every block-index leaf, Core statuses and branchlen", ()
     const after = await tips();
     expect(after).toEqual(before);
   }, 120_000);
+
+  // Core InvalidBlockFound sets BLOCK_FAILED_VALID on the index and the flag
+  // is flushed with it, so after a restart the block is still invalid and a
+  // header building on it is refused "bad-prevblk" (never indexed).
+  // tools/core-regtest warden_invalidated_submit/p2p-header: hotbuns indexed
+  // that child (078cf9..., height 105) and listed it as a tip.
+  test("a ConnectBlock failure stays invalid across a restart; its child header is refused", async () => {
+    const bad = mine(hashOf(blocks[5]), t + 1, 6, 0x27, SUBSIDY + 1n);
+    expect(await submit(bad)).toBe("bad-cb-amount");
+    // A valid sibling on the same parent connects: only the failed block and
+    // its descendants are marked, never its parent or siblings.
+    const good = mine(hashOf(blocks[5]), t + 2, 6, 0x28);
+    expect(await submit(good)).toBeNull();
+    expect(chainState.getBestBlock().hash.equals(hashOf(good))).toBe(true);
+
+    await restart();
+    expect(chainState.getBestBlock().hash.equals(hashOf(good))).toBe(true);
+    const all = await tips();
+    expect(all.get(display(hashOf(bad)))).toEqual({
+      height: 6, hash: display(hashOf(bad)), branchlen: 1, status: "invalid",
+    });
+    expect(all.get(display(hashOf(good)))!.status).toBe("active");
+
+    const child = mine(hashOf(bad), t + 3, 7, 0x27);
+    await expect(
+      rpc("submitheader", [serializeBlockHeader(child.header).toString("hex")])
+    ).rejects.toThrow("bad-prevblk");
+    await expect(rpc("getblockheader", [display(hashOf(child))])).rejects.toThrow("Block not found");
+    expect((await tips()).has(display(hashOf(child)))).toBe(false);
+
+    // A header on the valid sibling is still accepted.
+    const next = mine(hashOf(good), t + 4, 7, 0x28);
+    expect(await rpc("submitheader", [serializeBlockHeader(next.header).toString("hex")])).toBeNull();
+  }, 120_000);
 });
