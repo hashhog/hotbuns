@@ -3411,23 +3411,113 @@ export class RPCServer {
   }
 
   /**
-   * getchaintips: Return information about all known tips in the block tree.
-   * Returns an array of tips with status, height, and hash.
+   * getchaintips — Core rpc/blockchain.cpp getchaintips.
+   *
+   * Core walks m_block_index: every entry NOT on the active chain whose hash
+   * is no other off-chain entry's pprev is a tip, plus the active tip.
+   * branchlen = height - FindFork(active).height. Status, in Core's order:
+   *   active        on the active chain;
+   *   invalid       BLOCK_FAILED_MASK (the block or an ancestor failed);
+   *   headers-only  !HaveNumChainTxs (the block or an off-chain ancestor
+   *                 never had its data);
+   *   valid-fork    IsValid(BLOCK_VALID_SCRIPTS): the block was connected
+   *                 once (TXS_VALID in its index record);
+   *   valid-headers otherwise (data, never connected).
+   *
+   * The block index here is the header tree (`HeaderSync`) plus the per-hash
+   * index records in the DB. Read-only: nothing here feeds validation or
+   * chain selection.
    */
   private async getChainTips(): Promise<Array<Record<string, unknown>>> {
-    const tips: Array<Record<string, unknown>> = [];
-    const bestBlock = this.chainState.getBestBlock();
+    const best = this.chainState.getBestBlock();
+    const display = (h: Buffer) => Buffer.from(h).reverse().toString("hex");
+    const tips: Array<Record<string, unknown>> = [
+      { height: best.height, hash: display(best.hash), branchlen: 0, status: "active" },
+    ];
 
-    // For now, return just the active tip
-    // A full implementation would track all fork tips
-    tips.push({
-      height: bestBlock.height,
-      hash: Buffer.from(bestBlock.hash).reverse().toString("hex"),
-      branchlen: 0,
-      status: "active",
-    });
+    const activeCache = new Map<number, Buffer | null>();
+    const activeHashAt = async (height: number): Promise<Buffer | null> => {
+      if (height < 0 || height > best.height) return null;
+      if (height === best.height) return best.hash;
+      let h = activeCache.get(height);
+      if (h === undefined) {
+        h = await this.db.getBlockHashByHeight(height);
+        activeCache.set(height, h);
+      }
+      return h;
+    };
 
-    return tips;
+    // Highest height at which the best-header chain (in memory) and the
+    // active chain agree. Below it, an entry that is the best-header chain's
+    // entry at its height is on the active chain without a DB read.
+    let agree = best.height;
+    while (agree >= 0) {
+      const e = this.headerSync.getHeaderByHeight(agree);
+      const a = await activeHashAt(agree);
+      if (e && a && e.hash.equals(a)) break;
+      agree--;
+    }
+
+    // Off-active-chain index entries, keyed by hash hex.
+    const off = new Map<string, HeaderChainEntry>();
+    for (const e of this.headerSync.allHeaders()) {
+      if (e.height <= agree) {
+        const onBest = this.headerSync.getHeaderByHeight(e.height);
+        if (onBest && onBest.hash.equals(e.hash)) continue;
+      }
+      const a = await activeHashAt(e.height);
+      if (a && a.equals(e.hash)) continue;
+      off.set(e.hash.toString("hex"), e);
+    }
+    const prevs = new Set<string>();
+    for (const e of off.values()) prevs.add(e.header.prevBlock.toString("hex"));
+
+    const FAILED = BlockStatus.FAILED_VALID | BlockStatus.FAILED_CHILD;
+    const offTips: Array<Record<string, unknown>> = [];
+    for (const [hex, tip] of off) {
+      if (prevs.has(hex)) continue;
+      const tipIdx = await this.db.getBlockIndex(tip.hash);
+      let invalid = tip.status === "invalid" || (tipIdx !== null && (tipIdx.status & FAILED) !== 0);
+      let noData = false;
+      let forkHeight = tip.height - 1;
+      let cur: HeaderChainEntry = tip;
+      for (;;) {
+        if (cur.status === "invalid") invalid = true;
+        if (!noData) {
+          const idx = cur === tip ? tipIdx : await this.db.getBlockIndex(cur.hash);
+          const hasData =
+            idx !== null &&
+            (idx.nTx > 0 || (idx.status & (BlockStatus.TXS_VALID | BlockStatus.HAVE_DATA)) !== 0);
+          if (!hasData) noData = true;
+        }
+        const parentHex = cur.header.prevBlock.toString("hex");
+        const parent = off.get(parentHex);
+        if (!parent) {
+          // First ancestor on the active chain (or the bottom of a header
+          // island with no indexed parent).
+          forkHeight = cur.height - 1;
+          break;
+        }
+        cur = parent;
+      }
+
+      let status: string;
+      if (invalid) status = "invalid";
+      else if (noData) status = "headers-only";
+      else if (tipIdx !== null && (tipIdx.status & BlockStatus.TXS_VALID) !== 0) status = "valid-fork";
+      else status = "valid-headers";
+
+      offTips.push({
+        height: tip.height,
+        hash: display(tip.hash),
+        branchlen: Math.max(0, tip.height - forkHeight),
+        status,
+      });
+    }
+    // Core's setTips order: height descending (the active tip first on a tie;
+    // Array.prototype.sort is stable).
+    offTips.sort((a, b) => (a.hash as string).localeCompare(b.hash as string));
+    return [...tips, ...offTips].sort((a, b) => (b.height as number) - (a.height as number));
   }
 
   /**

@@ -3464,6 +3464,33 @@ export class BlockSync {
     return true;
   }
 
+  /**
+   * Persist a consensus failure in the block index: BLOCK_FAILED_VALID (32) on
+   * the failed block, BLOCK_FAILED_CHILD (64) on every indexed descendant
+   * (Core InvalidBlockFound + SetBlockFailureFlags). Best-effort: a write
+   * error leaves the in-memory verdict standing, as before.
+   */
+  private async persistBlockFailure(failedHash: Buffer): Promise<void> {
+    try {
+      const idx = await this.db.getBlockIndex(failedHash);
+      if (idx && !(idx.status & 32)) {
+        await this.db.updateBlockStatus(failedHash, idx.status | 32 /* FAILED_VALID */);
+      }
+      for (const d of this.headerSync.collectDescendants(failedHash)) {
+        const dIdx = await this.db.getBlockIndex(d.hash);
+        if (dIdx && !(dIdx.status & (32 | 64))) {
+          await this.db.updateBlockStatus(d.hash, dIdx.status | 64 /* FAILED_CHILD */);
+        }
+      }
+    } catch (err) {
+      console.warn(
+        `[invalidate-header] could not persist failure of ${failedHash
+          .toString("hex")
+          .slice(0, 16)}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
   private async processOrderedBlocks(): Promise<void> {
     // Shutdown requested: never start another block (see stop()).
     if (this.stopRequested) {
@@ -3832,10 +3859,17 @@ export class BlockSync {
           isInvalidBlockVerdict(failureMsg)
         ) {
           const activeTip = this.chainStateManager.getBestBlock();
-          this.headerSync.invalidateHeader(
-            invalidIntermediate ? invalidIntermediate.hash : headerEntry.hash,
-            activeTip.hash
-          );
+          const failedHash = invalidIntermediate ? invalidIntermediate.hash : headerEntry.hash;
+          this.headerSync.invalidateHeader(failedHash, activeTip.hash);
+          // Core InvalidBlockFound marks the index entry BLOCK_FAILED_VALID
+          // (and InvalidChainFound / SetBlockFailureFlags its descendants
+          // BLOCK_FAILED_CHILD) in m_dirty_blockindex, which is flushed, so
+          // the verdict survives a restart. The header-layer flag above is
+          // in-memory only: after a restart the block read back as a plain
+          // header and a header building on it was indexed instead of being
+          // refused "bad-prevblk". loadFromDB already maps these bits back to
+          // "invalid"; reconsiderblock already clears them.
+          await this.persistBlockFailure(failedHash);
         }
 
         // Track consecutive failures at the same height to detect permanent
