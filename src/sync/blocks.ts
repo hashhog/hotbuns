@@ -54,7 +54,11 @@ import {
 import {
   MAX_CMPCTBLOCK_DEPTH,
   MAX_BLOCKTXN_DEPTH,
+  createCompactBlockFromBlock,
+  createBlockTxnResponse,
 } from "../p2p/compact_blocks.js";
+import type { GetBlockTxnPayload } from "../p2p/messages.js";
+import { randomBytes } from "node:crypto";
 
 /**
  * Classify a connect-block error string into one of three buckets so the
@@ -1628,32 +1632,14 @@ export class BlockSync {
     });
 
     // BIP 152: Handle getblocktxn — peer requesting missing txs for compact block
-    // reconstruction they are performing. Depth guard: ignore requests for blocks
-    // deeper than MAX_BLOCKTXN_DEPTH=10 from the tip — stale requests waste I/O.
-    // Core: net_processing.cpp MAX_BLOCKTXN_DEPTH = 10.
+    // reconstruction they are performing. Core: ProcessGetBlockTxn
+    // (net_processing.cpp), MAX_BLOCKTXN_DEPTH = 10.
     peerManager.onMessage("getblocktxn", (peer, msg) => {
       if (msg.type !== "getblocktxn") return;
 
-      const blockHash = msg.payload.blockHash;
-      const hashHex = blockHash.toString("hex");
-
-      // Depth guard: refuse to serve getblocktxn for old blocks.
-      const tipHeight = this.state.nextHeightToProcess - 1;
-      const headerEntry = this.headerSync.getHeader(blockHash);
-      const blockHeight = headerEntry?.height;
-      const depth = blockHeight !== undefined ? tipHeight - blockHeight : 0;
-
-      if (depth > MAX_BLOCKTXN_DEPTH) {
-        console.log(
-          `Ignoring getblocktxn from ${peer.host}:${peer.port} — ` +
-          `depth=${depth} exceeds MAX_BLOCKTXN_DEPTH=${MAX_BLOCKTXN_DEPTH} ` +
-          `(hash=${hashHex.slice(0, 16)})`
-        );
-        return;
-      }
-
-      // We don't serve compact blocks yet (BUG-5 — getblocktxn serve path is a stub).
-      // The depth guard above is in place; full serving is out of scope for FIX-42.
+      this.handleGetBlockTxn(peer, msg.payload).catch((err) => {
+        console.error(`Error handling getblocktxn from ${peer.host}:${peer.port}:`, err);
+      });
     });
 
     // BIP 152: Handle blocktxn — response to our getblocktxn request
@@ -2462,6 +2448,40 @@ export class BlockSync {
   }
 
   /**
+   * Distance of a block from the tip, or Infinity when its header is unknown
+   * (Core: ActiveChain().Height() - pindex->nHeight).
+   */
+  private blockDepth(hash: Buffer): number {
+    const entry = this.headerSync.getHeader(hash);
+    if (!entry) return Infinity;
+    return this.state.nextHeightToProcess - 1 - entry.height;
+  }
+
+  /**
+   * Serve getblocktxn. Core ProcessGetBlockTxn (net_processing.cpp): unknown
+   * block -> nothing; deeper than MAX_BLOCKTXN_DEPTH -> the full block instead
+   * (the peer's compact-block state is stale); an out-of-range index is a
+   * protocol violation and gets no reply; otherwise blocktxn.
+   */
+  private async handleGetBlockTxn(peer: Peer, req: GetBlockTxnPayload): Promise<void> {
+    const rawBlock = await this.db.getBlock(req.blockHash);
+    if (!rawBlock) return;
+    const block = deserializeBlock(new BufferReader(rawBlock));
+    if (this.blockDepth(req.blockHash) > MAX_BLOCKTXN_DEPTH) {
+      peer.send({ type: "block", payload: { block } });
+      return;
+    }
+    const resp = createBlockTxnResponse(block, req);
+    if (!resp) {
+      console.log(
+        `Ignoring getblocktxn from ${peer.host}:${peer.port} — out-of-bounds tx index`,
+      );
+      return;
+    }
+    peer.send({ type: "blocktxn", payload: resp });
+  }
+
+  /**
    * Handle getdata requests from peers — serve blocks we have stored.
    */
   private async handleGetData(peer: Peer, inventory: InvVector[]): Promise<void> {
@@ -2474,27 +2494,26 @@ export class BlockSync {
       if (
         inv.type === InvType.MSG_BLOCK ||
         inv.type === InvType.MSG_WITNESS_BLOCK ||
-        // BIP-152: a Core peer that picked us as a high-bandwidth compact
-        // block peer fetches a freshly announced tip with
-        // getdata(MSG_CMPCT_BLOCK). This arm used to be missing, so the
-        // request was dropped with no reply and no notfound, and the peer
-        // never got the block (regtest relay test 2026-09-26). We answer
-        // with the FULL block, which is what Core itself sends for
-        // MSG_CMPCT_BLOCK outside MAX_CMPCTBLOCK_DEPTH
-        // (net_processing.cpp ProcessGetBlockData, the IsMsgCmpctBlk arm);
-        // a full block always satisfies the in-flight request. A cmpctblock
-        // reply would additionally require serving getblocktxn, which
-        // hotbuns does not do yet.
         inv.type === InvType.MSG_CMPCT_BLOCK
       ) {
         const rawBlock = await this.db.getBlock(inv.hash);
         if (rawBlock) {
           const block = deserializeBlock(new BufferReader(rawBlock));
-          const blockMsg: NetworkMessage = {
-            type: "block",
-            payload: { block },
-          };
-          peer.send(blockMsg);
+          // Core ProcessGetBlockData, IsMsgCmpctBlk arm: a block within
+          // MAX_CMPCTBLOCK_DEPTH of the tip goes out as a BIP-152 cmpctblock
+          // (version 2, coinbase prefilled, wtxid short IDs); deeper blocks,
+          // and blocks we have no header for, go out in full.
+          if (inv.type === InvType.MSG_CMPCT_BLOCK && this.blockDepth(inv.hash) <= MAX_CMPCTBLOCK_DEPTH) {
+            peer.send({
+              type: "cmpctblock",
+              payload: createCompactBlockFromBlock(
+                block,
+                randomBytes(8).readBigUInt64LE(0),
+              ),
+            });
+          } else {
+            peer.send({ type: "block", payload: { block } });
+          }
         }
       } else if (
         inv.type === InvType.MSG_TX ||
