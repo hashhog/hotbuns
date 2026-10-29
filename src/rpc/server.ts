@@ -24,6 +24,7 @@ import {
 import type { OrphanPool, OrphanEntry } from "../mempool/orphan_pool.js";
 import { RBFTransactionState } from "../mempool/rbf.js";
 import type { PeerManager } from "../p2p/manager.js";
+import { meetsFeeFilter } from "../p2p/feefilter.js";
 import { ServiceFlags } from "../p2p/manager.js";
 import { recordSnapshotOrigin, snapshotOriginWithoutHistory } from "../chain/snapshot_origin.js";
 import { parseIPv4, parseIPv6 } from "../p2p/asmap.js";
@@ -6076,7 +6077,11 @@ export class RPCServer {
    * type — Core peers silently discard inv entries with that type.
    */
   private broadcastTxInv(txid: Buffer): void {
+    // Core RelayTransaction skips a peer whose BIP-133 feefilter is above the
+    // tx's feerate (net_processing.cpp, `tx_relay->m_fee_filter_received`).
+    const feeRate = this.mempool.getTransaction(txid)?.feeRate;
     for (const peer of this.peerManager.getConnectedPeers()) {
+      if (feeRate !== undefined && !meetsFeeFilter(feeRate, peer.feeFilterReceived ?? 0n)) continue;
       const invType = peer.wtxidRelay ? InvType.MSG_WTX : InvType.MSG_TX;
       const invMsg: NetworkMessage = {
         type: "inv",

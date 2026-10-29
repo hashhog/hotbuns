@@ -51,6 +51,7 @@ describe("block relay serving", () => {
     db = new ChainDB(join(dataDir, "blocks.db"));
     await db.open();
     headerSync = new HeaderSync(db, REGTEST);
+    headerSync.initGenesis();
   });
 
   afterEach(async () => {
@@ -71,16 +72,19 @@ describe("block relay serving", () => {
     expect((headers[0].payload as any).headers.length).toBe(0);
   });
 
-  test("getdata(MSG_CMPCT_BLOCK) is answered with the block", async () => {
+  test("getdata(MSG_CMPCT_BLOCK) is answered (cmpctblock near the tip; block for MSG_WITNESS_BLOCK)", async () => {
     const raw = (REGTEST as any).genesisBlock as Buffer;
     const hash = sha256d(raw.subarray(0, 80));
     await db.putBlock(hash, raw);
     const sync = new BlockSync(db, REGTEST, headerSync) as any;
-    for (const type of [InvType.MSG_CMPCT_BLOCK, InvType.MSG_WITNESS_BLOCK]) {
+    for (const [type, reply] of [
+      [InvType.MSG_CMPCT_BLOCK, "cmpctblock"],
+      [InvType.MSG_WITNESS_BLOCK, "block"],
+    ] as const) {
       const { peer, sent } = stubPeer();
       await sync.handleGetData(peer, [{ type, hash }]);
-      const blocks = sent.filter((m) => m.type === "block");
-      expect(blocks.length).toBe(1);
+      expect(sent.filter((m) => m.type === reply).length).toBe(1);
+      expect(sent.length).toBe(1);
     }
   });
 });
