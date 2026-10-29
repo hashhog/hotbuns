@@ -248,6 +248,8 @@ export interface NodeConfig {
    * Reference: BIP-157, BIP-158, bitcoin-core/src/index/blockfilterindex.cpp
    */
   blockfilterindex: boolean;
+  /** Core -fallbackfee in BTC/kvB (0 = disabled, Core's default). */
+  fallbackfee: number;
   /**
    * Enable the per-height UTXO coinstats index. Mirrors Bitcoin Core's
    * `-coinstatsindex` (default OFF: DEFAULT_COINSTATSINDEX = false).
@@ -388,6 +390,7 @@ const DEFAULT_CONFIG: NodeConfig = {
   internalSupervisedChild: false,
   rest: false,
   blockfilterindex: false,
+  fallbackfee: 0,
   coinstatsindex: false,
   txospenderindex: false,
   txindex: false,
@@ -707,6 +710,12 @@ export function parseArgs(argv: string[]): ParsedArgs {
             if (!isNaN(restPortVal) && restPortVal > 0) config.restPort = restPortVal;
           }
           break;
+        case "fallbackfee": {
+          // Bitcoin Core `-fallbackfee=<amt>` in BTC/kvB. Default 0 = disabled.
+          const ff = parseFloat(value as string);
+          if (!isNaN(ff) && ff >= 0) config.fallbackfee = ff;
+          break;
+        }
         case "blockfilterindex":
           // Bitcoin Core flag `-blockfilterindex=basic`. Bare flag,
           // `=1`/`=true`/`=basic` enables; `=0`/`=false` disables.
@@ -1012,6 +1021,12 @@ export async function loadConfig(
             }
           }
           break;
+        case "fallbackfee": {
+          // Bitcoin Core `-fallbackfee=<amt>` in BTC/kvB. Default 0 = disabled.
+          const ff = parseFloat(value as string);
+          if (!isNaN(ff) && ff >= 0) config.fallbackfee = ff;
+          break;
+        }
         case "blockfilterindex":
           // Mirror CLI: 0/false = off; 1/true/basic = on.
           config.blockfilterindex =
@@ -2790,6 +2805,8 @@ async function startNode(config: NodeConfig): Promise<void> {
     mempool,
     peerManager,
     feeEstimator,
+    // BTC/kvB -> sat/vB
+    fallbackFeeSatVb: (mergedConfig.fallbackfee * 100_000_000) / 1000,
     headerSync,
     db,
     params,

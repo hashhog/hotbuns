@@ -60,16 +60,9 @@ describe("W139-G1: per-horizon decay constants", () => {
 // G2 — DEFAULT_FEE_RATE = 20 sat/vB fallback (BUG-1, P2-CONSISTENCY)
 // =============================================================================
 
-describe("W139-G2: DEFAULT_FEE_RATE=20 fallback (BUG-1)", () => {
-  it("BUG-1: hotbuns has a hardcoded 20 sat/vB fallback (Core returns CFeeRate(0))", () => {
-    // Core returns CFeeRate(0) to signal error; hotbuns substitutes 20.
-    // Source-level: DEFAULT_FEE_RATE constant exists at top of estimator.ts.
-    expect(ESTIMATOR_SRC).toMatch(/const\s+DEFAULT_FEE_RATE\s*=\s*20\b/);
-    // It is returned from estimateFee() and estimateSmartFee() fallbacks.
-    expect(ESTIMATOR_SRC).toMatch(/return\s+DEFAULT_FEE_RATE\s*;/);
-    expect(ESTIMATOR_SRC).toMatch(
-      /return\s*\{\s*feeRate:\s*DEFAULT_FEE_RATE,\s*blocks:/
-    );
+describe("W139-G2: no hardcoded fee fallback (BUG-1 fixed)", () => {
+  it("BUG-1 fixed: estimator has no DEFAULT_FEE_RATE substitute for 'no estimate'", () => {
+    expect(ESTIMATOR_SRC).not.toMatch(/DEFAULT_FEE_RATE/);
   });
 
   it("BUG-1: RPC layer masks the bug via its own zero/falsy gate", () => {

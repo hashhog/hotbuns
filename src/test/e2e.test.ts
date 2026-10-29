@@ -357,10 +357,11 @@ describe("e2e regtest", () => {
   });
 
   describe("estimatesmartfee", () => {
-    test("returns fee estimate", async () => {
+    test("fresh regtest node has no estimate: errors, no feerate (Core)", async () => {
       const estimate = await rpcCall("estimatesmartfee", [6]) as Record<string, unknown>;
 
-      expect(typeof estimate.feerate).toBe("number");
+      expect(estimate.feerate).toBeUndefined();
+      expect(estimate.errors).toEqual(["Insufficient data or no feerate found"]);
       expect(typeof estimate.blocks).toBe("number");
       expect(estimate.blocks).toBeGreaterThan(0);
     });

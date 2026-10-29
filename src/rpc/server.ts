@@ -343,6 +343,8 @@ export interface RPCServerConfig {
  * Dependencies for the RPC server.
  */
 export interface RPCServerDeps {
+  /** Core -fallbackfee in sat/vB; 0/undefined = disabled (Core default). */
+  fallbackFeeSatVb?: number;
   chainState: ChainStateManager;
   mempool: Mempool;
   peerManager: PeerManager;
@@ -812,6 +814,7 @@ export class RPCServer {
   private mempool: Mempool;
   private peerManager: PeerManager;
   private feeEstimator: FeeEstimator;
+  private fallbackFeeSatVb: number;
   private headerSync: HeaderSync;
   private db: ChainDB;
   private params: ConsensusParams;
@@ -933,6 +936,7 @@ export class RPCServer {
     this.mempool = deps.mempool;
     this.peerManager = deps.peerManager;
     this.feeEstimator = deps.feeEstimator;
+    this.fallbackFeeSatVb = deps.fallbackFeeSatVb ?? 0;
     this.headerSync = deps.headerSync;
     this.db = deps.db;
     this.params = deps.params;
@@ -13662,6 +13666,28 @@ export class RPCServer {
   }
 
   /**
+   * Fee rate (sat/vB) for a wallet send. Mirrors Core's GetMinimumFeeRate
+   * (wallet/fees.cpp): an explicit fee_rate wins; otherwise the estimator;
+   * if it has no data, -fallbackfee; if that is disabled too, fail with
+   * RPC_WALLET_INSUFFICIENT_FUNDS (-6), which is what SendMoney maps every
+   * CreateTransaction error to.
+   */
+  private resolveWalletFeeRate(explicit: number | undefined, confTargetParam: unknown): number {
+    if (explicit !== undefined) return explicit;
+    const target =
+      typeof confTargetParam === "number" && Number.isInteger(confTargetParam) && confTargetParam > 0
+        ? Math.min(confTargetParam, 1008)
+        : 6;
+    const est = this.feeEstimator.estimateSmartFee(target);
+    if (est.feeRate > 0) return est.feeRate;
+    if (this.fallbackFeeSatVb > 0) return this.fallbackFeeSatVb;
+    throw this.rpcError(
+      RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS,
+      "Fee estimation failed. Fallbackfee is disabled. Wait a few blocks or enable -fallbackfee."
+    );
+  }
+
+  /**
    * send [{"address":amount},...] ( conf_target "estimate_mode" fee_rate options )
    *
    * Reference: bitcoin-core/src/wallet/rpc/spend.cpp::send.
@@ -13672,10 +13698,12 @@ export class RPCServer {
   private async send(params: unknown[]): Promise<Record<string, unknown>> {
     const [outputsParam, , , feeRateParam] = params;
     const outputs = this.parsePaymentOutputs(outputsParam);
-    let feeRate = 1;
-    if (typeof feeRateParam === "number" && feeRateParam > 0 && Number.isFinite(feeRateParam)) {
-      feeRate = feeRateParam;
-    }
+    const feeRate = this.resolveWalletFeeRate(
+      typeof feeRateParam === "number" && feeRateParam > 0 && Number.isFinite(feeRateParam)
+        ? feeRateParam
+        : undefined,
+      params[1]
+    );
 
     const wallet = this.getCurrentWallet();
     if (wallet.isPrivateKeysDisabled()) {
@@ -13867,10 +13895,10 @@ export class RPCServer {
     }
 
     // Fee rate: Core's `fee_rate` (param 9) is sat/vB.
-    let feeRate = 1; // 1 sat/vB default
-    if (typeof feeRateParam === "number" && feeRateParam > 0) {
-      feeRate = feeRateParam;
-    }
+    const feeRate = this.resolveWalletFeeRate(
+      typeof feeRateParam === "number" && feeRateParam > 0 ? feeRateParam : undefined,
+      params[6]
+    );
 
     // Convert BTC → sats (rounded to nearest sat to avoid FP wobble).
     const amountSats = BigInt(Math.round(amountParam * 100_000_000));
