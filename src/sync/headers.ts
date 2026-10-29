@@ -2016,19 +2016,24 @@ export class HeaderSync {
    *   }
    *
    * Skipped (Core `already_validated_work`) when the last header is already
-   * on our best-header chain, and for headers that do not connect (those take
-   * the unconnecting path in processHeaders).
+   * on our best-header chain.
    *
    * Returns "proceed" (enough work — store as usual), "ignore" (drop the
-   * message), or the newly created PRESYNC state to run the message through.
+   * message), "unconnecting" (headers[0]'s parent is unknown — Core
+   * HandleUnconnectingHeaders, net_processing.cpp:3034, stores nothing), or
+   * the newly created PRESYNC state to run the message through.
+   *
+   * The claimed work is only meaningful because the caller has already run
+   * checkHeadersPoW: every header's PoW matches its own nBits and the batch is
+   * one continuous chain from headers[0].
    */
   private checkLowWorkHeaders(
     peerKey: string,
     headers: BlockHeader[],
     fullMessage: boolean
-  ): "proceed" | "ignore" | PeerSyncState {
+  ): "proceed" | "ignore" | "unconnecting" | PeerSyncState {
     const chainStart = this.headerChain.get(headers[0].prevBlock.toString("hex"));
-    if (!chainStart) return "proceed";
+    if (!chainStart) return "unconnecting";
 
     // Core IsAncestorOfBestHeaderOrTip: already-known best-chain headers use
     // no new memory, so they skip the work check.
@@ -2065,6 +2070,34 @@ export class HeaderSync {
   }
 
   /**
+   * Bitcoin Core `PeerManagerImpl::CheckHeadersPoW` (net_processing.cpp:2617):
+   * every header's hash must meet the target of its OWN nBits
+   * (`HasValidProofOfWork` → `CheckProofOfWork`, validation.cpp:4021), and
+   * each header must build on the one before it (`CheckHeadersAreContinuous`).
+   * Returns the Misbehaving reason on failure, or null.
+   *
+   * Without this the low-work gate summed claimed work over a batch that need
+   * not be a chain: one junk header with bits=0x03000001 (target 1) claims
+   * ~2^255 work and unlocked every other header for storage (audit C2).
+   */
+  private checkHeadersPoW(headers: BlockHeader[]): string | null {
+    for (const h of headers) {
+      const target = compactToBigInt(h.bits);
+      if (target === 0n || target > this.params.powLimit) {
+        return "header with invalid proof of work";
+      }
+      const hashValue = BigInt("0x" + Buffer.from(getBlockHash(h)).reverse().toString("hex"));
+      if (hashValue > target) return "header with invalid proof of work";
+    }
+    for (let i = 1; i < headers.length; i++) {
+      if (!headers[i].prevBlock.equals(getBlockHash(headers[i - 1]))) {
+        return "non-continuous headers sequence";
+      }
+    }
+    return null;
+  }
+
+  /**
    * Handle incoming headers message.
    *
    * Processes headers through anti-DoS state machine if active for this peer,
@@ -2097,12 +2130,30 @@ export class HeaderSync {
       return;
     }
 
+    // Core ProcessHeadersMessage (net_processing.cpp:2985) runs CheckHeadersPoW
+    // before the headers reach the sync state or the low-work gate, and
+    // Misbehaving() on failure; nothing in the message is stored. (The pre-base
+    // backfill route above is bounded to heights below the snapshot root and
+    // checks each header itself, keeping the valid prefix of a batch.)
+    const powError = this.checkHeadersPoW(headers);
+    if (powError) {
+      console.warn(`Rejected headers from ${peerKey}: ${powError}`);
+      peer.misbehaving(BanScores.INVALID_BLOCK_HEADER, powError);
+      return;
+    }
+
     let peerState = this.peerSyncStates.get(peerKey);
     const fullMessage = headers.length >= MAX_HEADERS_RESULTS;
 
     if (!peerState || peerState.syncState.getState() === HeadersSyncStateEnum.FINAL) {
       const gate = this.checkLowWorkHeaders(peerKey, headers, fullMessage);
       if (gate === "ignore") return;
+      if (gate === "unconnecting") {
+        // Core HandleUnconnectingHeaders: store nothing, try to fill the gap.
+        // Not a successful pass, so the unconnecting counter is not reset.
+        this.requestHeaders(peer);
+        return;
+      }
       if (gate !== "proceed") peerState = gate;
     }
 
