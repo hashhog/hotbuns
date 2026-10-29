@@ -83,6 +83,12 @@ export interface PeerConfig {
    * When absent, limited peers are treated as NOT desirable (IBD default).
    */
   isNearTip?: () => boolean;
+  /** Send-pause threshold in bytes. Defaults to {@link DEFAULT_MAX_SEND_BUFFER}. */
+  maxSendBuffer?: number;
+  /** Receive-pause threshold in bytes. Defaults to {@link DEFAULT_MAX_RECEIVE_BUFFER}. */
+  maxReceiveBuffer?: number;
+  /** Disconnect threshold for the send queue. Defaults to {@link SEND_BUFFER_HARD_LIMIT}. */
+  sendBufferHardLimit?: number;
 }
 
 /** Event handlers for peer lifecycle events. */
@@ -228,6 +234,32 @@ export const MAX_OUTBOUND_PEERS_TO_PROTECT = 4;
  * Reference: clearbit Peer.V2_HANDSHAKE_DEADLINE_MS = 30_000.
  */
 export const V2_HANDSHAKE_DEADLINE_MS = 30_000;
+
+/**
+ * Per-peer send queue limit (Core net.h DEFAULT_MAXSENDBUFFER = 1000 KB).
+ * Once this many bytes are waiting for the kernel, the peer is "send-paused"
+ * (Core fPauseSend): we stop dispatching its messages, so it cannot make us
+ * build more replies, until onDrain brings the queue back under the limit.
+ */
+export const DEFAULT_MAX_SEND_BUFFER = 1000 * 1000;
+
+/**
+ * Per-peer receive queue limit (Core net.h DEFAULT_MAXRECEIVEBUFFER = 5000 KB).
+ * Undispatched bytes beyond this pause the socket (Core fPauseRecv), so TCP
+ * flow control stops the sender instead of our heap absorbing its stream.
+ */
+export const DEFAULT_MAX_RECEIVE_BUFFER = 5000 * 1000;
+
+/**
+ * Send queue size at which the peer is disconnected. Core has no such cap
+ * because it stops serving a getdata mid-batch when fPauseSend is set; our
+ * async handlers (getdata reads blocks from disk) can still queue several
+ * replies after the pause, so this is the backstop that keeps one
+ * non-reading peer from growing the queue without bound. It sits well above
+ * an honest worst case: MAX_BLOCKS_IN_TRANSIT_PER_PEER (16) blocks of
+ * MAX_PROTOCOL_MESSAGE_LENGTH (4 MB) = 64 MB.
+ */
+export const SEND_BUFFER_HARD_LIMIT = 128 * 1000 * 1000;
 
 export class Peer {
   readonly host: string;
@@ -415,6 +447,26 @@ export class Peer {
    * order.
    */
   private outbox: Buffer[] = [];
+  /** Total bytes in {@link outbox}. */
+  private outboxBytes = 0;
+  /**
+   * Core fPauseSend: set while outboxBytes > maxSendBuffer. No messages from
+   * this peer are dispatched while it is set.
+   */
+  private sendPaused = false;
+  /** Core fPauseRecv: the socket is paused because too much is undispatched. */
+  private recvPaused = false;
+  /**
+   * Named holds on dispatch placed by consumers of this peer's messages
+   * (e.g. the tx ingress queue when this peer's share of it is full).
+   */
+  private readonly ingressHolds = new Set<string>();
+  /** v2 messages already decrypted but not yet dispatched (paused). */
+  private deferredV2: NetworkMessage[] = [];
+  private deferredV2Bytes: number[] = [];
+  private deferredV2Total = 0;
+  /** A resume pass is queued on the event loop. */
+  private resumeScheduled = false;
   private recvBuffer: Buffer;
   private config: PeerConfig;
   private events: PeerEvents;
@@ -940,13 +992,38 @@ export class Peer {
   private writeRaw(data: Buffer): void {
     if (!this.socket) return;
     if (this.outbox.length > 0) {
-      this.outbox.push(data);
+      this.parkOutbound(data);
       return;
     }
     const written = this.socket.write(data);
     if (written < data.length) {
-      this.outbox.push(data.subarray(written));
-      console.warn(`peer ${this.host}: backpressure — parked ${data.length - written} bytes for drain`);
+      // A short write arms the writable poll, which re-arms reading too.
+      if (this.recvPaused) this.reassertRecvPause();
+      if (this.outbox.length === 0) {
+        console.warn(`peer ${this.host}: backpressure — parked ${data.length - written} bytes for drain`);
+      }
+      this.parkOutbound(data.subarray(written));
+    }
+  }
+
+  /**
+   * Queue bytes the kernel did not take, and apply the send limits: over
+   * maxSendBuffer the peer is send-paused (Core fPauseSend, net.cpp
+   * PushMessage), over the hard limit it is disconnected.
+   */
+  private parkOutbound(data: Buffer): void {
+    this.outbox.push(data);
+    this.outboxBytes += data.length;
+    const hardLimit = this.config.sendBufferHardLimit ?? SEND_BUFFER_HARD_LIMIT;
+    if (this.outboxBytes > hardLimit) {
+      console.warn(
+        `peer ${this.host}:${this.port}: send queue ${this.outboxBytes} bytes over hard limit ${hardLimit} — disconnecting`
+      );
+      this.disconnect("send buffer over hard limit");
+      return;
+    }
+    if (!this.sendPaused && this.outboxBytes > (this.config.maxSendBuffer ?? DEFAULT_MAX_SEND_BUFFER)) {
+      this.sendPaused = true;
     }
   }
 
@@ -955,12 +1032,109 @@ export class Peer {
     while (this.outbox.length > 0 && this.socket) {
       const head = this.outbox[0];
       const written = this.socket.write(head);
+      this.outboxBytes -= written;
       if (written < head.length) {
         this.outbox[0] = head.subarray(written);
-        return; // still backpressured; next drain continues
+        break; // still backpressured; next drain continues
       }
       this.outbox.shift();
     }
+    if (this.sendPaused && this.outboxBytes <= (this.config.maxSendBuffer ?? DEFAULT_MAX_SEND_BUFFER)) {
+      this.sendPaused = false;
+      this.scheduleResume();
+    }
+    if (this.recvPaused) this.reassertRecvPause();
+  }
+
+  /**
+   * Bun 1.3.11 re-arms reading when a short write arms the writable poll or
+   * a writable event is serviced, which silently undoes pause(); a second
+   * pause() is a no-op because the socket still reports itself paused.
+   * resume()+pause() re-applies it. Called after short writes, after every
+   * drain, and on any read that arrives while paused.
+   */
+  private reassertRecvPause(): void {
+    if (!this.socket) return;
+    this.socket.resume();
+    this.socket.pause();
+  }
+
+  /** Bytes queued for this peer that the kernel has not accepted yet. */
+  getSendQueueBytes(): number {
+    return this.outboxBytes;
+  }
+
+  /** Received bytes (raw or decrypted) waiting to be dispatched. */
+  getRecvQueueBytes(): number {
+    return this.recvBuffer.length + this.deferredV2Total;
+  }
+
+  /** Core fPauseSend. */
+  isSendPaused(): boolean {
+    return this.sendPaused;
+  }
+
+  /** Core fPauseRecv: true while the socket is not being read. */
+  isRecvPaused(): boolean {
+    return this.recvPaused;
+  }
+
+  /**
+   * Stop dispatching this peer's messages until {@link releaseIngress} is
+   * called with the same reason. Used by consumers that queue this peer's
+   * messages for later work (the tx ingress queue), so that queue gets the
+   * same backpressure as Core's per-peer process queue (net.cpp:4033).
+   */
+  holdIngress(reason: string): void {
+    this.ingressHolds.add(reason);
+  }
+
+  /** Release a hold placed by {@link holdIngress}. */
+  releaseIngress(reason: string): void {
+    if (this.ingressHolds.delete(reason) && this.ingressHolds.size === 0) {
+      this.scheduleResume();
+    }
+  }
+
+  /** May the next received message be dispatched? */
+  private canDispatch(): boolean {
+    return !this.sendPaused && this.ingressHolds.size === 0 && this.state !== "disconnected";
+  }
+
+  /**
+   * Pause the socket while too much received data waits for dispatch, and
+   * resume it once that falls back under the limit (Core fPauseRecv,
+   * net.cpp:4033/4045). While paused the kernel's receive window fills and
+   * TCP stops the sender. Bun finishes the read loop it is in when pause()
+   * is called, so the overshoot is bounded by what the kernel had already
+   * buffered (net.ipv4.tcp_rmem max).
+   */
+  private updateRecvPause(): void {
+    if (!this.socket) return;
+    // Only held data counts: while dispatch is allowed every complete message
+    // has just been dispatched and what remains is one partial message, which
+    // must keep being read (Core counts only the process queue, not the
+    // partial message in the transport).
+    const held = this.canDispatch() ? 0 : this.getRecvQueueBytes();
+    const limit = this.config.maxReceiveBuffer ?? DEFAULT_MAX_RECEIVE_BUFFER;
+    if (!this.recvPaused && held >= limit) {
+      this.recvPaused = true;
+      this.socket.pause();
+    } else if (this.recvPaused && held < limit) {
+      this.recvPaused = false;
+      this.socket.resume();
+    }
+  }
+
+  /** Continue dispatching held messages on a fresh macrotask. */
+  private scheduleResume(): void {
+    if (this.resumeScheduled) return;
+    this.resumeScheduled = true;
+    setImmediate(() => {
+      this.resumeScheduled = false;
+      if (this.state === "disconnected" || !this.canDispatch()) return;
+      this.runRecvProcessing();
+    });
   }
 
   /**
@@ -1019,8 +1193,18 @@ export class Peer {
     // the v1 path and after the gate has already settled successfully.
     this.settleV2HandshakeFail(_reason ?? "disconnected during v2 handshake");
     this.state = "disconnected";
+    // Free what this peer had queued either way; nothing more is sent or
+    // dispatched once disconnected.
+    this.outbox = [];
+    this.outboxBytes = 0;
+    this.recvBuffer = Buffer.alloc(0);
+    this.deferredV2 = [];
+    this.deferredV2Bytes = [];
+    this.deferredV2Total = 0;
     if (this.socket) {
-      this.socket.end();
+      // A paused socket has unread data; end() would wait on it.
+      if (this.recvPaused) this.socket.terminate();
+      else this.socket.end();
       this.socket = null;
     }
     this.events.onDisconnect(this);
@@ -1314,6 +1498,8 @@ export class Peer {
    * Accumulates data in recvBuffer and processes complete messages.
    */
   private onData(data: Buffer): void {
+    // Data while paused means something re-armed the socket (see onDrain).
+    if (this.recvPaused) this.reassertRecvPause();
     this.bytesRecv += data.length;
     this.lastRecv = Date.now();
     // Accumulate incoming data - copy into new buffer to avoid
@@ -1328,14 +1514,25 @@ export class Peer {
     }
 
     // Process any complete messages
+    this.runRecvProcessing();
+  }
+
+  /** Dispatch what can be dispatched, then apply the receive limit. */
+  private runRecvProcessing(): void {
     try {
-      this.processRecvBuffer();
+      if (this.transportMode === "v2" && this.v2Transport && this.recvBuffer.length === 0) {
+        this.dispatchDeferredV2();
+      } else {
+        this.processRecvBuffer();
+      }
     } catch (error) {
       // Malformed message - disconnect
       const errMsg = error instanceof Error ? error.message : "malformed message";
       console.error(`PEER ERROR: ${this.host}:${this.port} processRecvBuffer failed: ${errMsg} (recvBuf=${this.recvBuffer.length} bytes)`);
       this.disconnect(errMsg);
+      return;
     }
+    if (this.state !== "disconnected") this.updateRecvPause();
   }
 
   /**
@@ -1387,8 +1584,9 @@ export class Peer {
       return;
     }
 
-    // 2. v1 path (unchanged from pre-W76 behaviour).
-    while (this.recvBuffer.length >= MESSAGE_HEADER_SIZE) {
+    // 2. v1 path. Undispatched bytes stay in recvBuffer while the peer is
+    // paused (send queue full or an ingress hold); updateRecvPause bounds it.
+    while (this.recvBuffer.length >= MESSAGE_HEADER_SIZE && this.canDispatch()) {
       const header = parseHeader(this.recvBuffer);
       if (!header) {
         break;
@@ -1532,8 +1730,30 @@ export class Peer {
           );
           continue;
         }
-        this.handleMessage(parsed);
+        this.deferredV2.push(parsed);
+        this.deferredV2Bytes.push(v2msg.payload.length);
+        this.deferredV2Total += v2msg.payload.length;
       }
+    }
+    this.dispatchDeferredV2();
+  }
+
+  /**
+   * Dispatch decrypted v2 messages in order while the peer may dispatch.
+   * The v2 transport decrypts everything it is given, so held messages wait
+   * here (counted by getRecvQueueBytes) instead of in recvBuffer.
+   */
+  private dispatchDeferredV2(): void {
+    let i = 0;
+    while (i < this.deferredV2.length && this.canDispatch()) {
+      const msg = this.deferredV2[i];
+      this.deferredV2Total -= this.deferredV2Bytes[i];
+      i++;
+      this.handleMessage(msg);
+    }
+    if (i > 0 && this.deferredV2.length > 0) {
+      this.deferredV2 = this.deferredV2.slice(i);
+      this.deferredV2Bytes = this.deferredV2Bytes.slice(i);
     }
   }
 
