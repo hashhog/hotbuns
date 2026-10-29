@@ -249,7 +249,7 @@ export interface NodeConfig {
    */
   blockfilterindex: boolean;
   /** Core -fallbackfee in BTC/kvB (0 = disabled, Core's default). */
-  fallbackfee: number;
+  fallbackfee?: number;
   /**
    * Enable the per-height UTXO coinstats index. Mirrors Bitcoin Core's
    * `-coinstatsindex` (default OFF: DEFAULT_COINSTATSINDEX = false).
@@ -2806,7 +2806,7 @@ async function startNode(config: NodeConfig): Promise<void> {
     peerManager,
     feeEstimator,
     // BTC/kvB -> sat/vB
-    fallbackFeeSatVb: (mergedConfig.fallbackfee * 100_000_000) / 1000,
+    fallbackFeeSatVb: ((mergedConfig.fallbackfee ?? 0) * 100_000_000) / 1000,
     headerSync,
     db,
     params,
