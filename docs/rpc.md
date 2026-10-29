@@ -4,7 +4,7 @@ hotbuns serves a JSON-RPC interface over HTTP on the RPC port (8332 mainnet, 483
 
 ## Calling it
 
-Authenticate with HTTP Basic auth, either with the cookie the node writes to `<datadir>/.cookie` (user `__cookie__`) or with `--rpc-user` / `--rpc-password` (default `user` / `pass`). A request is a JSON object, or a JSON array of objects for a batch. A request without an `id` gets a response without one. Wallet methods take the wallet from the URL path `/wallet/<name>`, as in Core.
+Authenticate with HTTP Basic auth, either with the cookie the node writes to `<datadir>/.cookie` (user `__cookie__`) or with `--rpc-user` / `--rpc-password` if both are set. There are no default credentials: as in Core, without them only the cookie works. A request is a JSON object, or a JSON array of objects for a batch. A request without an `id` gets a response without one. Wallet methods take the wallet from the URL path `/wallet/<name>`, as in Core.
 
 With a regtest node running as in the README quick start:
 

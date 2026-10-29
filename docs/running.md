@@ -92,8 +92,8 @@ For mainnet, plan for the disk of an unpruned Bitcoin Core node (several hundred
 | Flag | Default | Meaning |
 |---|---|---|
 | `--rpcport=<port>`, `--rpc-port=<port>` | per network | JSON-RPC port |
-| `--rpc-user=<user>` | `user` | RPC user name, accepted in addition to the cookie |
-| `--rpc-password=<pass>` | `pass` | RPC password |
+| `--rpc-user=<user>` | none | RPC user name, accepted in addition to the cookie when `--rpc-password` is also set |
+| `--rpc-password=<pass>` | none | RPC password; without it only the cookie works |
 | `--rpc-tls-cert=<file>`, `--rpc-tls-key=<file>` | none | Serve RPC over HTTPS with this PEM certificate and key; both or neither |
 | `--rest` | off | Serve the read-only REST API |
 | `--rest-port=<port>` | RPC port + 1 | REST listen port (`127.0.0.1`) |
@@ -132,10 +132,10 @@ bun run src/index.ts --network=regtest --datadir="$DATADIR" &
 sleep 5
 curl -s --user "$(cat "$DATADIR/.cookie")" -d '{"method":"getblockcount","params":[]}' http://127.0.0.1:18600/
 curl -s http://127.0.0.1:18601/rest/chaininfo.json
-curl -s --user user:pass -d '{"method":"stop","params":[]}' http://127.0.0.1:18600/
+curl -s --user "$(cat "$DATADIR/.cookie")" -d '{"method":"stop","params":[]}' http://127.0.0.1:18600/
 ```
 
-RPC answers on 18600 (`{"jsonrpc":"2.0","result":0}`) and REST on 18601, the RPC port plus one. Both the cookie and the default `user` / `pass` are accepted, and `stop` returns `"hotbuns stopping"`.
+RPC answers on 18600 (`{"jsonrpc":"2.0","result":0}`) and REST on 18601, the RPC port plus one. Only the cookie is accepted (there are no default credentials, as in Core), and `stop` returns `"hotbuns stopping"`.
 
 ## Environment variables
 

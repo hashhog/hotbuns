@@ -456,57 +456,36 @@ describe("W140 G28: -rpcthreads (N/A — Bun.serve is single-event-loop)", () =>
 // G29: Wallet routing — P0-SEC race condition
 // ===========================================================================
 
-describe("W140 G29: /wallet/<name> routing (PARTIAL — BUG-13 P0-SEC race)", () => {
+describe("W140 G29: /wallet/<name> routing (FIXED — BUG-13 / audit 2026-10-29 H5)", () => {
+  // Behavioural proof: src/rpc/rpc-default-creds-wallet-route.test.ts.
   test("PRESENT: /wallet/<name> path parsing exists", () => {
     expect(RPC_SRC.includes('pathParts[0] === "wallet"')).toBe(true);
     expect(RPC_SRC.includes("decodeURIComponent(pathParts[1])")).toBe(true);
   });
 
-  test("BUG-13: currentWalletName is a request-mutable class field", () => {
-    // Core uses request-local state (JSONRPCRequest.URI on the stack).
-    // hotbuns mutates a server-level field — race risk under concurrent
-    // requests.
-    expect(
-      RPC_SRC.includes("private currentWalletName: string | null = null")
-    ).toBe(true);
-    expect(
-      RPC_SRC.includes("this.currentWalletName = decodeURIComponent")
-    ).toBe(true);
-    expect(RPC_SRC.includes("this.currentWalletName = null")).toBe(true);
+  test("FIXED: no request-mutable currentWalletName field", () => {
+    // Core keeps the URI request-local (JSONRPCRequest.URI on the stack).
+    expect(RPC_SRC.includes("private currentWalletName")).toBe(false);
+    expect(RPC_SRC.includes("this.currentWalletName =")).toBe(false);
   });
 
-  test("BUG-13: currentWalletName is mutated BEFORE await req.json()", () => {
-    // The mutation site happens before any await, which means a second
-    // concurrent request can clobber it during the first's awaited body
-    // parse.
-    const mutateIdx = RPC_SRC.indexOf(
-      "this.currentWalletName = decodeURIComponent"
-    );
-    const awaitJsonIdx = RPC_SRC.indexOf("body = await req.json()");
-    expect(mutateIdx).toBeGreaterThanOrEqual(0);
-    expect(awaitJsonIdx).toBeGreaterThanOrEqual(0);
-    // Mutation happens textually (and at runtime) before the await.
-    expect(mutateIdx).toBeLessThan(awaitJsonIdx);
-  });
-
-  test("BUG-13: handlers READ currentWalletName after await — race window", () => {
-    // The first read site for wallet routing is in getCurrentWallet /
-    // wallet helpers, all of which are called from async handlers that
-    // run AFTER processRequest awaits the handler.
-    expect(RPC_SRC.includes("if (this.currentWalletName !== null)")).toBe(true);
-    // There is no `const walletName = this.currentWalletName` snapshot
-    // captured at the top of handleRequest — confirming the race.
+  test("FIXED: the wallet name is parsed only after authenticate()", () => {
     const handleIdx = RPC_SRC.indexOf("private async handleRequest");
     expect(handleIdx).toBeGreaterThanOrEqual(0);
-    const handleBody = RPC_SRC.slice(handleIdx, handleIdx + 4000);
-    expect(/const\s+walletName\s*=\s*this\.currentWalletName/.test(handleBody)).toBe(
-      false
-    );
+    const authIdx = RPC_SRC.indexOf("if (!this.authenticate(req))", handleIdx);
+    const parseIdx = RPC_SRC.indexOf("decodeURIComponent(pathParts[1])", handleIdx);
+    expect(authIdx).toBeGreaterThan(handleIdx);
+    expect(parseIdx).toBeGreaterThan(authIdx);
   });
 
-  test("BUG-13: no request-local wallet context (e.g. AsyncLocalStorage)", () => {
-    expect(RPC_SRC.includes("AsyncLocalStorage")).toBe(false);
-    expect(RPC_SRC.includes("requestContext")).toBe(false);
+  test("FIXED: request-local wallet context (AsyncLocalStorage)", () => {
+    expect(RPC_SRC.includes("new AsyncLocalStorage<string | null>()")).toBe(true);
+    expect(RPC_SRC.includes("this.walletRoute.run(walletName")).toBe(true);
+  });
+
+  test("FIXED: handlers read the route from the request's own context", () => {
+    expect(RPC_SRC.includes("return this.walletRoute.getStore() ?? null")).toBe(true);
+    expect(RPC_SRC.includes("this.currentWalletName")).toBe(false);
   });
 });
 
