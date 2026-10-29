@@ -4342,6 +4342,14 @@ export class Mempool {
   }
 
   /**
+   * The static admission min-relay fee rate (sat/vB), Core's
+   * `m_opts.min_relay_feerate` (chain().relayMinFee() for the wallet).
+   */
+  getMinRelayFeeRate(): number {
+    return this.minFeeRate;
+  }
+
+  /**
    * Get the minimum fee rate in sat/kvB (for BIP133 feefilter).
    *
    * Returns the rolling dynamic minimum (with decay), floored by the static

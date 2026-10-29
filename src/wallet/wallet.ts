@@ -118,6 +118,26 @@ export const BIP125_RBF_SEQUENCE = 0xfffffffd;
  */
 export const WALLET_MIN_RELAY_FEERATE = 0.1;
 
+/** Core DEFAULT_TRANSACTION_MINFEE (-mintxfee default), sat/kvB. wallet/wallet.h. */
+export const WALLET_DEFAULT_TRANSACTION_MINFEE_KVB = 1000;
+
+/** Core HIGH_TX_FEE_PER_KB (COIN / 100), sat/kvB. wallet/wallet.h. */
+export const HIGH_TX_FEE_PER_KB = 1_000_000;
+
+/**
+ * Fee for `vbytes` at `satPerVb`, rounded UP like CFeeRate::GetFee
+ * (EvaluateFeeUp): the rate is taken as integer sat/kvB and the product is
+ * done in integers, so e.g. 1.1 sat/vB * 1000 vB is 1100 sat, not the 1101
+ * that Math.ceil(1000 * 1.1) gives through float error. Fractional vbytes
+ * (weight / 4) are evaluated over the weight.
+ */
+export function feeAtRate(vbytes: number, satPerVb: number): bigint {
+  const kvb = BigInt(Math.round(satPerVb * 1000));
+  const wu = BigInt(Math.round(vbytes * 4));
+  if (kvb <= 0n || wu <= 0n) return 0n;
+  return (wu * kvb + 3999n) / 4000n;
+}
+
 /**
  * Recoverable error signalling that BIP-32 CKD landed on the spec-mandated
  * skip case: parse256(IL) >= n  OR  k_i == 0. Both conditions are extremely
@@ -1516,7 +1536,7 @@ export class Wallet {
     const numOutputs = outputs.length + 1; // +1 for potential change
     const estimatedVSize =
       10 + 68 * selectedUtxos.length + 31 * numOutputs;
-    const estimatedFee = BigInt(Math.ceil(estimatedVSize * effFeeRate));
+    const estimatedFee = feeAtRate(estimatedVSize, effFeeRate);
 
     // Calculate change
     const change = totalInput - totalOutput - estimatedFee;
@@ -1609,7 +1629,7 @@ export class Wallet {
       // re-signing can introduce (low-S DER sigs vary by a byte), so the
       // effective rate stays >= the floor even if the final vsize ticks up.
       const realVsize = getTxVSize(tx) + 1;
-      const requiredFee = BigInt(Math.ceil(realVsize * effFeeRate));
+      const requiredFee = feeAtRate(realVsize, effFeeRate);
       let totalOutNow = 0n;
       for (const out of tx.outputs) totalOutNow += out.value;
       const feeNow = totalInput - totalOutNow;
@@ -2264,8 +2284,8 @@ export class Wallet {
     // Calculate cost of change (creating + spending later)
     const changeOutputWeight = this.getOutputWeight(changeType);
     const changeInputWeight = this.getInputWeight(changeType);
-    const changeFee = BigInt(Math.ceil((changeOutputWeight / 4) * feeRate));
-    const costOfChange = changeFee + BigInt(Math.ceil((changeInputWeight / 4) * feeRate));
+    const changeFee = feeAtRate(changeOutputWeight / 4, feeRate);
+    const costOfChange = changeFee + feeAtRate(changeInputWeight / 4, feeRate);
 
     // Try BnB first (exact match without change output)
     const bnbResult = this.selectCoinsBnB(
@@ -2334,7 +2354,7 @@ export class Wallet {
    */
   private getEffectiveValue(utxo: WalletUTXO, feeRate: number): bigint {
     const inputWeight = this.getInputWeight(utxo.addressType);
-    const inputFee = BigInt(Math.ceil((inputWeight / 4) * feeRate));
+    const inputFee = feeAtRate(inputWeight / 4, feeRate);
     return utxo.amount - inputFee;
   }
 
@@ -2450,7 +2470,7 @@ export class Wallet {
     for (const input of selectedInputs) {
       totalInput += input.amount;
       const inputWeight = this.getInputWeight(input.addressType);
-      totalInputFee += BigInt(Math.ceil((inputWeight / 4) * feeRate));
+      totalInputFee += feeAtRate(inputWeight / 4, feeRate);
     }
 
     return {
@@ -2476,7 +2496,7 @@ export class Wallet {
   ): CoinSelectionResult | null {
     // Calculate change target (minimum change we want to produce)
     const changeOutputWeight = this.getOutputWeight(changeType);
-    const changeFee = BigInt(Math.ceil((changeOutputWeight / 4) * feeRate));
+    const changeFee = feeAtRate(changeOutputWeight / 4, feeRate);
     const minChange = CHANGE_LOWER + changeFee;
 
     // Calculate effective values
@@ -2491,7 +2511,7 @@ export class Wallet {
       if (effectiveValue === target) {
         // Exact match!
         const inputWeight = this.getInputWeight(utxo.addressType);
-        const fee = BigInt(Math.ceil((inputWeight / 4) * feeRate));
+        const fee = feeAtRate(inputWeight / 4, feeRate);
         return {
           inputs: [utxo],
           totalInput: utxo.amount,
@@ -2520,7 +2540,7 @@ export class Wallet {
     if (totalLower < target) {
       if (lowestLarger) {
         const inputWeight = this.getInputWeight(lowestLarger.utxo.addressType);
-        const fee = BigInt(Math.ceil((inputWeight / 4) * feeRate));
+        const fee = feeAtRate(inputWeight / 4, feeRate);
         return {
           inputs: [lowestLarger.utxo],
           totalInput: lowestLarger.utxo.amount,
@@ -2582,7 +2602,7 @@ export class Wallet {
         lowestLarger.effectiveValue <= bestValue)
     ) {
       const inputWeight = this.getInputWeight(lowestLarger.utxo.addressType);
-      const fee = BigInt(Math.ceil((inputWeight / 4) * feeRate));
+      const fee = feeAtRate(inputWeight / 4, feeRate);
       return {
         inputs: [lowestLarger.utxo],
         totalInput: lowestLarger.utxo.amount,
@@ -2621,7 +2641,7 @@ export class Wallet {
     for (const input of inputs) {
       totalInput += input.amount;
       const inputWeight = this.getInputWeight(input.addressType);
-      totalFee += BigInt(Math.ceil((inputWeight / 4) * feeRate));
+      totalFee += feeAtRate(inputWeight / 4, feeRate);
     }
 
     const change = target === 0n ? 0n : totalInput - target - totalFee;
@@ -2673,7 +2693,7 @@ export class Wallet {
       }
 
       const totalWeight = baseTxWeight + inputsWeight + outputWeight;
-      totalFee = BigInt(Math.ceil((totalWeight / 4) * feeRate));
+      totalFee = feeAtRate(totalWeight / 4, feeRate);
 
       if (totalSelected >= target + totalFee) {
         const change = totalSelected - target - totalFee;
