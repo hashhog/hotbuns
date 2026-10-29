@@ -97,7 +97,11 @@ import type {
   WalletUTXO,
   WalletAddressType,
 } from "../wallet/wallet.js";
-import { COINBASE_SPENDABLE_DEPTH } from "../wallet/wallet.js";
+import {
+  COINBASE_SPENDABLE_DEPTH,
+  WALLET_DEFAULT_TRANSACTION_MINFEE_KVB,
+  feeAtRate,
+} from "../wallet/wallet.js";
 import {
   parseDescriptor,
   getDescriptorInfo,
@@ -343,6 +347,8 @@ export interface RPCServerConfig {
  * Dependencies for the RPC server.
  */
 export interface RPCServerDeps {
+  /** Core -fallbackfee in sat/kvB (ParseMoney units); 0/undefined = disabled (Core default). */
+  fallbackFeeSatKvB?: number;
   chainState: ChainStateManager;
   mempool: Mempool;
   peerManager: PeerManager;
@@ -812,6 +818,7 @@ export class RPCServer {
   private mempool: Mempool;
   private peerManager: PeerManager;
   private feeEstimator: FeeEstimator;
+  private fallbackFeeSatKvB: number;
   private headerSync: HeaderSync;
   private db: ChainDB;
   private params: ConsensusParams;
@@ -933,6 +940,7 @@ export class RPCServer {
     this.mempool = deps.mempool;
     this.peerManager = deps.peerManager;
     this.feeEstimator = deps.feeEstimator;
+    this.fallbackFeeSatKvB = deps.fallbackFeeSatKvB ?? 0;
     this.headerSync = deps.headerSync;
     this.db = deps.db;
     this.params = deps.params;
@@ -13662,6 +13670,61 @@ export class RPCServer {
   }
 
   /**
+   * Fee rate (sat/vB) for a wallet send. Mirrors Core's GetMinimumFeeRate
+   * (wallet/fees.cpp), worked in integer sat/kvB like CFeeRate:
+   *   - an explicit fee_rate wins and is NOT raised to the mempool minimum;
+   *   - otherwise the estimator; if it has no data, -fallbackfee; a zero
+   *     fallback returns at once, and the caller fails with "Fee estimation
+   *     failed" (`failCode`: SendMoney/sendtoaddress maps it to -6,
+   *     FundTransaction/send/fundrawtransaction/walletcreatefundedpsbt to -4);
+   *   - a non-zero estimate/fallback is raised to the mempool minimum fee,
+   *     then to the required fee max(-mintxfee, -minrelaytxfee).
+   */
+  private resolveWalletFeeRate(
+    explicit: number | undefined,
+    confTargetParam: unknown,
+    failCode: number
+  ): number {
+    if (explicit !== undefined) return explicit;
+    const target =
+      typeof confTargetParam === "number" && Number.isInteger(confTargetParam) && confTargetParam > 0
+        ? Math.min(confTargetParam, 1008)
+        : 6; // DEFAULT_TX_CONFIRM_TARGET
+    // estimateSmartFee returns sat/vB; Core's estimate is CFeeRate(llround(sat/kvB)).
+    let feeKvB = Math.round(this.feeEstimator.estimateSmartFee(target).feeRate * 1000);
+    if (feeKvB <= 0) {
+      feeKvB = this.fallbackFeeSatKvB;
+      if (feeKvB === 0) {
+        throw this.rpcError(
+          failCode,
+          "Fee estimation failed. Fallbackfee is disabled. Wait a few blocks or enable -fallbackfee."
+        );
+      }
+    }
+    // Obey mempool min fee when using smart fee estimation (chain().mempoolMinFee()).
+    const mempoolMinKvB = Math.round(this.mempool.getMinFee());
+    if (feeKvB < mempoolMinKvB) feeKvB = mempoolMinKvB;
+    // GetRequiredFeeRate: max(m_min_fee (-mintxfee), relayMinFee()).
+    const requiredKvB = Math.max(
+      WALLET_DEFAULT_TRANSACTION_MINFEE_KVB,
+      Math.round(this.mempool.getMinRelayFeeRate() * 1000)
+    );
+    if (feeKvB < requiredKvB) feeKvB = requiredKvB;
+    return feeKvB / 1000;
+  }
+
+  /** Explicit fee rate (sat/vB) from funding options: fee_rate, or feeRate in BTC/kvB. */
+  private explicitOptionsFeeRate(options: Record<string, unknown>): number | undefined {
+    if (typeof options.fee_rate === "number" && options.fee_rate > 0) {
+      return options.fee_rate;
+    }
+    if (typeof options.feeRate === "number" && options.feeRate > 0) {
+      return (options.feeRate * 100_000_000) / 1000;
+    }
+    return undefined;
+  }
+
+  /**
    * send [{"address":amount},...] ( conf_target "estimate_mode" fee_rate options )
    *
    * Reference: bitcoin-core/src/wallet/rpc/spend.cpp::send.
@@ -13672,10 +13735,13 @@ export class RPCServer {
   private async send(params: unknown[]): Promise<Record<string, unknown>> {
     const [outputsParam, , , feeRateParam] = params;
     const outputs = this.parsePaymentOutputs(outputsParam);
-    let feeRate = 1;
-    if (typeof feeRateParam === "number" && feeRateParam > 0 && Number.isFinite(feeRateParam)) {
-      feeRate = feeRateParam;
-    }
+    const feeRate = this.resolveWalletFeeRate(
+      typeof feeRateParam === "number" && feeRateParam > 0 && Number.isFinite(feeRateParam)
+        ? feeRateParam
+        : undefined,
+      params[1],
+      RPCErrorCodes.WALLET_ERROR // FundTransaction failures -> RPC_WALLET_ERROR
+    );
 
     const wallet = this.getCurrentWallet();
     if (wallet.isPrivateKeysDisabled()) {
@@ -13867,10 +13933,11 @@ export class RPCServer {
     }
 
     // Fee rate: Core's `fee_rate` (param 9) is sat/vB.
-    let feeRate = 1; // 1 sat/vB default
-    if (typeof feeRateParam === "number" && feeRateParam > 0) {
-      feeRate = feeRateParam;
-    }
+    const feeRate = this.resolveWalletFeeRate(
+      typeof feeRateParam === "number" && feeRateParam > 0 ? feeRateParam : undefined,
+      params[6],
+      RPCErrorCodes.WALLET_INSUFFICIENT_FUNDS // SendMoney maps CreateTransaction errors to -6
+    );
 
     // Convert BTC → sats (rounded to nearest sat to avoid FP wobble).
     const amountSats = BigInt(Math.round(amountParam * 100_000_000));
@@ -15714,14 +15781,14 @@ export class RPCServer {
       );
     }
 
-    // Fee rate: prefer options.fee_rate (sat/vB).
-    let feeRate = 1;
-    if (typeof options.fee_rate === "number" && options.fee_rate > 0) {
-      feeRate = options.fee_rate as number;
-    } else if (typeof options.feeRate === "number" && (options.feeRate as number) > 0) {
-      // Core accepts feeRate (BTC/kvB) as a deprecated alias; convert to sat/vB.
-      feeRate = ((options.feeRate as number) * 100_000_000) / 1000;
-    }
+    // Fee rate: options.fee_rate (sat/vB), else options.feeRate (BTC/kvB,
+    // Core's deprecated alias), else Core's GetMinimumFeeRate resolution
+    // (estimator -> -fallbackfee). Failure is RPC_WALLET_ERROR (-4).
+    const feeRate = this.resolveWalletFeeRate(
+      this.explicitOptionsFeeRate(options),
+      options.conf_target,
+      RPCErrorCodes.WALLET_ERROR
+    );
 
     // Resolve the input set. Caller-supplied manual `inputs` are MANDATORY and
     // used verbatim (Core's `add_inputs` defaults to false when inputs are
@@ -15768,12 +15835,8 @@ export class RPCServer {
     // by the output + base bytes and fails Core fee-target parity.
     const inputTypes = selectedInputs.map((u) => u.addressType);
     const outLens = outputsList.map((o) => o.scriptPubKey.length);
-    const feeWithChange = BigInt(
-      Math.ceil(wallet.estimateTxVBytes(inputTypes, outLens, true) * feeRate)
-    );
-    const feeNoChange = BigInt(
-      Math.ceil(wallet.estimateTxVBytes(inputTypes, outLens, false) * feeRate)
-    );
+    const feeWithChange = feeAtRate(wallet.estimateTxVBytes(inputTypes, outLens, true), feeRate);
+    const feeNoChange = feeAtRate(wallet.estimateTxVBytes(inputTypes, outLens, false), feeRate);
 
     const DUST_THRESHOLD = 546n;
     let feeSats: bigint;
@@ -16503,15 +16566,14 @@ export class RPCServer {
       }
     }
 
-    // Fee rate: prefer options.fee_rate (sat/vB), else options.feeRate
-    // (BTC/kvB, Core's deprecated alias). Default 1 sat/vB, matching
-    // walletCreateFundedPSBT's default path.
-    let feeRate = 1;
-    if (typeof options.fee_rate === "number" && (options.fee_rate as number) > 0) {
-      feeRate = options.fee_rate as number;
-    } else if (typeof options.feeRate === "number" && (options.feeRate as number) > 0) {
-      feeRate = ((options.feeRate as number) * 100_000_000) / 1000;
-    }
+    // Fee rate: options.fee_rate (sat/vB), else options.feeRate (BTC/kvB,
+    // Core's deprecated alias), else Core's GetMinimumFeeRate resolution
+    // (estimator -> -fallbackfee). FundTransaction maps failure to -4.
+    const feeRate = this.resolveWalletFeeRate(
+      this.explicitOptionsFeeRate(options),
+      options.conf_target,
+      RPCErrorCodes.WALLET_ERROR
+    );
 
     // Coin selection over the wallet UTXO set — the SAME engine
     // walletCreateFundedPSBT uses. The selector targets the output sum and

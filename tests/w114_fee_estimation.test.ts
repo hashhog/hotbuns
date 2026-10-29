@@ -200,7 +200,7 @@ describe("G5 bucket spacing", () => {
 // G6 — processBlock / trackTransaction wired into production (DEAD HELPER)
 // ---------------------------------------------------------------------------
 describe("G6 dead helper — processBlock and trackTransaction not called in production", () => {
-  test("BUG-7 P0-CDIV DEAD HELPER: estimator always returns DEFAULT_FEE_RATE=20 because never fed data", async () => {
+  test("BUG-7 P0-CDIV DEAD HELPER: never-fed estimator reports no estimate (feeRate 0), not a made-up rate", async () => {
     const { est, cleanup } = await makeEstimator();
     try {
       // FeeEstimator is constructed and wired into the RPC server (server.ts:452),
@@ -211,12 +211,12 @@ describe("G6 dead helper — processBlock and trackTransaction not called in pro
       //   feeEstimator.trackTransaction(txid, currentHeight)
       //
       // Result: the estimator is permanently empty in production.
-      // estimateSmartFee always returns the hardcoded DEFAULT_FEE_RATE=20.
+      // estimateSmartFee reports feeRate 0 (no estimate); the old hardcoded 20 is gone.
       // This is a dead-helper: the subsystem is fully implemented but
       // never wired into the block-processing pipeline.
 
       const result = est.estimateSmartFee(6);
-      expect(result.feeRate).toBe(20); // 20 = DEFAULT_FEE_RATE, always returned
+      expect(result.feeRate).toBe(0); // 0 = no estimate
       expect(result.blocks).toBe(6);
 
       // Even after processing blocks (which would NOT happen in production),
@@ -224,7 +224,7 @@ describe("G6 dead helper — processBlock and trackTransaction not called in pro
       for (let h = 1; h <= 10; h++) {
         est.processBlock(emptyBlock(h) as any, h);
       }
-      expect(est.estimateSmartFee(6).feeRate).toBe(20); // still default
+      expect(est.estimateSmartFee(6).feeRate).toBe(0); // still no estimate
     } finally {
       await cleanup();
     }
@@ -317,19 +317,15 @@ describe("G10 confTarget minimum clamp to 2", () => {
 // G11 — estimateSmartFee error signal when no data
 // ---------------------------------------------------------------------------
 describe("G11 estimateSmartFee error response when no data", () => {
-  test("BUG-12: always returns {feeRate:20} instead of signaling 'no data' to RPC layer", async () => {
+  test("BUG-12 fixed: no data is signaled as feeRate 0 so the RPC layer returns { errors: [...] }", async () => {
     const { est, cleanup } = await makeEstimator();
     try {
       // Core: { errors: ["Insufficient data or no feerate found"], blocks: N }
       //   (no feerate field in response).
-      // Hotbuns estimateSmartFee always returns a non-null feeRate (20 fallback),
-      // so the RPC layer's error branch (server.ts:3814) is never triggered.
-      // Clients cannot distinguish "really no data" from "estimated 20 sat/vB".
+      // estimateSmartFee now returns feeRate 0 with no data, so the RPC
+      // layer's `!estimate.feeRate` branch returns { errors: [...] } per Core.
       const result = est.estimateSmartFee(6);
-      // feeRate is always 20 (not null / not undefined) when there's no data
-      expect(result.feeRate).toBe(20);
-      // BUG: the correct signal would be feeRate=null or feeRate=0 to let
-      // the RPC layer return { errors: [...] } per Core spec
+      expect(result.feeRate).toBe(0);
     } finally {
       await cleanup();
     }
@@ -365,7 +361,7 @@ describe("G12 triple-check algorithm", () => {
 // G14 — SUFFICIENT_FEETXS density guard
 // ---------------------------------------------------------------------------
 describe("G14 SUFFICIENT_FEETXS density guard", () => {
-  test("BUG-14: no per-block density guard; fixed minDataPoints=10 count ignores block span", async () => {
+  test("BUG-14: sparse slow-confirming data yields no estimate (feeRate 0)", async () => {
     const { est, cleanup } = await makeEstimator();
     try {
       // Core: require ≥0.1 average tx/block over the estimation horizon.
@@ -376,10 +372,11 @@ describe("G14 SUFFICIENT_FEETXS density guard", () => {
         est.recordConfirmation(txid, 100, 1, 1000); // 10 txs, ~1000 block span
       }
       const fee = est.estimateFee(6);
-      // Core would return 0 (no valid estimate) due to 0.01 tx/block < 0.1 threshold.
-      // Hotbuns accepts the data because count >= 10.
-      // BUG: fee > 0 when it should signal insufficient data
-      expect(fee).toBeGreaterThan(0); // BUG confirmed: accepts sparse data as valid
+      // Core returns 0 (no valid estimate) due to 0.01 tx/block < 0.1 threshold.
+      // These 10 confirmations (1000-block wait) never reach the 85% target-6
+      // threshold, so there is no estimate. The old "fee > 0" was the made-up
+      // default 20, not an accepted data point.
+      expect(fee).toBe(0);
     } finally {
       await cleanup();
     }

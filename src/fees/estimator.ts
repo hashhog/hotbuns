@@ -50,9 +50,6 @@ interface SerializedEstimatorState {
   txEntryHeights: Array<[string, number]>;
 }
 
-/** Default conservative fee rate when no data is available (sat/vB). */
-const DEFAULT_FEE_RATE = 20;
-
 /** Required confidence threshold for fee estimation. */
 const CONFIDENCE_THRESHOLD = 0.85;
 
@@ -483,8 +480,9 @@ export class FeeEstimator {
       return mempoolMedian;
     }
 
-    // No data at all: return conservative default
-    return DEFAULT_FEE_RATE;
+    // No data at all: 0 = no estimate (Core's CFeeRate(0)); callers decide
+    // whether -fallbackfee applies.
+    return 0;
   }
 
   /**
@@ -600,13 +598,13 @@ export class FeeEstimator {
       }
     }
 
-    // Fallback to mempool median or default
+    // Fallback to mempool median; 0 = no estimate
     const mempoolMedian = this.getMempoolMedianFeeRate();
     if (mempoolMedian > 0) {
       return { feeRate: mempoolMedian, blocks: targetBlocks };
     }
 
-    return { feeRate: DEFAULT_FEE_RATE, blocks: targetBlocks };
+    return { feeRate: 0, blocks: targetBlocks };
   }
 
   /**

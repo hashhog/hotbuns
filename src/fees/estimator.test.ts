@@ -269,7 +269,7 @@ describe("FeeEstimator", () => {
   describe("estimateFee", () => {
     test("returns default fee rate when no data", () => {
       const feeRate = estimator.estimateFee(6);
-      expect(feeRate).toBe(20); // Default conservative fee
+      expect(feeRate).toBe(0); // no data: no estimate (Core CFeeRate(0))
     });
 
     test("estimates based on historical data", () => {
@@ -324,7 +324,7 @@ describe("FeeEstimator", () => {
 
       // Very large target should be capped
       const feeLarge = estimator.estimateFee(10000);
-      expect(feeLarge).toBe(20); // Default (no data)
+      expect(feeLarge).toBe(0); // no data: no estimate
     });
   });
 
@@ -354,9 +354,9 @@ describe("FeeEstimator", () => {
       expect(result.feeRate).toBeGreaterThan(0);
     });
 
-    test("falls back to default with no data", () => {
+    test("reports no estimate (feeRate 0) with no data", () => {
       const result = estimator.estimateSmartFee(6);
-      expect(result.feeRate).toBe(20);
+      expect(result.feeRate).toBe(0);
       expect(result.blocks).toBe(6);
     });
   });
@@ -399,7 +399,7 @@ describe("FeeEstimator", () => {
 
       // Should still work with default state
       const feeRate = estimator.estimateFee(6);
-      expect(feeRate).toBe(20);
+      expect(feeRate).toBe(0);
     });
 
     test("handles partial/malformed state", () => {

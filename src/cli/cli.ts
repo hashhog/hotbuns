@@ -45,6 +45,7 @@ import { Logger, setLogger } from "../logger/logger.js";
 import { runSupervisorFromArgv } from "./supervisor.js";
 import { TxIngressQueue } from "../p2p/tx_ingress.js";
 import { LoopLagMonitor } from "../logger/loop_lag.js";
+import { parseFallbackFee } from "../wallet/fallbackfee.js";
 
 /**
  * Node configuration options.
@@ -248,6 +249,12 @@ export interface NodeConfig {
    * Reference: BIP-157, BIP-158, bitcoin-core/src/index/blockfilterindex.cpp
    */
   blockfilterindex: boolean;
+  /**
+   * Core -fallbackfee as given (BTC/kvB string; bare flag = ""). Parsed and
+   * validated like Core's ParseMoney at startup (parseFallbackFee); unset =
+   * 0 = disabled, Core's default.
+   */
+  fallbackfee?: string;
   /**
    * Enable the per-height UTXO coinstats index. Mirrors Bitcoin Core's
    * `-coinstatsindex` (default OFF: DEFAULT_COINSTATSINDEX = false).
@@ -707,6 +714,11 @@ export function parseArgs(argv: string[]): ParsedArgs {
             if (!isNaN(restPortVal) && restPortVal > 0) config.restPort = restPortVal;
           }
           break;
+        case "fallbackfee":
+          // Bitcoin Core `-fallbackfee=<amt>` in BTC/kvB; validated (and a bad
+          // value refuses startup) in startNode via parseFallbackFee.
+          config.fallbackfee = value ?? "";
+          break;
         case "blockfilterindex":
           // Bitcoin Core flag `-blockfilterindex=basic`. Bare flag,
           // `=1`/`=true`/`=basic` enables; `=0`/`=false` disables.
@@ -1011,6 +1023,11 @@ export async function loadConfig(
               config.restPort = restPortVal;
             }
           }
+          break;
+        case "fallbackfee":
+          // Bitcoin Core `-fallbackfee=<amt>` in BTC/kvB; validated (and a bad
+          // value refuses startup) in startNode via parseFallbackFee.
+          config.fallbackfee = value ?? "";
           break;
         case "blockfilterindex":
           // Mirror CLI: 0/false = off; 1/true/basic = on.
@@ -1640,6 +1657,19 @@ async function startNode(config: NodeConfig): Promise<void> {
   }
   if (config.pid !== undefined) mergedConfig.pid = config.pid;
   if (config.readyFd !== undefined) mergedConfig.readyFd = config.readyFd;
+  // Core: the command line overrides the config file.
+  if (config.fallbackfee !== undefined) mergedConfig.fallbackfee = config.fallbackfee;
+
+  // Core CWallet::Create: an amount ParseMoney refuses is an init error.
+  let fallbackFeeSatKvB: number;
+  try {
+    const ff = parseFallbackFee(mergedConfig.fallbackfee);
+    fallbackFeeSatKvB = ff.satKvB;
+    if (ff.warning) console.warn(`Warning: ${ff.warning}`);
+  } catch (e) {
+    console.error(`Error: ${(e as Error).message}`);
+    process.exit(1);
+  }
 
   // 1b. Initialize the process-wide logger from the merged config.
   const logger = new Logger({
@@ -2790,6 +2820,7 @@ async function startNode(config: NodeConfig): Promise<void> {
     mempool,
     peerManager,
     feeEstimator,
+    fallbackFeeSatKvB,
     headerSync,
     db,
     params,

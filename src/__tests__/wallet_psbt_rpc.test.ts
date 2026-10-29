@@ -57,6 +57,8 @@ class MockChainStateManager {
 
 class MockMempool {
   getInfo() { return { size: 0, bytes: 0, minFeeRate: 1 }; }
+  getMinFee() { return 0; } // rolling minimum, sat/kvB (wallet fee resolution)
+  getMinRelayFeeRate() { return 0.1; } // -minrelaytxfee, sat/vB
   getAllTxids() { return []; }
   getTransaction(_txid: Buffer) { return null; }
   hasTransaction(_txid: Buffer) { return false; }
