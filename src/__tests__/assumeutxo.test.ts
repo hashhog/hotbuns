@@ -40,6 +40,11 @@ import { ChainDB, DBPrefix } from "../storage/database.js";
 import { REGTEST, type ConsensusParams, type AssumeutxoData as ParamsAssumeutxoData } from "../consensus/params.js";
 import { MuHash3072 } from "../wire/muhash.js";
 
+/** Put the persisted tip back at genesis (height 0), below any snapshot base. */
+async function rewindTipBelowSnapshot(db: ChainDB): Promise<void> {
+  await db.putChainState({ bestBlockHash: REGTEST.genesisBlockHash, bestHeight: 0, totalWork: 1n });
+}
+
 describe("assumeUTXO", () => {
   const testDbPath = "/tmp/hotbuns-assumeutxo-test-" + Date.now();
 
@@ -407,6 +412,9 @@ describe("assumeUTXO", () => {
       const snapshotPath = join(testDbPath, "rt.dat");
       const dumpManager = new ChainstateManager(db, params);
       const dump = await dumpManager.dumpSnapshot(snapshotPath);
+      // Load into a datadir BEHIND the snapshot base: loadSnapshot refuses one
+      // whose persisted tip already reaches it (audit H9 stale-snapshot guard).
+      await rewindTipBelowSnapshot(db);
       expect(dump.coinsWritten).toBe(3n);
 
       // Wipe UTXOs, then reload from the snapshot file.
@@ -1114,6 +1122,9 @@ describe("assumeUTXO", () => {
       const dumpPath = join(testDbPath, "strict-bad.dat");
       const dumpMgr = new ChainstateManager(db, params);
       await dumpMgr.dumpSnapshot(dumpPath);
+      // Load into a datadir BEHIND the snapshot base: loadSnapshot refuses one
+      // whose persisted tip already reaches it (audit H9 stale-snapshot guard).
+      await rewindTipBelowSnapshot(db);
 
       // Wipe UTXOs so loadSnapshot has to reload from the file.
       const it = (db as any).db.iterator({
@@ -1181,6 +1192,9 @@ describe("assumeUTXO", () => {
       const dumpPath = join(testDbPath, "strict-muhash-rejected.dat");
       const dumpMgr = new ChainstateManager(db, params);
       await dumpMgr.dumpSnapshot(dumpPath);
+      // Load into a datadir BEHIND the snapshot base: loadSnapshot refuses one
+      // whose persisted tip already reaches it (audit H9 stale-snapshot guard).
+      await rewindTipBelowSnapshot(db);
 
       // Wipe + reload.
       const it = (db as any).db.iterator({
@@ -1241,6 +1255,9 @@ describe("assumeUTXO", () => {
       const dumpPath = join(testDbPath, "strict-good.dat");
       const dumpMgr = new ChainstateManager(db, params);
       await dumpMgr.dumpSnapshot(dumpPath);
+      // Load into a datadir BEHIND the snapshot base: loadSnapshot refuses one
+      // whose persisted tip already reaches it (audit H9 stale-snapshot guard).
+      await rewindTipBelowSnapshot(db);
 
       // Wipe + reload.
       const it = (db as any).db.iterator({
@@ -1405,6 +1422,9 @@ describe("assumeUTXO", () => {
       });
       const mgr = new ChainstateManager(snapDb, params);
       await mgr.dumpSnapshot(snapPath);
+      // Load into a datadir BEHIND the snapshot base: loadSnapshot refuses one
+      // whose persisted tip already reaches it (audit H9 stale-snapshot guard).
+      await rewindTipBelowSnapshot(snapDb);
     }
 
     // -----------------------------------------------------------------------

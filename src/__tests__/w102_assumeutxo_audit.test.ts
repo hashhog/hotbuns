@@ -196,6 +196,9 @@ describe("W102 AssumeUTXO snapshot loading gate audit", () => {
     if (keys.length > 0) {
       await (db as any).db.batch(keys.map((k: Buffer) => ({ type: "del", key: k })));
     }
+    // Load into a datadir BEHIND the snapshot base: loadSnapshot refuses one
+    // whose persisted tip already reaches it (audit H9 stale-snapshot guard).
+    await db.putChainState({ bestBlockHash: REGTEST.genesisBlockHash, bestHeight: 0, totalWork: 1n });
   }
 
   function snapshotPathFor(name: string): string {
@@ -231,7 +234,9 @@ describe("W102 AssumeUTXO snapshot loading gate audit", () => {
   it("G6: loadSnapshot rejects coin with height > snapshot height", async () => {
     const db = await openDb("g6-height");
     const tip = Buffer.alloc(32, 0x10);
-    await db.putChainState({ bestBlockHash: tip, bestHeight: 5, totalWork: 1n });
+    // Persisted tip BELOW the snapshot base, or the stale-snapshot guard
+    // (audit H9) refuses before the check under test runs.
+    await db.putChainState({ bestBlockHash: REGTEST.genesisBlockHash, bestHeight: 0, totalWork: 1n });
     await db.putBlockIndex(tip, { height: 5, header: Buffer.alloc(80), nTx: 1, status: 0x1f, dataPos: 0 });
 
     const params: ConsensusParams = {
@@ -559,7 +564,9 @@ describe("W102 AssumeUTXO snapshot loading gate audit", () => {
   it("G3: loadSnapshot rejects snapshot with wrong HASH_SERIALIZED (strict gate functional)", async () => {
     const db = await openDb("g3-strict");
     const tip = Buffer.alloc(32, 0x70);
-    await db.putChainState({ bestBlockHash: tip, bestHeight: 15, totalWork: 1n });
+    // Persisted tip BELOW the snapshot base, or the stale-snapshot guard
+    // (audit H9) refuses before the check under test runs.
+    await db.putChainState({ bestBlockHash: REGTEST.genesisBlockHash, bestHeight: 0, totalWork: 1n });
     await db.putBlockIndex(tip, { height: 15, header: Buffer.alloc(80), nTx: 1, status: 0x1f, dataPos: 0 });
 
     const coin = {

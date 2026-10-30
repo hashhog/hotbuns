@@ -679,53 +679,53 @@ export class ChainStateManager {
     // (utxoBestBlockHashHex) work correctly on the very next connect call.
     this.utxo.setBestBlock(blockHash);
 
-    // Serialize and store undo data
-    const undoData = serializeUndoData(spentOutputs);
-    await this.db.putUndoData(blockHash, undoData);
+    // Calculate chain work (approximate - should come from header chain)
+    // Work = 2^256 / (target + 1), but we use a simplified version here
+    const work = this.calculateWork(block.header.bits);
+    const chainWork = this.bestBlock.chainWork + work;
 
-    // Flush UTXO changes
-    await this.utxo.flush();
-
-    // Store block data
-    const rawBlock = serializeBlock(block);
-    await this.db.putBlock(blockHash, rawBlock);
-
-    // Store block index record (hash -> metadata) and height -> hash mapping
-    const headerBytes = serializeBlockHeader(block.header);
-    await this.db.putBlockIndex(blockHash, {
-      height,
-      header: headerBytes,
-      nTx: block.transactions.length,
-      status: BlockStatus.HEADER_VALID | BlockStatus.TXS_VALID | BlockStatus.HAVE_DATA | BlockStatus.HAVE_UNDO,
-      dataPos: 1, // block data exists
-    });
-
-    // ── Pattern C0: write txindex on connect ──
+    // ── Single-batch atomicity for connectBlock (audit H8) ──
     //
-    // Mirrors the sync/blocks.ts::connectBlock connect-side wiring
-    // added by this fix.  This path runs for generateblock /
-    // dumptxoutset re-apply / chain/state.ts::reorganize — they all
-    // need the same index entries so getrawtransaction works after
-    // a regtest mine or a snapshot rollback.  See
-    // CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
-    // (Pattern C0, hotbuns row).  Best-effort: a put failure is logged
-    // and ignored — txindex is an optional secondary index in Core.
-    try {
-      for (const tx of block.transactions) {
-        const txid = getTxId(tx);
-        await this.db.putTxIndex(txid, {
-          blockHash,
-          offset: 0,
-          length: 0,
-        });
-      }
-    } catch (err) {
-      console.warn(
-        `[txindex] failed to write entries for block ${blockHash
-          .toString("hex")
-          .slice(0, 16)}: ${err instanceof Error ? err.message : String(err)}`
-      );
+    // The coins for this block, its undo data, body, block-index record,
+    // active-chain height entry, txindex entries, chain work and the
+    // CHAIN_STATE tip all ride ONE flush batch, as disconnectBlock's do.
+    // They used to be separate awaited writes with the coins first and
+    // CHAIN_STATE last: a crash in between left coins at N with the tip at
+    // N-1, so the restart reconnected N against coins that had already spent
+    // its inputs (bad-txns-inputs-missingorspent) and persisted FAILED_VALID
+    // onto a valid main-chain block. Core writes the coins and the best
+    // block in one batch (txdb.cpp CCoinsViewDB::BatchWrite).
+    const extraOps: BatchOperation[] = [];
+    extraOps.push(this.db.buildUndoDataPutOp(blockHash, serializeUndoData(spentOutputs)));
+    extraOps.push(this.db.buildBlockDataPutOp(blockHash, serializeBlock(block)));
+    // Block index record (hash -> metadata) and height -> hash mapping
+    extraOps.push(
+      this.db.buildBlockIndexPutOp(blockHash, {
+        height,
+        header: serializeBlockHeader(block.header),
+        nTx: block.transactions.length,
+        status: BlockStatus.HEADER_VALID | BlockStatus.TXS_VALID | BlockStatus.HAVE_DATA | BlockStatus.HAVE_UNDO,
+        dataPos: 1, // block data exists
+      }),
+      this.db.buildHeightHashPutOp(height, blockHash)
+    );
+    // Pattern C0: write txindex on connect, so getrawtransaction works after a
+    // regtest mine or a snapshot rollback (generateblock / dumptxoutset
+    // re-apply / reorganize). See
+    // CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md.
+    for (const tx of block.transactions) {
+      extraOps.push(this.db.buildTxIndexPutOp(getTxId(tx), blockHash));
     }
+    // Per-block chain work so getblockheader returns correct chainwork.
+    extraOps.push(this.db.buildChainWorkPutOp(blockHash, chainWork));
+    extraOps.push(
+      this.db.buildChainStateOp({
+        bestBlockHash: blockHash,
+        bestHeight: height,
+        totalWork: chainWork,
+      })
+    );
+    await this.utxo.flush(extraOps);
 
     // ── BIP-157/158: advance the block filter index on connect ──
     //
@@ -802,15 +802,7 @@ export class ChainStateManager {
       }
     }
 
-    // Calculate chain work (approximate - should come from header chain)
-    // Work = 2^256 / (target + 1), but we use a simplified version here
-    const work = this.calculateWork(block.header.bits);
-    const chainWork = this.bestBlock.chainWork + work;
-
-    // Persist per-block chain work so getblockheader can return correct chainwork
-    await this.db.putChainWork(blockHash, chainWork);
-
-    // Update chain state
+    // Update chain state (on disk already, in the flush batch above)
     this.bestBlock = {
       hash: blockHash,
       height,
@@ -821,12 +813,6 @@ export class ChainStateManager {
     // Tip advanced (extension or reorg reconnect) — wake any wait-family RPC.
     // Core: ConnectTip fires KernelNotifications::blockTip for every connect.
     this.notifyTipChanged();
-
-    await this.db.putChainState({
-      bestBlockHash: blockHash,
-      bestHeight: height,
-      totalWork: chainWork,
-    });
 
     // ── W93 Gate: ConnectTip — mempool.removeForBlock ──
     //
@@ -1511,6 +1497,13 @@ export class ChainStateManager {
    * gate a correct baseline from block 1.
    */
   async load(): Promise<void> {
+    // A snapshot load the process did not finish is rolled back (before its
+    // hash gate) or completed (after it) before the tip is read (audit H9).
+    const recovered = await this.db.recoverSnapshotLoad();
+    if (recovered) {
+      console.warn(`[chainstate] interrupted snapshot load: ${recovered}`);
+    }
+
     const state = await this.db.getChainState();
 
     if (state) {

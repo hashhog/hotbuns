@@ -110,6 +110,40 @@ export const enum DBPrefix {
   PRUNE_STATE = 0x50, // 'P' - pruning state metadata
   CHAIN_WORK = 0x77, // 'w' - block hash -> cumulative chain work (32-byte big-endian uint256)
   MARKER = 0x4d, // 'M' - one-time migration done-markers (name -> completion record)
+  /**
+   * 'z' - snapshot coins staged by loadSnapshot until the content-hash gate
+   * passes (same key layout as UTXO). Must stay the highest prefix so the
+   * sorted bulk load into it displaces nothing.
+   */
+  SNAPSHOT_STAGING = 0x7a,
+}
+
+/**
+ * MARKER-prefix record of a snapshot load in flight (see
+ * {@link ChainDB.recoverSnapshotLoad}). Byte 0 is the phase; the PROMOTE_*
+ * phases carry the commit payload (base hash, height, chain work, header).
+ */
+export const SNAPSHOT_LOAD_MARKER = "snapshot-load-in-progress";
+/** MARKER-prefix copy of the rows displaced by {@link ChainDB.prepareSortedBulkLoad}. */
+export const SNAPSHOT_DISPLACED_MARKER = "snapshot-bulk-load-displaced";
+
+export const enum SnapshotLoadPhase {
+  /** Coins going straight into an EMPTY live UTXO keyspace. */
+  LOADING_DIRECT = 1,
+  /** Coins going into SNAPSHOT_STAGING; the live set is untouched. */
+  LOADING_STAGED = 2,
+  /** Hash verified; clearing the live UTXO keyspace before the move. */
+  PROMOTE_CLEAR = 3,
+  /** Hash verified; moving staged coins into the (cleared) live keyspace. */
+  PROMOTE_MOVE = 4,
+}
+
+/** What committing a verified snapshot writes besides the coins. */
+export interface SnapshotCommit {
+  baseHash: Buffer;
+  baseHeight: number;
+  chainWork: bigint;
+  header: Buffer; // 80 bytes
 }
 
 /** Block status flags (matches Bitcoin Core). */
@@ -177,6 +211,58 @@ export interface SnapshotWriteBatch {
  * Construct a prefixed key for database storage.
  * Writes prefix byte directly into a new buffer instead of concat.
  */
+function serializeDisplacedRows(rows: [Buffer, Buffer][]): Buffer {
+  const w = new BufferWriter();
+  w.writeVarInt(rows.length);
+  for (const [k, v] of rows) {
+    w.writeVarBytes(k);
+    w.writeVarBytes(v);
+  }
+  return w.toBuffer();
+}
+
+function deserializeDisplacedRows(data: Buffer): [Buffer, Buffer][] {
+  const r = new BufferReader(data);
+  const n = r.readVarInt();
+  const rows: [Buffer, Buffer][] = [];
+  for (let i = 0; i < n; i++) {
+    const k = Buffer.from(r.readVarBytes());
+    rows.push([k, Buffer.from(r.readVarBytes())]);
+  }
+  return rows;
+}
+
+function serializeSnapshotLoadMarker(phase: SnapshotLoadPhase, commit?: SnapshotCommit): Buffer {
+  if (!commit) return Buffer.from([phase]);
+  const out = Buffer.alloc(1 + 32 + 4 + 32 + 80);
+  out[0] = phase;
+  commit.baseHash.copy(out, 1, 0, 32);
+  out.writeUInt32LE(commit.baseHeight >>> 0, 33);
+  let w = commit.chainWork;
+  for (let i = 31; i >= 0; i--) {
+    out[37 + i] = Number(w & 0xffn);
+    w >>= 8n;
+  }
+  commit.header.copy(out, 69, 0, 80);
+  return out;
+}
+
+function deserializeSnapshotLoadMarker(data: Buffer): { phase: SnapshotLoadPhase; commit: SnapshotCommit | null } {
+  const phase = data[0] as SnapshotLoadPhase;
+  if (data.length < 149) return { phase, commit: null };
+  let chainWork = 0n;
+  for (let i = 0; i < 32; i++) chainWork = (chainWork << 8n) | BigInt(data[37 + i]!);
+  return {
+    phase,
+    commit: {
+      baseHash: Buffer.from(data.subarray(1, 33)),
+      baseHeight: data.readUInt32LE(33),
+      chainWork,
+      header: Buffer.from(data.subarray(69, 149)),
+    },
+  };
+}
+
 function makeKey(prefix: DBPrefix, key: Buffer): Buffer {
   const buf = Buffer.allocUnsafe(1 + key.length);
   buf[0] = prefix;
@@ -870,6 +956,11 @@ export class ChainDB {
     await this.db.put(key, rawBlock);
   }
 
+  /** Build a {@link BatchOperation} that stores a raw block body. */
+  buildBlockDataPutOp(hash: Buffer, rawBlock: Buffer): BatchOperation {
+    return { type: 'put', prefix: DBPrefix.BLOCK_DATA, key: hash, value: rawBlock };
+  }
+
   /**
    * True when this node holds the raw body of `hash` (LevelDB has(): an
    * iterator seek, no value copy into JS).
@@ -1172,9 +1263,14 @@ export class ChainDB {
       displaced.push([Buffer.from(k), Buffer.from(v)]);
     }
     if (displaced.length > maxDisplaced) return null;
+    const markerKey = makeKey(DBPrefix.MARKER, Buffer.from(SNAPSHOT_DISPLACED_MARKER, "utf8"));
     if (displaced.length > 0) {
+      // The rows leave the store in the same batch that records them under
+      // the MARKER prefix, so a crash before restore() cannot lose them:
+      // recoverSnapshotLoad() puts them back at startup (audit H9).
       const del = this.db.batch();
       for (const [k] of displaced) del.del(k);
+      del.put(markerKey, serializeDisplacedRows(displaced));
       await del.write();
       await this.purgeTombstonesBelow(lo, maxDisplaced * 64);
     }
@@ -1186,9 +1282,154 @@ export class ChainDB {
         restored = true;
         const put = this.db.batch();
         for (const [k, v] of displaced) put.put(k, v);
+        put.del(markerKey);
         await put.write();
       },
     };
+  }
+
+  // ── Snapshot load crash safety (audit H9) ──
+
+  /** True when no row exists under `prefix`. */
+  async isPrefixEmpty(prefix: DBPrefix): Promise<boolean> {
+    for await (const _k of this.db.keys({ gte: Buffer.from([prefix]), lt: Buffer.from([prefix + 1]), limit: 1 })) {
+      return false;
+    }
+    return true;
+  }
+
+  /** Delete every row under `prefix`. */
+  async clearPrefix(prefix: DBPrefix): Promise<void> {
+    await this.db.clear({ gte: Buffer.from([prefix]), lt: Buffer.from([prefix + 1]) });
+  }
+
+  /** Record (or advance) the in-flight snapshot load phase. */
+  async putSnapshotLoadMarker(phase: SnapshotLoadPhase, commit?: SnapshotCommit): Promise<void> {
+    await this.putMarker(SNAPSHOT_LOAD_MARKER, serializeSnapshotLoadMarker(phase, commit));
+  }
+
+  /**
+   * Move every staged snapshot coin into the live UTXO keyspace, one chunk
+   * per batch. Each batch deletes the staged rows it moved, so re-running
+   * after a crash continues where it stopped.
+   */
+  async moveStagedSnapshotCoins(chunk: number = 100_000): Promise<number> {
+    const it = this.db.iterator({
+      gte: Buffer.from([DBPrefix.SNAPSHOT_STAGING]),
+      lt: Buffer.from([DBPrefix.SNAPSHOT_STAGING + 1]),
+    });
+    let moved = 0;
+    let batch = this.db.batch();
+    let n = 0;
+    try {
+      for await (const [k, v] of it) {
+        const live = Buffer.from(k);
+        live[0] = DBPrefix.UTXO;
+        batch.put(live, Buffer.from(v));
+        batch.del(Buffer.from(k));
+        n++;
+        if (n >= chunk) {
+          await batch.write();
+          moved += n;
+          n = 0;
+          batch = this.db.batch();
+        }
+      }
+    } finally {
+      await it.close();
+    }
+    if (n > 0) {
+      await batch.write();
+      moved += n;
+    }
+    return moved;
+  }
+
+  /**
+   * The commit point of a snapshot load: the snapshot tip (CHAIN_STATE, base
+   * block index, height entry, chain work) lands in one batch with the
+   * removal of the in-progress marker, after every coin is in place.
+   */
+  async commitSnapshotLoad(commit: SnapshotCommit): Promise<void> {
+    const ops: BatchOperation[] = [
+      this.buildChainStateOp({
+        bestBlockHash: commit.baseHash,
+        bestHeight: commit.baseHeight,
+        totalWork: commit.chainWork,
+      }),
+      this.buildHeightHashPutOp(commit.baseHeight, commit.baseHash),
+      this.buildChainWorkPutOp(commit.baseHash, commit.chainWork),
+      { type: 'del', prefix: DBPrefix.MARKER, key: Buffer.from(SNAPSHOT_LOAD_MARKER, "utf8") },
+    ];
+    // Keep a base record that already exists (its header arrived first).
+    if ((await this.db.get(makeKey(DBPrefix.BLOCK_INDEX, commit.baseHash))) === undefined) {
+      ops.push(
+        this.buildBlockIndexPutOp(commit.baseHash, {
+          height: commit.baseHeight,
+          header: commit.header,
+          nTx: 0,
+          status: BlockStatus.HEADER_VALID | BlockStatus.TXS_VALID | BlockStatus.HAVE_DATA,
+          dataPos: 0,
+        })
+      );
+    }
+    await this.batch(ops);
+  }
+
+  /**
+   * Undo a snapshot load that has NOT passed its hash gate: drop whatever
+   * coins it wrote and its marker. The live set is as it was before the load.
+   */
+  async abortSnapshotLoad(phase: SnapshotLoadPhase): Promise<void> {
+    await this.clearPrefix(
+      phase === SnapshotLoadPhase.LOADING_DIRECT ? DBPrefix.UTXO : DBPrefix.SNAPSHOT_STAGING
+    );
+    await this.db.del(makeKey(DBPrefix.MARKER, Buffer.from(SNAPSHOT_LOAD_MARKER, "utf8")));
+  }
+
+  /** Finish replacing the live coins with verified staged coins. */
+  async promoteSnapshotLoad(commit: SnapshotCommit, phase: SnapshotLoadPhase): Promise<void> {
+    if (phase === SnapshotLoadPhase.PROMOTE_CLEAR) {
+      // Core: the snapshot chainstate is a fresh coins DB. Coins the old
+      // chainstate held must not survive into it.
+      await this.clearPrefix(DBPrefix.UTXO);
+      await this.putSnapshotLoadMarker(SnapshotLoadPhase.PROMOTE_MOVE, commit);
+    }
+    await this.moveStagedSnapshotCoins();
+    await this.commitSnapshotLoad(commit);
+  }
+
+  /**
+   * Startup recovery for a snapshot load the process did not finish (crash,
+   * kill, power loss). Before the hash gate: roll back (the coins written are
+   * unverified). After it: finish the promotion and commit. Also puts back
+   * rows prepareSortedBulkLoad displaced. Returns what it did, or null.
+   * Core analogue: a leftover chainstate_snapshot dir is deleted or adopted
+   * at startup (validation.cpp ChainstateManager::DetectSnapshotChainstate).
+   */
+  async recoverSnapshotLoad(): Promise<string | null> {
+    const done: string[] = [];
+    const displaced = await this.getMarker(SNAPSHOT_DISPLACED_MARKER);
+    if (displaced !== null) {
+      const rows = deserializeDisplacedRows(displaced);
+      const put = this.db.batch();
+      for (const [k, v] of rows) put.put(k, v);
+      put.del(makeKey(DBPrefix.MARKER, Buffer.from(SNAPSHOT_DISPLACED_MARKER, "utf8")));
+      await put.write();
+      done.push(`restored ${rows.length} row(s) displaced by an interrupted sorted bulk load`);
+    }
+    const rec = await this.getMarker(SNAPSHOT_LOAD_MARKER);
+    if (rec !== null) {
+      const { phase, commit } = deserializeSnapshotLoadMarker(rec);
+      if (commit) {
+        await this.promoteSnapshotLoad(commit, phase);
+        done.push(`finished promoting a verified snapshot at height ${commit.baseHeight}`);
+      } else {
+        await this.abortSnapshotLoad(phase);
+        done.push("rolled back an unverified, interrupted snapshot load");
+      }
+    }
+    return done.length > 0 ? done.join("; ") : null;
   }
 
   /**
@@ -1227,10 +1468,10 @@ export class ChainDB {
    * WriteBatch, which copies immediately, so the caller's value buffer may
    * be reused after putUTXO returns. The caller flushes at its own cadence.
    */
-  newChainedBatch(): SnapshotWriteBatch {
+  newChainedBatch(prefix: DBPrefix = DBPrefix.UTXO): SnapshotWriteBatch {
     const batch = this.db.batch();
     const keyBuf = Buffer.allocUnsafe(37);
-    keyBuf[0] = DBPrefix.UTXO;
+    keyBuf[0] = prefix;
     let n = 0;
     return {
       putUTXO: (txid: Buffer, vout: number, value: Buffer): void => {
@@ -1298,7 +1539,15 @@ export class ChainDB {
   // Chain work per-block (used by getblockheader/getblock RPC)
 
   async putChainWork(hash: Buffer, chainWork: bigint): Promise<void> {
-    const key = makeKey(DBPrefix.CHAIN_WORK, hash);
+    const op = this.buildChainWorkPutOp(hash, chainWork);
+    await this.db.put(makeKey(op.prefix, op.key), op.value!);
+  }
+
+  /**
+   * Build a {@link BatchOperation} that stores a block's cumulative chain
+   * work, so it can ride a coins flush with the tip it belongs to.
+   */
+  buildChainWorkPutOp(hash: Buffer, chainWork: bigint): BatchOperation {
     // Store as 32-byte big-endian uint256
     const buf = Buffer.allocUnsafe(32);
     // Write bigint as big-endian 32 bytes
@@ -1307,7 +1556,7 @@ export class ChainDB {
       buf[i] = Number(w & 0xffn);
       w >>= 8n;
     }
-    await this.db.put(key, buf);
+    return { type: 'put', prefix: DBPrefix.CHAIN_WORK, key: hash, value: buf };
   }
 
   async getChainWork(hash: Buffer): Promise<bigint | null> {

@@ -168,6 +168,9 @@ describe("snapshot-boot gettxoutsetinfo at the loaded base", () => {
       blockHash: base.hash,
     });
 
+    // Core refuses loadtxoutset when the active tip already reaches the base
+    // (validation.cpp:5787, audit H9): load into a node behind it.
+    await db.putChainState({ bestBlockHash: REGTEST.genesisBlockHash, bestHeight: 0, totalWork: 1n });
     const loaded = (await callRPC(server, "loadtxoutset", [snapPath])) as Record<
       string,
       unknown
@@ -207,6 +210,9 @@ describe("snapshot-boot gettxoutsetinfo at the loaded base", () => {
       blockHash: base.hash,
     });
 
+    // Core refuses loadtxoutset when the active tip already reaches the base
+    // (validation.cpp:5787, audit H9): load into a node behind it.
+    await db.putChainState({ bestBlockHash: REGTEST.genesisBlockHash, bestHeight: 0, totalWork: 1n });
     await callRPC(server, "loadtxoutset", [snapPath]);
 
     const inner = (db as any).db;
