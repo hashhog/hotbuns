@@ -25,12 +25,17 @@
  *     transactions instead of after the whole burst.
  *
  * The processing callback is the unchanged handler; only WHEN it runs moves.
- * Nothing is dropped: the queue is unbounded, exactly as the set of
- * concurrently started handlers it replaces was. (A count cap was tried and
- * rejected — a 50k-tx burst arrives in well under a second, so any cap below
- * the burst size silently discards valid transactions. Core bounds this with
- * receive-side backpressure, -maxreceivebuffer, which pauses the socket; that
- * is the follow-up if queue memory ever matters.)
+ *
+ * Bounds (security audit 2026-10-29 H3). A count cap was tried and rejected:
+ * a 50k-tx burst arrives in well under a second, so any cap below the burst
+ * size silently discards valid transactions. Instead each peer's queued
+ * bytes are counted, and once they exceed `maxPeerBytes` (default Core's
+ * -maxreceivebuffer, 5 MB) `onPeerPause` asks the transport to stop
+ * delivering that peer's messages; `onPeerResume` fires when its share falls
+ * back under the limit. That is Core's fPauseRecv on the process queue
+ * (net.cpp:4033,4045): backpressure, not loss. `drop(peer)` discards a
+ * disconnected peer's queue, as Core's FinalizeNode does, so its
+ * transactions are not validated after it has gone.
  */
 
 export interface TxIngressOptions<P, M> {
@@ -40,9 +45,20 @@ export interface TxIngressOptions<P, M> {
   yieldEveryMs?: number;
   /** Called if `process` throws (it is expected to catch internally). */
   onError?: (err: unknown) => void;
+  /** Byte size of a queued message (serialized tx size). Default 0. */
+  sizeOf?: (msg: M) => number;
+  /** Per-peer queued-bytes limit. Default {@link TX_INGRESS_MAX_PEER_BYTES}. */
+  maxPeerBytes?: number;
+  /** The peer's queued bytes went over `maxPeerBytes`: stop reading it. */
+  onPeerPause?: (peer: P) => void;
+  /** A paused peer's queued bytes fell back under `maxPeerBytes`. */
+  onPeerResume?: (peer: P) => void;
 }
 
 export const TX_INGRESS_DEFAULT_YIELD_MS = 10;
+
+/** Core net.h DEFAULT_MAXRECEIVEBUFFER (5000 KB). */
+export const TX_INGRESS_MAX_PEER_BYTES = 5000 * 1000;
 
 const yieldToEventLoop = (): Promise<void> =>
   new Promise((resolve) => setImmediate(resolve));
@@ -52,16 +68,57 @@ export class TxIngressQueue<P, M> {
   private readonly process: (peer: P, msg: M) => Promise<void>;
   private readonly yieldEveryMs: number;
   private readonly onError?: (err: unknown) => void;
+  private readonly sizeOf: (msg: M) => number;
+  private readonly maxPeerBytes: number;
+  private readonly onPeerPause?: (peer: P) => void;
+  private readonly onPeerResume?: (peer: P) => void;
+  /** Queued bytes per peer (only peers with something queued). */
+  private readonly peerBytes = new Map<P, number>();
+  /** Peers we have asked to pause. */
+  private readonly pausedPeers = new Set<P>();
   private draining = false;
   private stopped = false;
   private queued = 0;
   /** Counters for logs/metrics/tests. */
-  readonly stats = { enqueued: 0, processed: 0, yields: 0, maxQueued: 0 };
+  readonly stats = { enqueued: 0, processed: 0, yields: 0, maxQueued: 0, dropped: 0, pauses: 0 };
 
   constructor(opts: TxIngressOptions<P, M>) {
     this.process = opts.process;
     this.yieldEveryMs = opts.yieldEveryMs ?? TX_INGRESS_DEFAULT_YIELD_MS;
     this.onError = opts.onError;
+    this.sizeOf = opts.sizeOf ?? (() => 0);
+    this.maxPeerBytes = opts.maxPeerBytes ?? TX_INGRESS_MAX_PEER_BYTES;
+    this.onPeerPause = opts.onPeerPause;
+    this.onPeerResume = opts.onPeerResume;
+  }
+
+  /** Bytes queued for `peer` (not counting the one being validated). */
+  peerQueuedBytes(peer: P): number {
+    return this.peerBytes.get(peer) ?? 0;
+  }
+
+  /** True while `peer` is paused by this queue. */
+  isPeerPaused(peer: P): boolean {
+    return this.pausedPeers.has(peer);
+  }
+
+  /**
+   * Discard everything queued for `peer` (it disconnected). Its paused state
+   * is forgotten without calling onPeerResume: there is nobody to resume.
+   */
+  drop(peer: P): number {
+    const q = this.queues.get(peer);
+    const n = q?.length ?? 0;
+    if (q !== undefined) {
+      // Empty the array too: a drain pass may hold a reference to it.
+      q.length = 0;
+      this.queues.delete(peer);
+    }
+    this.queued -= n;
+    this.stats.dropped += n;
+    this.peerBytes.delete(peer);
+    this.pausedPeers.delete(peer);
+    return n;
   }
 
   /** Number of transactions waiting (not counting the one being validated). */
@@ -85,6 +142,13 @@ export class TxIngressQueue<P, M> {
     q.push(msg);
     this.queued++;
     this.stats.enqueued++;
+    const bytes = (this.peerBytes.get(peer) ?? 0) + this.sizeOf(msg);
+    this.peerBytes.set(peer, bytes);
+    if (bytes > this.maxPeerBytes && !this.pausedPeers.has(peer)) {
+      this.pausedPeers.add(peer);
+      this.stats.pauses++;
+      this.notify(this.onPeerPause, peer);
+    }
     if (this.queued > this.stats.maxQueued) this.stats.maxQueued = this.queued;
     if (!this.draining) {
       this.draining = true;
@@ -100,11 +164,32 @@ export class TxIngressQueue<P, M> {
     this.stopped = true;
     this.queues.clear();
     this.queued = 0;
+    this.peerBytes.clear();
+    this.pausedPeers.clear();
   }
 
   /** Resolves once the queue is empty and no drain is running (tests). */
   async idle(): Promise<void> {
     while (this.draining) await yieldToEventLoop();
+  }
+
+  /** A message left the queue: update its peer's bytes, resume if under. */
+  private release(peer: P, msg: M): void {
+    const left = (this.peerBytes.get(peer) ?? 0) - this.sizeOf(msg);
+    if (left > 0) this.peerBytes.set(peer, left);
+    else this.peerBytes.delete(peer);
+    if (left <= this.maxPeerBytes && this.pausedPeers.delete(peer)) {
+      this.notify(this.onPeerResume, peer);
+    }
+  }
+
+  /** Run a pause/resume callback; a throw must not abort the drain loop. */
+  private notify(cb: ((peer: P) => void) | undefined, peer: P): void {
+    try {
+      cb?.(peer);
+    } catch (err) {
+      this.onError?.(err);
+    }
   }
 
   private async drain(): Promise<void> {
@@ -120,6 +205,7 @@ export class TxIngressQueue<P, M> {
           if (q.length === 0) this.queues.delete(peer);
           if (msg === undefined) continue;
           this.queued--;
+          this.release(peer, msg);
           try {
             await this.process(peer, msg);
           } catch (err) {
