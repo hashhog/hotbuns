@@ -237,8 +237,11 @@ describe("Finding F — ADDR relay only fires when message has <=10 entries", ()
     const addrs = Array.from({ length: count }, (_, i) => ({
       timestamp: now,
       addr: {
-        // Use different IPs so each parses distinctly (not actually needed for relay)
-        ip: Buffer.from([1, i & 0xff, (i >> 8) & 0xff, 1]),
+        // Distinct routable IPv4-mapped addresses (1.x.y.1). Relay is per
+        // admitted address now (audit H4), so the entries must be ones the
+        // addr handler accepts; a 4-byte buffer is not a wire address and
+        // used to be relayed only because the raw message was forwarded.
+        ip: Buffer.from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, i & 0xff, (i >> 8) & 0xff, 1]),
         port: 8333,
         services: BigInt(ServiceFlags.NODE_NETWORK),
       },
