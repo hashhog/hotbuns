@@ -144,8 +144,6 @@ export interface SnapshotCommit {
   baseHeight: number;
   chainWork: bigint;
   header: Buffer; // 80 bytes
-  /** Write the base block-index record (false: one already exists). */
-  writeIndex: boolean;
 }
 
 /** Block status flags (matches Bitcoin Core). */
@@ -236,7 +234,7 @@ function deserializeDisplacedRows(data: Buffer): [Buffer, Buffer][] {
 
 function serializeSnapshotLoadMarker(phase: SnapshotLoadPhase, commit?: SnapshotCommit): Buffer {
   if (!commit) return Buffer.from([phase]);
-  const out = Buffer.alloc(1 + 32 + 4 + 32 + 80 + 1);
+  const out = Buffer.alloc(1 + 32 + 4 + 32 + 80);
   out[0] = phase;
   commit.baseHash.copy(out, 1, 0, 32);
   out.writeUInt32LE(commit.baseHeight >>> 0, 33);
@@ -246,13 +244,12 @@ function serializeSnapshotLoadMarker(phase: SnapshotLoadPhase, commit?: Snapshot
     w >>= 8n;
   }
   commit.header.copy(out, 69, 0, 80);
-  out[149] = commit.writeIndex ? 1 : 0;
   return out;
 }
 
 function deserializeSnapshotLoadMarker(data: Buffer): { phase: SnapshotLoadPhase; commit: SnapshotCommit | null } {
   const phase = data[0] as SnapshotLoadPhase;
-  if (data.length < 150) return { phase, commit: null };
+  if (data.length < 149) return { phase, commit: null };
   let chainWork = 0n;
   for (let i = 0; i < 32; i++) chainWork = (chainWork << 8n) | BigInt(data[37 + i]!);
   return {
@@ -262,7 +259,6 @@ function deserializeSnapshotLoadMarker(data: Buffer): { phase: SnapshotLoadPhase
       baseHeight: data.readUInt32LE(33),
       chainWork,
       header: Buffer.from(data.subarray(69, 149)),
-      writeIndex: data[149] === 1,
     },
   };
 }
@@ -1365,7 +1361,8 @@ export class ChainDB {
       this.buildChainWorkPutOp(commit.baseHash, commit.chainWork),
       { type: 'del', prefix: DBPrefix.MARKER, key: Buffer.from(SNAPSHOT_LOAD_MARKER, "utf8") },
     ];
-    if (commit.writeIndex) {
+    // Keep a base record that already exists (its header arrived first).
+    if ((await this.db.get(makeKey(DBPrefix.BLOCK_INDEX, commit.baseHash))) === undefined) {
       ops.push(
         this.buildBlockIndexPutOp(commit.baseHash, {
           height: commit.baseHeight,

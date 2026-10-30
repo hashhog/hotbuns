@@ -1217,8 +1217,8 @@ export class ChainstateManager {
     let streamedHash: Buffer | null = null;
     let bulkLoad: Awaited<ReturnType<ChainDB["prepareSortedBulkLoad"]>> = null;
     // Set once coins start going to disk (audit H9): where they go, and so
-    // what undoing the load means. Core loads into a separate
-    // chainstate_snapshot DB and deletes it on any failure
+    // what undoing the load means. Core loads into a separate snapshot
+    // coins DB and deletes it on any failure
     // (validation.cpp ActivateSnapshot); this store has one keyspace, so an
     // EMPTY live UTXO keyspace is loaded in place and cleared on failure, and
     // a non-empty one is left alone while the coins go to SNAPSHOT_STAGING.
@@ -1536,7 +1536,6 @@ export class ChainstateManager {
           auData?.baseHeader && auData.baseHeader.length >= 80
             ? auData.baseHeader.subarray(0, 80)
             : Buffer.alloc(80),
-        writeIndex: (await this.db.getBlockIndex(metadata.baseBlockHash)) === null,
       };
       if (loadPhase === SnapshotLoadPhase.LOADING_DIRECT) {
         await this.db.commitSnapshotLoad(commit);
