@@ -37,7 +37,7 @@ import { RPCServer, type RPCServerConfig, type RPCServerDeps } from "../rpc/serv
 import { RESTServer, type RESTServerConfig, type RESTServerDeps } from "../rpc/rest.js";
 import { BlockFilterIndex, PersistentCoinStatsIndex, TxoSpenderIndex } from "../storage/indexes.js";
 import { InventoryRelay } from "../p2p/relay.js";
-import { getTxId, getTxVSize, getWTxId } from "../validation/tx.js";
+import { getTxId, getTxTotalSize, getTxVSize, getWTxId } from "../validation/tx.js";
 import { InvType, type NetworkMessage, type InvVector } from "../p2p/messages.js";
 import { Wallet, WalletManager } from "../wallet/wallet.js";
 import { MAINNET, TESTNET, TESTNET4, REGTEST, disableAssumeValid, type ConsensusParams } from "../consensus/params.js";
@@ -2628,11 +2628,21 @@ async function startNode(config: NodeConfig): Promise<void> {
     }
   };
 
+  // Per-peer byte bound (audit 2026-10-29 H3): a peer whose queued txs pass
+  // 5 MB stops being read until they are validated, and a disconnected
+  // peer's queue is discarded instead of validated.
+  const TX_INGRESS_HOLD = "tx-ingress";
   const txIngress = new TxIngressQueue<import("../p2p/peer.js").Peer, NetworkMessage>({
     process: handleTxMessage,
     onError: logTxAcceptThrow,
+    sizeOf: (msg) => (msg.type === "tx" ? getTxTotalSize(msg.payload.tx) : 0),
+    onPeerPause: (peer) => peer.holdIngress(TX_INGRESS_HOLD),
+    onPeerResume: (peer) => peer.releaseIngress(TX_INGRESS_HOLD),
   });
   nodeTxIngress = txIngress;
+  peerManager.onMessage("__disconnect__", (peer) => {
+    txIngress.drop(peer);
+  });
   peerManager.onMessage("tx", (peer: import("../p2p/peer.js").Peer, msg: NetworkMessage) => {
     if (msg.type !== "tx") return;
     txIngress.enqueue(peer, msg);
