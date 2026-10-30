@@ -126,6 +126,12 @@ export type NetworkMessage =
   | { type: "getheaders"; payload: GetHeadersPayload }
   | { type: "headers"; payload: HeadersPayload }
   | { type: "block"; payload: BlockPayload }
+  /**
+   * Outbound only: a stored block sent as its raw bytes under the `block`
+   * command, so serving getdata does not parse and re-serialize it (Core
+   * sends the bytes it read from disk). Never produced by deserializeMessage.
+   */
+  | { type: "rawblock"; payload: { raw: Buffer } }
   | { type: "tx"; payload: TxPayload }
   | { type: "addr"; payload: AddrPayload }
   | { type: "addrv2"; payload: AddrV2Payload }
@@ -1486,6 +1492,10 @@ export function serializeMessage(magic: number, msg: NetworkMessage): Buffer {
     case "block":
       command = "block";
       payload = serializeBlock(msg.payload.block);
+      break;
+    case "rawblock":
+      command = "block";
+      payload = msg.payload.raw;
       break;
     case "tx":
       command = "tx";

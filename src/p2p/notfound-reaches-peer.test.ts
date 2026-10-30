@@ -285,16 +285,20 @@ describe("notfound reaches a peer", () => {
           frames = parsed.frames;
           return (
             parsed.rest === 0 &&
-            frames.some((f) => f.command === "notfound") &&
+            frames.filter((f) => f.command === "notfound").length >= 2 &&
             frames.some((f) => f.command === "tx")
           );
-        }, 3000, "notfound frame");
+        }, 3000, "notfound frames");
 
+        // Core ProcessGetData (net_processing.cpp:2518) answers one pass at a
+        // time: the leading tx items, then one block item, then a notfound for
+        // that pass. The tx items after the block come in the next pass, with
+        // their own notfound.
         const nf = frames.filter((f) => f.command === "notfound");
-        expect(nf.length).toBe(1);
-        const items = parseInv(nf[0].payload);
-        expect(items.map((i) => i.type)).toEqual([
-          InvType.MSG_TX,
+        expect(nf.length).toBe(2);
+        const items = [...parseInv(nf[0].payload), ...parseInv(nf[1].payload)];
+        expect(parseInv(nf[0].payload).map((i) => i.type)).toEqual([InvType.MSG_TX]);
+        expect(parseInv(nf[1].payload).map((i) => i.type)).toEqual([
           InvType.MSG_WTX,
           InvType.MSG_WITNESS_TX,
         ]);

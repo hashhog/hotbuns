@@ -909,6 +909,17 @@ export class Peer {
   }
 
   /**
+   * Bytes accepted by {@link send} that the kernel has not taken yet. The
+   * getdata server stops while this is over Core's -maxsendbuffer, the way
+   * Core's ProcessGetData stops on fPauseSend.
+   */
+  pendingSendBytes(): number {
+    let n = 0;
+    for (const b of this.outbox) n += b.length;
+    return n;
+  }
+
+  /**
    * Send a NetworkMessage to this peer.
    *
    * Routes through the BIP-324 v2 transport when negotiated; otherwise
