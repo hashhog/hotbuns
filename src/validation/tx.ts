@@ -187,6 +187,16 @@ export function serializeTx(tx: Transaction, withWitness: boolean): Buffer {
 }
 
 /**
+ * Every empty witness item shares this one zero-length Buffer. An empty item
+ * costs one byte on the wire, so a 4 MB payload can carry ~4 million of them;
+ * allocating a fresh Buffer for each one doubled the parse time and took
+ * ~430 MB (audit H2). A zero-length Buffer has no bytes to mutate, so sharing
+ * it cannot leak one item's content into another, and it re-serializes as the
+ * same single 0x00 length byte.
+ */
+const EMPTY_WITNESS_ITEM = Buffer.alloc(0);
+
+/**
  * Deserialize a transaction from a BufferReader.
  */
 export function deserializeTx(reader: BufferReader): Transaction {
@@ -267,7 +277,12 @@ export function deserializeTx(reader: BufferReader): Transaction {
       const witnessCount = reader.readVarInt();
       const witness: Buffer[] = [];
       for (let j = 0; j < witnessCount; j++) {
-        witness.push(reader.readVarBytes());
+        const len = reader.readVarInt();
+        if (len > 0x02000000) {
+          // Same MAX_SIZE guard and message as readVarBytes().
+          throw new Error("ReadCompactSize(): size too large");
+        }
+        witness.push(len === 0 ? EMPTY_WITNESS_ITEM : reader.readBytes(len));
       }
       inputs[i].witness = witness;
     }

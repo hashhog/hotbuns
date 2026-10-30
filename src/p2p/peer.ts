@@ -15,6 +15,7 @@ import {
   parseHeader,
   serializeMessage,
   deserializeMessage,
+  OversizedTxMessageError,
   deserializeV2Message,
   extractCommandAndPayload,
   hostToBuffer,
@@ -1418,6 +1419,12 @@ export class Peer {
       try {
         msg = deserializeMessage(header, payload);
       } catch (deserErr) {
+        if (deserErr instanceof OversizedTxMessageError) {
+          // Non-standard by size: drop it unparsed, keep the peer (audit H2).
+          console.warn(`peer ${this.host}: ${deserErr.message}`);
+          this.recvBuffer = this.recvBuffer.subarray(totalLength);
+          continue;
+        }
         if (header.command === "block") {
           console.error(`BLOCK DESER ERROR: size=${header.length} from=${this.host}: ${deserErr instanceof Error ? deserErr.message : String(deserErr)}`);
         }
