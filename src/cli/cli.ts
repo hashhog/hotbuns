@@ -54,8 +54,10 @@ export interface NodeConfig {
   datadir: string;
   network: "mainnet" | "testnet" | "testnet4" | "regtest";
   rpcPort: number;
-  rpcUser: string;
-  rpcPassword: string;
+  /** -rpcuser. Unset by default: like Core, only the cookie works until set. */
+  rpcUser?: string;
+  /** -rpcpassword. Unset by default (see rpcUser). */
+  rpcPassword?: string;
   maxOutbound: number;
   listen: boolean;
   port: number;
@@ -379,8 +381,10 @@ const DEFAULT_CONFIG: NodeConfig = {
   datadir: path.join(os.homedir(), ".hotbuns"),
   network: "mainnet",
   rpcPort: 8332,
-  rpcUser: "user",
-  rpcPassword: "pass",
+  // No rpcUser/rpcPassword: Core has no default RPC credentials. Without
+  // -rpcpassword only the random <datadir>/.cookie authenticates
+  // (httprpc.cpp InitRPCAuthentication). A built-in pair let any local
+  // process drive the node (audit 2026-10-29 C3).
   maxOutbound: 8,
   listen: true,
   port: 8333,
@@ -3337,6 +3341,28 @@ async function gracefulShutdown(): Promise<void> {
 }
 
 /**
+ * Basic-auth header value for the CLI client, as bitcoin-cli picks it:
+ * the configured -rpcuser/-rpcpassword if both are set, else the node's
+ * <datadir>/.cookie.
+ */
+function rpcClientAuth(config: NodeConfig): string {
+  let credentials: string;
+  if (config.rpcUser && config.rpcPassword) {
+    credentials = `${config.rpcUser}:${config.rpcPassword}`;
+  } else {
+    const cookiePath = path.join(config.datadir, ".cookie");
+    try {
+      credentials = fs.readFileSync(cookiePath, "utf8").trim();
+    } catch {
+      throw new Error(
+        `Could not locate RPC credentials. No authentication cookie could be found (${cookiePath}), and no rpcpassword is set.`
+      );
+    }
+  }
+  return Buffer.from(credentials).toString("base64");
+}
+
+/**
  * Send an RPC request to the running node.
  */
 async function rpcCall(
@@ -3345,9 +3371,7 @@ async function rpcCall(
   params: unknown[] = []
 ): Promise<unknown> {
   const url = `http://127.0.0.1:${config.rpcPort}/`;
-  const auth = Buffer.from(`${config.rpcUser}:${config.rpcPassword}`).toString(
-    "base64"
-  );
+  const auth = rpcClientAuth(config);
 
   const body = JSON.stringify({
     jsonrpc: "2.0",
@@ -3386,9 +3410,7 @@ export function formatRpcRequest(
   params: unknown[] = []
 ): { url: string; headers: Record<string, string>; body: string } {
   const url = `http://127.0.0.1:${config.rpcPort}/`;
-  const auth = Buffer.from(`${config.rpcUser}:${config.rpcPassword}`).toString(
-    "base64"
-  );
+  const auth = rpcClientAuth(config);
 
   return {
     url,
@@ -3697,8 +3719,8 @@ OPTIONS:
   --rest-port=<port>    REST port when --rest is set (default: rpcPort+1)
   --blockfilterindex    Enable BIP-157/158 compact block filter index (default: off)
   --metrics-port=<port> Prometheus metrics port (default: 9332, 0 = disabled)
-  --rpc-user=<user>     RPC username (default: user)
-  --rpc-password=<pass> RPC password (default: pass)
+  --rpc-user=<user>     RPC username (default: none; cookie auth only)
+  --rpc-password=<pass> RPC password (default: none; cookie auth only)
   --rpc-tls-cert=<path> PEM cert for HTTPS RPC (pair with --rpc-tls-key)
   --rpc-tls-key=<path>  PEM key for HTTPS RPC (pair with --rpc-tls-cert)
   --max-outbound=<n>    Max outbound connections (default: 8)
@@ -3728,7 +3750,7 @@ OPTIONS:
 
 EXAMPLES:
   hotbuns start --network=testnet
-  hotbuns getinfo --rpc-port=18332 --rpc-user=user --rpc-password=pass
+  hotbuns getinfo --rpc-port=18332 --rpc-user=alice --rpc-password=<secret>
   hotbuns wallet create --password=mysecret
   hotbuns wallet send bc1q... 0.01 --password=mysecret --fee-rate=5
 `);

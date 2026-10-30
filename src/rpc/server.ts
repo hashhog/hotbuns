@@ -6,6 +6,7 @@
  */
 
 import * as path from "path";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { mempoolInfoToJSON } from "../mempool/info.js";
 import { FATAL_ERROR_TOKEN, fatalRefusal, isFatal } from "../chain/fatal.js";
 import * as fs from "fs";
@@ -852,8 +853,14 @@ export class RPCServer {
    *  Backs gettxspendingprevout's confirmed-spend path + getindexinfo. */
   private txoSpenderIndex?: import("../storage/indexes.js").TxoSpenderIndex;
   private shutdownCallback: (() => void) | null = null;
-  /** Current wallet name for request context (set from URL path). */
-  private currentWalletName: string | null = null;
+  /**
+   * The /wallet/<name> segment of the request being served, scoped to that
+   * request's async context. Core reads the name from each request's own URI
+   * (wallet/rpc/util.cpp GetWalletNameFromJSONRPCRequest); a field shared by
+   * every request let a concurrent -- even unauthenticated -- request re-route
+   * another client's wallet call (audit 2026-10-29 H5).
+   */
+  private readonly walletRoute = new AsyncLocalStorage<string | null>();
   /** Cookie password generated on startup (hex-encoded random bytes). */
   private cookiePassword: string | null = null;
   /** Absolute path to the .cookie file written on startup. */
@@ -1272,17 +1279,6 @@ export class RPCServer {
       return this.handlePayJoinRoute(req, url);
     }
 
-    // Parse wallet name from URL path: /wallet/<name>
-    // Reference: Bitcoin Core wallet-specific RPC endpoints
-    const pathParts = url.pathname.split("/").filter((p) => p !== "");
-    if (pathParts.length >= 2 && pathParts[0] === "wallet") {
-      // URL has /wallet/<name> prefix - use that wallet
-      this.currentWalletName = decodeURIComponent(pathParts[1]);
-    } else {
-      // No wallet in URL - will use default if exactly one wallet loaded
-      this.currentWalletName = null;
-    }
-
     // Authenticate
     if (!this.authenticate(req)) {
       return new Response(
@@ -1302,6 +1298,23 @@ export class RPCServer {
       );
     }
 
+    // Parse wallet name from URL path: /wallet/<name>, only once the request
+    // is authenticated, and bind it to this request alone (null = no wallet in
+    // URL; the default is used if exactly one wallet is loaded).
+    // Reference: Bitcoin Core wallet-specific RPC endpoints
+    const pathParts = url.pathname.split("/").filter((p) => p !== "");
+    const walletName =
+      pathParts.length >= 2 && pathParts[0] === "wallet"
+        ? decodeURIComponent(pathParts[1])
+        : null;
+    return this.walletRoute.run(walletName, () => this.handleRpcBody(req));
+  }
+
+  /**
+   * Parse and dispatch the JSON-RPC body of an authenticated request. Runs
+   * inside {@link walletRoute} so every handler sees this request's wallet.
+   */
+  private async handleRpcBody(req: Request): Promise<Response> {
     // Parse request body
     let body: unknown;
     try {
@@ -10905,6 +10918,11 @@ export class RPCServer {
    *
    * Reference: Bitcoin Core's GetWalletForJSONRPCRequest in wallet/rpc/util.cpp
    */
+  /** The /wallet/<name> of the request being served, or null. */
+  private requestWalletName(): string | null {
+    return this.walletRoute.getStore() ?? null;
+  }
+
   private getCurrentWallet(): Wallet {
     // First check legacy single wallet
     if (this.wallet && !this.walletManager) {
@@ -10919,12 +10937,13 @@ export class RPCServer {
     }
 
     // If wallet name specified in URL
-    if (this.currentWalletName !== null) {
-      const wallet = this.walletManager.getWallet(this.currentWalletName);
+    const urlWallet = this.requestWalletName();
+    if (urlWallet !== null) {
+      const wallet = this.walletManager.getWallet(urlWallet);
       if (!wallet) {
         throw {
           code: RPCErrorCodes.WALLET_NOT_FOUND,
-          message: `Wallet "${this.currentWalletName}" not found`,
+          message: `Wallet "${urlWallet}" not found`,
         };
       }
       return wallet;
@@ -10962,8 +10981,9 @@ export class RPCServer {
    * Get the name of the current wallet for RPC response.
    */
   private getCurrentWalletName(): string {
-    if (this.currentWalletName !== null) {
-      return this.currentWalletName;
+    const urlWallet = this.requestWalletName();
+    if (urlWallet !== null) {
+      return urlWallet;
     }
     if (this.walletManager && this.walletManager.getWalletCount() === 1) {
       return this.walletManager.listWallets()[0];
@@ -10983,11 +11003,10 @@ export class RPCServer {
     if (!this.walletManager) return;
     try {
       const name =
-        this.currentWalletName !== null
-          ? this.currentWalletName
-          : this.walletManager.getWalletCount() === 1
+        this.requestWalletName() ??
+          (this.walletManager.getWalletCount() === 1
             ? this.walletManager.listWallets()[0]
-            : null;
+            : null);
       if (name !== null) {
         this.walletManager.markDirty(name);
       }
@@ -11224,6 +11243,7 @@ export class RPCServer {
     const [walletNameParam, loadOnStartup] = params;
 
     // Determine wallet name: from param or from URL
+    const urlWallet = this.requestWalletName();
     let walletName: string;
     if (walletNameParam !== undefined && walletNameParam !== null) {
       if (typeof walletNameParam !== "string") {
@@ -11233,8 +11253,8 @@ export class RPCServer {
         };
       }
       walletName = walletNameParam;
-    } else if (this.currentWalletName !== null) {
-      walletName = this.currentWalletName;
+    } else if (urlWallet !== null) {
+      walletName = urlWallet;
     } else if (this.walletManager.getWalletCount() === 1) {
       walletName = this.walletManager.listWallets()[0];
     } else {
@@ -11245,11 +11265,11 @@ export class RPCServer {
     }
 
     // If both URL and param specify wallet, they must match
-    if (this.currentWalletName !== null && walletNameParam !== undefined && walletNameParam !== null) {
-      if (this.currentWalletName !== walletNameParam) {
+    if (urlWallet !== null && walletNameParam !== undefined && walletNameParam !== null) {
+      if (urlWallet !== walletNameParam) {
         throw {
           code: RPCErrorCodes.INVALID_PARAMS,
-          message: `Wallet name from URL (${this.currentWalletName}) does not match parameter (${walletNameParam})`,
+          message: `Wallet name from URL (${urlWallet}) does not match parameter (${walletNameParam})`,
         };
       }
     }
