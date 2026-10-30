@@ -28,7 +28,8 @@ import {
   MAX_SCRIPT_SIZE,
 } from "../wire/compressor.js";
 import { MuHash3072 } from "../wire/muhash.js";
-import { ChainDB, DBPrefix, BlockStatus } from "../storage/database.js";
+import { ChainDB, DBPrefix, BlockStatus, SnapshotLoadPhase } from "../storage/database.js";
+import type { SnapshotCommit } from "../storage/database.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import type { Coin, CoinsViewCache, CoinsViewDB } from "./utxo.js";
 import { UTXOManager } from "./utxo.js";
@@ -1180,7 +1181,18 @@ export class ChainstateManager {
     // height so loading a stale snapshot is rejected.
     // Note: Core performs this check again at activation time inside
     // ActivateSnapshot() after PopulateAndValidateSnapshot succeeds.
-    const activeTipHeight = this.activeChainstate.tipHeight;
+    //
+    // The in-memory tipHeight is 0 for a manager built at startup (cli) or
+    // lazily by the RPC, so compare against the PERSISTED tip too (audit H9):
+    // with only the in-memory value, `--load-snapshot` left on the command
+    // line of a synced datadir reloaded over the live coins and rewound
+    // CHAIN_STATE to the snapshot base. Core compares against the real
+    // active tip (validation.cpp:5788).
+    const persistedTip = await this.db.getChainState();
+    const activeTipHeight = Math.max(
+      this.activeChainstate.tipHeight,
+      persistedTip?.bestHeight ?? 0,
+    );
 
     let stat;
     try {
@@ -1204,6 +1216,17 @@ export class ChainstateManager {
     let snapshotChainstate: Chainstate;
     let streamedHash: Buffer | null = null;
     let bulkLoad: Awaited<ReturnType<ChainDB["prepareSortedBulkLoad"]>> = null;
+    // Set once coins start going to disk (audit H9): where they go, and so
+    // what undoing the load means. Core loads into a separate
+    // chainstate_snapshot DB and deletes it on any failure
+    // (validation.cpp ActivateSnapshot); this store has one keyspace, so an
+    // EMPTY live UTXO keyspace is loaded in place and cleared on failure, and
+    // a non-empty one is left alone while the coins go to SNAPSHOT_STAGING.
+    // A marker records the phase so startup can finish the job after a crash
+    // (ChainDB.recoverSnapshotLoad).
+    let loadPhase: SnapshotLoadPhase | null = null;
+    let verified = false;
+    let computedHash: Buffer = Buffer.alloc(0);
     const loadStats: SnapshotLoadStats = {
       txouts: 0n,
       transactions: 0n,
@@ -1285,8 +1308,19 @@ export class ChainstateManager {
       snapshotChainstate.tipHash = metadata.baseBlockHash;
       snapshotChainstate.tipHeight = baseHeight;
 
+      loadPhase = (await this.db.isPrefixEmpty(DBPrefix.UTXO))
+        ? SnapshotLoadPhase.LOADING_DIRECT
+        : SnapshotLoadPhase.LOADING_STAGED;
+      const coinPrefix =
+        loadPhase === SnapshotLoadPhase.LOADING_DIRECT ? DBPrefix.UTXO : DBPrefix.SNAPSHOT_STAGING;
+      // A staging area left by an earlier failed load would be merged in.
+      if (loadPhase === SnapshotLoadPhase.LOADING_STAGED) {
+        await this.db.clearPrefix(DBPrefix.SNAPSHOT_STAGING);
+      }
+      await this.db.putSnapshotLoadMarker(loadPhase);
+
       bulkLoad = opts?.isolateBulkLoad
-        ? await this.db.prepareSortedBulkLoad(DBPrefix.UTXO)
+        ? await this.db.prepareSortedBulkLoad(coinPrefix)
         : null;
       if (bulkLoad && bulkLoad.displaced > 0) {
         console.log(
@@ -1295,7 +1329,7 @@ export class ChainstateManager {
         );
       }
 
-      let batch = this.db.newChainedBatch();
+      let batch = this.db.newChainedBatch(coinPrefix);
       const valueScratch = Buffer.allocUnsafe(16 * 1024);
       const hasher = auData ? new Bun.CryptoHasher("sha256") : null;
       const hashGroup: SnapshotHashCoin[] = [];
@@ -1421,7 +1455,7 @@ export class ChainstateManager {
 
           if (batch.length >= COINS_LOAD_BATCH_SIZE) {
             await batch.write();
-            batch = this.db.newChainedBatch();
+            batch = this.db.newChainedBatch(coinPrefix);
           }
         }
       }
@@ -1444,52 +1478,90 @@ export class ChainstateManager {
           `Bad snapshot - coins left over after deserializing ${coinsLoaded} coins`,
         );
       }
+
+      // Strict snapshot content-hash check.
+      //
+      // Mirrors Bitcoin Core validation.cpp:5902-5914
+      // (PopulateAndValidateSnapshot):
+      //
+      //   maybe_stats = ComputeUTXOStats(
+      //       CoinStatsHashType::HASH_SERIALIZED, ..., interruption_point);
+      //   ...
+      //   if (AssumeutxoHash{maybe_stats->hashSerialized} != au_data.hash_serialized) {
+      //       return util::Error{Untranslated(strprintf(
+      //           "Bad snapshot content hash: expected %s, got %s", ...))};
+      //   }
+      //
+      // Core uses HASH_SERIALIZED (SHA256d via HashWriter, see
+      // `kernel/coinstats.cpp:161-163`) for the strict gate, NOT MuHash3072.
+      // MuHash is for `gettxoutsetinfo hash_type=muhash` only; the
+      // `m_assumeutxo_data.hash_serialized` constants in chainparams.cpp are
+      // SHA256d-via-HashWriter outputs. Refusing on mismatch is what makes
+      // `loadtxoutset` strict — a malformed or out-of-band snapshot cannot
+      // poison the chainstate.
+      // The HASH_SERIALIZED folded during the load (same per-txid
+      // numeric-vout order as computeUTXOSetHash) is the gate's input: the
+      // streaming hasher runs whenever auData is set, and a DB walk would
+      // hash the wrong set (staged coins are not in the live keyspace yet).
+      // HASHHOG_UNSAFE_SNAPSHOT_HEIGHT leaves auData null and skips the
+      // comparison entirely.
+      computedHash = streamedHash ?? Buffer.alloc(0);
+
+      // `auData === null` ONLY under the HASHHOG_UNSAFE_SNAPSHOT_HEIGHT bypass
+      // above, where no chainparams entry exists and therefore no hardcoded
+      // hash_serialized to compare against. That is the one and only check the
+      // bypass drops (the loud warning above already said so); with the variable
+      // unset this is byte-for-byte the previous strict gate.
+      if (auData && !computedHash.equals(auData.hashSerialized)) {
+        throw new Error(
+          `Bad snapshot content hash: expected ${auData.hashSerialized.toString("hex")}, got ${computedHash.toString("hex")}`
+        );
+      }
+      verified = true;
+
+      // Commit: the coins become the live set and the snapshot base becomes
+      // the tip in one final batch (ChainDB.commitSnapshotLoad), so a crash
+      // can never leave snapshot coins under the old CHAIN_STATE. The same
+      // values the callers stitch afterwards (cli runSnapshotLoad, RPC
+      // loadtxoutset): the 80-byte base header when known, else zeros, and
+      // the assumeutxo chain work, else nMinimumChainWork.
+      const commit: SnapshotCommit = {
+        baseHash: metadata.baseBlockHash,
+        baseHeight,
+        chainWork:
+          auData?.chainWork && auData.chainWork > 0n
+            ? auData.chainWork
+            : this.params.nMinimumChainWork,
+        header:
+          auData?.baseHeader && auData.baseHeader.length >= 80
+            ? auData.baseHeader.subarray(0, 80)
+            : Buffer.alloc(80),
+        writeIndex: (await this.db.getBlockIndex(metadata.baseBlockHash)) === null,
+      };
+      if (loadPhase === SnapshotLoadPhase.LOADING_DIRECT) {
+        await this.db.commitSnapshotLoad(commit);
+      } else {
+        await this.db.putSnapshotLoadMarker(SnapshotLoadPhase.PROMOTE_CLEAR, commit);
+        await this.db.promoteSnapshotLoad(commit, SnapshotLoadPhase.PROMOTE_CLEAR);
+      }
+    } catch (err) {
+      // Not verified: drop every coin this load wrote. (A crash here leaves
+      // the marker, and startup does the same.) Once verified, a failure is
+      // left for startup recovery to finish rather than undone.
+      if (loadPhase !== null && !verified) {
+        await this.db.abortSnapshotLoad(loadPhase).catch((e) => {
+          console.error(
+            `[snapshot] rollback of the failed load did not finish (${
+              e instanceof Error ? e.message : String(e)
+            }); it completes at the next startup`,
+          );
+        });
+      }
+      throw err;
     } finally {
       await fh.close().catch(() => { /* close-on-error best-effort */ });
       // Put the displaced rows back whether the load succeeded or threw.
       await bulkLoad?.restore();
-    }
-
-    // Strict snapshot content-hash check.
-    //
-    // Mirrors Bitcoin Core validation.cpp:5902-5914
-    // (PopulateAndValidateSnapshot):
-    //
-    //   maybe_stats = ComputeUTXOStats(
-    //       CoinStatsHashType::HASH_SERIALIZED, ..., interruption_point);
-    //   ...
-    //   if (AssumeutxoHash{maybe_stats->hashSerialized} != au_data.hash_serialized) {
-    //       return util::Error{Untranslated(strprintf(
-    //           "Bad snapshot content hash: expected %s, got %s", ...))};
-    //   }
-    //
-    // Core uses HASH_SERIALIZED (SHA256d via HashWriter, see
-    // `kernel/coinstats.cpp:161-163`) for the strict gate, NOT MuHash3072.
-    // MuHash is for `gettxoutsetinfo hash_type=muhash` only; the
-    // `m_assumeutxo_data.hash_serialized` constants in chainparams.cpp are
-    // SHA256d-via-HashWriter outputs. Refusing on mismatch is what makes
-    // `loadtxoutset` strict — a malformed or out-of-band snapshot cannot
-    // poison the chainstate.
-    // Prefer the HASH_SERIALIZED folded during the load (same per-txid
-    // numeric-vout order as computeUTXOSetHash) so a 168M-coin import does
-    // not walk the coins DB a second time. Fall back to the DB walk if the
-    // streaming hasher was not used. HASHHOG_UNSAFE_SNAPSHOT_HEIGHT leaves
-    // auData null and skips the comparison entirely.
-    const { hash: computedHash } = streamedHash
-      ? { hash: streamedHash }
-      : auData
-        ? await computeUTXOSetHash(this.db, interruptCheck)
-        : { hash: Buffer.alloc(0) };
-
-    // `auData === null` ONLY under the HASHHOG_UNSAFE_SNAPSHOT_HEIGHT bypass
-    // above, where no chainparams entry exists and therefore no hardcoded
-    // hash_serialized to compare against. That is the one and only check the
-    // bypass drops (the loud warning above already said so); with the variable
-    // unset this is byte-for-byte the previous strict gate.
-    if (auData && !computedHash.equals(auData.hashSerialized)) {
-      throw new Error(
-        `Bad snapshot content hash: expected ${auData.hashSerialized.toString("hex")}, got ${computedHash.toString("hex")}`
-      );
     }
 
     // Create background chainstate for validation from genesis
