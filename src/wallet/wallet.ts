@@ -460,6 +460,23 @@ interface WalletData {
   // Imported watch-only descriptors (importdescriptors). The per-address
   // watch view is re-expanded from these on load.
   watchDescriptors?: WatchDescriptorRecord[];
+  // importprivkey keys (H7). Plaintext `privateKey` only in an unencrypted
+  // wallet; an encrypted wallet stores `encryptedPrivateKey` + `iv` only.
+  importedKeys?: ImportedKeyRecord[];
+}
+
+/**
+ * A key added with importprivkey. Core writes imported keys to the wallet DB,
+ * encrypted when the wallet is encrypted; this is the hotbuns equivalent.
+ * Exactly one of `privateKey` / (`encryptedPrivateKey` + `iv`) is set.
+ */
+interface ImportedKeyRecord {
+  address: string;
+  addressType: AddressType;
+  publicKey: string; // hex, compressed
+  privateKey?: string; // hex, unencrypted wallets only
+  encryptedPrivateKey?: string; // hex, AES-256-GCM (see importedKeyCipherKey)
+  iv?: string; // hex, 12-byte GCM nonce
 }
 
 interface SerializedUTXO {
@@ -553,6 +570,10 @@ export class Wallet {
   // INTENTIONALLY separate from `keys` so coin signing can never treat a
   // watch address as key-bearing.
   private watchDescriptors: WatchDescriptorRecord[];
+
+  // importprivkey keys, as persisted (address -> record). The usable key
+  // material lives in `keys`; this is what save() writes.
+  private importedKeys: Map<string, ImportedKeyRecord>;
   private watchAddresses: Map<string, WatchAddressInfo>;
 
   constructor(config: WalletConfig) {
@@ -570,6 +591,7 @@ export class Wallet {
     this.blank = false;
     this.watchDescriptors = [];
     this.watchAddresses = new Map();
+    this.importedKeys = new Map();
 
     // Initialize encryption state
     this.encryption = {
@@ -867,6 +889,14 @@ export class Wallet {
       );
     }
 
+    // Restore imported-key records (each independently). The keys themselves
+    // are put back into the keyring below, or on unlock for an encrypted one.
+    for (const rec of data.importedKeys ?? []) {
+      if (rec && typeof rec.address === "string") {
+        wallet.importedKeys.set(rec.address, rec);
+      }
+    }
+
     // Regenerate keys (only if not encrypted, or if we have the seed).
     // disable_private_keys / blank wallets stay keyless across restarts.
     if (
@@ -875,6 +905,9 @@ export class Wallet {
       (!wallet.encryption.isEncrypted || wallet.seed.length > 0)
     ) {
       wallet.pregenerateAddresses();
+    }
+    if (!wallet.encryption.isEncrypted || wallet.seed.length > 0) {
+      wallet.restoreImportedKeys();
     }
 
     return wallet;
@@ -961,6 +994,7 @@ export class Wallet {
       disablePrivateKeys: this.disablePrivateKeys,
       blank: this.blank,
       watchDescriptors: this.watchDescriptors,
+      importedKeys: Array.from(this.importedKeys.values()),
     };
 
     // bigint is not JSON-serializable: WalletTxRecord carries debit/credit/fee
@@ -1019,8 +1053,12 @@ export class Wallet {
     await fsp.mkdir(dir, { recursive: true });
     const tmpPath = `${targetPath}.tmp`;
 
-    const fh = await fsp.open(tmpPath, "w");
+    // 0600: an unencrypted wallet's seed is protected only by file mode, as
+    // in Core (the "hotbuns" storage key is fixed and public). chmod as well,
+    // since the mode argument is ignored when a stale temp file exists.
+    const fh = await fsp.open(tmpPath, "w", 0o600);
     try {
+      await fh.chmod(0o600);
       await fh.writeFile(bytes);
       await fh.sync();
     } finally {
@@ -3284,6 +3322,10 @@ export class Wallet {
    * The imported key is marked with path "imported" so it is never confused
    * with an HD-derived key (it must not advance nextReceiveIndex / the gap
    * limit). Returns the derived address.
+   *
+   * The key is also recorded for save() (audit H7: it used to live only in
+   * memory). In an encrypted wallet the record holds only the encrypted key,
+   * so the wallet must be unlocked, as in Core (EnsureWalletIsUnlocked).
    */
   addImportedKey(
     privateKey: Buffer,
@@ -3293,8 +3335,22 @@ export class Wallet {
     if (privateKey.length !== 32) {
       throw new Error(`importprivkey: private key must be 32 bytes, got ${privateKey.length}`);
     }
+    if (this.isLocked()) {
+      throw new Error("Error: Please enter the wallet passphrase with walletpassphrase first.");
+    }
     const publicKey = privateKeyToPublicKey(privateKey, true);
     const address = this.pubkeyToAddress(publicKey, addressType);
+    const record: ImportedKeyRecord = {
+      address,
+      addressType,
+      publicKey: publicKey.toString("hex"),
+    };
+    if (this.encryption.isEncrypted) {
+      Object.assign(record, this.sealImportedKey(privateKey));
+    } else {
+      record.privateKey = privateKey.toString("hex");
+    }
+    this.importedKeys.set(address, record);
     const key: WalletKey = {
       privateKey: Buffer.from(privateKey),
       publicKey,
@@ -3307,6 +3363,68 @@ export class Wallet {
       this.labels.set(address, label);
     }
     return address;
+  }
+
+  /**
+   * Key that encrypts imported private keys in an encrypted wallet. Derived
+   * from the seed, which is itself stored only under the passphrase, so an
+   * imported key is exactly as protected as the HD keys: available while
+   * unlocked, unreadable otherwise, and unaffected by walletpassphrasechange
+   * (which re-wraps the seed, not the seed's value).
+   */
+  private importedKeyCipherKey(): Buffer {
+    if (this.seed.length !== 64) {
+      throw new Error("Error: Please enter the wallet passphrase with walletpassphrase first.");
+    }
+    return Buffer.from(
+      hmac(sha256, this.seed, Buffer.from("hotbuns/imported-key/v1", "utf-8"))
+    );
+  }
+
+  private sealImportedKey(privateKey: Buffer): { encryptedPrivateKey: string; iv: string } {
+    const iv = Buffer.from(randomBytes(12));
+    const ct = gcm(this.importedKeyCipherKey(), iv).encrypt(privateKey);
+    return { encryptedPrivateKey: Buffer.from(ct).toString("hex"), iv: iv.toString("hex") };
+  }
+
+  /**
+   * Put every persisted imported key back into the keyring. Needs the seed
+   * for encrypted records, so it runs on load (unencrypted) or on unlock. A
+   * record that fails to decrypt or whose key does not match its public key
+   * is skipped with a warning rather than discarding the rest.
+   */
+  private restoreImportedKeys(): void {
+    for (const rec of this.importedKeys.values()) {
+      try {
+        let priv: Buffer;
+        if (rec.privateKey !== undefined) {
+          priv = Buffer.from(rec.privateKey, "hex");
+        } else if (rec.encryptedPrivateKey !== undefined && rec.iv !== undefined) {
+          priv = Buffer.from(
+            gcm(this.importedKeyCipherKey(), Buffer.from(rec.iv, "hex")).decrypt(
+              Buffer.from(rec.encryptedPrivateKey, "hex")
+            )
+          );
+        } else {
+          throw new Error("record has no key material");
+        }
+        const publicKey = privateKeyToPublicKey(priv, true);
+        if (publicKey.toString("hex") !== rec.publicKey) {
+          throw new Error("private key does not match recorded public key");
+        }
+        this.keys.set(rec.address, {
+          privateKey: priv,
+          publicKey,
+          address: rec.address,
+          path: "imported",
+          addressType: rec.addressType,
+        });
+      } catch (err) {
+        console.warn(
+          `[wallet] imported key for ${rec.address} not restored (${(err as Error).message})`
+        );
+      }
+    }
   }
 
   /**
@@ -3535,6 +3653,22 @@ export class Wallet {
     // Encrypt the seed
     const encryptedSeed = this.encryptAES256CBC(this.seed, key, iv);
 
+    // Re-store any imported keys in encrypted form (needs the seed, so before
+    // it is cleared below). Built first, swapped in only once all succeed.
+    const sealed = new Map<string, ImportedKeyRecord>();
+    for (const [address, rec] of this.importedKeys) {
+      if (rec.privateKey === undefined) {
+        sealed.set(address, rec);
+        continue;
+      }
+      const { privateKey, ...pub } = rec;
+      sealed.set(address, {
+        ...pub,
+        ...this.sealImportedKey(Buffer.from(privateKey, "hex")),
+      });
+    }
+    this.importedKeys = sealed;
+
     // Update encryption state
     this.encryption = {
       isEncrypted: true,
@@ -3610,6 +3744,7 @@ export class Wallet {
 
     // Regenerate addresses now that we have the seed
     this.pregenerateAddresses();
+    this.restoreImportedKeys();
 
     // Mark as unlocked
     this.encryption.isLocked = false;
@@ -4001,7 +4136,10 @@ export class WalletManager {
    * `flushInFlight` so two overlapping flushes never race on the same file.
    */
   async flushDirty(): Promise<void> {
-    if (this.flushInFlight) {
+    // `while`, not `if`: two callers waiting on the same flush must not both
+    // start a save (they would share `wallet.dat.tmp`); the first to resume
+    // claims flushInFlight synchronously and the other waits on that.
+    while (this.flushInFlight) {
       await this.flushInFlight;
       // A second drain in case more became dirty while the first ran.
     }
@@ -4028,6 +4166,33 @@ export class WalletManager {
       await this.flushInFlight;
     } finally {
       this.flushInFlight = null;
+    }
+  }
+
+  /**
+   * Persist `name`'s wallet now and report failure to the caller. For RPCs
+   * whose reply promises the change is on disk (encryptwallet,
+   * walletpassphrasechange, importprivkey): Core writes those before it
+   * replies, and the debounced flush would leave a crash window (audit H6/H7).
+   * Serialized with flushDirty through `flushInFlight`.
+   */
+  async saveNow(name: string): Promise<void> {
+    const wallet = this.wallets.get(name);
+    if (!wallet) return;
+    while (this.flushInFlight) {
+      await this.flushInFlight;
+    }
+    this.dirty.delete(name);
+    const save = wallet.save(this.storagePassword);
+    const inFlight = save.catch(() => {});
+    this.flushInFlight = inFlight;
+    try {
+      await save;
+    } catch (err) {
+      this.dirty.add(name);
+      throw err;
+    } finally {
+      if (this.flushInFlight === inFlight) this.flushInFlight = null;
     }
   }
 

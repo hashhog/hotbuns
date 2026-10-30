@@ -7313,6 +7313,15 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Invalid private key");
     }
 
+    // Core: EnsureWalletIsUnlocked (wallet/rpc/backup.cpp). The key is
+    // stored encrypted, which needs the unlocked wallet.
+    if (wallet.isLocked()) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_UNLOCK_NEEDED,
+        "Error: Please enter the wallet passphrase with walletpassphrase first."
+      );
+    }
+
     // Add the key + its P2WPKH address to the wallet keyring.
     try {
       wallet.addImportedKey(privkey, AddressType.P2WPKH, label);
@@ -7329,9 +7338,9 @@ export class RPCServer {
       await wallet.rescan((h) => this.getActiveChainBlock(h), 0, tipHeight);
     }
 
-    // Persist the imported key (+ any rescanned credits) so it survives a
-    // restart without re-importing.
-    this.markWalletDirty();
+    // Persist the imported key (+ any rescanned credits) before replying, so
+    // it survives a restart without re-importing (audit H7).
+    await this.persistWalletNow();
 
     // Core returns null.
     return null;
@@ -11000,19 +11009,43 @@ export class RPCServer {
    * legacy single-wallet path (no manager) and for unresolved wallet names.
    */
   private markWalletDirty(): void {
-    if (!this.walletManager) return;
+    const name = this.mutatedWalletName();
+    if (name !== null) this.walletManager!.markDirty(name);
+  }
+
+  /**
+   * Write the wallet just mutated by an RPC to disk before replying, for
+   * changes the reply vouches for (encryption, passphrase, imported keys).
+   * A write failure becomes an RPC error instead of a reply that is untrue
+   * after a crash. No-op for the legacy single-wallet path (no manager).
+   */
+  private async persistWalletNow(): Promise<void> {
+    const name = this.mutatedWalletName();
+    if (name === null) return;
     try {
-      const name =
+      await this.walletManager!.saveNow(name);
+    } catch (err) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_ERROR,
+        `Error: failed to write wallet to disk: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  /** Name of the wallet the current RPC mutated, or null if unresolvable. */
+  private mutatedWalletName(): string | null {
+    if (!this.walletManager) return null;
+    try {
+      return (
         this.requestWalletName() ??
-          (this.walletManager.getWalletCount() === 1
-            ? this.walletManager.listWallets()[0]
-            : null);
-      if (name !== null) {
-        this.walletManager.markDirty(name);
-      }
+        (this.walletManager.getWalletCount() === 1
+          ? this.walletManager.listWallets()[0]
+          : null)
+      );
     } catch {
       // Resolving the active wallet name is best-effort; a failure here must
       // never turn a successful mutation into an RPC error.
+      return null;
     }
   }
 
@@ -11379,13 +11412,17 @@ export class RPCServer {
 
     try {
       await wallet.encryptWallet(passphrase);
-      return "Wallet encrypted. The wallet is now locked. You need to call walletpassphrase before signing transactions.";
     } catch (err) {
       throw {
         code: RPCErrorCodes.WALLET_ENCRYPTION_FAILED,
         message: err instanceof Error ? err.message : "Encryption failed",
       };
     }
+    // Core writes the encrypted keys before EncryptWallet returns
+    // (wallet/wallet.cpp:818-886); a debounced flush would leave the plaintext
+    // seed on disk after "Wallet encrypted" (audit H6).
+    await this.persistWalletNow();
+    return "Wallet encrypted. The wallet is now locked. You need to call walletpassphrase before signing transactions.";
   }
 
   /**
@@ -11476,13 +11513,16 @@ export class RPCServer {
 
     try {
       await wallet.changePassphrase(oldPassphrase, newPassphrase);
-      return null;
     } catch (err) {
       throw {
         code: RPCErrorCodes.WALLET_PASSPHRASE_INCORRECT,
         message: err instanceof Error ? err.message : "Error changing passphrase",
       };
     }
+    // Otherwise the old passphrase keeps unlocking wallet.dat until an
+    // unrelated flush (audit H6).
+    await this.persistWalletNow();
+    return null;
   }
 
   /**
