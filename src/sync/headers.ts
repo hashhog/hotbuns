@@ -601,6 +601,7 @@ export class HeaderSync {
 
       // Store in memory
       this.headerChain.set(hashHex, entry);
+      this.sequenceIds.set(hashHex, this.nextSequenceId++);
 
       // Update best header if this chain has more work.  Never promote an
       // invalid header (Core FindMostWorkChain skips BLOCK_FAILED_MASK).
@@ -679,6 +680,20 @@ export class HeaderSync {
       return true;
     }
     return false;
+  }
+
+  /**
+   * Core CBlockIndex::nSequenceId: the order a header entered the index in
+   * this process. Headers loaded from disk have none (0, Core
+   * SEQ_ID_*_FROM_DISK), so a restart erases the order, as in Core. Used only
+   * to break an equal-work tie when reconsiderblock re-adds a branch
+   * (CBlockIndexWorkComparator: equal work -> lower sequence id wins).
+   */
+  private sequenceIds = new Map<string, number>();
+  private nextSequenceId = 1;
+
+  private sequenceIdOf(entry: HeaderChainEntry): number {
+    return this.sequenceIds.get(entry.hash.toString("hex")) ?? 0;
   }
 
   /**
@@ -896,9 +911,43 @@ export class HeaderSync {
     }
     if (cleared.length > 0) {
       this.mostWorkValid = this.findMostWorkValidHeader();
-      this.promoteMostWorkHeader();
+      if (!this.promoteMostWorkHeader()) this.preferEarlierEqualWorkHeader(cleared);
     }
     return cleared;
+  }
+
+  /**
+   * Core ActivateBestChain after ResetBlockFailureFlags: the cleared blocks
+   * re-enter setBlockIndexCandidates, whose order is chainwork, then
+   * nSequenceId (lower = received first wins). So a reconsidered tip with the
+   * SAME work as the best header, received before it in this process, takes
+   * over (failed_reorg scenario C). Loaded-from-disk headers carry no
+   * sequence id, so after a restart the tie stays with the current tip
+   * (scenario E).
+   */
+  private preferEarlierEqualWorkHeader(cleared: HeaderChainEntry[]): void {
+    const best = this.bestHeader;
+    if (!best) return;
+    let pick: HeaderChainEntry | null = null;
+    // Only the cleared blocks are new candidates: any other equal-work block
+    // received earlier than the tip would already be the tip.
+    for (const e of cleared) {
+      if (e.status === "invalid" || e.chainWork !== best.chainWork) continue;
+      if (this.sequenceIdOf(e) >= this.sequenceIdOf(pick ?? best)) continue;
+      pick = e;
+    }
+    if (!pick) return;
+    this.bestHeader = pick;
+    this.mostWorkValid = pick;
+    for (let h = pick.height + 1; h <= best.height; h++) {
+      this.headersByHeight.delete(h);
+    }
+    this.updateBestChain(pick);
+    console.log(
+      `[best-header] equal-work tie after reconsiderblock: re-seated on ` +
+        `${pick.hash.toString("hex").slice(0, 16)} (height ${pick.height}), received before ` +
+        `${best.hash.toString("hex").slice(0, 16)}`
+    );
   }
 
   /**

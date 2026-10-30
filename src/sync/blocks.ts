@@ -1199,8 +1199,14 @@ export class BlockSync {
         const e = this.headerSync.getHeader(Buffer.from(hex, "hex"));
         if (e && e.status === "invalid") this.state.pendingBlocks.delete(hex);
       }
-      if (this.peerManager) this.peerManager.updateBestHeight(newTip.height);
-      if (this.mempool) this.mempool.setTipHeight(newTip.height);
+      // ActivateBestChain before returning (Core: the invalidateblock RPC
+      // calls ActivateBestChain after InvalidateBlock). A stored side branch
+      // that now has the most work is connected from disk; an invalid block
+      // on it fails ConnectBlock and the tip settles on its valid prefix.
+      await this.activateBestChainFromDisk();
+      const settled = cs.getBestBlock();
+      if (this.peerManager) this.peerManager.updateBestHeight(settled.height);
+      if (this.mempool) this.mempool.setTipHeight(settled.height);
       return result;
     });
   }
@@ -1223,27 +1229,61 @@ export class BlockSync {
       if (!known) return result;
       this.headerSync.reconsiderHeader(blockHash);
       this.headerSync.promoteMostWorkHeader();
-      // Re-activation: stage the best chain above the active tip whose bodies
-      // are on disk (bounded by the reconsidered stretch).
-      this.rollFrontierToActiveTip();
-      const tip = cs.getBestBlock();
-      const best = this.headerSync.getBestHeader();
-      if (best) {
-        for (let h = tip.height + 1; h <= best.height; h++) {
-          const e = this.headerSync.getHeaderByHeight(h);
-          if (!e || e.status === "invalid") break;
-          const idx = await this.db.getBlockIndex(e.hash);
-          if (!idx || !(idx.status & 8 /* HAVE_DATA */) || idx.nTx === 0) break;
-          this.reactivateFromDisk.add(e.hash.toString("hex"));
-        }
-      }
-      // ActivateBestChain before returning (Core reconsiderblock): connect the
-      // re-activated stretch now, while we still hold the chain lock.
-      if (this.reactivateFromDisk.size > 0) {
-        await this.processOrderedBlocksInner();
-      }
+      // ActivateBestChain before returning (Core reconsiderblock).
+      await this.activateBestChainFromDisk();
       return result;
     });
+  }
+
+  /**
+   * Core ActivateBestChain for the RPC chain writers (invalidateblock,
+   * reconsiderblock), caller holding the chain lock: stage the bodies already
+   * on disk (BLOCK_HAVE_DATA) along the best header chain above the active
+   * tip and connect them now. When that chain forks below the tip, the
+   * connect loop's reorg dispatch disconnects back to the fork point and
+   * reads the bridging side-branch bodies from disk; a block that fails
+   * ConnectBlock is marked failed and the tip stays on the valid prefix.
+   */
+  private async activateBestChainFromDisk(): Promise<void> {
+    const cs = this.chainStateManager;
+    if (!cs) return;
+    this.rollFrontierToActiveTip();
+    const tip = cs.getBestBlock();
+    const best = this.headerSync.getBestHeader();
+    if (!best) return;
+    // Fork point of the active tip and the best header chain. Normally the
+    // tip is on that chain (fork = tip); an equal-work tie won by an earlier
+    // branch (reconsiderblock) puts the best header beside the tip instead.
+    let fork = this.headerSync.getHeader(tip.hash);
+    while (fork && fork.height > 0) {
+      const onBest = this.headerSync.getHeaderByHeight(fork.height);
+      if (onBest && onBest.hash.equals(fork.hash)) break;
+      fork = this.headerSync.getHeader(fork.header.prevBlock);
+    }
+    if (!fork) return;
+    const staged: string[] = [];
+    for (let h = fork.height + 1; h <= best.height; h++) {
+      const e = this.headerSync.getHeaderByHeight(h);
+      if (!e || e.status === "invalid") break;
+      const idx = await this.db.getBlockIndex(e.hash);
+      if (!idx || !(idx.status & 8 /* HAVE_DATA */)) break;
+      staged.push(e.hash.toString("hex"));
+    }
+    // Reorg only to a branch with more work than the tip, or equal work that
+    // the header layer already preferred; the connect loop's reorg dispatch
+    // then disconnects back to the fork point.
+    const reach = fork.height + staged.length;
+    const reachEntry = reach > fork.height ? this.headerSync.getHeaderByHeight(reach) : undefined;
+    const tipEntry = this.headerSync.getHeader(tip.hash);
+    if (fork.height < tip.height &&
+        (!reachEntry || !tipEntry || reachEntry.chainWork < tipEntry.chainWork)) {
+      return;
+    }
+    for (const hex of staged) this.reactivateFromDisk.add(hex);
+    if (fork.height < tip.height) this.state.nextHeightToProcess = fork.height + 1;
+    if (this.reactivateFromDisk.size > 0) {
+      await this.processOrderedBlocksInner(true);
+    }
   }
 
   /** preciousblock — serialized with connect like every chain writer. */
