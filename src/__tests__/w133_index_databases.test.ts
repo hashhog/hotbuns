@@ -750,7 +750,9 @@ describe("W133-META: TxIndexManager/CoinStatsIndex/IndexManager wiring", () => {
     // the flat `db.put*` path is live.
     const stateSrc = readSrc("chain/state.ts");
     const syncSrc = readSrc("sync/blocks.ts");
-    expect(stateSrc).toContain("db.putTxIndex");
+    // chain/state.ts connectBlock now batches its txindex puts with the coins
+    // flush (audit H8), through the same builder sync/blocks.ts uses.
+    expect(stateSrc).toContain("db.buildTxIndexPutOp");
     expect(syncSrc).toContain("db.buildTxIndexPutOp");
   });
 });

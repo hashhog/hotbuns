@@ -709,7 +709,7 @@ export class ChainStateManager {
       }),
       this.db.buildHeightHashPutOp(height, blockHash)
     );
-    // Pattern C0: txindex on connect, so getrawtransaction works after a
+    // Pattern C0: write txindex on connect, so getrawtransaction works after a
     // regtest mine or a snapshot rollback (generateblock / dumptxoutset
     // re-apply / reorganize). See
     // CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md.

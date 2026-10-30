@@ -442,6 +442,9 @@ describe("snapshot node without history answers like Core", () => {
         nChainTx: BigInt(n + 1),
         blockHash: prev,
       });
+      // Core refuses loadtxoutset when the active tip already reaches the base
+      // (validation.cpp:5787, audit H9): load into a node behind it.
+      await node.db.putChainState({ bestBlockHash: REGTEST.genesisBlockHash, bestHeight: 0, totalWork: 1n });
       const r = (await callRPC(node.server, "loadtxoutset", [p])) as Record<string, unknown>;
       expect(r.validated).toBe(true);
       // Core init.cpp: background download complete and not pruning ->
