@@ -15,6 +15,7 @@ import {
   parseHeader,
   serializeMessage,
   deserializeMessage,
+  OversizedTxMessageError,
   deserializeV2Message,
   extractCommandAndPayload,
   hostToBuffer,
@@ -960,6 +961,17 @@ export class Peer {
   }
 
   /**
+   * Bytes accepted by {@link send} that the kernel has not taken yet. The
+   * getdata server stops while this is over Core's -maxsendbuffer, the way
+   * Core's ProcessGetData stops on fPauseSend.
+   */
+  pendingSendBytes(): number {
+    let n = 0;
+    for (const b of this.outbox) n += b.length;
+    return n;
+  }
+
+  /**
    * Send a NetworkMessage to this peer.
    *
    * Routes through the BIP-324 v2 transport when negotiated; otherwise
@@ -1616,6 +1628,12 @@ export class Peer {
       try {
         msg = deserializeMessage(header, payload);
       } catch (deserErr) {
+        if (deserErr instanceof OversizedTxMessageError) {
+          // Non-standard by size: drop it unparsed, keep the peer (audit H2).
+          console.warn(`peer ${this.host}: ${deserErr.message}`);
+          this.recvBuffer = this.recvBuffer.subarray(totalLength);
+          continue;
+        }
         if (header.command === "block") {
           console.error(`BLOCK DESER ERROR: size=${header.length} from=${this.host}: ${deserErr instanceof Error ? deserErr.message : String(deserErr)}`);
         }

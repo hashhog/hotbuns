@@ -467,6 +467,29 @@ interface PeerInFlight {
  * Downloads full blocks after headers are synced, validates them,
  * updates the UTXO set, and persists to the database.
  */
+/**
+ * Unserved getdata entries kept per peer. Core has no explicit cap because it
+ * stops reading a peer whose getdata queue is not empty; here messages keep
+ * arriving while a queue drains, so the queue is bounded at one maximal
+ * getdata (Core MAX_INV_SZ) and the excess is dropped.
+ */
+export const GETDATA_QUEUE_MAX = 50_000;
+
+/**
+ * Stop serving a peer's getdata while more than this many bytes are unsent to
+ * it (Core DEFAULT_MAXSENDBUFFER, net.h: 1000 KB; fPauseSend).
+ */
+export const GETDATA_MAX_SEND_BUFFER = 1000 * 1000;
+
+/** How often a send-paused getdata queue re-checks the peer's send buffer. */
+const GETDATA_PAUSE_POLL_MS = 50;
+
+/** A peer's unserved getdata entries; items[head..] are still pending. */
+interface GetDataQueue {
+  items: InvVector[];
+  head: number;
+}
+
 export class BlockSync {
   private db: ChainDB;
   private params: ConsensusParams;
@@ -477,6 +500,12 @@ export class BlockSync {
 
   /** Per-peer in-flight tracking. */
   private peerInFlight: Map<string, PeerInFlight>;
+  /**
+   * Per-peer getdata requests not served yet (Core Peer::m_getdata_requests),
+   * and the serve loop draining each one. See {@link handleGetData}.
+   */
+  private getDataQueues = new Map<Peer, GetDataQueue>();
+  private getDataServing = new Map<Peer, Promise<void>>();
 
   /** UTXO manager with proper layered cache. */
   private utxoManager: UTXOManager;
@@ -1732,6 +1761,8 @@ export class BlockSync {
     // now pick up the gap immediately rather than waiting for the next
     // poll tick.
     peerManager.onMessage("__disconnect__", (peer) => {
+      // Core FinalizeNode: a gone peer's unserved getdata is discarded.
+      this.getDataQueues.delete(peer);
       if (!this.running) return;
       const peerKey = `${peer.host}:${peer.port}`;
       let cleared = 0;
@@ -2522,62 +2553,128 @@ export class BlockSync {
   }
 
   /**
-   * Handle getdata requests from peers — serve blocks we have stored.
+   * Queue a peer's getdata and serve it incrementally (Core ProcessGetData,
+   * net_processing.cpp:2518-2585). The returned promise settles when this
+   * peer's queue is empty, it disconnected, or a pass threw.
+   *
+   * Each getdata used to start its own loop that read, parsed and
+   * re-serialized every requested block back to back, kept going after the
+   * peer left, and stacked with the next getdata: 1.8 MB of requests bought
+   * ~100 GB of disk and CPU (audit H1). Now, like Core:
+   *  - requests go on one per-peer FIFO, capped at MAX_INV_SZ entries;
+   *  - a pass serves the leading tx items and at most one block, then yields
+   *    the event loop so other peers and RPC run between blocks;
+   *  - nothing is served while the peer has more than
+   *    {@link GETDATA_MAX_SEND_BUFFER} bytes unsent (Core fPauseSend);
+   *  - the queue is dropped when the peer disconnects (Core FinalizeNode);
+   *  - blocks go out as the stored bytes, not parsed and re-serialized
+   *    (Core sends what it read from disk, net_processing.cpp:2407).
    */
-  private async handleGetData(peer: Peer, inventory: InvVector[]): Promise<void> {
+  private handleGetData(peer: Peer, inventory: InvVector[]): Promise<void> {
+    let queue = this.getDataQueues.get(peer);
+    if (!queue) {
+      queue = { items: [], head: 0 };
+      this.getDataQueues.set(peer, queue);
+    }
+    const room = GETDATA_QUEUE_MAX - (queue.items.length - queue.head);
+    if (inventory.length > room) {
+      console.warn(
+        `getdata from ${peer.host}:${peer.port}: ${inventory.length - Math.max(room, 0)} items over the ${GETDATA_QUEUE_MAX}-entry queue dropped`,
+      );
+    }
+    for (let i = 0; i < inventory.length && i < room; i++) queue.items.push(inventory[i]);
+
+    let serving = this.getDataServing.get(peer);
+    if (!serving) {
+      serving = this.serveGetDataQueue(peer).finally(() => {
+        this.getDataServing.delete(peer);
+        const q = this.getDataQueues.get(peer);
+        if (q && q.head >= q.items.length) this.getDataQueues.delete(peer);
+      });
+      this.getDataServing.set(peer, serving);
+    }
+    return serving;
+  }
+
+  /** Drain one peer's getdata queue, one {@link processGetDataPass} at a time. */
+  private async serveGetDataQueue(peer: Peer): Promise<void> {
+    for (;;) {
+      const queue = this.getDataQueues.get(peer);
+      if (!queue || queue.head >= queue.items.length) return;
+      if (peer.state === "disconnected") {
+        this.getDataQueues.delete(peer);
+        return;
+      }
+      if (this.getDataSendPaused(peer)) {
+        await new Promise((r) => setTimeout(r, GETDATA_PAUSE_POLL_MS));
+        continue;
+      }
+      await this.processGetDataPass(peer, queue);
+      if (queue.head > 1024 && queue.head * 2 > queue.items.length) {
+        queue.items = queue.items.slice(queue.head);
+        queue.head = 0;
+      }
+      if (queue.head < queue.items.length) {
+        await new Promise<void>((r) => setImmediate(r));
+      }
+    }
+  }
+
+  /** Core fPauseSend: too many of this peer's bytes are still unsent. */
+  private getDataSendPaused(peer: Peer): boolean {
+    return typeof peer.pendingSendBytes === "function" &&
+      peer.pendingSendBytes() > GETDATA_MAX_SEND_BUFFER;
+  }
+
+  /**
+   * One Core ProcessGetData pass: the leading tx items, then at most one
+   * block item, then a notfound for the tx items we could not serve.
+   */
+  private async processGetDataPass(peer: Peer, queue: GetDataQueue): Promise<void> {
     // notfound accumulator for tx items we can't serve — lets the peer stop
     // waiting and re-request the tx elsewhere (Core ProcessGetData →
     // NetMsgType::NOTFOUND, net_processing.cpp:2570-2585).
     const notFound: InvVector[] = [];
 
-    for (const inv of inventory) {
+    while (queue.head < queue.items.length && !this.getDataSendPaused(peer)) {
+      const inv = queue.items[queue.head];
+      if (
+        inv.type !== InvType.MSG_TX &&
+        inv.type !== InvType.MSG_WTX &&
+        inv.type !== InvType.MSG_WITNESS_TX
+      ) {
+        break;
+      }
+      queue.head++;
+      // Serve an unconfirmed transaction from the mempool by txid/wtxid.
+      // Reference: bitcoin-core net_processing.cpp ProcessGetData →
+      // FindTxForGetData (L2494) → MakeAndPushMessage(TX). On a miss we
+      // append to notfound rather than silently dropping.
+      const tx = this.findMempoolTxForInv(inv);
+      if (tx) {
+        const txMsg: NetworkMessage = {
+          type: "tx",
+          payload: { tx },
+        };
+        peer.send(txMsg);
+        // Core ProcessGetData: a peer fetching the tx is the
+        // acknowledgement that ends its unbroadcast state.
+        this.mempool?.removeUnbroadcastTx(getTxIdOf(tx));
+      } else {
+        notFound.push({ type: inv.type, hash: inv.hash });
+      }
+    }
+
+    if (queue.head < queue.items.length && !this.getDataSendPaused(peer)) {
+      const inv = queue.items[queue.head++];
       if (
         inv.type === InvType.MSG_BLOCK ||
         inv.type === InvType.MSG_WITNESS_BLOCK ||
         inv.type === InvType.MSG_CMPCT_BLOCK
       ) {
-        const rawBlock = await this.db.getBlock(inv.hash);
-        if (rawBlock) {
-          const block = deserializeBlock(new BufferReader(rawBlock));
-          // Core ProcessGetBlockData, IsMsgCmpctBlk arm: a block within
-          // MAX_CMPCTBLOCK_DEPTH of the tip goes out as a BIP-152 cmpctblock
-          // (version 2, coinbase prefilled, wtxid short IDs); deeper blocks,
-          // and blocks we have no header for, go out in full.
-          if (inv.type === InvType.MSG_CMPCT_BLOCK && this.blockDepth(inv.hash) <= MAX_CMPCTBLOCK_DEPTH) {
-            peer.send({
-              type: "cmpctblock",
-              payload: createCompactBlockFromBlock(
-                block,
-                randomBytes(8).readBigUInt64LE(0),
-              ),
-            });
-          } else {
-            peer.send({ type: "block", payload: { block } });
-          }
-        }
-      } else if (
-        inv.type === InvType.MSG_TX ||
-        inv.type === InvType.MSG_WTX ||
-        inv.type === InvType.MSG_WITNESS_TX
-      ) {
-        // Serve an unconfirmed transaction from the mempool by txid/wtxid.
-        // Reference: bitcoin-core net_processing.cpp ProcessGetData →
-        // FindTxForGetData (L2494) → MakeAndPushMessage(TX). On a miss we
-        // append to notfound rather than silently dropping.
-        const tx = this.findMempoolTxForInv(inv);
-        if (tx) {
-          const txMsg: NetworkMessage = {
-            type: "tx",
-            payload: { tx },
-          };
-          peer.send(txMsg);
-          // Core ProcessGetData: a peer fetching the tx is the
-          // acknowledgement that ends its unbroadcast state.
-          this.mempool?.removeUnbroadcastTx(getTxIdOf(tx));
-        } else {
-          notFound.push({ type: inv.type, hash: inv.hash });
-        }
+        await this.serveGetDataBlock(peer, inv);
       }
+      // Any other inv type is skipped, as before.
     }
 
     if (notFound.length > 0) {
@@ -2591,6 +2688,30 @@ export class BlockSync {
           `notfound did not reach ${peer.host}:${peer.port} (${notFound.length} inv)`,
         );
       }
+    }
+  }
+
+  /** Serve one block item of a getdata. */
+  private async serveGetDataBlock(peer: Peer, inv: InvVector): Promise<void> {
+    const rawBlock = await this.db.getBlock(inv.hash);
+    if (!rawBlock || peer.state === "disconnected") return;
+    // Core ProcessGetBlockData, IsMsgCmpctBlk arm: a block within
+    // MAX_CMPCTBLOCK_DEPTH of the tip goes out as a BIP-152 cmpctblock
+    // (version 2, coinbase prefilled, wtxid short IDs); deeper blocks,
+    // and blocks we have no header for, go out in full.
+    if (inv.type === InvType.MSG_CMPCT_BLOCK && this.blockDepth(inv.hash) <= MAX_CMPCTBLOCK_DEPTH) {
+      const block = deserializeBlock(new BufferReader(rawBlock));
+      peer.send({
+        type: "cmpctblock",
+        payload: createCompactBlockFromBlock(
+          block,
+          randomBytes(8).readBigUInt64LE(0),
+        ),
+      });
+    } else {
+      // The stored bytes are the witness serialization, which is what the
+      // old parse + serializeBlock round trip produced for every block type.
+      peer.send({ type: "rawblock", payload: { raw: rawBlock } });
     }
   }
 

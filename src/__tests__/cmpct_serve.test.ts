@@ -124,14 +124,16 @@ describe("serve cmpctblock / blocktxn", () => {
     placeAtDepth(6);
     r = stubPeer();
     await sync.handleGetData(r.peer, [{ type: InvType.MSG_CMPCT_BLOCK, hash }]);
-    expect(r.sent.map((m) => m.type)).toEqual(["block"]);
+    // A full block is served as its stored bytes under the `block` command
+    // (audit H1); see getdata-serve-queue.test.ts for the wire identity.
+    expect(r.sent.map((m) => m.type)).toEqual(["rawblock"]);
   });
 
   test("getdata(MSG_WITNESS_BLOCK) is still a full block", async () => {
     placeAtDepth(0);
     const { peer, sent } = stubPeer();
     await sync.handleGetData(peer, [{ type: InvType.MSG_WITNESS_BLOCK, hash }]);
-    expect(sent.map((m) => m.type)).toEqual(["block"]);
+    expect(sent.map((m) => m.type)).toEqual(["rawblock"]);
   });
 
   test("getblocktxn within depth -> blocktxn with exactly the requested txs", async () => {

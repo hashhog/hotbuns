@@ -53,6 +53,28 @@ export const MAX_MESSAGE_SIZE = 4 * 1000 * 1000;
 /** Message header size in bytes */
 export const MESSAGE_HEADER_SIZE = 24;
 
+/**
+ * Largest loose `tx` payload worth parsing: Core MAX_STANDARD_TX_WEIGHT
+ * (policy.h, 400,000 WU). Weight is 3 x base size + total size, so it is never
+ * below the serialized size; a larger payload is a tx the mempool always
+ * rejects as `tx-size` (mempool.ts IsStandardTx gate, unconditional in hotbuns).
+ * Parsing it first is pure cost: a 4 MB tx of empty witness items held the
+ * event loop for ~0.7 s (audit H2). Blocks are not capped here.
+ */
+export const MAX_TX_MESSAGE_PAYLOAD = 400_000;
+
+/**
+ * Thrown by {@link deserializeMessage} for a `tx` payload over
+ * {@link MAX_TX_MESSAGE_PAYLOAD}. The caller drops the message and keeps the
+ * peer: Core rejects such a tx as non-standard without penalising the sender.
+ */
+export class OversizedTxMessageError extends Error {
+  constructor(readonly size: number) {
+    super(`tx payload ${size} bytes exceeds ${MAX_TX_MESSAGE_PAYLOAD} (non-standard tx-size), dropped unparsed`);
+    this.name = "OversizedTxMessageError";
+  }
+}
+
 // ============================================================================
 // Wire-decode caps (DoS protection)
 //
@@ -104,6 +126,12 @@ export type NetworkMessage =
   | { type: "getheaders"; payload: GetHeadersPayload }
   | { type: "headers"; payload: HeadersPayload }
   | { type: "block"; payload: BlockPayload }
+  /**
+   * Outbound only: a stored block sent as its raw bytes under the `block`
+   * command, so serving getdata does not parse and re-serialize it (Core
+   * sends the bytes it read from disk). Never produced by deserializeMessage.
+   */
+  | { type: "rawblock"; payload: { raw: Buffer } }
   | { type: "tx"; payload: TxPayload }
   | { type: "addr"; payload: AddrPayload }
   | { type: "addrv2"; payload: AddrV2Payload }
@@ -1465,6 +1493,10 @@ export function serializeMessage(magic: number, msg: NetworkMessage): Buffer {
       command = "block";
       payload = serializeBlock(msg.payload.block);
       break;
+    case "rawblock":
+      command = "block";
+      payload = msg.payload.raw;
+      break;
     case "tx":
       command = "tx";
       payload = serializeTx(msg.payload.tx, true);
@@ -1694,6 +1726,9 @@ export function deserializeMessage(header: MessageHeader, payload: Buffer): Netw
     case "block":
       return { type: "block", payload: { block: deserializeBlock(reader) } };
     case "tx":
+      if (payload.length > MAX_TX_MESSAGE_PAYLOAD) {
+        throw new OversizedTxMessageError(payload.length);
+      }
       return { type: "tx", payload: { tx: deserializeTx(reader) } };
     case "addr":
       return { type: "addr", payload: deserializeAddrPayload(reader) };

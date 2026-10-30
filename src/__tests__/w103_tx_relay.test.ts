@@ -259,9 +259,11 @@ describe("G2: getdata for tx types — FIXED (BUG-1 closed: serve txs from mempo
     // Core net_processing.cpp serves MSG_TX/MSG_WITNESS_TX getdata from mempool.
     // hotbuns handleGetData now branches on tx inv types and serves the tx from
     // the mempool (message-level behavior asserted in tx_inv_getdata_relay.test).
+    // The tx branch lives in processGetDataPass, one pass of the per-peer
+    // getdata queue handleGetData feeds (audit H1).
     const { BlockSync } = require("../sync/blocks.js");
     const proto = BlockSync.prototype as any;
-    const src = proto.handleGetData?.toString() ?? "";
+    const src = proto.processGetDataPass?.toString() ?? "";
     // The function must handle MSG_TX (= 1) or MSG_WTX (= 5).
     const handlesTx =
       src.includes("MSG_TX") ||

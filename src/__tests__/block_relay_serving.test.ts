@@ -79,7 +79,8 @@ describe("block relay serving", () => {
     const sync = new BlockSync(db, REGTEST, headerSync) as any;
     for (const [type, reply] of [
       [InvType.MSG_CMPCT_BLOCK, "cmpctblock"],
-      [InvType.MSG_WITNESS_BLOCK, "block"],
+      // Full blocks go out as the stored bytes under the `block` command.
+      [InvType.MSG_WITNESS_BLOCK, "rawblock"],
     ] as const) {
       const { peer, sent } = stubPeer();
       await sync.handleGetData(peer, [{ type, hash }]);

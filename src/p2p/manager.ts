@@ -31,6 +31,7 @@ import {
   normalizeHost,
   nextLocalAddrDelayMs,
   peerAddrLocal,
+  ipBytesToString,
 } from "./localaddr.js";
 import type { ConsensusParams } from "../consensus/params.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
@@ -41,6 +42,7 @@ import {
   isValidNetworkAddressV2,
   networkAddressV2ToIPv4String,
   legacyAddressToNetworkAddressV2,
+  networkAddressV2ToLegacy,
   isAddrV1Compatible,
   formatNetworkAddressV2,
   formatTorV3,
@@ -52,7 +54,7 @@ import {
   MAX_MONEY,
   FEEFILTER_VERSION,
 } from "./feefilter.js";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   loadAsmap,
   getMappedAS as asmapGetMappedAS,
@@ -649,6 +651,33 @@ export interface EvictionCandidate {
  * - Route received messages to registered handlers
  * - Persist known addresses for faster restarts
  */
+/** An address that passed ProcessAddrs and may be relayed. */
+interface RelayAddr {
+  key: string;
+  timestamp: number;
+  addr: NetworkAddressV2;
+}
+
+/** Core m_addr_known capacity: CRollingBloomFilter(5000, 0.001). */
+const ADDR_KNOWN_MAX = 5000;
+
+/** Core relays only addresses stamped within the last 10 minutes. */
+const ADDR_RELAY_MAX_AGE_SEC = 10 * 60;
+
+/** Core ROTATE_ADDR_RELAY_DEST_INTERVAL: relay targets rotate every 24 h. */
+const ADDR_RELAY_ROTATE_SEC = 24n * 60n * 60n;
+
+/**
+ * Host string to judge routability and bans for an addrv2 entry, or null for
+ * networks with no IP (Tor, I2P, CJDNS: Core treats valid ones as routable).
+ */
+function addrV2RoutingHost(addr: NetworkAddressV2): string | null {
+  // An IP that does not parse maps to the unspecified address, never routable.
+  if (addr.networkId === BIP155Network.IPV4) return networkAddressV2ToIPv4String(addr) ?? "0.0.0.0";
+  if (addr.networkId === BIP155Network.IPV6) return ipBytesToString(addr.addr) ?? "::";
+  return null;
+}
+
 export class PeerManager {
   private peers: Map<string, Peer>;
   private knownAddresses: Map<string, PeerInfo>;
@@ -750,6 +779,29 @@ export class PeerManager {
    * net_processing.cpp:4022).
    */
   private addrTokenBucket: Map<string, { tokens: number; ts: number }>;
+
+  /**
+   * Addresses each peer is known to have (Core Peer::m_addr_known, a
+   * CRollingBloomFilter(5000)): ones it sent us and ones we relayed to it.
+   * Relay skips them, so one address reaches a peer at most once.
+   */
+  private addrKnown = new Map<string, Set<string>>();
+
+  /**
+   * Inbound peers that opted into addr relay by sending addr, addrv2 or
+   * getaddr (Core SetupAddressRelay). Outbound peers other than
+   * block-relay-only are always in; see {@link addrRelayEnabledFor}.
+   */
+  private addrRelayEnabled = new Set<string>();
+
+  /**
+   * Peers we sent a getaddr to whose reply has not arrived yet (Core
+   * Peer::m_getaddr_sent). Addresses in that reply are not relayed.
+   */
+  private getaddrSent = new Set<string>();
+
+  /** Key for choosing addr relay targets (Core RANDOMIZER_ID_ADDRESS_RELAY). */
+  private readonly addrRelaySalt = randomBytes(32);
 
   /**
    * Set true once {@link stop} has been entered.  Independent of
@@ -1526,6 +1578,9 @@ export class PeerManager {
     this.feelerInFlight.clear();
     this.getaddrRecvd.clear();
     this.addrTokenBucket.clear();
+    this.addrKnown.clear();
+    this.addrRelayEnabled.clear();
+    this.getaddrSent.clear();
 
     // Save addresses and ban list before shutdown
     await this.saveAddresses();
@@ -3046,6 +3101,9 @@ export class PeerManager {
     this.feelerInFlight.delete(key);
     this.getaddrRecvd.delete(key);
     this.addrTokenBucket.delete(key);
+    this.addrKnown.delete(key);
+    this.addrRelayEnabled.delete(key);
+    this.getaddrSent.delete(key);
 
     // Emit disconnect event to handlers
     const handlers = this.messageHandlers.get("__disconnect__") ?? [];
@@ -3159,22 +3217,30 @@ export class PeerManager {
     // per-peer token bucket (Core net_processing.cpp:4022 routes ADDR and
     // ADDRV2 through the same ProcessAddrs), so an attacker cannot bypass the
     // rate limit by switching to addrv2.
-    if (msg.type === "addr") {
-      this.handleAddrMessage(peer, msg.payload);
-      // Core net_processing.cpp:5688: only relay if the message carries <=10
-      // addresses (unsolicited spontaneous advertisements, not getaddr replies).
-      if (msg.payload.addrs.length <= 10) {
-        this.relayAddrToRandomPeers(peer, msg);
-      }
-    } else if (msg.type === "addrv2") {
-      this.handleAddrV2Message(peer, msg.payload);
-      // Core net_processing.cpp:5688: same <=10 relay gate applies to addrv2.
-      if (msg.payload.addrs.length <= 10) {
-        this.relayAddrToRandomPeers(peer, msg);
+    //
+    // Relay is per address, after the bucket and filters (Core ProcessAddrs,
+    // net_processing.cpp:5625-5703). It used to forward the attacker's whole
+    // message, empty or not, to 2 random peers including block-relay-only
+    // ones (audit H4).
+    if (msg.type === "addr" || msg.type === "addrv2") {
+      if (this.setupAddrRelay(peer)) {
+        const relayable = msg.type === "addr"
+          ? this.handleAddrMessage(peer, msg.payload)
+          : this.handleAddrV2Message(peer, msg.payload);
+        // Core net_processing.cpp:5688: relay only from messages of <=10
+        // addresses (spontaneous announcements), never from a getaddr reply.
+        if (
+          msg.payload.addrs.length <= 10 &&
+          !this.getaddrSent.has(key) &&
+          relayable.length > 0
+        ) {
+          this.relayAddrToRandomPeers(peer, relayable);
+        }
+        if (msg.payload.addrs.length < MAX_ADDR_TO_SEND) this.getaddrSent.delete(key);
       }
     } else if (msg.type === "getaddr") {
       // Anti-DoS getaddr responder (Core net_processing.cpp:4815).
-      this.handleGetAddr(peer);
+      if (this.setupAddrRelay(peer)) this.handleGetAddr(peer);
     } else if (msg.type === "feefilter") {
       // BIP133: Handle received feefilter
       this.handleFeeFilterMessage(peer, msg.payload);
@@ -3325,6 +3391,7 @@ export class PeerManager {
    */
   private creditGetaddrResponse(peer: Peer): void {
     const key = `${peer.host}:${peer.port}`;
+    this.getaddrSent.add(key);
     let state = this.addrTokenBucket.get(key);
     if (!state) {
       state = { tokens: 1.0, ts: Date.now() };
@@ -3340,8 +3407,9 @@ export class PeerManager {
    * ({@link admitAddrTokens}) BEFORE any address is stored, so an addr flood
    * past the drained bucket is dropped.
    */
-  private handleAddrMessage(peer: Peer, payload: AddrPayload): void {
+  private handleAddrMessage(peer: Peer, payload: AddrPayload): RelayAddr[] {
     const now = Math.floor(Date.now() / 1000);
+    const relayable: RelayAddr[] = [];
 
     // Shared token bucket (covers addr + addrv2). Admit at most this many.
     const budget = this.admitAddrTokens(peer, payload.addrs.length);
@@ -3368,6 +3436,9 @@ export class PeerManager {
       if (!isRoutable(ip)) continue;
 
       const key = `${ip}:${entry.addr.port}`;
+      this.noteAddrRelayCandidate(peer, key, ip, ts, now,
+        legacyAddressToNetworkAddressV2(entry.addr.ip, entry.addr.port, entry.addr.services),
+        relayable);
 
       // Add or update address
       const existing = this.knownAddresses.get(key);
@@ -3389,6 +3460,7 @@ export class PeerManager {
         });
       }
     }
+    return relayable;
   }
 
   /**
@@ -3402,8 +3474,9 @@ export class PeerManager {
    * switching to addrv2 (Core net_processing.cpp:4022 routes both through one
    * ProcessAddrs bucket).
    */
-  private handleAddrV2Message(peer: Peer, payload: AddrV2Payload): void {
+  private handleAddrV2Message(peer: Peer, payload: AddrV2Payload): RelayAddr[] {
     const now = Math.floor(Date.now() / 1000);
+    const relayable: RelayAddr[] = [];
 
     // Shared token bucket (covers addr + addrv2). Admit at most this many.
     const budget = this.admitAddrTokens(peer, payload.addrs.length);
@@ -3430,6 +3503,8 @@ export class PeerManager {
       // Generate unique key for this address
       const key = this.getAddrV2Key(entry.addr);
       if (!key) continue;
+      this.noteAddrRelayCandidate(peer, key, addrV2RoutingHost(entry.addr), ts, now,
+        entry.addr, relayable);
 
       // Add or update address
       const existing = this.knownAddresses.get(key);
@@ -3446,6 +3521,76 @@ export class PeerManager {
         }
       }
     }
+    return relayable;
+  }
+
+  /**
+   * Core SetupAddressRelay (net_processing.cpp:5608): no addr relay at all
+   * with an outbound block-relay-only peer — its addr messages are ignored
+   * and it is never a relay target, so addr traffic cannot reveal the link.
+   * Any other peer that sends addr, addrv2 or getaddr is opted in.
+   */
+  private setupAddrRelay(peer: Peer): boolean {
+    const key = `${peer.host}:${peer.port}`;
+    if (!this.inboundPeers.has(key) && this.peerConnectionType.get(key) === "block_relay") {
+      return false;
+    }
+    this.addrRelayEnabled.add(key);
+    return true;
+  }
+
+  /**
+   * Whether a peer takes addr relay (Core Peer::m_addr_relay_enabled):
+   * outbound peers except block-relay-only from the handshake on, inbound
+   * peers once they sent an addr-related message.
+   */
+  private addrRelayEnabledFor(key: string): boolean {
+    if (this.inboundPeers.has(key)) return this.addrRelayEnabled.has(key);
+    return this.peerConnectionType.get(key) !== "block_relay";
+  }
+
+  /** Core AddAddressKnown: remember that this peer has this address. */
+  private addAddrKnown(peerKey: string, addrKey: string): void {
+    let known = this.addrKnown.get(peerKey);
+    if (!known) {
+      known = new Set();
+      this.addrKnown.set(peerKey, known);
+    }
+    known.delete(addrKey);
+    known.add(addrKey);
+    if (known.size > ADDR_KNOWN_MAX) {
+      known.delete(known.values().next().value as string);
+    }
+  }
+
+  /**
+   * One admitted address from `source`: record it as known to the source and
+   * keep it for relay if Core would relay it (ProcessAddrs,
+   * net_processing.cpp:5666-5690): it advertises NODE_NETWORK or
+   * NODE_NETWORK_LIMITED, it is not banned, its (clamped) time is within the
+   * last 10 minutes, and it is routable. `host` is null when the network has
+   * no IP to check (Tor, I2P, CJDNS are routable by definition).
+   */
+  private noteAddrRelayCandidate(
+    source: Peer,
+    key: string,
+    host: string | null,
+    ts: number,
+    now: number,
+    addr: NetworkAddressV2,
+    out: RelayAddr[],
+  ): void {
+    if (!source) return;
+    const sourceKey = `${source.host}:${source.port}`;
+    this.addAddrKnown(sourceKey, key);
+    const services = BigInt(addr.services);
+    if ((services & (ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_NETWORK_LIMITED)) === 0n) return;
+    if (ts <= now - ADDR_RELAY_MAX_AGE_SEC) return;
+    if (host !== null) {
+      if (!isRoutableAddr(host)) return;
+      if (this.banManager.isBanned(host)) return;
+    }
+    out.push({ key, timestamp: ts, addr });
   }
 
   // ---------------------------------------------------------------------------
@@ -4486,31 +4631,72 @@ export class PeerManager {
   }
 
   /**
-   * Relay an addr or addrv2 message to up to 2 random connected peers,
-   * excluding the source peer. Implements Bitcoin Core's RelayAddress behavior.
+   * Relay addresses that passed ProcessAddrs (Core RelayAddress,
+   * net_processing.cpp:2277-2318). Each address goes to the 2 addr-relay
+   * peers that score highest under a keyed hash of (address, 24 h window,
+   * peer), so repeats of one address within a day pick the same targets;
+   * targets that already know the address are skipped. Each target gets one
+   * message: addrv2 if it sent sendaddrv2, else addr with only the v1
+   * compatible entries (Core IsAddrCompatible).
    */
-  private relayAddrToRandomPeers(source: Peer, msg: any): void {
-    const candidates: Peer[] = [];
-    for (const [_key, p] of this.peers) {
-      if (p !== source && p.state === "connected") {
-        candidates.push(p);
+  private relayAddrToRandomPeers(source: Peer, addrs: RelayAddr[]): void {
+    const candidates: Array<{ peer: Peer; key: string }> = [];
+    for (const [key, p] of this.peers) {
+      if (p !== source && p.state === "connected" && this.addrRelayEnabledFor(key)) {
+        candidates.push({ peer: p, key });
       }
     }
     if (candidates.length === 0) return;
 
-    // Shuffle and pick up to 2 (CSPRNG — Core: FastRandomContext)
-    for (let i = candidates.length - 1; i > 0; i--) {
-      const j = this.secureRandInt(i + 1);
-      [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+    const nowSec = BigInt(Math.floor(Date.now() / 1000));
+    const perTarget = new Map<string, { peer: Peer; addrs: RelayAddr[] }>();
+    for (const a of addrs) {
+      const hashAddr = this.addrRelayHash(a.key);
+      const window = (nowSec + hashAddr) / ADDR_RELAY_ROTATE_SEC;
+      const best: Array<{ score: bigint; c: { peer: Peer; key: string } }> = [];
+      for (const c of candidates) {
+        if (!(c.peer.wantsAddrV2 || isAddrV1Compatible(a.addr))) continue;
+        const score = this.addrRelayHash(`${a.key}|${window}|${c.key}`);
+        best.push({ score, c });
+        best.sort((x, y) => (x.score > y.score ? -1 : x.score < y.score ? 1 : 0));
+        if (best.length > 2) best.pop();
+      }
+      for (const { c } of best) {
+        if (this.addrKnown.get(c.key)?.has(a.key)) continue;
+        this.addAddrKnown(c.key, a.key);
+        let t = perTarget.get(c.key);
+        if (!t) {
+          t = { peer: c.peer, addrs: [] };
+          perTarget.set(c.key, t);
+        }
+        t.addrs.push(a);
+      }
     }
-    const targets = candidates.slice(0, Math.min(2, candidates.length));
-    for (const target of targets) {
+
+    for (const { peer: target, addrs: out } of perTarget.values()) {
       try {
-        target.send(msg);
+        if (target.wantsAddrV2) {
+          target.send({
+            type: "addrv2",
+            payload: { addrs: out.map((a) => ({ timestamp: a.timestamp, addr: a.addr })) },
+          });
+        } else {
+          const legacy: AddrPayload["addrs"] = [];
+          for (const a of out) {
+            const ip = networkAddressV2ToLegacy(a.addr);
+            if (ip) legacy.push({ timestamp: a.timestamp, addr: { services: BigInt(a.addr.services), ip, port: a.addr.port } });
+          }
+          if (legacy.length > 0) target.send({ type: "addr", payload: { addrs: legacy } });
+        }
       } catch (_e) {
         // Ignore send errors during relay
       }
     }
+  }
+
+  /** First 8 bytes of a salted SHA-256, as an unsigned 64-bit score. */
+  private addrRelayHash(data: string): bigint {
+    return createHash("sha256").update(this.addrRelaySalt).update(data).digest().readBigUInt64LE(0);
   }
 
   /**
