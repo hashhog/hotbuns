@@ -19,6 +19,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import * as fs from "fs";
+import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { Wallet, type WalletConfig } from "./wallet.js";
@@ -26,7 +27,6 @@ import { AddressType, base58CheckEncode } from "../address/encoding.js";
 
 const STORAGE_PW = "hotbuns";
 const REPO = path.resolve(import.meta.dir, "../..");
-let nextPort = 43000 + (process.pid % 1500) * 4;
 
 // A fixed, valid secp256k1 scalar (well below the curve order).
 const IMPORT_PRIV = Buffer.from(
@@ -177,10 +177,26 @@ describe("H7: imported private keys are persisted", () => {
 
 type Node = { proc: ReturnType<typeof Bun.spawn>; datadir: string; rpcPort: number; auth: string };
 
+/** A port the OS just handed out, so the node never waits on a taken one. */
+async function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const port = (srv.address() as net.AddressInfo).port;
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+// The unit-isolate preload gives each test file 60s, so startup must fail
+// well inside that rather than wait out a node that is never coming up.
+const STARTUP_MS = 40_000;
+
 async function startRegtestNode(): Promise<Node> {
   const datadir = tmpDir("node");
-  const rpcPort = nextPort++;
-  const p2pPort = nextPort++;
+  const rpcPort = await freePort();
+  const p2pPort = await freePort();
   const proc = Bun.spawn(
     [
       process.execPath,
@@ -199,8 +215,12 @@ async function startRegtestNode(): Promise<Node> {
     { cwd: REPO, stdout: "ignore", stderr: "ignore" },
   );
   const cookie = path.join(datadir, ".cookie");
-  const deadline = Date.now() + 90_000;
-  while (Date.now() < deadline) {
+  let exited = false;
+  void proc.exited.then(() => {
+    exited = true;
+  });
+  const deadline = Date.now() + STARTUP_MS;
+  while (Date.now() < deadline && !exited) {
     if (fs.existsSync(cookie) && fs.readFileSync(cookie, "utf8").startsWith("__cookie__:")) {
       const auth = "Basic " + Buffer.from(fs.readFileSync(cookie, "utf8").trim()).toString("base64");
       try {
@@ -220,7 +240,7 @@ async function startRegtestNode(): Promise<Node> {
   proc.kill("SIGKILL");
   await proc.exited;
   fs.rmSync(datadir, { recursive: true, force: true });
-  throw new Error("regtest node did not come up within 90s");
+  throw new Error(`regtest node did not come up (exited=${exited})`);
 }
 
 async function rpc(node: Node, pathname: string, method: string, params: unknown[]): Promise<any> {
@@ -238,7 +258,7 @@ describe("H6/H7 end to end on a regtest node", () => {
   let node: Node;
   beforeAll(async () => {
     node = await startRegtestNode();
-  }, 120_000);
+  }, STARTUP_MS + 5_000);
   afterAll(async () => {
     if (!node) return;
     node.proc.kill("SIGKILL");
