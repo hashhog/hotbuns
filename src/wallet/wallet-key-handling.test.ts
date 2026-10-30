@@ -217,7 +217,9 @@ async function startRegtestNode(): Promise<Node> {
     }
     await Bun.sleep(100);
   }
-  proc.kill();
+  proc.kill("SIGKILL");
+  await proc.exited;
+  fs.rmSync(datadir, { recursive: true, force: true });
   throw new Error("regtest node did not come up within 90s");
 }
 
