@@ -246,6 +246,63 @@ describe("invalidateblock re-adds the disconnected txs (MaybeUpdateMempoolForReo
     expect(ordered).not.toContain(hex(children[0]));
   });
 
+  test("parent in block N, 64 children in block N+1: re-added per disconnected block, so Trim drops the cheapest child, not the last", async () => {
+    // Core InvalidateBlock runs MaybeUpdateMempoolForReorg after EACH
+    // DisconnectTip. Disconnecting N+1 admits the children while the parent
+    // is still a confirmed coin (64 one-tx clusters); disconnecting N admits
+    // the parent, UpdateTransactionsFromBlock links all 64 children to it and
+    // Trim drops the lowest chunk feerate child. Re-accepting both blocks in
+    // one pass would admit the parent first and refuse the 64th child (the
+    // dearest) at the cluster-count limit.
+    await extend(101);
+    const CHILDREN = 64;
+    const PARENT_FEE = 10_000n;
+    const each = (SUBSIDY - PARENT_FEE) / BigInt(CHILDREN);
+    const remainder = SUBSIDY - PARENT_FEE - each * BigInt(CHILDREN);
+    const values = Array.from({ length: CHILDREN }, (_, i) => each + (i === 0 ? remainder : 0n));
+    const parent = spendTx(cb(1), values, 0);
+    // Strictly increasing fees: child 0 is the cheapest, child 63 the dearest.
+    const children = values.map((v, i) => spendTx(out(parent, i), [v - BigInt((i + 1) * 1000)], 1));
+    await extend(1, new Map([[102, [parent]]]));
+    await extend(1, new Map([[103, children]]));
+    expect(pool().size).toBe(0);
+
+    expect((await blockSync.invalidateBlock(getBlockHash(blocks[102].header))).success).toBe(true);
+    expect(chainState.getBestBlock().height).toBe(101);
+    const ids = pool();
+    expect({
+      parent: ids.has(hex(parent)),
+      cheapest: ids.has(hex(children[0])),
+      dearest: ids.has(hex(children[CHILDREN - 1])),
+    }).toEqual({ parent: true, cheapest: false, dearest: true });
+    expect(ids).toEqual(new Set([hex(parent), ...children.slice(1).map(hex)]));
+    expect(mempool.getClusterSize(hex(parent))).toBe(CHILDREN);
+    await expectPoolConsistent();
+  });
+
+  test("parent and child in the SAME disconnected block still share a cluster at admission: refused in admission order", async () => {
+    // Inside one MaybeUpdateMempoolForReorg Core admits a block's txs in block
+    // order through ATMP with bypass_limits, which does not skip the cluster
+    // limit: the parent and its first 63 children fill the cluster, the 64th
+    // child is refused however high its fee.
+    await extend(101);
+    const CHILDREN = 64;
+    const PARENT_FEE = 10_000n;
+    const each = (SUBSIDY - PARENT_FEE) / BigInt(CHILDREN);
+    const remainder = SUBSIDY - PARENT_FEE - each * BigInt(CHILDREN);
+    const values = Array.from({ length: CHILDREN }, (_, i) => each + (i === 0 ? remainder : 0n));
+    const parent = spendTx(cb(1), values, 0);
+    const children = values.map((v, i) => spendTx(out(parent, i), [v - BigInt((i + 1) * 1000)], 1));
+    await extend(1, new Map([[102, [parent, ...children]]]));
+
+    expect((await blockSync.invalidateBlock(getBlockHash(blocks[102].header))).success).toBe(true);
+    const ids = pool();
+    expect(ids).toEqual(new Set([hex(parent), ...children.slice(0, CHILDREN - 1).map(hex)]));
+    expect(ids.has(hex(children[CHILDREN - 1]))).toBe(false);
+    expect(mempool.getClusterSize(hex(parent))).toBe(CHILDREN);
+    await expectPoolConsistent();
+  });
+
   test("a disconnected tx refused on re-accept takes its in-pool spender with it", async () => {
     await extend(101);
     // Version 4: consensus-valid in a block, non-standard for the mempool.

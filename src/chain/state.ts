@@ -1751,7 +1751,7 @@ export class ChainStateManager {
   async invalidateBlock(
     blockHash: Buffer,
     knownDescendants?: Buffer[],
-    disconnectedTxsOut?: Transaction[][]
+    onDisconnected?: (txs: Transaction[], height: number, prevHash: Buffer) => Promise<void>
   ): Promise<ChainManagementResult> {
     // Check if block exists
     const blockIndex = await this.db.getBlockIndex(blockHash);
@@ -1820,18 +1820,24 @@ export class ChainStateManager {
 
         await this.disconnectBlock(block, idx.height);
         blocksDisconnected++;
-        // Core DisconnectTip -> DisconnectedBlockTransactions: the caller
-        // re-accepts these into the mempool (MaybeUpdateMempoolForReorg).
-        // One entry per disconnected block, tip first.
-        if (disconnectedTxsOut) {
-          disconnectedTxsOut.push(block.transactions.filter((t) => !isCoinbase(t)));
-        }
 
         // Mark the disconnected block as invalid
         await this.db.updateBlockStatus(
           hash,
           idx.status | BlockStatus.FAILED_VALID
         );
+
+        // Core DisconnectTip -> MaybeUpdateMempoolForReorg, once per
+        // disconnected block while the coins are at that block's parent: the
+        // caller re-accepts this block's txs into the mempool now, before the
+        // next DisconnectTip.
+        if (onDisconnected) {
+          await onDisconnected(
+            block.transactions.filter((t) => !isCoinbase(t)),
+            idx.height,
+            block.header.prevBlock
+          );
+        }
       }
     } else {
       // Block is not on our chain, just mark it invalid
@@ -1860,10 +1866,10 @@ export class ChainStateManager {
     // Mempool: Core InvalidateBlock does not evict the invalidated blocks'
     // txs (they were confirmed, so they are not in the pool); it re-accepts
     // them with MaybeUpdateMempoolForReorg. BlockSync.invalidateBlock does
-    // that from `disconnectedTxsOut` once the live coin view is at the new
-    // tip. This used to removeTransaction the invalidated block's own txs: a
-    // no-op that left every disconnected tx out of the pool and its in-pool
-    // spenders orphaned there.
+    // that per block through `onDisconnected`, while the coins are at that
+    // block's parent. This used to removeTransaction the invalidated block's
+    // own txs: a no-op that left every disconnected tx out of the pool and
+    // its in-pool spenders orphaned there.
 
     return { success: true, blocksAffected: blocksDisconnected };
   }

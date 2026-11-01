@@ -1199,11 +1199,15 @@ export class BlockSync {
         : undefined;
       const tDesc = Date.now();
       let result: ChainManagementResult;
-      // Core DisconnectTip -> DisconnectedBlockTransactions, one entry per
-      // disconnected block, tip first.
-      const disconnectedBlocks: Transaction[][] = [];
+      // Core: MaybeUpdateMempoolForReorg after each DisconnectTip, with
+      // fAddToMempool = (++disconnected <= 10).
+      let disconnected = 0;
+      const onDisconnected = this.mempool
+        ? (txs: Transaction[], height: number, prevHash: Buffer) =>
+            this.updateMempoolForDisconnect(txs, height, prevHash, ++disconnected <= 10)
+        : undefined;
       try {
-        result = await cs.invalidateBlock(blockHash, descendants, disconnectedBlocks);
+        result = await cs.invalidateBlock(blockHash, descendants, onDisconnected);
         console.log(
           `[invalidateblock] ${blockHash.toString("hex").slice(0, 16)}: ` +
             `${result.success ? `disconnected ${result.blocksAffected ?? 0}` : `failed: ${result.error}`}` +
@@ -1233,9 +1237,6 @@ export class BlockSync {
         const e = this.headerSync.getHeader(Buffer.from(hex, "hex"));
         if (e && e.status === "invalid") this.state.pendingBlocks.delete(hex);
       }
-      if (this.mempool) {
-        await this.updateMempoolForInvalidate(newTip.height, disconnectedBlocks);
-      }
       // ActivateBestChain before returning (Core: the invalidateblock RPC
       // calls ActivateBestChain after InvalidateBlock). A stored side branch
       // that now has the most work is connected from disk; an invalid block
@@ -1249,43 +1250,42 @@ export class BlockSync {
   }
 
   /**
-   * Core InvalidateBlock -> MaybeUpdateMempoolForReorg (validation.cpp): the
-   * disconnected txs go back to the pool earliest-confirmed first, refused
-   * ones take their in-mempool descendants with them, the clusters the
-   * re-added parents rejoin are trimmed to the cluster limits, then entries
-   * non-final / sequence-locked / immature at tip+1 are dropped. Core runs it
-   * after each DisconnectTip with fAddToMempool = (++disconnected <= 10): only
-   * the txs of the first 10 disconnected blocks are re-accepted. Here the coin
-   * view is re-pointed once, so it runs once over the whole disconnect pool;
-   * the result is the same, since every check only gets stricter as the tip
-   * goes down. Best effort: a failure here must not fail the invalidate.
+   * Core InvalidateBlock -> MaybeUpdateMempoolForReorg (validation.cpp), run
+   * right after ChainStateManager disconnects the block at `height`, while
+   * the coins and the chain tip are at its parent `prevHash`: the block's txs
+   * go back to the pool in block order, refused ones take their in-mempool
+   * descendants with them, the clusters the re-added parents rejoin are
+   * trimmed to the cluster limits by chunk feerate, then entries non-final /
+   * sequence-locked / immature at the new tip+1 are dropped.
+   *
+   * It has to run per disconnected block, not once at the final tip: a child
+   * confirmed one block after its parent is admitted while the parent is
+   * still a confirmed coin (its own cluster); only when the parent's block is
+   * disconnected does UpdateTransactionsFromBlock join them, and Trim then
+   * drops the lowest chunk feerate. Admitting the parent first would instead
+   * refuse whichever child comes last at the cluster limit.
+   *
+   * Core passes fAddToMempool = (++disconnected <= 10): past the first 10
+   * blocks the txs are not re-accepted, only their in-pool spenders removed.
+   * Best effort: a failure here must not fail the invalidate.
    */
-  private async updateMempoolForInvalidate(
-    tipHeight: number,
-    disconnectedBlocks: Transaction[][]
+  private async updateMempoolForDisconnect(
+    txs: Transaction[],
+    height: number,
+    prevHash: Buffer,
+    addToMempool: boolean
   ): Promise<void> {
     const mempool = this.mempool;
     if (!mempool) return;
-    mempool.setTipHeight(tipHeight);
-    // disconnectedBlocks[i] is the block at height tipHeight + n - i. Core
-    // re-accepts its txs right after that block's DisconnectTip, so their
-    // entry height is the block's height - 1.
-    const n = disconnectedBlocks.length;
-    const earliestFirst: Transaction[] = [];
-    const notAddable = new Set<Transaction>();
-    const heightOf = new Map<Transaction, number>();
-    for (let i = n - 1; i >= 0; i--) {
-      for (const t of disconnectedBlocks[i]) {
-        earliestFirst.push(t);
-        heightOf.set(t, tipHeight + n - i - 1);
-        if (i >= 10) notAddable.add(t);
-      }
-    }
     try {
+      // ChainStateManager flushed the disconnect to disk; the mempool reads
+      // BlockSync's live view, which must re-read it at the parent.
+      this.discardView(prevHash);
+      mempool.setTipHeight(height - 1);
       await mempool.updateForReorg(
-        earliestFirst,
-        (t) => !notAddable.has(t),
-        (t) => heightOf.get(t)
+        txs,
+        () => addToMempool,
+        () => height - 1
       );
     } catch (err) {
       console.warn(

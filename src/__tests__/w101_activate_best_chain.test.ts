@@ -386,7 +386,7 @@ describe("W101 ActivateBestChain + InvalidateBlock gates", () => {
   });
 
   /**
-   * G18 FIXED: InvalidateBlock -> MaybeUpdateMempoolForReorg runs in
+   * G18 FIXED: InvalidateBlock -> MaybeUpdateMempoolForReorg runs per disconnected block in
    * BlockSync.invalidateBlock (it owns the live coin view the mempool reads).
    * End-to-end coverage: src/sync/invalidateblock-mempool-readd.test.ts.
    */
@@ -394,8 +394,8 @@ describe("W101 ActivateBestChain + InvalidateBlock gates", () => {
     const { BlockSync } = await import("../sync/blocks.js");
     const src =
       BlockSync.prototype.invalidateBlock.toString() +
-      (BlockSync.prototype as any).updateMempoolForInvalidate.toString();
-    expect(src).toContain("updateMempoolForInvalidate");
+      (BlockSync.prototype as any).updateMempoolForDisconnect.toString();
+    expect(src).toContain("updateMempoolForDisconnect");
     expect(src).toContain("updateForReorg");
   });
 
