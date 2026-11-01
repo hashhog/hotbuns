@@ -6183,7 +6183,7 @@ export class RPCServer {
         ancestorcount: rel.ancestorCount,
         ancestorsize: rel.ancestorSize,
         chunkweight: chunk.size,
-        wtxid: txidHex, // Simplified (same as txid for non-witness txs)
+        wtxid: displayHex(getWTxId(entry.tx)),
         // Core entryToJSON (mempool.cpp:527-533): fees is nested; no top-level fee/modifiedfee.
         fees: {
           base: Number(entry.fee) / 100_000_000,
@@ -6222,9 +6222,6 @@ export class RPCServer {
       throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, "Transaction not in mempool");
     }
 
-    // Get mining score (effective fee rate from cluster linearization)
-    const miningScore = entry.miningScore;
-
     // Modified fee = base fee + prioritisetransaction delta (Core GetModifiedFee).
     const modifiedFeeSats = this.mempool.getModifiedFee(txid);
     // Core CalculateAncestorData / CalculateDescendantData (transitive, modified fees).
@@ -6241,7 +6238,8 @@ export class RPCServer {
       ancestorcount: rel.ancestorCount,
       ancestorsize: rel.ancestorSize,
       chunkweight: chunk.size,
-      wtxid: txidParam,
+      // Core entryToJSON: tx.GetWitnessHash(), not the txid.
+      wtxid: displayHex(getWTxId(entry.tx)),
       // Core entryToJSON (mempool.cpp:527-533): fees is nested; no top-level fee/modifiedfee.
       fees: {
         base: Number(entry.fee) / 100_000_000,
@@ -6256,8 +6254,6 @@ export class RPCServer {
       // full-RBF replaceability.
       "bip125-replaceable": this.mempool.getRBFOptInState(txid) === RBFTransactionState.REPLACEABLE_BIP125,
       unbroadcast: this.mempool.isUnbroadcast(txid),
-      // Cluster mempool fields
-      miningScore: miningScore, // Effective fee rate (sat/vB) from chunk
     };
   }
 

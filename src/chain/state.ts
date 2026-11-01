@@ -1750,7 +1750,8 @@ export class ChainStateManager {
    */
   async invalidateBlock(
     blockHash: Buffer,
-    knownDescendants?: Buffer[]
+    knownDescendants?: Buffer[],
+    disconnectedTxsOut?: Transaction[][]
   ): Promise<ChainManagementResult> {
     // Check if block exists
     const blockIndex = await this.db.getBlockIndex(blockHash);
@@ -1819,6 +1820,12 @@ export class ChainStateManager {
 
         await this.disconnectBlock(block, idx.height);
         blocksDisconnected++;
+        // Core DisconnectTip -> DisconnectedBlockTransactions: the caller
+        // re-accepts these into the mempool (MaybeUpdateMempoolForReorg).
+        // One entry per disconnected block, tip first.
+        if (disconnectedTxsOut) {
+          disconnectedTxsOut.push(block.transactions.filter((t) => !isCoinbase(t)));
+        }
 
         // Mark the disconnected block as invalid
         await this.db.updateBlockStatus(
@@ -1850,19 +1857,13 @@ export class ChainStateManager {
       await this.markDescendantsInvalid(blockHash, blockIndex.height);
     }
 
-    // Remove conflicting transactions from mempool
-    if (this.mempool) {
-      // Get all txids in the invalidated block and its descendants
-      // This is a simplified version - full implementation would track all descendants
-      const rawBlock = await this.db.getBlock(blockHash);
-      if (rawBlock) {
-        const block = deserializeBlock(new BufferReader(rawBlock));
-        for (const tx of block.transactions) {
-          const txid = getTxId(tx);
-          this.mempool.removeTransaction(txid, true);
-        }
-      }
-    }
+    // Mempool: Core InvalidateBlock does not evict the invalidated blocks'
+    // txs (they were confirmed, so they are not in the pool); it re-accepts
+    // them with MaybeUpdateMempoolForReorg. BlockSync.invalidateBlock does
+    // that from `disconnectedTxsOut` once the live coin view is at the new
+    // tip. This used to removeTransaction the invalidated block's own txs: a
+    // no-op that left every disconnected tx out of the pool and its in-pool
+    // spenders orphaned there.
 
     return { success: true, blocksAffected: blocksDisconnected };
   }

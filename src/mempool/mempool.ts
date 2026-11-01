@@ -840,6 +840,12 @@ export interface MempoolEntry {
    * Reference: Bitcoin Core GetTransactionSigOpCost()
    */
   sigOpCost: number;
+  /**
+   * Spends a confirmed coinbase output (Core CTxMemPoolEntry::GetSpendsCoinbase).
+   * removeForReorg re-checks maturity only for these; undefined (an entry
+   * built by a path that did not read the coins) is always re-checked.
+   */
+  spendsCoinbase?: boolean;
 }
 
 /**
@@ -1378,6 +1384,20 @@ export interface AcceptToMemoryPoolOptions {
    * paths only; a single-tx caller never passes it.
    */
   inPackage?: PackageAcceptContext;
+  /**
+   * Core ATMPArgs::m_bypass_limits, set by the reorg re-accept of
+   * disconnected transactions (MaybeUpdateMempoolForReorg): skip the
+   * min-relay and rolling minimum fee floors (CheckFeeRate) and the size
+   * trim. Every other check still runs.
+   */
+  bypassLimits?: boolean;
+  /**
+   * Entry height to record instead of the mempool tip (Core
+   * CTxMemPoolEntry::entryHeight is the chain height when ATMP ran; the
+   * reorg re-accept runs after each DisconnectTip, one block above the final
+   * tip per block still to disconnect).
+   */
+  entryHeight?: number;
 }
 
 /**
@@ -2267,7 +2287,7 @@ export class Mempool {
     const rollingMinSatPerVB = this.getMinFee() / 1000;
     // Core PreChecks skips CheckFeeRate when m_package_feerates: the
     // package's aggregate feerate is checked instead (validation.cpp:1507).
-    const individualFeerate = !inPackage?.packageFeerates;
+    const individualFeerate = !inPackage?.packageFeerates && !options?.bypassLimits;
     if (individualFeerate && rollingMinSatPerVB > 0 && feeRate < rollingMinSatPerVB) {
       return {
         accepted: false,
@@ -2824,7 +2844,7 @@ export class Mempool {
       vsize,
       weight,
       addedTime: nowSeconds(),
-      height: this.tipHeight,
+      height: options?.entryHeight ?? this.tipHeight,
       spentBy: new Set(),
       dependsOn: parentTxids,
       ancestorCount,
@@ -2836,6 +2856,9 @@ export class Mempool {
       ephemeralDustParents,
       hasEphemeralDust: txHasEphemeralDust,
       sigOpCost,
+      spendsCoinbase: inputUtxos.some(
+        (u) => !u.isMempool && (u.utxo as UTXOEntry).coinbase === true
+      ),
     };
 
     // Add to mempool
@@ -2868,7 +2891,12 @@ export class Mempool {
     // Evict if over size limit. Core trims on DynamicMemoryUsage()
     // (txmempool.cpp:868); the vsize check is kept as a belt-and-braces
     // lower bound (usage >= vsize always, so it is normally redundant).
-    if (this.currentUsage > this.maxSize || this.currentSize > this.maxSize) {
+    // bypass_limits: the reorg re-accept trims once at the end (Core
+    // MaybeUpdateMempoolForReorg -> LimitMempoolSize).
+    if (
+      !options?.bypassLimits &&
+      (this.currentUsage > this.maxSize || this.currentSize > this.maxSize)
+    ) {
       this.evict();
     }
 
@@ -3143,6 +3171,350 @@ export class Mempool {
         }
       }
     }
+  }
+
+  /**
+   * Core Chainstate::MaybeUpdateMempoolForReorg (validation.cpp) for the
+   * transactions of blocks taken off the active chain. The caller is the
+   * chain writer (BlockSync, under the chain lock) and has already re-pointed
+   * the coin view and the mempool tip at the new tip.
+   *
+   * `disconnected` is EARLIEST-CONFIRMED FIRST (Core walks the disconnect
+   * pool in reverse), so a parent is re-accepted before its child.
+   *
+   *   1. re-accept each tx through ATMP with bypass_limits; a refused tx is
+   *      removeRecursive'd: its in-mempool spenders go with it (they would
+   *      otherwise spend an output that exists nowhere);
+   *   2. UpdateTransactionsFromBlock: link in-mempool children of the
+   *      re-accepted txs (they entered while the parent was confirmed), then
+   *      TxGraph::Trim the clusters that link made too large;
+   *   3. removeForReorg: drop, with descendants, every entry that at tip+1 is
+   *      non-final, sequence-locked or spends an immature coinbase;
+   *   4. LimitMempoolSize.
+   */
+  async updateForReorg(
+    disconnected: Transaction[],
+    addToMempool: (tx: Transaction) => boolean = () => true,
+    entryHeight: (tx: Transaction) => number | undefined = () => undefined
+  ): Promise<{ readded: number; refused: number; trimmed: number; removedForReorg: number }> {
+    const readded: string[] = [];
+    let refused = 0;
+    for (const tx of disconnected) {
+      if (isCoinbase(tx)) continue;
+      const txidHex = getTxId(tx).toString("hex");
+      if (this.entries.has(txidHex)) continue;
+      let accepted = false;
+      if (addToMempool(tx)) {
+        const r = await this.addTransaction(tx, { bypassLimits: true, entryHeight: entryHeight(tx) });
+        accepted = r.accepted;
+        if (!accepted) {
+          console.log(
+            `[mempool-reorg] disconnected tx ${txidHex.slice(0, 16)}... not re-accepted (${r.error}); removing its in-mempool descendants`
+          );
+        }
+      }
+      if (accepted) {
+        readded.push(txidHex);
+      } else {
+        refused++;
+        this.removeRecursiveForTx(tx);
+      }
+    }
+    const trimmed = this.updateTransactionsFromBlock(readded);
+    const removedForReorg = await this.removeForReorg();
+    if (this.currentUsage > this.maxSize || this.currentSize > this.maxSize) {
+      this.evict();
+    }
+    console.log(
+      `[mempool-reorg] MaybeUpdateMempoolForReorg: ${disconnected.length} disconnected, ` +
+        `${readded.length} re-accepted, ${refused} refused, ${trimmed} trimmed, ` +
+        `${removedForReorg} removed for reorg (tip ${this.tipHeight}, mempool ${this.entries.size})`
+    );
+    return { readded: readded.length, refused, trimmed, removedForReorg };
+  }
+
+  /**
+   * Core CTxMemPool::removeRecursive(tx): remove `tx` with its descendants;
+   * when `tx` is not in the pool (a disconnected tx that was not re-accepted)
+   * remove every in-mempool spender of its outputs, with descendants.
+   */
+  private removeRecursiveForTx(tx: Transaction): void {
+    const txid = getTxId(tx);
+    const txidHex = txid.toString("hex");
+    if (this.entries.has(txidHex)) {
+      this.removeTransaction(txid, true);
+      return;
+    }
+    for (let vout = 0; vout < tx.outputs.length; vout++) {
+      const spender = this.outpointIndex.get(`${txidHex}:${vout}`);
+      if (spender && this.entries.has(spender)) {
+        this.removeTransaction(Buffer.from(spender, "hex"), true);
+      }
+    }
+  }
+
+  /**
+   * Core CTxMemPool::UpdateTransactionsFromBlock (txmempool.cpp): a
+   * re-accepted tx may already have children in the pool, admitted while it
+   * was confirmed. Add those parent -> child links, then enforce the cluster
+   * limits on the clusters they merge (m_txgraph->Trim(), removal reason
+   * SIZELIMIT). Returns the number of transactions trimmed.
+   */
+  private updateTransactionsFromBlock(readded: string[]): number {
+    const links: Array<[string, string]> = [];
+    for (const parentHex of readded) {
+      const parent = this.entries.get(parentHex);
+      if (!parent) continue;
+      for (let vout = 0; vout < parent.tx.outputs.length; vout++) {
+        const childHex = this.outpointIndex.get(`${parentHex}:${vout}`);
+        if (!childHex || childHex === parentHex) continue;
+        const child = this.entries.get(childHex);
+        if (!child || child.dependsOn.has(parentHex)) continue;
+        links.push([parentHex, childHex]);
+      }
+    }
+    if (links.length === 0) return 0;
+
+    // The pre-link clusters and their linearizations: Trim orders each
+    // cluster's transactions by their chunk feerate there.
+    this.rebuildClusterCache();
+    const touched = new Map<string, Cluster>();
+    for (const [p, c] of links) {
+      for (const id of [p, c]) {
+        const root = this.clusters.find(id);
+        const cluster = this.clusterCache.get(root);
+        if (cluster) touched.set(root, cluster);
+      }
+    }
+    const preLink = Array.from(touched.values());
+
+    for (const [p, c] of links) {
+      this.entries.get(p)!.spentBy.add(c);
+      this.entries.get(c)!.dependsOn.add(p);
+    }
+    this.recalculateAllStats();
+    this.rebuildClusters();
+
+    const toRemove = this.trimClusters(preLink);
+    for (const txidHex of toRemove) {
+      if (this.entries.has(txidHex)) {
+        this.removeTransaction(Buffer.from(txidHex, "hex"), true);
+      }
+    }
+    // removeTransaction leaves the union-find sets as they were; re-derive
+    // them so the trimmed cluster's size is its real member count.
+    if (toRemove.length > 0) this.rebuildClusters();
+    return toRemove.length;
+  }
+
+  /**
+   * Core TxGraphImpl::Trim (txgraph.cpp) over the clusters the new links merged.
+   * For each merged cluster over MAX_CLUSTER_COUNT / MAX_CLUSTER_SIZE_WEIGHT,
+   * build the rudimentary linearization: repeatedly take the highest
+   * chunk-feerate transaction whose dependencies are all taken (dependencies
+   * = the new links, the existing parent links, and an implicit link between
+   * consecutive transactions of each pre-link cluster's linearization). A
+   * transaction whose partition (it plus everything it depends on, by union)
+   * would break a limit is skipped; everything never taken is removed, so a
+   * skipped transaction's descendants go with it.
+   */
+  private trimClusters(preLink: Cluster[]): string[] {
+    type Node = {
+      id: string;
+      fee: bigint;
+      size: number; // chunk size, for the chunk feerate
+      weight: number; // sigop-adjusted weight, the cluster size unit
+      parents: string[];
+      children: string[];
+      depsLeft: number;
+      included: boolean;
+      uf: Node;
+      ufCount: number;
+      ufWeight: number;
+    };
+    const nodes = new Map<string, Node>();
+    for (const cluster of preLink) {
+      let prev: string | null = null;
+      for (const chunk of cluster.linearization.chunks) {
+        for (const id of this.topologicalSort(chunk.txids)) {
+          const entry = this.entries.get(id);
+          if (!entry) continue;
+          const node = {
+            id,
+            fee: chunk.totalFee,
+            size: chunk.totalVsize,
+            weight: this.clusterWeightContribution(entry),
+            parents: [] as string[],
+            children: [] as string[],
+            depsLeft: 0,
+            included: false,
+            ufCount: 1,
+            ufWeight: 0,
+          } as Node;
+          node.uf = node;
+          nodes.set(id, node);
+          if (prev !== null) node.parents.push(prev);
+          prev = id;
+        }
+      }
+    }
+    for (const node of nodes.values()) {
+      for (const p of this.entries.get(node.id)!.dependsOn) {
+        if (nodes.has(p) && !node.parents.includes(p)) node.parents.push(p);
+      }
+    }
+    for (const node of nodes.values()) {
+      for (const p of node.parents) nodes.get(p)!.children.push(node.id);
+      node.depsLeft = node.parents.length;
+    }
+    const find = (n: Node): Node => {
+      while (n.uf !== n) {
+        n.uf = n.uf.uf;
+        n = n.uf;
+      }
+      return n;
+    };
+    // FeeFrac order: higher feerate first; equal feerate, smaller size first.
+    const better = (a: Node, b: Node): boolean => {
+      const l = a.fee * BigInt(b.size);
+      const r = b.fee * BigInt(a.size);
+      return l !== r ? l > r : a.size < b.size;
+    };
+
+    const removed: string[] = [];
+    const groups = new Map<string, Node[]>();
+    for (const node of nodes.values()) {
+      const root = this.clusters.find(node.id);
+      if (!groups.has(root)) groups.set(root, []);
+      groups.get(root)!.push(node);
+    }
+    for (const group of groups.values()) {
+      let weight = 0;
+      for (const n of group) weight += n.weight;
+      if (group.length <= MAX_CLUSTER_COUNT && weight <= MAX_CLUSTER_SIZE_WEIGHT) continue;
+      const ready = group.filter((n) => n.depsLeft === 0 && n.weight <= MAX_CLUSTER_SIZE_WEIGHT);
+      while (ready.length > 0) {
+        let bi = 0;
+        for (let i = 1; i < ready.length; i++) if (better(ready[i], ready[bi])) bi = i;
+        const node = ready.splice(bi, 1)[0];
+        node.ufWeight = node.weight;
+        const reps = new Set<Node>();
+        for (const p of node.parents) reps.add(find(nodes.get(p)!));
+        let count = 1;
+        let w = node.weight;
+        for (const r of reps) {
+          count += r.ufCount;
+          w += r.ufWeight;
+        }
+        if (count > MAX_CLUSTER_COUNT || w > MAX_CLUSTER_SIZE_WEIGHT) continue;
+        for (const r of reps) {
+          r.uf = node;
+          node.ufCount += r.ufCount;
+          node.ufWeight += r.ufWeight;
+        }
+        node.included = true;
+        for (const c of node.children) {
+          const child = nodes.get(c)!;
+          if (--child.depsLeft === 0) ready.push(child);
+        }
+      }
+      for (const n of group) if (!n.included) removed.push(n.id);
+    }
+    return removed;
+  }
+
+  /**
+   * Core CTxMemPool::removeForReorg with MaybeUpdateMempoolForReorg's
+   * filter_final_and_mature (validation.cpp): remove, with descendants, every
+   * entry that at tip+1 is non-final (CheckFinalTxAtTip, BIP113), fails its
+   * sequence locks (CheckSequenceLocksAtTip, BIP68) or spends a coinbase that
+   * is immature at tip+1. A confirmed input missing from the coin view also
+   * removes the entry (it can no longer be mined). Returns the number removed.
+   */
+  async removeForReorg(): Promise<number> {
+    if (this.entries.size === 0) return 0;
+    const nextHeight = this.tipHeight + 1;
+    let tipMTP: number;
+    try {
+      tipMTP = this.chainMTPProvider ? this.chainMTPProvider.tipMTP() : this.tipMTP;
+    } catch (err) {
+      if (!(err instanceof MissingAncestorHeaderError)) throw err;
+      tipMTP = Number.NaN;
+    }
+    const enforceBIP68 = this.tipHeight >= (this.params.csvHeight ?? 0);
+    const remove: string[] = [];
+    for (const [txidHex, entry] of Array.from(this.entries)) {
+      const tx = entry.tx;
+      // A time-based nLockTime with no MTP available is refused, never
+      // guessed (same rule as admission).
+      const timeLocked =
+        (tx.lockTime >>> 0) >= LOCKTIME_THRESHOLD_MTP &&
+        tx.inputs.some((i) => (i.sequence >>> 0) !== SEQUENCE_FINAL);
+      if (timeLocked && Number.isNaN(tipMTP)) {
+        remove.push(txidHex);
+        continue;
+      }
+      if (!isFinalTx(tx, nextHeight, Number.isNaN(tipMTP) ? 0 : tipMTP)) {
+        remove.push(txidHex);
+        continue;
+      }
+      const hasRelativeLock =
+        enforceBIP68 &&
+        tx.version >= 2 &&
+        tx.inputs.some((i) => ((i.sequence >>> 0) & SEQUENCE_LOCKTIME_DISABLE_FLAG) === 0);
+      if (!hasRelativeLock && entry.spendsCoinbase === false) continue;
+      let bad = false;
+      const confs: UTXOConfirmation[] = [];
+      for (const input of tx.inputs) {
+        if (this.entries.has(input.prevOut.txid.toString("hex"))) {
+          confs.push({ height: nextHeight, medianTimePast: tipMTP });
+          continue;
+        }
+        const coin = await this.utxo.getUTXOAsync(input.prevOut);
+        if (!coin) {
+          bad = true;
+          break;
+        }
+        if (coin.coinbase && nextHeight - coin.height < this.params.coinbaseMaturity) {
+          bad = true;
+          break;
+        }
+        if (!hasRelativeLock) continue;
+        const seq = input.sequence >>> 0;
+        const timeType =
+          (seq & SEQUENCE_LOCKTIME_DISABLE_FLAG) === 0 &&
+          (seq & SEQUENCE_LOCKTIME_TYPE_FLAG) !== 0;
+        let coinMTP = 0;
+        if (timeType) {
+          try {
+            coinMTP = this.chainMTPProvider ? this.chainMTPProvider.coinMTP(coin.height) : tipMTP;
+          } catch (err) {
+            if (!(err instanceof MissingAncestorHeaderError)) throw err;
+            coinMTP = Number.NaN;
+          }
+          if (Number.isNaN(coinMTP) || Number.isNaN(tipMTP)) {
+            bad = true;
+            break;
+          }
+        }
+        confs.push({ height: coin.height, medianTimePast: coinMTP });
+      }
+      if (
+        !bad &&
+        hasRelativeLock &&
+        !checkSequenceLocks(tx, true, nextHeight, Number.isNaN(tipMTP) ? 0 : tipMTP, confs)
+      ) {
+        bad = true;
+      }
+      if (bad) remove.push(txidHex);
+    }
+    const before = this.entries.size;
+    for (const txidHex of remove) {
+      if (this.entries.has(txidHex)) {
+        this.removeTransaction(Buffer.from(txidHex, "hex"), true);
+      }
+    }
+    return before - this.entries.size;
   }
 
   /**
@@ -4699,8 +5071,9 @@ export class Mempool {
       return { chunks: [], txToChunk: new Map() };
     }
 
-    // Build a topological ordering of the cluster
-    const topoOrder = this.topologicalSort(txids);
+    // Order the cluster for chunking (Core cluster_linearize.h Linearize
+    // targets the optimal linearization of the cluster).
+    const topoOrder = this.ancestorSetOrder(txids);
 
     // Compute chunks using the greedy algorithm from Bitcoin Core
     // Each tx starts as its own chunk, then absorb higher-feerate chunks
@@ -4753,6 +5126,71 @@ export class Mempool {
     }
 
     return { chunks, txToChunk };
+  }
+
+  /**
+   * Ancestor-set linearization order: repeatedly take the not-yet-placed
+   * transaction whose not-yet-placed ancestor set has the highest feerate
+   * (modified fees; ties: smaller set, then topological position) and emit
+   * that set in topological order. It is topological, and optimal for tree-
+   * shaped clusters (one parent with many children, a chain), where Core's
+   * Linearize (cluster_linearize.h) reaches the same optimum. The plain
+   * topological order it replaces put a parent's children in arrival order,
+   * so a fan-out cluster chunked as one block where Core splits it.
+   */
+  private ancestorSetOrder(txids: Set<string>): string[] {
+    const topo = this.topologicalSort(txids);
+    if (topo.length <= 1) return topo;
+    const pos = new Map<string, number>();
+    topo.forEach((id, i) => pos.set(id, i));
+    const ancestors = new Map<string, Set<string>>();
+    for (const id of topo) {
+      const set = new Set<string>([id]);
+      for (const p of this.entries.get(id)!.dependsOn) {
+        const pa = ancestors.get(p);
+        if (pa) for (const a of pa) set.add(a);
+      }
+      ancestors.set(id, set);
+    }
+    const fee = new Map<string, bigint>();
+    for (const id of topo) fee.set(id, this.getEntryModifiedFee(this.entries.get(id)!));
+    const placed = new Set<string>();
+    const out: string[] = [];
+    while (out.length < topo.length) {
+      let best: string | null = null;
+      let bestFee = 0n;
+      let bestSize = 0;
+      for (const id of topo) {
+        if (placed.has(id)) continue;
+        let f = 0n;
+        let sz = 0;
+        for (const a of ancestors.get(id)!) {
+          if (placed.has(a)) continue;
+          f += fee.get(a)!;
+          sz += this.entries.get(a)!.vsize;
+        }
+        if (best === null) {
+          best = id;
+          bestFee = f;
+          bestSize = sz;
+          continue;
+        }
+        const l = f * BigInt(bestSize);
+        const r = bestFee * BigInt(sz);
+        if (l > r || (l === r && sz < bestSize)) {
+          best = id;
+          bestFee = f;
+          bestSize = sz;
+        }
+      }
+      const set = Array.from(ancestors.get(best!)!).filter((a) => !placed.has(a));
+      set.sort((a, b) => pos.get(a)! - pos.get(b)!);
+      for (const a of set) {
+        placed.add(a);
+        out.push(a);
+      }
+    }
+    return out;
   }
 
   /**

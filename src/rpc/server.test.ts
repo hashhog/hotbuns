@@ -968,8 +968,15 @@ describe("RPCServer", () => {
     });
 
     it("should return verbose entries when verbose=true", async () => {
-      const txid = Buffer.alloc(32, 1);
-      mockMempool.addTestTransaction(txid, {
+      // A real (segwit) transaction: verbose entries report its wtxid.
+      const tx = {
+        version: 2,
+        inputs: [{ prevOut: { txid: Buffer.alloc(32, 7), vout: 0 }, scriptSig: Buffer.alloc(0), sequence: 0xfffffffd, witness: [Buffer.from([0x51])] }],
+        outputs: [{ value: 1000n, scriptPubKey: Buffer.from([0x51]) }],
+        lockTime: 0,
+      };
+      mockMempool.addTestTransaction(getTxId(tx), {
+        tx,
         fee: 1000n,
         feeRate: 10,
         vsize: 200,
@@ -981,10 +988,12 @@ describe("RPCServer", () => {
 
       expect(result.result).toBeDefined();
       expect(typeof result.result).toBe("object");
-      const txidHex = txid.toString("hex");
+      const txidHex = Buffer.from(getTxId(tx)).reverse().toString("hex");
       expect(result.result[txidHex]).toBeDefined();
       expect(result.result[txidHex].vsize).toBe(200);
       expect(result.result[txidHex].weight).toBe(800);
+      // Core entryToJSON: wtxid is the witness hash, not the txid.
+      expect(result.result[txidHex].wtxid).toBe(Buffer.from(getWTxId(tx)).reverse().toString("hex"));
       // Core rpc/mempool.cpp entryToJSON: verbose entries carry bip125-replaceable.
       expect(result.result[txidHex]["bip125-replaceable"]).toBe(false);
     });
