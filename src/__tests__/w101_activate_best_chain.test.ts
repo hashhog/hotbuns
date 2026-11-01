@@ -350,26 +350,22 @@ describe("W101 ActivateBestChain + InvalidateBlock gates", () => {
   });
 
   /**
-   * BUG G17b: InvalidateBlock — mempool removal only covers the directly
-   *           invalidated block, not its on-chain descendants.
-   *
-   * Core (line 3589) calls MaybeUpdateMempoolForReorg which re-adds valid
-   * disconnected txs and removes invalid ones from all disconnected blocks.
-   * Hotbuns (line 1297-1308) only removes txs from the single target block.
+   * G17b FIXED: ChainStateManager.invalidateBlock no longer touches the
+   * mempool. It used to removeTransaction the invalidated block's own txs, a
+   * no-op (they were confirmed, so not in the pool) standing in for Core's
+   * MaybeUpdateMempoolForReorg. It now hands each disconnected block's
+   * non-coinbase txs to the caller (BlockSync.invalidateBlock), which
+   * re-accepts them via Mempool.updateForReorg.
    */
-  it("G17b: invalidateBlock mempool removal only covers target block, not descendants", async () => {
-    // Structural test — verify the code path only reads the target block
-    // for mempool removal by checking that no attempt is made to iterate
-    // descendant blocks' transactions.
+  it("G17b: invalidateBlock removes nothing from the mempool (the caller re-accepts the disconnected txs)", async () => {
     const genesis = Buffer.alloc(32, 0);
 
     const block1 = createBlock(genesis, 1, 0);
     const hash1 = await storeBlock(db, block1, 1);
 
     const block2 = createBlock(hash1, 2, 0);
-    const hash2 = await storeBlock(db, block2, 2);
+    await storeBlock(db, block2, 2);
 
-    // Track which blocks had their mempool entries queried.
     const mempoolRemovals: string[] = [];
     const fakeMempool = {
       removeTransaction: (txid: Buffer, _recursive: boolean) => {
@@ -378,37 +374,29 @@ describe("W101 ActivateBestChain + InvalidateBlock gates", () => {
     };
     cs.setMempool(fakeMempool as never);
 
-    // Invalidate block1 — block2 is a descendant that should also have its
-    // txs removed from the mempool (Core does this via MaybeUpdateMempoolForReorg).
-    await cs.invalidateBlock(hash1);
-
-    // BUG: only block1's coinbase txid appears — block2's txid is absent.
-    const cbTxid1 = getTxId(block1.transactions[0]).toString("hex");
-    const cbTxid2 = getTxId(block2.transactions[0]).toString("hex");
-    expect(mempoolRemovals).toContain(cbTxid1);
-    // This assertion documents the bug: cbTxid2 should appear but doesn't.
-    expect(mempoolRemovals).not.toContain(cbTxid2);
+    const disconnected: unknown[][] = [];
+    const result = await cs.invalidateBlock(hash1, undefined, disconnected as never);
+    expect(result.success).toBe(true);
+    // Base removed block1's txids here; Core never evicts on invalidate.
+    expect(mempoolRemovals).toEqual([]);
+    // This fixture's best block is not on block1's chain, so nothing is
+    // disconnected; the hand-off is covered end to end in
+    // src/sync/invalidateblock-mempool-readd.test.ts.
+    expect(disconnected.length).toBe(result.blocksAffected ?? 0);
   });
 
   /**
-   * BUG G18: InvalidateBlock — no MaybeUpdateMempoolForReorg pattern.
-   *
-   * Core's InvalidateBlock calls MaybeUpdateMempoolForReorg with fAddToMempool
-   * controlled by disconnection count (<=10 and successful).  Hotbuns never
-   * re-adds the disconnected transactions back to the mempool.
-   *
-   * This is distinct from the removeForBlock path: after invalidating a block,
-   * its non-coinbase transactions SHOULD be re-added to the mempool so they
-   * can be included in the next valid block.
+   * G18 FIXED: InvalidateBlock -> MaybeUpdateMempoolForReorg runs per disconnected block in
+   * BlockSync.invalidateBlock (it owns the live coin view the mempool reads).
+   * End-to-end coverage: src/sync/invalidateblock-mempool-readd.test.ts.
    */
-  it("G18: invalidateBlock does not re-add disconnected txs to mempool (MaybeUpdateMempoolForReorg absent)", async () => {
-    // Verify there is no readdTransactions / reorgRefillUnchecked path
-    // in the invalidateBlock code path by checking the method body doesn't
-    // reference these.
-    const methodStr = cs.invalidateBlock.toString();
-    expect(methodStr).not.toContain("readdTransactions");
-    expect(methodStr).not.toContain("reorgRefillUnchecked");
-    expect(methodStr).not.toContain("MaybeUpdateMempoolForReorg");
+  it("G18: invalidateblock re-adds disconnected txs (BlockSync -> Mempool.updateForReorg)", async () => {
+    const { BlockSync } = await import("../sync/blocks.js");
+    const src =
+      BlockSync.prototype.invalidateBlock.toString() +
+      (BlockSync.prototype as any).updateMempoolForDisconnect.toString();
+    expect(src).toContain("updateMempoolForDisconnect");
+    expect(src).toContain("updateForReorg");
   });
 
   /**
