@@ -92,6 +92,18 @@ class MockMempool implements Partial<Mempool> {
     return this.entries.get(txid.toString("hex"))?.fee ?? 0n;
   }
 
+  // Single-tx chunks, no BIP-125 signal, nothing unbroadcast (Core entryToJSON inputs).
+  getMainChunkFeerate(txid: Buffer) {
+    const e = this.entries.get(txid.toString("hex"));
+    return { fee: e?.fee ?? 0n, size: (e?.vsize ?? 0) * 4 };
+  }
+  getRBFOptInState(_txid: Buffer): number {
+    return 0;
+  }
+  isUnbroadcast(_txid: Buffer): boolean {
+    return false;
+  }
+
   // Mirrors Mempool.getEntryRelatives for the mock's unrelated entries
   // (the REST tests add no parent/child links): totals are the entry itself.
   getEntryRelatives(txid: Buffer) {

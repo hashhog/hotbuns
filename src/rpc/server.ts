@@ -6503,10 +6503,15 @@ export class RPCServer {
         continue;
       }
       const err = result.error || "rejected";
+      // An error already in Core's ToString() form ("<reason>, <debug>") is
+      // the reject-details as-is; the reason is the leading token.
+      const coreForm = /^([a-z0-9-]+), /.exec(err);
       const sep = err.indexOf(": ");
-      const reason = sep >= 0 ? err.slice(0, sep) : err;
+      const reason = coreForm ? coreForm[1] : sep >= 0 ? err.slice(0, sep) : err;
       if (reason === "bad-txns-inputs-missingorspent") {
         reject("missing-inputs");
+      } else if (coreForm) {
+        reject(reason, err);
       } else {
         reject(reason, sep >= 0 ? `${reason}, ${err.slice(sep + 2)}` : reason);
       }

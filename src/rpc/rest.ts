@@ -29,6 +29,7 @@
 import type { ChainStateManager } from "../chain/state.js";
 import type { ChainDB, UTXOEntry } from "../storage/database.js";
 import type { Mempool } from "../mempool/mempool.js";
+import { RBFTransactionState } from "../mempool/rbf.js";
 import { mempoolInfoToJSON } from "../mempool/info.js";
 import type { HeaderSync } from "../sync/headers.js";
 import type { ConsensusParams } from "../consensus/params.js";
@@ -831,26 +832,31 @@ export class RESTServer {
         if (entry) {
           // Core CalculateAncestorData / CalculateDescendantData (transitive, modified fees).
           const rel = this.mempool.getEntryRelatives(txid)!;
+          // Same object as getrawmempool(verbose) / getmempoolentry (Core
+          // entryToJSON, rpc/mempool.cpp): no top-level fee/modifiedfee.
+          const chunk = this.mempool.getMainChunkFeerate(txid);
           entries.set(Buffer.from(txid).reverse().toString("hex"), {
             vsize: entry.vsize,
             weight: entry.weight,
-            fee: Number(entry.fee) / 100000000,
-            modifiedfee: Number(entry.fee) / 100000000,
             time: entry.addedTime,
             height: entry.height,
             descendantcount: rel.descendantCount,
             descendantsize: rel.descendantSize,
             ancestorcount: rel.ancestorCount,
             ancestorsize: rel.ancestorSize,
+            chunkweight: chunk.size,
             wtxid: Buffer.from(getWTxId(entry.tx)).reverse().toString("hex"),
             fees: {
               base: Number(entry.fee) / 100000000,
               modified: Number(this.mempool.getModifiedFee(txid)) / 100000000,
               ancestor: Number(rel.ancestorFees) / 100000000,
               descendant: Number(rel.descendantFees) / 100000000,
+              chunk: Number(chunk.fee) / 100000000,
             },
             depends: rel.depends,
             spentby: rel.spentby,
+            "bip125-replaceable": this.mempool.getRBFOptInState(txid) === RBFTransactionState.REPLACEABLE_BIP125,
+            unbroadcast: this.mempool.isUnbroadcast(txid),
           });
         }
       }
