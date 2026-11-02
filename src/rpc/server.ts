@@ -10,7 +10,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { mempoolInfoToJSON } from "../mempool/info.js";
 import { FATAL_ERROR_TOKEN, fatalRefusal, isFatal } from "../chain/fatal.js";
 import * as fs from "fs";
-import { setMockTime } from "../clock.js";
+import { setMockTime, nowSeconds as clockNowSeconds } from "../clock.js";
 import type { ChainStateManager } from "../chain/state.js";
 import type { ChainDB } from "../storage/database.js";
 import { DBPrefix, BlockStatus } from "../storage/database.js";
@@ -10736,21 +10736,14 @@ export class RPCServer {
       return false;
     }
 
-    // Get current time in seconds
-    const nowSeconds = Math.floor(Date.now() / 1000);
+    // Core IsInitialBlockDownload compares the tip time with GetTime(), which
+    // honours -mocktime (setmocktime). There is no regtest exemption: a regtest
+    // chain with an old tip is in IBD until a recent block arrives or mocktime
+    // is moved up to the tip.
     const maxTipAgeSeconds = 24 * 60 * 60; // 24 hours
+    const tipTooOld = bestBlockTimestamp < clockNowSeconds() - maxTipAgeSeconds;
 
-    // On regtest the tip-age gate does not apply: Core evaluates tip age against
-    // GetTime() which honours -mocktime, so a regtest chain mined under mocktime
-    // (tip time ~= mocktime) is NOT "old" and IsInitialBlockDownload latches to
-    // false at the tip. hotbuns has no mocktime clock here, so a regtest chain's
-    // (intentionally backdated) tip would otherwise look perpetually stale and
-    // pin IBD=true. Exempt regtest from the wall-clock tip-age check so it
-    // latches false at tip like Core. Mainnet/testnet keep the real gate.
-    const isRegtest = this.params.networkMagic === 0xdab5bffa;
-    const tipTooOld = !isRegtest && bestBlockTimestamp < nowSeconds - maxTipAgeSeconds;
-
-    // Still in IBD if chainwork is below minimum OR (off-regtest) tip is stale.
+    // Still in IBD if chainwork is below minimum OR tip is stale.
     const stillInIBD =
       bestBlockChainWork < this.params.nMinimumChainWork ||
       tipTooOld;
