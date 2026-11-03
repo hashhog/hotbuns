@@ -2335,14 +2335,24 @@ export class BlockSync {
       }
     }
 
-    // Already processed?
+    // Below the processing frontier: either a block we already hold, or a
+    // side-branch block that does not out-work the active tip.
     if (headerEntry.height < this.state.nextHeightToProcess) {
+      // Core submitblock (rpc/mining.cpp) answers "duplicate" only when
+      // ProcessNewBlock reports new_block=false, i.e. AcceptBlock found
+      // BLOCK_HAVE_DATA already set (fAlreadyHave). A side-branch block seen
+      // for the first time is written to disk (new_block=true) but not
+      // connected, so BlockChecked never fires for it and the answer is
+      // "inconclusive".
+      if (await this.db.hasBlock(blockHash)) {
+        return "duplicate";
+      }
       // Side-branch storage: persist the block body even though it's
       // not on the active chain right now (see storeSideBranchBlock for
       // the full rationale — a future heavier sibling reorg reads the
       // bridging bodies back via db.getBlock).
       await this.storeSideBranchBlock(block, blockHash, hashHex);
-      return "duplicate";
+      return "inconclusive";
     }
 
     // Reject blocks that are too far ahead of the processing frontier.
