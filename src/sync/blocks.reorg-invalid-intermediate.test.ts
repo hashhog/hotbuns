@@ -191,7 +191,7 @@ describe("BlockSync reorg intermediate fails consensus (Core InvalidBlockFound p
       const X = fakePeer("127.0.0.2", 50001);
       const H = fakePeer("127.0.0.3", 50002);
       (blockSync as any).peerManager = fakeManager([X, H]);
-      expect(await blockSync.injectBlock(B1)).toBe("duplicate");
+      expect(await blockSync.injectBlock(B1)).toBe("inconclusive");
       (blockSync as any).forkBodySource.set(B1Hash.toString("hex"), "127.0.0.2:50001");
       expect(chainState.getBestBlock().hash.equals(A1Hash)).toBe(true);
 
@@ -244,7 +244,7 @@ describe("BlockSync reorg intermediate fails consensus (Core InvalidBlockFound p
     "submitblock of the fork tip answers 'inconclusive' when the verdict belongs to the intermediate",
     async () => {
       const { A1Hash, B1, B1Hash, B2x, B2xHash } = await setup();
-      expect(await blockSync.injectBlock(B1)).toBe("duplicate");
+      expect(await blockSync.injectBlock(B1)).toBe("inconclusive");
 
       // Core rpc/mining.cpp submitblock: the state catcher only listens for
       // BlockChecked(B2x). ConnectTip(B1) fails, so BlockChecked fires for B1
@@ -281,7 +281,7 @@ describe("BlockSync reorg intermediate fails consensus (Core InvalidBlockFound p
       const { A1Hash, B1, B1Hash, B2x, B2xHash } = await setup();
       const X = fakePeer("127.0.0.2", 50001);
       (blockSync as any).peerManager = fakeManager([X]);
-      expect(await blockSync.injectBlock(B1)).toBe("duplicate");
+      expect(await blockSync.injectBlock(B1)).toBe("inconclusive");
       (blockSync as any).forkBodySource.set(B1Hash.toString("hex"), "127.0.0.2:50001");
 
       // Snapshot-style partial header window: the intermediate's BIP-113 MTP

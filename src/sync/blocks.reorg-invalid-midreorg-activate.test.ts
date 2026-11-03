@@ -170,8 +170,8 @@ describe("BlockSync invalid-mid-reorg: valid follow-up activates (Core parity)",
         REGTEST_SUBSIDY * 2n // bad-cb-amount
       );
 
-      expect(await blockSync.injectBlock(B1)).toBe("duplicate");
-      expect(await blockSync.injectBlock(B2)).toBe("duplicate");
+      expect(await blockSync.injectBlock(B1)).toBe("inconclusive");
+      expect(await blockSync.injectBlock(B2)).toBe("inconclusive");
 
       // B3 drives the reorg, which MUST fail and roll back to A2 atomically.
       const b3Result = await blockSync.injectBlock(B3);

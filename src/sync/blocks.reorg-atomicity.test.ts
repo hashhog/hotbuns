@@ -182,8 +182,8 @@ describe("BlockSync reorg atomicity (Reorg wave 3)", () => {
 
       // Submit the competing intermediates first (stored as side-branch
       // bodies, exactly as submitblock does for below-frontier siblings).
-      expect(await blockSync.injectBlock(B1)).toBe("duplicate");
-      expect(await blockSync.injectBlock(B2)).toBe("duplicate");
+      expect(await blockSync.injectBlock(B1)).toBe("inconclusive");
+      expect(await blockSync.injectBlock(B2)).toBe("inconclusive");
 
       // Submitting B3 makes B the heaviest chain and drives the reorg, which
       // must FAIL on B3 and roll back to A2 atomically.
