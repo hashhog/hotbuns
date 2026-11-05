@@ -598,12 +598,22 @@ export function validateBip34Height(
  * - Witness commitment matches (if segwit active)
  * - Total block weight within limit
  * - Each transaction is valid
+ *
+ * With `contextual: false` only Core's context-free CheckBlock subset runs
+ * (size, coinbase placement, merkle root / mutation, the stripped-size limit,
+ * CheckTransaction): the checks that need the parent (witness commitment,
+ * block weight, nVersion floors, BIP34 height — ContextualCheckBlockHeader /
+ * ContextualCheckBlock) are skipped and `height` is ignored. This is what
+ * Core runs for a block whose parent it does not know, before
+ * AcceptBlockHeader rejects it with prev-blk-not-found.
  */
 export function validateBlock(
   block: Block,
   height: number,
-  params: ConsensusParams
+  params: ConsensusParams,
+  options: { contextual?: boolean } = {}
 ): { valid: boolean; error?: string } {
+  const contextual = options.contextual ?? true;
   // Block must have at least one transaction.
   // Core CheckBlock (validation.cpp:3947-3948) folds vtx.empty() into the
   // SIZE-LIMITS check, so an empty block rejects with "bad-blk-length"
@@ -663,6 +673,23 @@ export function validateBlock(
 
   if (!computedMerkleRoot.equals(block.header.merkleRoot)) {
     return { valid: false, error: "Merkle root mismatch" };
+  }
+
+  if (!contextual) {
+    // Core CheckBlock size limit (validation.cpp CheckBlock): the block
+    // without witness data, scaled by WITNESS_SCALE_FACTOR, must fit
+    // MAX_BLOCK_WEIGHT ("bad-blk-length"). The full-weight check below is
+    // ContextualCheckBlock's.
+    if (getBlockBaseSize(block) * 4 > params.maxBlockWeight) {
+      return { valid: false, error: "bad-blk-length" };
+    }
+    for (let i = 0; i < block.transactions.length; i++) {
+      const result = validateTxBasic(block.transactions[i]);
+      if (!result.valid) {
+        return { valid: false, error: `Transaction ${i}: ${result.error}` };
+      }
+    }
+    return { valid: true };
   }
 
   // BIP-141 witness commitment / malleation check.
