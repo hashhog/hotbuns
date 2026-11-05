@@ -8858,7 +8858,7 @@ export class RPCServer {
       this.stop();
     }, 100);
 
-    return "hotbuns stopping";
+    return "Bitcoin Core stopping";
   }
 
   // ========== Address Validation Methods ==========

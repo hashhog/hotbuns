@@ -1516,7 +1516,7 @@ describe("RPCServer", () => {
 
       const result = await rpcRequest(testPort, "stop");
 
-      expect(result.result).toBe("hotbuns stopping");
+      expect(result.result).toBe("Bitcoin Core stopping");
 
       // Wait a bit for the shutdown callback to be invoked
       await new Promise(resolve => setTimeout(resolve, 300));
