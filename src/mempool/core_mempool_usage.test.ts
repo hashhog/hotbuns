@@ -5,8 +5,9 @@
  * Every expected number below was measured on Bitcoin Core 31.1 regtest with
  * the same transaction shapes (P2WSH(OP_DROP OP_DROP OP_TRUE) spends whose
  * witness is two 80-byte items and the 3-byte script), each case on a freshly
- * started bitcoind so its pool starts empty like a new Mempool. Probe and
- * output: hashhog staged-patches/hotbuns-core-mempool-usage/.
+ * started bitcoind (-persistmempool=0, funding confirmed before a restart) so
+ * its pool starts empty like a new Mempool. The probe script and its output
+ * are in the pull request description.
  *
  * Core regtest rows this covers: warden_invalidated_submit usage-* and the
  * pressure / pressure-decay contents, where hotbuns' old JS-heap estimate
@@ -26,6 +27,7 @@ import { Mempool } from "./mempool.js";
 import type { Transaction } from "../validation/tx.js";
 import { getTxId } from "../validation/tx.js";
 import type { Block } from "../validation/block.js";
+import { setMockTime } from "../clock.js";
 
 const DROP_SCRIPT = Buffer.from("755175", "hex"); // OP_DROP OP_DROP OP_TRUE
 const DROP_P2WSH = Buffer.concat([
@@ -67,6 +69,7 @@ describe("mempool usage matches Core 31.1 DynamicMemoryUsage", () => {
   });
 
   afterEach(async () => {
+    setMockTime(0);
     await db.close();
     await rm(tempDir, { recursive: true, force: true });
   });
@@ -186,5 +189,42 @@ describe("mempool usage matches Core 31.1 DynamicMemoryUsage", () => {
     expect(mempool.getInfo().size).toBe(2);
     // The first transaction pays the least (10,000 sat); it is the one evicted.
     expect(mempool.hasTransaction(Buffer.from(ids[0], "hex"))).toBe(false);
+  });
+
+  test("eviction sets mempoolminfee to Core's whole-sat/kvB removed feerate, which then decays", async () => {
+    // Core TrimToSize: removed = CFeeRate(fee, vsize) += incremental_relay_feerate,
+    // i.e. floor(fee * 1000 / vsize) + 100 sat/kvB; getmempoolinfo reports
+    // llround() of the rolling rate, which halves every 12 h once a block
+    // has been seen (GetMinFee). Here the evicted tx pays 10,000 sat for
+    // 137 vB: floor(72,992.7) + 100 = 73,092 sat/kvB.
+    const T0 = 1_700_000_000;
+    setMockTime(T0);
+    mempool = new Mempool(new UTXOManager(db), REGTEST, 3799);
+    mempool.setTipHeight(200);
+    for (let i = 0; i < 3; i++) {
+      await mempool.addTransaction(
+        dropSpend([await fund()], [{ value: V - 10_000n - BigInt(i) * 1_000n, scriptPubKey: DROP_P2WSH }])
+      );
+    }
+    expect(mempool.getInfo().size).toBe(2);
+    expect(mempool.getInfo().minFeeRate).toBe(73.092);
+
+    // A block (here coinbase-only) arms the decay; 12 h + 11 s later the
+    // pool is still over half full, so the halflife is the full 12 h:
+    // llround(73,092 / 2^(43,211 / 43,200)) = 36,540 sat/kvB.
+    const coinbase: Transaction = {
+      version: 2,
+      inputs: [{
+        prevOut: { txid: Buffer.alloc(32, 0), vout: 0xffffffff },
+        scriptSig: Buffer.from([0x02, 0xc9, 0x00]),
+        sequence: 0xffffffff,
+        witness: [],
+      }],
+      outputs: [{ value: 0n, scriptPubKey: HEAVY_SCRIPT }],
+      lockTime: 0,
+    };
+    mine([coinbase]);
+    setMockTime(T0 + 43_211);
+    expect(mempool.getInfo().minFeeRate).toBe(36.54);
   });
 });

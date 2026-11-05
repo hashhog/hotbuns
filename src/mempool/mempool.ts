@@ -4692,8 +4692,9 @@ export class Mempool {
    * @returns Minimum fee rate in sat/kvB.
    */
   getMinFee(): number {
+    // Core returns CFeeRate(llround(rollingMinimumFeeRate)): whole sat/kvB.
     if (!this.blockSinceLastRollingFeeBump || this.rollingMinimumFeeRate === 0) {
-      return this.rollingMinimumFeeRate;
+      return Math.round(this.rollingMinimumFeeRate);
     }
 
     const now = nowSeconds();
@@ -4727,8 +4728,8 @@ export class Mempool {
 
     // Return the greater of the rolling rate and the incremental relay fee.
     // Reference: txmempool.cpp:850
-    const incrementalRelayKvB = this.incrementalRelayFee * 1000;
-    return Math.max(this.rollingMinimumFeeRate, incrementalRelayKvB);
+    const incrementalRelayKvB = Math.round(this.incrementalRelayFee * 1000);
+    return Math.max(Math.round(this.rollingMinimumFeeRate), incrementalRelayKvB);
   }
 
   /**
@@ -4753,8 +4754,6 @@ export class Mempool {
   private evict(): void {
     this.rebuildClusterCache();
 
-    let nTxnRemoved = 0;
-    let maxFeeRateRemovedKvB = 0;
 
     while (
       this.isOverLimit() &&
@@ -4785,21 +4784,19 @@ export class Mempool {
       if (worstChunkTxids.length === 0) break;
 
       // Compute the evicted fee rate in sat/kvB and add incrementalRelayFee.
-      // Reference: txmempool.cpp:870-878
-      // removed = chunk_feerate_sat_per_kvB + incrementalRelayFee_sat_per_kvB
+      // Reference: txmempool.cpp TrimToSize: `CFeeRate removed{fee, size};
+      // removed += incremental_relay_feerate;` CFeeRate::operator+= adds the
+      // two GetFeePerK() values, i.e. floor(fee * 1000 / vsize) (EvaluateFeeDown)
+      // plus the incremental fee, so the rolling minimum is a whole number of
+      // sat/kvB (policy/feerate.h).
       const chunkFeeRateKvB =
         worstChunkTotalVsize > 0
-          ? (Number(worstChunkTotalFee) / worstChunkTotalVsize) * 1000
+          ? Math.floor((Number(worstChunkTotalFee) * 1000) / worstChunkTotalVsize)
           : 0;
-      const incrementalRelayKvB = this.incrementalRelayFee * 1000;
+      const incrementalRelayKvB = Math.round(this.incrementalRelayFee * 1000);
       const removedKvB = chunkFeeRateKvB + incrementalRelayKvB;
 
       this.trackPackageRemoved(removedKvB);
-      if (removedKvB > maxFeeRateRemovedKvB) {
-        maxFeeRateRemovedKvB = removedKvB;
-      }
-
-      nTxnRemoved += worstChunkTxids.length;
 
       // Remove all transactions in the chunk.
       // removeTransactionInternal handles descendant stats + index cleanup.
@@ -4815,14 +4812,11 @@ export class Mempool {
       this.rebuildClusterCache();
     }
 
-    // Sync the admission minFeeRate from the rolling rate (sat/vB).
-    // This ensures that new transactions must pay at least the rate of what
-    // was just evicted.
-    if (maxFeeRateRemovedKvB > 0) {
-      // Convert sat/kvB → sat/vB for the admission gate comparison.
-      const newMinSatPerVB = maxFeeRateRemovedKvB / 1000;
-      this.minFeeRate = Math.max(this.minFeeRate, newMinSatPerVB);
-    }
+    // The evicted feerate lives only in the rolling minimum
+    // (trackPackageRemoved), which admission reads through getMinFee() and
+    // which decays. Core never raises min_relay_feerate (-minrelaytxfee) here;
+    // copying the rolling rate into this.minFeeRate pinned mempoolminfee at
+    // the eviction rate forever.
   }
 
   /**
