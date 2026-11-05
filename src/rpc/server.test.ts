@@ -2756,9 +2756,11 @@ describe("RPCServer", () => {
         };
         const s = makeServerWithBlockSync(port, mockBlockSync);
         mockHeaderSync.setUnknown(UNKNOWN_PARENT);
+        const hex = buildMinimalBlockHex({ ...opts, prevBlock: UNKNOWN_PARENT });
+        // A real HeaderSync knows neither the parent nor the block itself.
+        mockHeaderSync.setUnknown(hash256(Buffer.from(hex, "hex").subarray(0, 80)));
         s.start();
         try {
-          const hex = buildMinimalBlockHex({ ...opts, prevBlock: UNKNOWN_PARENT });
           const result = await rpcRequest(port, "submitblock", [hex]);
           return { result, injectCalled };
         } finally {
@@ -2784,6 +2786,32 @@ describe("RPCServer", () => {
         const { result, injectCalled } = await submitUnknownParent({ cbHeight: 1, badMerkle: true });
         expect(result.result).toBe("bad-txnmrklroot");
         expect(injectCalled).toBe(false);
+      });
+
+      it("prev-not-found: the genesis block (no parent, own header indexed) still answers duplicate", async () => {
+        // Core AcceptBlockHeader skips the duplicate and parent lookups for
+        // hashGenesisBlock; AcceptBlock then finds the data already stored and
+        // submitblock answers "duplicate".
+        const port = getTestPort();
+        let injectCalled = false;
+        const mockBlockSync = {
+          injectBlock: async (_block: any) => {
+            injectCalled = true;
+            return "duplicate";
+          },
+        };
+        const s = makeServerWithBlockSync(port, mockBlockSync);
+        mockHeaderSync.setUnknown(Buffer.alloc(32, 0)); // genesis' prevBlock
+        s.start();
+        try {
+          const result = await rpcRequest(port, "submitblock", [REGTEST.genesisBlock.toString("hex")]);
+          expect(result.error).toBeUndefined();
+          expect(result.result).toBe("duplicate");
+          expect(injectCalled).toBe(true);
+        } finally {
+          s.stop();
+          mockHeaderSync.nextTargetOverride = null;
+        }
       });
 
       it("prev-not-found: proof of work against the block's own nBits runs first (high-hash)", async () => {
@@ -2865,9 +2893,11 @@ describe("RPCServer", () => {
       // returns undefined and we exercise the active-tip fallback.
       mockHeaderSync.setUnknown(Buffer.alloc(32, 0));
       mockHeaderSync.bestHeaderHeightOverride = 100;
+      const hex = buildMinimalBlockHex({ cbHeight: 101 });
+      // ...and the block's own header is not indexed either.
+      mockHeaderSync.setUnknown(hash256(Buffer.from(hex, "hex").subarray(0, 80)));
       s.start();
       try {
-        const hex = buildMinimalBlockHex({ cbHeight: 101 });
         const result = await rpcRequest(port, "submitblock", [hex]);
         expect(result.error).toBeUndefined();
         expect(result.result).toBe("prev-blk-not-found");

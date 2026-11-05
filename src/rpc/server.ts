@@ -9477,8 +9477,12 @@ export class RPCServer {
     // CheckBlock passed for a block whose parent is not in the block index:
     // Core AcceptBlockHeader answers prev-blk-not-found (see above). The
     // block is not stored, as before (injectBlock could not accept its header
-    // either and answered "inconclusive").
-    if (!parentEntry) {
+    // either and answered "inconclusive"). The one block with no parent whose
+    // header is already indexed is genesis: Core's AcceptBlockHeader skips both
+    // the duplicate and the parent lookup for it and AcceptBlock reports it as
+    // already had, so submitblock answers "duplicate" — leave that to
+    // injectBlock, which finds the stored block.
+    if (!parentEntry && !this.headerSync.getHeader(blockHash)) {
       return "prev-blk-not-found";
     }
 
