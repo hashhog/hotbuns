@@ -658,6 +658,115 @@ export function estimateEntryUsage(tx: Transaction, vsize: number): number {
 }
 
 /**
+ * Core's `memusage::MallocUsage` on a 64-bit build (memusage.h): the bytes
+ * malloc really hands out for an `alloc`-byte request.
+ */
+export function mallocUsage(alloc: number): number {
+  if (alloc <= 0) return 0;
+  return Math.floor((alloc + 31) / 16) * 16;
+}
+
+/**
+ * `memusage::DynamicUsage(CScript)`: a CScript is a `prevector<36, uint8_t>`
+ * (script/script.h CScriptBase), so a script of up to 36 bytes lives inline
+ * and allocates nothing; a longer one allocates exactly its length.
+ */
+function scriptDynamicUsage(len: number): number {
+  return len > 36 ? mallocUsage(len) : 0;
+}
+
+/** sizeof(CTxIn) / sizeof(CTxOut) on x86_64 (CScript is 40 bytes). */
+const CORE_SIZEOF_TXIN = 112;
+const CORE_SIZEOF_TXOUT = 48;
+
+/**
+ * Per-entry constant of Core's CTxMemPool::DynamicMemoryUsage() for a
+ * transaction alone in its cluster: MallocUsage(sizeof(CTxMemPoolEntry) +
+ * 9 pointers) for the mapTx node, plus the TxGraph Entry, plus the
+ * SingletonClusterImpl (MallocUsage(48) + the unique_ptr slot = 72), plus one
+ * m_main_chunkindex node (64). Measured against Core 31.1 regtest: every
+ * single-transaction pool equals 632 + RecursiveDynamicUsage(tx) +
+ * 64 * inputs + the txns_randomized vector.
+ */
+export const CORE_SINGLETON_ENTRY_USAGE = 632;
+/** SingletonClusterImpl: MallocUsage(sizeof = 48) + sizeof(unique_ptr). */
+const CORE_SINGLETON_CLUSTER_USAGE = 72;
+/** GenericClusterImpl: MallocUsage(sizeof = 104) + sizeof(unique_ptr). */
+const CORE_GENERIC_CLUSTER_USAGE = 136;
+/** One std::set node of TxGraph's m_main_chunkindex (per chunk). */
+const CORE_CHUNKINDEX_NODE_USAGE = 64;
+/** One indirectmap node of mapNextTx (per spent outpoint). */
+const CORE_MAPNEXTTX_NODE_USAGE = 64;
+/** sizeof(std::pair<Wtxid, TxHandle>), the txns_randomized element. */
+const CORE_TXNS_RANDOMIZED_ELEM = 40;
+
+/**
+ * Core's per-transaction share of `CTxMemPool::DynamicMemoryUsage()`
+ * (txmempool.cpp:778) when the transaction is a singleton cluster:
+ * `RecursiveDynamicUsage(tx)` (core_memusage.h — the vin / vout vectors,
+ * scripts longer than 36 bytes, witness stacks and items), its mapNextTx
+ * nodes, and CORE_SINGLETON_ENTRY_USAGE. Multi-transaction clusters are
+ * corrected for in rebuildClusterCache() (clusterUsageCorrection).
+ */
+export function coreEntryUsage(tx: Transaction): number {
+  let usage =
+    CORE_SINGLETON_ENTRY_USAGE +
+    mallocUsage(CORE_SIZEOF_TXIN * tx.inputs.length) +
+    mallocUsage(CORE_SIZEOF_TXOUT * tx.outputs.length);
+  for (const input of tx.inputs) {
+    usage += scriptDynamicUsage(input.scriptSig.length);
+    // CScriptWitness::stack is a std::vector<std::vector<unsigned char>>.
+    usage += mallocUsage(24 * input.witness.length);
+    for (const item of input.witness) usage += mallocUsage(item.length);
+    usage += CORE_MAPNEXTTX_NODE_USAGE;
+  }
+  for (const output of tx.outputs) {
+    usage += scriptDynamicUsage(output.scriptPubKey.length);
+  }
+  return usage;
+}
+
+/**
+ * TxGraph memory of one cluster of `txCount` transactions with `chunkCount`
+ * chunks (txgraph.cpp GetMainMemoryUsage / *ClusterImpl::TotalMemoryUsage),
+ * less what CORE_SINGLETON_ENTRY_USAGE already counts per transaction. Zero
+ * for a singleton. A GenericClusterImpl holds m_mapping and m_linearization
+ * (uint32 each) and a DepGraph entry of 32 bytes per transaction, compacted
+ * to size after a merge.
+ */
+export function coreClusterUsageCorrection(txCount: number, chunkCount: number): number {
+  const perTxInBasis = CORE_SINGLETON_CLUSTER_USAGE + CORE_CHUNKINDEX_NODE_USAGE;
+  if (txCount <= 1) return 0;
+  const cluster =
+    CORE_GENERIC_CLUSTER_USAGE +
+    2 * mallocUsage(4 * txCount) +
+    mallocUsage(32 * txCount);
+  return cluster + CORE_CHUNKINDEX_NODE_USAGE * chunkCount - perTxInBasis * txCount;
+}
+
+/**
+ * The old JS-heap estimate (estimateEntryUsage) is kept only as an OOM
+ * backstop: the pool is also trimmed if it exceeds this multiple of
+ * -maxmempool. It must never bind before Core's limit does, so the factor is
+ * above the largest ratio estimateEntryUsage / coreEntryUsage can reach. Per
+ * element the estimate charges at most: an output 184 + script bytes against
+ * Core's 48 for a script of up to 36 bytes (4.58x; a longer script adds about
+ * the same bytes to both); an input without witness 552 + scriptSig against
+ * Core's 176 (3.3x); a witness item 96 + bytes against Core's 24-byte stack
+ * slot plus MallocUsage(bytes) (4x when empty); the entry itself 792 against
+ * 632. So the ratio stays below 4.6 (a 1-in/100-out P2WSH fan-out is 3.9x:
+ * 23,595 against Core's 6,024).
+ */
+const HEAP_BACKSTOP_FACTOR = 5;
+
+/**
+ * Upper bound on how much one addition that joins an existing cluster can
+ * raise coreClusterUsageCorrection (two singletons -> one pair is +136; a
+ * larger cluster grows by its vector rounding and at most one chunk).
+ */
+const CLUSTER_JOIN_SLACK = 256;
+
+/**
  * Default mempool expiry in seconds (336 hours = 14 days).
  * kernel/mempool_options.h: DEFAULT_MEMPOOL_EXPIRY_HOURS = 336.
  * Reference: bitcoin-core/src/txmempool.cpp:811-827 (Expire)
@@ -1504,12 +1613,38 @@ export class Mempool {
   private currentSize: number;
 
   /**
-   * Current estimated JS-heap usage of all entries (bytes).
-   * Analogue of Core's CTxMemPool::DynamicMemoryUsage() (txmempool.cpp:778).
-   * `maxSize` bounds THIS value (like Core's -maxmempool), not raw vsize —
-   * see estimateEntryUsage() and BUG-hotbuns-memleak-2026-07-20 (S3).
+   * Sum of coreEntryUsage() over all entries: Core's
+   * CTxMemPool::DynamicMemoryUsage() (txmempool.cpp:778) on a
+   * singleton-cluster basis. dynamicMemoryUsage() adds the txns_randomized
+   * vector and the multi-transaction cluster correction; `maxSize` bounds that
+   * total, like Core's -maxmempool.
    */
   private currentUsage: number;
+
+  /**
+   * Sum of estimateEntryUsage() (the JS-heap estimate) over all entries; only
+   * used for the HEAP_BACKSTOP_FACTOR OOM guard (BUG-hotbuns-memleak S3).
+   */
+  private heapUsage = 0;
+
+  /**
+   * Emulation of Core's `txns_randomized` vector (size and libstdc++
+   * capacity), whose allocation is part of DynamicMemoryUsage(): it grows by
+   * doubling on emplace_back, shrinks to fit when under half full, and keeps
+   * its capacity when cleared (txmempool.cpp addNewTransaction /
+   * removeUnchecked). An emptied pool therefore reports 64 or more, not 0.
+   */
+  private txnsRandomizedSize = 0;
+  private txnsRandomizedCapacity = 0;
+
+  /**
+   * TxGraph usage of multi-transaction clusters beyond the singleton basis,
+   * recomputed in rebuildClusterCache(). `clusterJoinsSinceRebuild` counts
+   * additions that joined an existing cluster since then (the correction is
+   * stale by at most CLUSTER_JOIN_SLACK each).
+   */
+  private clusterUsageCorrection = 0;
+  private clusterJoinsSinceRebuild = 0;
 
   /** UTXO manager for checking confirmed outputs. */
   private utxo: UTXOManager;
@@ -1608,6 +1743,11 @@ export class Mempool {
     this.maxSize = maxSize;
     this.currentSize = 0;
     this.currentUsage = 0;
+    this.heapUsage = 0;
+    this.txnsRandomizedSize = 0;
+    this.txnsRandomizedCapacity = 0;
+    this.clusterUsageCorrection = 0;
+    this.clusterJoinsSinceRebuild = 0;
     this.utxo = utxo;
     this.params = params;
     this.minFeeRate = DEFAULT_MIN_FEE_RATE;
@@ -2870,7 +3010,7 @@ export class Mempool {
     this.entries.set(txidHex, entry);
     this.indexWtxid(txidHex, tx);
     this.currentSize += vsize;
-    this.currentUsage += estimateEntryUsage(tx, vsize);
+    this.trackEntryAdded(tx, vsize);
 
     // Update parent entries' spentBy and descendant stats
     for (const parentTxidHex of parentTxids) {
@@ -2899,7 +3039,7 @@ export class Mempool {
     // MaybeUpdateMempoolForReorg -> LimitMempoolSize).
     if (
       !options?.bypassLimits &&
-      (this.currentUsage > this.maxSize || this.currentSize > this.maxSize)
+      this.mayBeOverLimit()
     ) {
       this.evict();
     }
@@ -2994,7 +3134,7 @@ export class Mempool {
     this.unbroadcastTxids.delete(txidHex);
     this.unindexWtxid(txidHex);
     this.currentSize -= entry.vsize;
-    this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
+    this.trackEntryRemoved(entry.tx, entry.vsize);
 
     // Mark cluster cache as dirty
     this.clusterCacheDirty = true;
@@ -3050,7 +3190,7 @@ export class Mempool {
         this.unbroadcastTxids.delete(txidHex);
         this.unindexWtxid(txidHex);
         this.currentSize -= entry.vsize;
-        this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
+        this.trackEntryRemoved(entry.tx, entry.vsize);
       }
     }
 
@@ -3226,7 +3366,7 @@ export class Mempool {
     }
     const trimmed = this.updateTransactionsFromBlock(readded);
     const removedForReorg = await this.removeForReorg();
-    if (this.currentUsage > this.maxSize || this.currentSize > this.maxSize) {
+    if (this.mayBeOverLimit()) {
       this.evict();
     }
     console.log(
@@ -3638,7 +3778,7 @@ export class Mempool {
       this.entries.set(txidHex, entry);
       this.indexWtxid(txidHex, tx);
       this.currentSize += vsize;
-      this.currentUsage += estimateEntryUsage(tx, vsize);
+      this.trackEntryAdded(tx, vsize);
 
       // Index spent outpoints so a later RBF / double-spend would
       // surface this entry as a conflict (defence-in-depth).
@@ -4404,7 +4544,7 @@ export class Mempool {
     this.unbroadcastTxids.delete(txidHex);
     this.unindexWtxid(txidHex);
     this.currentSize -= entry.vsize;
-    this.currentUsage -= estimateEntryUsage(entry.tx, entry.vsize);
+    this.trackEntryRemoved(entry.tx, entry.vsize);
   }
 
   /**
@@ -4559,8 +4699,9 @@ export class Mempool {
    * @returns Minimum fee rate in sat/kvB.
    */
   getMinFee(): number {
+    // Core returns CFeeRate(llround(rollingMinimumFeeRate)): whole sat/kvB.
     if (!this.blockSinceLastRollingFeeBump || this.rollingMinimumFeeRate === 0) {
-      return this.rollingMinimumFeeRate;
+      return Math.round(this.rollingMinimumFeeRate);
     }
 
     const now = nowSeconds();
@@ -4570,9 +4711,10 @@ export class Mempool {
       let halflife = ROLLING_FEE_HALFLIFE;
       // Core compares DynamicMemoryUsage() (real allocation), not vsize,
       // against sizelimit here — txmempool.cpp:836-841.
-      if (this.currentUsage < this.maxSize / 4) {
+      const usage = this.approxDynamicMemoryUsage();
+      if (usage < this.maxSize / 4) {
         halflife /= 4;
-      } else if (this.currentUsage < this.maxSize / 2) {
+      } else if (usage < this.maxSize / 2) {
         halflife /= 2;
       }
 
@@ -4593,8 +4735,8 @@ export class Mempool {
 
     // Return the greater of the rolling rate and the incremental relay fee.
     // Reference: txmempool.cpp:850
-    const incrementalRelayKvB = this.incrementalRelayFee * 1000;
-    return Math.max(this.rollingMinimumFeeRate, incrementalRelayKvB);
+    const incrementalRelayKvB = Math.round(this.incrementalRelayFee * 1000);
+    return Math.max(Math.round(this.rollingMinimumFeeRate), incrementalRelayKvB);
   }
 
   /**
@@ -4619,11 +4761,9 @@ export class Mempool {
   private evict(): void {
     this.rebuildClusterCache();
 
-    let nTxnRemoved = 0;
-    let maxFeeRateRemovedKvB = 0;
 
     while (
-      (this.currentUsage > this.maxSize || this.currentSize > this.maxSize) &&
+      this.isOverLimit() &&
       this.entries.size > 0
     ) {
       // Find the worst chunk across all clusters.
@@ -4651,21 +4791,19 @@ export class Mempool {
       if (worstChunkTxids.length === 0) break;
 
       // Compute the evicted fee rate in sat/kvB and add incrementalRelayFee.
-      // Reference: txmempool.cpp:870-878
-      // removed = chunk_feerate_sat_per_kvB + incrementalRelayFee_sat_per_kvB
+      // Reference: txmempool.cpp TrimToSize: `CFeeRate removed{fee, size};
+      // removed += incremental_relay_feerate;` CFeeRate::operator+= adds the
+      // two GetFeePerK() values, i.e. floor(fee * 1000 / vsize) (EvaluateFeeDown)
+      // plus the incremental fee, so the rolling minimum is a whole number of
+      // sat/kvB (policy/feerate.h).
       const chunkFeeRateKvB =
         worstChunkTotalVsize > 0
-          ? (Number(worstChunkTotalFee) / worstChunkTotalVsize) * 1000
+          ? Math.floor((Number(worstChunkTotalFee) * 1000) / worstChunkTotalVsize)
           : 0;
-      const incrementalRelayKvB = this.incrementalRelayFee * 1000;
+      const incrementalRelayKvB = Math.round(this.incrementalRelayFee * 1000);
       const removedKvB = chunkFeeRateKvB + incrementalRelayKvB;
 
       this.trackPackageRemoved(removedKvB);
-      if (removedKvB > maxFeeRateRemovedKvB) {
-        maxFeeRateRemovedKvB = removedKvB;
-      }
-
-      nTxnRemoved += worstChunkTxids.length;
 
       // Remove all transactions in the chunk.
       // removeTransactionInternal handles descendant stats + index cleanup.
@@ -4681,14 +4819,11 @@ export class Mempool {
       this.rebuildClusterCache();
     }
 
-    // Sync the admission minFeeRate from the rolling rate (sat/vB).
-    // This ensures that new transactions must pay at least the rate of what
-    // was just evicted.
-    if (maxFeeRateRemovedKvB > 0) {
-      // Convert sat/kvB → sat/vB for the admission gate comparison.
-      const newMinSatPerVB = maxFeeRateRemovedKvB / 1000;
-      this.minFeeRate = Math.max(this.minFeeRate, newMinSatPerVB);
-    }
+    // The evicted feerate lives only in the rolling minimum
+    // (trackPackageRemoved), which admission reads through getMinFee() and
+    // which decays. Core never raises min_relay_feerate (-minrelaytxfee) here;
+    // copying the rolling rate into this.minFeeRate pinned mempoolminfee at
+    // the eviction rate forever.
   }
 
   /**
@@ -4702,7 +4837,7 @@ export class Mempool {
       bytes: this.currentSize,
       // Estimated real heap retention — the value `maxmempool` bounds
       // (Core getmempoolinfo "usage" = DynamicMemoryUsage()).
-      usage: this.currentUsage,
+      usage: this.dynamicMemoryUsage(),
       maxmempool: this.maxSize,
       minFeeRate: dynamicMinSatPerVB,
     };
@@ -4775,6 +4910,11 @@ export class Mempool {
     this.txidToWtxid.clear();
     this.currentSize = 0;
     this.currentUsage = 0;
+    this.heapUsage = 0;
+    this.txnsRandomizedSize = 0;
+    this.txnsRandomizedCapacity = 0;
+    this.clusterUsageCorrection = 0;
+    this.clusterJoinsSinceRebuild = 0;
     this.minFeeRate = DEFAULT_MIN_FEE_RATE;
     this.clusters.clear();
     this.clusterCache.clear();
@@ -4992,11 +5132,14 @@ export class Mempool {
     this.clusters.makeSet(txidHex);
 
     // Union with all parent clusters
+    let joined = false;
     for (const parentTxidHex of parentTxids) {
       if (this.entries.has(parentTxidHex)) {
         this.clusters.union(txidHex, parentTxidHex);
+        joined = true;
       }
     }
+    if (joined) this.clusterJoinsSinceRebuild++;
 
     // Mark cache as dirty since cluster structure changed
     this.clusterCacheDirty = true;
@@ -5010,6 +5153,7 @@ export class Mempool {
     if (!this.clusterCacheDirty) return;
 
     this.clusterCache.clear();
+    let usageCorrection = 0;
 
     // Group transactions by cluster ID
     const clusterTxids = new Map<string, Set<string>>();
@@ -5042,6 +5186,7 @@ export class Mempool {
       };
 
       this.clusterCache.set(clusterId, cluster);
+      usageCorrection += coreClusterUsageCorrection(txids.size, linearization.chunks.length);
 
       // Update mining scores for all transactions in this cluster
       for (let chunkIdx = 0; chunkIdx < linearization.chunks.length; chunkIdx++) {
@@ -5056,7 +5201,75 @@ export class Mempool {
       }
     }
 
+    this.clusterUsageCorrection = usageCorrection;
+    this.clusterJoinsSinceRebuild = 0;
     this.clusterCacheDirty = false;
+  }
+
+  /** Account for an entry entering the pool (Core addNewTransaction). */
+  private trackEntryAdded(tx: Transaction, vsize: number): void {
+    this.currentUsage += coreEntryUsage(tx);
+    this.heapUsage += estimateEntryUsage(tx, vsize);
+    // txns_randomized.emplace_back: libstdc++ doubles a full vector.
+    if (this.txnsRandomizedSize === this.txnsRandomizedCapacity) {
+      this.txnsRandomizedCapacity = Math.max(1, this.txnsRandomizedCapacity * 2);
+    }
+    this.txnsRandomizedSize++;
+  }
+
+  /** Account for an entry leaving the pool (Core removeUnchecked). */
+  private trackEntryRemoved(tx: Transaction, vsize: number): void {
+    this.currentUsage -= coreEntryUsage(tx);
+    this.heapUsage -= estimateEntryUsage(tx, vsize);
+    if (this.txnsRandomizedSize > 1) {
+      this.txnsRandomizedSize--;
+      if (this.txnsRandomizedSize * 2 < this.txnsRandomizedCapacity) {
+        this.txnsRandomizedCapacity = this.txnsRandomizedSize; // shrink_to_fit
+      }
+    } else {
+      this.txnsRandomizedSize = 0; // clear() keeps the capacity
+    }
+  }
+
+  /**
+   * Core's CTxMemPool::DynamicMemoryUsage() (txmempool.cpp:778). Rebuilds the
+   * cluster cache when stale, so the TxGraph term is exact.
+   */
+  dynamicMemoryUsage(): number {
+    this.rebuildClusterCache();
+    return this.approxDynamicMemoryUsage();
+  }
+
+  /** DynamicMemoryUsage() with the cluster correction as of the last rebuild. */
+  private approxDynamicMemoryUsage(): number {
+    return (
+      this.currentUsage +
+      mallocUsage(CORE_TXNS_RANDOMIZED_ELEM * this.txnsRandomizedCapacity) +
+      this.clusterUsageCorrection
+    );
+  }
+
+  /** Exact limit test (Core TrimToSize's loop condition), plus the heap backstop. */
+  private isOverLimit(): boolean {
+    return (
+      this.dynamicMemoryUsage() > this.maxSize ||
+      this.currentSize > this.maxSize ||
+      this.heapUsage > this.maxSize * HEAP_BACKSTOP_FACTOR
+    );
+  }
+
+  /**
+   * Cheap pre-check before evict(): true whenever isOverLimit() could be true.
+   * Avoids re-linearizing every cluster on each admission; joining an existing
+   * cluster can raise the correction by less than CLUSTER_JOIN_SLACK.
+   */
+  private mayBeOverLimit(): boolean {
+    const slack = this.clusterCacheDirty ? CLUSTER_JOIN_SLACK * this.clusterJoinsSinceRebuild : 0;
+    return (
+      this.approxDynamicMemoryUsage() + slack > this.maxSize ||
+      this.currentSize > this.maxSize ||
+      this.heapUsage > this.maxSize * HEAP_BACKSTOP_FACTOR
+    );
   }
 
   /**
