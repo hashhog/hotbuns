@@ -2587,6 +2587,8 @@ describe("RPCServer", () => {
     function buildMinimalBlockHex(opts: {
       badMerkle?: boolean;
       cbHeight?: number;
+      prevBlock?: Buffer;
+      failPow?: boolean;
     } = {}): string {
       // Minimal coinbase transaction using the correct Transaction field names.
       // Coinbase: prevOut.txid must be all zeros (not 0xff) for isCoinbase() to pass.
@@ -2622,7 +2624,7 @@ describe("RPCServer", () => {
       // reaches injectBlock.
       const header: import("../validation/block.js").BlockHeader = {
         version: 4,
-        prevBlock: Buffer.alloc(32, 0), // matches MockHeaderSync.getHeader returning an entry
+        prevBlock: opts.prevBlock ?? Buffer.alloc(32, 0), // matches MockHeaderSync.getHeader returning an entry
         merkleRoot: opts.badMerkle ? Buffer.alloc(32, 0xab) : correctMerkle,
         timestamp: 1296688602,
         bits: REGTEST.powLimitBits,
@@ -2631,7 +2633,7 @@ describe("RPCServer", () => {
       // Mine the nonce deterministically (lowest nonce whose hash <= REGTEST.powLimit)
       // instead of hard-coding one: any header-field change would otherwise
       // silently turn every test here into a "high-hash" rejection.
-      while (!checkProofOfWork(getBlockHash(header), header.bits, REGTEST)) {
+      while (checkProofOfWork(getBlockHash(header), header.bits, REGTEST) === !!opts.failPow) {
         header.nonce++;
       }
 
@@ -2735,6 +2737,90 @@ describe("RPCServer", () => {
       }
     });
 
+    // Core ProcessNewBlock: CheckBlock (context-free) runs, then
+    // AcceptBlockHeader rejects a block whose parent is not in the block index
+    // with "prev-blk-not-found". Core regtest row chain/submit/prev-not-found:
+    // a block on parent 11..11 whose coinbase encodes height 1, where hotbuns
+    // answered bad-cb-height (BIP-34 checked against best header + 1).
+    describe("submitblock with an unknown parent", () => {
+      const UNKNOWN_PARENT = Buffer.alloc(32, 0x11);
+
+      async function submitUnknownParent(opts: { cbHeight?: number; badMerkle?: boolean; failPow?: boolean }) {
+        const port = getTestPort();
+        let injectCalled = false;
+        const mockBlockSync = {
+          injectBlock: async (_block: any) => {
+            injectCalled = true;
+            return "inconclusive";
+          },
+        };
+        const s = makeServerWithBlockSync(port, mockBlockSync);
+        mockHeaderSync.setUnknown(UNKNOWN_PARENT);
+        const hex = buildMinimalBlockHex({ ...opts, prevBlock: UNKNOWN_PARENT });
+        // A real HeaderSync knows neither the parent nor the block itself.
+        mockHeaderSync.setUnknown(hash256(Buffer.from(hex, "hex").subarray(0, 80)));
+        s.start();
+        try {
+          const result = await rpcRequest(port, "submitblock", [hex]);
+          return { result, injectCalled };
+        } finally {
+          s.stop();
+          mockHeaderSync.nextTargetOverride = null;
+        }
+      }
+
+      it("prev-not-found: coinbase height 1 against best header 100 answers prev-blk-not-found, not bad-cb-height", async () => {
+        const { result, injectCalled } = await submitUnknownParent({ cbHeight: 1 });
+        expect(result.error).toBeUndefined();
+        expect(result.result).toBe("prev-blk-not-found");
+        expect(injectCalled).toBe(false);
+      });
+
+      it("prev-not-found: a coinbase at best header + 1 also answers prev-blk-not-found, not inconclusive", async () => {
+        const { result, injectCalled } = await submitUnknownParent({ cbHeight: 101 });
+        expect(result.result).toBe("prev-blk-not-found");
+        expect(injectCalled).toBe(false);
+      });
+
+      it("prev-not-found: CheckBlock still runs first, so a bad merkle root answers bad-txnmrklroot", async () => {
+        const { result, injectCalled } = await submitUnknownParent({ cbHeight: 1, badMerkle: true });
+        expect(result.result).toBe("bad-txnmrklroot");
+        expect(injectCalled).toBe(false);
+      });
+
+      it("prev-not-found: the genesis block (no parent, own header indexed) still answers duplicate", async () => {
+        // Core AcceptBlockHeader skips the duplicate and parent lookups for
+        // hashGenesisBlock; AcceptBlock then finds the data already stored and
+        // submitblock answers "duplicate".
+        const port = getTestPort();
+        let injectCalled = false;
+        const mockBlockSync = {
+          injectBlock: async (_block: any) => {
+            injectCalled = true;
+            return "duplicate";
+          },
+        };
+        const s = makeServerWithBlockSync(port, mockBlockSync);
+        mockHeaderSync.setUnknown(Buffer.alloc(32, 0)); // genesis' prevBlock
+        s.start();
+        try {
+          const result = await rpcRequest(port, "submitblock", [REGTEST.genesisBlock.toString("hex")]);
+          expect(result.error).toBeUndefined();
+          expect(result.result).toBe("duplicate");
+          expect(injectCalled).toBe(true);
+        } finally {
+          s.stop();
+          mockHeaderSync.nextTargetOverride = null;
+        }
+      });
+
+      it("prev-not-found: proof of work against the block's own nBits runs first (high-hash)", async () => {
+        const { result, injectCalled } = await submitUnknownParent({ cbHeight: 1, failPow: true });
+        expect(result.result).toBe("high-hash");
+        expect(injectCalled).toBe(false);
+      });
+    });
+
     it("non-hex submitblock param returns JSON-RPC error, not BIP-22 string", async () => {
       const result = await rpcRequest(testPort, "submitblock", [12345]);
       expect(result.error).toBeDefined();
@@ -2788,12 +2874,12 @@ describe("RPCServer", () => {
       }
     });
 
-    // Negative companion: confirms that the active-tip fallback still
-    // fires when the parent is genuinely unknown (orphan path).  In that
-    // case, the block forwards to injectBlock which returns
-    // "inconclusive" — exercising the else branch of the height
-    // derivation introduced by the Pattern X fix.
-    it("submitblock orphan (parent unknown) falls back to active-tip+1", async () => {
+    // Negative companion: when the parent is genuinely unknown (orphan
+    // path) there is no height to check BIP-34 against. Core runs only the
+    // context-free CheckBlock and answers prev-blk-not-found from
+    // AcceptBlockHeader; the block never reaches injectBlock. (This test
+    // used to assert the active-tip + 1 fallback and "inconclusive".)
+    it("submitblock orphan (parent unknown) answers prev-blk-not-found without injecting", async () => {
       const port = getTestPort();
       let injectCalled = false;
       const mockBlockSync = {
@@ -2807,13 +2893,15 @@ describe("RPCServer", () => {
       // returns undefined and we exercise the active-tip fallback.
       mockHeaderSync.setUnknown(Buffer.alloc(32, 0));
       mockHeaderSync.bestHeaderHeightOverride = 100;
+      const hex = buildMinimalBlockHex({ cbHeight: 101 });
+      // ...and the block's own header is not indexed either.
+      mockHeaderSync.setUnknown(hash256(Buffer.from(hex, "hex").subarray(0, 80)));
       s.start();
       try {
-        const hex = buildMinimalBlockHex({ cbHeight: 101 });
         const result = await rpcRequest(port, "submitblock", [hex]);
         expect(result.error).toBeUndefined();
-        expect(result.result).toBe("inconclusive");
-        expect(injectCalled).toBe(true);
+        expect(result.result).toBe("prev-blk-not-found");
+        expect(injectCalled).toBe(false);
       } finally {
         s.stop();
         mockHeaderSync.nextTargetOverride = null;

@@ -9413,12 +9413,24 @@ export class RPCServer {
         return "time-too-new";
       }
     } else {
-      // Parent unknown — can't check PoW target; fall through to injectBlock
-      // which will return "inconclusive" for orphan blocks.
+      // Parent unknown. Core's ProcessNewBlock runs the context-free CheckBlock
+      // (CheckBlockHeader's proof of work against the block's own nBits, size,
+      // coinbase, merkle root, CheckTransaction, legacy sigops) and then
+      // AcceptBlock -> AcceptBlockHeader rejects the block with
+      // "prev-blk-not-found" (BLOCK_MISSING_PREV, validation.cpp
+      // AcceptBlockHeader); submitblock reports that reason. No check that
+      // needs the parent (BIP-34 height, witness commitment, nVersion floor,
+      // difficulty, MTP) can run, so validateBlock must not guess a height:
+      // the old best-header + 1 guess answered bad-cb-height for any coinbase
+      // that encoded another height.
+      if (!checkProofOfWork(blockHash, block.header.bits, this.params)) {
+        return "high-hash";
+      }
     }
 
-    // Stateless block structure validation (merkle root, witness commitment,
-    // weight, BIP34 height encoding).  Runs even if parent is unknown.
+    // Block structure validation (merkle root, witness commitment, weight,
+    // BIP34 height encoding). With an unknown parent only the context-free
+    // part runs (Core CheckBlock), then the block answers prev-blk-not-found.
     //
     // BIP-34 height MUST be derived from the BLOCK'S PARENT in the block
     // index, not from the active chain tip — Core
@@ -9431,18 +9443,9 @@ export class RPCServer {
     // 111 but the active-tip-relative check expects 113.  This is the
     // Pattern X bug observed in
     // CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md.
-    //
-    // Fall-back order: parent in index → active-tip + 1 → 0 (orphan path
-    // where parent is unknown; injectBlock returns "inconclusive" anyway,
-    // so a benign approxHeight that skips BIP-34 is fine).
-    let approxHeight: number;
-    if (parentEntry) {
-      approxHeight = parentEntry.height + 1;
-    } else {
-      const bestHeader = this.headerSync.getBestHeader();
-      approxHeight = bestHeader ? bestHeader.height + 1 : 0;
-    }
-    const structCheck = validateBlock(block, approxHeight, this.params);
+    const structCheck = parentEntry
+      ? validateBlock(block, parentEntry.height + 1, this.params)
+      : validateBlock(block, 0, this.params, { contextual: false });
     if (!structCheck.valid) {
       const reason = structCheck.error ?? "rejected";
       return bip22Result(reason);
@@ -9469,6 +9472,18 @@ export class RPCServer {
     }
     if (legacyBlockSigOpCost > MAX_BLOCK_SIGOPS_COST) {
       return "bad-blk-sigops";
+    }
+
+    // CheckBlock passed for a block whose parent is not in the block index:
+    // Core AcceptBlockHeader answers prev-blk-not-found (see above). The
+    // block is not stored, as before (injectBlock could not accept its header
+    // either and answered "inconclusive"). The one block with no parent whose
+    // header is already indexed is genesis: Core's AcceptBlockHeader skips both
+    // the duplicate and the parent lookup for it and AcceptBlock reports it as
+    // already had, so submitblock answers "duplicate" — leave that to
+    // injectBlock, which finds the stored block.
+    if (!parentEntry && !this.headerSync.getHeader(blockHash)) {
+      return "prev-blk-not-found";
     }
 
     // If we have a BlockSync instance, inject the block directly.
