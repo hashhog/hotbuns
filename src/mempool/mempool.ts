@@ -747,10 +747,17 @@ export function coreClusterUsageCorrection(txCount: number, chunkCount: number):
 /**
  * The old JS-heap estimate (estimateEntryUsage) is kept only as an OOM
  * backstop: the pool is also trimmed if it exceeds this multiple of
- * -maxmempool. hotbuns' real heap per entry runs ~1.6-2x Core's accounting,
- * so the backstop never binds before Core's limit does.
+ * -maxmempool. It must never bind before Core's limit does, so the factor is
+ * above the largest ratio estimateEntryUsage / coreEntryUsage can reach. Per
+ * element the estimate charges at most: an output 184 + script bytes against
+ * Core's 48 for a script of up to 36 bytes (4.58x; a longer script adds about
+ * the same bytes to both); an input without witness 552 + scriptSig against
+ * Core's 176 (3.3x); a witness item 96 + bytes against Core's 24-byte stack
+ * slot plus MallocUsage(bytes) (4x when empty); the entry itself 792 against
+ * 632. So the ratio stays below 4.6 (a 1-in/100-out P2WSH fan-out is 3.9x:
+ * 23,595 against Core's 6,024).
  */
-const HEAP_BACKSTOP_FACTOR = 3;
+const HEAP_BACKSTOP_FACTOR = 5;
 
 /**
  * Upper bound on how much one addition that joins an existing cluster can

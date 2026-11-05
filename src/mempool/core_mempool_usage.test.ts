@@ -6,8 +6,9 @@
  * the same transaction shapes (P2WSH(OP_DROP OP_DROP OP_TRUE) spends whose
  * witness is two 80-byte items and the 3-byte script), each case on a freshly
  * started bitcoind (-persistmempool=0, funding confirmed before a restart) so
- * its pool starts empty like a new Mempool. The probe script and its output
- * are in the pull request description.
+ * its pool starts empty like a new Mempool. Probe: tools/core_mempool_usage_probe.py;
+ * its output, recorded 2026-11-05 against Core 31.1:
+ * tools/core_mempool_usage_probe.recorded.jsonl ("part": "shapes").
  *
  * Core regtest rows this covers: warden_invalidated_submit usage-* and the
  * pressure / pressure-decay contents, where hotbuns' old JS-heap estimate
@@ -189,6 +190,18 @@ describe("mempool usage matches Core 31.1 DynamicMemoryUsage", () => {
     expect(mempool.getInfo().size).toBe(2);
     // The first transaction pays the least (10,000 sat); it is the one evicted.
     expect(mempool.hasTransaction(Buffer.from(ids[0], "hex"))).toBe(false);
+  });
+
+  test("a 1-in/100-out fan-out at -maxmempool equal to Core's usage (6024) is kept", async () => {
+    // Core keeps it: TrimToSize trims only while DynamicMemoryUsage() > the
+    // limit. The JS-heap estimate of this tx is 3.9x Core's figure, so the
+    // OOM backstop must not trim it either.
+    mempool = new Mempool(new UTXOManager(db), REGTEST, 6024);
+    mempool.setTipHeight(200);
+    const outputs = Array.from({ length: 100 }, () => ({ value: 990_000n, scriptPubKey: DROP_P2WSH }));
+    await accept(dropSpend([await fund()], outputs));
+    expect(mempool.getInfo().size).toBe(1);
+    expect(mempool.getInfo().usage).toBe(6024);
   });
 
   test("eviction sets mempoolminfee to Core's whole-sat/kvB removed feerate, which then decays", async () => {
