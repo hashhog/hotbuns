@@ -2858,6 +2858,9 @@ async function startNode(config: NodeConfig): Promise<void> {
     // confirmed-spend path of gettxspendingprevout and getindexinfo's
     // "txospenderindex" entry.
     txoSpenderIndex,
+    // Core's -txindex (default off). Gates getrawtransaction without a
+    // blockhash and the getindexinfo "txindex" entry.
+    txindex: mergedConfig.txindex,
   };
 
   const rpcServer = new RPCServer(rpcConfig, rpcDeps);
