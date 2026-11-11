@@ -14566,10 +14566,47 @@ export class RPCServer {
       }
     }
 
+    // Core: query_options.include_immature_coinbase (bool, default false) is
+    // type-checked with RPCTypeCheckObj (wallet/rpc/coins.cpp listunspent).
+    // RPCTypeCheckObj lets an explicit null through, but the key exists, so
+    // get_bool() throws UniValue::type_error, which rpc/server.cpp:512 also
+    // reports as RPC_TYPE_ERROR (without the "for field" part).
+    let includeImmatureCoinbase = false;
+    const queryOptions = params[4];
+    if (queryOptions !== undefined && queryOptions !== null && typeof queryOptions === "object") {
+      const opts = queryOptions as Record<string, unknown>;
+      const v = opts.include_immature_coinbase;
+      if (v === null && "include_immature_coinbase" in opts) {
+        throw this.rpcError(
+          RPCErrorCodes.TYPE_ERROR,
+          "JSON value of type null is not of expected type bool"
+        );
+      }
+      if (v !== undefined) {
+        if (typeof v !== "boolean") {
+          throw this.rpcError(
+            RPCErrorCodes.TYPE_ERROR,
+            `JSON value of type ${jsonTypeName(v)} for field include_immature_coinbase is not of expected type bool`
+          );
+        }
+        includeImmatureCoinbase = v;
+      }
+    }
+
     const result: Array<Record<string, unknown>> = [];
     for (const utxo of wallet.getUTXOs()) {
       if (utxo.confirmations < minConf || utxo.confirmations > maxConf) continue;
       if (addressFilter && !addressFilter.has(utxo.address)) continue;
+      // Core AvailableCoins (wallet/spend.cpp) skips a coinbase while it has
+      // fewer than COINBASE_MATURITY + 1 confirmations (IsTxImmatureCoinBase)
+      // unless include_immature_coinbase is set.
+      if (
+        utxo.isCoinbase &&
+        utxo.confirmations < COINBASE_SPENDABLE_DEPTH &&
+        !includeImmatureCoinbase
+      ) {
+        continue;
+      }
 
       const key = wallet.getKey(utxo.address);
       // Reconstruct scriptPubKey from address type + hash. Works for both
@@ -14582,7 +14619,11 @@ export class RPCServer {
         scriptPubKeyHex = "";
       }
 
-      const spendable = wallet.isUTXOSpendable(utxo);
+      // Core: "spendable" is deprecated and always true for a listed coin
+      // (coins.cpp: "Any coins we list are always spendable"). A confirmed
+      // coin is safe, including an immature coinbase listed on request.
+      const spendable = true;
+      const safe = utxo.confirmations >= 1;
       // solvable: true when we know the key, or the watch descriptor carries
       // key material; false for bare addr() watch imports (Core: descriptor
       // ISMINE entries list spendable:true, solvable:false for addr()).
@@ -14603,7 +14644,7 @@ export class RPCServer {
         solvable,
         desc: desc ?? "",
         parent_descs: parentDesc ? [parentDesc] : [],
-        safe: spendable,
+        safe,
       });
     }
 
