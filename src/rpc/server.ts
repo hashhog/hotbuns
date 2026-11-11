@@ -11835,13 +11835,8 @@ export class RPCServer {
   private async getWalletInfo(): Promise<Record<string, unknown>> {
     const wallet = this.getCurrentWallet();
 
-    // Core getwalletinfo reports the maturity-aware split (GetBalance()):
-    // balance = trusted spendable (== getbalance), immature_balance = immature
-    // coinbase, unconfirmed_balance = untrusted pending. The raw getBalance()
-    // sums every credited UTXO as "confirmed", which over-reports right after
-    // mining (every fresh coinbase is immature) — use getBalances() instead.
-    const balances = wallet.getBalances();
-
+    // Core v31 getwalletinfo has no balance fields (wallet/rpc/wallet.cpp);
+    // balances are reported by getbalances / getbalance.
     // Core: private_keys_enabled = !WALLET_FLAG_DISABLE_PRIVATE_KEYS
     // (wallet/rpc/wallet.cpp:50,98); a dpk wallet has no keypool.
     const privateKeysEnabled = !wallet.isPrivateKeysDisabled();
@@ -11855,9 +11850,6 @@ export class RPCServer {
       walletname: this.getCurrentWalletName(),
       walletversion: 169900,
       format: "sqlite",
-      balance: Number(balances.trusted) / 100_000_000,
-      unconfirmed_balance: Number(balances.untrustedPending) / 100_000_000,
-      immature_balance: Number(balances.immature) / 100_000_000,
       txcount,
       keypoolsize: privateKeysEnabled && !wallet.isBlank() ? 20 : 0,
       unlocked_until: wallet.isLocked() ? 0 : undefined,
