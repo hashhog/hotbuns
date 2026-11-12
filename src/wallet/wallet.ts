@@ -2842,6 +2842,13 @@ export class Wallet {
       let totalOut = 0n;
       const recvDetails: WalletTxDetail[] = [];
       const nonWalletOuts: WalletTxDetail[] = [];
+      // Outputs paying one of OUR addresses, split by chain. Core's
+      // CachedTxGetAmounts skips change (OutputIsChange) for a tx that debits
+      // us, and lists every other output as "send"; an output that is also
+      // ours is listed as "receive" too. So a send to another address of the
+      // same wallet yields [send, receive] and the change output is absent.
+      const ownNonChangeOuts: WalletTxDetail[] = [];
+      const changeVouts = new Set<number>();
 
       // Check outputs for incoming payments
       for (let vout = 0; vout < tx.outputs.length; vout++) {
@@ -2868,6 +2875,17 @@ export class Wallet {
           createdThisBlock.add(outpointKey);
 
           credit += output.value;
+          // BIP44 internal chain (.../1/n) = change; watch-only is never change.
+          if (/\/1\/\d+$/.test(keyPath)) {
+            changeVouts.add(vout);
+          } else {
+            ownNonChangeOuts.push({
+              address: addressInfo.address,
+              category: "send",
+              amount: output.value,
+              vout,
+            });
+          }
           recvDetails.push({
             address: addressInfo.address,
             category: "receive",
@@ -2911,10 +2929,16 @@ export class Wallet {
         let fee = 0n;
         if (isFromMe) {
           for (const d of nonWalletOuts) details.push(d);
+          for (const d of ownNonChangeOuts) details.push(d);
           const rawFee = debit - totalOut;
           fee = rawFee > 0n ? rawFee : 0n;
         }
-        for (const d of recvDetails) details.push(d);
+        for (const d of recvDetails) {
+          // A debiting tx's change is neither sent nor received (Core).
+          if (isFromMe && changeVouts.has(d.vout)) continue;
+          details.push(d);
+        }
+        // Stable sort: send entry stays ahead of the receive entry of a vout.
         details.sort((a, b) => a.vout - b.vout);
 
         this.txHistory.set(txidHex, {
