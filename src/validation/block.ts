@@ -10,7 +10,10 @@ import { hash256 } from "../crypto/primitives.js";
 import { ConsensusParams, compactToBigInt } from "../consensus/params.js";
 import {
   Transaction,
-  deserializeTx,
+  deserializeTxSteps,
+  runParseSteps,
+  PARSE_STEP_BYTES,
+  type ParseSteps,
   serializeTx,
   getTxId,
   getWTxId,
@@ -148,13 +151,28 @@ export function serializeBlock(block: Block): Buffer {
  * Deserialize a complete block from a BufferReader.
  */
 export function deserializeBlock(reader: BufferReader): Block {
+  return runParseSteps(deserializeBlockSteps(reader));
+}
+
+/**
+ * {@link deserializeBlock} as a stepped parser (see deserializeTxSteps): same
+ * bytes consumed, same Block, same errors; it yields every PARSE_STEP_BYTES
+ * bytes, inside a transaction and between transactions, so a P2P block can
+ * be parsed without holding the event loop for the whole payload.
+ */
+export function* deserializeBlockSteps(reader: BufferReader): ParseSteps<Block> {
   const header = deserializeBlockHeader(reader);
 
   const txCount = reader.readVarInt();
   const transactions: Transaction[] = [];
 
+  let nextYieldAt = reader.position + PARSE_STEP_BYTES;
   for (let i = 0; i < txCount; i++) {
-    transactions.push(deserializeTx(reader));
+    transactions.push(yield* deserializeTxSteps(reader));
+    if (reader.position >= nextYieldAt) {
+      nextYieldAt = reader.position + PARSE_STEP_BYTES;
+      yield;
+    }
   }
 
   return { header, transactions };

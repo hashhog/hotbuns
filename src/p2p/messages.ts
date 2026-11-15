@@ -18,12 +18,17 @@ import {
   Block,
   deserializeBlockHeader,
   deserializeBlock,
+  deserializeBlockSteps,
   serializeBlockHeader,
   serializeBlock,
 } from "../validation/block.js";
 import {
   Transaction,
   deserializeTx,
+  deserializeTxSteps,
+  runParseSteps,
+  type ParseSteps,
+  PARSE_STEP_BYTES,
   serializeTx,
 } from "../validation/tx.js";
 import {
@@ -1262,6 +1267,10 @@ function deserializeFeeFilterPayload(reader: BufferReader): FeeFilterPayload {
 const MAX_CMPCT_TOTAL_TX = 0xffff;
 
 function deserializeCmpctBlockPayload(reader: BufferReader): CmpctBlockPayload {
+  return runParseSteps(deserializeCmpctBlockPayloadSteps(reader));
+}
+
+function* deserializeCmpctBlockPayloadSteps(reader: BufferReader): ParseSteps<CmpctBlockPayload> {
   const header = deserializeBlockHeader(reader);
   const nonce = reader.readUInt64LE();
 
@@ -1287,12 +1296,17 @@ function deserializeCmpctBlockPayload(reader: BufferReader): CmpctBlockPayload {
   }
   const prefilledTxns: PrefilledTx[] = [];
   let lastIndex = -1;
+  let nextYieldAt = reader.position + PARSE_STEP_BYTES;
   for (let i = 0; i < prefilledCount; i++) {
     const diff = reader.readVarInt();
     const index = lastIndex + diff + 1;
-    const tx = deserializeTx(reader);
+    const tx = yield* deserializeTxSteps(reader);
     prefilledTxns.push({ index, tx });
     lastIndex = index;
+    if (reader.position >= nextYieldAt) {
+      nextYieldAt = reader.position + PARSE_STEP_BYTES;
+      yield;
+    }
   }
 
   return { header, nonce, shortIds, prefilledTxns };
@@ -1316,11 +1330,20 @@ function deserializeGetBlockTxnPayload(reader: BufferReader): GetBlockTxnPayload
 }
 
 function deserializeBlockTxnPayload(reader: BufferReader): BlockTxnPayload {
+  return runParseSteps(deserializeBlockTxnPayloadSteps(reader));
+}
+
+function* deserializeBlockTxnPayloadSteps(reader: BufferReader): ParseSteps<BlockTxnPayload> {
   const blockHash = reader.readHash();
   const count = reader.readVarInt();
   const transactions: Transaction[] = [];
+  let nextYieldAt = reader.position + PARSE_STEP_BYTES;
   for (let i = 0; i < count; i++) {
-    transactions.push(deserializeTx(reader));
+    transactions.push(yield* deserializeTxSteps(reader));
+    if (reader.position >= nextYieldAt) {
+      nextYieldAt = reader.position + PARSE_STEP_BYTES;
+      yield;
+    }
   }
   return { blockHash, transactions };
 }
@@ -1675,6 +1698,61 @@ export function deserializeV2Message(
     checksum: hash256(payload).subarray(0, 4),
   };
   return deserializeMessage(fakeHeader, payload);
+}
+
+/**
+ * Commands whose payload may be a whole block's worth of transactions (up to
+ * MAX_MESSAGE_SIZE of them). {@link deserializeMessageSteps} parses these in
+ * steps; every other command is small enough to parse in one go.
+ */
+export function isSteppedParseCommand(command: string): boolean {
+  return command === "block" || command === "cmpctblock" || command === "blocktxn";
+}
+
+/**
+ * {@link deserializeMessage} as a stepped parser (audit H2). For `block`,
+ * `cmpctblock` and `blocktxn` it yields every PARSE_STEP_BYTES of payload, so
+ * the caller can hand the event loop back while a 4 MB block parses; for any
+ * other command it returns at once without yielding. It runs the same
+ * parsers as deserializeMessage: the same message comes out for the same
+ * bytes, and the same error is thrown for the same bad bytes.
+ */
+export function* deserializeMessageSteps(
+  header: MessageHeader,
+  payload: Buffer
+): ParseSteps<NetworkMessage> {
+  if (!isSteppedParseCommand(header.command)) {
+    return deserializeMessage(header, payload);
+  }
+  const expectedChecksum = hash256(payload).subarray(0, 4);
+  if (!header.checksum.equals(expectedChecksum)) {
+    throw new Error(
+      `Checksum mismatch: expected ${expectedChecksum.toString("hex")}, got ${header.checksum.toString("hex")}`
+    );
+  }
+  const reader = new BufferReader(payload);
+  switch (header.command) {
+    case "block":
+      return { type: "block", payload: { block: yield* deserializeBlockSteps(reader) } };
+    case "cmpctblock":
+      return { type: "cmpctblock", payload: yield* deserializeCmpctBlockPayloadSteps(reader) };
+    default:
+      return { type: "blocktxn", payload: yield* deserializeBlockTxnPayloadSteps(reader) };
+  }
+}
+
+/** {@link deserializeMessageSteps} for a v2-decrypted message (see deserializeV2Message). */
+export function deserializeV2MessageSteps(
+  command: string,
+  payload: Buffer
+): ParseSteps<NetworkMessage> {
+  const fakeHeader: MessageHeader = {
+    magic: 0,
+    command,
+    length: payload.length,
+    checksum: hash256(payload).subarray(0, 4),
+  };
+  return deserializeMessageSteps(fakeHeader, payload);
 }
 
 /**

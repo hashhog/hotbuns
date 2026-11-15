@@ -17,6 +17,9 @@ import {
   deserializeMessage,
   OversizedTxMessageError,
   deserializeV2Message,
+  deserializeMessageSteps,
+  deserializeV2MessageSteps,
+  isSteppedParseCommand,
   extractCommandAndPayload,
   hostToBuffer,
 } from "./messages.js";
@@ -26,6 +29,34 @@ import {
   looksLikeV1Version,
 } from "./v2_transport.js";
 import type { ProxyManager, NetworkType } from "./proxy.js";
+import type { ParseSteps } from "../validation/tx.js";
+
+/**
+ * Longest a block/cmpctblock/blocktxn parse runs before it hands the event
+ * loop back (audit H2). A normal block parses inside one slice and is
+ * dispatched synchronously, as before; only a payload that takes longer (a
+ * 4 MB block of millions of empty witness items took 200-370 ms) continues
+ * on later macrotasks, so other peers, RPC clients and timers run between
+ * slices. Core gets the same isolation from parsing on the msghand thread.
+ */
+export const PARSE_SLICE_MS = 8;
+
+/** Ingress hold placed while a sliced parse of this peer's message runs. */
+const PARSE_HOLD = "sliced-parse";
+
+/** Advance a stepped parse for up to {@link PARSE_SLICE_MS}. */
+function runParseSlice<T>(steps: ParseSteps<T>): IteratorResult<void, T> {
+  const end = performance.now() + PARSE_SLICE_MS;
+  for (;;) {
+    const r = steps.next();
+    if (r.done || performance.now() >= end) return r;
+  }
+}
+
+/** A v2 message decrypted but not yet parsed (block-sized commands only). */
+interface UnparsedV2 {
+  unparsed: { type: string; payload: Buffer };
+}
 
 /** State of a peer connection. */
 export type PeerState = "connecting" | "handshaking" | "connected" | "disconnected";
@@ -463,7 +494,7 @@ export class Peer {
    */
   private readonly ingressHolds = new Set<string>();
   /** v2 messages already decrypted but not yet dispatched (paused). */
-  private deferredV2: NetworkMessage[] = [];
+  private deferredV2: (NetworkMessage | UnparsedV2)[] = [];
   private deferredV2Bytes: number[] = [];
   private deferredV2Total = 0;
   /** A resume pass is queued on the event loop. */
@@ -1538,13 +1569,82 @@ export class Peer {
         this.processRecvBuffer();
       }
     } catch (error) {
-      // Malformed message - disconnect
-      const errMsg = error instanceof Error ? error.message : "malformed message";
-      console.error(`PEER ERROR: ${this.host}:${this.port} processRecvBuffer failed: ${errMsg} (recvBuf=${this.recvBuffer.length} bytes)`);
-      this.disconnect(errMsg);
+      this.failRecvProcessing(error);
       return;
     }
     if (this.state !== "disconnected") this.updateRecvPause();
+  }
+
+  /** Malformed message (or a handler threw): disconnect. */
+  private failRecvProcessing(error: unknown): void {
+    const errMsg = error instanceof Error ? error.message : "malformed message";
+    console.error(`PEER ERROR: ${this.host}:${this.port} processRecvBuffer failed: ${errMsg} (recvBuf=${this.recvBuffer.length} bytes)`);
+    this.disconnect(errMsg);
+  }
+
+  private logV1DeserError(header: MessageHeader, deserErr: unknown): void {
+    if (header.command === "block") {
+      console.error(`BLOCK DESER ERROR: size=${header.length} from=${this.host}: ${deserErr instanceof Error ? deserErr.message : String(deserErr)}`);
+    }
+  }
+
+  private logV2DeserError(type: string, err: unknown): void {
+    // Unrecognized command name, malformed payload, etc.  Match
+    // Bitcoin Core: log and discard rather than disconnect, since
+    // BIP-324 explicitly leaves room for unknown extensions.
+    console.error(
+      `V2 deser error from ${this.host}:${this.port} type=${type}: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+
+  /**
+   * Finish a stepped parse one {@link PARSE_SLICE_MS} slice per macrotask,
+   * then dispatch the message and carry on with what was received behind it
+   * (audit H2). While it runs, the PARSE_HOLD ingress hold stops this peer's
+   * later messages from dispatching ahead of it, and updateRecvPause bounds
+   * what queues up behind it (Core fPauseRecv). A peer that disconnects
+   * meanwhile is dropped without finishing the parse.
+   */
+  private continueSlicedParse(
+    steps: ParseSteps<NetworkMessage>,
+    onError: (err: unknown) => void
+  ): void {
+    this.ingressHolds.add(PARSE_HOLD);
+    const step = (): void => {
+      if (this.state === "disconnected") {
+        this.ingressHolds.delete(PARSE_HOLD);
+        return;
+      }
+      let r: IteratorResult<void, NetworkMessage>;
+      try {
+        r = runParseSlice(steps);
+      } catch (err) {
+        this.ingressHolds.delete(PARSE_HOLD);
+        onError(err);
+        this.resumeAfterSlicedParse();
+        return;
+      }
+      if (!r.done) {
+        setImmediate(step);
+        return;
+      }
+      this.ingressHolds.delete(PARSE_HOLD);
+      try {
+        this.handleMessage(r.value);
+      } catch (err) {
+        this.failRecvProcessing(err);
+        return;
+      }
+      this.resumeAfterSlicedParse();
+    };
+    setImmediate(step);
+  }
+
+  /** Dispatch what was held behind a sliced parse, or re-apply the limit. */
+  private resumeAfterSlicedParse(): void {
+    if (this.state === "disconnected") return;
+    if (this.canDispatch()) this.runRecvProcessing();
+    else this.updateRecvPause();
   }
 
   /**
@@ -1624,9 +1724,21 @@ export class Peer {
         );
       }
 
-      let msg;
+      let msg: NetworkMessage | undefined;
+      let steps: ParseSteps<NetworkMessage> | null = null;
       try {
-        msg = deserializeMessage(header, payload);
+        if (isSteppedParseCommand(header.command)) {
+          // Block-sized payload: parse one slice now; a payload that needs
+          // more continues on later macrotasks (audit H2).
+          steps = deserializeMessageSteps(header, payload);
+          const r = runParseSlice(steps);
+          if (r.done) {
+            msg = r.value;
+            steps = null;
+          }
+        } else {
+          msg = deserializeMessage(header, payload);
+        }
       } catch (deserErr) {
         if (deserErr instanceof OversizedTxMessageError) {
           // Non-standard by size: drop it unparsed, keep the peer (audit H2).
@@ -1634,9 +1746,7 @@ export class Peer {
           this.recvBuffer = this.recvBuffer.subarray(totalLength);
           continue;
         }
-        if (header.command === "block") {
-          console.error(`BLOCK DESER ERROR: size=${header.length} from=${this.host}: ${deserErr instanceof Error ? deserErr.message : String(deserErr)}`);
-        }
+        this.logV1DeserError(header, deserErr);
         throw deserErr;
       }
 
@@ -1645,7 +1755,17 @@ export class Peer {
       // 50k-tx burst went to this line alone (flood-regtest profile). The
       // remainder is compacted once, below.
       this.recvBuffer = this.recvBuffer.subarray(totalLength);
-      this.handleMessage(msg);
+      if (steps) {
+        // Nothing behind this message dispatches until it has been parsed
+        // and dispatched; recvBuffer keeps the rest, under the receive limit.
+        // A parse error disconnects, exactly as the synchronous path does.
+        this.continueSlicedParse(steps, (err) => {
+          this.logV1DeserError(header, err);
+          this.failRecvProcessing(err);
+        });
+        break;
+      }
+      this.handleMessage(msg!);
     }
     // Compact the unconsumed tail (a partial message) into its own buffer so
     // it does not pin the large read buffer it was sliced from.
@@ -1736,17 +1856,17 @@ export class Peer {
     if (this.v2Transport.hasReceivedMessages()) {
       const messages = this.v2Transport.getReceivedMessages();
       for (const v2msg of messages) {
-        let parsed: NetworkMessage;
-        try {
-          parsed = deserializeV2Message(v2msg.type, v2msg.payload);
-        } catch (err) {
-          // Unrecognized command name, malformed payload, etc.  Match
-          // Bitcoin Core: log and discard rather than disconnect, since
-          // BIP-324 explicitly leaves room for unknown extensions.
-          console.error(
-            `V2 deser error from ${this.host}:${this.port} type=${v2msg.type}: ${err instanceof Error ? err.message : String(err)}`
-          );
-          continue;
+        let parsed: NetworkMessage | UnparsedV2;
+        if (isSteppedParseCommand(v2msg.type)) {
+          // Block-sized: parsed at dispatch time, in slices (audit H2).
+          parsed = { unparsed: { type: v2msg.type, payload: v2msg.payload } };
+        } else {
+          try {
+            parsed = deserializeV2Message(v2msg.type, v2msg.payload);
+          } catch (err) {
+            this.logV2DeserError(v2msg.type, err);
+            continue;
+          }
         }
         this.deferredV2.push(parsed);
         this.deferredV2Bytes.push(v2msg.payload.length);
@@ -1764,10 +1884,28 @@ export class Peer {
   private dispatchDeferredV2(): void {
     let i = 0;
     while (i < this.deferredV2.length && this.canDispatch()) {
-      const msg = this.deferredV2[i];
+      const entry = this.deferredV2[i];
       this.deferredV2Total -= this.deferredV2Bytes[i];
       i++;
-      this.handleMessage(msg);
+      if ("unparsed" in entry) {
+        const { type, payload } = entry.unparsed;
+        const steps = deserializeV2MessageSteps(type, payload);
+        let r: IteratorResult<void, NetworkMessage>;
+        try {
+          r = runParseSlice(steps);
+        } catch (err) {
+          this.logV2DeserError(type, err);
+          continue;
+        }
+        if (!r.done) {
+          // A parse error is logged and the message discarded, as above.
+          this.continueSlicedParse(steps, (err) => this.logV2DeserError(type, err));
+          break;
+        }
+        this.handleMessage(r.value);
+        continue;
+      }
+      this.handleMessage(entry);
     }
     if (i > 0 && this.deferredV2.length > 0) {
       this.deferredV2 = this.deferredV2.slice(i);
