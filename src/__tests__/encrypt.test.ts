@@ -147,7 +147,9 @@ describe("Wallet Encryption", () => {
     await wallet.unlockWallet(passphrase, 0);
     const seedAfter = wallet.getSeed();
     expect(seedAfter.length).toBe(64);
-    expect(seedAfter.equals(seedBefore)).toBe(true);
+    // encryptwallet replaces the seed, as Core's EncryptWallet does: the old
+    // one is in every pre-encryption copy of wallet.dat (audit H6).
+    expect(seedAfter.equals(seedBefore)).toBe(false);
   });
 
   test("encryption state is serializable", async () => {
