@@ -197,9 +197,41 @@ export function serializeTx(tx: Transaction, withWitness: boolean): Buffer {
 const EMPTY_WITNESS_ITEM = Buffer.alloc(0);
 
 /**
+ * Bytes a stepped parser consumes between two yield points. The costliest
+ * thing to parse is a one-byte item (an empty witness item, an empty
+ * scriptSig input), so this bounds the work per step to ~4096 items, well
+ * under a millisecond.
+ */
+export const PARSE_STEP_BYTES = 4096;
+
+/** A stepped parser: yields at points where the caller may pause it. */
+export type ParseSteps<T> = Generator<void, T, void>;
+
+/** Run a stepped parser to completion, synchronously. */
+export function runParseSteps<T>(steps: ParseSteps<T>): T {
+  for (;;) {
+    const r = steps.next();
+    if (r.done) return r.value;
+  }
+}
+
+/**
  * Deserialize a transaction from a BufferReader.
  */
 export function deserializeTx(reader: BufferReader): Transaction {
+  return runParseSteps(deserializeTxSteps(reader));
+}
+
+/**
+ * {@link deserializeTx} as a stepped parser: the same bytes are consumed, the
+ * same Transaction is returned and the same errors are thrown, but it yields
+ * every {@link PARSE_STEP_BYTES} consumed bytes so a caller can
+ * give the event loop back in the middle of one huge transaction (audit H2:
+ * a 4 MB block of ~4 million empty witness items parsed in one go stalled
+ * every peer and RPC client for 200-370 ms).
+ */
+export function* deserializeTxSteps(reader: BufferReader): ParseSteps<Transaction> {
+  let nextYieldAt = reader.position + PARSE_STEP_BYTES;
   const version = reader.readInt32LE();
 
   // Check for segwit marker
@@ -260,6 +292,10 @@ export function deserializeTx(reader: BufferReader): Transaction {
       sequence,
       witness: [], // Will be populated later if segwit
     });
+    if (reader.position >= nextYieldAt) {
+      nextYieldAt = reader.position + PARSE_STEP_BYTES;
+      yield;
+    }
   }
 
   // Parse outputs
@@ -269,6 +305,10 @@ export function deserializeTx(reader: BufferReader): Transaction {
     const value = reader.readUInt64LE();
     const scriptPubKey = reader.readVarBytes();
     outputs.push({ value, scriptPubKey });
+    if (reader.position >= nextYieldAt) {
+      nextYieldAt = reader.position + PARSE_STEP_BYTES;
+      yield;
+    }
   }
 
   // Parse witness data if present
@@ -283,6 +323,10 @@ export function deserializeTx(reader: BufferReader): Transaction {
           throw new Error("ReadCompactSize(): size too large");
         }
         witness.push(len === 0 ? EMPTY_WITNESS_ITEM : reader.readBytes(len));
+        if (reader.position >= nextYieldAt) {
+          nextYieldAt = reader.position + PARSE_STEP_BYTES;
+          yield;
+        }
       }
       inputs[i].witness = witness;
     }
