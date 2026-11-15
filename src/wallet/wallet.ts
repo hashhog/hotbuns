@@ -237,6 +237,11 @@ export interface WalletKey {
   address: string;
   path: string; // e.g., "m/84'/0'/0'/0/0"
   addressType: AddressType;
+  /**
+   * Derived from a seed retired by encryptwallet (Core: an inactive
+   * descriptor). Still owned and spendable; never used for new addresses.
+   */
+  retired?: boolean;
 }
 
 /**
@@ -463,6 +468,24 @@ interface WalletData {
   // importprivkey keys (H7). Plaintext `privateKey` only in an unencrypted
   // wallet; an encrypted wallet stores `encryptedPrivateKey` + `iv` only.
   importedKeys?: ImportedKeyRecord[];
+  // HD seeds retired by encryptwallet (H6), sealed under the current seed.
+  retiredSeeds?: RetiredSeedRecord[];
+}
+
+/**
+ * An HD seed that encryptwallet replaced. Core's EncryptWallet makes new
+ * descriptors from a new seed and keeps the old ones (encrypted, inactive) so
+ * coins paid to them stay spendable (wallet/wallet.cpp:818-886). The seed is
+ * sealed with AES-256-GCM under a key derived from the current seed, which is
+ * itself stored only under the passphrase -- so it is readable exactly when
+ * the wallet is unlocked, and walletpassphrasechange needs no change.
+ * The indices are the old seed's frontier at rotation time.
+ */
+interface RetiredSeedRecord {
+  encryptedSeed: string; // hex, AES-256-GCM (see retiredSeedCipherKey)
+  iv: string; // hex, 12-byte GCM nonce
+  nextReceiveIndices: Record<string, number>;
+  nextChangeIndices: Record<string, number>;
 }
 
 /**
@@ -576,6 +599,10 @@ export class Wallet {
   private importedKeys: Map<string, ImportedKeyRecord>;
   private watchAddresses: Map<string, WatchAddressInfo>;
 
+  // Seeds retired by encryptwallet, as persisted (sealed). Their keys are
+  // re-derived into `keys` (marked retired) whenever the seed is available.
+  private retiredSeeds: RetiredSeedRecord[];
+
   constructor(config: WalletConfig) {
     this.config = config;
     this.keys = new Map();
@@ -592,6 +619,7 @@ export class Wallet {
     this.watchDescriptors = [];
     this.watchAddresses = new Map();
     this.importedKeys = new Map();
+    this.retiredSeeds = [];
 
     // Initialize encryption state
     this.encryption = {
@@ -896,6 +924,11 @@ export class Wallet {
         wallet.importedKeys.set(rec.address, rec);
       }
     }
+    for (const rec of data.retiredSeeds ?? []) {
+      if (rec && typeof rec.encryptedSeed === "string" && typeof rec.iv === "string") {
+        wallet.retiredSeeds.push(rec);
+      }
+    }
 
     // Regenerate keys (only if not encrypted, or if we have the seed).
     // disable_private_keys / blank wallets stay keyless across restarts.
@@ -904,6 +937,7 @@ export class Wallet {
       !wallet.blank &&
       (!wallet.encryption.isEncrypted || wallet.seed.length > 0)
     ) {
+      wallet.restoreRetiredKeys();
       wallet.pregenerateAddresses();
     }
     if (!wallet.encryption.isEncrypted || wallet.seed.length > 0) {
@@ -995,6 +1029,7 @@ export class Wallet {
       blank: this.blank,
       watchDescriptors: this.watchDescriptors,
       importedKeys: Array.from(this.importedKeys.values()),
+      retiredSeeds: this.retiredSeeds,
     };
 
     // bigint is not JSON-serializable: WalletTxRecord carries debit/credit/fee
@@ -1135,14 +1170,18 @@ export class Wallet {
    *   BIP-84 (P2WPKH):     m/84'/coin'/account'/change/index
    *   BIP-86 (P2TR):       m/86'/coin'/account'/change/index
    */
-  private deriveKey(path: string, addressType: AddressType): WalletKey {
+  private deriveKey(
+    path: string,
+    addressType: AddressType,
+    master: { key: Buffer; chainCode: Buffer } = this.masterKey
+  ): WalletKey {
     if (!path.startsWith("m/")) {
       throw new Error(`Invalid path format: ${path}`);
     }
 
     const parts = path.slice(2).split("/");
-    let currentKey = this.masterKey.key;
-    let currentChainCode = this.masterKey.chainCode;
+    let currentKey = master.key;
+    let currentChainCode = master.chainCode;
 
     for (const part of parts) {
       const isHardened = part.endsWith("'");
@@ -1359,7 +1398,8 @@ export class Wallet {
    */
   private hasKeyForPath(path: string): boolean {
     for (const key of this.keys.values()) {
-      if (key.path === path) {
+      // A retired seed's key at the same path is a different key.
+      if (key.path === path && !key.retired) {
         return true;
       }
     }
@@ -3405,6 +3445,78 @@ export class Wallet {
     );
   }
 
+  /** Key that seals retired HD seeds; derived from `seed` (the current one). */
+  private static retiredSeedCipherKey(seed: Buffer): Buffer {
+    if (seed.length !== 64) {
+      throw new Error("Error: Please enter the wallet passphrase with walletpassphrase first.");
+    }
+    return Buffer.from(hmac(sha256, seed, Buffer.from("hotbuns/retired-seed/v1", "utf-8")));
+  }
+
+  private static openRetiredSeed(rec: RetiredSeedRecord, currentSeed: Buffer): Buffer {
+    return Buffer.from(
+      gcm(Wallet.retiredSeedCipherKey(currentSeed), Buffer.from(rec.iv, "hex")).decrypt(
+        Buffer.from(rec.encryptedSeed, "hex")
+      )
+    );
+  }
+
+  private static sealRetiredSeed(
+    oldSeed: Buffer,
+    currentSeed: Buffer,
+    nextReceiveIndices: Record<string, number>,
+    nextChangeIndices: Record<string, number>
+  ): RetiredSeedRecord {
+    const iv = Buffer.from(randomBytes(12));
+    const ct = gcm(Wallet.retiredSeedCipherKey(currentSeed), iv).encrypt(oldSeed);
+    return {
+      encryptedSeed: Buffer.from(ct).toString("hex"),
+      iv: iv.toString("hex"),
+      nextReceiveIndices,
+      nextChangeIndices,
+    };
+  }
+
+  /**
+   * Re-derive every retired seed's keys into the keyring, marked `retired`,
+   * over the same window the seed covered when it was active (its frontier
+   * plus the address gap, on both chains of every type). Needs the current
+   * seed, so it runs on load (unencrypted) or on unlock. A record that fails
+   * to open is skipped with a warning rather than discarding the rest.
+   */
+  private restoreRetiredKeys(): void {
+    for (const rec of this.retiredSeeds) {
+      let oldSeed: Buffer | undefined;
+      try {
+        oldSeed = Wallet.openRetiredSeed(rec, this.seed);
+        const master = this.deriveMasterKey(oldSeed);
+        for (const addressType of [
+          AddressType.P2PKH,
+          AddressType.P2SH,
+          AddressType.P2WPKH,
+          AddressType.P2TR,
+        ]) {
+          const chains: [Record<string, number>, (i: number, t: AddressType) => string][] = [
+            [rec.nextReceiveIndices ?? {}, (i, t) => this.getReceivePath(i, t)],
+            [rec.nextChangeIndices ?? {}, (i, t) => this.getChangePath(i, t)],
+          ];
+          for (const [indices, pathFor] of chains) {
+            const target = (indices[addressType] ?? 0) + this.ADDRESS_GAP;
+            for (let i = 0; i < target; i++) {
+              const key = this.deriveKey(pathFor(i, addressType), addressType, master);
+              key.retired = true;
+              this.keys.set(key.address, key);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn(`[wallet] retired seed not restored (${(err as Error).message})`);
+      } finally {
+        oldSeed?.fill(0);
+      }
+    }
+  }
+
   private sealImportedKey(privateKey: Buffer): { encryptedPrivateKey: string; iv: string } {
     const iv = Buffer.from(randomBytes(12));
     const ct = gcm(this.importedKeyCipherKey(), iv).encrypt(privateKey);
@@ -3655,10 +3767,23 @@ export class Wallet {
    * This encrypts the seed with AES-256-CBC and locks the wallet.
    * After encryption, the wallet file will be re-saved with encrypted keys.
    *
+   * Like Core's CWallet::EncryptWallet (wallet/wallet.cpp:818-886), the HD
+   * seed is replaced: every copy of wallet.dat written before encryption
+   * (backups included) holds the old seed in the clear, so new addresses must
+   * not come from it. The old seed is kept, sealed under the new one, so the
+   * keys it already covered stay owned and spendable (Core keeps the old
+   * descriptors, encrypted and inactive). See {@link rotateSeed}.
+   *
    * @param passphrase - The encryption passphrase
+   * @param opts.rotateSeed - Replace the HD seed (default true). Only false
+   *   when the seed has never been written unencrypted and must stay the one
+   *   the caller chose (createwallet with a mnemonic and a passphrase).
    * @throws If wallet is already encrypted
    */
-  async encryptWallet(passphrase: string): Promise<void> {
+  async encryptWallet(
+    passphrase: string,
+    opts: { rotateSeed?: boolean } = {}
+  ): Promise<void> {
     if (this.encryption.isEncrypted) {
       throw new Error("Wallet is already encrypted. Use walletpassphrasechange to change the passphrase.");
     }
@@ -3673,6 +3798,12 @@ export class Wallet {
 
     // Derive encryption key
     const key = await this.deriveEncryptionKey(passphrase, salt);
+
+    // New seed first: the imported keys below are sealed under the seed in
+    // use when encryption completes.
+    if (opts.rotateSeed !== false) {
+      this.rotateSeed();
+    }
 
     // Encrypt the seed
     const encryptedSeed = this.encryptAES256CBC(this.seed, key, iv);
@@ -3713,6 +3844,65 @@ export class Wallet {
 
     // Note: Private keys are derived on-demand from the seed, so they're not in memory
     // when the wallet is locked. The key map contains public info only when locked.
+  }
+
+  /**
+   * Replace the HD seed with a fresh random one (encryptwallet, H6).
+   *
+   * - The old seed is sealed under the new one with its index frontier and
+   *   appended to `retiredSeeds`; earlier retired seeds are re-sealed.
+   * - Keys already in the keyring from the old seed are marked retired: they
+   *   stay owned and signable, but new addresses and change come from the
+   *   new seed, starting at index 0 on every chain (Core: new descriptors).
+   * - Imported keys are untouched here; encryptWallet seals them afterwards.
+   * The plaintext old seed is zeroed.
+   */
+  private rotateSeed(): void {
+    const oldSeed = this.seed;
+    if (oldSeed.length !== 64) {
+      throw new Error("Wallet seed is unavailable; cannot rotate it.");
+    }
+    const newSeed = Buffer.from(randomBytes(64));
+
+    const toObj = (m: Map<AddressType, number>): Record<string, number> => {
+      const o: Record<string, number> = {};
+      for (const [t, i] of m.entries()) o[t] = i;
+      return o;
+    };
+    // Build every new record before changing any state.
+    const resealed = this.retiredSeeds.map((rec) => {
+      const s = Wallet.openRetiredSeed(rec, oldSeed);
+      try {
+        return Wallet.sealRetiredSeed(s, newSeed, rec.nextReceiveIndices, rec.nextChangeIndices);
+      } finally {
+        s.fill(0);
+      }
+    });
+    resealed.push(
+      Wallet.sealRetiredSeed(
+        oldSeed,
+        newSeed,
+        toObj(this.nextReceiveIndex),
+        toObj(this.nextChangeIndex)
+      )
+    );
+
+    for (const k of this.keys.values()) {
+      if (k.path !== "imported") k.retired = true;
+    }
+    this.retiredSeeds = resealed;
+
+    oldSeed.fill(0);
+    this.masterKey.key.fill(0);
+    this.masterKey.chainCode.fill(0);
+    this.seed = newSeed;
+    this.masterKey = this.deriveMasterKey(newSeed);
+    for (const t of this.nextReceiveIndex.keys()) this.nextReceiveIndex.set(t, 0);
+    for (const t of this.nextChangeIndex.keys()) this.nextChangeIndex.set(t, 0);
+
+    if (!this.disablePrivateKeys && !this.blank) {
+      this.pregenerateAddresses();
+    }
   }
 
   /**
@@ -3766,7 +3956,11 @@ export class Wallet {
     this.seed = decryptedSeed;
     this.masterKey = this.deriveMasterKey(this.seed);
 
-    // Regenerate addresses now that we have the seed
+    // Regenerate addresses now that we have the seed. A blank wallet's
+    // retired seed covered no keys, so it gets none back.
+    if (!this.blank && !this.disablePrivateKeys) {
+      this.restoreRetiredKeys();
+    }
     this.pregenerateAddresses();
     this.restoreImportedKeys();
 
@@ -4342,9 +4536,12 @@ export class WalletManager {
       ? Wallet.create(config, options.mnemonic, options.mnemonicPassphrase ?? "", createOpts)
       : Wallet.create(config, undefined, "", createOpts);
 
-    // If passphrase provided in options, encrypt the wallet
+    // If passphrase provided in options, encrypt the wallet. No seed rotation:
+    // this seed has never been written unencrypted, and with a mnemonic it is
+    // the one the caller is restoring (rotating would break seed-only
+    // recovery of every new address).
     if (encryptionPassphrase) {
-      await wallet.encryptWallet(encryptionPassphrase);
+      await wallet.encryptWallet(encryptionPassphrase, { rotateSeed: false });
     }
 
     // Save the wallet
