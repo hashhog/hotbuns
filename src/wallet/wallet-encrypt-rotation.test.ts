@@ -1,6 +1,5 @@
 /**
- * Security audit H6 (fleet-security-findings 2026-11-08): encryptwallet kept
- * the old HD seed.
+ * Security audit H6: encryptwallet kept the old HD seed.
  *
  * Every wallet.dat is wrapped with the fixed storage key "hotbuns", so the
  * seed of an unencrypted wallet is plaintext to anyone holding the file -- and

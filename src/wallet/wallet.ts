@@ -3956,8 +3956,11 @@ export class Wallet {
     this.seed = decryptedSeed;
     this.masterKey = this.deriveMasterKey(this.seed);
 
-    // Regenerate addresses now that we have the seed
-    this.restoreRetiredKeys();
+    // Regenerate addresses now that we have the seed. A blank wallet's
+    // retired seed covered no keys, so it gets none back.
+    if (!this.blank && !this.disablePrivateKeys) {
+      this.restoreRetiredKeys();
+    }
     this.pregenerateAddresses();
     this.restoreImportedKeys();
 
