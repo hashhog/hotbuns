@@ -2356,7 +2356,9 @@ export class Wallet {
     }
 
     if (available.length === 0) {
-      throw new Error("No confirmed UTXOs available");
+      // Nothing spendable: Core's general coin-selection failure,
+      // util::Error{_("Insufficient funds")} (wallet/spend.cpp:1234).
+      throw new Error("Insufficient funds");
     }
 
     // Calculate cost of change (creating + spending later)
@@ -2785,6 +2787,16 @@ export class Wallet {
       }
     }
 
+    // Every spendable coin is selected by now. When they do not reach the
+    // amount itself Core reports the general failure with no amounts,
+    // util::Error{_("Insufficient funds")} (wallet/spend.cpp:1234), and
+    // sendtoaddress / send pass that text through unchanged. Covering the
+    // amount but not the fee is a different Core message ("The total exceeds
+    // your balance when the ... transaction fee is included.",
+    // spend.cpp:1228); that branch keeps the detailed text below.
+    if (totalSelected < target) {
+      throw new Error("Insufficient funds");
+    }
     throw new Error(
       `Insufficient funds: need ${target}, only have ${totalSelected}`
     );
