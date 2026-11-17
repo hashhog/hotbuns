@@ -13712,9 +13712,10 @@ export class RPCServer {
       }
       try {
         decodeAddress(address);
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid address: ${msg}`);
+      } catch {
+        // Core ParseOutputs (rpc/rawtransaction_util.cpp:121) names the
+        // address as given, not the decoder's reason.
+        throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid Bitcoin address: ${address}`);
       }
       outputs.push({
         address,
@@ -13971,9 +13972,9 @@ export class RPCServer {
     // Validate the destination address up-front for a clean error code.
     try {
       decodeAddress(addressParam);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid address: ${msg}`);
+    } catch {
+      // Core ParseOutputs (rpc/rawtransaction_util.cpp:121).
+      throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid Bitcoin address: ${addressParam}`);
     }
 
     const wallet = this.getCurrentWallet();
@@ -15859,7 +15860,8 @@ export class RPCServer {
           try {
             decoded = decodeAddress(k);
           } catch {
-            throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid address: ${k}`);
+            // Core ParseOutputs (rpc/rawtransaction_util.cpp:121).
+            throw this.rpcError(RPCErrorCodes.INVALID_ADDRESS_OR_KEY, `Invalid Bitcoin address: ${k}`);
           }
           const sats = BigInt(Math.round(v * 100_000_000));
           totalOutputSats += sats;
