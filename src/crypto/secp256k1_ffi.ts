@@ -289,6 +289,35 @@ function _parseSigDER(derBytes: Uint8Array): boolean {
 }
 
 /**
+ * Read a lax-DER INTEGER length at `pos` (just after the 0x02 tag), mirroring
+ * Bitcoin Core's ecdsa_signature_parse_der_lax (src/pubkey.cpp): in long form
+ * the byte count must fit in the remaining input, leading zero length bytes
+ * are skipped, and 4 or more significant length bytes is a parse failure
+ * (Core: `lenbyte >= 4` -> return 0). Without that limit a 32-bit accumulator
+ * wraps, e.g. `85 01 00 00 00 20` becomes 0x20 and a signature Core rejects
+ * would verify. Returns [length, newPos] or null; the caller still checks the
+ * length against the remaining input.
+ */
+function laxDerIntLength(sig: Uint8Array, pos: number): [number, number] | null {
+  if (pos >= sig.length) return null;
+  let lenbyte = sig[pos++];
+  if (!(lenbyte & 0x80)) return [lenbyte, pos];
+  lenbyte -= 0x80;
+  if (lenbyte > sig.length - pos) return null;
+  while (lenbyte > 0 && sig[pos] === 0) {
+    pos++;
+    lenbyte--;
+  }
+  if (lenbyte >= 4) return null;
+  let n = 0;
+  while (lenbyte > 0) {
+    n = n * 256 + sig[pos++];
+    lenbyte--;
+  }
+  return [n, pos];
+}
+
+/**
  * Lax DER parser matching Bitcoin Core's ecdsa_signature_parse_der_lax.
  *
  * Extracts (r, s) tolerating non-canonical DER encodings:
@@ -308,28 +337,23 @@ function _laxDerToCompact(sig: Uint8Array): Uint8Array | null {
 
   // Sequence length — skip (may be non-minimal multi-byte encoding)
   if (pos >= len) return null;
-  let seqLen = sig[pos++];
+  const seqLen = sig[pos++];
   if (seqLen & 0x80) {
+    // Core skips the long-form sequence length bytes without decoding them,
+    // but fails when the byte count runs past the end of the input.
     const numBytes = seqLen & 0x7f;
-    seqLen = 0;
-    for (let i = 0; i < numBytes && pos < len; i++) {
-      seqLen = (seqLen << 8) | sig[pos++];
-    }
+    if (numBytes > len - pos) return null;
+    pos += numBytes;
   }
 
   // Parse R integer
   if (pos >= len || sig[pos] !== 0x02) return null;
   pos++;
-  if (pos >= len) return null;
-  let rLen = sig[pos++];
-  if (rLen & 0x80) {
-    const numBytes = rLen & 0x7f;
-    rLen = 0;
-    for (let i = 0; i < numBytes && pos < len; i++) {
-      rLen = (rLen << 8) | sig[pos++];
-    }
-  }
-  if (pos + rLen > len) return null;
+  const rParsed = laxDerIntLength(sig, pos);
+  if (!rParsed) return null;
+  const rLen = rParsed[0];
+  pos = rParsed[1];
+  if (rLen > len - pos) return null;
   let rStart = pos;
   const rEnd = pos + rLen;
   // Strip leading zero padding
@@ -340,16 +364,11 @@ function _laxDerToCompact(sig: Uint8Array): Uint8Array | null {
   // Parse S integer
   if (pos >= len || sig[pos] !== 0x02) return null;
   pos++;
-  if (pos >= len) return null;
-  let sLen = sig[pos++];
-  if (sLen & 0x80) {
-    const numBytes = sLen & 0x7f;
-    sLen = 0;
-    for (let i = 0; i < numBytes && pos < len; i++) {
-      sLen = (sLen << 8) | sig[pos++];
-    }
-  }
-  if (pos + sLen > len) return null;
+  const sParsed = laxDerIntLength(sig, pos);
+  if (!sParsed) return null;
+  const sLen = sParsed[0];
+  pos = sParsed[1];
+  if (sLen > len - pos) return null;
   let sStart = pos;
   const sEnd = pos + sLen;
   while (sStart < sEnd && sig[sStart] === 0x00) sStart++;
