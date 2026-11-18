@@ -897,7 +897,9 @@ export function parseScript(raw: Buffer): Script {
       if (i + 3 >= raw.length) {
         throw new Error("Script parse error: OP_PUSHDATA4 missing length");
       }
-      const len = raw[i] | (raw[i + 1] << 8) | (raw[i + 2] << 16) | (raw[i + 3] << 24);
+      // Unsigned: Core reads nSize with ReadLE32. A signed read turns
+      // `ff ff ff ff` into -1 and lets a walker step backwards.
+      const len = (raw[i] | (raw[i + 1] << 8) | (raw[i + 2] << 16) | (raw[i + 3] << 24)) >>> 0;
       i += 4;
       const data = raw.subarray(i, i + len);
       if (data.length !== len) {
@@ -957,7 +959,10 @@ export function isPushOnly(script: Buffer): boolean {
       i += 2 + len;
     } else if (opcode === Opcode.OP_PUSHDATA4) {
       if (i + 4 > script.length) return false;
-      const len = script[i] | (script[i + 1] << 8) | (script[i + 2] << 16) | (script[i + 3] << 24);
+      // Unsigned (Core GetScriptOp: ReadLE32 into unsigned nSize). A signed
+      // read gave `4e fb ff ff ff` len = -5, so `i += 4 + len` reset i to 0
+      // and the loop never ended (mempool standardness gate, main thread).
+      const len = (script[i] | (script[i + 1] << 8) | (script[i + 2] << 16) | (script[i + 3] << 24)) >>> 0;
       if (i + 4 + len > script.length) return false; // Truncated
       i += 4 + len;
     }
@@ -1087,10 +1092,10 @@ function opcodeEndPos(script: Buffer, pos: number): number {
     if (pos + 4 >= script.length) return -1;
     const end =
       pos + 5 +
-      (script[pos + 1] |
+      ((script[pos + 1] |
         (script[pos + 2] << 8) |
         (script[pos + 3] << 16) |
-        (script[pos + 4] << 24));
+        (script[pos + 4] << 24)) >>> 0); // unsigned, as Core's ReadLE32
     return end <= script.length ? end : -1;
   } else {
     // OP_0 (0x00) and all non-push opcodes: 1 byte

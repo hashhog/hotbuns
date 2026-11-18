@@ -751,10 +751,10 @@ export function removeCodeSeparators(script: Buffer): Buffer {
       // OP_PUSHDATA4
       if (pos + 4 >= script.length) break;
       const len =
-        script[pos + 1] |
-        (script[pos + 2] << 8) |
-        (script[pos + 3] << 16) |
-        (script[pos + 4] << 24);
+        (script[pos + 1] |
+          (script[pos + 2] << 8) |
+          (script[pos + 3] << 16) |
+          (script[pos + 4] << 24)) >>> 0; // unsigned (Core ReadLE32); signed could step pos backwards
       pos += 5 + len;
     } else {
       // Single-byte opcode
@@ -805,10 +805,10 @@ export function removeCodeSeparators(script: Buffer): Buffer {
         chunkEnd = script.length;
       } else {
         const len =
-          script[pos + 1] |
-          (script[pos + 2] << 8) |
-          (script[pos + 3] << 16) |
-          (script[pos + 4] << 24);
+          (script[pos + 1] |
+            (script[pos + 2] << 8) |
+            (script[pos + 3] << 16) |
+            (script[pos + 4] << 24)) >>> 0; // unsigned (Core ReadLE32); signed could step pos backwards
         chunkEnd = pos + 5 + len;
       }
     } else {
@@ -936,10 +936,10 @@ export function findAndDelete(script: Buffer, needle: Buffer): Buffer {
         nextPos = script.length;
       } else {
         const len =
-          script[pos + 1] |
-          (script[pos + 2] << 8) |
-          (script[pos + 3] << 16) |
-          (script[pos + 4] << 24);
+          (script[pos + 1] |
+            (script[pos + 2] << 8) |
+            (script[pos + 3] << 16) |
+            (script[pos + 4] << 24)) >>> 0; // unsigned (Core ReadLE32); signed could step pos backwards
         nextPos = pos + 5 + len;
       }
     } else {
