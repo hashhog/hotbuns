@@ -56,6 +56,12 @@ function runIsolated(body: string): { timedOut: boolean; value: unknown; stderr:
 const NEG5 = "4efbffffff";
 // ff ff ff ff = 0xffffffff (unsigned) / -1 (signed): moves the cursor back by one.
 const NEG1 = "4effffffff";
+// 02 06 51 | 4e f9 ff ff ff | 51: the signed len -7 jumps back to offset 1,
+// INSIDE the first push's data. Re-parsed from there, `06` pushes 6 bytes that
+// cover the whole PUSHDATA4 and the scan ends on OP_1, so the signed reader
+// answered TRUE (push-only) for a scriptSig Core rejects (GetOp fails on the
+// truncated PUSHDATA4, so IsPushOnly is false): the invalid-accepted direction.
+const JUMP_INTO_PUSH = "0206514ef9ffffff51";
 
 describe("cffix: OP_PUSHDATA4 length is unsigned in every script walker", () => {
   test("isPushOnly(4e fb ff ff ff) returns false instead of looping forever", () => {
@@ -76,6 +82,15 @@ describe("cffix: OP_PUSHDATA4 length is unsigned in every script walker", () => 
     expect(r.value).toBe(false);
   }, TEST_TIMEOUT_MS);
 
+  test("isPushOnly(02 06 51 4e f9 ff ff ff 51) is false: a backwards jump must not re-parse into push data", () => {
+    const r = runIsolated(`
+      const { isPushOnly } = await import(SRC + "/script/interpreter.ts");
+      return isPushOnly(Buffer.from(${JSON.stringify(JUMP_INTO_PUSH)}, "hex"));
+    `);
+    expect(r.timedOut).toBe(false);
+    expect(r.value).toBe(false);
+  }, TEST_TIMEOUT_MS);
+
   test("isPushOnly still accepts a well-formed PUSHDATA4 push (control)", () => {
     const r = runIsolated(`
       const { isPushOnly } = await import(SRC + "/script/interpreter.ts");
@@ -85,8 +100,9 @@ describe("cffix: OP_PUSHDATA4 length is unsigned in every script walker", () => 
     expect(r.value).toBe(true);
   }, TEST_TIMEOUT_MS);
 
-  test("mempool rejects a 65+ byte tx with scriptSig 4e fb ff ff ff as scriptsig-not-pushonly", () => {
-    const r = runIsolated(`
+  /** Submit a 65+ byte tx whose only input carries `scriptSigHex`, in a child bun. */
+  function submitWithScriptSig(scriptSigHex: string) {
+    return runIsolated(`
       const { mkdtemp, rm } = await import("node:fs/promises");
       const { tmpdir } = await import("node:os");
       const { join } = await import("node:path");
@@ -106,7 +122,7 @@ describe("cffix: OP_PUSHDATA4 length is unsigned in every script walker", () => 
           version: 2,
           inputs: [{
             prevOut: { txid: Buffer.alloc(32, 0xab), vout: 0 },
-            scriptSig: Buffer.from(${JSON.stringify(NEG5)}, "hex"),
+            scriptSig: Buffer.from(${JSON.stringify(scriptSigHex)}, "hex"),
             sequence: 0xffffffff,
             witness: [],
           }],
@@ -117,18 +133,29 @@ describe("cffix: OP_PUSHDATA4 length is unsigned in every script walker", () => 
           lockTime: 0,
         };
         const size = serializeTx(tx, false).length;
-        const res = await mempool.addTransaction(tx);
+        const res = await mempool.acceptToMemoryPool(tx);
         return { size, accepted: res.accepted, error: res.error ?? "" };
       } finally {
         await db.close();
         await rm(dir, { recursive: true, force: true });
       }
     `);
+  }
+
+  function expectNotPushOnlyReject(r: ReturnType<typeof runIsolated>) {
     expect(r.timedOut).toBe(false);
     const v = r.value as { size: number; accepted: boolean; error: string };
     expect(v.size).toBeGreaterThanOrEqual(65);
     expect(v.accepted).toBe(false);
     expect(v.error).toContain("scriptsig-not-pushonly");
+  }
+
+  test("mempool rejects a 65+ byte tx with scriptSig 4e fb ff ff ff as scriptsig-not-pushonly", () => {
+    expectNotPushOnlyReject(submitWithScriptSig(NEG5));
+  }, TEST_TIMEOUT_MS);
+
+  test("mempool rejects a 65+ byte tx with scriptSig 02 06 51 4e f9 ff ff ff 51 as scriptsig-not-pushonly", () => {
+    expectNotPushOnlyReject(submitWithScriptSig(JUMP_INTO_PUSH));
   }, TEST_TIMEOUT_MS);
 
   test("removeCodeSeparators(4e fb ff ff ff) terminates and keeps the bytes", () => {
