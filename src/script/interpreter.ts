@@ -396,32 +396,52 @@ function isOpSuccess(opcode: number): boolean {
 }
 
 /**
- * Check if a raw script contains any OP_SUCCESSx opcodes.
- * If it does, the script succeeds immediately (BIP-342 rule).
+ * BIP-342 OP_SUCCESSx pre-scan. Returns true if the script contains an
+ * OP_SUCCESSx opcode (the script then succeeds immediately), false if it
+ * parses cleanly without one.
+ *
+ * Mirrors Core's ExecuteWitnessScript tapscript loop (interpreter.cpp):
+ *   while (pc < end) {
+ *     if (!script.GetOp(pc, opcode)) return SCRIPT_ERR_BAD_OPCODE;
+ *     if (IsOpSuccess(opcode)) return success;
+ *   }
+ * Opcodes are read in order with GetScriptOp semantics (script.cpp): push
+ * lengths are UNSIGNED little-endian, and a length field or payload that
+ * runs past the end of the script is a parse failure, thrown here as
+ * BAD_OPCODE. An OP_SUCCESSx that precedes a malformed push still wins,
+ * because the scan never reaches the malformed bytes.
  */
 function containsOpSuccess(script: Buffer): boolean {
+  const end = script.length;
   let i = 0;
-  while (i < script.length) {
+  while (i < end) {
     const opcode = script[i];
     i++;
 
-    // Check for OP_SUCCESS before parsing push data
-    if (isOpSuccess(opcode)) {
-      return true;
+    if (opcode <= Opcode.OP_PUSHDATA4) {
+      let size: number;
+      if (opcode < Opcode.OP_PUSHDATA1) {
+        size = opcode; // 0x00..0x4b: direct push of `opcode` bytes
+      } else if (opcode === Opcode.OP_PUSHDATA1) {
+        if (end - i < 1) throw new ScriptError("BAD_OPCODE");
+        size = script[i];
+        i += 1;
+      } else if (opcode === Opcode.OP_PUSHDATA2) {
+        if (end - i < 2) throw new ScriptError("BAD_OPCODE");
+        size = script.readUInt16LE(i);
+        i += 2;
+      } else {
+        if (end - i < 4) throw new ScriptError("BAD_OPCODE");
+        size = script.readUInt32LE(i); // unsigned, 0..2^32-1
+        i += 4;
+      }
+      if (end - i < size) throw new ScriptError("BAD_OPCODE");
+      i += size;
+      continue;
     }
 
-    // Skip push data
-    if (opcode >= 1 && opcode <= 75) {
-      i += opcode;
-    } else if (opcode === Opcode.OP_PUSHDATA1 && i < script.length) {
-      const len = script[i];
-      i += 1 + len;
-    } else if (opcode === Opcode.OP_PUSHDATA2 && i + 1 < script.length) {
-      const len = script[i] | (script[i + 1] << 8);
-      i += 2 + len;
-    } else if (opcode === Opcode.OP_PUSHDATA4 && i + 3 < script.length) {
-      const len = script[i] | (script[i + 1] << 8) | (script[i + 2] << 16) | (script[i + 3] << 24);
-      i += 4 + len;
+    if (isOpSuccess(opcode)) {
+      return true;
     }
   }
   return false;
