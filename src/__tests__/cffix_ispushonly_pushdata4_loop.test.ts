@@ -169,6 +169,17 @@ describe("cffix: OP_PUSHDATA4 length is unsigned in every script walker", () => 
     expect(r.value).toBe(NEG5 + "ab");
   }, TEST_TIMEOUT_MS);
 
+  test("removeCodeSeparators(ab 4e fb ff ff ff) strips the separator and terminates in the rewrite loop", () => {
+    // With a separator present, the second (rewrite) walker runs too: it must
+    // not loop on the negative length either.
+    const r = runIsolated(`
+      const { removeCodeSeparators } = await import(SRC + "/validation/tx.ts");
+      return removeCodeSeparators(Buffer.from("ab" + ${JSON.stringify(NEG5)}, "hex")).toString("hex");
+    `);
+    expect(r.timedOut).toBe(false);
+    expect(r.value).toBe(NEG5);
+  }, TEST_TIMEOUT_MS);
+
   test("removeCodeSeparators still strips a separator after a short push (control)", () => {
     const r = runIsolated(`
       const { removeCodeSeparators } = await import(SRC + "/validation/tx.ts");
