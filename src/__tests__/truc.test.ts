@@ -318,8 +318,8 @@ describe("TRUC (v3) Policy", () => {
       );
       const result2 = await mempool.addTransaction(child2);
       expect(result2.accepted).toBe(false);
-      // Sibling eviction requires higher fee
-      expect(result2.error).toContain("sibling eviction requires higher fee");
+      // Sibling eviction runs PaysForRBF (Core ReplacementChecks): equal fee fails Rule #4
+      expect(result2.error).toContain("insufficient fee (including sibling eviction)");
     });
   });
 
@@ -523,7 +523,7 @@ describe("TRUC (v3) Policy", () => {
       );
       const result2 = await mempool.addTransaction(sibling2);
       expect(result2.accepted).toBe(false);
-      expect(result2.error).toContain("sibling eviction requires higher fee");
+      expect(result2.error).toContain("insufficient fee (including sibling eviction)");
 
       // First sibling should still be in mempool
       expect(mempool.hasTransaction(sibling1Txid)).toBe(true);
