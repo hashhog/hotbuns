@@ -1178,14 +1178,64 @@ function findAndDelete(script: Buffer, sig: Buffer): { result: Buffer; found: nu
 }
 
 /**
+ * IF/ELSE/ENDIF condition stack with O(1) operations, mirroring Core's
+ * `ConditionStack` (src/script/interpreter.cpp). Only the stack size and the
+ * position of the first false entry are tracked: all values above the first
+ * false one are irrelevant, since the script is not executing anyway. This
+ * matters for tapscript, which has neither the 201-opcode limit nor a script
+ * size limit, so nesting depth and opcode count can both reach ~10^5.
+ */
+class ConditionStack {
+  private static readonly NO_FALSE = -1;
+  private size = 0;
+  private firstFalsePos = ConditionStack.NO_FALSE;
+
+  empty(): boolean {
+    return this.size === 0;
+  }
+
+  allTrue(): boolean {
+    return this.firstFalsePos === ConditionStack.NO_FALSE;
+  }
+
+  pushBack(f: boolean): void {
+    if (this.firstFalsePos === ConditionStack.NO_FALSE && !f) {
+      // The stack consists of all true values, and a false is added.
+      this.firstFalsePos = this.size;
+    }
+    this.size++;
+  }
+
+  popBack(): void {
+    this.size--;
+    if (this.firstFalsePos === this.size) {
+      // When popping off the first false value, everything becomes true.
+      this.firstFalsePos = ConditionStack.NO_FALSE;
+    }
+  }
+
+  toggleTop(): void {
+    if (this.firstFalsePos === ConditionStack.NO_FALSE) {
+      // The current stack is all true values; the first false will be the top.
+      this.firstFalsePos = this.size - 1;
+    } else if (this.firstFalsePos === this.size - 1) {
+      // The top is the first false value; toggling it makes everything true.
+      this.firstFalsePos = ConditionStack.NO_FALSE;
+    }
+    // Otherwise there is a false value below the top; toggling the top
+    // changes nothing observable.
+  }
+}
+
+/**
  * Execute a parsed script.
  */
 export function executeScript(script: Script, ctx: ExecutionContext): boolean {
   const { stack, altStack, flags, sigHasher } = ctx;
   const sigVersion = ctx.sigVersion ?? SigVersion.BASE;
 
-  // Condition stack for IF/ELSE/ENDIF
-  const condStack: boolean[] = [];
+  // Condition stack for IF/ELSE/ENDIF (O(1) per op, Core ConditionStack)
+  const condStack = new ConditionStack();
 
   // Track code separator position for sighash
   let codeSepPos = 0xffffffff;
@@ -1198,7 +1248,7 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
     const opcode = chunk.opcode;
 
     // Check if we're in an executing branch
-    const executing = condStack.every((v) => v);
+    const executing = condStack.allTrue();
 
     // Check for disabled opcodes (fail even if not executing)
     if (DISABLED_OPCODES.has(opcode)) {
@@ -1311,27 +1361,25 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
           value = !value;
         }
       }
-      condStack.push(executing && value);
+      condStack.pushBack(executing && value);
       continue;
     }
 
     if (opcode === Opcode.OP_ELSE) {
-      if (condStack.length === 0) {
+      if (condStack.empty()) {
         return false;
       }
-      // Only flip if all outer conditions are true
-      const outerExecuting = condStack.length === 1 || condStack.slice(0, -1).every((v) => v);
-      if (outerExecuting) {
-        condStack[condStack.length - 1] = !condStack[condStack.length - 1];
-      }
+      // Core toggles unconditionally; when an outer entry is false the
+      // script stays non-executing either way (see ConditionStack.toggleTop).
+      condStack.toggleTop();
       continue;
     }
 
     if (opcode === Opcode.OP_ENDIF) {
-      if (condStack.length === 0) {
+      if (condStack.empty()) {
         return false;
       }
-      condStack.pop();
+      condStack.popBack();
       continue;
     }
 
@@ -2131,7 +2179,7 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
   }
 
   // Check for unbalanced conditionals
-  if (condStack.length !== 0) {
+  if (!condStack.empty()) {
     return false;
   }
 
