@@ -7358,6 +7358,16 @@ export class RPCServer {
    *
    * @param params [address]
    */
+  /** Core EnsureWalletIsUnlocked: RPC_WALLET_UNLOCK_NEEDED (-13) when locked. */
+  private ensureWalletUnlocked(wallet: Wallet): void {
+    if (wallet.isLocked()) {
+      throw this.rpcError(
+        RPCErrorCodes.WALLET_UNLOCK_NEEDED,
+        "Error: Please enter the wallet passphrase with walletpassphrase first."
+      );
+    }
+  }
+
   private async dumpPrivKey(params: unknown[]): Promise<string> {
     const wallet = this.getCurrentWallet();
 
@@ -7368,6 +7378,8 @@ export class RPCServer {
         "Error: Private keys are disabled for this wallet"
       );
     }
+    // Core: EnsureWalletIsUnlocked before the address is read (-13).
+    this.ensureWalletUnlocked(wallet);
     const address = params[0];
     if (typeof address !== "string") {
       throw this.rpcError(RPCErrorCodes.INVALID_PARAMS, "dumpprivkey requires an address");
@@ -7470,6 +7482,9 @@ export class RPCServer {
 
     // getCurrentWallet throws WALLET_NOT_FOUND if no wallet is loaded.
     const wallet = this.getCurrentWallet();
+
+    // Core rpc/signmessage.cpp: EnsureWalletIsUnlocked before decoding (-13).
+    this.ensureWalletUnlocked(wallet);
 
     // Validate address as P2PKH; Core returns TYPE_ERROR for non-PKH.
     let decoded: { version: number; hash: Buffer };
