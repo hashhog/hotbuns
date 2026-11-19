@@ -3993,11 +3993,13 @@ export class Wallet {
       throw new Error("Wallet is not encrypted.");
     }
 
+    // Core's CWallet::Unlock decrypts with the given passphrase and fails on
+    // mismatch even when the wallet is already unlocked.
+    const decryptedSeed = await this.decryptSeedWithPassphrase(passphrase);
+
     if (!this.encryption.isLocked) {
-      // Already unlocked. Core's CWallet::Unlock still decrypts with the
-      // given passphrase and fails on mismatch, so check it before only
-      // resetting the timeout.
-      (await this.decryptSeedWithPassphrase(passphrase)).fill(0);
+      // Still unlocked after the KDF: only reset the timeout.
+      decryptedSeed.fill(0);
       if (this.encryption.unlockTimeout) {
         clearTimeout(this.encryption.unlockTimeout);
         this.encryption.unlockTimeout = null;
@@ -4011,7 +4013,12 @@ export class Wallet {
       return;
     }
 
-    const decryptedSeed = await this.decryptSeedWithPassphrase(passphrase);
+    // Locked (possibly by the auto-lock timer firing during the KDF): the
+    // passphrase just decrypted the stored seed, so restore from it.
+    if (this.encryption.unlockTimeout) {
+      clearTimeout(this.encryption.unlockTimeout);
+      this.encryption.unlockTimeout = null;
+    }
 
     // Restore the seed
     this.seed = decryptedSeed;
