@@ -12285,6 +12285,86 @@ export class RPCServer {
       this.chainstateManager = manager;
     }
 
+    // Exclusive chain access for the whole activation (Core: ActivateSnapshot
+    // swaps the coins view under LOCK(::cs_main), validation.cpp). The P2P
+    // connect loop is paused and drained BEFORE loadSnapshot rewrites the
+    // coins keyspace, so no block connects or flushes against a half-swapped
+    // view and no flush writes a pre-snapshot tip label over snapshot coins;
+    // submitblock is refused for the same window. Released once the active
+    // tip, block index, height index and download frontier all name the
+    // snapshot base -- the background pass below only reads the shared block
+    // store and writes its own separate coins store, which Core also runs
+    // outside cs_main, concurrently with tip connection.
+    const blockSync = this.blockSync;
+    await blockSync?.beginExclusiveChainOp();
+    const prevPaused = this.blockSubmissionPaused;
+    this.blockSubmissionPaused = true;
+    let loadResult: Awaited<ReturnType<ChainstateManager["loadSnapshot"]>>;
+    try {
+      loadResult = await this.loadTxoutsetActivate(manager, pathParam);
+    } finally {
+      this.blockSubmissionPaused = prevPaused;
+      blockSync?.endExclusiveChainOp();
+    }
+
+    // (2) REAL background dual-chainstate validation (Core AddChainstate +
+    //     MaybeValidateSnapshot). The background validator owns a SEPARATE
+    //     coins store; getBlock(height) reads canonical blocks from the shared
+    //     block store the daemon persisted (Core shares BlockManager across
+    //     chainstates).
+    manager.setBackgroundDataDir(`${this.db.path()}-bgvalidate-${Date.now()}`);
+
+    const getBlock = async (height: number): Promise<Block | null> => {
+      const hash = await this.db.getBlockHashByHeight(height);
+      if (!hash) return null;
+      const raw = await this.db.getBlock(hash);
+      if (!raw) return null;
+      return deserializeBlock(new BufferReader(raw));
+    };
+
+    // Drive the background pass to its terminal verdict. A MISMATCH flips the
+    // snapshot chainstate to INVALID inside startBackgroundValidation (never
+    // silently accepted); per Core's async model the mismatch is surfaced via
+    // the chainstate state, NOT an error from this call, so we do not rethrow.
+    await manager.startBackgroundValidation(getBlock);
+
+    // Record the activation on the context so getchainstates can read
+    // validated / snapshot_blockhash from the snapshot chainstate.
+    this.snapshotChainstateManager = manager;
+
+    const status = manager.getStatus();
+    // Core init.cpp: once the background chainstate finished (every block
+    // genesis -> base connected and the hash matched) and the node is not
+    // pruning, NODE_NETWORK is advertised again.
+    if (
+      status.snapshotValidated &&
+      !this.pruneManager?.isPruneMode() &&
+      !(await snapshotOriginWithoutHistory(this.db, this.params))
+    ) {
+      this.peerManager.addLocalServices?.(ServiceFlags.NODE_NETWORK);
+    }
+    return {
+      coins_loaded: Number(loadResult.coinsLoaded),
+      tip_hash: Buffer.from(loadResult.baseBlockHash).reverse().toString("hex"),
+      base_height: loadResult.baseHeight,
+      base_hash: Buffer.from(loadResult.baseBlockHash).reverse().toString("hex"),
+      path: pathParam,
+      // AssumeUTXO validated state (Core getchainstates.validated): true once
+      // the background chainstate re-derived the same base UTXO hash.
+      validated: status.snapshotValidated,
+    };
+  }
+
+  /**
+   * Activation half of {@link loadTxoutset}: load + content-hash gate, then
+   * point the active chainstate, block index, height index, best header and
+   * download frontier at the snapshot base. Caller holds the exclusive chain
+   * op (Core: ActivateSnapshot under cs_main).
+   */
+  private async loadTxoutsetActivate(
+    manager: ChainstateManager,
+    pathParam: string,
+  ): Promise<Awaited<ReturnType<ChainstateManager["loadSnapshot"]>>> {
     // (1) LOAD-TIME content-hash gate. A malformed snapshot / unrecognized
     //     assumeutxo base / bad content hash throws here and is the rejecter
     //     (Core PopulateAndValidateSnapshot). Map any throw to a JSON-RPC error.
@@ -12390,53 +12470,7 @@ export class RPCServer {
       loadResult.baseHeight,
     );
     this.blockSync?.advanceFrontierPast(loadResult.baseHeight);
-
-    // (2) REAL background dual-chainstate validation (Core AddChainstate +
-    //     MaybeValidateSnapshot). The background validator owns a SEPARATE
-    //     coins store; getBlock(height) reads canonical blocks from the shared
-    //     block store the daemon persisted (Core shares BlockManager across
-    //     chainstates).
-    manager.setBackgroundDataDir(`${this.db.path()}-bgvalidate-${Date.now()}`);
-
-    const getBlock = async (height: number): Promise<Block | null> => {
-      const hash = await this.db.getBlockHashByHeight(height);
-      if (!hash) return null;
-      const raw = await this.db.getBlock(hash);
-      if (!raw) return null;
-      return deserializeBlock(new BufferReader(raw));
-    };
-
-    // Drive the background pass to its terminal verdict. A MISMATCH flips the
-    // snapshot chainstate to INVALID inside startBackgroundValidation (never
-    // silently accepted); per Core's async model the mismatch is surfaced via
-    // the chainstate state, NOT an error from this call, so we do not rethrow.
-    await manager.startBackgroundValidation(getBlock);
-
-    // Record the activation on the context so getchainstates can read
-    // validated / snapshot_blockhash from the snapshot chainstate.
-    this.snapshotChainstateManager = manager;
-
-    const status = manager.getStatus();
-    // Core init.cpp: once the background chainstate finished (every block
-    // genesis -> base connected and the hash matched) and the node is not
-    // pruning, NODE_NETWORK is advertised again.
-    if (
-      status.snapshotValidated &&
-      !this.pruneManager?.isPruneMode() &&
-      !(await snapshotOriginWithoutHistory(this.db, this.params))
-    ) {
-      this.peerManager.addLocalServices?.(ServiceFlags.NODE_NETWORK);
-    }
-    return {
-      coins_loaded: Number(loadResult.coinsLoaded),
-      tip_hash: Buffer.from(loadResult.baseBlockHash).reverse().toString("hex"),
-      base_height: loadResult.baseHeight,
-      base_hash: Buffer.from(loadResult.baseBlockHash).reverse().toString("hex"),
-      path: pathParam,
-      // AssumeUTXO validated state (Core getchainstates.validated): true once
-      // the background chainstate re-derived the same base UTXO hash.
-      validated: status.snapshotValidated,
-    };
+    return loadResult;
   }
 
   /**
