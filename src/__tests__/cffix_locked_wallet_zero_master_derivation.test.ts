@@ -21,6 +21,7 @@ import * as os from "os";
 import * as nodePath from "path";
 import { hmac } from "@noble/hashes/hmac.js";
 import { sha512 } from "@noble/hashes/sha2.js";
+import { pbkdf2 } from "@noble/hashes/pbkdf2.js";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { Wallet, WalletManager, type WalletConfig } from "../wallet/wallet";
 import { RPCServer, type RPCServerDeps, RPCErrorCodes } from "../rpc/server.js";
@@ -42,10 +43,8 @@ function be32(k: bigint): Buffer {
   return Buffer.from(k.toString(16).padStart(64, "0"), "hex");
 }
 
-/** Independent BIP-32 CKDpriv from key=0, chaincode=0 along `path`. */
-function zeroMasterP2WPKH(path: string): string {
-  let k = 0n;
-  let c = Buffer.alloc(32);
+/** Independent BIP-32 CKDpriv from (k, c) along `path`, as a P2WPKH address. */
+function ckdP2WPKH(k: bigint, c: Buffer, path: string): string {
   for (const part of path.slice(2).split("/")) {
     const hardened = part.endsWith("'");
     let index = parseInt(hardened ? part.slice(0, -1) : part, 10);
@@ -65,6 +64,28 @@ function zeroMasterP2WPKH(path: string): string {
   return pubkeyToP2WPKH(Buffer.from(secp256k1.getPublicKey(be32(k), true)), "regtest");
 }
 
+/** Address from the all-zero master (key=0, chaincode=0): what a cleared master gives. */
+function zeroMasterP2WPKH(path: string): string {
+  return ckdP2WPKH(0n, Buffer.alloc(32), path);
+}
+
+/** BIP-32 master from a seed: HMAC-SHA512("Bitcoin seed", seed). */
+function seedP2WPKH(seed: Buffer, path: string): string {
+  const I = Buffer.from(hmac(sha512, Buffer.from("Bitcoin seed"), seed));
+  return ckdP2WPKH(BigInt("0x" + I.subarray(0, 32).toString("hex")), I.subarray(32), path);
+}
+
+/** The wallet's real key at `path`: BIP-39 seed of TEST_MNEMONIC, no passphrase. */
+function realP2WPKH(path: string): string {
+  const seed = Buffer.from(
+    pbkdf2(sha512, Buffer.from(TEST_MNEMONIC), Buffer.from("mnemonic"), { c: 2048, dkLen: 64 })
+  );
+  return seedP2WPKH(seed, path);
+}
+
+const recv = (i: number) => `m/84'/1'/0'/0/${i}`;
+const chg = (i: number) => `m/84'/1'/0'/1/${i}`;
+
 /** Next address, or the error it raised. */
 function next(fn: () => string): { address?: string; error?: Error } {
   try {
@@ -74,80 +95,97 @@ function next(fn: () => string): { address?: string; error?: Error } {
   }
 }
 
+/**
+ * Each locked call must either fail like Core ("Keypool ran out") or return
+ * the wallet's real key for that index. Checked for the pool and one past it.
+ */
+function expectOnlyRealOrRanOut(fn: () => string, path: (i: number) => string): number {
+  let served = 0;
+  for (let i = 0; i <= GAP; i++) {
+    const r = next(fn);
+    if (r.error) {
+      expect(r.error.message).toContain("Keypool ran out");
+      break;
+    }
+    expect(r.address).not.toBe(zeroMasterP2WPKH(path(i)));
+    expect(r.address).toBe(realP2WPKH(path(i)));
+    served++;
+  }
+  return served;
+}
+
+/** A wallet on TEST_MNEMONIC's seed, encrypted (and so locked) with "pw". */
+async function lockedWallet(): Promise<Wallet> {
+  const wallet = Wallet.create(config(), TEST_MNEMONIC);
+  // Keep the mnemonic seed (as WalletManager.createWallet with a passphrase
+  // does) so the real keys can be computed independently.
+  await wallet.encryptWallet("pw", { rotateSeed: false });
+  expect(wallet.isLocked()).toBe(true);
+  return wallet;
+}
+
 describe("cffix: locked wallet never derives from the zeroed master", () => {
   beforeEach(() => mkdirSync(TEST_DATADIR, { recursive: true }));
   afterEach(() => rmSync(TEST_DATADIR, { recursive: true, force: true }));
 
   test("getNewAddress past the pool while locked does not use the zero master", async () => {
-    const wallet = Wallet.create(config(), TEST_MNEMONIC);
-    await wallet.encryptWallet("pw");
-    expect(wallet.isLocked()).toBe(true);
+    const wallet = await lockedWallet();
+    const served = expectOnlyRealOrRanOut(() => wallet.getNewAddress("bech32"), recv);
+    // The pre-derived pool is served while locked; past it, Core fails.
+    expect(served).toBe(GAP);
 
-    const pooled: string[] = [];
-    for (let i = 0; i < GAP; i++) pooled.push(wallet.getNewAddress("bech32"));
-
-    const zero = zeroMasterP2WPKH(`m/84'/1'/0'/0/${GAP}`);
-    const r = next(() => wallet.getNewAddress("bech32"));
-    expect(r.address).not.toBe(zero);
-    if (r.error) {
-      expect(r.error.message).toContain("Keypool ran out");
-    }
-
-    // The pool keys handed out while locked are the wallet's real keys.
+    // The failure did not consume an index: unlocked, the next address is
+    // the real key at index GAP.
     await wallet.unlockWallet("pw", 0);
-    const seen = new Set(pooled);
-    expect(seen.size).toBe(GAP);
-    for (const a of pooled) {
-      expect(wallet.hasAddress(a)).toBe(true);
-      expect(a).not.toBe(zeroMasterP2WPKH(`m/84'/1'/0'/0/${pooled.indexOf(a)}`));
-    }
-    if (r.address) {
-      // If an address was handed out, it is the one the unlocked wallet owns.
-      expect(wallet.hasAddress(r.address)).toBe(true);
-    } else {
-      // Locked failure did not consume an index: unlocked, the next address
-      // is index GAP from the real seed, not from the zero master.
-      const a = wallet.getNewAddress("bech32");
-      expect(a).not.toBe(zero);
-      expect(seen.has(a)).toBe(false);
-    }
+    expect(wallet.getNewAddress("bech32")).toBe(realP2WPKH(recv(GAP)));
   });
 
   test("getChangeAddress past the pool while locked does not use the zero master", async () => {
-    const wallet = Wallet.create(config(), TEST_MNEMONIC);
-    await wallet.encryptWallet("pw");
-    for (let i = 0; i < GAP; i++) wallet.getChangeAddress("bech32");
-
-    const zero = zeroMasterP2WPKH(`m/84'/1'/0'/1/${GAP}`);
-    const r = next(() => wallet.getChangeAddress("bech32"));
-    expect(r.address).not.toBe(zero);
-    if (r.error) {
-      expect(r.error.message).toContain("Keypool ran out");
-    }
+    const wallet = await lockedWallet();
+    const served = expectOnlyRealOrRanOut(() => wallet.getChangeAddress("bech32"), chg);
+    expect(served).toBe(GAP);
   });
 
   test("relocked wallet (walletlock) does not use the zero master either", async () => {
-    const wallet = Wallet.create(config(), TEST_MNEMONIC);
-    await wallet.encryptWallet("pw");
+    const wallet = await lockedWallet();
     await wallet.unlockWallet("pw", 0);
     wallet.lockWallet();
-    for (let i = 0; i < GAP; i++) wallet.getNewAddress("bech32");
-    const zero = zeroMasterP2WPKH(`m/84'/1'/0'/0/${GAP}`);
-    const r = next(() => wallet.getNewAddress("bech32"));
-    expect(r.address).not.toBe(zero);
-    if (r.error) {
-      expect(r.error.message).toContain("Keypool ran out");
-    }
+    expect(wallet.isLocked()).toBe(true);
+    const served = expectOnlyRealOrRanOut(() => wallet.getNewAddress("bech32"), recv);
+    expect(served).toBe(GAP);
   });
 
-  test("independent zero-master derivation is the instrument the test claims", () => {
-    // Negative control for the oracle: it differs from a real seed's address
-    // at the same path, and is deterministic.
+  test("encrypted wallet reloaded from disk (locked) does not derive from an empty seed", async () => {
+    const wallet = await lockedWallet();
+    await wallet.save("filepw");
+    const loaded = await Wallet.load(config(), "filepw");
+    expect(loaded.isLocked()).toBe(true);
+    // Base derived a master from the empty on-disk seed: HMAC("Bitcoin seed", "").
+    const emptySeed = seedP2WPKH(Buffer.alloc(0), recv(0));
+    const r = next(() => loaded.getNewAddress("bech32"));
+    expect(r.address).not.toBe(emptySeed);
+    expectOnlyRealOrRanOut(() => loaded.getChangeAddress("bech32"), chg);
+    if (r.error) {
+      expect(r.error.message).toContain("Keypool ran out");
+    } else {
+      expect(r.address).toBe(realP2WPKH(recv(0)));
+    }
+    // Unlocking restores derivation from the real seed.
+    await loaded.unlockWallet("pw", 0);
+    expect(loaded.getNewAddress("bech32")).toBe(realP2WPKH(recv(0)));
+  });
+
+  test("independent oracles are the instruments the tests claim (control)", () => {
+    // The real-seed oracle reproduces an unlocked wallet's addresses; the
+    // zero- and empty-seed oracles do not.
     const wallet = Wallet.create(config(), TEST_MNEMONIC);
-    const real = wallet.getNewAddress("bech32");
-    expect(real).not.toBe(zeroMasterP2WPKH("m/84'/1'/0'/0/0"));
-    expect(zeroMasterP2WPKH("m/84'/1'/0'/0/0")).toBe(zeroMasterP2WPKH("m/84'/1'/0'/0/0"));
-    expect(zeroMasterP2WPKH("m/84'/1'/0'/0/0").startsWith("bcrt1q")).toBe(true);
+    const a0 = wallet.getNewAddress("bech32");
+    const c0 = wallet.getChangeAddress("bech32");
+    expect(a0).toBe(realP2WPKH(recv(0)));
+    expect(c0).toBe(realP2WPKH(chg(0)));
+    expect(a0).not.toBe(zeroMasterP2WPKH(recv(0)));
+    expect(a0).not.toBe(seedP2WPKH(Buffer.alloc(0), recv(0)));
+    expect(zeroMasterP2WPKH(recv(0)).startsWith("bcrt1q")).toBe(true);
   });
 });
 

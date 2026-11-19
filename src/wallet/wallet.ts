@@ -816,7 +816,11 @@ export class Wallet {
     // field cannot wipe the funds-critical seed/indices that precede it.
     const wallet = new Wallet(config);
     wallet.seed = Buffer.from(data.seed ?? "", "hex");
-    wallet.masterKey = wallet.deriveMasterKey(wallet.seed);
+    // An encrypted wallet is saved with an empty seed. HMAC of an empty seed
+    // is a public master, so leave the master empty until unlockWallet.
+    if (wallet.seed.length > 0) {
+      wallet.masterKey = wallet.deriveMasterKey(wallet.seed);
+    }
 
     // Restore indices - support both new per-type and legacy format
     try {
@@ -1194,7 +1198,10 @@ export class Wallet {
     // lockWallet/encryptWallet zero the master in place, and a wallet loaded
     // locked has an empty one. Deriving from either gives keys anyone can
     // compute, so refuse instead.
-    if (!Wallet.isUsableMaster(master)) {
+    if (
+      !Wallet.isUsableMaster(master) ||
+      (master === this.masterKey && !this.canDeriveFromMaster())
+    ) {
       throw new WalletKeypoolRanOutError();
     }
 
@@ -1442,12 +1449,13 @@ export class Wallet {
   }
 
   /**
-   * True when new keys may be derived from the wallet's own master. Locking
-   * zeroes the master, so this is false whenever the wallet is locked (and
-   * true during unlockWallet once the master is restored).
+   * True when new keys may be derived from the wallet's own master: the seed
+   * is in memory and the master is not the zeroed placeholder. Locking clears
+   * both, so this is false whenever the wallet is locked (and true during
+   * unlockWallet once the seed and master are restored).
    */
   private canDeriveFromMaster(): boolean {
-    return Wallet.isUsableMaster(this.masterKey);
+    return this.seed.length > 0 && Wallet.isUsableMaster(this.masterKey);
   }
 
   /**
