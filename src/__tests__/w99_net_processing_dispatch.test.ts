@@ -424,7 +424,7 @@ describe("G13: Orphan recursive parent-arrival resolution", () => {
 
     // Create a fake parent tx with the right txid by hacking the buffer
     // (we use findChildrenOf directly since we know the txid)
-    const children = pool.findChildrenOf(parentTxid);
+    const children = pool.findChildrenOf(parentTxid, 1);
     expect(children.length).toBe(1);
   });
 });

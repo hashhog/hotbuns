@@ -621,7 +621,7 @@ describe("G19: ProcessOrphan cascade — PASS", () => {
     const parentTx = makeTx(1, 0);
     // Override txid via a helper — onParentAdmitted uses getTxId
     // We can test directly: findChildrenOf the parentTxid
-    const children = pool.findChildrenOf(parentTxid);
+    const children = pool.findChildrenOf(parentTxid, 1);
     expect(children.length).toBe(1);
   });
 
@@ -844,7 +844,7 @@ describe("G25: Recursive orphan resolve — PASS", () => {
     child2.inputs[0].prevOut = { txid: parentHash, vout: 1 };
     pool.add(child1, "p");
     pool.add(child2, "p");
-    const children = pool.findChildrenOf(parentHash);
+    const children = pool.findChildrenOf(parentHash, 2);
     expect(children.length).toBe(2);
   });
 
@@ -855,7 +855,7 @@ describe("G25: Recursive orphan resolve — PASS", () => {
     const tx = makeTx(1, 60);
     tx.inputs[0].prevOut = { txid: hash1, vout: 0 };
     pool.add(tx, "p");
-    expect(pool.findChildrenOf(hash2).length).toBe(0);
+    expect(pool.findChildrenOf(hash2, 1).length).toBe(0);
   });
 });
 
