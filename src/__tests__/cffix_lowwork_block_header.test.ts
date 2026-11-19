@@ -196,6 +196,17 @@ describe("cffix-hotbuns-lowwork-block-header: unrequested low-work block", () =>
     expect(peer.misbehaving).not.toHaveBeenCalled();
   });
 
+  test("control: an unrequested block extending the active tip is still accepted (valid block not refused)", async () => {
+    const tipBlock = active[299];
+    const next = mineBlock(getBlockHash(tipBlock.header), tipBlock.header.timestamp + 600, 301, 11);
+    const peer = mockPeer();
+    await bs.handleBlock(peer, next);
+    const entry = headerSync.getHeader(getBlockHash(next.header));
+    expect(entry).toBeDefined();
+    expect(entry!.height).toBe(301);
+    expect(peer.misbehaving).not.toHaveBeenCalled();
+  });
+
   test("processHeaders(minPowChecked=false) refuses even when chain work is above nMinimumChainWork", async () => {
     const parent = active[199];
     const fork = mineBlock(getBlockHash(parent.header), parent.header.timestamp + 1, 201, 9);
