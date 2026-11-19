@@ -23,10 +23,13 @@
  * chose the file, so the anti-DoS low-work header gate does not apply (an
  * import from genesis would otherwise be refused below nMinimumChainWork).
  *
- * A block whose body fails is not marked invalid in the header index: a
- * corrupted body (bad merkle root) has the same hash as the real block, and
- * Core does not mark a mutated block failed either. The importer stops at the
- * first failure and the tip stays where it was.
+ * A block that fails is not marked invalid in the header index, and the
+ * importer refuses it with the tip unchanged. Core's AcceptBlock marks the
+ * index entry failed (InvalidBlockFound) for every failure except a
+ * BLOCK_MUTATED one, where a tampered body may share the real block's hash.
+ * Not marking is the conservative half of that: the header can stay a
+ * best-header candidate, but nothing connects it without passing these
+ * checks again on the P2P path.
  */
 
 import type { Block } from "../validation/block.js";
