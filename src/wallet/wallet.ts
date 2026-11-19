@@ -162,6 +162,19 @@ export class Bip32InvalidChildError extends Error {
 }
 
 /**
+ * The wallet is locked and the pre-derived pool for the requested chain is
+ * used up. Core: DescriptorScriptPubKeyMan::TopUp cannot derive hardened keys
+ * while locked, so GetNewDestination fails with "Keypool ran out"
+ * (RPC_WALLET_KEYPOOL_RAN_OUT, wallet/rpc/addresses.cpp).
+ */
+export class WalletKeypoolRanOutError extends Error {
+  constructor() {
+    super("Error: Keypool ran out, please call keypoolrefill first");
+    this.name = "WalletKeypoolRanOutError";
+  }
+}
+
+/**
  * Pure BIP-32 CKD-priv math given a precomputed HMAC-SHA512 output `I`
  * (64 bytes). Throws `Bip32InvalidChildError` on the spec-mandated skip cases
  * (parse256(IL) >= n  OR  k_i == 0). Exported for unit testing the retry
@@ -1178,6 +1191,12 @@ export class Wallet {
     if (!path.startsWith("m/")) {
       throw new Error(`Invalid path format: ${path}`);
     }
+    // lockWallet/encryptWallet zero the master in place, and a wallet loaded
+    // locked has an empty one. Deriving from either gives keys anyone can
+    // compute, so refuse instead.
+    if (!Wallet.isUsableMaster(master)) {
+      throw new WalletKeypoolRanOutError();
+    }
 
     const parts = path.slice(2).split("/");
     let currentKey = master.key;
@@ -1360,6 +1379,8 @@ export class Wallet {
    * Maintains a gap of ADDRESS_GAP addresses ahead of the last used.
    */
   private pregenerateAddresses(): void {
+    // Locked: no master to derive from (Core's TopUp is a no-op when locked).
+    if (!this.canDeriveFromMaster()) return;
     const addressTypes = [
       AddressType.P2PKH,
       AddressType.P2SH,
@@ -1397,13 +1418,48 @@ export class Wallet {
    * Check if we have a key for a given path.
    */
   private hasKeyForPath(path: string): boolean {
+    return this.keyForPath(path) !== undefined;
+  }
+
+  /** The current seed's key at `path`, if already derived. */
+  private keyForPath(path: string): WalletKey | undefined {
     for (const key of this.keys.values()) {
       // A retired seed's key at the same path is a different key.
       if (key.path === path && !key.retired) {
-        return true;
+        return key;
       }
     }
-    return false;
+    return undefined;
+  }
+
+  /** A master key that is present and not the zeroed/empty placeholder. */
+  private static isUsableMaster(master: { key: Buffer; chainCode: Buffer }): boolean {
+    return (
+      master.key.length === 32 &&
+      master.chainCode.length === 32 &&
+      master.key.some((b) => b !== 0)
+    );
+  }
+
+  /**
+   * True when new keys may be derived from the wallet's own master. Locking
+   * zeroes the master, so this is false whenever the wallet is locked (and
+   * true during unlockWallet once the master is restored).
+   */
+  private canDeriveFromMaster(): boolean {
+    return Wallet.isUsableMaster(this.masterKey);
+  }
+
+  /**
+   * Key at `path`: derived when the master is available, otherwise taken from
+   * the pre-derived pool. A locked wallet whose pool is used up fails like
+   * Core's keypool-ran-out and does not consume the index.
+   */
+  private keyForNextPath(path: string, addressType: AddressType): WalletKey {
+    if (this.canDeriveFromMaster()) return this.deriveKey(path, addressType);
+    const pooled = this.keyForPath(path);
+    if (pooled === undefined) throw new WalletKeypoolRanOutError();
+    return pooled;
   }
 
   /**
@@ -1453,7 +1509,7 @@ export class Wallet {
     const addressType = Wallet.walletAddressTypeToEnum(type);
     const index = this.nextReceiveIndex.get(addressType) ?? 0;
     const path = this.getReceivePath(index, addressType);
-    const key = this.deriveKey(path, addressType);
+    const key = this.keyForNextPath(path, addressType);
     this.keys.set(key.address, key);
     this.nextReceiveIndex.set(addressType, index + 1);
 
@@ -1471,7 +1527,7 @@ export class Wallet {
     const addressType = Wallet.walletAddressTypeToEnum(type);
     const index = this.nextChangeIndex.get(addressType) ?? 0;
     const path = this.getChangePath(index, addressType);
-    const key = this.deriveKey(path, addressType);
+    const key = this.keyForNextPath(path, addressType);
     this.keys.set(key.address, key);
     this.nextChangeIndex.set(addressType, index + 1);
 
