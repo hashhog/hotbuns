@@ -242,6 +242,27 @@ export function isTerrible(e: AddrInfo, now: number): boolean {
   return false;
 }
 
+/**
+ * getChance mirrors Core AddrInfo::GetChance (addrman.cpp): an entry tried in
+ * the last 10 minutes is deprioritised 100x, and each failed attempt (capped
+ * at 8) multiplies the chance by 0.66. now is unix seconds.
+ */
+export function getChance(e: AddrInfo, now: number): number {
+  let chance = 1.0;
+  if (now - e.lastTry < 10 * 60) chance *= 0.01;
+  chance *= Math.pow(0.66, Math.min(e.attempts, 8));
+  return chance;
+}
+
+/**
+ * Random (bucket, position) draws {@link AddrMan.select} makes before falling
+ * back to a bounded scan. Core's Select_ loop is unbounded; with the chance
+ * factor growing 1.2x per refusal it accepts within a few dozen draws, and an
+ * empty-bucket miss costs one 64-slot walk, so this cap is only reached on a
+ * near-empty table.
+ */
+const SELECT_MAX_RANDOM_DRAWS = 4096;
+
 // ---------------------------------------------------------------------------
 // AddrMan — the full Core CAddrMan: NEW/TRIED id-tables + maps + salt.
 // ---------------------------------------------------------------------------
@@ -647,6 +668,34 @@ export class AddrMan {
 
     const table = searchTried ? this.vvTried : this.vvNew;
     const bucketCount = searchTried ? ADDRMAN_TRIED_BUCKET_COUNT : ADDRMAN_NEW_BUCKET_COUNT;
+
+    // Core Select_ (addrman.cpp): pick a random bucket and a random initial
+    // position, walk that ONE bucket from there; an entirely empty bucket
+    // restarts with a fresh random bucket. The entry found is returned with
+    // probability chance_factor * GetChance(), and chance_factor grows by 1.2
+    // on every refusal. This makes every non-empty bucket equally likely, so
+    // a source confined to its 64 new buckets cannot crowd out the rest.
+    // Core loops without bound; we cap the draws and fall back to the
+    // deterministic-start scan below so select() always terminates.
+    const nowSec = Math.floor(Date.now() / 1000);
+    let chanceFactor = 1.0;
+    for (let draw = 0; draw < SELECT_MAX_RANDOM_DRAWS; draw++) {
+      const bucket = this.rng.range(bucketCount);
+      const initial = this.rng.range(ADDRMAN_BUCKET_SIZE);
+      let found: AddrInfo | undefined;
+      for (let i = 0; i < ADDRMAN_BUCKET_SIZE; i++) {
+        const id = table[bucket]![(initial + i) % ADDRMAN_BUCKET_SIZE]!;
+        if (id !== EMPTY) {
+          found = this.mapInfo.get(id);
+          if (found) break;
+        }
+      }
+      if (!found) continue; // empty bucket: start over
+      if (this.rng.next() / 0x1_0000_0000 < chanceFactor * getChance(found, nowSec)) {
+        return found;
+      }
+      chanceFactor *= 1.2;
+    }
 
     const startBucket = this.rng.range(bucketCount);
     const initialPos = this.rng.range(ADDRMAN_BUCKET_SIZE);
