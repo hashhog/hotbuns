@@ -459,6 +459,11 @@ export class AddrMan {
     return this.mapInfo.size;
   }
   /** Whether addr is in the tried table. */
+  /** Whether the manager holds host:port in either table (Core Find != null). */
+  has(host: string, port: number): boolean {
+    return this.find(host, port) !== EMPTY;
+  }
+
   isInTried(host: string, port: number): boolean {
     const id = this.find(host, port);
     if (id === EMPTY) return false;

@@ -3072,7 +3072,7 @@ export class PeerManager {
     if (candidates.length < limit) {
       const rest: Array<[string, PeerInfo]> = [];
       for (const [key, info] of this.knownAddresses) {
-        if (seen.has(key) || this.addrMan.findAddressEntry(info.host, info.port)) continue;
+        if (seen.has(key) || this.addrMan.has(info.host, info.port)) continue;
         if (eligible(key, info)) rest.push([key, info]);
       }
       for (let i = rest.length - 1; i > 0; i--) {
