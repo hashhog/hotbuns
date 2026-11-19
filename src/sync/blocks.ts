@@ -132,6 +132,12 @@ export function classifyCallbackError(
     "bad-txns",
     "bad-blk",
     "bad-cb-amount",
+    // validateBlock's CheckBlock / ContextualCheckBlock(Header) rejects
+    // (Core BLOCK_CONSENSUS): bad-cb-height / -missing / -multiple / -length,
+    // the nVersion floors, and the block weight limit.
+    "bad-cb-",
+    "bad-version(",
+    "block weight exceeds maximum",
     "pays too much",
     "non-final",
     "bad sigops",
@@ -5156,6 +5162,33 @@ export class BlockSync {
       try {
         intermBlock = deserializeBlock(new BufferReader(rawBlock));
       } catch {
+        return false;
+      }
+      // CheckBlock + ContextualCheckBlock at the intermediate's own height
+      // (coinbase placement/length, merkle, CheckTransaction incl. duplicate
+      // inputs, witness commitment, block weight, nVersion floors, BIP34
+      // coinbase height). Core runs both in AcceptBlock before a body is ever
+      // stored and re-runs CheckBlock first in ConnectBlock, so every block
+      // ConnectTip connects in ActivateBestChainStep has passed them. hotbuns
+      // stores side-branch bodies after only the receipt mutation check, so
+      // without this a heavier fork whose middle block breaks one of these
+      // rules was connected. (IsFinalTx, the MTP half of ContextualCheckBlock,
+      // runs inside coreConnectBlockChecks with intermPrevMTP below.)
+      const intermCheck = validateBlock(intermBlock, intermediate.height, this.params);
+      if (!intermCheck.valid) {
+        const error = intermCheck.error ?? "bad-blk";
+        console.warn(
+          `[reorg] intermediate block ${intermediate.hash.toString("hex").slice(0, 16)} at height ${intermediate.height} failed validation: ${error}`
+        );
+        // Same verdict rule as a connect failure below: a mutated body is not
+        // a verdict on the block (Core BLOCK_MUTATED), anything else is.
+        if (isInvalidBlockVerdict(error)) {
+          this.reorgInvalidIntermediate = {
+            hash: intermediate.hash,
+            height: intermediate.height,
+            error,
+          };
+        }
         return false;
       }
       // Get prevMTP for the intermediate block.
