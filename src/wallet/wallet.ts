@@ -3994,7 +3994,10 @@ export class Wallet {
     }
 
     if (!this.encryption.isLocked) {
-      // Already unlocked - just reset the timeout
+      // Already unlocked. Core's CWallet::Unlock still decrypts with the
+      // given passphrase and fails on mismatch, so check it before only
+      // resetting the timeout.
+      (await this.decryptSeedWithPassphrase(passphrase)).fill(0);
       if (this.encryption.unlockTimeout) {
         clearTimeout(this.encryption.unlockTimeout);
         this.encryption.unlockTimeout = null;
@@ -4008,25 +4011,7 @@ export class Wallet {
       return;
     }
 
-    if (!this.encryption.encryptedSeed || !this.encryption.encryptionSalt || !this.encryption.encryptionIV) {
-      throw new Error("Wallet encryption state is invalid.");
-    }
-
-    // Derive encryption key
-    const key = await this.deriveEncryptionKey(passphrase, this.encryption.encryptionSalt);
-
-    // Try to decrypt the seed
-    let decryptedSeed: Buffer;
-    try {
-      decryptedSeed = this.decryptAES256CBC(this.encryption.encryptedSeed, key, this.encryption.encryptionIV);
-    } catch {
-      throw new Error("Incorrect passphrase.");
-    }
-
-    // Verify the seed is valid (64 bytes for BIP-39)
-    if (decryptedSeed.length !== 64) {
-      throw new Error("Incorrect passphrase.");
-    }
+    const decryptedSeed = await this.decryptSeedWithPassphrase(passphrase);
 
     // Restore the seed
     this.seed = decryptedSeed;
@@ -4049,6 +4034,44 @@ export class Wallet {
         this.lockWallet();
       }, timeout * 1000);
     }
+  }
+
+  /**
+   * Decrypt the stored seed with `passphrase`, throwing "Incorrect
+   * passphrase." on mismatch. Does not change wallet state. When the wallet
+   * is unlocked the result must also equal the in-memory seed, so a stale or
+   * foreign ciphertext cannot pass the check.
+   */
+  private async decryptSeedWithPassphrase(passphrase: string): Promise<Buffer> {
+    if (!this.encryption.encryptedSeed || !this.encryption.encryptionSalt || !this.encryption.encryptionIV) {
+      throw new Error("Wallet encryption state is invalid.");
+    }
+
+    const key = await this.deriveEncryptionKey(passphrase, this.encryption.encryptionSalt);
+
+    let decryptedSeed: Buffer;
+    try {
+      decryptedSeed = this.decryptAES256CBC(this.encryption.encryptedSeed, key, this.encryption.encryptionIV);
+    } catch {
+      throw new Error("Incorrect passphrase.");
+    }
+
+    // The seed is 64 bytes (BIP-39); anything else is a wrong passphrase.
+    if (decryptedSeed.length !== 64) {
+      decryptedSeed.fill(0);
+      throw new Error("Incorrect passphrase.");
+    }
+
+    if (!this.encryption.isLocked) {
+      const match =
+        this.seed.length === 64 && crypto.timingSafeEqual(decryptedSeed, this.seed);
+      if (!match) {
+        decryptedSeed.fill(0);
+        throw new Error("Incorrect passphrase.");
+      }
+    }
+
+    return decryptedSeed;
   }
 
   /**
@@ -4103,6 +4126,10 @@ export class Wallet {
     const wasLocked = this.encryption.isLocked;
     if (wasLocked) {
       await this.unlockWallet(oldPassphrase, 0);
+    } else {
+      // Core's CWallet::ChangeWalletPassphrase checks the old passphrase
+      // whatever the lock state; an unlocked wallet is no exception.
+      (await this.decryptSeedWithPassphrase(oldPassphrase)).fill(0);
     }
 
     // Generate new salt and IV
