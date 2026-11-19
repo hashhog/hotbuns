@@ -2501,6 +2501,61 @@ export class Mempool {
       };
     }
 
+    // 9a. Check TRUC (v3) policy rules.
+    //
+    // Core runs SingleTRUCChecks at the end of PreChecks, BEFORE
+    // ReplacementChecks (validation.cpp). On a sibling-eviction verdict it adds
+    // the sibling to ws.m_conflicts and sets m_sibling_eviction, so the
+    // sibling is replaced under the full RBF rules below (Rule #5, PaysForRBF
+    // Rules #3/#4, cluster limit, ImprovesFeerateDiagram), not a bare
+    // fee > sibling.fee test that let each replacement cost 1 sat.
+    let siblingEviction = false;
+    const trucResult = this.checkTRUCPolicy(
+      tx,
+      vsize,
+      parentTxids,
+      conflicts,
+      isReplacement
+    );
+    if (!trucResult.valid) {
+      // If sibling eviction is possible, add the sibling to conflicts
+      if (trucResult.siblingToEvict) {
+        // Sibling eviction: v3 child can replace existing v3 child
+        const siblingEntry = this.entries.get(trucResult.siblingToEvict);
+        if (siblingEntry) {
+          // In a package the RBF block below is skipped (package RBF runs on
+          // the package instead), so keep the absolute-fee floor there.
+          if (inPackage && fee <= siblingEntry.fee) {
+            return {
+              accepted: false,
+              error: `TRUC sibling eviction requires higher fee: ${fee} <= ${siblingEntry.fee}`,
+            };
+          }
+
+          // Add the sibling (and, generally, its descendants: Core's
+          // GetEntriesForConflicts walks them) to the eviction list.
+          const siblingHex = siblingEntry.txid.toString("hex");
+          const evicting = new Set<string>(conflictsToEvict.map((e) => e.txid.toString("hex")));
+          for (const h of [siblingHex, ...this.getDescendantSet(siblingHex)]) {
+            if (evicting.has(h)) continue;
+            const e = this.entries.get(h);
+            if (!e) continue;
+            evicting.add(h);
+            conflictsToEvict.push(e);
+            totalConflictingFee += e.fee;
+            totalConflictingVsize += e.vsize;
+          }
+          // Core inserts the sibling into m_iters_conflicting, so Rule #5
+          // counts its cluster among the direct conflicts' clusters.
+          conflictingClusterCount = this.uniqueClusterCount([...conflicts, siblingEntry]);
+          isReplacement = true;
+          siblingEviction = true;
+        }
+      } else {
+        return { accepted: false, error: trucResult.error };
+      }
+    }
+
     // RBF replacement checks (BIP 125 Rule #2, #3, #4). In a package Core
     // runs PackageRBFChecks on the whole package instead (validation.cpp:1515).
     if (isReplacement && !inPackage) {
@@ -2568,7 +2623,9 @@ export class Mempool {
       // Five clusters of 21 txs (105 evictions) is five, and is allowed.
       if (conflictingClusterCount > MAX_REPLACEMENT_CANDIDATES) {
         return rbfReject(
-          "too many potential replacements",
+          siblingEviction
+            ? "too many potential replacements (including sibling eviction)"
+            : "too many potential replacements",
           `rejecting replacement ${displayTxidHex(txid)}; too many conflicting clusters (${conflictingClusterCount} > ${MAX_REPLACEMENT_CANDIDATES})`,
         );
       }
@@ -2579,6 +2636,12 @@ export class Mempool {
       // Core ReplacementChecks: TX_RECONSIDERABLE "insufficient fee" with
       // PaysForRBF's text, so a package can retry it with its child.
       if (fee < totalConflictingFee) {
+        if (siblingEviction) {
+          return rbfReject(
+            "insufficient fee (including sibling eviction)",
+            `rejecting replacement ${displayTxidHex(txid)}, less fees than conflicting txs; ${formatMoney(fee)} < ${formatMoney(totalConflictingFee)}`,
+          );
+        }
         return {
           accepted: false,
           error: `insufficient fee: rejecting replacement ${Buffer.from(txid).reverse().toString("hex")}, less fees than conflicting txs; ${formatMoney(fee)} < ${formatMoney(totalConflictingFee)}`, // BIP-125 Rule 3
@@ -2591,6 +2654,12 @@ export class Mempool {
       const additionalFee = fee - totalConflictingFee;
       const requiredIncrementalFee = BigInt(Math.ceil(this.incrementalRelayFee * vsize));
       if (additionalFee < requiredIncrementalFee) {
+        if (siblingEviction) {
+          return rbfReject(
+            "insufficient fee (including sibling eviction)",
+            `rejecting replacement ${displayTxidHex(txid)}, not enough additional fees to relay; ${formatMoney(additionalFee)} < ${formatMoney(requiredIncrementalFee)}`,
+          );
+        }
         return {
           accepted: false,
           error: `RBF incremental fee ${additionalFee} < required ${requiredIncrementalFee} (${this.incrementalRelayFee} sat/vB * ${vsize} vB) (BIP-125 Rule 4)`,
@@ -2635,41 +2704,7 @@ export class Mempool {
       }
     }
 
-    // 9a. Check TRUC (v3) policy rules
-    const trucResult = this.checkTRUCPolicy(
-      tx,
-      vsize,
-      parentTxids,
-      conflicts,
-      isReplacement
-    );
-    if (!trucResult.valid) {
-      // If sibling eviction is possible, add the sibling to conflicts
-      if (trucResult.siblingToEvict) {
-        // Sibling eviction: v3 child can replace existing v3 child
-        const siblingEntry = this.entries.get(trucResult.siblingToEvict);
-        if (siblingEntry) {
-          // For sibling eviction, we allow replacement without normal RBF fee-rate rules
-          // Just need to pay higher absolute fee
-          if (fee <= siblingEntry.fee) {
-            return {
-              accepted: false,
-              error: `TRUC sibling eviction requires higher fee: ${fee} <= ${siblingEntry.fee}`,
-            };
-          }
-
-          // Add sibling to eviction list
-          if (!conflictsToEvict.some((e) => e.txid.toString("hex") === trucResult.siblingToEvict)) {
-            conflictsToEvict.push(siblingEntry);
-            totalConflictingFee += siblingEntry.fee;
-            totalConflictingVsize += siblingEntry.vsize;
-            isReplacement = true;
-          }
-        }
-      } else {
-        return { accepted: false, error: trucResult.error };
-      }
-    }
+    // (9a. TRUC policy runs before the RBF block above, as in Core PreChecks.)
 
     // 9b. Cluster limits — the ONLY general mempool topology bound.
     //
