@@ -467,6 +467,13 @@ export type ConnectionType = "full_relay" | "block_relay" | "inbound" | "feeler"
 export const FEELER_INTERVAL_MS = 120_000;
 
 /**
+ * addrman Select() draws per outbound slot in {@link PeerManager}'s candidate
+ * selection. Core ThreadOpenConnections tries up to 100 Select() results per
+ * connection attempt before giving up for that round (net.cpp).
+ */
+export const CANDIDATE_DRAWS_PER_SLOT = 100;
+
+/**
  * Maximum number of in-flight feeler connections.
  *
  * Core net.h `MAX_FEELER_CONNECTIONS = 1` — only one feeler probe is ever in
@@ -1445,7 +1452,10 @@ export class PeerManager {
       for (const ip of addresses) {
         const key = `${ip}:${this.config.params.defaultPort}`;
         if (!this.knownAddresses.has(key)) {
-          this.knownAddresses.set(key, {
+          // addKnownAddress (cap + addrman mirror), as Core adds seed results
+          // to addrman (ThreadDNSAddressSeed addrman.Add), so outbound
+          // Select() draws them alongside relayed addresses.
+          this.addKnownAddress(key, {
             host: ip,
             port: this.config.params.defaultPort,
             // Conservative baseline: assume full-node + segwit only.
@@ -1463,7 +1473,7 @@ export class PeerManager {
       for (const { host, port } of fallbacks) {
         const key = `${host}:${port}`;
         if (!this.knownAddresses.has(key)) {
-          this.knownAddresses.set(key, {
+          this.addKnownAddress(key, {
             host,
             port,
             // Conservative baseline: assume full-node + segwit only.
@@ -2901,10 +2911,11 @@ export class PeerManager {
    * real TRIED table to promote into via {@link AddrMan.good}.
    *
    * Only IPv4/IPv6 literals (and routable ones) are mirrored — addrman.add
-   * itself drops non-routable. `source` defaults to the address itself when the
-   * advertising peer is unknown (Core uses the relaying peer as the source
-   * group; we approximate with self-source, which still spreads NEW buckets by
-   * the address group).
+   * itself drops non-routable. `source` is the relaying peer's host for addresses
+   * learned from addr/addrv2 (Core AddrMan::Add(vAddr, pfrom.addr): the NEW
+   * bucket is keyed by group(source), so one sender is confined to
+   * ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP buckets). It defaults to the address
+   * itself for locally injected entries (fixed seeds, RPC addpeeraddress).
    */
   private mirrorToAddrMan(info: PeerInfo, source?: string): void {
     // The bucketed addrman keys on host literals; only mirror IP-literal
@@ -3001,8 +3012,28 @@ export class PeerManager {
   }
 
   /**
-   * Get candidate addresses for connection, sorted by preference.
-   * Prefers peers with NODE_WITNESS, recently seen, low ban scores.
+   * Get candidate addresses for outbound connection.
+   *
+   * Each candidate is DRAWN from the bucketed {@link addrMan} with
+   * {@link AddrMan.select} — Core ThreadOpenConnections calls
+   * addrman.Select() once per attempt (net.cpp), which picks the new or tried
+   * table at random, then a random bucket and position, with a GetChance()
+   * quality factor. New-table placement is keyed by the advertising peer's
+   * source group (GetNewBucket), so one addr sender reaches at most 64 of the
+   * 1024 new buckets however many addresses it sends or however it stamps
+   * them. Nothing peer-supplied (lastSeen, services) decides WHICH addresses
+   * are drawn.
+   *
+   * (Before cffix-hotbuns-outbound-addr-selection this sorted the flat
+   * {@link knownAddresses} map by services and then by the peer-supplied
+   * `lastSeen`, accepted up to now+600 s, and returned the top N: one peer
+   * advertising its own addresses stamped in the future filled every
+   * outbound slot.)
+   *
+   * Entries not mirrored into the addrman (non-IP-literal networks: TorV3,
+   * I2P, CJDNS and addrv2 IPv6 stored as hex, see {@link mirrorToAddrMan})
+   * are only used when the addrman draw cannot fill `limit`, in uniformly
+   * random order.
    *
    * BUG-5 (W117): filters out peers whose network is unreachable in the
    * current configuration so we never hand a hex-encoded TorV3 / I2P /
@@ -3021,25 +3052,22 @@ export class PeerManager {
   private getCandidateAddresses(limit: number): PeerInfo[] {
     const now = Date.now();
     const candidates: PeerInfo[] = [];
+    const seen = new Set<string>();
 
-    for (const [key, info] of this.knownAddresses) {
+    const eligible = (key: string, info: PeerInfo): boolean => {
       // Skip already connected or connecting
       if (this.peers.has(key) || this.connectingPeers.has(key)) {
-        continue;
+        return false;
       }
 
       // Skip banned peers (check both local score and ban manager)
       if (info.banScore >= 100 || this.banManager.isBanned(info.host)) {
-        continue;
+        return false;
       }
 
       // Skip recently failed connections (wait at least 5 minutes)
       if (info.lastConnected > 0 && now - info.lastConnected < 300_000) {
-        const peer = this.peers.get(key);
-        if (!peer) {
-          // Recently tried but not connected - skip
-          continue;
-        }
+        return false;
       }
 
       // BUG-5: Network reachability filter.  Without it,
@@ -3047,42 +3075,69 @@ export class PeerManager {
       // entries whose `host` is a 32-char hex blob, and connectPeer would
       // then pass that string straight to Bun.connect → instant failure.
       if (this.resolveDialable(info) === null) {
-        continue;
+        return false;
       }
-
       // Core net.cpp ThreadOpenConnections: no automatic outbound connection
       // to an IPv4/IPv6 address on a well-known service port (IsBadPort).
       if (isIPNetworkPeerInfo(info) && isBadPort(info.port)) {
-        continue;
+        return false;
       }
+      return true;
+    };
 
+    // Draw from the addrman. Core allows up to 100 Select() calls per slot
+    // before giving up for this round; stop early once every addrman entry
+    // has been seen (a small table would otherwise burn every draw on
+    // repeats).
+    const addrmanSize = this.addrMan.size();
+    const maxDraws = limit * CANDIDATE_DRAWS_PER_SLOT;
+    for (let draw = 0; draw < maxDraws && candidates.length < limit; draw++) {
+      if (seen.size >= addrmanSize) break;
+      const picked = this.addrMan.select(false);
+      if (!picked) break;
+      const key = `${picked.host}:${picked.port}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const info = this.knownAddresses.get(key);
+      if (!info || !eligible(key, info)) continue;
       candidates.push(info);
     }
 
-    // Sort by preference: NODE_WITNESS > recent lastSeen > low banScore
+    // Fallback for entries the addrman does not hold (non-IP-literal
+    // networks): uniform random order, never a sort on peer-supplied fields.
+    if (candidates.length < limit) {
+      const rest: Array<[string, PeerInfo]> = [];
+      for (const [key, info] of this.knownAddresses) {
+        if (seen.has(key) || this.addrMan.has(info.host, info.port)) continue;
+        if (eligible(key, info)) rest.push([key, info]);
+      }
+      for (let i = rest.length - 1; i > 0; i--) {
+        const j = this.secureRandInt(i + 1);
+        [rest[i], rest[j]] = [rest[j]!, rest[i]!];
+      }
+      for (const [, info] of rest) {
+        if (candidates.length >= limit) break;
+        candidates.push(info);
+      }
+    }
+
+    // Order the drawn set (membership is already fixed) so that within it
+    // the fill loop dials full-service peers first. A stable sort keeps the
+    // random draw order among equals.
     candidates.sort((a, b) => {
       // Prefer NODE_WITNESS
       const aWitness = (a.services & ServiceFlags.NODE_WITNESS) !== 0n;
       const bWitness = (b.services & ServiceFlags.NODE_WITNESS) !== 0n;
-      if (aWitness && !bWitness) return -1;
-      if (!aWitness && bWitness) return 1;
+      if (aWitness !== bWitness) return aWitness ? -1 : 1;
 
       // Prefer NODE_NETWORK
       const aNetwork = (a.services & ServiceFlags.NODE_NETWORK) !== 0n;
       const bNetwork = (b.services & ServiceFlags.NODE_NETWORK) !== 0n;
-      if (aNetwork && !bNetwork) return -1;
-      if (!aNetwork && bNetwork) return 1;
-
-      // Prefer lower ban score
-      if (a.banScore !== b.banScore) {
-        return a.banScore - b.banScore;
-      }
-
-      // Prefer more recently seen
-      return b.lastSeen - a.lastSeen;
+      if (aNetwork !== bNetwork) return aNetwork ? -1 : 1;
+      return 0;
     });
 
-    return candidates.slice(0, limit);
+    return candidates;
   }
 
   /**
@@ -3302,7 +3357,7 @@ export class PeerManager {
    * Mirrors the {@link markV1Only} cap pattern (drop-on-overflow) already used
    * for `v1OnlyCache`.
    */
-  private addKnownAddress(key: string, info: PeerInfo): void {
+  private addKnownAddress(key: string, info: PeerInfo, sourceHost?: string): void {
     // Core AddrManImpl::AddSingle: `if (!addr.IsRoutable()) return false;`
     // This is the shared insertion point for addr, addrv2 and seed learning,
     // so a peer cannot make us store (and later dial) loopback, RFC1918,
@@ -3317,7 +3372,7 @@ export class PeerManager {
     // real NEW table to draw from and a real TRIED table to promote into. The
     // live getaddr/outbound path still reads knownAddresses; this keeps the two
     // in sync without changing the live store's behaviour.
-    this.mirrorToAddrMan(info);
+    this.mirrorToAddrMan(info, sourceHost);
   }
 
   /**
@@ -3496,7 +3551,7 @@ export class PeerManager {
           banScore: 0,
           lastConnected: 0,
           networkId: BIP155Network.IPV4,
-        });
+        }, peer.host);
       }
     }
     return relayable;
@@ -3556,7 +3611,7 @@ export class PeerManager {
       } else {
         const peerInfo = this.addrV2ToPeerInfo(entry.addr, ts);
         if (peerInfo) {
-          this.addKnownAddress(key, peerInfo);
+          this.addKnownAddress(key, peerInfo, peer.host);
         }
       }
     }
