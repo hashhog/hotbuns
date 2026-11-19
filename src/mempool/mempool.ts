@@ -2623,7 +2623,9 @@ export class Mempool {
       // Five clusters of 21 txs (105 evictions) is five, and is allowed.
       if (conflictingClusterCount > MAX_REPLACEMENT_CANDIDATES) {
         return rbfReject(
-          `too many potential replacements${siblingEviction ? " (including sibling eviction)" : ""}`,
+          siblingEviction
+            ? "too many potential replacements (including sibling eviction)"
+            : "too many potential replacements",
           `rejecting replacement ${displayTxidHex(txid)}; too many conflicting clusters (${conflictingClusterCount} > ${MAX_REPLACEMENT_CANDIDATES})`,
         );
       }
