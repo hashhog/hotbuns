@@ -16,11 +16,16 @@
  */
 
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { rmSync, mkdirSync } from "fs";
+import { rmSync, mkdirSync, mkdtempSync } from "fs";
+import * as os from "os";
+import * as nodePath from "path";
 import { hmac } from "@noble/hashes/hmac.js";
 import { sha512 } from "@noble/hashes/sha2.js";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
-import { Wallet, type WalletConfig } from "../wallet/wallet";
+import { Wallet, WalletManager, type WalletConfig } from "../wallet/wallet";
+import { RPCServer, type RPCServerDeps, RPCErrorCodes } from "../rpc/server.js";
+import { startTestRpc } from "../test/rpc-listen.js";
+import { REGTEST } from "../consensus/params.js";
 import { pubkeyToP2WPKH } from "../address/encoding";
 
 const TEST_DATADIR = "/tmp/hotbuns-cffix-locked-zero-master-test";
@@ -143,5 +148,68 @@ describe("cffix: locked wallet never derives from the zeroed master", () => {
     expect(real).not.toBe(zeroMasterP2WPKH("m/84'/1'/0'/0/0"));
     expect(zeroMasterP2WPKH("m/84'/1'/0'/0/0")).toBe(zeroMasterP2WPKH("m/84'/1'/0'/0/0"));
     expect(zeroMasterP2WPKH("m/84'/1'/0'/0/0").startsWith("bcrt1q")).toBe(true);
+  });
+});
+
+// RPC: getnewaddress past the pool on a locked wallet is Core's -12.
+describe("cffix: getnewaddress RPC on a locked wallet", () => {
+  let server: RPCServer;
+  let port: number;
+  let caseDir: string;
+
+  beforeEach(async () => {
+    caseDir = mkdtempSync(nodePath.join(os.tmpdir(), "hotbuns-cffix-locked-rpc-"));
+    mkdirSync(`${caseDir}/wallets`, { recursive: true });
+    const manager = new WalletManager(caseDir, "regtest");
+    await manager.createWallet("default", {});
+    const wallet = manager.getWallet("default")!;
+    await wallet.encryptWallet("pw");
+    const chain = {
+      getBestBlock: () => ({ hash: Buffer.alloc(32, 0), height: 0, chainWork: 0n }),
+      getUTXOManager: () => ({ async getUTXOAsync() { return null; } }),
+    };
+    const deps: RPCServerDeps = {
+      chainState: chain as any,
+      mempool: {} as any,
+      peerManager: { getConnectedPeers: () => [], broadcast() {} } as any,
+      feeEstimator: {} as any,
+      headerSync: {} as any,
+      db: {} as any,
+      params: REGTEST,
+      walletManager: manager,
+    };
+    const started = startTestRpc(deps);
+    server = started.server;
+    port = started.port;
+  });
+
+  afterEach(() => {
+    server.stop();
+    try {
+      rmSync(caseDir, { recursive: true, force: true });
+    } catch {
+      /* persist may still be flushing */
+    }
+  });
+
+  async function rpc(method: string, params: unknown[] = []): Promise<any> {
+    const r = await fetch(`http://127.0.0.1:${port}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    });
+    return r.json();
+  }
+
+  test("pool addresses are served, then -12 Keypool ran out, never the zero-master address", async () => {
+    for (let i = 0; i < GAP; i++) {
+      const r = await rpc("getnewaddress", []);
+      expect(r.error ?? null).toBeNull();
+      expect(r.result).not.toBe(zeroMasterP2WPKH(`m/84'/1'/0'/0/${i}`));
+    }
+    const r = await rpc("getnewaddress", []);
+    expect(r.result ?? null).not.toBe(zeroMasterP2WPKH(`m/84'/1'/0'/0/${GAP}`));
+    expect(r.error?.code).toBe(RPCErrorCodes.WALLET_KEYPOOL_RAN_OUT);
+    expect(r.error?.message).toBe("Error: Keypool ran out, please call keypoolrefill first");
   });
 });
