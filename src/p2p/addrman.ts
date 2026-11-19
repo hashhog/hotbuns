@@ -37,6 +37,7 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
+import { isRoutableIP16 } from "./netbase.js";
 
 import { getNetGroup } from "./manager.js";
 
@@ -507,6 +508,12 @@ export class AddrMan {
     now: number = Math.floor(Date.now() / 1000),
     rawAddr?: Buffer,
   ): boolean {
+    // Core AddrManImpl::AddSingle: `if (!addr.IsRoutable()) return false;`
+    // One check here covers addr, addrv2, seeds and peers.dat reload. Hosts
+    // with no IP form (Tor/I2P/CJDNS, keyed by rawAddr) are routable in Core.
+    const ip16 = hostTo16(host);
+    if (ip16 !== null && !isRoutableIP16(ip16)) return false;
+
     let id = this.find(host, port);
     if (id !== EMPTY) {
       const info = this.mapInfo.get(id)!;

@@ -147,10 +147,10 @@ describe("W128-G3: Secret nKey (256-bit) seeds bucket selection — FIXED (axis 
   it("FIXED-3: the salt actually moves placement (different nKey -> different slot)", () => {
     const a = mkAddrMan();
     const b = new AddrMan({ nKey: Buffer.alloc(32, 0xab), rngSeed: 1n });
-    a.add("203.0.113.5", 8333, "198.51.100.1", 1n, W128_NOW, W128_NOW);
-    b.add("203.0.113.5", 8333, "198.51.100.1", 1n, W128_NOW, W128_NOW);
-    const sa = a.newSlotOf("203.0.113.5", 8333)!;
-    const sb = b.newSlotOf("203.0.113.5", 8333)!;
+    a.add("93.184.216.5", 8333, "198.51.100.1", 1n, W128_NOW, W128_NOW);
+    b.add("93.184.216.5", 8333, "198.51.100.1", 1n, W128_NOW, W128_NOW);
+    const sa = a.newSlotOf("93.184.216.5", 8333)!;
+    const sb = b.newSlotOf("93.184.216.5", 8333)!;
     expect(sa.bucket !== sb.bucket || sa.position !== sb.position).toBe(true);
   });
 });
@@ -380,7 +380,7 @@ describe("W128-G13: Good(): tried-collision evicts occupant back to NEW — FIXE
     const seen = new Map<string, string>();
     let aHost = "", bHost = "";
     for (let i = 1; i < 4000 && (aHost === "" || bHost === ""); i++) {
-      const h = `10.0.${(i >> 8) & 0xff}.${i & 0xff}`;
+      const h = `11.0.${(i >> 8) & 0xff}.${i & 0xff}`; // routable: AddrMan.add refuses RFC1918
       if (h.endsWith(".0") || h.endsWith(".255")) continue;
       const k = slotKey(h);
       const prev = seen.get(k);
@@ -486,14 +486,20 @@ describe("W128-G18: HasAllDesirableServiceFlags filter (non-feeler) — PARTIAL 
 });
 
 // =============================================================================
-// G19 — IsBadPort skip (until 50 tries elapsed) — MISSING (BUG-19)
+// G19 — IsBadPort skip — FIXED (cffix-hotbuns-addrv2-routable)
 // =============================================================================
-describe("W128-G19: IsBadPort skip (until 50 invalid addresses) — MISSING (BUG-19)", () => {
-  it("BUG-19: no isBadPort / IsBadPort function in src/p2p", () => {
-    expect(MANAGER_SRC).not.toMatch(/isBadPort|IsBadPort/);
+// FLIPPED: the dialer (getCandidateAddresses + selectFeelerTarget) now skips
+// Core netbase.cpp IsBadPort ports. The table lives in src/p2p/netbase.ts; the
+// behavioural proof is cffix_addrv2_routable.test.ts. Deviation kept: Core
+// relaxes the skip after 50 tries; hotbuns has no per-attempt tries counter
+// and skips bad ports unconditionally.
+describe("W128-G19: IsBadPort skip — FIXED", () => {
+  it("FIXED: manager.ts calls isBadPort in the outbound candidate filter", () => {
+    expect(MANAGER_SRC).toMatch(/isIPNetworkPeerInfo\(info\) && isBadPort\(info\.port\)/);
   });
-  it("BUG-19: no bad-port table (HTTP/SMTP/etc.)", () => {
-    expect(MANAGER_SRC).not.toMatch(/BAD_PORTS|badPorts/);
+  it("FIXED: the bad-port table exists in netbase.ts", () => {
+    const NETBASE_SRC = readFileSync(resolve(SRC, "p2p", "netbase.ts"), "utf8");
+    expect(NETBASE_SRC).toMatch(/BAD_PORTS/);
   });
 });
 
@@ -625,16 +631,17 @@ describe("W128-G25: IsRoutable enforced for IPv4/IPv6/Tor/I2P/CJDNS — PARTIAL 
     expect(isRoutable("fe80::1")).toBe(false); // link-local — should be unroutable
     expect(isRoutable("fc00::1")).toBe(false); // ULA — should be unroutable
   });
-  it("BUG-23: isRoutable IS not called from handleAddrV2Message", () => {
-    // The v2 path validates via isValidNetworkAddressV2 then calls
-    // addrV2ToPeerInfo — no isRoutable on the IPv6 / Tor / I2P /
-    // CJDNS branches.
-    const v2Block = MANAGER_SRC.match(
-      /private handleAddrV2Message[^]*?^\s\s\}/m
+  it("FIXED: addKnownAddress (shared by addr and addrv2) enforces IsRoutable", () => {
+    // FLIPPED (cffix-hotbuns-addrv2-routable): the routability check now sits
+    // at the shared insertion point, as Core's AddSingle does, so the addrv2
+    // path is covered without its own check. Behavioural proof:
+    // cffix_addrv2_routable.test.ts.
+    const addBlock = MANAGER_SRC.match(
+      /private addKnownAddress[^]*?^\s\s\}/m
     );
-    expect(v2Block).not.toBeNull();
-    if (v2Block) {
-      expect(v2Block[0]).not.toMatch(/isRoutable/);
+    expect(addBlock).not.toBeNull();
+    if (addBlock) {
+      expect(addBlock[0]).toMatch(/if \(!isRoutablePeerInfo\(info\)\) return;/);
     }
   });
   it("BUG-23: source comment admits the IPv4-only gap", () => {
@@ -742,12 +749,12 @@ describe("W128-G30: addrman persistence round-trips placement + nKey (versioned,
   });
   it("FIXED-1/2/3: restart preserves bucket placement (same nKey -> same slot)", () => {
     const am = mkAddrMan();
-    am.add("203.0.113.5", 8333, "198.51.100.1", 1n, W128_NOW, W128_NOW);
+    am.add("93.184.216.5", 8333, "198.51.100.1", 1n, W128_NOW, W128_NOW);
     am.add("8.8.8.8", 8333, "1.2.3.4", 1n, W128_NOW, W128_NOW);
     am.good("8.8.8.8", 8333, W128_NOW); // tried
-    const before = am.findAddressEntry("203.0.113.5", 8333)!;
+    const before = am.findAddressEntry("93.184.216.5", 8333)!;
     const restored = AddrMan.deserialize(am.serialize(), { rngSeed: 1n })!;
-    const after = restored.findAddressEntry("203.0.113.5", 8333)!;
+    const after = restored.findAddressEntry("93.184.216.5", 8333)!;
     expect(after.bucket).toBe(before.bucket);
     expect(after.position).toBe(before.position);
     expect(restored.isInTried("8.8.8.8", 8333)).toBe(true);

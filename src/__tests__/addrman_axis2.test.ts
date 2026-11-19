@@ -69,10 +69,10 @@ describe("axis2 (1): placement determinism", () => {
   it("same addr+nKey -> same new bucket/pos every time", () => {
     const a = mkMan();
     const b = mkMan();
-    a.add("203.0.113.5", 8333, "198.51.100.1", NODE_NETWORK, NOW, NOW);
-    b.add("203.0.113.5", 8333, "198.51.100.1", NODE_NETWORK, NOW, NOW);
-    const sa = a.newSlotOf("203.0.113.5", 8333);
-    const sb = b.newSlotOf("203.0.113.5", 8333);
+    a.add("93.184.216.5", 8333, "198.51.100.1", NODE_NETWORK, NOW, NOW);
+    b.add("93.184.216.5", 8333, "198.51.100.1", NODE_NETWORK, NOW, NOW);
+    const sa = a.newSlotOf("93.184.216.5", 8333);
+    const sb = b.newSlotOf("93.184.216.5", 8333);
     expect(sa).not.toBeNull();
     expect(sa).toEqual(sb);
   });
@@ -151,10 +151,10 @@ describe("axis2 (1): placement determinism", () => {
     const am1 = mkMan();
     const otherKey = Buffer.alloc(32, 0xab);
     const am2 = new AddrMan({ nKey: otherKey, rngSeed: 1n });
-    am1.add("203.0.113.5", 8333, "198.51.100.1", NODE_NETWORK, NOW, NOW);
-    am2.add("203.0.113.5", 8333, "198.51.100.1", NODE_NETWORK, NOW, NOW);
-    const s1 = am1.newSlotOf("203.0.113.5", 8333)!;
-    const s2 = am2.newSlotOf("203.0.113.5", 8333)!;
+    am1.add("93.184.216.5", 8333, "198.51.100.1", NODE_NETWORK, NOW, NOW);
+    am2.add("93.184.216.5", 8333, "198.51.100.1", NODE_NETWORK, NOW, NOW);
+    const s1 = am1.newSlotOf("93.184.216.5", 8333)!;
+    const s2 = am2.newSlotOf("93.184.216.5", 8333)!;
     // Overwhelmingly likely to differ; assert at least one coordinate moved.
     expect(s1.bucket !== s2.bucket || s1.position !== s2.position).toBe(true);
   });
@@ -210,12 +210,12 @@ describe("axis2 (2): Add->NEW, Good->TRIED, eviction", () => {
       const tp = am.getBucketPosition(false, tb, info);
       return `${tb}:${tp}`;
     };
-    // Search the 10.0.0.x space for two hosts colliding in tried.
+    // Search the 11.0.0.x space for two hosts colliding in tried.
     const seen = new Map<string, string>();
     let aHost = "";
     let bHost = "";
     outer: for (let i = 1; i < 4000 && (aHost === "" || bHost === ""); i++) {
-      const h = `10.0.${(i >> 8) & 0xff}.${i & 0xff}`;
+      const h = `11.0.${(i >> 8) & 0xff}.${i & 0xff}`; // routable: AddrMan.add refuses RFC1918
       if (h.endsWith(".0") || h.endsWith(".255")) continue;
       const k = slotKey(h);
       const prev = seen.get(k);
@@ -274,12 +274,12 @@ describe("axis2 (3): restart persistence preserves placement", () => {
   it("serialize -> deserialize preserves nKey, new placement, and tried set", () => {
     const am = mkMan();
     am.add("8.8.8.8", 8333, "1.2.3.4", NODE_NETWORK, NOW, NOW);
-    am.add("203.0.113.5", 8333, "198.51.100.1", NODE_NETWORK, NOW, NOW);
+    am.add("93.184.216.5", 8333, "198.51.100.1", NODE_NETWORK, NOW, NOW);
     am.add("9.9.9.9", 8333, "5.6.7.8", NODE_NETWORK, NOW, NOW);
     am.good("8.8.8.8", 8333, NOW); // -> tried
 
     const before8 = am.findAddressEntry("8.8.8.8", 8333)!;
-    const before203 = am.findAddressEntry("203.0.113.5", 8333)!;
+    const before203 = am.findAddressEntry("93.184.216.5", 8333)!;
 
     const text = am.serialize();
     const restored = AddrMan.deserialize(text, { rngSeed: 1n });
@@ -296,7 +296,7 @@ describe("axis2 (3): restart persistence preserves placement", () => {
     expect(after8.position).toBe(before8.position);
 
     // new placement preserved.
-    const after203 = restored!.findAddressEntry("203.0.113.5", 8333)!;
+    const after203 = restored!.findAddressEntry("93.184.216.5", 8333)!;
     expect(after203.tried).toBe(false);
     expect(after203.bucket).toBe(before203.bucket);
     expect(after203.position).toBe(before203.position);
