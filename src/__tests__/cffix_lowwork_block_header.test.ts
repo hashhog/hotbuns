@@ -37,6 +37,8 @@ import {
   type BlockHeader,
   getBlockHash,
   computeMerkleRoot,
+  encodeBip34Height,
+  validateBlock,
 } from "../validation/block.js";
 import { type Transaction, getTxId } from "../validation/tx.js";
 import { HeaderSync } from "../sync/headers.js";
@@ -72,14 +74,14 @@ function mockPeerManager(peers: any[]): any {
 }
 
 function coinbase(height: number, tag: number): Transaction {
-  const h = Buffer.alloc(4);
-  h.writeUInt32LE(height);
+  // Canonical BIP34 height push (Core: CScript() << nHeight), so every fixture
+  // block is consensus-valid, not just its header.
   return {
     version: 1,
     inputs: [
       {
         prevOut: { txid: Buffer.alloc(32, 0), vout: 0xffffffff },
-        scriptSig: Buffer.concat([Buffer.from([0x03]), h.subarray(0, 3), Buffer.from([0x01, tag & 0xff])]),
+        scriptSig: Buffer.concat([encodeBip34Height(height), Buffer.from([0x01, tag & 0xff])]),
         sequence: 0xffffffff,
         witness: [],
       },
@@ -199,11 +201,30 @@ describe("cffix-hotbuns-lowwork-block-header: unrequested low-work block", () =>
   test("control: an unrequested block extending the active tip is still accepted (valid block not refused)", async () => {
     const tipBlock = active[299];
     const next = mineBlock(getBlockHash(tipBlock.header), tipBlock.header.timestamp + 600, 301, 11);
+    // The block itself is consensus-valid (CheckBlock + contextual checks,
+    // BIP34 height included), so refusing it would be a real regression.
+    const v = validateBlock(next, 301, PARAMS);
+    expect(v.error).toBeUndefined();
+    expect(v.valid).toBe(true);
+
+    // The fixture has headers only (no UTXO set for the 300-block chain), so
+    // spy connectBlock and assert the block reaches it, as
+    // blocks.reorg-p2p.test.ts does; the UTXO connect itself is covered there.
+    const connectCalls: Array<{ hashHex: string; height: number }> = [];
+    (bs as any).connectBlock = async (block: Block, height: number) => {
+      connectCalls.push({ hashHex: getBlockHash(block.header).toString("hex"), height });
+      return true;
+    };
+
     const peer = mockPeer();
     await bs.handleBlock(peer, next);
+    const nextHex = getBlockHash(next.header).toString("hex");
     const entry = headerSync.getHeader(getBlockHash(next.header));
     expect(entry).toBeDefined();
     expect(entry!.height).toBe(301);
+    expect(entry!.status).not.toBe("invalid");
+    expect(connectCalls).toEqual([{ hashHex: nextHex, height: 301 }]);
+    expect(bs.getState().nextHeightToProcess).toBe(302);
     expect(peer.misbehaving).not.toHaveBeenCalled();
   });
 
