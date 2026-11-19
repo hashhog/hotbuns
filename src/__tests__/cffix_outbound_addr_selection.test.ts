@@ -175,6 +175,44 @@ describe("cffix: outbound address selection is not steerable by one addr sender"
     expect(buckets.size).toBeLessThanOrEqual(64);
   });
 
+  test("DNS-seed results are drawn too: one later addr sender cannot crowd them out", async () => {
+    // Core ThreadDNSAddressSeed adds seed results to addrman
+    // (addrman.Add(vAdd, resolveSource)), so Select() weighs them with every
+    // other entry. If they bypass the addrman, a cold-started node's outbound
+    // draw is filled entirely by the first addr sender. 200 seed addresses
+    // (several seeds of ~25 each, as on mainnet) occupy ~180 new buckets
+    // against the sender's 64, so its share should be about a quarter.
+    const pm = makeManager();
+    const seeds: string[] = [];
+    for (let i = 0; i < 200; i++) seeds.push(`${11 + (i % 50)}.${200 + Math.floor(i / 50)}.${i + 1}.9`);
+    pm.resolveDNSSeeds = async () => seeds;
+    pm.fillConnections = async () => {};
+    await pm.start();
+    try {
+      // A few may lose a new-bucket slot collision (Core AddSingle drops those
+      // too); before the fix none were held.
+      const held = seeds.filter((ip) => pm.addrMan.findAddressEntry(ip, 18444) !== null).length;
+      expect(held).toBeGreaterThan(seeds.length * 0.9);
+      const now = Math.floor(Date.now() / 1000);
+      const attacker: string[] = [];
+      for (let i = 0; i < 1000; i++) attacker.push(attackerIp(i));
+      feedAddrs(pm, "203.0.113.7", attacker, () => now + 500);
+      const bad = new Set(attacker.map((ip) => `${ip}:8333`));
+      let picked = 0;
+      let fromAttacker = 0;
+      for (let iter = 0; iter < 200; iter++) {
+        for (const c of pm.getCandidateAddresses(8)) {
+          picked++;
+          if (bad.has(`${c.host}:${c.port}`)) fromAttacker++;
+        }
+      }
+      expect(picked).toBe(200 * 8);
+      expect(fromAttacker / picked).toBeLessThan(0.5);
+    } finally {
+      await pm.stop();
+    }
+  });
+
   test("candidate selection still skips connected and recently failed addresses", () => {
     const pm = makeManager();
     const now = Math.floor(Date.now() / 1000);

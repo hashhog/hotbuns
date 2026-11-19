@@ -1426,7 +1426,10 @@ export class PeerManager {
       for (const ip of addresses) {
         const key = `${ip}:${this.config.params.defaultPort}`;
         if (!this.knownAddresses.has(key)) {
-          this.knownAddresses.set(key, {
+          // addKnownAddress (cap + addrman mirror), as Core adds seed results
+          // to addrman (ThreadDNSAddressSeed addrman.Add), so outbound
+          // Select() draws them alongside relayed addresses.
+          this.addKnownAddress(key, {
             host: ip,
             port: this.config.params.defaultPort,
             // Conservative baseline: assume full-node + segwit only.
@@ -1444,7 +1447,7 @@ export class PeerManager {
       for (const { host, port } of fallbacks) {
         const key = `${host}:${port}`;
         if (!this.knownAddresses.has(key)) {
-          this.knownAddresses.set(key, {
+          this.addKnownAddress(key, {
             host,
             port,
             // Conservative baseline: assume full-node + segwit only.
