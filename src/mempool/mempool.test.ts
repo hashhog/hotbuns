@@ -825,7 +825,7 @@ describe("Mempool", () => {
       expect(mempool.hasWtxidHex(wtxidHex)).toBe(false);
     });
 
-    test("CHARACTERIZATION: concurrent submissions of one tx all report accepted", async () => {
+    test("concurrent submissions of one tx: exactly one is accepted (ATMP serialized)", async () => {
       // Documents the hazard that forced the relay-layer validation latch in
       // cli.ts (`txValidationInFlight`).
       //
@@ -844,10 +844,10 @@ describe("Mempool", () => {
       // consecutive lines. Each spurious "accept" cost a full re-validation, a
       // re-announcement to every peer, and a double fee-estimator entry.
       //
-      // The fix is at the relay layer (a per-txid latch around the call), so
-      // this test pins the underlying mempool behavior rather than asserting
-      // it has changed. If a future wave serializes inside the mempool, this
-      // test SHOULD start failing — update it then.
+      // The relay layer got a per-txid latch first; the mempool now also
+      // serializes every accept (Mempool.withAtmpLock, the analogue of
+      // Core's cs_main + m_pool.cs), so the later copies see the first one
+      // and are refused, as in Core.
       const inputTxid = Buffer.alloc(32, 0xc4);
       await setupUTXO(inputTxid, 0, 10000n);
       const tx = createTestTx(
@@ -862,14 +862,16 @@ describe("Mempool", () => {
         mempool.acceptToMemoryPool(tx),
       ]);
 
-      // All four "succeed"...
-      expect(results.filter((r) => r.accepted).length).toBe(4);
-      // ...but the pool holds exactly one copy. That gap is the bug.
+      // Exactly one is accepted; the other three see it in the pool.
+      expect(results.filter((r) => r.accepted).length).toBe(1);
+      expect(results[0].accepted).toBe(true);
+      for (const r of results.slice(1)) {
+        expect(r.error).toBe("txn-already-in-mempool");
+      }
       expect(mempool.getSize()).toBe(1);
       expect(mempool.hasTxidHex(getTxId(tx).toString("hex"))).toBe(true);
 
-      // Sequentially, the second submission is correctly rejected — proving
-      // the difference is purely the concurrent interleaving.
+      // Sequentially, a further submission is rejected the same way.
       const again = await mempool.acceptToMemoryPool(tx);
       expect(again.accepted).toBe(false);
       expect(again.error).toBe("txn-already-in-mempool");

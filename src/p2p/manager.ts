@@ -63,7 +63,9 @@ import {
 } from "./asmap.js";
 import type { ProxyManager, NetworkType } from "./proxy.js";
 import { getNetworkTypeFromAddress } from "./proxy.js";
-import { AddrMan } from "./addrman.js";
+import { AddrMan, hostTo16 } from "./addrman.js";
+import { isBadPort, isRoutableIP16 } from "./netbase.js";
+export { isBadPort } from "./netbase.js";
 
 /**
  * Maximum number of addresses retained in the v1-only fallback cache.
@@ -683,6 +685,30 @@ function addrV2RoutingHost(addr: NetworkAddressV2): string | null {
   if (addr.networkId === BIP155Network.IPV4) return networkAddressV2ToIPv4String(addr) ?? "0.0.0.0";
   if (addr.networkId === BIP155Network.IPV6) return ipBytesToString(addr.addr) ?? "::";
   return null;
+}
+
+/** True for IPv4/IPv6 entries (legacy entries carry no networkId and are IPv4). */
+function isIPNetworkPeerInfo(info: PeerInfo): boolean {
+  return (
+    info.networkId === undefined ||
+    info.networkId === BIP155Network.IPV4 ||
+    info.networkId === BIP155Network.IPV6
+  );
+}
+
+/**
+ * Core CNetAddr::IsRoutable for a known-address entry. IPv6 entries from
+ * addrv2 keep their bytes in `rawAddr` (the host is a hex string); IPv4 and
+ * IPv6 literals are judged from the host. Tor/I2P/CJDNS have no IP to check
+ * and are routable in Core.
+ */
+function isRoutablePeerInfo(info: PeerInfo): boolean {
+  if (info.networkId === BIP155Network.IPV6 && info.rawAddr) {
+    return isRoutableIP16(info.rawAddr);
+  }
+  if (!isIPNetworkPeerInfo(info)) return true;
+  const ip16 = hostTo16(info.host);
+  return ip16 === null ? true : isRoutableIP16(ip16);
 }
 
 export class PeerManager {
@@ -2978,6 +3004,8 @@ export class PeerManager {
       const key = `${info.host}:${info.port}`;
       if (this.peers.has(key) || this.connectingPeers.has(key)) continue;
       if (this.banManager.isBanned(info.host)) continue;
+      // Core ThreadOpenConnections applies IsBadPort to feelers too.
+      if (isBadPort(info.port)) continue;
       return { host: info.host, port: info.port };
     }
     return null;
@@ -3047,6 +3075,11 @@ export class PeerManager {
       // entries whose `host` is a 32-char hex blob, and connectPeer would
       // then pass that string straight to Bun.connect → instant failure.
       if (this.resolveDialable(info) === null) {
+        return false;
+      }
+      // Core net.cpp ThreadOpenConnections: no automatic outbound connection
+      // to an IPv4/IPv6 address on a well-known service port (IsBadPort).
+      if (isIPNetworkPeerInfo(info) && isBadPort(info.port)) {
         return false;
       }
       return true;
@@ -3325,6 +3358,11 @@ export class PeerManager {
    * for `v1OnlyCache`.
    */
   private addKnownAddress(key: string, info: PeerInfo, sourceHost?: string): void {
+    // Core AddrManImpl::AddSingle: `if (!addr.IsRoutable()) return false;`
+    // This is the shared insertion point for addr, addrv2 and seed learning,
+    // so a peer cannot make us store (and later dial) loopback, RFC1918,
+    // link-local or ULA addresses through either message type.
+    if (!isRoutablePeerInfo(info)) return;
     if (this.knownAddresses.size >= KNOWN_ADDRESSES_MAX) {
       this.evictOldestKnownAddress();
     }

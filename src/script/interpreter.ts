@@ -396,32 +396,52 @@ function isOpSuccess(opcode: number): boolean {
 }
 
 /**
- * Check if a raw script contains any OP_SUCCESSx opcodes.
- * If it does, the script succeeds immediately (BIP-342 rule).
+ * BIP-342 OP_SUCCESSx pre-scan. Returns true if the script contains an
+ * OP_SUCCESSx opcode (the script then succeeds immediately), false if it
+ * parses cleanly without one.
+ *
+ * Mirrors Core's ExecuteWitnessScript tapscript loop (interpreter.cpp):
+ *   while (pc < end) {
+ *     if (!script.GetOp(pc, opcode)) return SCRIPT_ERR_BAD_OPCODE;
+ *     if (IsOpSuccess(opcode)) return success;
+ *   }
+ * Opcodes are read in order with GetScriptOp semantics (script.cpp): push
+ * lengths are UNSIGNED little-endian, and a length field or payload that
+ * runs past the end of the script is a parse failure, thrown here as
+ * BAD_OPCODE. An OP_SUCCESSx that precedes a malformed push still wins,
+ * because the scan never reaches the malformed bytes.
  */
 function containsOpSuccess(script: Buffer): boolean {
+  const end = script.length;
   let i = 0;
-  while (i < script.length) {
+  while (i < end) {
     const opcode = script[i];
     i++;
 
-    // Check for OP_SUCCESS before parsing push data
-    if (isOpSuccess(opcode)) {
-      return true;
+    if (opcode <= Opcode.OP_PUSHDATA4) {
+      let size: number;
+      if (opcode < Opcode.OP_PUSHDATA1) {
+        size = opcode; // 0x00..0x4b: direct push of `opcode` bytes
+      } else if (opcode === Opcode.OP_PUSHDATA1) {
+        if (end - i < 1) throw new ScriptError("BAD_OPCODE");
+        size = script[i];
+        i += 1;
+      } else if (opcode === Opcode.OP_PUSHDATA2) {
+        if (end - i < 2) throw new ScriptError("BAD_OPCODE");
+        size = script.readUInt16LE(i);
+        i += 2;
+      } else {
+        if (end - i < 4) throw new ScriptError("BAD_OPCODE");
+        size = script.readUInt32LE(i); // unsigned, 0..2^32-1
+        i += 4;
+      }
+      if (end - i < size) throw new ScriptError("BAD_OPCODE");
+      i += size;
+      continue;
     }
 
-    // Skip push data
-    if (opcode >= 1 && opcode <= 75) {
-      i += opcode;
-    } else if (opcode === Opcode.OP_PUSHDATA1 && i < script.length) {
-      const len = script[i];
-      i += 1 + len;
-    } else if (opcode === Opcode.OP_PUSHDATA2 && i + 1 < script.length) {
-      const len = script[i] | (script[i + 1] << 8);
-      i += 2 + len;
-    } else if (opcode === Opcode.OP_PUSHDATA4 && i + 3 < script.length) {
-      const len = script[i] | (script[i + 1] << 8) | (script[i + 2] << 16) | (script[i + 3] << 24);
-      i += 4 + len;
+    if (isOpSuccess(opcode)) {
+      return true;
     }
   }
   return false;
@@ -897,7 +917,9 @@ export function parseScript(raw: Buffer): Script {
       if (i + 3 >= raw.length) {
         throw new Error("Script parse error: OP_PUSHDATA4 missing length");
       }
-      const len = raw[i] | (raw[i + 1] << 8) | (raw[i + 2] << 16) | (raw[i + 3] << 24);
+      // Unsigned: Core reads nSize with ReadLE32. A signed read turns
+      // `ff ff ff ff` into -1 and lets a walker step backwards.
+      const len = (raw[i] | (raw[i + 1] << 8) | (raw[i + 2] << 16) | (raw[i + 3] << 24)) >>> 0;
       i += 4;
       const data = raw.subarray(i, i + len);
       if (data.length !== len) {
@@ -957,7 +979,10 @@ export function isPushOnly(script: Buffer): boolean {
       i += 2 + len;
     } else if (opcode === Opcode.OP_PUSHDATA4) {
       if (i + 4 > script.length) return false;
-      const len = script[i] | (script[i + 1] << 8) | (script[i + 2] << 16) | (script[i + 3] << 24);
+      // Unsigned (Core GetScriptOp: ReadLE32 into unsigned nSize). A signed
+      // read gave `4e fb ff ff ff` len = -5, so `i += 4 + len` reset i to 0
+      // and the loop never ended (mempool standardness gate, main thread).
+      const len = (script[i] | (script[i + 1] << 8) | (script[i + 2] << 16) | (script[i + 3] << 24)) >>> 0;
       if (i + 4 + len > script.length) return false; // Truncated
       i += 4 + len;
     }
@@ -1087,10 +1112,10 @@ function opcodeEndPos(script: Buffer, pos: number): number {
     if (pos + 4 >= script.length) return -1;
     const end =
       pos + 5 +
-      (script[pos + 1] |
+      ((script[pos + 1] |
         (script[pos + 2] << 8) |
         (script[pos + 3] << 16) |
-        (script[pos + 4] << 24));
+        (script[pos + 4] << 24)) >>> 0); // unsigned, as Core's ReadLE32
     return end <= script.length ? end : -1;
   } else {
     // OP_0 (0x00) and all non-push opcodes: 1 byte
@@ -1178,14 +1203,64 @@ function findAndDelete(script: Buffer, sig: Buffer): { result: Buffer; found: nu
 }
 
 /**
+ * IF/ELSE/ENDIF condition stack with O(1) operations, mirroring Core's
+ * `ConditionStack` (src/script/interpreter.cpp). Only the stack size and the
+ * position of the first false entry are tracked: all values above the first
+ * false one are irrelevant, since the script is not executing anyway. This
+ * matters for tapscript, which has neither the 201-opcode limit nor a script
+ * size limit, so nesting depth and opcode count can both reach ~10^5.
+ */
+class ConditionStack {
+  private static readonly NO_FALSE = -1;
+  private size = 0;
+  private firstFalsePos = ConditionStack.NO_FALSE;
+
+  empty(): boolean {
+    return this.size === 0;
+  }
+
+  allTrue(): boolean {
+    return this.firstFalsePos === ConditionStack.NO_FALSE;
+  }
+
+  pushBack(f: boolean): void {
+    if (this.firstFalsePos === ConditionStack.NO_FALSE && !f) {
+      // The stack consists of all true values, and a false is added.
+      this.firstFalsePos = this.size;
+    }
+    this.size++;
+  }
+
+  popBack(): void {
+    this.size--;
+    if (this.firstFalsePos === this.size) {
+      // When popping off the first false value, everything becomes true.
+      this.firstFalsePos = ConditionStack.NO_FALSE;
+    }
+  }
+
+  toggleTop(): void {
+    if (this.firstFalsePos === ConditionStack.NO_FALSE) {
+      // The current stack is all true values; the first false will be the top.
+      this.firstFalsePos = this.size - 1;
+    } else if (this.firstFalsePos === this.size - 1) {
+      // The top is the first false value; toggling it makes everything true.
+      this.firstFalsePos = ConditionStack.NO_FALSE;
+    }
+    // Otherwise there is a false value below the top; toggling the top
+    // changes nothing observable.
+  }
+}
+
+/**
  * Execute a parsed script.
  */
 export function executeScript(script: Script, ctx: ExecutionContext): boolean {
   const { stack, altStack, flags, sigHasher } = ctx;
   const sigVersion = ctx.sigVersion ?? SigVersion.BASE;
 
-  // Condition stack for IF/ELSE/ENDIF
-  const condStack: boolean[] = [];
+  // Condition stack for IF/ELSE/ENDIF (O(1) per op, Core ConditionStack)
+  const condStack = new ConditionStack();
 
   // Track code separator position for sighash
   let codeSepPos = 0xffffffff;
@@ -1198,7 +1273,7 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
     const opcode = chunk.opcode;
 
     // Check if we're in an executing branch
-    const executing = condStack.every((v) => v);
+    const executing = condStack.allTrue();
 
     // Check for disabled opcodes (fail even if not executing)
     if (DISABLED_OPCODES.has(opcode)) {
@@ -1311,27 +1386,25 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
           value = !value;
         }
       }
-      condStack.push(executing && value);
+      condStack.pushBack(executing && value);
       continue;
     }
 
     if (opcode === Opcode.OP_ELSE) {
-      if (condStack.length === 0) {
+      if (condStack.empty()) {
         return false;
       }
-      // Only flip if all outer conditions are true
-      const outerExecuting = condStack.length === 1 || condStack.slice(0, -1).every((v) => v);
-      if (outerExecuting) {
-        condStack[condStack.length - 1] = !condStack[condStack.length - 1];
-      }
+      // Core toggles unconditionally; when an outer entry is false the
+      // script stays non-executing either way (see ConditionStack.toggleTop).
+      condStack.toggleTop();
       continue;
     }
 
     if (opcode === Opcode.OP_ENDIF) {
-      if (condStack.length === 0) {
+      if (condStack.empty()) {
         return false;
       }
-      condStack.pop();
+      condStack.popBack();
       continue;
     }
 
@@ -2131,7 +2204,7 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
   }
 
   // Check for unbalanced conditionals
-  if (condStack.length !== 0) {
+  if (!condStack.empty()) {
     return false;
   }
 

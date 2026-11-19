@@ -1725,9 +1725,10 @@ export class HeaderSync {
   private async processPreBaseHeaders(
     peer: Peer,
     headers: BlockHeader[],
+    start?: HeaderChainEntry,
   ): Promise<void> {
     const gap = this.preBaseGap;
-    let parent: HeaderChainEntry | null = this.preBaseFrontier;
+    let parent: HeaderChainEntry | null = start ?? this.preBaseFrontier;
     if (!gap || !parent) return;
     const peerKey = `${peer.host}:${peer.port}`;
     this.preBaseInFlight = null;
@@ -1820,6 +1821,28 @@ export class HeaderSync {
       );
     }
     this.maybeRequestPreBaseHeaders(peer);
+  }
+
+  /**
+   * Where a solicited backfill reply attaches: the frontier, or one of its
+   * ancestors. A reply that forks below the frontier is how an honest peer
+   * answers after a previous peer moved the frontier onto a chain the peer
+   * does not have (Core's getheaders answers from the last locator entry it
+   * knows, here genesis). Re-attaching there lets the true chain replace the
+   * frontier instead of being unroutable. Anything else (not on the
+   * frontier's genesis-linked path) is not a backfill reply.
+   */
+  private findPreBaseParent(prevHash: Buffer): HeaderChainEntry | null {
+    const frontier = this.preBaseFrontier;
+    if (!frontier) return null;
+    if (prevHash.equals(frontier.hash)) return frontier;
+    const target = this.headerChain.get(prevHash.toString("hex"));
+    if (!target || target.height >= frontier.height) return null;
+    let walk: HeaderChainEntry | undefined = frontier;
+    while (walk && walk.height > target.height) {
+      walk = this.headerChain.get(walk.header.prevBlock.toString("hex"));
+    }
+    return walk && walk.hash.equals(target.hash) ? target : null;
   }
 
   /**
@@ -2161,14 +2184,36 @@ export class HeaderSync {
     // Snapshot pre-base backfill reply: it extends the backfill frontier,
     // not our best chain. Routed before the normal-sync latch so it does not
     // release a getheaders that is still in flight.
-    if (
-      this.preBaseGap &&
-      this.preBaseFrontier &&
-      headers.length > 0 &&
-      headers[0].prevBlock.equals(this.preBaseFrontier.hash)
-    ) {
-      await this.processPreBaseHeaders(peer, headers);
-      return;
+    //
+    // Only the peer the backfill getheaders went to may move the frontier.
+    // Core never stores a header chain it cannot connect to the snapshot
+    // base (ActivateSnapshot needs the base already in m_block_index, and
+    // headers only arrive through ProcessHeadersMessage's anti-DoS gate);
+    // these headers skip the low-work gate, so the request is their
+    // anchor. An unsolicited batch extending the frontier is dropped: near
+    // genesis one difficulty-1 fork header would otherwise move the single
+    // linear frontier off the snapshot chain, and every honest reply after
+    // it would be unroutable.
+    if (this.preBaseGap && this.preBaseFrontier && headers.length > 0) {
+      const solicited =
+        this.preBaseInFlight !== null && this.preBaseInFlight.peerKey === peerKey;
+      if (solicited) {
+        const parent = this.findPreBaseParent(headers[0].prevBlock);
+        if (parent) {
+          await this.processPreBaseHeaders(peer, headers, parent);
+          return;
+        }
+      } else if (headers[0].prevBlock.equals(this.preBaseFrontier.hash)) {
+        const now = Date.now();
+        if (now - this.preBaseLastLogMs >= 10_000) {
+          this.preBaseLastLogMs = now;
+          console.warn(
+            `[assumeutxo] ignoring unsolicited pre-base headers from ${peerKey} ` +
+              `(backfill request is ${this.preBaseInFlight ? `with ${this.preBaseInFlight.peerKey}` : "not in flight"})`,
+          );
+        }
+        return;
+      }
     }
 
     this.syncingPeers.delete(peerKey);

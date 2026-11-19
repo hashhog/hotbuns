@@ -487,13 +487,43 @@ export const GETDATA_QUEUE_MAX = 50_000;
  */
 export const GETDATA_MAX_SEND_BUFFER = 1000 * 1000;
 
+/**
+ * Total getblocktxn indexes a peer may have parked on its getdata queue. Core
+ * never parks a getblocktxn: it leaves the message in the peer's receive
+ * buffer while getdata is pending or fPauseSend is set, and stops reading at
+ * -maxreceivebuffer. Here the decoded request is already in memory, and the
+ * entry cap above counts entries, not their size, so a peer that stops
+ * reading could otherwise park 50,000 requests of tens of thousands of
+ * indexes each. Four times the largest valid request (indexes are uint16
+ * differentials, so at most 65,536 per block) leaves room for any honest
+ * peer; past it, new getblocktxn are dropped until the queue drains.
+ */
+export const GETBLOCKTXN_QUEUED_INDEXES_MAX = 4 * 65_536;
+
 /** How often a send-paused getdata queue re-checks the peer's send buffer. */
 const GETDATA_PAUSE_POLL_MS = 50;
 
-/** A peer's unserved getdata entries; items[head..] are still pending. */
+/**
+ * A getblocktxn waiting on the same per-peer queue as getdata. Core handles
+ * GETBLOCKTXN in the per-peer ProcessMessage loop, which takes one message
+ * per pass, none while fPauseSend is set, and only once the getdata queue
+ * is empty, so a peer's getblocktxn replies are serial and in order with
+ * its getdata.
+ */
+interface GetBlockTxnItem {
+  getBlockTxn: GetBlockTxnPayload;
+}
+
+/** A peer's unserved getdata / getblocktxn entries; items[head..] are still pending. */
 interface GetDataQueue {
-  items: InvVector[];
+  items: (InvVector | GetBlockTxnItem)[];
   head: number;
+  /** Sum of indexes over the getblocktxn items still pending. */
+  getBlockTxnIndexes: number;
+}
+
+function isGetBlockTxnItem(item: InvVector | GetBlockTxnItem): item is GetBlockTxnItem {
+  return (item as GetBlockTxnItem).getBlockTxn !== undefined;
 }
 
 export class BlockSync {
@@ -2606,9 +2636,30 @@ export class BlockSync {
    * (the peer's compact-block state is stale); an out-of-range index is a
    * protocol violation and gets no reply; otherwise blocktxn.
    */
-  private async handleGetBlockTxn(peer: Peer, req: GetBlockTxnPayload): Promise<void> {
+  private handleGetBlockTxn(peer: Peer, req: GetBlockTxnPayload): Promise<void> {
+    // Each request is a full-block read and parse. It used to start as its
+    // own detached promise, so 100 messages of 57 bytes meant 100 concurrent
+    // reads, replies pushed into a full send buffer, and work continuing for
+    // a peer already gone. It now waits on the peer's getdata queue and is
+    // served under the same pause and drop-on-disconnect rules.
+    // Only drop while a serve loop is draining the queue; if a pass threw and
+    // ended the loop, enqueueing restarts it rather than starving the peer.
+    const queue = this.getDataQueues.get(peer);
+    const parked = queue ? queue.getBlockTxnIndexes : 0;
+    const serving = this.getDataServing.get(peer);
+    if (serving && parked > 0 && parked + req.indexes.length > GETBLOCKTXN_QUEUED_INDEXES_MAX) {
+      console.warn(
+        `getblocktxn from ${peer.host}:${peer.port} dropped: ${parked} indexes already queued`,
+      );
+      return serving;
+    }
+    return this.enqueueGetData(peer, [{ getBlockTxn: req }]);
+  }
+
+  /** Serve one queued getblocktxn (Core ProcessGetBlockTxn). */
+  private async serveGetBlockTxn(peer: Peer, req: GetBlockTxnPayload): Promise<void> {
     const rawBlock = await this.db.getBlock(req.blockHash);
-    if (!rawBlock) return;
+    if (!rawBlock || peer.state === "disconnected") return;
     const block = deserializeBlock(new BufferReader(rawBlock));
     if (this.blockDepth(req.blockHash) > MAX_BLOCKTXN_DEPTH) {
       peer.send({ type: "block", payload: { block } });
@@ -2643,18 +2694,27 @@ export class BlockSync {
    *    (Core sends what it read from disk, net_processing.cpp:2407).
    */
   private handleGetData(peer: Peer, inventory: InvVector[]): Promise<void> {
+    return this.enqueueGetData(peer, inventory);
+  }
+
+  /** Append to the peer's queue (capped) and make sure its serve loop runs. */
+  private enqueueGetData(peer: Peer, inventory: (InvVector | GetBlockTxnItem)[]): Promise<void> {
     let queue = this.getDataQueues.get(peer);
     if (!queue) {
-      queue = { items: [], head: 0 };
+      queue = { items: [], head: 0, getBlockTxnIndexes: 0 };
       this.getDataQueues.set(peer, queue);
     }
     const room = GETDATA_QUEUE_MAX - (queue.items.length - queue.head);
     if (inventory.length > room) {
       console.warn(
-        `getdata from ${peer.host}:${peer.port}: ${inventory.length - Math.max(room, 0)} items over the ${GETDATA_QUEUE_MAX}-entry queue dropped`,
+        `getdata/getblocktxn from ${peer.host}:${peer.port}: ${inventory.length - Math.max(room, 0)} items over the ${GETDATA_QUEUE_MAX}-entry queue dropped`,
       );
     }
-    for (let i = 0; i < inventory.length && i < room; i++) queue.items.push(inventory[i]);
+    for (let i = 0; i < inventory.length && i < room; i++) {
+      const item = inventory[i];
+      if (isGetBlockTxnItem(item)) queue.getBlockTxnIndexes += item.getBlockTxn.indexes.length;
+      queue.items.push(item);
+    }
 
     let serving = this.getDataServing.get(peer);
     if (!serving) {
@@ -2711,9 +2771,10 @@ export class BlockSync {
     while (queue.head < queue.items.length && !this.getDataSendPaused(peer)) {
       const inv = queue.items[queue.head];
       if (
-        inv.type !== InvType.MSG_TX &&
-        inv.type !== InvType.MSG_WTX &&
-        inv.type !== InvType.MSG_WITNESS_TX
+        isGetBlockTxnItem(inv) ||
+        (inv.type !== InvType.MSG_TX &&
+          inv.type !== InvType.MSG_WTX &&
+          inv.type !== InvType.MSG_WITNESS_TX)
       ) {
         break;
       }
@@ -2739,7 +2800,11 @@ export class BlockSync {
 
     if (queue.head < queue.items.length && !this.getDataSendPaused(peer)) {
       const inv = queue.items[queue.head++];
-      if (
+      if (isGetBlockTxnItem(inv)) {
+        // A getblocktxn costs a block read, so it takes the block slot.
+        queue.getBlockTxnIndexes -= inv.getBlockTxn.indexes.length;
+        await this.serveGetBlockTxn(peer, inv.getBlockTxn);
+      } else if (
         inv.type === InvType.MSG_BLOCK ||
         inv.type === InvType.MSG_WITNESS_BLOCK ||
         inv.type === InvType.MSG_CMPCT_BLOCK

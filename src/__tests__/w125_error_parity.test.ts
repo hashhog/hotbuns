@@ -203,14 +203,15 @@ describe("W125-G10: RPC_WALLET_INVALID_LABEL_NAME (-11) — PRESENT", () => {
 });
 
 // =============================================================================
-// G11 — RPC_WALLET_KEYPOOL_RAN_OUT (-12) — PARTIAL (constant present, no thrower)
+// G11 — RPC_WALLET_KEYPOOL_RAN_OUT (-12) — PRESENT
 // =============================================================================
-describe("W125-G11: RPC_WALLET_KEYPOOL_RAN_OUT (-12) — PARTIAL", () => {
+describe("W125-G11: RPC_WALLET_KEYPOOL_RAN_OUT (-12) — PRESENT", () => {
   it("WALLET_KEYPOOL_RAN_OUT === -12", () => {
     expect(RPCErrorCodes.WALLET_KEYPOOL_RAN_OUT).toBe(-12);
   });
-  it("no call site explicitly throws WALLET_KEYPOOL_RAN_OUT yet", () => {
-    expect(RPC_SERVER_SRC).not.toMatch(
+  it("getnewaddress throws it when a locked wallet's pool is used up", () => {
+    // Core: GetNewDestination -> "Keypool ran out" (wallet/rpc/addresses.cpp).
+    expect(RPC_SERVER_SRC).toMatch(
       /this\.rpcError\(\s*RPCErrorCodes\.WALLET_KEYPOOL_RAN_OUT/
     );
   });

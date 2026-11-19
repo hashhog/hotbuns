@@ -1566,6 +1566,18 @@ export class Mempool {
   /** Map of txid hex -> entry. */
   private entries: Map<string, MempoolEntry>;
 
+  /**
+   * Tail of the ATMP queue: the Core LOCK(cs_main) + LOCK(m_pool.cs) that
+   * MemPoolAccept holds for a whole accept. addTransaction awaits coin
+   * lookups between its duplicate/conflict checks and the insert, so two
+   * accepts that interleave there could both pass the conflict check and
+   * both insert a spend of the same outpoint. Every public accept path
+   * (single, package, test-accept package, reorg re-add) runs under
+   * withAtmpLock; their internal calls use addTransactionLocked, never the
+   * public addTransaction, which would wait on the lock they hold.
+   */
+  private atmpTail: Promise<void> = Promise.resolve();
+
   /** Map of "txid_hex:vout" -> spending txid hex. */
   private outpointIndex: Map<string, string>;
 
@@ -1879,6 +1891,34 @@ export class Mempool {
    * 9. Ancestor/descendant limits
    */
   async addTransaction(
+    tx: Transaction,
+    options?: AcceptToMemoryPoolOptions,
+  ): Promise<AcceptResult> {
+    return this.withAtmpLock(() => this.addTransactionLocked(tx, options));
+  }
+
+  /**
+   * Run `fn` with the ATMP lock held: it starts only after every earlier
+   * locked call has settled (resolved or thrown), and the next one starts
+   * only after it settles. Not re-entrant: `fn` must not call a public
+   * accept method.
+   */
+  private async withAtmpLock<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this.atmpTail;
+    let release!: () => void;
+    this.atmpTail = new Promise<void>((r) => {
+      release = r;
+    });
+    try {
+      await prev;
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  /** addTransaction body; the caller holds the ATMP lock. */
+  private async addTransactionLocked(
     tx: Transaction,
     options?: AcceptToMemoryPoolOptions,
   ): Promise<AcceptResult> {
@@ -3341,6 +3381,14 @@ export class Mempool {
     addToMempool: (tx: Transaction) => boolean = () => true,
     entryHeight: (tx: Transaction) => number | undefined = () => undefined
   ): Promise<{ readded: number; refused: number; trimmed: number; removedForReorg: number }> {
+    return this.withAtmpLock(() => this.updateForReorgLocked(disconnected, addToMempool, entryHeight));
+  }
+
+  private async updateForReorgLocked(
+    disconnected: Transaction[],
+    addToMempool: (tx: Transaction) => boolean,
+    entryHeight: (tx: Transaction) => number | undefined
+  ): Promise<{ readded: number; refused: number; trimmed: number; removedForReorg: number }> {
     const readded: string[] = [];
     let refused = 0;
     for (const tx of disconnected) {
@@ -3349,7 +3397,7 @@ export class Mempool {
       if (this.entries.has(txidHex)) continue;
       let accepted = false;
       if (addToMempool(tx)) {
-        const r = await this.addTransaction(tx, { bypassLimits: true, entryHeight: entryHeight(tx) });
+        const r = await this.addTransactionLocked(tx, { bypassLimits: true, entryHeight: entryHeight(tx) });
         accepted = r.accepted;
         if (!accepted) {
           console.log(
@@ -3673,6 +3721,10 @@ export class Mempool {
    * chain.
    */
   async readdTransactions(txs: Transaction[]): Promise<void> {
+    return this.withAtmpLock(() => this.readdTransactionsLocked(txs));
+  }
+
+  private async readdTransactionsLocked(txs: Transaction[]): Promise<void> {
     for (const tx of txs) {
       // Skip coinbase
       if (isCoinbase(tx)) continue;
@@ -3682,7 +3734,7 @@ export class Mempool {
       // semantics: drop txs that are no longer policy-valid against
       // the new tip).  Surfacing the error helps diagnose Pattern B2
       // partial-refill bugs vs. transient policy mismatches.
-      const result = await this.addTransaction(tx);
+      const result = await this.addTransactionLocked(tx);
       if (!result.accepted) {
         const txid = getTxId(tx).toString("hex");
         console.warn(
@@ -5864,6 +5916,13 @@ export class Mempool {
     transactions: Transaction[],
     options?: { maxFeeRateSatPerVB?: number },
   ): Promise<PackageResult> {
+    return this.withAtmpLock(() => this.submitPackageLocked(transactions, options));
+  }
+
+  private async submitPackageLocked(
+    transactions: Transaction[],
+    options?: { maxFeeRateSatPerVB?: number },
+  ): Promise<PackageResult> {
     const txResults = new Map<string, PackageTxResult>();
     const replacedTxids: string[] = [];
 
@@ -5937,7 +5996,7 @@ export class Mempool {
         continue;
       }
 
-      const single = await this.addTransaction(tx, singleOptions);
+      const single = await this.addTransactionLocked(tx, singleOptions);
       if (single.accepted) {
         replacedTxids.push(...(single.replaced ?? []));
         finalResults.set(wtxid, individualSuccess(tx, single.fee!, single.vsize!));
@@ -5962,7 +6021,7 @@ export class Mempool {
     if (!quitEarly && toEvaluate.length === 1) {
       const tx = toEvaluate[0];
       const { txid, wtxid } = txHashes(tx);
-      const single = await this.addTransaction(tx, singleOptions);
+      const single = await this.addTransactionLocked(tx, singleOptions);
       if (single.accepted) {
         multi.txResults.set(wtxid, individualSuccess(tx, single.fee!, single.vsize!));
         multi.replacedTxids = single.replaced ?? [];
@@ -6007,11 +6066,13 @@ export class Mempool {
    * nothing is committed. A tx with no result was not reached.
    */
   async testAcceptPackage(transactions: Transaction[]): Promise<PackageResult> {
-    return this.acceptMultiple(transactions, {
-      testAccept: true,
-      packageFeerates: false,
-      allowReplacement: false,
-    });
+    return this.withAtmpLock(() =>
+      this.acceptMultiple(transactions, {
+        testAccept: true,
+        packageFeerates: false,
+        allowReplacement: false,
+      }),
+    );
   }
 
   /**
@@ -6059,7 +6120,7 @@ export class Mempool {
     const coins = new Map<string, Transaction>();
     for (const tx of transactions) {
       const { txid, wtxid } = txHashes(tx);
-      const pre = await this.addTransaction(tx, {
+      const pre = await this.addTransactionLocked(tx, {
         testAccept: true,
         inPackage: {
           coins,
@@ -6177,7 +6238,7 @@ export class Mempool {
     // Script checks, in package order (validation.cpp:1536).
     const scriptCoins = new Map<string, Transaction>();
     for (const m of members) {
-      const checked = await this.addTransaction(m.tx, {
+      const checked = await this.addTransactionLocked(m.tx, {
         testAccept: true,
         inPackage: {
           coins: scriptCoins,
@@ -6205,7 +6266,7 @@ export class Mempool {
     // added; the package-level checks above stand in for the per-tx ones.
     const committed: Transaction[] = [];
     for (const m of members) {
-      const added = await this.addTransaction(m.tx, {
+      const added = await this.addTransactionLocked(m.tx, {
         inPackage: { coins: new Map(), packageFeerates: true, allowReplacement: true },
       });
       if (!added.accepted) {

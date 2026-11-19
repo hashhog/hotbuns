@@ -102,6 +102,7 @@ import {
   COINBASE_SPENDABLE_DEPTH,
   WALLET_DEFAULT_TRANSACTION_MINFEE_KVB,
   feeAtRate,
+  WalletKeypoolRanOutError,
 } from "../wallet/wallet.js";
 import {
   parseDescriptor,
@@ -13613,7 +13614,16 @@ export class RPCServer {
       }
       addressType = addressTypeParam;
     }
-    const address = wallet.getNewAddress(addressType);
+    let address: string;
+    try {
+      address = wallet.getNewAddress(addressType);
+    } catch (e) {
+      // Locked wallet, pool used up: Core -12 (wallet/rpc/addresses.cpp).
+      if (e instanceof WalletKeypoolRanOutError) {
+        throw this.rpcError(RPCErrorCodes.WALLET_KEYPOOL_RAN_OUT, e.message);
+      }
+      throw e;
+    }
     // Advancing the receive-index keypool is state-changing: persist so a
     // SIGKILL before the next block doesn't reissue the same index.
     this.markWalletDirty();
