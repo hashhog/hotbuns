@@ -22,7 +22,12 @@ import { join } from "node:path";
 
 import { REGTEST } from "../consensus/params.js";
 import { ChainDB } from "../storage/database.js";
+import * as blocks from "../sync/blocks.js";
 import { BlockSync, GETDATA_MAX_SEND_BUFFER } from "../sync/blocks.js";
+
+// Added by the fix; the fallback keeps this file compiling and running on master.
+const GETBLOCKTXN_QUEUED_INDEXES_MAX: number =
+  (blocks as any).GETBLOCKTXN_QUEUED_INDEXES_MAX ?? 4 * 65_536;
 import { HeaderSync } from "../sync/headers.js";
 import { InvType } from "../p2p/messages.js";
 import { deserializeBlock, getBlockHash } from "../validation/block.js";
@@ -171,6 +176,46 @@ describe("cffix: getblocktxn is paced like getdata", () => {
         await new Promise((r) => setTimeout(r, 300));
         expect(h.reads() - atDisconnect).toBeLessThanOrEqual(1);
         expect(h.reads()).toBeLessThan(N);
+      } finally {
+        await close(h);
+      }
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a send-paused peer cannot park unbounded getblocktxn indexes on its queue",
+    async () => {
+      const h = await open();
+      try {
+        const { peer, sent } = stubPeer();
+        peer.unsent = GETDATA_MAX_SEND_BUFFER * 2;
+        const fn = h.handlers.get("getblocktxn")!;
+        const big = Array.from({ length: 60_000 }, (_, i) => i);
+        for (let i = 0; i < 50; i++) {
+          fn(peer, { type: "getblocktxn", payload: { blockHash: h.hash, indexes: big } });
+        }
+        await new Promise((r) => setTimeout(r, 100));
+        // Whatever this peer has parked is held to the budget (on master
+        // nothing is parked; each request is read at once instead).
+        const q = h.sync.getDataQueues.get(peer);
+        const parked = q
+          ? q.items.slice(q.head).reduce(
+              (n: number, it: any) => n + (it.getBlockTxn ? it.getBlockTxn.indexes.length : 0),
+              0,
+            )
+          : 0;
+        expect(parked).toBeLessThanOrEqual(GETBLOCKTXN_QUEUED_INDEXES_MAX);
+        if (q) expect(q.getBlockTxnIndexes).toBe(parked);
+
+        // The parked requests are still served once the peer reads; the
+        // budget then frees up for new ones.
+        peer.unsent = 0;
+        await waitFor(() => !h.sync.getDataServing.get(peer), 10_000, "queue drained");
+        expect(sent.length).toBe(0); // the indexes are out of range: no reply
+        deliver(h, peer, 1);
+        await waitFor(() => sent.length === 1, 10_000, "reply after drain");
+        expect(sent[0].type).toBe("blocktxn");
       } finally {
         await close(h);
       }
