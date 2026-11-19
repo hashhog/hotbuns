@@ -22,6 +22,8 @@
  * drops the store rather than rewinding `end`.
  */
 const EMPTY = Buffer.alloc(0);
+/** Stores at or below this size are never shrunk on consume. */
+const SHRINK_MIN_STORE = 256 * 1024;
 
 export class RecvBuffer {
   private store: Buffer = EMPTY;
@@ -63,7 +65,19 @@ export class RecvBuffer {
       throw new RangeError(`RecvBuffer.consume(${n}) with ${this.length} bytes buffered`);
     }
     this.start += n;
-    if (this.start === this.end) this.clear();
+    if (this.start === this.end) {
+      this.clear();
+    } else if (this.store.length > SHRINK_MIN_STORE && 4 * this.length < this.store.length) {
+      // A small tail left behind a large message: move it to its own store so
+      // a peer that always keeps a partial message buffered does not pin the
+      // large one. Copies at most a quarter of the store, and only after
+      // `n` bytes were consumed, so appends stay amortized O(1).
+      const tail = Buffer.allocUnsafe(this.length);
+      this.store.copy(tail, 0, this.start, this.end);
+      this.store = tail;
+      this.start = 0;
+      this.end = tail.length;
+    }
   }
 
   /** Return the unconsumed bytes as a view and empty the buffer. */

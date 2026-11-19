@@ -274,4 +274,18 @@ describe("RecvBuffer never rewrites bytes it has handed out", () => {
     rb.append(tail);
     expect(rb.view().equals(Buffer.concat([before, tail]))).toBe(true);
   });
+
+  test("a small tail left behind a large message does not pin the large store", async () => {
+    const mod = await import("../p2p/recv_buffer.js").catch(() => null);
+    expect(mod).not.toBeNull();
+    const rb = new mod!.RecvBuffer();
+    for (let i = 0; i < 4000; i++) rb.append(randomBytes(1000));
+    const big = rb.view().subarray(0, 3_999_900);
+    const bigCopy = Buffer.from(big);
+    const tail = Buffer.from(rb.view().subarray(3_999_900));
+    rb.consume(3_999_900);
+    expect(rb.view().equals(tail)).toBe(true);
+    expect((rb as any).store.length).toBeLessThan(256 * 1024);
+    expect(big.equals(bigCopy)).toBe(true);
+  });
 });
