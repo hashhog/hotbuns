@@ -3918,8 +3918,41 @@ export class Wallet {
     this.masterKey.key.fill(0);
     this.masterKey.chainCode.fill(0);
 
-    // Note: Private keys are derived on-demand from the seed, so they're not in memory
-    // when the wallet is locked. The key map contains public info only when locked.
+    // rotateSeed and earlier derivation left plaintext keys in the keyring.
+    this.wipePrivateKeys();
+  }
+
+  /**
+   * Zero and drop the private key of every keyring entry (derived, retired
+   * and imported), keeping address, public key and path so ownership and
+   * balance tracking still work while locked. Core: CWallet::Lock leaves keys
+   * only in encrypted form. unlockWallet re-derives / re-decrypts them.
+   */
+  private wipePrivateKeys(): void {
+    for (const key of this.keys.values()) {
+      key.privateKey.fill(0);
+      key.privateKey = Buffer.alloc(0);
+    }
+  }
+
+  /**
+   * After unlock: re-derive the current seed's keys wiped by lockWallet or
+   * encryptWallet. Retired and imported keys are restored by
+   * restoreRetiredKeys / restoreImportedKeys.
+   */
+  private rederiveWipedKeys(): void {
+    for (const [address, key] of this.keys) {
+      if (key.privateKey.length !== 0 || key.retired || key.path === "imported") continue;
+      try {
+        const fresh = this.deriveKey(key.path, key.addressType);
+        if (fresh.address !== address) {
+          throw new Error(`derived ${fresh.address} at ${key.path}`);
+        }
+        this.keys.set(address, fresh);
+      } catch (err) {
+        console.warn(`[wallet] key for ${address} not re-derived (${(err as Error).message})`);
+      }
+    }
   }
 
   /**
@@ -4037,6 +4070,7 @@ export class Wallet {
     if (!this.blank && !this.disablePrivateKeys) {
       this.restoreRetiredKeys();
     }
+    this.rederiveWipedKeys();
     this.pregenerateAddresses();
     this.restoreImportedKeys();
 
@@ -4054,7 +4088,7 @@ export class Wallet {
   /**
    * Lock the wallet (walletlock RPC).
    *
-   * Clears the decrypted seed from memory.
+   * Clears the decrypted seed, the master key and every keyring private key.
    */
   lockWallet(): void {
     if (!this.encryption.isEncrypted) {
@@ -4078,6 +4112,9 @@ export class Wallet {
     // Clear master key
     this.masterKey.key.fill(0);
     this.masterKey.chainCode.fill(0);
+
+    // Clear every derived and imported private key.
+    this.wipePrivateKeys();
 
     // Mark as locked
     this.encryption.isLocked = true;
