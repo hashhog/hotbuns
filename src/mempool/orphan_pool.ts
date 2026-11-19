@@ -325,19 +325,26 @@ export class OrphanPool {
   }
 
   /**
-   * Find every orphan that depends on any output of `parentTxid` (any vout).
+   * Find every orphan that spends any of the first `numOutputs` outputs of
+   * `parentTxid`, each orphan at most once.
+   *
+   * One keyed `byPrevout` lookup per parent output, like Core's
+   * `TxOrphanage::AddChildrenToWorkSet` (node/txorphanage.cpp), which does
+   * `m_outpoint_to_orphan_it.find(COutPoint(tx.GetHash(), i))` for each
+   * output `i`. The previous version scanned every key of `byPrevout` (one
+   * per orphan input, up to ~200k in a full pool of large orphans) on every
+   * parent admission.
    *
    * Used on full parent admission: caller will then re-attempt the orphans
    * via mempool.acceptTx.
    */
-  findChildrenOf(parentTxid: Buffer): OrphanEntry[] {
+  findChildrenOf(parentTxid: Buffer, numOutputs: number): OrphanEntry[] {
     const parentHex = parentTxid.toString("hex");
     const out: OrphanEntry[] = [];
     const seen = new Set<string>();
-    for (const [key, set] of this.byPrevout) {
-      const colon = key.indexOf(":");
-      if (colon === -1) continue;
-      if (key.slice(0, colon) !== parentHex) continue;
+    for (let vout = 0; vout < numOutputs; vout++) {
+      const set = this.byPrevout.get(`${parentHex}:${vout}`);
+      if (!set) continue;
       for (const wtxidHex of set) {
         if (seen.has(wtxidHex)) continue;
         seen.add(wtxidHex);
@@ -355,7 +362,7 @@ export class OrphanPool {
    * the ones that resolve.
    */
   onParentAdmitted(parent: Transaction): OrphanEntry[] {
-    return this.findChildrenOf(getTxId(parent));
+    return this.findChildrenOf(getTxId(parent), parent.outputs.length);
   }
 
   /** Remove all orphans (test helper / shutdown). */
