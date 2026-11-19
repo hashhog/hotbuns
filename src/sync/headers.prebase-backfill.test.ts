@@ -307,6 +307,8 @@ describe("snapshot pre-base header backfill", () => {
     let completed = 0;
     hs.onPreBaseBackfillComplete(() => completed++);
     const peer = new FakePeer();
+    // Backfill replies are accepted only from the peer the request went to.
+    hs.maybeRequestPreBaseHeaders(peer as any);
 
     await deliver(hs, peer, 1, 10);
     expect(hs.getPreBaseBackfillStatus()).toEqual({ rootHeight: ROOT, frontierHeight: 10 });
@@ -343,6 +345,7 @@ describe("snapshot pre-base header backfill", () => {
   test("restart mid-backfill resumes from the persisted frontier", async () => {
     const hs = await islandNode();
     const peer = new FakePeer();
+    hs.maybeRequestPreBaseHeaders(peer as any);
     await deliver(hs, peer, 1, 12);
 
     const hs2 = new HeaderSync(db, params);
@@ -360,6 +363,7 @@ describe("snapshot pre-base header backfill", () => {
     const hs = await islandNode();
     const other = mineRegtestChain(ROOT, 7); // same heights, different hashes
     const peer = new FakePeer();
+    hs.maybeRequestPreBaseHeaders(peer as any);
     await (hs as any).handleHeadersMessage(
       peer,
       other.slice(1, ROOT + 1).map((c) => c.header),
@@ -381,6 +385,7 @@ describe("snapshot pre-base header backfill", () => {
       const h = getBlockHash(bad[2]);
       if (BigInt("0x" + Buffer.from(h).reverse().toString("hex")) > target) break;
     }
+    hs.maybeRequestPreBaseHeaders(peer as any);
     await (hs as any).handleHeadersMessage(peer, bad);
     expect(hs.getPreBaseBackfillStatus()).toEqual({ rootHeight: ROOT, frontierHeight: 2 });
   });
