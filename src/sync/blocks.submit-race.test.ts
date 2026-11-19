@@ -215,7 +215,9 @@ describe("submitblock racing the same block over P2P (SUBP2P finding 6)", () => 
       }
       return v;
     };
-    expect(await headerSync.processHeaders([b102.header], null, false)).toBe(1);
+    // The header arrives as a headers-message header would (Core: PRESYNC-released,
+    // min_pow_checked=true); `false` is now refused unconditionally, as in Core.
+    expect(await headerSync.processHeaders([b102.header], null, true)).toBe(1);
     const p2p = blockSync.handleBlock(peer(), b102);
     for (let i = 0; i < 500 && !parked; i++) await new Promise((r) => setTimeout(r, 2));
     // Instrument check: the race window is really open (else this test proves nothing).

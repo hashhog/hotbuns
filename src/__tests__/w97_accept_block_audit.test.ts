@@ -174,11 +174,13 @@ describe("W97 AcceptBlockHeader — duplicate, prev-blk, contextual gates", () =
   });
 
   // ── G8: min_pow_checked / too-little-chainwork at AcceptBlockHeader level ──
-  // FIX B05: processHeaders now accepts a 3rd parameter `minPowChecked`
-  // (default true).  When false it rejects headers whose cumulative chainWork
-  // falls below params.nMinimumChainWork with "too-little-chainwork".
-  // The submitblock direct path (blocks.ts injectBlock) passes false.
-  // PRESYNC-released headers and the generateblock path pass true (default).
+  // FIX B05: processHeaders accepts a 3rd parameter `minPowChecked`
+  // (default true).  When false it rejects the header with
+  // "too-little-chainwork" UNCONDITIONALLY, as Core's AcceptBlockHeader does
+  // (cffix-hotbuns-lowwork-block-header; the earlier gate only compared
+  // against params.nMinimumChainWork and so did nothing once the node was
+  // past it).  submitblock passes true, as Core's rpc/mining.cpp does; the
+  // unrequested-block path in handleBlock passes its anti-DoS comparison.
   // Reference: Bitcoin Core validation.cpp:4229.
 
   test("G8-1 — processHeaders signature contains minPowChecked parameter", () => {
@@ -189,19 +191,15 @@ describe("W97 AcceptBlockHeader — duplicate, prev-blk, contextual gates", () =
     );
   });
 
-  test("G8-2 — processHeaders with minPowChecked=true accepts a low-chainwork header (PRESYNC-released path)", () => {
-    // Build a minimal HeaderSync on regtest (nMinimumChainWork=0n) and verify
-    // a header is accepted when minPowChecked=true regardless of chainWork.
-    // We use regtest to keep PoW trivial; the gate is skipped when
-    // nMinimumChainWork===0n, so this confirms the safe-default path.
-    const { REGTEST } = require("../consensus/params.js");
-    // Confirm regtest nMinimumChainWork is 0 (skip path)
-    expect(REGTEST.nMinimumChainWork).toBe(0n);
-    // A HeaderSync on REGTEST: the guard is a no-op, minPowChecked=true is safe.
-    const src = HEADERS_SRC;
-    // The guard must be conditioned on `this.params.nMinimumChainWork > 0n`
-    // so that regtest never hits it.
-    expect(src).toContain("this.params.nMinimumChainWork > 0n");
+  test("G8-2 — processHeaders' low-work gate is unconditional on minPowChecked=false (Core AcceptBlockHeader)", () => {
+    // Core: `if (!min_pow_checked) return state.Invalid(BLOCK_HEADER_LOW_WORK, ...)`
+    // with no nMinimumChainWork condition. The behavioural pin is
+    // src/__tests__/cffix_lowwork_block_header.test.ts; this checks the gate
+    // is no longer conditioned on nMinimumChainWork.
+    const idx = HEADERS_SRC.indexOf("async processHeaders(");
+    const slice = HEADERS_SRC.slice(idx, idx + 6000);
+    expect(slice).toContain("if (!minPowChecked) {");
+    expect(slice).not.toContain("!minPowChecked && this.params.nMinimumChainWork");
   });
 
   test("G8-3 — processHeaders source contains too-little-chainwork guard on minPowChecked=false path", () => {
@@ -210,7 +208,7 @@ describe("W97 AcceptBlockHeader — duplicate, prev-blk, contextual gates", () =
     const idx = HEADERS_SRC.indexOf("async processHeaders(");
     expect(idx).toBeGreaterThan(-1);
     const slice = HEADERS_SRC.slice(idx, idx + 6000);
-    // The guard fires when !minPowChecked && nMinimumChainWork > 0n && chainWork < nMinimumChainWork.
+    // The guard fires whenever !minPowChecked.
     expect(slice).toContain("!minPowChecked");
     // Core's canonical error string (validation.cpp:4229):
     expect(slice).toContain("too-little-chainwork");
