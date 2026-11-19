@@ -28,6 +28,7 @@ import {
   V1_PREFIX_LEN,
   looksLikeV1Version,
 } from "./v2_transport.js";
+import { RecvBuffer } from "./recv_buffer.js";
 import type { ProxyManager, NetworkType } from "./proxy.js";
 import type { ParseSteps } from "../validation/tx.js";
 
@@ -499,7 +500,8 @@ export class Peer {
   private deferredV2Total = 0;
   /** A resume pass is queued on the event loop. */
   private resumeScheduled = false;
-  private recvBuffer: Buffer;
+  /** Received bytes not yet parsed; grows geometrically (see RecvBuffer). */
+  private readonly recvBuffer = new RecvBuffer();
   private config: PeerConfig;
   private events: PeerEvents;
   private pingNonce: bigint | null;
@@ -574,7 +576,6 @@ export class Peer {
     this.state = "connecting";
     this.versionPayload = null;
     this.socket = null;
-    this.recvBuffer = Buffer.alloc(0);
     this.pingNonce = null;
     this.lastPingTime = 0;
     this.latency = 0;
@@ -1240,7 +1241,7 @@ export class Peer {
     // dispatched once disconnected.
     this.outbox = [];
     this.outboxBytes = 0;
-    this.recvBuffer = Buffer.alloc(0);
+    this.recvBuffer.clear();
     this.deferredV2 = [];
     this.deferredV2Bytes = [];
     this.deferredV2Total = 0;
@@ -1545,16 +1546,11 @@ export class Peer {
     if (this.recvPaused) this.reassertRecvPause();
     this.bytesRecv += data.length;
     this.lastRecv = Date.now();
-    // Accumulate incoming data - copy into new buffer to avoid
-    // retaining references to large underlying ArrayBuffers
-    if (this.recvBuffer.length === 0) {
-      this.recvBuffer = Buffer.from(data);
-    } else {
-      const newBuf = Buffer.allocUnsafe(this.recvBuffer.length + data.length);
-      newBuf.set(this.recvBuffer, 0);
-      newBuf.set(data, this.recvBuffer.length);
-      this.recvBuffer = newBuf;
-    }
+    // Append in place (amortized O(1) per byte, Core V1Transport::readData).
+    // Rebuilding the buffer on every read made a message dripped in small
+    // reads cost O(n^2) memcpy. append() copies, so the socket's read buffer
+    // is not retained.
+    this.recvBuffer.append(data);
 
     // Process any complete messages
     this.runRecvProcessing();
@@ -1669,7 +1665,7 @@ export class Peer {
         // Need more bytes before we can decide.
         return;
       }
-      if (looksLikeV1Version(this.recvBuffer.subarray(0, V1_PREFIX_LEN), this.magicLE)) {
+      if (looksLikeV1Version(this.recvBuffer.view().subarray(0, V1_PREFIX_LEN), this.magicLE)) {
         this.transportMode = "v1";
         // Send our v1 VERSION now (was previously deferred at acceptSocket
         // time so we wouldn't corrupt a v2 wire).
@@ -1699,7 +1695,8 @@ export class Peer {
     // 2. v1 path. Undispatched bytes stay in recvBuffer while the peer is
     // paused (send queue full or an ingress hold); updateRecvPause bounds it.
     while (this.recvBuffer.length >= MESSAGE_HEADER_SIZE && this.canDispatch()) {
-      const header = parseHeader(this.recvBuffer);
+      const recv = this.recvBuffer.view();
+      const header = parseHeader(recv);
       if (!header) {
         break;
       }
@@ -1711,11 +1708,13 @@ export class Peer {
       }
 
       const totalLength = MESSAGE_HEADER_SIZE + header.length;
-      if (this.recvBuffer.length < totalLength) {
+      if (recv.length < totalLength) {
         break;
       }
 
-      const payload = this.recvBuffer.subarray(MESSAGE_HEADER_SIZE, totalLength);
+      // A view: RecvBuffer never rewrites bytes it has handed out, so this
+      // stays valid across a sliced parse while more data is appended.
+      const payload = recv.subarray(MESSAGE_HEADER_SIZE, totalLength);
 
       const expectedChecksum = hash256(payload).subarray(0, 4);
       if (!header.checksum.equals(expectedChecksum)) {
@@ -1743,18 +1742,17 @@ export class Peer {
         if (deserErr instanceof OversizedTxMessageError) {
           // Non-standard by size: drop it unparsed, keep the peer (audit H2).
           console.warn(`peer ${this.host}: ${deserErr.message}`);
-          this.recvBuffer = this.recvBuffer.subarray(totalLength);
+          this.recvBuffer.consume(totalLength);
           continue;
         }
         this.logV1DeserError(header, deserErr);
         throw deserErr;
       }
 
-      // O(1) view, not a copy: copying the remainder after EVERY message made
+      // O(1), not a copy: copying the remainder after EVERY message made
       // one socket read of N small messages cost O(N * bytes) — 2.4 s of a
-      // 50k-tx burst went to this line alone (flood-regtest profile). The
-      // remainder is compacted once, below.
-      this.recvBuffer = this.recvBuffer.subarray(totalLength);
+      // 50k-tx burst went to this line alone (flood-regtest profile).
+      this.recvBuffer.consume(totalLength);
       if (steps) {
         // Nothing behind this message dispatches until it has been parsed
         // and dispatched; recvBuffer keeps the rest, under the receive limit.
@@ -1767,11 +1765,9 @@ export class Peer {
       }
       this.handleMessage(msg!);
     }
-    // Compact the unconsumed tail (a partial message) into its own buffer so
-    // it does not pin the large read buffer it was sliced from.
-    if (this.recvBuffer.length > 0 && this.recvBuffer.byteOffset !== 0) {
-      this.recvBuffer = Buffer.from(this.recvBuffer);
-    }
+    // No per-call compaction of the partial tail: recopying it on every read
+    // was the quadratic case. RecvBuffer moves live bytes only when it grows,
+    // and drops its store once drained.
   }
 
   /**
@@ -1800,15 +1796,14 @@ export class Peer {
     if (
       !this.v2Transport.isReady() &&
       this.recvBuffer.length >= V1_PREFIX_LEN &&
-      looksLikeV1Version(this.recvBuffer.subarray(0, V1_PREFIX_LEN), this.magicLE)
+      looksLikeV1Version(this.recvBuffer.view().subarray(0, V1_PREFIX_LEN), this.magicLE)
     ) {
       this.disconnect("v2 outbound: peer responded with v1 VERSION");
       return;
     }
 
     // One-shot: drive the state machine on whatever has accumulated.
-    const inbound = this.recvBuffer;
-    this.recvBuffer = Buffer.alloc(0);
+    const inbound = this.recvBuffer.takeAll();
     const result = this.v2Transport.receiveBytes(inbound);
 
     // Flush whatever the state machine queued (responder pubkey + garbage

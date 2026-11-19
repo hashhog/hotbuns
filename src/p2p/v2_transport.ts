@@ -21,6 +21,7 @@ import {
 } from "./bip324/cipher.js";
 import { EllSwiftPubKey, ELLSWIFT_PUBLIC_KEY_SIZE } from "./bip324/elligator_swift.js";
 import { encodeMessageType, decodeMessageType } from "./bip324/message_ids.js";
+import { RecvBuffer } from "./recv_buffer.js";
 
 /** Maximum v2 protocol message payload size (matches Core MAX_PROTOCOL_MESSAGE_LENGTH) */
 export const MAX_V2_MESSAGE_SIZE = 4 * 1000 * 1000;
@@ -134,7 +135,8 @@ export class V2Transport {
   private networkMagic: Buffer;
 
   // Receive buffers
-  private recvBuffer: Buffer = Buffer.alloc(0);
+  /** Received bytes not yet consumed; grows geometrically (see RecvBuffer). */
+  private recvBuffer: RecvBuffer = new RecvBuffer();
   private recvGarbage: Buffer = Buffer.alloc(0);
   /** End offset of the trailing-16B garbage windows already compared against
    *  the terminator (Core scans one byte at a time, so each window is checked
@@ -214,7 +216,7 @@ export class V2Transport {
     t.initiator = initiator;
     t.cipher = BIP324Cipher.withKey(privateKey, entropy, networkMagic);
     t.sendGarbage = garbage;
-    t.recvBuffer = Buffer.alloc(0);
+    t.recvBuffer = new RecvBuffer();
     t.recvGarbage = Buffer.alloc(0);
     t.garbageScanned = 0;
     t.currentPacketLen = -1;
@@ -311,9 +313,9 @@ export class V2Transport {
    * @returns Result indicating whether to continue processing
    */
   receiveBytes(data: Buffer): RecvResult {
-    if (data.length > 0) {
-      this.recvBuffer = Buffer.concat([this.recvBuffer, data]);
-    }
+    // Append in place: Buffer.concat here (and a copy of the remainder per
+    // consumed chunk below) made a packet dripped in small reads cost O(n^2).
+    this.recvBuffer.append(data);
 
     // Drive the state machine until it stalls (waiting for more bytes).
     while (true) {
@@ -362,10 +364,11 @@ export class V2Transport {
     }
     // Build the expected 16-byte prefix: networkMagic + V1_VERSION_COMMAND.
     const v1Prefix = Buffer.concat([this.networkMagic, V1_VERSION_COMMAND]);
-    const received = this.recvBuffer.length;
+    const recv = this.recvBuffer.view();
+    const received = recv.length;
     // Check byte-by-byte as far as we have received; any mismatch → v2.
     for (let i = 0; i < Math.min(received, V1_PREFIX_LEN); i++) {
-      if (this.recvBuffer[i] !== v1Prefix[i]) {
+      if (recv[i] !== v1Prefix[i]) {
         // Mismatch before 16 bytes — this is a v2 connection.
         this.recvState = RecvState.KEY;
         return { continue: true, fallbackV1: false };
@@ -392,11 +395,9 @@ export class V2Transport {
 
     // Extract their pubkey.
     this.theirKey = new EllSwiftPubKey(
-      this.recvBuffer.subarray(0, ELLSWIFT_PUBLIC_KEY_SIZE)
+      Buffer.from(this.recvBuffer.view().subarray(0, ELLSWIFT_PUBLIC_KEY_SIZE))
     );
-    this.recvBuffer = Buffer.from(
-      this.recvBuffer.subarray(ELLSWIFT_PUBLIC_KEY_SIZE)
-    );
+    this.recvBuffer.consume(ELLSWIFT_PUBLIC_KEY_SIZE);
 
     // Initialize the cipher (computes ECDH, derives keys).
     this.cipher.initialize(this.theirKey, this.initiator);
@@ -439,19 +440,20 @@ export class V2Transport {
   private processGarbage(): RecvResult {
     const terminator = this.cipher.recvGarbageTerminator;
     const MAX = MAX_GARBAGE_LEN + GARBAGE_TERMINATOR_LEN; // 4111
+    const recv = this.recvBuffer.view();
 
     // Advance the per-byte equivalent scan over any windows completed since the
     // last call.  `end` is the (exclusive) end of the trailing window — i.e.
     // Core's m_recv_buffer.size() after appending that byte.
     for (
       let end = Math.max(this.garbageScanned, GARBAGE_TERMINATOR_LEN);
-      end <= this.recvBuffer.length;
+      end <= recv.length;
       end++
     ) {
       // Core only checks once buffer.size() >= GARBAGE_TERMINATOR_LEN
       // (net.cpp:1185); the trailing window is [end-16, end).
       if (
-        this.recvBuffer
+        recv
           .subarray(end - GARBAGE_TERMINATOR_LEN, end)
           .equals(terminator)
       ) {
@@ -462,10 +464,10 @@ export class V2Transport {
         const garbEnd = end - GARBAGE_TERMINATOR_LEN;
         this.recvGarbage =
           garbEnd > 0
-            ? Buffer.from(this.recvBuffer.subarray(0, garbEnd))
+            ? Buffer.from(recv.subarray(0, garbEnd))
             : Buffer.alloc(0);
         this.recvAad = this.recvGarbage;
-        this.recvBuffer = Buffer.from(this.recvBuffer.subarray(end));
+        this.recvBuffer.consume(end);
         this.garbageScanned = 0;
         this.recvState = RecvState.VERSION;
         this.currentPacketLen = -1;
@@ -482,7 +484,7 @@ export class V2Transport {
     // Remember how far we have scanned so we never re-compare a window, and
     // wait for more bytes (Core's "need to receive more" branch,
     // net.cpp:1197-1203).
-    this.garbageScanned = this.recvBuffer.length;
+    this.garbageScanned = recv.length;
     return { continue: false, fallbackV1: false };
   }
 
@@ -517,9 +519,9 @@ export class V2Transport {
       if (this.recvBuffer.length < LENGTH_LEN) {
         return { continue: false, fallbackV1: false };
       }
-      const encryptedLen = this.recvBuffer.subarray(0, LENGTH_LEN);
+      const encryptedLen = this.recvBuffer.view().subarray(0, LENGTH_LEN);
       this.currentPacketLen = this.cipher.decryptLength(encryptedLen);
-      this.recvBuffer = Buffer.from(this.recvBuffer.subarray(LENGTH_LEN));
+      this.recvBuffer.consume(LENGTH_LEN);
       if (this.currentPacketLen > MAX_V2_MESSAGE_SIZE) {
         return {
           continue: false,
@@ -534,8 +536,9 @@ export class V2Transport {
       return { continue: false, fallbackV1: false };
     }
 
-    const encryptedPayload = this.recvBuffer.subarray(0, expectedLen);
-    this.recvBuffer = Buffer.from(this.recvBuffer.subarray(expectedLen));
+    // A view: RecvBuffer never rewrites bytes it has handed out.
+    const encryptedPayload = this.recvBuffer.view().subarray(0, expectedLen);
+    this.recvBuffer.consume(expectedLen);
 
     // AAD for the very first inbound packet is recv_garbage; thereafter it's
     // empty.  Either way, recvAad is consumed (cleared) after a successful
