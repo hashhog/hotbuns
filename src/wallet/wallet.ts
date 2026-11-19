@@ -4139,6 +4139,12 @@ export class Wallet {
     // Derive new encryption key
     const newKey = await this.deriveEncryptionKey(newPassphrase, newSalt);
 
+    // The auto-lock timer can fire during the awaits above and clear the
+    // seed; never seal an empty seed under the new passphrase.
+    if (this.seed.length !== 64) {
+      throw new Error("Wallet was locked during the passphrase change; nothing was changed.");
+    }
+
     // Re-encrypt the seed
     const encryptedSeed = this.encryptAES256CBC(this.seed, newKey, newIV);
 

@@ -125,6 +125,20 @@ describe("cffix: passphrase checked on an unlocked wallet", () => {
     expect((await rpc("walletpassphrase", ["new", 60])).error ?? null).toBeNull();
   });
 
+  test("a lock landing during changePassphrase on an unlocked wallet changes nothing", async () => {
+    await wallet.unlockWallet("pw", 0);
+    // changePassphrase runs synchronously up to its first await; locking now
+    // stands in for the auto-lock timer firing while the KDF runs.
+    const pending = wallet.changePassphrase("pw", "new");
+    wallet.lockWallet();
+    await expect(pending).rejects.toThrow();
+    expect(wallet.isLocked()).toBe(true);
+    // The stored seed was not resealed (as empty) under "new".
+    await expect(wallet.unlockWallet("new", 0)).rejects.toThrow("Incorrect passphrase.");
+    await wallet.unlockWallet("pw", 0);
+    expect(wallet.isLocked()).toBe(false);
+  });
+
   test("walletpassphrasechange on a locked wallet: wrong old is -14, right old works and leaves it locked", async () => {
     expect(wallet.isLocked()).toBe(true);
     const bad = await rpc("walletpassphrasechange", ["wrong", "new"]);
