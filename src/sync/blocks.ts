@@ -2355,10 +2355,13 @@ export class BlockSync {
       // This allows submitblock to work even when header sync is stalled
       // (e.g. after IBD completes but chain work hasn't reached nMinimumChainWork,
       // causing the anti-DoS PRESYNC to block new headers from peers).
-      // minPowChecked=false: the submitblock direct path bypasses the
-      // PRESYNC/REDOWNLOAD anti-DoS gate, so we must enforce the
-      // too-little-chainwork guard here.  (Core validation.cpp:4229.)
-      const accepted = await this.headerSync.processHeaders([block.header], null, false);
+      // minPowChecked=true: Core's submitblock calls
+      // ProcessNewBlock(..., /*min_pow_checked=*/true, ...) (rpc/mining.cpp);
+      // a locally submitted block is not subject to the P2P anti-DoS
+      // threshold. processHeaders refuses every header handed in with
+      // `false`, so passing `false` here would refuse every new header
+      // submitblock brings.
+      const accepted = await this.headerSync.processHeaders([block.header], null, true);
       if (accepted > 0) {
         headerEntry = this.headerSync.getHeader(blockHash);
       }

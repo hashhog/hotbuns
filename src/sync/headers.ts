@@ -534,25 +534,25 @@ export class HeaderSync {
       const headerWork = this.getHeaderWork(header.bits);
       const chainWork = parent.chainWork + headerWork;
 
-      // G8 / AcceptBlockHeader gate: if the caller has not already verified that
-      // this header chain meets MIN_CHAIN_WORK (minPowChecked == false), we
-      // reject headers whose cumulative chain work falls below nMinimumChainWork.
-      //
-      // Core canonical (validation.cpp:4229):
+      // AcceptBlockHeader low-work gate (Core validation.cpp
+      // ChainstateManager::AcceptBlockHeader):
       //   if (!min_pow_checked)
       //     return state.Invalid(BLOCK_HEADER_LOW_WORK, "too-little-chainwork");
       //
-      // The PRESYNC/REDOWNLOAD anti-DoS gate sets minPowChecked = true because
-      // it has already verified the chain reaches nMinimumChainWork before
-      // releasing headers for permanent storage.  The submitblock direct path
-      // and any raw P2P path that bypasses PRESYNC must pass minPowChecked = false
-      // so that low-work header chains are rejected here.
-      //
-      // Skipped for regtest (nMinimumChainWork === 0n) to allow test chains.
-      if (!minPowChecked && this.params.nMinimumChainWork > 0n && chainWork < this.params.nMinimumChainWork) {
+      // UNCONDITIONAL in Core: the caller has already decided whether this
+      // header's chain clears the anti-DoS threshold (PRESYNC/REDOWNLOAD for
+      // headers messages, the net_processing "block" handler's
+      // GetAntiDoSWorkThreshold comparison for an unrequested block). A
+      // `false` from that decision means the header is never indexed — not
+      // "compare against nMinimumChainWork". Gating only on nMinimumChainWork
+      // let a node past minimum chain work store an unrequested low-work
+      // header, and handleBlock then wrote its body to disk as a fork body
+      // (cffix-hotbuns-lowwork-block-header). submitblock passes true, as
+      // Core's rpc/mining.cpp does.
+      if (!minPowChecked) {
         console.warn(
-          `Rejected low-chainwork header from ${fromPeer?.host ?? "local"}: ` +
-          `chainWork=${chainWork} < nMinimumChainWork=${this.params.nMinimumChainWork} (too-little-chainwork)`
+          `Rejected low-work header from ${fromPeer?.host ?? "local"}: ` +
+          `chainWork=${chainWork} below the caller's anti-DoS threshold (too-little-chainwork)`
         );
         continue;
       }
