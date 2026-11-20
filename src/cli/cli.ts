@@ -16,6 +16,7 @@ import { reconcileNTxProvenanceOnce } from "../storage/ntx_provenance.js";
 import { BufferReader, BufferWriter } from "../wire/serialization.js";
 import { deserializeBlock } from "../validation/block.js";
 import { ChainStateManager } from "../chain/state.js";
+import { acceptImportedBlock } from "../chain/import_block.js";
 import { TipNotifier } from "../chain/tip_notifier.js";
 import { ChainstateManager, getAssumeutxoData, loadCampaignAssumeutxo, persistAssumeutxoTailHeaders } from "../chain/snapshot.js";
 import { applySnapshotHistoryServices, recordSnapshotOrigin } from "../chain/snapshot_origin.js";
@@ -1214,16 +1215,27 @@ async function runBlockImport(
   const { deserializeBlock, deserializeBlockHeader, getBlockHash } = await import("../validation/block.js");
   const { BufferReader } = await import("../wire/serialization.js");
 
+  // Every imported block runs the header + CheckBlock + connect pipeline
+  // (acceptImportedBlock), so the importer needs the header index, loaded
+  // from the datadir exactly as the node loads it for P2P sync. Core:
+  // LoadExternalBlockFile -> AcceptBlock (validation.cpp).
+  const headerSync = new HeaderSync(db, params);
+  headerSync.setActiveTipProvider(() => chainState.getBestBlock());
+  await headerSync.loadFromDB();
+  // connectBlock's BIP-113 / BIP-68 time context reads the parent's MTP
+  // through the header index first.
+  chainState.setHeaderSync(headerSync);
+
   const bestBlock = chainState.getBestBlock();
   const startHeight = bestBlock.height;
   console.log(`Block import mode: starting from height ${startHeight}`);
 
   if (importPath === "-") {
     // Read framed format from stdin: [4B height LE][4B size LE][block data]
-    await importFromStdin(startHeight, db, chainState, deserializeBlock, BufferReader);
+    await importFromStdin(startHeight, headerSync, chainState, params, deserializeBlock, BufferReader);
   } else {
     // Read from blk*.dat directory
-    await importFromBlkFiles(importPath, startHeight, db, chainState, params, deserializeBlock, deserializeBlockHeader, getBlockHash, BufferReader);
+    await importFromBlkFiles(importPath, headerSync, chainState, params, deserializeBlock, deserializeBlockHeader, getBlockHash, BufferReader);
   }
 }
 
@@ -1232,8 +1244,9 @@ async function runBlockImport(
  */
 async function importFromStdin(
   startHeight: number,
-  db: ChainDB,
+  headerSync: HeaderSync,
   chainState: ChainStateManager,
+  params: ConsensusParams,
   deserializeBlock: (reader: any) => any,
   BufferReader: any,
 ): Promise<void> {
@@ -1284,12 +1297,17 @@ async function importFromStdin(
     const blockData = await readExact(frameSize);
     if (!blockData) break;
 
-    const block = deserializeBlock(new BufferReader(blockData));
-
+    let block;
     try {
-      await chainState.connectBlock(block, frameHeight);
+      block = deserializeBlock(new BufferReader(blockData));
     } catch (e: any) {
-      console.error(`Block validation failed at height ${frameHeight}: ${e.message}`);
+      console.error(`Block decode failed at height ${frameHeight}: ${e.message}`);
+      break;
+    }
+
+    const result = await acceptImportedBlock(block, frameHeight, headerSync, chainState, params);
+    if (!result.ok) {
+      console.error(`Block validation failed at height ${frameHeight}: ${result.reason}`);
       break;
     }
 
@@ -1317,12 +1335,19 @@ async function importFromStdin(
 
 /**
  * Read blocks from blk*.dat files.
- * Scans all files to build a hash-to-location index, then processes in height order.
+ *
+ * Scans all files to index every block by its parent, then connects forward
+ * from the active tip: at each step the children of the tip, in file order,
+ * go through acceptImportedBlock and the first that passes is connected.
+ * Core LoadExternalBlockFile likewise places each block by hashPrevBlock
+ * (out-of-order blocks wait for their parent), not by a height the node has
+ * not validated yet. This used to look blocks up through the height index
+ * above the tip, which ChainStateManager.load() rolls back to the tip, so the
+ * importer found nothing to import on any loaded datadir.
  */
 async function importFromBlkFiles(
   blocksDir: string,
-  startHeight: number,
-  db: ChainDB,
+  headerSync: HeaderSync,
   chainState: ChainStateManager,
   params: ConsensusParams,
   deserializeBlock: (reader: any) => any,
@@ -1338,8 +1363,9 @@ async function importFromBlkFiles(
   // Detect XOR obfuscation key (Bitcoin Core 28.0+)
   const xorKey = await detectXorKey(blocksDir, magic);
 
-  // Build hash -> (fileNum, offset, size) index
-  const index = new Map<string, { fileNum: number; offset: number; size: number }>();
+  // Build parent hash -> [(fileNum, offset, size)] index, children in file order
+  const children = new Map<string, { fileNum: number; offset: number; size: number }[]>();
+  let indexed = 0;
   let fileNum = 0;
 
   while (true) {
@@ -1377,16 +1403,18 @@ async function importFromBlkFiles(
       const headerBuf = Buffer.from(fileData.subarray(blockOffset, blockOffset + 80));
       xorDeobfuscate(headerBuf, blockOffset, xorKey);
       const header = deserializeBlockHeader(new BufferReader(headerBuf));
-      const hash = getBlockHash(header);
-      const hashHex = hash.toString("hex");
-
-      index.set(hashHex, { fileNum, offset: blockOffset, size });
+      const parentHex = Buffer.from(header.prevBlock).toString("hex");
+      const kids = children.get(parentHex);
+      const loc = { fileNum, offset: blockOffset, size };
+      if (kids) kids.push(loc);
+      else children.set(parentHex, [loc]);
+      indexed++;
 
       blocksInFile++;
       pos = blockOffset + size;
     }
 
-    console.log(`Scanned blk${String(fileNum).padStart(5, "0")}.dat: ${blocksInFile} blocks (total: ${index.size})`);
+    console.log(`Scanned blk${String(fileNum).padStart(5, "0")}.dat: ${blocksInFile} blocks (total: ${indexed})`);
     fileNum++;
   }
 
@@ -1395,7 +1423,7 @@ async function importFromBlkFiles(
     return;
   }
 
-  console.log(`Block index built: ${index.size} blocks from ${fileNum} files`);
+  console.log(`Block index built: ${indexed} blocks from ${fileNum} files`);
 
   // Cache file data for reading blocks (keep last 2 files in memory)
   const fileCache = new Map<number, Buffer>();
@@ -1415,50 +1443,55 @@ async function importFromBlkFiles(
     return data.subarray(loc.offset, loc.offset + loc.size);
   };
 
-  // Process blocks in height order
-  let height = startHeight + 1;
+  // Connect forward from the active tip, one child of the tip at a time.
   let imported = 0;
   const importStart = Date.now();
   let batchStart = Date.now();
 
-  while (true) {
-    // Get expected block hash at this height from our header chain
-    const hashBuf = await db.getBlockHashByHeight(height);
-    if (!hashBuf) {
-      console.log(`No header at height ${height} — end of header chain. Imported ${imported} blocks.`);
-      break;
-    }
-    const hashHex = hashBuf.toString("hex");
-
-    const loc = index.get(hashHex);
-    if (!loc) {
-      console.warn(`Block ${hashHex} at height ${height} not found in blk files. Stopping.`);
+  outer: while (true) {
+    const tip = chainState.getBestBlock();
+    const tipHex = Buffer.from(tip.hash).toString("hex");
+    const kids = children.get(tipHex) ?? [];
+    if (kids.length === 0) {
+      console.log(`No block in the files extends tip height ${tip.height}. Imported ${imported} blocks.`);
       break;
     }
 
-    const blockData = Buffer.from(await readBlock(loc));
-    xorDeobfuscate(blockData, loc.offset, xorKey);
-    const block = deserializeBlock(new BufferReader(blockData));
+    for (const loc of kids) {
+      const blockData = Buffer.from(await readBlock(loc));
+      xorDeobfuscate(blockData, loc.offset, xorKey);
+      let block;
+      try {
+        block = deserializeBlock(new BufferReader(blockData));
+      } catch (e: any) {
+        console.error(`Block decode failed at blk${String(loc.fileNum).padStart(5, "0")}.dat offset ${loc.offset}: ${e.message}`);
+        continue;
+      }
+      const result = await acceptImportedBlock(block, null, headerSync, chainState, params);
+      if (!result.ok) {
+        console.error(
+          `Block validation failed at height ${tip.height + 1} ` +
+            `(${Buffer.from(getBlockHash(block.header)).reverse().toString("hex")}): ${result.reason}`,
+        );
+        continue;
+      }
 
-    try {
-      await chainState.connectBlock(block, height);
-    } catch (e: any) {
-      console.error(`Block validation failed at height ${height}: ${e.message}`);
-      break;
+      imported++;
+      if (imported % 1000 === 0) {
+        const elapsed = (Date.now() - batchStart) / 1000;
+        const bps = 1000 / elapsed;
+        const totalElapsed = (Date.now() - importStart) / 1000;
+        console.log(
+          `Import progress: height ${result.height} (${imported} blocks, ${bps.toFixed(0)} blocks/sec, ${(bps * 60).toFixed(0)} blocks/min, elapsed ${totalElapsed.toFixed(1)}s)`,
+        );
+        batchStart = Date.now();
+      }
+      continue outer;
     }
 
-    imported++;
-    height++;
-
-    if (imported % 1000 === 0) {
-      const elapsed = (Date.now() - batchStart) / 1000;
-      const bps = 1000 / elapsed;
-      const totalElapsed = (Date.now() - importStart) / 1000;
-      console.log(
-        `Import progress: height ${height - 1} (${imported} blocks, ${bps.toFixed(0)} blocks/sec, ${(bps * 60).toFixed(0)} blocks/min, elapsed ${totalElapsed.toFixed(1)}s)`,
-      );
-      batchStart = Date.now();
-    }
+    // Every child of the tip failed: stop with the tip unchanged.
+    console.error(`No valid block in the files extends tip height ${tip.height}. Imported ${imported} blocks.`);
+    break;
   }
 
   const totalElapsed = (Date.now() - importStart) / 1000;
