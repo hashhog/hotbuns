@@ -1141,13 +1141,15 @@ function opcodeEndPos(script: Buffer, pos: number): number {
  * from the scriptCode while that flag is set, the script is rejected with
  * SCRIPT_ERR_SIG_FINDANDDELETE (interpreter.cpp:330-332 for CHECKSIG,
  * :1146-1148 for CHECKMULTISIG).
+ *
+ * An EMPTY sig is not skipped: Core searches for `CScript() << vchSig`, which
+ * for an empty vchSig is the single byte 0x00 (OP_0), so every opcode-aligned
+ * OP_0 is removed from scriptCode. In CHECKMULTISIG that changes the sighash
+ * of the other signatures, so skipping it was a consensus split both ways.
  */
 function findAndDelete(script: Buffer, sig: Buffer): { result: Buffer; found: number } {
-  if (sig.length === 0) {
-    return { result: script, found: 0 };
-  }
-
-  // Build the canonical push-encoded signature to search for.
+  // Build the canonical push-encoded signature to search for
+  // (an empty sig encodes as [0x00] = OP_0, like Core's CScript() << {}).
   let pushSig: Buffer;
   if (sig.length < 76) {
     pushSig = Buffer.concat([Buffer.from([sig.length]), sig]);
@@ -1973,26 +1975,29 @@ export function executeScript(script: Script, ctx: ExecutionContext): boolean {
           checkSignatureEncoding(sig, flags);
           checkPubKeyEncoding(pubkey, flags, sigVersion);
 
+          // Build subscript for sighash
+          let subscript: Buffer;
+          if (sigVersion === SigVersion.BASE) {
+            // For legacy, we need to remove the signature from the scriptCode.
+            // Core runs this for an empty sig too (pattern OP_0), so it must
+            // stay outside the `sig.length > 0` branch for the
+            // CONST_SCRIPTCODE count below.
+            const scriptCode = serializeScript(script.slice(codeSepPos === 0xffffffff ? 0 : codeSepPos + 1));
+            const fad = findAndDelete(scriptCode, sig);
+            // SCRIPT_VERIFY_CONST_SCRIPTCODE: if a signature push was actually
+            // deleted from the scriptCode, reject (Core interpreter.cpp:330-332).
+            if (fad.found > 0 && flags.verifyConstScriptCode) {
+              throw new ScriptError("SIG_FINDANDDELETE");
+            }
+            subscript = fad.result;
+          } else {
+            // For segwit, just use the scriptCode without FindAndDelete
+            subscript = serializeScript(script.slice(codeSepPos === 0xffffffff ? 0 : codeSepPos + 1));
+          }
+
           if (sig.length > 0) {
             const hashType = sig[sig.length - 1];
             const sigBytes = sig.subarray(0, sig.length - 1);
-
-            // Build subscript for sighash
-            let subscript: Buffer;
-            if (sigVersion === SigVersion.BASE) {
-              // For legacy, we need to remove the signature from the scriptCode
-              const scriptCode = serializeScript(script.slice(codeSepPos === 0xffffffff ? 0 : codeSepPos + 1));
-              const fad = findAndDelete(scriptCode, sig);
-              // SCRIPT_VERIFY_CONST_SCRIPTCODE: if a signature push was actually
-              // deleted from the scriptCode, reject (Core interpreter.cpp:330-332).
-              if (fad.found > 0 && flags.verifyConstScriptCode) {
-                throw new ScriptError("SIG_FINDANDDELETE");
-              }
-              subscript = fad.result;
-            } else {
-              // For segwit, just use the scriptCode without FindAndDelete
-              subscript = serializeScript(script.slice(codeSepPos === 0xffffffff ? 0 : codeSepPos + 1));
-            }
 
             const sighash = sigHasher(subscript, hashType);
             success = ecdsaVerifyLax(sigBytes, sighash, pubkey);
