@@ -733,6 +733,11 @@ export async function coreConnectBlockChecks(
         //   if (!MoneyRange(coin.out.nValue) || !MoneyRange(nValueIn))
         //     → "bad-txns-inputvalues-outofrange"
         const MAX_MONEY_INPUT = 2_100_000_000_000_000n; // 21_000_000 * COIN
+        // nValueIn is local to ONE transaction in Core. Chained transactions
+        // in a block legitimately move the same coins several times, so a
+        // block-wide sum (totalInputValue) can exceed MAX_MONEY in a valid
+        // block and must never be range-checked.
+        let txInputValue = 0n;
         for (const input of tx.inputs) {
           const spentEntry = utxoManager.spendOutput(input.prevOut);
           // Gate: individual coin value must be in MoneyRange.
@@ -743,8 +748,9 @@ export async function coreConnectBlockChecks(
             };
           }
           totalInputValue += spentEntry.amount;
-          // Gate: accumulated input value must stay in MoneyRange.
-          if (totalInputValue > MAX_MONEY_INPUT) {
+          txInputValue += spentEntry.amount;
+          // Gate: this tx's accumulated input value must stay in MoneyRange.
+          if (txInputValue > MAX_MONEY_INPUT) {
             return {
               ok: false,
               error: `bad-txns-inputvalues-outofrange (accumulated) in tx ${txidHex.slice(0, 16)}`,
