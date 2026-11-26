@@ -548,6 +548,25 @@ export class ChainStateManager {
    * Reference: Bitcoin Core validation.cpp::ConnectBlock
    */
   async connectBlock(block: Block, height: number): Promise<void> {
+    // Core's ConnectBlock spends and adds coins in a temporary CCoinsViewCache
+    // that is only flushed into the chainstate when every check passed; on a
+    // failure the temporary view is dropped. Here the block's coins are
+    // applied to this.utxo's cache directly, and every connect that succeeds
+    // flushes it in one batch. So when a connect fails, everything dirty in
+    // the cache is this block's partial work: throw it away and re-point the
+    // view at the unchanged tip, or the next block would see the failed
+    // block's spends and outputs (a valid sibling rejected, a spend of a coin
+    // that never existed accepted).
+    let connected = false;
+    try {
+      await this.connectBlockOnView(block, height);
+      connected = true;
+    } finally {
+      if (!connected) this.utxo.clearCache(this.bestBlock.hash);
+    }
+  }
+
+  private async connectBlockOnView(block: Block, height: number): Promise<void> {
     const blockHash = getBlockHash(block.header);
 
     // Verify checkpoint if this height has one
